@@ -1,0 +1,24 @@
+[package]
+name = "rclaw-weixin-login"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# 独立的微信扫码登录工具（移植自 CClaw tools/weixin_login）。
+# 不依赖任何 rclaw-* crate，避免引入环；与 rclaw-channels::weixin 共用同一 iLink Bot 协议，
+# 取到的 token 直接填入 rclaw.toml 的 [weixin] 段即可。
+
+[[bin]]
+name = "rclaw-weixin-login"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+qrcode = "0.14"
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+tokio.workspace = true

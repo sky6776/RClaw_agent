@@ -1,0 +1,825 @@
+manifest_version = 1
+
+[skill]
+name = "ai-berkshire"
+
+[[entrypoints]]
+name = "ashare-quote"
+description = "查询 A 股实时行情。"
+runtime = "python"
+script = "tools/ashare_data.py"
+fixed_args = ["quote"]
+
+[[entrypoints.arguments]]
+name = "code"
+type = "string"
+description = "股票代码，例如 600519。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "ashare-financials"
+description = "查询 A 股近五年核心财务数据。"
+runtime = "python"
+script = "tools/ashare_data.py"
+fixed_args = ["financials"]
+
+[[entrypoints.arguments]]
+name = "code"
+type = "string"
+description = "股票代码。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "ashare-valuation"
+description = "查询 A 股估值指标。"
+runtime = "python"
+script = "tools/ashare_data.py"
+fixed_args = ["valuation"]
+
+[[entrypoints.arguments]]
+name = "code"
+type = "string"
+description = "股票代码。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "ashare-search"
+description = "按公司名或关键词搜索 A 股代码。"
+runtime = "python"
+script = "tools/ashare_data.py"
+fixed_args = ["search"]
+
+[[entrypoints.arguments]]
+name = "keyword"
+type = "string"
+description = "公司名或搜索关键词。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "financial-verify-market-cap"
+description = "验算市值是否等于股价乘以总股本。"
+runtime = "python"
+script = "tools/financial_rigor.py"
+fixed_args = ["verify-market-cap"]
+
+[[entrypoints.arguments]]
+name = "price"
+type = "number"
+description = "股价，必须大于零。"
+required = true
+flag = "--price"
+
+[[entrypoints.arguments]]
+name = "shares"
+type = "number"
+description = "总股本，必须大于零。"
+required = true
+flag = "--shares"
+
+[[entrypoints.arguments]]
+name = "reported"
+type = "number"
+description = "报告中的市值，必须大于零。"
+required = true
+flag = "--reported"
+
+[[entrypoints.arguments]]
+name = "currency"
+type = "string"
+description = "可选币种。"
+flag = "--currency"
+
+[[entrypoints]]
+name = "financial-verify-valuation"
+description = "依据股价和每股指标验算估值倍数。"
+runtime = "python"
+script = "tools/financial_rigor.py"
+fixed_args = ["verify-valuation"]
+
+[[entrypoints.arguments]]
+name = "price"
+type = "number"
+description = "股价，必须大于零。"
+required = true
+flag = "--price"
+
+[[entrypoints.arguments]]
+name = "eps"
+type = "number"
+description = "每股收益。"
+flag = "--eps"
+
+[[entrypoints.arguments]]
+name = "bvps"
+type = "number"
+description = "每股净资产。"
+flag = "--bvps"
+
+[[entrypoints.arguments]]
+name = "fcf_per_share"
+type = "number"
+description = "每股自由现金流。"
+flag = "--fcf-per-share"
+
+[[entrypoints.arguments]]
+name = "dividend"
+type = "number"
+description = "每股股息。"
+flag = "--dividend"
+
+[[entrypoints.arguments]]
+name = "revenue_per_share"
+type = "number"
+description = "每股营业收入。"
+flag = "--revenue-per-share"
+
+[[entrypoints]]
+name = "financial-cross-validate"
+description = "对同一金融字段的多个来源数值执行交叉验证。"
+runtime = "python"
+script = "tools/financial_rigor.py"
+fixed_args = ["cross-validate"]
+
+[entrypoints.constraints]
+exactly_one = [["values", "values_file"]]
+
+[[entrypoints.arguments]]
+name = "field"
+type = "string"
+description = "数据字段名。"
+required = true
+flag = "--field"
+
+[[entrypoints.arguments]]
+name = "values"
+type = "string"
+description = "来源到数值的紧凑 JSON 对象；通常优先使用 values_file。"
+flag = "--values"
+
+[[entrypoints.arguments]]
+name = "values_file"
+type = "path"
+description = "包含来源到数值 JSON 对象的 UTF-8 文件。"
+flag = "--values-file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "unit"
+type = "string"
+description = "数据单位。"
+flag = "--unit"
+
+[[entrypoints.arguments]]
+name = "tolerance"
+type = "number"
+description = "非负容差百分比；投研报告通常显式传 1。"
+flag = "--tolerance"
+
+[[entrypoints]]
+name = "financial-benford"
+description = "对一组金融数值执行 Benford 定律检测。"
+runtime = "python"
+script = "tools/financial_rigor.py"
+fixed_args = ["benford"]
+
+[entrypoints.constraints]
+exactly_one = [["values", "values_file"]]
+
+[[entrypoints.arguments]]
+name = "values"
+type = "string"
+description = "待检测数值的紧凑 JSON 数组；通常优先使用 values_file。"
+flag = "--values"
+
+[[entrypoints.arguments]]
+name = "values_file"
+type = "path"
+description = "包含待检测数值 JSON 数组的 UTF-8 文件。"
+flag = "--values-file"
+must_exist = true
+
+[[entrypoints]]
+name = "financial-calc"
+description = "使用十进制定点规则精确计算金融算式。"
+runtime = "python"
+script = "tools/financial_rigor.py"
+fixed_args = ["calc"]
+
+[[entrypoints.arguments]]
+name = "expression"
+type = "string"
+description = "需要计算的算术表达式。"
+required = true
+flag = "--expr"
+
+[[entrypoints]]
+name = "financial-three-scenario"
+description = "计算乐观、中性、悲观三种情景下的估值。"
+runtime = "python"
+script = "tools/financial_rigor.py"
+fixed_args = ["three-scenario"]
+
+[[entrypoints.arguments]]
+name = "price"
+type = "number"
+description = "当前股价，必须大于零。"
+required = true
+flag = "--price"
+
+[[entrypoints.arguments]]
+name = "eps"
+type = "number"
+description = "当前每股收益。"
+required = true
+flag = "--eps"
+
+[[entrypoints.arguments]]
+name = "shares"
+type = "number"
+description = "总股本，单位为亿股，必须大于零。"
+required = true
+flag = "--shares"
+
+[[entrypoints.arguments]]
+name = "growth"
+type = "number_array"
+description = "依次为乐观、中性、悲观年增长率的小数值。"
+required = true
+flag = "--growth"
+repeat_flag = false
+min_items = 3
+max_items = 3
+
+[[entrypoints.arguments]]
+name = "pe"
+type = "number_array"
+description = "依次为乐观、中性、悲观目标市盈率。"
+required = true
+flag = "--pe"
+repeat_flag = false
+min_items = 3
+max_items = 3
+
+[[entrypoints.arguments]]
+name = "years"
+type = "integer"
+description = "预测年数，默认由脚本使用 3。"
+flag = "--years"
+minimum = 1
+
+[[entrypoints.arguments]]
+name = "currency"
+type = "string"
+description = "可选币种。"
+flag = "--currency"
+
+[[entrypoints]]
+name = "report-lint"
+description = "全量检查报告审计事实区和单位。"
+runtime = "python"
+script = "tools/report_audit.py"
+fixed_args = ["lint"]
+
+[[entrypoints.arguments]]
+name = "report"
+type = "path"
+description = "待检查的 Markdown 报告。"
+required = true
+flag = "--report"
+must_exist = true
+
+[[entrypoints]]
+name = "report-source-snapshot"
+description = "把已保存的来源正文绑定为带 URL 和哈希的证据快照。"
+runtime = "python"
+script = "tools/report_audit.py"
+fixed_args = ["source-snapshot"]
+
+[[entrypoints.arguments]]
+name = "source"
+type = "string"
+description = "正文对应的直接证据 URL。"
+required = true
+flag = "--source"
+
+[[entrypoints.arguments]]
+name = "input"
+type = "path"
+description = "联网工具保存的 UTF-8 页面正文。"
+required = true
+flag = "--input"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "要写入的来源快照 JSON 路径。"
+required = true
+flag = "--output"
+
+[[entrypoints]]
+name = "report-verify-pass"
+description = "验证报告旁的准出凭证和证据账本。"
+runtime = "python"
+script = "tools/report_audit.py"
+fixed_args = ["verify-pass"]
+
+[[entrypoints.arguments]]
+name = "report"
+type = "path"
+description = "待确认为有效基线的 Markdown 报告。"
+required = true
+flag = "--report"
+must_exist = true
+
+[[entrypoints]]
+name = "report-extract"
+description = "从报告提取数据点并生成固定比例的审计抽样包。"
+runtime = "python"
+script = "tools/report_audit.py"
+fixed_args = ["extract"]
+
+[[entrypoints.arguments]]
+name = "report"
+type = "path"
+description = "待抽样的 Markdown 报告。"
+required = true
+flag = "--report"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "dry_run"
+type = "boolean"
+description = "只打印抽检清单，不写 JSON。"
+flag = "--dry-run"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "要写入的可填写审计包 JSON 路径。"
+flag = "--output"
+
+[[entrypoints]]
+name = "report-preflight"
+description = "一次性预检审计包中的全部证据字段。"
+runtime = "python"
+script = "tools/report_audit.py"
+fixed_args = ["preflight"]
+
+[[entrypoints.arguments]]
+name = "results_file"
+type = "path"
+description = "extract 生成并已填写证据字段的审计包。"
+required = true
+flag = "--results-file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "report"
+type = "path"
+description = "被审计的实际 Markdown 报告。"
+required = true
+flag = "--report"
+must_exist = true
+
+[[entrypoints]]
+name = "report-verdict"
+description = "根据核验结果输出报告准出或打回判决。"
+runtime = "python"
+script = "tools/report_audit.py"
+fixed_args = ["verdict"]
+
+[[entrypoints.arguments]]
+name = "results_file"
+type = "path"
+description = "extract 生成并已填写证据字段的审计包。"
+required = true
+flag = "--results-file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "report"
+type = "path"
+description = "被审计的实际 Markdown 报告。"
+required = true
+flag = "--report"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "output_json"
+type = "boolean"
+description = "把判决结果以 JSON 输出到标准输出。"
+flag = "--output-json"
+
+[[entrypoints]]
+name = "xueqiu-scrape"
+description = "抓取指定雪球用户的本人原发言并按关键词筛选。"
+runtime = "python"
+script = "tools/xueqiu_scraper.py"
+timeout_ms = 900000
+
+[[entrypoints.arguments]]
+name = "user_id"
+type = "integer"
+description = "雪球用户主页 URL 中的数字 ID。"
+required = true
+flag = "--user-id"
+minimum = 1
+
+[[entrypoints.arguments]]
+name = "keywords"
+type = "string"
+description = "以逗号分隔的筛选关键词。"
+flag = "--keywords"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选 Markdown 输出路径。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "raw_json"
+type = "path"
+description = "可选命中条目原始 JSON 输出路径。"
+flag = "--raw-json"
+
+[[entrypoints.arguments]]
+name = "state_path"
+type = "path"
+description = "登录态缓存路径；建议放在 skills/ai-berkshire/tmp 下。"
+flag = "--state-path"
+
+[[entrypoints.arguments]]
+name = "dump_all"
+type = "path"
+description = "可选的全量原发言缓存输出路径。"
+flag = "--dump-all"
+
+[[entrypoints]]
+name = "xueqiu-filter-cache"
+description = "从已有雪球全量缓存中按关键词生成 Markdown。"
+runtime = "python"
+script = "tools/xueqiu_scraper.py"
+
+[[entrypoints.arguments]]
+name = "from_cache"
+type = "path"
+description = "已有的雪球全量缓存 JSON。"
+required = true
+flag = "--from-cache"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "keywords"
+type = "string"
+description = "以逗号分隔的筛选关键词。"
+required = true
+flag = "--keywords"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "Markdown 输出路径。"
+required = true
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "user_id"
+type = "integer"
+description = "可选的雪球用户 ID，用于输出元数据。"
+flag = "--user-id"
+minimum = 1
+
+[[entrypoints]]
+name = "twstock-quote"
+description = "查询台股最新行情、PER/PBR/殖利率并附市值验算（新台币口径）。"
+runtime = "python"
+script = "tools/twstock_data.py"
+fixed_args = ["quote"]
+
+[[entrypoints.arguments]]
+name = "code"
+type = "string"
+description = "台股代码，如 2330、2454。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "twstock-valuation"
+description = "查询台股估值指标与 52 周高低（新台币口径）。"
+runtime = "python"
+script = "tools/twstock_data.py"
+fixed_args = ["valuation"]
+
+[[entrypoints.arguments]]
+name = "code"
+type = "string"
+description = "台股代码。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "twstock-financials"
+description = "查询台股近五年年度核心财务（营收/毛利率/归母净利/EPS/ROE）。"
+runtime = "python"
+script = "tools/twstock_data.py"
+fixed_args = ["financials"]
+
+[[entrypoints.arguments]]
+name = "code"
+type = "string"
+description = "台股代码。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "twstock-revenue"
+description = "查询台股近 13 个月月营收及同比（台股每月 10 日前强制披露）。"
+runtime = "python"
+script = "tools/twstock_data.py"
+fixed_args = ["revenue"]
+
+[[entrypoints.arguments]]
+name = "code"
+type = "string"
+description = "台股代码。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "twstock-dividend"
+description = "查询台股近年股利政策（现金/股票股利、除息日）。"
+runtime = "python"
+script = "tools/twstock_data.py"
+fixed_args = ["dividend"]
+
+[[entrypoints.arguments]]
+name = "code"
+type = "string"
+description = "台股代码。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "twstock-search"
+description = "按公司名（繁体）或代码搜索台股代码。"
+runtime = "python"
+script = "tools/twstock_data.py"
+fixed_args = ["search"]
+
+[[entrypoints.arguments]]
+name = "keyword"
+type = "string"
+description = "公司名（繁体）或代码。"
+required = true
+position = 0
+
+[[entrypoints]]
+name = "terminal-value-pe"
+description = "永续增长模型单点退出 PE，打印完整算式。"
+runtime = "python"
+script = "tools/terminal_value.py"
+fixed_args = ["pe"]
+
+[[entrypoints.arguments]]
+name = "roic"
+type = "number"
+description = "稳态增量 ROIC，小数（如 0.20）。"
+required = true
+flag = "--roic"
+
+[[entrypoints.arguments]]
+name = "g"
+type = "number"
+description = "永续增速，小数（如 0.02）。"
+required = true
+flag = "--g"
+
+[[entrypoints.arguments]]
+name = "r"
+type = "number"
+description = "资本成本，小数（如 0.06）。"
+required = true
+flag = "--r"
+
+[[entrypoints]]
+name = "terminal-value-irr"
+description = "从终值年利润与今日市值计算十年 IRR。"
+runtime = "python"
+script = "tools/terminal_value.py"
+fixed_args = ["irr"]
+
+[[entrypoints.arguments]]
+name = "profit"
+type = "number"
+description = "终值年利润。"
+required = true
+flag = "--profit"
+
+[[entrypoints.arguments]]
+name = "mcap"
+type = "number"
+description = "今日市值，与利润同单位同币种。"
+required = true
+flag = "--mcap"
+
+[[entrypoints.arguments]]
+name = "pe"
+type = "number"
+description = "退出 PE。"
+required = true
+flag = "--pe"
+
+[[entrypoints.arguments]]
+name = "years"
+type = "integer"
+description = "持有期年数，默认 10。"
+flag = "--years"
+
+[[entrypoints.arguments]]
+name = "payout"
+type = "number"
+description = "股息率减稀释率，年化小数。"
+flag = "--payout"
+
+[[entrypoints]]
+name = "terminal-value-audit"
+description = "十年折现估值三条硬约束准出检查（币种一致/分母宽度/离散风险归属），退出码非 0 即打回。"
+runtime = "python"
+script = "tools/terminal_value.py"
+fixed_args = ["audit"]
+
+[[entrypoints.arguments]]
+name = "currency"
+type = "enum"
+description = "现金流币种。"
+required = true
+flag = "--currency"
+values = ["CNY", "USD", "HKD"]
+
+[[entrypoints.arguments]]
+name = "r"
+type = "number"
+description = "资本成本，小数。"
+required = true
+flag = "--r"
+
+[[entrypoints.arguments]]
+name = "roic"
+type = "number"
+description = "终值年稳态增量 ROIC，小数。"
+required = true
+flag = "--roic"
+
+[[entrypoints.arguments]]
+name = "g"
+type = "string"
+description = "三档永续增速，逗号分隔小数，如 0.005,0.02,0.03。"
+required = true
+flag = "--g"
+
+[[entrypoints.arguments]]
+name = "rf"
+type = "number"
+description = "无风险利率，小数；给了会校验与币种是否匹配。"
+flag = "--rf"
+
+[[entrypoints.arguments]]
+name = "beta"
+type = "number"
+description = "股票风险系数，默认 1.0。"
+flag = "--beta"
+
+[[entrypoints.arguments]]
+name = "beta_justification"
+type = "string"
+description = "β 偏离 1.0 时必填的理由。"
+flag = "--beta-justification"
+
+[[entrypoints.arguments]]
+name = "discrete_risks"
+type = "string"
+description = "离散风险归属清单，格式 风险名:归属，逗号分隔；合法归属为 情景/尾部档/概率/未建模。"
+flag = "--discrete-risks"
+
+[[entrypoints.arguments]]
+name = "upside_only"
+type = "boolean"
+description = "声明本档仅作上行/下行情景参考，允许分母不足 5pct。"
+flag = "--upside-only"
+
+[[entrypoints]]
+name = "terminal-value-sweep"
+description = "多档资本成本敏感性检验与排序稳定性。"
+runtime = "python"
+script = "tools/terminal_value.py"
+fixed_args = ["sweep"]
+
+[[entrypoints.arguments]]
+name = "r"
+type = "string"
+description = "逗号分隔的多档资本成本小数，如 0.06,0.08,0.10。"
+required = true
+flag = "--r"
+
+[[entrypoints.arguments]]
+name = "rf"
+type = "number"
+description = "无风险利率，小数。"
+flag = "--rf"
+
+[[entrypoints.arguments]]
+name = "g_shift"
+type = "number"
+description = "g 的币种平移，小数；人民币口径相对报告原值取 -0.01。"
+flag = "--g-shift"
+
+[[entrypoints.arguments]]
+name = "years"
+type = "integer"
+description = "持有期年数，默认 10。"
+flag = "--years"
+
+[[entrypoints.arguments]]
+name = "config"
+type = "path"
+description = "自定义公司配置 JSON，缺省用内置 7 家预设。"
+flag = "--config"
+must_exist = true
+
+[[entrypoints]]
+name = "terminal-value-check"
+description = "分母 r-g 宽度体检，标出低于 5pct 有效性下限的格子。"
+runtime = "python"
+script = "tools/terminal_value.py"
+fixed_args = ["check"]
+
+[[entrypoints.arguments]]
+name = "r"
+type = "number"
+description = "资本成本，小数。"
+required = true
+flag = "--r"
+
+[[entrypoints.arguments]]
+name = "g_shift"
+type = "number"
+description = "g 的币种平移，小数。"
+flag = "--g-shift"
+
+[[entrypoints.arguments]]
+name = "years"
+type = "integer"
+description = "持有期年数，默认 10。"
+flag = "--years"
+
+[[entrypoints.arguments]]
+name = "config"
+type = "path"
+description = "自定义公司配置 JSON，缺省用内置 7 家预设。"
+flag = "--config"
+must_exist = true
+
+[[entrypoints]]
+name = "terminal-value-table"
+description = "多公司十年横评表与排序。"
+runtime = "python"
+script = "tools/terminal_value.py"
+fixed_args = ["table"]
+
+[[entrypoints.arguments]]
+name = "r"
+type = "number"
+description = "资本成本，小数。"
+required = true
+flag = "--r"
+
+[[entrypoints.arguments]]
+name = "rf"
+type = "number"
+description = "无风险利率，小数。"
+flag = "--rf"
+
+[[entrypoints.arguments]]
+name = "g_shift"
+type = "number"
+description = "g 的币种平移，小数。"
+flag = "--g-shift"
+
+[[entrypoints.arguments]]
+name = "years"
+type = "integer"
+description = "持有期年数，默认 10。"
+flag = "--years"
+
+[[entrypoints.arguments]]
+name = "config"
+type = "path"
+description = "自定义公司配置 JSON，缺省用内置 7 家预设。"
+flag = "--config"
+must_exist = true

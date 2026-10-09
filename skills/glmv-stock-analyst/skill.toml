@@ -1,0 +1,205 @@
+manifest_version = 1
+
+[skill]
+name = "glmv-stock-analyst"
+
+[[entrypoints]]
+name = "setup"
+description = "按当前平台初始化或健康检查股票分析 skill 的隔离 Python 环境。"
+runtime = "platform_shell"
+script = "scripts/setup.sh"
+windows_script = "scripts/setup.ps1"
+timeout_ms = 1500000
+
+[[entrypoints]]
+name = "fetch-data"
+description = "采集指定股票的行情、财务、资金流、新闻和研报数据并生成图表。"
+runtime = "python"
+script = "scripts/fetch_all.py"
+python_venv = "skills/glmv-stock-analyst/scripts/venv"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "stock"
+type = "string"
+description = "股票代码，例如 0700.HK、600519.SS 或 AAPL。"
+required = true
+position = 0
+
+[[entrypoints.arguments]]
+name = "adr"
+type = "string"
+description = "可选的对应 ADR 代码。"
+flag = "--adr"
+
+[[entrypoints.arguments]]
+name = "output_dir"
+type = "directory"
+description = "任务输出根目录；脚本会在其中创建带时间戳的 stock_data_output 子目录。"
+flag = "--output-dir"
+
+[[entrypoints]]
+name = "fetch-ir"
+description = "从一份 HTTPS PDF 或本地 PDF 中提取最多若干页关键 IR 图表页面。"
+runtime = "python"
+script = "scripts/fetch_ir.py"
+python_venv = "skills/glmv-stock-analyst/scripts/venv"
+
+[entrypoints.constraints]
+exactly_one = [["url", "file"]]
+
+[[entrypoints.arguments]]
+name = "url"
+type = "string"
+description = "IR PDF 的 HTTPS 地址。"
+flag = "--url"
+
+[[entrypoints.arguments]]
+name = "file"
+type = "path"
+description = "本地 IR PDF 文件。"
+flag = "--file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "output_dir"
+type = "directory"
+description = "提取结果输出目录。"
+required = true
+flag = "--output-dir"
+
+[[entrypoints.arguments]]
+name = "max_pages"
+type = "integer"
+description = "最多提取的关键页面数量。"
+flag = "--max-pages"
+minimum = 1
+
+[[entrypoints.arguments]]
+name = "dpi"
+type = "integer"
+description = "页面图片渲染 DPI。"
+flag = "--dpi"
+minimum = 36
+maximum = 600
+
+[[entrypoints]]
+name = "generate-report"
+description = "让配置的 GLM-5V-Turbo 读取股票数据与图表，并生成协议化报告、摘要和元数据。"
+runtime = "python"
+script = "scripts/glm5v_report.py"
+python_venv = "skills/glmv-stock-analyst/scripts/venv"
+# 思考模式下健康的一次完整生成实测需要 10-25 分钟（数千行 reasoning 先行），
+# 25 分钟会把正常的慢生成连同尚未产出的报告一起强杀，故放宽到 55 分钟。
+timeout_ms = 3300000
+
+[[entrypoints.arguments]]
+name = "output_dir"
+type = "directory"
+description = "fetch-data 返回的实际任务输出目录。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "user_request"
+type = "string"
+description = "用户原始需求。"
+flag = "--user-request"
+
+[[entrypoints.arguments]]
+name = "extra_context"
+type = "string"
+description = "来源登记和补充证据文本。"
+flag = "--extra-context"
+
+[[entrypoints.arguments]]
+name = "extra_context_file"
+type = "path"
+description = "较长来源登记和补充证据的 UTF-8 文件。"
+flag = "--extra-context-file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "dry_run"
+type = "boolean"
+description = "只校验输入并打印请求摘要，不调用 API。"
+flag = "--dry-run"
+
+[[entrypoints]]
+name = "render-report"
+description = "把股票 Markdown 报告渲染为 HTML，并按真实来源 channel 处理附件标记。"
+runtime = "python"
+script = "scripts/md2html.py"
+publishes_media = true
+python_venv = "skills/glmv-stock-analyst/scripts/venv"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "HTML 输出文件。"
+required = true
+position = 0
+
+[[entrypoints.arguments]]
+name = "input"
+type = "path"
+description = "待渲染的 Markdown 报告。"
+required = true
+flag = "--input"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "title"
+type = "string"
+description = "HTML 页面标题。"
+flag = "--title"
+
+[[entrypoints.arguments]]
+name = "embed_images"
+type = "boolean"
+description = "把本地报告图片嵌入 HTML。"
+flag = "--embed-images"
+
+[[entrypoints.arguments]]
+name = "no_md"
+type = "boolean"
+description = "外部 channel 不同时发布 Markdown 附件。"
+flag = "--no-md"
+
+[[entrypoints.arguments]]
+name = "meta"
+type = "path"
+description = "用于渲染顶部 KPI 的 meta.json。"
+flag = "--meta"
+must_exist = true
+
+[[entrypoints]]
+name = "export-report"
+description = "仅在用户明确要求时，把股票 Markdown 报告导出为 PDF、DOCX 或两者。"
+runtime = "python"
+script = "scripts/export_report.py"
+publishes_media = true
+python_venv = "skills/glmv-stock-analyst/scripts/venv"
+
+[[entrypoints.arguments]]
+name = "input"
+type = "path"
+description = "待导出的 Markdown 报告。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "format"
+type = "enum"
+description = "导出格式。"
+required = true
+flag = "--format"
+values = ["pdf", "docx", "both"]
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的精确输出文件路径。"
+flag = "--output"

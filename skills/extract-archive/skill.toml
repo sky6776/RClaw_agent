@@ -1,0 +1,25 @@
+manifest_version = 1
+
+[skill]
+name = "extract-archive"
+
+[[entrypoints]]
+name = "extract"
+description = "解压常见格式的压缩包（zip / tar / tar.gz / tgz / tar.bz2 / tbz2 / tar.xz / txz，及单文件 gz/bz2/xz），自动防护路径穿越与中文文件名乱码，输出解压清单。"
+runtime = "python"
+script = "scripts/extract_archive.py"
+timeout_ms = 300000
+
+[[entrypoints.arguments]]
+name = "archive"
+type = "path"
+description = "要解压的压缩包路径（相对 agent 工作区）。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "dest"
+type = "directory"
+description = "解压目标目录（相对 agent 工作区），缺省为压缩包同目录下以其主干命名的子目录。"
+flag = "--dest"

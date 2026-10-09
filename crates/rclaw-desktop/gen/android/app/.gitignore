@@ -1,0 +1,16 @@
+/src/main/**/generated
+/src/main/jniLibs/**/*.so
+/src/main/assets/tauri.conf.json
+/tauri.build.gradle.kts
+/proguard-tauri.pro
+/tauri.properties
+/src/main/java/ai/rclaw/app/proguard-wry.pro
+/src/main/java/ai/rclaw/app/Ipc.kt
+/src/main/java/ai/rclaw/app/Logger.kt
+/src/main/java/ai/rclaw/app/PermissionHelper.kt
+/src/main/java/ai/rclaw/app/Rust.kt
+/src/main/java/ai/rclaw/app/RustWebChromeClient.kt
+/src/main/java/ai/rclaw/app/RustWebView.kt
+/src/main/java/ai/rclaw/app/RustWebViewClient.kt
+/src/main/java/ai/rclaw/app/TauriActivity.kt
+/src/main/java/ai/rclaw/app/WryActivity.kt

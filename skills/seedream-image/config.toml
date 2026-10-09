@@ -1,0 +1,49 @@
+# Seedream 5.0 lite 图片生成 skill 的独立配置。
+#
+# 本 skill 不读取环境变量；请求参数只从本文件的 [seedream] 表读取。
+# API Key 集中在 skills/ark_key.toml（火山方舟系列共享），本文件不再存
+# api_key，残留的 api_key 会被脚本拒绝。
+
+[seedream]
+# 图片生成 API 的模型标识。5.0 lite 的等效别名还有
+# doubao-seedream-5-0-260128（官方文档两个 ID 均可调用）。
+model = "doubao-seedream-5-0-lite-260128"
+
+# 图片生成 API 完整接口地址（同步接口，非异步任务）。
+api_url = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+
+# 以下生成参数为默认值，命令行 --size/--output-format/--watermark 可覆盖。
+
+# 输出尺寸：分辨率档位 2K / 3K / 4K，或宽x高像素值（如 2848x1600，
+# 总像素须在 [2560x1440, 4096x4096] 区间，宽高比须在 [1/16, 16]）。
+# 用档位时，宽高比由模型根据提示词中的自然语言描述判断。
+size = "2K"
+
+# 输出图像格式：png / jpeg。
+output_format = "png"
+
+# 是否在图片右下角添加「AI 生成」水印。官方默认 true；这里默认关，
+# 命令行传 --watermark 可开启。
+watermark = false
+
+# 单张输入参考图的大小上限（字节）。API 允许 30MB，
+# 本地图片转 Base64 后会膨胀约 1/3，超过上限在请求前拒绝。
+max_input_image_bytes = 31457280
+
+# 输入参考图的最大张数（Seedream 5.0 lite 上限 14 张）。
+max_input_images = 14
+
+# 生成请求（单次 HTTP POST）的超时秒数。同步接口在高分辨率组图
+# （最多 15 张 4K）时耗时可达数分钟，因此给足余量。
+request_timeout_sec = 600
+
+# 下载单张结果图片的超时秒数。
+download_timeout_sec = 120
+
+# 下载单张图片允许接收的最大字节数（256 MiB），超过即中止，
+# 防止异常响应耗尽磁盘。
+max_download_bytes = 268435456
+
+# 生成与下载请求对 HTTP 429、连接级网络错误的额外重试次数。
+# 5xx 一律立即报错，避免重复计费。
+max_retries = 3

@@ -1,0 +1,469 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------------- */
+/* WebView 83 兼容补丁（vivo 等 Android 10 设备）。                          */
+/* preflight 的按钮重置用了 :where()（Chrome 88+）：83 解析失败会丢弃整条    */
+/* 规则，按钮露出 UA 默认灰底（rgb(221,221,221)），暗色主题下尤其刺眼。      */
+/* 这里用手写老式选择器补齐——桌面 preflight 本就生效，叠加同值规则无副作用。 */
+/* ---------------------------------------------------------------------- */
+button,
+input[type='button'],
+input[type='reset'],
+input[type='submit'] {
+  -webkit-appearance: button;
+  background-color: transparent;
+  background-image: none;
+}
+
+/* 点击聚焦的黄色描边：Chrome 83 无 :focus-visible 启发式（86+），每次点击
+   聚焦都画默认框。鼠标/触摸聚焦一律无框；桌面键盘 Tab 聚焦显示靛蓝环
+   （83 不识别 :focus-visible，该规则在安卓整条丢弃 = 触屏无框）。 */
+button:focus {
+  outline: none;
+}
+button:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}
+
+/* Android 触摸高亮：按下时的半透明大色块与圆角按钮不对齐且残留，全局关闭。 */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* flex gap 不支持兜底（Chrome 84 才支持 flex 容器的 gap）：运行时探测失败时
+   html 挂 .no-flex-gap（见 polyfills.ts），按项目实际用到的 5 个档位用相邻
+   兄弟 margin 模拟；grid 容器（gap 原生可用）与纵向 flex-col 单独处理。
+   桌面探测通过不挂类，以下规则零匹配。 */
+.no-flex-gap .gap-0\.5:not(.grid) > * + * {
+  margin-left: 2px;
+}
+.no-flex-gap .gap-1:not(.grid) > * + * {
+  margin-left: 4px;
+}
+.no-flex-gap .gap-1\.5:not(.grid) > * + * {
+  margin-left: 6px;
+}
+.no-flex-gap .gap-2:not(.grid) > * + * {
+  margin-left: 8px;
+}
+.no-flex-gap .gap-2\.5:not(.grid) > * + * {
+  margin-left: 10px;
+}
+.no-flex-gap .gap-3:not(.grid) > * + * {
+  margin-left: 12px;
+}
+.no-flex-gap .flex-col.gap-1:not(.grid) > * + * {
+  margin-left: 0;
+  margin-top: 4px;
+}
+.no-flex-gap .flex-col.gap-1\.5:not(.grid) > * + * {
+  margin-left: 0;
+  margin-top: 6px;
+}
+.no-flex-gap .flex-col.gap-2:not(.grid) > * + * {
+  margin-left: 0;
+  margin-top: 8px;
+}
+.no-flex-gap .flex-col.gap-2\.5:not(.grid) > * + * {
+  margin-left: 0;
+  margin-top: 10px;
+}
+.no-flex-gap .flex-col.gap-3:not(.grid) > * + * {
+  margin-left: 0;
+  margin-top: 12px;
+}
+
+
+/* 深色主题基调：与 agent 的「无人值守常驻」气质一致。 */
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background-color: #0f1117;
+  color: #e5e7eb;
+  font-family:
+    "Segoe UI",
+    "Microsoft YaHei",
+    "PingFang SC",
+    system-ui,
+    sans-serif;
+  overflow: hidden;
+}
+
+/* 细滚动条（聊天流 / 面板） */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a2f3a;
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a4150;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 安卓 App：隐藏滚动条（触摸设备以惯性滚动为准，滚动条占宽度且在浅色
+   主题下突兀）。html.android-app 由 main.tsx 按 WebView UA 挂载，
+   桌面版不命中。 */
+html.android-app *::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+}
+html.android-app *::-webkit-scrollbar-thumb,
+html.android-app *::-webkit-scrollbar-track {
+  display: none !important;
+}
+
+/* 安卓 App：全应用禁用文本选择（输入框恢复）。长按统一弹应用内菜单
+   （引用/复制/多选），原生选择会在长按 ~400ms 时接管手势并对 touch 序列
+   发 cancel，把应用菜单的 450ms 计时器掐掉——表现为「长按文字永远弹不出
+   菜单，弹的是系统选择工具条」（图片卡无文本可选，所以一直正常）。
+   必须是 body 级而非只挂会话流：长按期间 WebView 补发的选择会命中刚挂载
+   的菜单遮罩，把菜单项文字选中、留下选择手柄。复制走菜单整条复制。 */
+html.android-app body {
+  -webkit-user-select: none;
+  user-select: none;
+}
+html.android-app input,
+html.android-app textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Markdown 正文（assistant 消息） */
+.md-body {
+  line-height: 1.65;
+  /* anywhere（而非 break-word）才参与 min-content 计算：长路径 / URL 在
+     flex 收缩列里不再把气泡撑出屏幕（顺带消除消息列表的横向溢出，它曾让
+     边缘滑动呼出侧栏的手势被误判为横向滚动区）。 */
+  overflow-wrap: anywhere;
+}
+.md-body p {
+  margin: 0.35em 0;
+}
+.md-body pre {
+  background: #161a22;
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+.md-body code {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 0.9em;
+}
+.md-body :not(pre) > code {
+  background: #1c212b;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.md-body ul,
+.md-body ol {
+  padding-left: 1.4em;
+  margin: 0.35em 0;
+}
+.md-body ul {
+  list-style: disc;
+}
+.md-body ol {
+  list-style: decimal;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  font-weight: 600;
+  margin: 0.6em 0 0.3em;
+}
+.md-body table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid #2a2f3a;
+  padding: 4px 10px;
+}
+.md-body a {
+  color: #818cf8;
+  text-decoration: underline;
+}
+.md-body blockquote {
+  border-left: 3px solid #3a4150;
+  padding-left: 10px;
+  color: #9ca3af;
+  margin: 0.4em 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* 浅色主题（html.theme-light）。                                            */
+/* 注：Tailwind 3.4 下文本工具类编译为字面量（TW4 才是 var(--color-*)），      */
+/*    所以变量翻转对文本无效——下方按类名逐个定向覆盖；变量段保留，供          */
+/*    未来升回 TW4 时自动接管。bg-[#…] 任意值两类主题都需要定向覆盖。          */
+/* ---------------------------------------------------------------------- */
+html.theme-light {
+  color-scheme: light;
+  /* 文本灰阶反转：dark 主题里数字越小越亮，浅色下深浅对调。 */
+  --color-gray-100: #111827;
+  --color-gray-200: #1f2937;
+  --color-gray-300: #374151;
+  --color-gray-400: #4b5563;
+  --color-gray-500: #6b7280;
+  --color-gray-600: #9ca3af;
+  /* 强调色文本在白底上加深一档，保证对比度。 */
+  --color-indigo-200: #4338ca;
+  --color-indigo-300: #4f46e5;
+  --color-red-300: #b91c1c;
+  --color-red-400: #dc2626;
+  --color-emerald-300: #047857;
+  --color-emerald-400: #059669;
+  --color-amber-300: #b45309;
+  --color-amber-400: #b45309;
+  --color-amber-500: #b45309;
+}
+
+html.theme-light,
+html.theme-light body,
+html.theme-light #root {
+  background-color: #f6f7f9;
+  /* 基础兜底文本色：无显式色类的裸文本在浅底下必须是深色。 */
+  color: #1f2937;
+}
+
+/* 任意值背景 / 边框（字面量编译）：面板、输入、悬停与选中态。 */
+.theme-light .bg-\[\#12151d\] {
+  background-color: #eceef2;
+}
+.theme-light .bg-\[\#141821\] {
+  background-color: #ffffff;
+}
+.theme-light .bg-\[\#161a22\] {
+  background-color: #f1f3f6;
+}
+.theme-light .bg-\[\#0f131b\] {
+  background-color: #f6f7f9;
+}
+.theme-light .bg-\[\#1a1f29\],
+.theme-light .hover\:bg-\[\#1a1f29\]:hover {
+  background-color: #e3e6eb;
+}
+.theme-light .bg-\[\#1a2030\] {
+  background-color: #e4e8fb;
+}
+/* 全屏工作层（工作区文档编辑器 / 拍照编辑页）随主题：dark 保持原深底，
+   浅色系换纸白——此前这两个字面量没有浅色覆盖，浅色主题下编辑器整页深底。 */
+.theme-light .bg-\[\#0f1117\],
+.theme-light .bg-\[\#0b0e14\] {
+  background-color: #f6f7f9;
+}
+/* 「回到底部」悬浮钮的半透明面板底：/90 透明度修饰符编译成独立类名，
+   不带透明度的覆盖匹配不到它，浅色主题下曾保持深底（看起来是黑块）。 */
+.theme-light .bg-\[\#1a2030\]\/90 {
+  background-color: #ffffffef;
+}
+.theme-light .border-\[\#2a2f3a\] {
+  border-color: #d8dce4;
+}
+.theme-light .border-\[\#3a4150\],
+.theme-light .hover\:border-\[\#3a4150\]:hover {
+  border-color: #c9cfda;
+}
+
+/* 双用途补丁：gray-200 变量已按文本色翻转，用户气泡背景保持浅灰。 */
+.theme-light .bg-gray-200 {
+  background-color: #e5e7eb;
+}
+
+/* 自绘样式随主题切换：Markdown 正文与滚动条。 */
+.theme-light .md-body pre {
+  background: #f1f3f6;
+  border-color: #d8dce4;
+}
+.theme-light .md-body :not(pre) > code {
+  background: #eceef3;
+}
+.theme-light .md-body th,
+.theme-light .md-body td {
+  border-color: #d8dce4;
+}
+.theme-light .md-body a {
+  color: #4f46e5;
+}
+.theme-light .md-body blockquote {
+  border-left-color: #c9cfda;
+  color: #6b7280;
+}
+.theme-light *::-webkit-scrollbar-thumb {
+  background: #c8cdd7;
+}
+.theme-light *::-webkit-scrollbar-thumb:hover {
+  background: #aab3c2;
+}
+
+/* 文本灰阶/强调色反转（Tailwind 3.4 字面量版；与上方变量同一套色值）。 */
+.theme-light .text-gray-100 {
+  color: #111827;
+}
+.theme-light .text-gray-200,
+.theme-light .hover\:text-gray-200:hover {
+  color: #1f2937;
+}
+.theme-light .text-gray-300,
+.theme-light .hover\:text-gray-300:hover {
+  color: #374151;
+}
+.theme-light .text-gray-400 {
+  color: #4b5563;
+}
+.theme-light .text-gray-500 {
+  color: #6b7280;
+}
+.theme-light .text-gray-600 {
+  color: #9ca3af;
+}
+.theme-light .text-indigo-100 {
+  color: #3730a3;
+}
+.theme-light .text-indigo-200,
+.theme-light .hover\:text-indigo-200:hover {
+  color: #4338ca;
+}
+.theme-light .text-indigo-300,
+.theme-light .hover\:text-indigo-300:hover {
+  color: #4f46e5;
+}
+.theme-light .text-indigo-400 {
+  color: #4f46e5;
+}
+.theme-light .text-red-300,
+.theme-light .hover\:text-red-300:hover {
+  color: #b91c1c;
+}
+.theme-light .text-red-400,
+.theme-light .hover\:text-red-400:hover {
+  color: #dc2626;
+}
+.theme-light .text-emerald-400 {
+  color: #059669;
+}
+.theme-light .text-emerald-300,
+.theme-light .hover\:text-emerald-300:hover {
+  color: #047857;
+}
+.theme-light .text-amber-300,
+.theme-light .hover\:text-amber-300:hover {
+  color: #b45309;
+}
+.theme-light .text-amber-400 {
+  color: #b45309;
+}
+.theme-light .text-amber-500 {
+  color: #b45309;
+}
+
+/* ===========================================================================
+   多主题背景层：聊天区（.chat-bg）、侧边栏（.sidebar-bg）、顶栏（.topbar-bg）。
+   只在对应主题类挂在 html 根时生效；默认 dark/light 不定义 → 维持原样。
+   双类选择器（.theme-x .chat-bg）特异性高于 Tailwind 单类背景，无需 !important。
+   =========================================================================== */
+
+/* 浅色系主题下侧边栏/顶栏的深色底换成浅色，避免粉色背景配深色面板。 */
+.theme-light .sidebar-bg,
+.theme-light .topbar-bg {
+  background: #ffffff;
+}
+
+/* ---- 浪漫星空（卡通风）：深蓝紫渐变天空 + 固定星点 + 大月亮光晕 ---- */
+.theme-starry .chat-bg {
+  background-image:
+    radial-gradient(circle 44px at 82% 12%, rgba(255, 236, 170, 0.95) 98%, transparent 100%),
+    radial-gradient(circle 58px at 82% 12%, rgba(255, 236, 170, 0.25) 99%, transparent 100%),
+    radial-gradient(2px 2px at 12% 18%, #fff8 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 28% 8%, #fff6 52%, transparent 53%),
+    radial-gradient(2px 2px at 44% 26%, #ffe9a86e 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 60% 12%, #fff7 52%, transparent 53%),
+    radial-gradient(2.5px 2.5px at 73% 32%, #fff9 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 88% 44%, #fff5 52%, transparent 53%),
+    radial-gradient(2px 2px at 8% 46%, #ffe9a866 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 20% 62%, #fff6 52%, transparent 53%),
+    radial-gradient(2px 2px at 38% 78%, #fff8 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 55% 58%, #ffe9a85e 52%, transparent 53%),
+    radial-gradient(2px 2px at 68% 84%, #fff7 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 84% 70%, #fff6 52%, transparent 53%),
+    radial-gradient(2.5px 2.5px at 94% 90%, #ffe9a866 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 6% 90%, #fff5 52%, transparent 53%),
+    linear-gradient(180deg, #0b1026 0%, #171040 55%, #2b1b55 100%);
+  background-attachment: fixed;
+}
+.theme-starry .sidebar-bg,
+.theme-starry .topbar-bg {
+  background-image:
+    radial-gradient(1.5px 1.5px at 30% 10%, #fff6 52%, transparent 53%),
+    radial-gradient(2px 2px at 70% 28%, #ffe9a85e 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 50% 52%, #fff5 52%, transparent 53%),
+    radial-gradient(2px 2px at 20% 78%, #fff6 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 80% 90%, #ffe9a852 52%, transparent 53%),
+    linear-gradient(180deg, #0a0e20 0%, #120e2e 100%);
+}
+
+/* ---- 森林之夜：幽绿渐变 + 萤光点 ---- */
+.theme-forest .chat-bg {
+  background-image:
+    radial-gradient(2px 2px at 18% 22%, #a7f3d06e 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 42% 46%, #a7f3d052 52%, transparent 53%),
+    radial-gradient(2px 2px at 66% 30%, #d9f99d4d 52%, transparent 53%),
+    radial-gradient(1.5px 1.5px at 82% 60%, #a7f3d040 52%, transparent 53%),
+    radial-gradient(2px 2px at 30% 74%, #d9f99d40 52%, transparent 53%),
+    linear-gradient(180deg, #0d1a13 0%, #12241a 55%, #17301f 100%);
+  background-attachment: fixed;
+}
+.theme-forest .sidebar-bg,
+.theme-forest .topbar-bg {
+  background-image: linear-gradient(180deg, #0b1811 0%, #102016 100%);
+}
+
+/* ---- 樱花粉：浅粉渐变 + 柔和花瓣点 ---- */
+.theme-light.theme-sakura .chat-bg {
+  background-image:
+    radial-gradient(circle 14px at 88% 10%, #fbcfe8 60%, #fbcfe800 61%),
+    radial-gradient(circle 10px at 8% 30%, #f9a8d4 60%, #f9a8d400 61%),
+    radial-gradient(circle 12px at 78% 52%, #fbcfe8 60%, #fbcfe800 61%),
+    radial-gradient(circle 9px at 22% 74%, #f9a8d4 60%, #f9a8d400 61%),
+    radial-gradient(circle 11px at 62% 90%, #fbcfe8 60%, #fbcfe800 61%),
+    linear-gradient(180deg, #fdf0f4 0%, #fce7f0 60%, #fbdcec 100%);
+  background-attachment: fixed;
+}
+.theme-light.theme-sakura .sidebar-bg,
+.theme-light.theme-sakura .topbar-bg {
+  background: #fff7fa;
+}
+/* 樱花浅底上侧边栏深色文字保底（theme-light 覆盖已把灰字调深，无需额外处理）。 */
+
+/* ---- 奶油暖阳：暖奶油渐变 + 阳光圆点 ---- */
+.theme-light.theme-cream .chat-bg {
+  background-image:
+    radial-gradient(circle 26px at 85% 8%, #fde68a 60%, #fde68a00 61%),
+    radial-gradient(circle 12px at 12% 26%, #fcd34d4d 60%, #fcd34d00 61%),
+    radial-gradient(circle 10px at 70% 44%, #fde68a66 60%, #fde68a00 61%),
+    radial-gradient(circle 13px at 30% 66%, #fcd34d40 60%, #fcd34d00 61%),
+    radial-gradient(circle 10px at 58% 86%, #fde68a59 60%, #fde68a00 61%),
+    linear-gradient(180deg, #faf3e6 0%, #f8ecd4 60%, #f6e4c4 100%);
+  background-attachment: fixed;
+}
+.theme-light.theme-cream .sidebar-bg,
+.theme-light.theme-cream .topbar-bg {
+  background: #fffaf0;
+}

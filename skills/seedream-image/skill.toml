@@ -1,0 +1,65 @@
+manifest_version = 1
+
+[skill]
+name = "seedream-image"
+
+[[entrypoints]]
+name = "generate-image"
+description = "调用火山方舟 Doubao Seedream 5.0 lite 同步图片生成接口：文生图、图生图编辑（增/删/替换/修改）、多图融合、参考图生图、组图（文/单图/多图生组图）与联网搜索，并把生成的图片下载到指定路径。"
+runtime = "python"
+script = "scripts/seedream_image_cli.py"
+timeout_ms = 1200000
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "完整、具体且不含密钥的提示词：文生图/参考图生图写画面描述（主体+行为+环境，可补风格、色彩、光影、构图）；图片编辑写明确的编辑指令与需保持不变的部分；要渲染的文字内容放在双引号中。建议不超过 300 个汉字。"
+required = true
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "save"
+type = "path"
+description = "生成图片的保存路径（workspace 内相对路径）；扩展名按实际格式规范化为 .png/.jpg，组图多张时自动加 _001.._NNN 序号。"
+required = true
+flag = "--save"
+
+[[entrypoints.arguments]]
+name = "image"
+type = "url_or_path_array"
+description = "参考图片，可传 1-14 张，每张为可公网访问的 http(s) URL 或本地文件路径（本地图片自动转 Base64）。单张不超过 30MB，支持 jpeg/png/webp/bmp/tiff/gif/heic/heif。不传为纯文生图；传 1 张为单图编辑/参考生图；传多张为多图融合或复合编辑。"
+flag = "--image"
+max_items = 14
+
+[[entrypoints.arguments]]
+name = "size"
+type = "string"
+description = "输出尺寸：分辨率档位 2K/3K/4K（宽高比由提示词描述决定，如「竖版海报」「16:9 横图」），或显式宽x高像素值（总像素须在 2560x1440 与 4096x4096 之间，宽高比须在 1/16 与 16 之间，如 2848x1600）。省略时使用配置默认值（当前 2K）。"
+flag = "--size"
+
+[[entrypoints.arguments]]
+name = "max_images"
+type = "integer"
+minimum = 1
+maximum = 15
+description = "组图模式：传入即在请求中开启 sequential_image_generation=auto，并把最多生成张数限制为 N（1-15）。组图适合分镜、漫画、成套品牌视觉、表情包等多图输出；参考图数量+生成数量不超过 15。"
+flag = "--max-images"
+
+[[entrypoints.arguments]]
+name = "web_search"
+type = "boolean"
+description = "传入 true 开启联网搜索工具：模型按提示词自主决定是否搜索互联网（天气、商品、新闻等），提升时效性但增加时延；实际搜索次数见结果 usage.tool_usage.web_search。"
+flag = "--web-search"
+
+[[entrypoints.arguments]]
+name = "output_format"
+type = "enum"
+values = ["png", "jpeg"]
+description = "输出图片文件格式 png/jpeg；省略时默认 png（config 可改）。"
+flag = "--output-format"
+
+[[entrypoints.arguments]]
+name = "watermark"
+type = "boolean"
+description = "传入 true 在图片右下角添加「AI 生成」水印；省略时使用配置默认值（当前为不加）。"
+flag = "--watermark"

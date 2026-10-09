@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">"RClaw"</string>
+    <string name="main_activity_title">"RClaw"</string>
+    <string name="runtime_channel">RClaw runtime</string>
+    <string name="runtime_running">RClaw 正在本机运行</string>
+    <string name="runtime_starting">RClaw 正在启动…</string>
+    <string name="runtime_restarting">运行时异常，将在 %1$d 秒后自动恢复…</string>
+    <string name="start_failed">启动失败：%1$s</string>
+    <string name="config_save_failed">无法保存运行状态</string>
+    <string name="stop">停止</string>
+    <string name="done_channel">任务完成</string>
+    <string name="turn_done_title">RClaw 任务完成</string>
+    <string name="fgs_subtype">Runs the user-configured local RClaw assistant and its embedded knowledge tools.</string>
+</resources>

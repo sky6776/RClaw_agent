@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.rclaw_desktop" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- 与前端顶栏 #12151d 同色：状态栏/导航栏融入应用，不再出现主题紫 -->
+        <item name="android:statusBarColor">#12151D</item>
+        <item name="android:navigationBarColor">#12151D</item>
+    </style>
+</resources>

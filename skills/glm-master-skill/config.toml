@@ -1,0 +1,156 @@
+# RClaw GLM skills 的共享模型配置。
+#
+# 除 glmv-stock-analyst 外，skills/ 下新增的 GLM skills 默认只从本文件读取
+# API 凭据和模型请求参数，不使用环境变量。填入真实 Key 后请勿公开、打印或提交本文件。
+#
+# 合并顺序：脚本先读取 [zhipu]，再按调用顺序合并模型 section 和任务 section；
+# 后读取的同名字段会覆盖前面的值。例如 Caption 使用
+# [zhipu] -> [glm5v] -> [caption]，所以 [caption] 可按需覆盖 [glm5v] 的字段。
+
+[zhipu]
+# 智谱开放平台 API Key。所有共享 skill 都用它生成 Authorization: Bearer 请求头；
+# 空字符串只允许配置检查或 dry-run，真正请求模型时会立即报错。
+api_key = ""
+
+# GLM-5V OpenAI 兼容 API 的基础地址。对话脚本会自动在末尾补
+# /chat/completions；GLM-OCR、GLM-Image 和本地文件解析使用各自的完整 api_url。
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+# 鉴权方式的兼容性保护项。当前脚本仅实现 Bearer 鉴权，因此必须保持为 "bearer"；
+# 修改为其它值不会切换鉴权协议，而会在加载配置时被拒绝。
+auth = "bearer"
+
+# 建立 TCP/TLS 连接时最多等待的秒数。GLM-5V 对话和本地文件解析请求使用此值；
+# 连接建立后等待响应数据使用 read_timeout_sec。
+connect_timeout_sec = 8
+
+# 已连接后等待下一段响应数据的最长秒数。流式对话中它是读取空闲超时，
+# 不是整次生成的总时长；本地文件解析也使用此值作为读取超时。
+read_timeout_sec = 300
+
+# 可重试错误发生后的“额外重试次数”。3 表示首次请求失败后最多再试 3 次，
+# 即总共最多 4 次；主要覆盖连接/读取中断、HTTP 408/429 和部分 5xx 响应。
+max_retries = 3
+
+[glm5v]
+# GLM-5V 请求体中的模型标识。Caption、文档写作、Prompt、简历、Grounding
+# 及通用多模态入口都会继承此值。
+model = "GLM-5V-Turbo"
+
+# 请求体中承载输出 token 上限的字段名。当前智谱兼容接口使用 "max_tokens"；
+# 此项用于集中适配字段名，不是 token 数值，通常不应修改。
+max_tokens_key = "max_tokens"
+
+# 单次回复允许生成的最大 token 数。128000 是 GLM-5V-Turbo 官方最大输出上限；
+# 它只是上限，不会强制生成到 128K。提高上限可能增加长任务的最坏延迟和费用。
+# 下方各 GLM-5V 任务 section 未覆盖此字段，因此全部继承 128000。
+max_tokens = 128000
+
+# 深度思考模式。脚本把它转换为 thinking = { type = "enabled" } 发送；
+# 当前流式调用与安全重试逻辑要求始终为 "enabled"，其它值会被配置校验拒绝。
+thinking = "enabled"
+
+# 是否请求 SSE 流式响应。必须保持 true；脚本会聚合最终正文、忽略思考过程，
+# 并能在流意外中断时丢弃不完整内容后按 max_retries 重试。
+stream = true
+
+# 通用多模态入口单次允许的图片总数。处理本地视频时也作为最多抽取帧数；
+# Grounding 本地视频抽帧同样读取此值。数值越大，输入 token 和处理时间通常越高。
+image_limit = 8
+
+# 通用多模态入口单次允许的文件或视频数量上限；本地视频另有“每次最多 1 个”限制。
+# 该字段不改变模型或文件解析服务自身的格式、大小限制。
+file_limit = 8
+
+# 多个本地文档经文件解析服务转成文本后，允许写入一次模型提示词的总字符上限。
+# 脚本会按本地文件数量平均分配额度并截断超出部分；远程 file_url 不走此截断流程。
+max_file_chars = 160000
+
+# 本地 DOC/DOCX/PPT/PPTX/XLS/XLSX/PDF 等文件上传解析时调用的完整同步接口地址。
+# 它只负责把本地二进制文档转成文本，不是 GLM-5V 对话接口。
+file_parser_url = "https://open.bigmodel.cn/api/paas/v4/files/parser/sync"
+
+# 发送给文件解析接口的 tool_type 表单字段，决定服务端采用的同步解析工具类型。
+# 当前脚本与智谱接口按 "prime-sync" 对接，除非接口规范变化否则不要修改。
+file_parser_tool_type = "prime-sync"
+
+# 发送给文件解析接口的 format_type 表单字段。"text" 表示返回可加入提示词的纯文本；
+# 改成其它格式前必须确认解析接口返回结构仍与脚本的 content 读取逻辑兼容。
+file_parser_format = "text"
+
+[caption]
+# Caption 专用采样温度，直接写入 GLM-5V 请求体。较高值通常让描述更多样，
+# 较低值通常更稳定；输出 token 上限继续继承 [glm5v].max_tokens。
+temperature = 0.8
+
+# Caption 专用 nucleus sampling 阈值，直接写入请求体并与 temperature 共同作用；
+# 较小值会把候选范围收得更窄。其它 GLM-5V skill 当前不发送此项。
+top_p = 0.6
+
+[doc_based_writing]
+# 基于文档写作的采样温度。0.3 偏向稳定、贴近材料的表述；
+# 此 section 未声明 max_tokens，所以继承 [glm5v] 的 128000。
+temperature = 0.3
+
+[prompt_gen]
+# 图片/视频提示词生成的采样温度。0.6 在稳定性和表达多样性之间取中间值；
+# 此 section 未声明 max_tokens，所以继承 [glm5v] 的 128000。
+temperature = 0.6
+
+[resume_screen]
+# 简历筛选与职位匹配的采样温度。0.3 用于减少评分和结论的随机波动；
+# 此 section 未声明 max_tokens，所以继承 [glm5v] 的 128000。
+temperature = 0.3
+
+[grounding]
+# Grounding 脚本必须加载此 section；当前没有任务特有生成参数，
+# 因而模型、thinking、stream、image_limit 和 max_tokens 全部继承 [glm5v]。
+
+[glm_ocr]
+# GLM-OCR layout parsing 的完整接口地址。所有 glmocr* 专用 skill 直接请求此地址，
+# 不会改用 [zhipu].base_url 下的 GLM-5V 对话接口。
+api_url = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
+
+# OCR 请求体中的专用模型标识。该模型独立于 [glm5v].model。
+model = "glm-ocr"
+
+# GLM-OCR 单次 HTTP 请求的超时秒数。当前 OCR 脚本把同一个值交给 requests，
+# 因此同时约束连接和读取等待，并覆盖 [zhipu].read_timeout_sec。
+read_timeout_sec = 60
+
+# GLM-OCR 的额外重试次数，覆盖 [zhipu].max_retries。3 表示总共最多尝试 4 次；
+# 网络异常、HTTP 429 和 5xx 会触发重试。
+max_retries = 3
+
+[glm_image]
+# GLM-Image 图片生成的完整接口地址，不经过 GLM-5V chat/completions。
+api_url = "https://open.bigmodel.cn/api/paas/v4/images/generations"
+
+# 图片生成请求体中的专用模型标识，独立于 [glm5v].model。
+model = "glm-image"
+
+# 生成图片的宽高，格式为 "宽x高"。当前 glm-image 校验要求宽高为 512~2048、
+# 均为 32 的倍数且总像素不超过 2^22；该值会直接写入生成请求。
+size = "1280x1280"
+
+# 图片质量参数，原样写入 GLM-Image 请求体。"hd" 表示使用当前配置的高清质量档；
+# 如需改值，应使用所选图片模型接口支持的 quality 枚举。
+quality = "hd"
+
+# 是否让 GLM-Image 在生成图片中加入水印。必须是 TOML 布尔值 true 或 false，
+# 脚本会原样作为 watermark_enabled 发送。
+watermark_enabled = true
+
+# 调用图片生成 API 时的单次请求超时秒数；超时后可按 max_retries 重试。
+request_timeout_sec = 120
+
+# 使用 --save 下载生成图片时的单次下载超时秒数；不保存到本地时此项不生效。
+download_timeout_sec = 60
+
+# 使用 --save 下载生成图片时允许接收的最大字节数。33554432 等于 32 MiB；
+# 超过上限会中止下载，防止异常响应耗尽 Termux 存储或内存。
+max_download_bytes = 33554432
+
+# GLM-Image API 的额外重试次数，覆盖 [zhipu].max_retries。429、5xx 和网络错误
+# 会触发重试；该值不控制结果图片 URL 的下载重试。
+max_retries = 3

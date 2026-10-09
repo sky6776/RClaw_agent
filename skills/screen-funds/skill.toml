@@ -1,0 +1,41 @@
+manifest_version = 1
+
+[skill]
+name = "screen-funds"
+
+[[entrypoints]]
+name = "screen-universe"
+description = "按可比同类和结构化配置筛选一份标准化境内公募基金全集。"
+runtime = "python"
+script = "scripts/screen_funds.py"
+
+[[entrypoints.arguments]]
+name = "universe_csv"
+type = "path"
+description = "标准化 UTF-8 基金全集 CSV。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "manifest"
+type = "path"
+description = "全集来源、字段口径和覆盖范围 manifest JSON。"
+required = true
+flag = "--manifest"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "config"
+type = "path"
+description = "筛选阈值、同类分组和排名配置 JSON。"
+required = true
+flag = "--config"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "任务目录内的筛选结果 JSON。"
+required = true
+flag = "--output"

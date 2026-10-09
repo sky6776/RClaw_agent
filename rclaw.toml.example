@@ -1,0 +1,559 @@
+# RClaw 配置
+
+[agent]
+# Agent 运行数据根目录。相对路径按启动 RClaw 时的当前工作目录解析。
+# RClaw 会在这里派生并维护：
+#   config/SOUL.md、config/USER.md
+#   memory/MEMORY.md、memory/daily/、memory/session_summaries/
+#   sessions/、skills/、cron.json、HEARTBEAT.md
+# 改这个值相当于切换一套独立的记忆、会话、技能和定时任务数据。
+base_dir = "agent"
+
+# 会话语义压缩开关。开启后，每个新 turn 加载历史前会先读取完整 session，
+# 并估算“完整请求压力”（system prompt + 工具 schema + 会话历史）。这个估算值
+# 超过 compression_threshold_tokens 时，RClaw 会：
+#   1. 先便宜剪掉较旧的大 tool result / tool_use input；
+#   2. 若仍超阈值，把中间旧历史交给 LLM 摘要；
+#   3. 用一条 CONTEXT COMPACTION 摘要消息 + 最近上下文重写 session；
+#   4. 同步把摘要写入 memory/session_summaries/ 供后续延续。
+# 关闭后不会做语义摘要，超过窗口时只按内置 max_history / max_history_bytes 做硬裁剪。
+session_compression = true
+
+# 首次语义压缩时原样保护会话开头的消息条数。默认 3，对齐 Hermes。
+# 这用于保留会话最初的任务框架、用户约束、身份/目标说明等“开场锚点”。
+# 保护只发生在还没有 CONTEXT COMPACTION 摘要的会话里；一旦历史中已有摘要，
+# 后续压缩会把这里视为 0，避免旧开头永久占住上下文。
+# 如果开头消息后面紧跟工具结果，运行时会把保护边界延过对应 tool_result，
+# 防止留下孤立工具结果；这属于协议配对保护，不代表普通文本消息会无限变大。
+compression_protect_first = 3
+
+# 压缩后原样保留的最近消息条数基线。默认 80。
+# 这里的“尾窗”指压缩后仍以原始消息形式保留下来的最近历史；尾窗之前的旧历史会被合成摘要。
+# 这个值不是硬性的“最终一定保留 N 条”，因为运行时还会叠加几条协议与连续性规则：
+#   - 至少保留 8 条，避免尾窗过短；这个下限也可用 compression_tail_min_floor 覆盖。
+#   - “最新真实 user 消息”必须留在尾窗：它代表当前活跃任务，不能被卷进摘要里。
+#   - “最新 assistant 消息”也必须留在尾窗：它代表上一条可见回复，避免后续对话丢失承接点。
+#   - 如果尾窗边界正好落在 tool_result 载体上，RClaw 会把边界往后挪，避免留下孤立 tool_result。
+#     tool_result 是工具调用返回值，必须和前面的 assistant tool_use 保持协议语义一致；
+#     边界处理的目标是“不要让模型看到没来由的工具结果”，通常会让尾窗少保留一些旧工具结果，
+#     而不是无条件变大。
+# 因此 compression_keep_recent 应理解为“近期原文保留目标”：锚点/最小下限可能让尾窗比该目标更大，
+# token 预算和 tool_result 边界处理也可能让它更小。
+compression_keep_recent = 80
+
+# 压缩摘要输出 token 的绝对上限，默认 12000，对齐 Hermes 的 _SUMMARY_TOKENS_CEILING。
+# 真正发给摘要 LLM 的 max_tokens 不是固定等于本值，而是按以下规则动态算：
+#   被压缩内容估算 token × 20%
+#   再受 min(context_length × 5%, compression_summary_max_tokens) 限制
+#   最低给 2000 token，最后乘 1.3 留结构化余量，并受 provider 自身 max_tokens 封顶。
+# 调大可让超长历史摘要更保真；调小可降成本，但更容易丢细节。
+compression_summary_max_tokens = 12000
+
+# 自动长期记忆。开启后，成功用户 turn 会计入后台 memory review 的 nudge 计数；
+# 达到 memory_review_nudge_interval 后才触发一次后台 review。
+# “成功 turn”指前台用户消息已经完成处理并写入会话历史；后台 review 是异步 best-effort，
+# 不会阻塞当前回复，也不会因为 review 失败而让本轮对话失败。
+# review 会读取当前 turn 已加载的会话历史（不再额外按条数截断），提炼稳定事实、用户偏好、可复用上下文。
+# 在 legacy JSON 路径下，它会追加到 memory/MEMORY.md，并可追加当天 daily note。
+# 在带工具路径下，它会使用 memory 工具，先 list 现有条目，再 add/replace/remove/batch，
+# 因此能去重、改写旧条目，也可以写 target=user 的 config/USER.md 用户画像。
+auto_memory = true
+
+# 自动自进化。开启后，后台 review 会从最近对话中提炼可复用的工作方式/技能改进。
+# 适合保存“以后遇到同类任务应该怎么做”的流程经验，而不是保存当前任务的一次性内容。
+# 当 auto_review_tooled 缺省时，auto_evolve=true 会自动启用带工具 review：
+# fork agent 可用 skills_list/read/skill_manage，在 read-before-write 与受保护技能约束下
+# 真实修改 agent/skills/。若显式 auto_review_tooled=false，则走 legacy JSON 路径，
+# 只把建议以 [自进化] 前缀写入 MEMORY.md，不直接改技能。
+auto_evolve = true
+
+# Skill Curator 使用 `.usage.json` 遥测做确定性生命周期维护：active -> stale -> archive。
+# 自动维护只会修改/归档 agent-owned Skill；repository/user-owned 与 pinned Skill 不会被碰。
+# 归档位于 skills/.archive，可通过 `/skills restore <name>` 恢复。
+skill_curator = true
+skill_curator_interval_hours = 168
+skill_stale_after_days = 30
+skill_archive_after_days = 90
+
+
+[llm]
+provider = "zhipu"
+stream = true
+max_tokens = 128000
+request_timeout_secs = 300      # 单次 LLM 请求总超时；深度投研长上下文建议不少于 300 秒
+max_tool_calls = 256
+
+[[llm.providers]]
+name = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-5.3-flash"
+context_length = 1000000             # glm-5.3-flash 原生多模态 1M 上下文；OpenAI 兼容接口不要写成 glm-5.3-flash[1m]；缺省按 128K 假设派生压缩 token 预算
+api_key = "your-zhipu-api-key"
+auth = "bearer"
+reasoning_field = "reasoning_content"
+max_tokens_key = "max_tokens"
+
+
+# ── web_search（可选）：多来源高可用搜索池 ────────────────────────────────────
+# 支持豆包 Custom、Tavily 多 Key、智谱 MCP、豆包 Global。请求按 order 顺序尝试；
+# 额度/鉴权错误会阻塞当前方式，连续临时故障会触发短时熔断，fallback=true 时自动切换。
+# `/search` 查看状态，`/search <方式>` 调整首选方式，
+# `/search dis|en <方式>` 可在额度耗尽时禁用/恢复单个方式。
+[web_search]
+enabled = true
+order = ["doubao-custom", "tavily", "zhipu", "doubao-global"] # 默认豆包 Custom 为主
+fallback = true
+read_top = 3                  # 搜索后最多补读前 N 条正文；0=只返回搜索摘要，上限 5
+max_results = 10              # web_search 最终结果上限
+total_timeout_secs = 25       # 整条搜索链的总超时
+circuit_failure_threshold = 3 # 连续临时故障达到该次数后熔断
+circuit_cooldown_secs = 60    # 临时熔断冷却时间
+
+# 豆包 Custom：适合包月额度作为默认主源。
+[web_search.doubao_custom]
+enabled = true
+api_key = "your-doubao-custom-api-key"
+# endpoint = "https://open.feedcoopapi.com/search_api/web_search"
+timeout_secs = 8
+max_results = 50
+
+# Tavily：支持多个 Key；鉴权、额度或限流失败时按数组顺序自动切换。
+[web_search.tavily]
+enabled = false
+api_keys = ["tvly-dev-your-tavily-key-1", "tvly-dev-your-tavily-key-2"]
+# base_url = "https://api.tavily.com"
+timeout_secs = 20
+max_results = 5
+search_depth = "basic"        # basic / advanced / fast / ultra-fast
+include_answer = false        # true 时请求 Tavily 返回聚合答案；false 仅返回搜索结果
+
+# 智谱 webSearchPrime + webReader MCP，共用一个 BigModel API Key。
+[web_search.zhipu]
+enabled = true
+api_key = "your-zhipu-api-key"
+# search_url = "https://open.bigmodel.cn/api/mcp/web_search_prime/mcp"
+# reader_url = "https://open.bigmodel.cn/api/mcp/web_reader/mcp"
+startup_timeout_secs = 10
+call_timeout_secs = 10
+
+# 豆包 Global：按量后付费，放在末位作为独立的最终兜底。
+[web_search.doubao_global]
+enabled = true
+api_key = "your-doubao-global-api-key"
+# endpoint = "https://open.feedcoopapi.com/search_api/global_search"
+timeout_secs = 8
+max_results = 20
+max_snippet_tokens = 1000
+
+
+[napcat]
+enabled = false                  # true 启用 NapCatQQ 通道（OneBot 11 over WebSocket）
+ws_url = "ws://127.0.0.1:3001"   # NapCat 的 WebSocket 地址（需以 ws:// 或 wss:// 开头，结尾 / 会自动补齐）
+access_token = "your-napcat-access-token"             # 与 NapCat 配置一致的 access_token；留空表示不鉴权（仅可信内网建议留空）
+# allow_from = ""               # 逗号分隔的允许用户 QQ；空=放行全部，支持 `*`
+# allow_groups = ""             # 逗号分隔的允许群号；空=放行全部群，支持 `*`
+# block_from = ""               # 逗号分隔的拉黑用户 QQ，优先级高于 allow_from，支持 `*`
+max_from = "123456"         # 逗号分隔的「max 权限」用户 QQ：这些 QQ 的私聊消息可让
+                               # read/write/edit/list/grep/shell 操作 agent 目录外任意路径；
+                               # 群消息始终受限。空=无人拥有 max 权限，支持 `*`
+group_response_mode = "at_only"   # 群消息响应模式：none(不响应) / at_only(仅@机器人时) / all(全部，默认)
+# heartbeat_interval_sec = 30   # 心跳探活间隔（秒）
+# reconnect_delay_sec = 5       # 重连基础退避（秒，指数翻倍上限 60）
+# 私聊 chat_id 形如 `user:<qq>`，群聊 `group:<群号>`。
+# 媒体：收到的图片/语音/视频/文件会下载到 agent/media/napcat/（路径自动注入，无需在此配置）；
+#   要把本地文件发给用户（如股票报告 HTML），用 write_file 写到 agent/media/out/ 后，
+#   在回复里写 `[:napcat-media type=file path=agent/media/out/report.html name=报告]` 标记即可（路径须在 media 沙箱内）。
+
+[weixin]
+enabled = false
+api_base = "https://ilinkai.weixin.qq.com"
+token = "your-ilink-bot-token"
+
+[cron]
+check_interval_sec = 60
+
+[heartbeat]
+interval_sec = 1800
+
+# ── 日志（[log]）──────────────────────────────────────────────────────────────
+# 控制日志等级与输出目标。console / file 两个开关互相独立：
+#   - console = true   输出到控制台（stdout）
+#   - file    = true   输出到文件（按日轮转，写入 dir/file_name.YYYY-MM-DD，单文件不无限增长）
+# 可「只控制台」「只文件」「两者都开」「两者都关」（都关 = 丢弃所有日志）。
+# console_level / file_level 各自独立（如控制台 debug、文件 info）；RUST_LOG 环境变量若设置则同时覆盖两者（运维临时调参）。
+# 整节缺省时 = 写文件 info、不输出到控制台（与下方显式默认一致）。
+[log]
+console_level = "info"    # 控制台日志等级：error / warn / info / debug / trace
+file_level = "info"       # 文件日志等级：error / warn / info / debug / trace
+console = false
+file = true
+# dir = ""                  # 日志文件目录（相对 CWD 或绝对路径；留空=agent/logs，与 config/skills 平级；file=true 时使用，不存在自动创建）
+# file_name = "rclaw.log"  # 日志文件名前缀，按日轮转为 <file_name>.YYYY-MM-DD
+
+
+[mcp]
+startup_timeout_secs = 20
+call_timeout_secs = 60
+auto_start = true
+
+[mcp.servers.gbrain]
+# 安卓 APK：gbrain 已进程内集成（rclaw-gbrain 直连，无 MCP 子进程），
+# 无需 command/args/cwd（写了也会被忽略）。数据路径同样不配：App 启动时
+# 自动归一化到应用私有目录 files/gbrain（brain.db/kb/artifacts/logs 在其下）。
+enabled = true
+auto_start = true
+startup_timeout_secs = 30
+call_timeout_secs = 120
+
+[mcp.servers.gbrain.env]
+# -----------------------------------------------------------------------------
+# 启动严格校验
+# -----------------------------------------------------------------------------
+# gbrain 启动时会校验本栏目里的配置。必选项缺失、空值、枚举非法、布尔/数字格式非法都会直接报错并终止启动。
+# 外部模型服务不再使用共享 API 密钥、共享基础 URL 或旧兼容别名；每个用途必须配置自己的 key/base URL/model。
+# embedding 已改用 GBRAIN_EMBEDDING_* 命名，不再使用 GBRAIN_OPENAI_*。
+
+# -----------------------------------------------------------------------------
+# Embedding 向量化配置
+# -----------------------------------------------------------------------------
+# embedding API 密钥，必填。只用于嵌入向量请求，不再作为其它 LLM 功能的共享密钥。
+GBRAIN_EMBEDDING_API_KEY = "your-zhipu-api-key"
+
+# embedding API 基础 URL，必填。实际请求路径为：GBRAIN_EMBEDDING_BASE_URL + /embeddings。
+# 必须是 http/https URL；不会回退到 OpenAI 默认地址。
+GBRAIN_EMBEDDING_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+
+# embedding 模型名称，必填。用于文档向量化、查询向量、语义搜索。
+GBRAIN_EMBEDDING_MODEL = "embedding-3"
+
+# embedding 向量维度，必填正整数。服务端返回维度不一致时，该批向量会被拒绝。
+GBRAIN_EMBEDDING_DIMENSIONS = "1536"
+
+# embedding 请求并发批次数，可选但这里显式配置。
+# 可选值：1..8 的整数。1 最稳；2..8 导入更快但更容易触发限流。
+GBRAIN_EMBEDDING_CONCURRENCY = "1"
+
+# -----------------------------------------------------------------------------
+# 查询扩展、查询改写、重排、增强 LLM 配置
+# -----------------------------------------------------------------------------
+# 查询扩展、查询改写、搜索重排、分块增强等聊天任务的 API 密钥，必填。
+# 不会回退到 embedding API 密钥。
+GBRAIN_EXPANSION_API_KEY = "your-zhipu-api-key"
+
+# 查询扩展相关聊天补全基础 URL，必填。实际请求路径通常为：GBRAIN_EXPANSION_BASE_URL + /chat/completions。
+GBRAIN_EXPANSION_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
+
+# 查询扩展相关聊天模型，必填。glm 开头模型会在源码中自动关闭 thinking，便于稳定输出结构化 JSON。
+GBRAIN_EXPANSION_MODEL = "glm-5.3-flash"
+
+# -----------------------------------------------------------------------------
+# LLM 引导分块配置
+# -----------------------------------------------------------------------------
+# LLM 分块器 API 密钥，必填。用于让模型识别普通脑页的自然章节边界。
+# 不会作为 RAPTOR 的回退密钥；RAPTOR 必须配置自己的密钥。
+GBRAIN_CHUNKER_API_KEY = "your-zhipu-api-key"
+
+# LLM 分块器聊天补全基础 URL，必填。实际请求路径通常为：GBRAIN_CHUNKER_BASE_URL + /chat/completions。
+GBRAIN_CHUNKER_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
+
+# LLM 分块器模型，必填。输出期望是 JSON 数组；glm 开头模型会自动关闭 thinking。
+GBRAIN_CHUNKER_MODEL = "glm-5.3-flash"
+
+# 普通脑页分块模式，未配置时默认 auto。
+# 可选值：
+# - auto：默认。非代码脑页优先尝试 LLM 引导分块；模型不可用、输出不适合或内容超限时回退递归分块。
+# - recursive：始终使用本地递归分块，不调用 LLM 分块器。
+# - llm：强制优先调用 LLM 分块器；失败时仍回退递归分块，避免页面没有 chunks。
+# 说明：该配置只影响 pages/chunks 的普通脑页分块；KB 文档仍使用 src/kb/splitter 自适应分块。
+GBRAIN_PAGE_CHUNKER_MODE = "auto"
+
+# -----------------------------------------------------------------------------
+# KB RAPTOR 摘要配置
+# -----------------------------------------------------------------------------
+# RAPTOR 递归摘要树 API 密钥，必填。
+# 不会从库级配置、EXPANSION、CHUNKER 或 EMBEDDING 配置回退。
+GBRAIN_KB_RAPTOR_API_KEY = "your-zhipu-api-key"
+
+# RAPTOR 摘要聊天补全基础 URL，必填。实际请求路径通常为：GBRAIN_KB_RAPTOR_BASE_URL + /chat/completions。
+GBRAIN_KB_RAPTOR_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
+
+# RAPTOR 摘要模型，必填。不会回退到 GBRAIN_EXPANSION_MODEL、GBRAIN_CHUNKER_MODEL 或默认模型。
+GBRAIN_KB_RAPTOR_MODEL = "glm-5.3-flash"
+
+# -----------------------------------------------------------------------------
+# 音频转录配置
+# -----------------------------------------------------------------------------
+# 音频转录提供方，必填。
+# 可选值：openai / groq。启动时会校验所选提供方对应的 key 和 base URL。
+GBRAIN_TRANSCRIPTION_PROVIDER = "openai"
+
+# Groq 提供方 API 密钥。GBRAIN_TRANSCRIPTION_PROVIDER="groq" 时必填；其它提供方时保留为显式备用配置。
+GBRAIN_TRANSCRIPTION_GROQ_API_KEY = "your-zhipu-api-key"
+
+# Groq 提供方基础 URL。实际请求会追加 /audio/transcriptions。必须是 http/https URL。
+GBRAIN_TRANSCRIPTION_GROQ_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+
+# OpenAI 兼容转录 API 密钥。GBRAIN_TRANSCRIPTION_PROVIDER="openai" 时必填。
+# 不会回退到 embedding API 密钥。
+GBRAIN_TRANSCRIPTION_OPENAI_API_KEY = "your-zhipu-api-key"
+
+# OpenAI 兼容转录基础 URL。实际请求会追加 /audio/transcriptions。不会回退到 embedding 基础 URL。
+GBRAIN_TRANSCRIPTION_OPENAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+
+# -----------------------------------------------------------------------------
+# 日志配置
+# -----------------------------------------------------------------------------
+# 是否写入日志文件，必填布尔值。可选值：true / false。
+GBRAIN_LOG_TO_FILE = "true"
+
+# 是否把日志输出到标准错误，必填布尔值。MCP stdio 服务建议 false，避免干扰 JSON-RPC 标准输出。
+GBRAIN_LOG_TO_CONSOLE = "false"
+
+# gbrain 默认日志级别，必填。可选值：trace / debug / info / warn / error。
+# trace 最详细；debug 适合调试；info 为常规运行；warn/error 更安静。
+GBRAIN_LOG_LEVEL = "trace"
+
+# 日志文件路径。GBRAIN_LOG_TO_FILE=true 时必填；实际文件名可能带日期后缀。
+# 安卓 APK：不配，App 归一化到应用私有目录 files/gbrain/logs/gbrain.log。
+
+# tracing 日志过滤规则，可选但这里显式配置。优先级高于 GBRAIN_LOG_LEVEL。
+# 可写简单级别如 trace/debug/info，也可写模块过滤规则，如 gbrain_core=debug,sqlx=warn。非法规则会导致启动失败。
+GBRAIN_RUST_LOG = "trace"
+
+# -----------------------------------------------------------------------------
+# 页面写入后的后处理配置
+# -----------------------------------------------------------------------------
+# 写入页面后是否自动抽取双链/引用关系，必填布尔值。可选值：true/false/1/0。
+GBRAIN_AUTO_LINK = "true"
+
+# 写入页面后是否自动抽取时间线条目，必填布尔值。可选值：true/false/1/0。
+GBRAIN_AUTO_TIMELINE = "true"
+
+# 写入后是否运行静态检查，必填布尔值。可选值：true/false/1/0。
+GBRAIN_POST_WRITE_LINT = "false"
+
+# -----------------------------------------------------------------------------
+# KB 子系统与后台任务配置
+# -----------------------------------------------------------------------------
+# 是否启用 KB 子系统，必填布尔值。可选值：true/false/1/0。
+GBRAIN_KB_ENABLED = "true"
+
+# KB 上传文件大小上限，单位 MiB，必填正整数。
+GBRAIN_KB_MAX_FILE_SIZE_MB = "128"
+
+# KB 允许处理的文件扩展名，必填非空逗号分隔列表。
+# 常见类型：pdf, docx, xlsx, csv, tsv, html, htm, txt, md, markdown, rst, json, xml, yaml, yml, toml, png, jpg, jpeg。
+GBRAIN_KB_ALLOWED_EXTENSIONS = "pdf,docx,xlsx,csv,tsv,html,htm,txt,md,markdown,rst,json,xml,yaml,yml,toml,png,jpg,jpeg"
+
+# 自定义 KB 存储根目录，必填。源码主要在清理安全检查中使用该根目录。
+# 安卓 APK：不配，App 归一化到应用私有目录 files/gbrain/kb。
+
+# 是否启用 KB 后台工作器，必填布尔值。用于异步处理导入、OCR、重嵌入等任务。
+GBRAIN_KB_WORKER_ENABLED = "true"
+
+# KB 后台工作器轮询间隔，单位秒，必填正整数。
+GBRAIN_KB_WORKER_POLL_INTERVAL = "30"
+
+# 是否启用自动维护，必填布尔值。gbrain serve 时会定期做维护任务，例如补嵌入、健康检查。
+GBRAIN_AUTOPILOT_ENABLED = "true"
+
+# 自动维护执行间隔，单位秒，必填整数且必须 >= 60；非法值不再自动修正。
+GBRAIN_AUTOPILOT_INTERVAL = "3600"
+
+# -----------------------------------------------------------------------------
+# 制品（Artifact）路由与存储配置
+# -----------------------------------------------------------------------------
+# 制品原件或附件存储目录，必填。
+# 安卓 APK：不配，App 归一化到应用私有目录 files/gbrain/artifacts。
+
+# 默认 KB 库 ID。可为空，表示不强制默认库；非空时必须是大于 0 的整数。
+GBRAIN_DEFAULT_KB_LIBRARY_ID = ""
+
+# 上传默认提升策略，必填。可选值：
+# - none：不提升到 KB 或候选，仅保留制品记录。
+# - shadow：生成影子页面或影子投影，用于后续审阅或检索。
+# - candidate：生成候选变更，需要后续审阅或应用。
+# - auto / auto-low-risk / auto_accept_low_risk：仅自动应用低风险候选。
+# - auto-apply / auto_apply / auto_all / auto-all / auto-apply-all：自动应用全部可应用候选。
+GBRAIN_UPLOAD_PROMOTION_POLICY = "auto-apply"
+
+# 制品默认意图，必填。可选值：
+# - memory：长期记忆；默认会写入 gbrain 页面，并可同步进入 KB。
+# - evidence：证据/资料型内容，更偏向作为检索证据。
+# - promote：进入提升/候选流程，用于从原始材料提炼结构化知识。
+GBRAIN_ARTIFACT_DEFAULT_INTENT = "memory"
+
+# artifact_put 需要 KB 收件箱但不存在时，是否自动创建收件箱库，必填布尔值。
+GBRAIN_ARTIFACT_AUTO_CREATE_INBOX_LIBRARY = "true"
+
+# memory 意图是否也写入 KB，必填布尔值。
+# - true：memory 同时写页面和 KB，便于语义检索。
+# - false：memory 只写 gbrain 页面，不进入 KB 文档处理流程。
+GBRAIN_ARTIFACT_MANUAL_MEMORY_TO_KB = "true"
+
+# -----------------------------------------------------------------------------
+# OCR 与 GLM-OCR 配置
+# -----------------------------------------------------------------------------
+# OCR 全局开关，必填布尔值。可选值：true/false/1/0。
+GBRAIN_OCR_ENABLED = "true"
+
+# OCR API 密钥。GBRAIN_OCR_ENABLED=true 时必填；不再兼容 ZHIPU_API_KEY 回退。
+GBRAIN_OCR_API_KEY = "your-zhipu-api-key"
+
+# OCR API URL。GBRAIN_OCR_ENABLED=true 时必填，必须是 http/https URL。
+GBRAIN_OCR_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/layout_parsing"
+
+# 是否允许使用 GBRAIN_OCR_BASE_URL 指定的 OCR URL，必填布尔值。
+# 当前设为 true，表示使用本文件显式配置的 URL；设为 false 时源码会固定官方 endpoint。
+GBRAIN_OCR_ALLOW_CUSTOM_BASE_URL = "true"
+
+# OCR 模型名。GBRAIN_OCR_ENABLED=true 时必填；不再兼容 GLMOCR_MODEL 回退。
+GBRAIN_OCR_MODEL = "glm-ocr"
+
+# OCR 后处理 profile，必填。该值不会发送给 GLM-OCR API，只影响 gbrain 在收到 OCR 结果后如何整理文本/Markdown。
+# 依赖 OCR 返回的 layout_details 版面块；建议 GBRAIN_OCR_ENABLE_LAYOUT=true。
+# 可选值：
+# - auto：推荐默认值。按 OCR 返回的版面块类型自动增强：
+#   * 表格块使用 table 处理，尽量保留 Markdown 表格结构；
+#   * 公式块使用 formula 处理，尽量保留 LaTeX/公式原文；
+#   * 普通文本、未知块按 general 处理。
+#   同一页里同时有表格和公式时，会分别按各自块类型处理，不需要手动二选一。
+# - general：通用文档模式。适合普通扫描件、正文型 PDF、图文混排文档；表格/公式只做基础保留。
+# - table：表格优先模式。适合报表、清单、台账、价格表、名单等表格密集内容；表格块会尽量输出 Markdown 表格。
+# - formula：公式优先模式。适合论文、教材、试卷、技术文档等公式密集内容；公式块会用 $$...$$ 形式保留。
+# - handwriting：手写场景模式。当前主要作为场景标识，文本整理不过度改写；识别质量主要由 OCR 模型决定。
+GBRAIN_OCR_PROFILE = "auto"
+
+# 是否请求 OCR 提供方返回版面细节，必填布尔值。不再兼容 GLMOCR_ENABLE_LAYOUT 回退。
+GBRAIN_OCR_ENABLE_LAYOUT = "true"
+
+# OCR 选择模式，必填。可选值：
+# - auto：先本地检测，只对空文本、低密度、图片/矢量/乱码等疑似页面 OCR。
+# - all_pages：强制所有页 OCR，成本更高但最彻底。
+GBRAIN_OCR_MODE = "auto"
+
+# PDF OCR 提交模式，必填。可选值：
+# - pdf_range：按页段/范围提交，更稳，便于控制页数和大小。
+# - pdf_first：优先整 PDF 提交，失败或受限时再走拆分逻辑。
+GBRAIN_OCR_SUBMIT_MODE = "pdf_range"
+
+# 低文本密度阈值，必填非负整数。页面文本字符数低于该值时可能被判定为 OCR 候选页。
+GBRAIN_OCR_TEXT_DENSITY_THRESHOLD = "50"
+
+# 旧版低密度比例阈值，必填数字且范围 0..=1；当前源码注释为已废弃，保留用于兼容旧配置结构。
+GBRAIN_OCR_MIN_LOW_DENSITY_RATIO = "0.5"
+
+# 图片面积占比阈值，必填数字且范围 0..=1。页面图片区域比例超过该值时可能触发 OCR。
+GBRAIN_OCR_IMAGE_AREA_THRESHOLD = "0.08"
+
+# 页面嵌入图片数量阈值，必填正整数。达到该数量时可能触发 OCR。
+GBRAIN_OCR_IMAGE_COUNT_THRESHOLD = "1"
+
+# OCR 单页超时秒数，必填正整数。多页请求会按页数放大总超时；不再兼容 GLM_OCR_TIMEOUT/GLMOCR_TIMEOUT 回退。
+GBRAIN_OCR_TIMEOUT_SECONDS_PER_PAGE = "60"
+
+# 单次 OCR 请求最多包含多少页，必填正整数。
+GBRAIN_OCR_MAX_PAGES_PER_REQUEST = "5"
+
+# 单次 OCR 请求最大 PDF 字节数，必填正整数。52428800 = 50 MiB。
+GBRAIN_OCR_MAX_PDF_BYTES_PER_REQUEST = "52428800"
+
+# 单文档最多尝试 OCR 的页数，必填正整数；0 不再自动修正。
+GBRAIN_OCR_MAX_PAGES_PER_DOCUMENT = "300"
+
+# OCR 最大并发请求数，必填正整数；0 不再自动修正。
+GBRAIN_OCR_MAX_CONCURRENCY = "2"
+
+# OCR 拆分页临时文件的进程内总字节预算，必填正整数。536870912 = 512 MiB。
+GBRAIN_OCR_TEMP_DIR_MAX_BYTES = "536870912"
+
+# 是否要求 OCR 提供方返回裁剪图片，必填布尔值。开启会增加响应体大小和存储压力。
+GBRAIN_OCR_RETURN_CROP_IMAGES = "false"
+
+# 是否要求 OCR 提供方返回版面可视化结果，必填布尔值。通常调试 OCR 版面时才开启。
+GBRAIN_OCR_NEED_LAYOUT_VISUALIZATION = "false"
+
+# 是否同步内联执行 OCR，必填布尔值。
+# - false：默认异步任务，适合生产；上传/处理流程不会长时间阻塞。
+# - true：当前处理流程内直接 OCR，便于调试，但会拉长单次处理时间。
+GBRAIN_OCR_SYNC_INLINE = "false"
+
+# -----------------------------------------------------------------------------
+# 命令行、进度、运行时、搜索调优
+# -----------------------------------------------------------------------------
+# 进度输出模式。可选值：
+# - auto：自动选择，通常交互终端显示人类可读进度，非交互环境更安静。
+# - human：人类可读进度。
+# - json：每行输出 JSON 事件，适合集成脚本。
+# - quiet：不输出进度。
+GBRAIN_PROGRESS_MODE = "auto"
+
+# 强制 JSON 进度输出，可选值：true/false/1/0。GBRAIN_PROGRESS_MODE=json 时语义上已经是 JSON。
+GBRAIN_PROGRESS_JSON = "0"
+
+# 全局 Tokio 运行时工作线程数，必填正整数；源码实际最小使用值为 2。
+GBRAIN_ASYNC_WORKER_THREADS = "4"
+
+# 搜索调试日志开关，可选值：true/false/1/0。
+GBRAIN_SEARCH_DEBUG = "false"
+
+# 搜索硬排除 slug 前缀，逗号分隔。可为空；默认硬排除包含 test/、archive/、attachments/、.raw/。
+GBRAIN_SEARCH_EXCLUDE = ""
+
+# 搜索来源加权规则，逗号分隔，每项格式为“前缀:系数”。可为空；系数必须是非负有限数。示例：projects/:1.4,daily/:0.8。
+GBRAIN_SOURCE_BOOST = ""
+
+# ── ZCode 金融 MCP（headers 为占位符；真实令牌用 scripts/zcode_tokens.py --write 本地提取填入）──
+[mcp.servers.hexin-stock]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_hexin_stock"
+[mcp.servers.hexin-stock.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"
+
+[mcp.servers.hexin-index]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_hexin_index"
+[mcp.servers.hexin-index.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"
+
+[mcp.servers.finance-search]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_search"
+[mcp.servers.finance-search.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"
+
+[mcp.servers.wind-stock]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_wind_stock"
+[mcp.servers.wind-stock.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"
+
+[mcp.servers.wind-docs]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_wind_docs"
+[mcp.servers.wind-docs.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"
+
+[mcp.servers.wind-index]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_wind_index"
+[mcp.servers.wind-index.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"
+
+[mcp.servers.wind-economic]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_wind_economic"
+[mcp.servers.wind-economic.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"
+
+[mcp.servers.hexin-fund]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_hexin_fund"
+[mcp.servers.hexin-fund.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"
+
+[mcp.servers.wind-fund]
+url = "https://zcode.z.ai/api/v1/mcp/server/finance_wind_fund"
+[mcp.servers.wind-fund.headers]
+Authorization = "Bearer your-zcode-jwt-token"
+X-Bigmodel-Authorization = "Bearer your-zcode-bigmodel-token"

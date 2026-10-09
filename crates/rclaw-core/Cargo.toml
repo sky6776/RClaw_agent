@@ -1,0 +1,23 @@
+# =============================================================================
+# rclaw-core：领域内核（无 IO 假设）
+# -----------------------------------------------------------------------------
+# 定义 RClaw 全 crate 共享的规范化数据模型：
+#   - 消息与内容块（Role / ContentBlock / Message）
+#   - LLM 请求/响应（ChatRequest / ChatOutcome / FinishReason / ToolCall）
+#   - 工具描述（ToolSchema）
+#   - 通道间契约（BusMessage）
+#
+# 该 crate 故意不依赖任何 IO / 运行时库（仅 serde），
+# 使其可被任意宿主、测试、或非 Rust FFI 边界复用。
+# 领域内核：消息模型、总线契约、工具描述。
+# =============================================================================
+[package]
+name = "rclaw-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,11 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+include ':app'
+
+apply from: 'tauri.settings.gradle'

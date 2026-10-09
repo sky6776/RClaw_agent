@@ -1,0 +1,46 @@
+manifest_version = 1
+
+[skill]
+name = "glmv-doc-based-writing"
+
+[[entrypoints]]
+name = "write-from-documents"
+description = "使用专用 GLM-5V 写作协议，根据一组本地或远程文档和明确要求生成文本。"
+runtime = "python"
+script = "scripts/doc_based_writing.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "files"
+type = "url_or_path_array"
+description = "按顺序排列的本地文档路径或公开 HTTPS 地址。"
+required = true
+flag = "--files"
+repeat_flag = false
+must_exist = true
+max_items = 50
+
+[[entrypoints.arguments]]
+name = "requirements"
+type = "string"
+description = "完整的写作目标、结构、语气和输出约束。"
+required = true
+flag = "--requirements"
+
+[[entrypoints.arguments]]
+name = "system_prompt"
+type = "string"
+description = "可选的自定义系统角色说明。"
+flag = "--system-prompt"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 Markdown 或 JSON 输出文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 输出。"
+flag = "--pretty"

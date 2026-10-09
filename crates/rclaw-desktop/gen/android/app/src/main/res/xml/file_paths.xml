@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- 只暴露应用私有存储：FileProvider 的调用点（拍照 EXTRA_OUTPUT、openMedia、
+       主配置 rclaw.toml 复制到系统剪贴板）都在 files 下；不声明外部存储与
+       cache（纯放宽攻击面）。agent/ 单列保持旧条目名，files 根覆盖主配置。 -->
+  <files-path name="agent_media" path="agent/" />
+  <files-path name="config_root" path="." />
+</paths>

@@ -1,0 +1,42 @@
+# =============================================================================
+# rclaw-channels：通道抽象与具体通道
+# -----------------------------------------------------------------------------
+# Channel trait + OutboundDispatcher（按 msg.channel 名字路由）。
+# 内置通道：
+#   - console (cli)：stdin 读取 / stdout 输出（与流式输出协作）
+#   - weixin：iLink Bot 长轮询 getupdates + sendmessage（UTF-8 安全分段 + allowlist + 退避）
+# 通道通过 tokio::mpsc 与 agent loop 解耦（inbound/outbound 各一条）。
+# 通道层：消息总线接入与 outbound 分发。
+# =============================================================================
+[package]
+name = "rclaw-channels"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rclaw-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+base64 = "0.22"     # 仅 weixin 的 X-WECHAT-UIN 头需要
+rand = { workspace = true }
+rustyline = "18"     # console 通道：行编辑（方向键 / 行内编辑 / 历史），替代裸 read_line
+# ── 媒体收发（iLink CDN：AES-128-ECB + PKCS7 / MD5 / hex）─────────────────────
+aes = "0.8"            # AES-128 块加密（CDN 媒体加解密）
+cipher = "0.4"         # BlockEncrypt/BlockDecrypt/KeyInit trait
+generic-array = "0.14" # GenericArray（AES 的键/块容器）
+md-5 = "0.10"          # 上传时 rawfilemd5
+hex = "0.4"            # aeskey 十六进制编解码
+sha2 = "0.10"          # napcat Stream API 上传时计算 expected_sha256
+
+[dev-dependencies]
+tempfile = "3"

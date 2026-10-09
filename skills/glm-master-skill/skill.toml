@@ -1,0 +1,38 @@
+manifest_version = 1
+
+[skill]
+name = "glm-master-skill"
+
+[[entrypoints]]
+name = "publish-media"
+description = "把已生成的文件复制到 RClaw 媒体沙箱，并依据运行时注入的真实来源 channel 生成受校验的媒体标记。"
+runtime = "python"
+script = "scripts/publish_media.py"
+publishes_media = true
+
+[[entrypoints.arguments]]
+name = "path"
+type = "path"
+description = "需要投递的本地成品文件。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "media_type"
+type = "enum"
+description = "附件类型；不确定时使用 auto。"
+flag = "--type"
+values = ["auto", "file", "image", "video", "voice"]
+
+[[entrypoints.arguments]]
+name = "name"
+type = "string"
+description = "可选的收件人可见文件名。"
+flag = "--name"
+
+[[entrypoints.arguments]]
+name = "caption"
+type = "string"
+description = "可选的附件说明文字。"
+flag = "--caption"

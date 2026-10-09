@@ -1,0 +1,93 @@
+manifest_version = 1
+
+[skill]
+name = "glmv-pdf-to-ppt"
+
+[[entrypoints]]
+name = "render-pdf"
+description = "把本地 PDF 按指定 DPI 渲染为有序 PNG 页面，并输出页码到路径的 JSON 映射。"
+runtime = "python"
+script = "scripts/pdf_to_images.py"
+
+[[entrypoints.arguments]]
+name = "pdf_source"
+type = "path"
+description = "待渲染的本地 PDF。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "dpi"
+type = "integer"
+description = "渲染 DPI，允许 36 到 600。"
+flag = "--dpi"
+minimum = 36
+maximum = 600
+
+[[entrypoints.arguments]]
+name = "out_dir"
+type = "directory"
+description = "页面 PNG 输出目录。"
+required = true
+flag = "--out-dir"
+
+[[entrypoints]]
+name = "crop-image"
+description = "按 0 到 1000 归一化坐标裁剪一张页面图片，并返回裁剪结果路径。"
+runtime = "python"
+script = "scripts/crop.py"
+
+[[entrypoints.arguments]]
+name = "path"
+type = "path"
+description = "待裁剪的本地页面图片。"
+required = true
+flag = "--path"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "box"
+type = "integer_array"
+description = "按 x1、y1、x2、y2 排列的四个归一化坐标。"
+required = true
+flag = "--box"
+repeat_flag = false
+min_items = 4
+max_items = 4
+minimum = 0
+maximum = 1000
+
+[[entrypoints.arguments]]
+name = "out_dir"
+type = "directory"
+description = "裁剪 PNG 输出目录。"
+required = true
+flag = "--out-dir"
+
+[[entrypoints.arguments]]
+name = "name"
+type = "string"
+description = "可选的输出文件名主体。"
+flag = "--name"
+
+[[entrypoints]]
+name = "generate-presentation"
+description = "从已验证的 slides.json 生成可编辑的 PowerPoint 演示文稿。"
+runtime = "node"
+script = "scripts/generate_pptx.mjs"
+
+[[entrypoints.arguments]]
+name = "slides_json"
+type = "path"
+description = "符合演示文稿契约的 slides.json。"
+required = true
+flag = "--slides-json"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "任务目录内的 PPTX 输出文件。"
+required = true
+flag = "--output"

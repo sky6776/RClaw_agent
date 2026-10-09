@@ -1,0 +1,4 @@
+interface:
+  display_name: "黄金行情评估与操作计划"
+  short_description: "用人民币评估国内黄金行情，生成交易触发与风险控制计划"
+  default_prompt: "使用 $analyze-gold-market 结合国际黄金与人民币市场，以人民币/克评估当前行情，并给出适合境内渠道的条件式操作计划。"

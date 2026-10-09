@@ -1,0 +1,31 @@
+manifest_version = 1
+
+[skill]
+name = "glmocr-sdk"
+
+[[entrypoints]]
+name = "extract-batch"
+description = "通过 SDK 风格批处理包装器，依次使用共享 GLM-OCR 契约解析多份本地图片或 PDF。"
+runtime = "python"
+script = "scripts/glmocr_sdk_cli.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "files"
+type = "path_array"
+description = "按处理顺序排列的本地图片或 PDF 文件。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 UTF-8 JSON 输出文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 输出。"
+flag = "--pretty"

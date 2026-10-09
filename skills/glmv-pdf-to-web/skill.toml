@@ -1,0 +1,99 @@
+manifest_version = 1
+
+[skill]
+name = "glmv-pdf-to-web"
+
+[[entrypoints]]
+name = "render-pdf"
+description = "把本地 PDF 按指定 DPI 渲染为有序 PNG 页面，并输出页码到路径的 JSON 映射。"
+runtime = "python"
+script = "scripts/pdf_to_images.py"
+
+[[entrypoints.arguments]]
+name = "pdf_source"
+type = "path"
+description = "待渲染的本地 PDF。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "dpi"
+type = "integer"
+description = "渲染 DPI，允许 36 到 600。"
+flag = "--dpi"
+minimum = 36
+maximum = 600
+
+[[entrypoints.arguments]]
+name = "out_dir"
+type = "directory"
+description = "页面 PNG 输出目录。"
+required = true
+flag = "--out-dir"
+
+[[entrypoints]]
+name = "crop-image"
+description = "按 0 到 1000 归一化坐标裁剪一张页面图片，并返回裁剪结果路径。"
+runtime = "python"
+script = "scripts/crop.py"
+
+[[entrypoints.arguments]]
+name = "path"
+type = "path"
+description = "待裁剪的本地页面图片。"
+required = true
+flag = "--path"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "box"
+type = "integer_array"
+description = "按 x1、y1、x2、y2 排列的四个归一化坐标。"
+required = true
+flag = "--box"
+repeat_flag = false
+min_items = 4
+max_items = 4
+minimum = 0
+maximum = 1000
+
+[[entrypoints.arguments]]
+name = "out_dir"
+type = "directory"
+description = "裁剪 PNG 输出目录。"
+required = true
+flag = "--out-dir"
+
+[[entrypoints.arguments]]
+name = "name"
+type = "string"
+description = "可选的输出文件名主体。"
+flag = "--name"
+
+[[entrypoints]]
+name = "generate-website"
+description = "保存已经生成并校验的学术项目网站 HTML。"
+runtime = "python"
+script = "scripts/generate_web.py"
+
+[[entrypoints.arguments]]
+name = "html_file"
+type = "path"
+description = "待保存的完整 HTML 源文件。"
+required = true
+flag = "--html-file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "title"
+type = "string"
+description = "论文或项目标题。"
+flag = "--title"
+
+[[entrypoints.arguments]]
+name = "out_dir"
+type = "directory"
+description = "网站成品输出目录。"
+required = true
+flag = "--out-dir"

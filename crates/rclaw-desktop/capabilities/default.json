@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "RClaw 桌面主窗口默认能力（核心事件 / 调用自身命令）。",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

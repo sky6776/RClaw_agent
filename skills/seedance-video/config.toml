@@ -1,0 +1,71 @@
+# Seedance 2.5 视频生成 skill 的独立配置。
+#
+# 本 skill 不读取环境变量；请求参数只从本文件的 [seedance] 表读取。
+# API Key 集中在 skills/ark_key.toml（火山方舟系列共享），
+# 本文件不再存 api_key，残留的 api_key 会被脚本拒绝。
+
+[seedance]
+# 视频生成 API 的模型标识（Seedance 2.5）。
+model = "doubao-seedance-2-5-260628"
+
+# 创建视频生成任务（异步）的完整接口地址。
+submit_url = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+
+# 任务查询/取消地址模板，{task_id} 会被替换为创建任务返回的任务 ID。
+task_url_template = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/{task_id}"
+
+# 以下生成参数为默认值，命令行同名参数可覆盖。
+
+# 分辨率档位：480p / 720p / 1080p（1080p 为 10bit H.265）。
+resolution = "720p"
+
+# 宽高比：16:9 / 4:3 / 1:1 / 3:4 / 9:16 / 21:9 / adaptive。
+# 视频编辑、视频延长、首帧/首尾帧任务固定 adaptive（脚本会自动锁定）。
+ratio = "adaptive"
+
+# 时长（秒）：-1 表示由模型智能选择；显式取值须在 [4, 30]。
+# 视频编辑任务固定 -1（输出时长对齐待编辑视频）。
+duration = -1
+
+# 是否生成与画面同步的声音。官方默认 true；--mute 可关闭。
+generate_audio = true
+
+# 是否在右下角添加「AI 生成」水印。官方默认 false。
+watermark = false
+
+# 输出格式：mp4（通用）/ mov（专业高色彩精度，适合编辑延长场景二次加工）。
+output_format = "mp4"
+
+# 提交/查询单次 HTTP 请求的超时秒数。
+request_timeout_sec = 60
+
+# 下载结果视频的超时秒数；1080p 长视频文件更大，因此长于请求超时。
+download_timeout_sec = 300
+
+# 下载视频允许接收的最大字节数（512 MiB）。
+max_download_bytes = 536870912
+
+# 单张输入图片的大小上限（字节，API 限制 30MB；本地图片转 Base64 后
+# 请求体总大小不能超过 64MB，由脚本合计校验）。
+max_input_image_bytes = 31457280
+
+# 单段输入音频的大小上限（字节，API 限制 15MB）。
+max_input_audio_bytes = 15728640
+
+# Base64 请求体总大小上限（字节，官方限制 64MB，留少量余量）。
+max_request_body_bytes = 62914560
+
+# 输入素材数量上限（图片 30 + 视频 10 + 音频 10，总计 50）。
+max_images = 30
+max_videos = 10
+max_audios = 10
+
+# 轮询任务状态的间隔秒数（查询接口账号级 QPS 上限 20，5 秒间隔安全）。
+poll_interval_sec = 5
+
+# 从提交成功起轮询结果的最长等待秒数。30 秒 1080p 任务高负载时
+# 可达十余分钟；1500 秒（25 分钟）与入口 30 分钟超时保持预算一致。
+poll_timeout_sec = 1500
+
+# 提交与查询请求对 HTTP 429、连接级网络错误的额外重试次数。
+max_retries = 3

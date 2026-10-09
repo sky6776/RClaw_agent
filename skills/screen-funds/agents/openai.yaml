@@ -1,0 +1,4 @@
+interface:
+  display_name: "国内基金全市场筛选"
+  short_description: "国内公募基金全市场建池、分类筛选、审计复核与候选交接"
+  default_prompt: "使用 $screen-funds 从国内公募基金全市场构建可审计候选池，并分类筛选值得深入研究的基金。"

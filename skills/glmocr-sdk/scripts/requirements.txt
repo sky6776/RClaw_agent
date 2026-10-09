@@ -1,0 +1,2 @@
+# Core fallback dependency. Install the optional glmocr SDK separately on non-Termux hosts.
+requests>=2.31,<3

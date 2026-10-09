@@ -1,0 +1,18 @@
+manifest_version = 1
+
+[skill]
+name = "glm-quota-query"
+
+[[entrypoints]]
+name = "quota"
+description = "查询智谱 GLM Coding Plan 编码套餐额度：5小时/每周 Token 窗口已用百分比与重置时间、MCP 工具月度配额、套餐档位。"
+runtime = "platform_shell"
+script = "scripts/quota.sh"
+windows_script = "scripts/quota.ps1"
+timeout_ms = 60000
+
+[[entrypoints.arguments]]
+name = "model_usage"
+type = "boolean"
+description = "追加查询 24 小时内模型 Token 用量统计。"
+flag = "--model-usage"

@@ -1,0 +1,29 @@
+# =============================================================================
+# rclaw-llm：LLM Provider 抽象层（可扩展性核心）
+# -----------------------------------------------------------------------------
+# 两层抽象：
+#   1. 协议层 ChatProtocol：回答「怎么序列化/反序列化」
+#      - OpenAiCompat（一套实现覆盖 DeepSeek / 智谱兼容端点 / Kimi / ...）
+#   2. 身份层 ProviderConfig：回答「是谁、key、模型、协议、方言」
+# 高层 Provider trait 是 agent loop 唯一调用入口，完全屏蔽 wire format。
+# 各 provider 均通过配置接入，无需修改协议实现。
+# =============================================================================
+[package]
+name = "rclaw-llm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rclaw-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+bytes = { workspace = true }
+secrecy = { workspace = true }

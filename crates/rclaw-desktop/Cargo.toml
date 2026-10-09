@@ -1,0 +1,89 @@
+# =============================================================================
+# rclaw-desktop：Windows 桌面壳（Tauri 2 + React）。
+# -----------------------------------------------------------------------------
+# 复用 rclaw-cli 的 Config / bootstrap 装配；前端只经 command/event 与核心通信。
+# 构建顺序约束：ui/dist 必须先于 cargo build 生成（tauri 在编译期内嵌前端资源）：
+#   cd ui && npm install && npm run build && cargo build -p rclaw-desktop
+# Termux（target_os = "android" 且未开 apk-host）：不编译 tauri 壳相关依赖与
+# 桌面代码，只产出提示入口（见 src/lib.rs）；Android APK（--features apk-host）
+# 经 target-specific optional 依赖拉入 tauri 与 rclaw-android，产出单 .so。
+# =============================================================================
+
+[features]
+# 缺省空：Windows 桌面构建不需要任何 feature（tauri 在 not(android) 表非可选）。
+# apk-host 绝不进 default——否则 Termux 构建直接拉 tauri（D7，v1.7 review #3）。
+default = []
+# APK 宿主：tauri/android 表可选依赖 + rclaw-android(rlib) + jni。
+apk-host = ["dep:tauri", "dep:rclaw-android", "dep:rclaw-channels", "dep:jni"]
+[lib]
+name = "rclaw_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[package]
+name = "rclaw-desktop"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(not(target_os = "android"))'.build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+
+# APK 宿主（可选）：tauri 无托盘 feature；jni 供 android_host 导出符号。
+[target.'cfg(target_os = "android")'.dependencies]
+tauri = { version = "2", features = [], optional = true }
+rclaw-android = { path = "../rclaw-android", optional = true }
+rclaw-channels = { path = "../rclaw-channels", optional = true }
+jni = { version = "0.21", optional = true }
+
+# build script 在 APK 构建（--features apk-host）时也要跑 tauri-build 生成
+# tauri context / mobile cfg；Termux 构建会多编译一个宿主工具，不影响 -e normal 依赖图。
+[target.'cfg(target_os = "android")'.build-dependencies]
+tauri-build = { version = "2", features = [] }
+# 进程内存读取（状态面板）：仅在 Windows 路径用到；版本对齐依赖树已有条目，不引新包。
+# 后三个 feature 是状态条复制路径的 Win32 剪贴板 API（CF_UNICODETEXT 直写，
+# 规避 clip.exe 按控制台代码页解码导致非 ASCII 路径乱码）。
+[target.'cfg(all(not(target_os = "android"), windows))'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_Foundation",
+] }
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+percent-encoding = { workspace = true }
+chrono = { workspace = true }
+toml_edit = { workspace = true }
+tokio-util = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+rclaw-core = { workspace = true }
+rclaw-llm = { workspace = true }
+rclaw-runtime = { workspace = true }
+rclaw-store = { workspace = true }
+rclaw-tools = { workspace = true }
+rclaw-cli = { path = "../rclaw-cli" }
+# 检查更新（GitHub releases API）。外部链接打开：桌面走系统 shell，
+# Android 经 rclaw-android 的 JNI Intent（不用 opener 插件——其版本矩阵与
+# tauri-runtime/tauri-plugin 强耦合，曾致 JNI 面/Kotlin 类错配）。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# 会话消息导出 DOCX 打包（版本对齐 rclaw-gbrain 依赖树已有条目，不引新包族）。
+zip = "2"
+# 会话媒体预览图生成（长边缩到 1440 + JPEG 编码；版本对齐依赖树已有的 image 条目）。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# 预览缓存键（路径 + mtime + 大小）；版本对齐 rclaw-android 已有条目。
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

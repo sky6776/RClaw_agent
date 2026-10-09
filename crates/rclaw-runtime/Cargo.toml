@@ -1,0 +1,35 @@
+# =============================================================================
+# rclaw-runtime：编排层
+# -----------------------------------------------------------------------------
+# 把各能力组装成可运行的 agent：
+#   - context_builder：拼装系统提示（前言 + SOUL/USER + 记忆 + daily + skills）
+#   - AgentLoop：ReAct 工具调用循环（忠实实现全部正确性红线）
+#   - CronService / Heartbeat：作为 inbound 生产者
+#   - OutboundDispatcher：按 channel 名把回复路由回各通道
+# 编排层。
+# =============================================================================
+[package]
+name = "rclaw-runtime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rclaw-core = { workspace = true }
+rclaw-store = { workspace = true }
+rclaw-llm = { workspace = true }
+rclaw-tools = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+secrecy = { workspace = true }

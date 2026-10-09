@@ -1,0 +1,5 @@
+interface:
+  display_name: "GLM-5V Multimodal"
+  short_description: "使用 GLM-5V-Turbo 分析图片、视频与文档"
+  default_prompt: "使用 $glm5v-multimodal 分析这些媒体，并结合我的问题给出结论。"
+

@@ -1,0 +1,51 @@
+# =============================================================================
+# rclaw-tools：工具注册表与内置工具
+# -----------------------------------------------------------------------------
+# Tool trait + ToolRegistry。
+# 内置工具：read / write / edit / list / grep / shell / web_search /
+#           tavily_search / tavily_extract /
+#           cron_add / cron_list / cron_remove。
+# cron 工具通过注入的句柄操作 store 层的 cron 持久化。
+# 工具层。
+# =============================================================================
+[package]
+name = "rclaw-tools"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rclaw-core = { workspace = true }
+rclaw-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+# MCP stdio 客户端需要：oneshot/timeout/spawn_blocking（异步同步原语与时间）、sync::Mutex。
+# 工作区已开启 "full"，故直接复用 workspace 依赖（与 rclaw-runtime 一致）。
+tokio = { workspace = true }
+reqwest = { workspace = true }
+# grep 工具：进程内正则搜索（ripgrep 同源 regex 引擎）+ 目录遍历，跨平台无 C 依赖。
+regex = "1"
+walkdir = "2"
+# read 工具 PDF 透明路由（ADR-0003）：检测 PDF 类型 + 本地提取文本。
+# 绝不开 ocr feature——拉 PDFium/ONNX C 依赖，破坏 Termux。
+pdf-inspector = { workspace = true }
+
+# MCP stdio 子进程（Windows）：GUI 宿主下用 GetConsoleWindow 判定是否附着控制台，
+# 决定是否给控制台子进程加 CREATE_NO_WINDOW（版本对齐依赖树已有条目，不引新包）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+# 仅测试构造 PDF fixture 用（与 pdf-inspector 所用同主版本），不随产品发布。
+lopdf = "0.42"

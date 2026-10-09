@@ -1,0 +1,188 @@
+manifest_version = 1
+
+[skill]
+name = "seedance-video"
+
+[[entrypoints]]
+name = "generate-video"
+description = "调用火山方舟 Doubao Seedance 2.5 创建视频生成任务并轮询到完成后下载 MP4/MOV：文生视频（最长 30 秒）、首帧/首尾帧生视频、全模态参考生视频（图/视频/音频各参考其主体/风格/动作/音色）、视频编辑（替换主体/增删对象/局部重绘/音频编辑，可用时间戳）、视频延长（向前/向后）、样片模式两步出片。耗时通常 1-10 分钟。"
+runtime = "python"
+script = "scripts/seedance_video_cli.py"
+timeout_ms = 1800000
+fixed_args = ["generate"]
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "文本提示词：文生视频必填；参考/编辑/延长场景写明素材职责（@图片N/@视频N/@音频N 按上传顺序编号）与编辑/延长意图（编辑需含「编辑/增加/删除/修改/替换」类关键词，延长需含「向前/向后延长/延续/续写」）。中文建议 500 字内。与 draft_task_id 互斥。"
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "save"
+type = "path"
+description = "视频保存路径（workspace 内相对路径）；扩展名规范化为 .mp4/.mov。"
+required = true
+flag = "--save"
+
+[[entrypoints.arguments]]
+name = "image"
+type = "url_or_path_array"
+description = "全模态参考图片（role=reference_image），1-30 张，可传 http(s) URL、asset:// 素材ID 或本地路径（自动转 Base64）。与首帧/首尾帧模式互斥。"
+flag = "--image"
+max_items = 30
+
+[[entrypoints.arguments]]
+name = "first_frame"
+type = "url_or_path"
+description = "首帧图片（role=first_frame），单张。输出宽高比自动与首帧一致。"
+flag = "--first-frame"
+
+[[entrypoints.arguments]]
+name = "last_frame"
+type = "url_or_path"
+description = "尾帧图片（role=last_frame），必须与 first_frame 同时提供。"
+flag = "--last-frame"
+
+[[entrypoints.arguments]]
+name = "video"
+type = "url_or_path_array"
+description = "参考视频（role=reference_video），1-10 个，单个 2-30 秒（视频编辑任务的母版须 4-30 秒）、总时长 ≤30 秒。仅接受 http(s) URL 或 asset:// 素材ID（API 不支持视频 Base64，本地文件请先上传取 URL）。视频编辑/延长任务的母版视频从这里传入。"
+flag = "--video"
+max_items = 10
+
+[[entrypoints.arguments]]
+name = "audio"
+type = "url_or_path_array"
+description = "参考音频（role=reference_audio），1-10 段，单个 2-30 秒、总时长 ≤30 秒；支持 http(s) URL、asset:// 或本地 wav/mp3（自动转 Base64）。可单独传音频生成视频。"
+flag = "--audio"
+max_items = 10
+
+[[entrypoints.arguments]]
+name = "resolution"
+type = "enum"
+values = ["480p", "720p", "1080p"]
+description = "分辨率档位；省略用配置默认（当前 720p）。1080p 为 10bit H.265 编码。样片模式固定 480p；样片转正式固定 1080p。"
+flag = "--resolution"
+
+[[entrypoints.arguments]]
+name = "ratio"
+type = "enum"
+values = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"]
+description = "宽高比；省略用配置默认（当前 adaptive）。编辑/延长/首尾帧任务自动锁定 adaptive（脚本会自动调整并提示）。"
+flag = "--ratio"
+
+[[entrypoints.arguments]]
+name = "duration"
+type = "integer"
+minimum = -1
+maximum = 30
+description = "时长秒数：-1 为模型智能选择（默认），显式取值 4-30。视频编辑任务固定 -1。"
+flag = "--duration"
+
+[[entrypoints.arguments]]
+name = "task_type"
+type = "enum"
+values = ["auto", "reference", "edit", "extend"]
+description = "全模态任务类型引导（omni_reference_task_type）：auto 由模型按提示词判定；reference 参考生视频；edit 视频编辑（须有参考视频）；extend 视频延长（须有参考视频）。显式指定可把参数校验前置。"
+flag = "--task-type"
+
+[[entrypoints.arguments]]
+name = "mute"
+type = "boolean"
+description = "传入 true 生成无声视频；默认生成与画面同步的声音（台词建议放双引号内）。"
+flag = "--mute"
+
+[[entrypoints.arguments]]
+name = "watermark"
+type = "boolean"
+description = "传入 true 在视频右下角添加「AI 生成」水印；默认不加。"
+flag = "--watermark"
+
+[[entrypoints.arguments]]
+name = "output_format"
+type = "enum"
+values = ["mp4", "mov"]
+description = "输出格式：mp4 通用兼容；mov 高色彩精度，适合编辑/延长结果的二次专业加工。"
+flag = "--output-format"
+
+[[entrypoints.arguments]]
+name = "return_last_frame"
+type = "boolean"
+description = "传入 true 同时返回视频尾帧 JPEG（保存为 <文件名>_last_frame.jpg），可作为下一个任务的首帧实现多段连续生成。"
+flag = "--return-last-frame"
+
+[[entrypoints.arguments]]
+name = "draft"
+type = "boolean"
+description = "传入 true 开启样片模式：低成本生成 480p 预览确认镜头与意图，分辨率自动固定 480p；确认后用 draft_task_id 出 1080p 正式片。"
+flag = "--draft"
+
+[[entrypoints.arguments]]
+name = "draft_task_id"
+type = "string"
+description = "样片任务 ID：基于已确认的样片生成 1080p 正式视频。此时提示词/素材/比例/时长由模型自动复用，不可传入；仅可指定 output_format/watermark/return_last_frame 及任务管理参数。"
+flag = "--draft-task-id"
+
+[[entrypoints.arguments]]
+name = "web_search"
+type = "boolean"
+description = "传入 true 开启联网搜索工具：模型按提示词自主决定是否搜索互联网（天气、商品、时事等），提升视频时效性但增加时延；实际搜索次数见结果 usage.tool_usage.web_search。"
+flag = "--web-search"
+
+[[entrypoints.arguments]]
+name = "priority"
+type = "integer"
+minimum = 0
+maximum = 9
+description = "队列执行优先级 0-9，越大越先执行（同优先级 FIFO；仅影响排队顺序，不打断运行中任务）。省略为默认 0。"
+flag = "--priority"
+
+[[entrypoints.arguments]]
+name = "execution_expires_after"
+type = "integer"
+minimum = 3600
+maximum = 259200
+description = "任务超时阈值（秒）：排队/运行超过该时长任务自动终止并标记 expired。取值 [3600, 259200]，省略为默认 48 小时。"
+flag = "--execution-expires-after"
+
+[[entrypoints.arguments]]
+name = "safety_identifier"
+type = "string"
+description = "终端用户标识（不超过 64 字符，推荐传用户名/ID/邮箱的哈希），用于平台使用政策检测；多用户应用建议传入。"
+flag = "--safety-identifier"
+
+[[entrypoints]]
+name = "check-task"
+description = "查询视频生成任务状态与结果（7 天内任务）。轮询超时后可用它补查并下载视频。"
+runtime = "python"
+script = "scripts/seedance_video_cli.py"
+timeout_ms = 300000
+fixed_args = ["check"]
+
+[[entrypoints.arguments]]
+name = "task_id"
+type = "string"
+description = "创建任务时返回的任务 ID（cgt- 开头）。"
+required = true
+flag = "--task-id"
+
+[[entrypoints.arguments]]
+name = "save"
+type = "path"
+description = "可选：任务已成功时把视频下载到该路径。"
+flag = "--save"
+
+[[entrypoints]]
+name = "cancel-task"
+description = "取消排队中的视频生成任务，或删除已结束的任务记录，避免无谓等待与占用。"
+runtime = "python"
+script = "scripts/seedance_video_cli.py"
+timeout_ms = 120000
+fixed_args = ["cancel"]
+
+[[entrypoints.arguments]]
+name = "task_id"
+type = "string"
+description = "要取消或删除的任务 ID。"
+required = true
+flag = "--task-id"

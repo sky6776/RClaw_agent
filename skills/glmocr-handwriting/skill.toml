@@ -1,0 +1,59 @@
+manifest_version = 1
+
+[skill]
+name = "glmocr-handwriting"
+
+[[entrypoints]]
+name = "extract-handwriting"
+description = "使用手写内容专用 GLM-OCR 提取一份本地或远程图片、PDF 中的手写文本和版面信息。"
+runtime = "python"
+script = "scripts/glm_ocr_cli.py"
+timeout_ms = 1500000
+
+[entrypoints.constraints]
+exactly_one = [["file", "file_url"]]
+
+[[entrypoints.arguments]]
+name = "file"
+type = "path"
+description = "本地图片或 PDF 文件。"
+flag = "--file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "file_url"
+type = "string"
+description = "远程图片或 PDF 的 HTTPS 地址。"
+flag = "--file-url"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 JSON 结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 输出。"
+flag = "--pretty"
+
+[[entrypoints.arguments]]
+name = "include_raw"
+type = "boolean"
+description = "仅调试时附带完整上游响应。"
+flag = "--include-raw"
+
+[[entrypoints.arguments]]
+name = "start_page"
+type = "integer"
+description = "PDF 起始页，从 1 开始。"
+flag = "--start-page"
+minimum = 1
+
+[[entrypoints.arguments]]
+name = "end_page"
+type = "integer"
+description = "PDF 结束页，从 1 开始。"
+flag = "--end-page"
+minimum = 1

@@ -1,0 +1,40 @@
+# =============================================================================
+# rclaw-cli：顶层二进制（独立 console agent）
+# -----------------------------------------------------------------------------
+# 职责：
+#   - 加载配置（rclaw.toml > 默认）
+#   - 初始化 tracing
+#   - 装配 store / llm(provider) / tools / channels / runtime
+#   - 启动 agent（装配并常驻运行）
+# 启动流程详见 main.rs。
+# =============================================================================
+[package]
+name = "rclaw-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rclaw"
+path = "src/main.rs"
+
+[dependencies]
+rclaw-core = { workspace = true }
+rclaw-store = { workspace = true }
+rclaw-llm = { workspace = true }
+rclaw-tools = { workspace = true }
+rclaw-channels = { workspace = true }
+rclaw-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }   # 文件日志按本地日期轮转命名（已在依赖树中，不新增编译）
+tokio = { workspace = true }
+secrecy = { workspace = true }
+toml = "0.8"
+# url：用于 build_provider_config 的 base_url 启动期可解析性校验。
+# （reqwest 已传递依赖 url，故新增直接依赖不增加实际编译开销。）
+url = "2"

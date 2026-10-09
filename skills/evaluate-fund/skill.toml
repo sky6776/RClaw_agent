@@ -1,0 +1,201 @@
+manifest_version = 1
+
+[skill]
+name = "evaluate-fund"
+
+[[entrypoints]]
+name = "extract-evidence"
+description = "使用基金专用 GLM-5V 证据协议，从持仓截图、基金文档或基金图表中提取可审计的结构化事实。"
+runtime = "python"
+script = "scripts/glm5v_extract.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "任务输出目录内的 JSON 结果文件。"
+required = true
+position = 0
+
+[[entrypoints.arguments]]
+name = "images"
+type = "path_array"
+description = "按分析顺序排列的本地 JPG、JPEG 或 PNG 文件。"
+required = true
+position = 1
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "mode"
+type = "enum"
+description = "识别协议类型；持仓截图使用 portfolio-screenshot。"
+required = true
+flag = "--mode"
+values = ["portfolio-screenshot", "fund-document", "fund-chart"]
+
+[[entrypoints.arguments]]
+name = "context"
+type = "string"
+description = "不含密钥的简短基金名称、报告类型和已知日期。"
+flag = "--context"
+
+[[entrypoints.arguments]]
+name = "context_file"
+type = "path"
+description = "可选的 UTF-8 补充上下文文件。"
+flag = "--context-file"
+must_exist = true
+
+[[entrypoints]]
+name = "compare-funds"
+description = "从同一份总回报或复权净值 CSV 计算多只基金的共同区间风险收益、相关性和相对指标。"
+runtime = "python"
+script = "scripts/multi_fund_metrics.py"
+
+[[entrypoints.arguments]]
+name = "csv_path"
+type = "path"
+description = "包含日期和多只基金净值列的 UTF-8 CSV。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "fund_cols"
+type = "string_array"
+description = "至少两只待比较基金的净值列名。"
+required = true
+flag = "--fund-cols"
+repeat_flag = false
+min_items = 2
+
+[[entrypoints.arguments]]
+name = "date_col"
+type = "string"
+description = "日期列名；默认 date。"
+flag = "--date-col"
+
+[[entrypoints.arguments]]
+name = "benchmark_col"
+type = "string"
+description = "可选的共同基准净值列名；仅适用于基准相同的基金。"
+flag = "--benchmark-col"
+
+[[entrypoints.arguments]]
+name = "risk_free_rate"
+type = "number"
+description = "可核验的年化无风险利率小数；未知时省略。"
+flag = "--risk-free-rate"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "任务目录内的 JSON 输出文件。"
+required = true
+flag = "--output"
+
+[[entrypoints]]
+name = "analyze-portfolio"
+description = "聚合基金组合的穿透暴露、重叠、集中度和再平衡所需结构化指标。"
+runtime = "python"
+script = "scripts/portfolio_exposure.py"
+
+[[entrypoints.arguments]]
+name = "portfolio_json"
+type = "path"
+description = "符合基金组合输入契约的 JSON 文件。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "任务目录内的组合分析 JSON 输出文件。"
+required = true
+flag = "--output"
+
+[[entrypoints]]
+name = "calculate-fund-metrics"
+description = "从一只基金及其可选正式基准的总回报或复权净值 CSV 计算风险收益指标。"
+runtime = "python"
+script = "scripts/fund_metrics.py"
+
+[[entrypoints.arguments]]
+name = "csv_path"
+type = "path"
+description = "包含日期、基金和可选基准净值列的 UTF-8 CSV。"
+required = true
+position = 0
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "date_col"
+type = "string"
+description = "日期列名；默认 date。"
+flag = "--date-col"
+
+[[entrypoints.arguments]]
+name = "fund_col"
+type = "string"
+description = "基金净值列名；默认 fund。"
+flag = "--fund-col"
+
+[[entrypoints.arguments]]
+name = "benchmark_col"
+type = "string"
+description = "可选的正式基准净值列名。"
+flag = "--benchmark-col"
+
+[[entrypoints.arguments]]
+name = "risk_free_rate"
+type = "number"
+description = "可核验的年化无风险利率小数；未知时省略。"
+flag = "--risk-free-rate"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "任务目录内的 JSON 输出文件。"
+required = true
+flag = "--output"
+
+[[entrypoints]]
+name = "render-report"
+description = "把基金 Markdown 报告渲染为安全的自包含 HTML，并按真实来源 channel 处理附件标记。"
+runtime = "python"
+script = "scripts/md2html.py"
+publishes_media = true
+
+[[entrypoints.arguments]]
+name = "output_html"
+type = "path"
+description = "任务目录内的 HTML 输出文件。"
+required = true
+position = 0
+
+[[entrypoints.arguments]]
+name = "input"
+type = "path"
+description = "待渲染的 Markdown 报告。"
+required = true
+flag = "--input"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "title"
+type = "string"
+description = "HTML 文档标题。"
+flag = "--title"
+
+[[entrypoints.arguments]]
+name = "embed_images"
+type = "boolean"
+description = "把本地报告图片嵌入 HTML。"
+flag = "--embed-images"
+
+[[entrypoints.arguments]]
+name = "no_md"
+type = "boolean"
+description = "外部 channel 不同时发布 Markdown 附件。"
+flag = "--no-md"

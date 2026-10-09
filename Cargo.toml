@@ -1,0 +1,133 @@
+# =============================================================================
+# RClaw workspace 根清单
+# -----------------------------------------------------------------------------
+# RClaw：用 Rust 实现的 LLM agent 内核。
+# 采用单 workspace 多 crate 布局，按关注点拆分。
+#
+# 依赖方向（无环）：
+#   rclaw-cli ──► rclaw-runtime ──► { rclaw-core, rclaw-llm,
+#                                     rclaw-channels, rclaw-tools, rclaw-store }
+#   rclaw-llm / rclaw-channels / rclaw-tools / rclaw-store ──► rclaw-core
+#
+# 这样设计的好处（双入口理念）：
+#   - rclaw-core 是无 IO 假设的领域内核，可被任意宿主复用；
+#   - rclaw-runtime 是可嵌入的编排层；
+#   - rclaw-cli 是可独立运行的二进制（独立 console agent）。
+# =============================================================================
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/rclaw-core",
+    "crates/rclaw-store",
+    "crates/rclaw-llm",
+    "crates/rclaw-tools",
+    "crates/rclaw-gbrain",
+    "crates/rclaw-android",
+    "crates/rclaw-channels",
+    "crates/rclaw-runtime",
+    "crates/rclaw-cli",
+    "crates/rclaw-desktop",
+    "crates/rclaw-weixin-login",
+]
+# 缺省构建/测试集（无参 `cargo build` / `cargo test` / `cargo check`）= 桌面九 crate，
+# 与 Android APK 移植前的 workspace 完全一致（零回归约束 D7）：
+#   - rclaw-gbrain（约 3 万行 SQLite 知识库，仅 APK 进程内直连）与
+#   - rclaw-android（JNI 宿主 / Chaquopy 桥执行器，rlib）
+#   只经 rclaw-desktop 的 `apk-host` feature 链路被拉入 APK 构建，Termux 的
+#   `cargo build --profile release-termux` 依赖图不含二者。
+# 注意 `--workspace` 会覆盖本列表，把两个 APK 专属 crate 拉进 host 编译；
+# 门禁一律用无参命令（见 docs/android-port-implementation.md §4.1 / 附录 C）。
+default-members = [
+    "crates/rclaw-core",
+    "crates/rclaw-store",
+    "crates/rclaw-llm",
+    "crates/rclaw-tools",
+    "crates/rclaw-channels",
+    "crates/rclaw-runtime",
+    "crates/rclaw-cli",
+    "crates/rclaw-desktop",
+    "crates/rclaw-weixin-login",
+]
+
+# -----------------------------------------------------------------------------
+# workspace 级公共配置：所有 crate 共享同一套 edition / profile / 元信息。
+# -----------------------------------------------------------------------------
+[workspace.package]
+edition = "2021"        # 2021 edition 兼容性最广；避免 2024 edition 的 MSRV 门槛
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.91"
+
+[workspace.dependencies]
+# ---- 异步运行时 ----
+tokio = { version = "1", features = ["full"] }   # multi-thread runtime，驱动 agent loop / 通道 / SSE
+tokio-stream = "0.1"
+tokio-util = "0.7"                                # CancellationToken：活动 turn 的取消语义（/cancel 中断）
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] } # napcat 通道：OneBot 11 over WebSocket（rustls，无 OpenSSL 依赖）
+futures = "0.3"
+
+# ---- 序列化 ----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ---- HTTP（含 TLS 与 SSE 流）----
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+bytes = "1"
+
+# ---- 错误与日志 ----
+thiserror = "1"          # 库层结构化错误
+anyhow = "1"            # 二进制层错误聚合
+tracing = "0.1"         # 结构化日志（替代 printf 式 AGENT_LOG）
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ---- 配置 / 工具 ----
+async-trait = "0.1"     # async fn in trait（兼容老 MSRV；新版本可逐步切原生）
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+lunar-lite = "1.3.0"
+percent-encoding = "2"  # session 键、URL 编码（替代手写百分号编码）
+rand = "0.8"            # cron 8 位 hex id
+secrecy = "0.8"         # 包装 API key，防意外打印
+toml_edit = "0.23"      # rclaw.toml 注释保真写入（ADR-0002）
+toml = "0.9"            # bot 定义读写（agent/bots/*.toml，无注释保真需求）
+base64 = "0.22"         # weixin-login：生成 X-WECHAT-UIN（base64 编码随机 u32）
+sha2 = "0.10"           # 文件工具 optimistic concurrency 的 SHA-256 版本
+qrcode = "0.14"         # weixin-login：终端二维码渲染（纯 Rust，无 C 依赖）
+# read 工具 PDF 透明路由（ADR-0003）：检测 PDF 类型 + 本地提取文本。
+# 只用默认 features（纯 Rust）；绝不开 ocr feature——拉 PDFium/ONNX C 依赖，破坏 Termux。
+pdf-inspector = "1.17"
+
+# ---- 内部 crate 互引（用 workspace 相对路径）----
+rclaw-core     = { path = "crates/rclaw-core" }
+rclaw-store    = { path = "crates/rclaw-store" }
+rclaw-llm      = { path = "crates/rclaw-llm" }
+rclaw-tools    = { path = "crates/rclaw-tools" }
+rclaw-gbrain   = { path = "crates/rclaw-gbrain" }
+rclaw-android  = { path = "crates/rclaw-android" }
+rclaw-channels = { path = "crates/rclaw-channels" }
+rclaw-runtime  = { path = "crates/rclaw-runtime" }
+rclaw-cli      = { path = "crates/rclaw-cli" }
+
+# -----------------------------------------------------------------------------
+# 发布构建优化：依赖开启优化（流式 SSE 等热路径受益），自身保留调试信息便于排查。
+# -----------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Termux / Android 手机上内存较小时使用：
+#   cargo build --profile release-termux -j1
+#
+# 关闭 LTO、增加 codegen-units，并降低 build script / proc-macro 的优化等级，
+# 避免链接 lunar-lite 等 build script 时被 LLVM/clang OOM 杀掉。
+[profile.release-termux]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+
+[profile.release-termux.build-override]
+opt-level = 0
+codegen-units = 16
+debug = false

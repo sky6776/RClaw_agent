@@ -1,0 +1,74 @@
+manifest_version = 1
+
+[skill]
+name = "glmv-prompt-gen"
+
+[[entrypoints]]
+name = "prompt-from-images"
+description = "根据一组参考图片反推可用于图像或视频生成的详细提示词。"
+runtime = "python"
+script = "scripts/prompt_gen.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "images"
+type = "url_or_path_array"
+description = "按顺序排列的本地图片路径或公开 HTTPS 地址。"
+required = true
+flag = "--images"
+repeat_flag = false
+must_exist = true
+max_items = 50
+
+[[entrypoints.arguments]]
+name = "mode"
+type = "enum"
+description = "生成 image、video 或两者 auto 的提示词。"
+flag = "--mode"
+values = ["image", "video", "auto"]
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的提示词结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 错误输出。"
+flag = "--pretty"
+
+[[entrypoints]]
+name = "prompt-from-videos"
+description = "根据一组远程参考视频反推可用于视频生成的详细提示词。"
+runtime = "python"
+script = "scripts/prompt_gen.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "videos"
+type = "string_array"
+description = "按顺序排列的公开 HTTPS 视频地址。"
+required = true
+flag = "--videos"
+repeat_flag = false
+
+[[entrypoints.arguments]]
+name = "mode"
+type = "enum"
+description = "生成 video 或 auto 模式提示词。"
+flag = "--mode"
+values = ["video", "auto"]
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的提示词结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 错误输出。"
+flag = "--pretty"

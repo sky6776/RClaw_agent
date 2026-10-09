@@ -1,0 +1,11 @@
+# 火山方舟系列 skill（seedream-image / seedance-video / sd25-pe）共享的 API Key 配置。
+#
+# skill 脚本从本文件读取 api_key；各 skill 自己的 config.toml
+# 只存模型与请求参数，不再存 key（残留 api_key 会被脚本拒绝）。
+# 本文件入库时保持空值；填入真实 Key 后请勿公开、打印或提交。
+
+[ark]
+# 火山方舟 API Key（形如 ark-xxxx）。
+# 在 https://console.volcengine.com/ark 的「API Key 管理」页面创建。
+# 空字符串只允许配置检查，真正发起生成请求时会立即报错。
+api_key = ""

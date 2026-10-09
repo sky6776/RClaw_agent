@@ -1,0 +1,70 @@
+manifest_version = 1
+
+[skill]
+name = "happyhorse-r2v"
+
+[[entrypoints]]
+name = "generate-video"
+description = "调用阿里云百炼 HappyHorse-1.1-R2V 参考生视频模型：以 1-9 张参考图（主体/场景/风格）加提示词合成视频，prompt 中用 [Image 1]、[Image 2] 按顺序引用各图。提交异步任务并轮询到完成后把 MP4 下载到指定路径，耗时通常 1-5 分钟。"
+runtime = "python"
+script = "scripts/happyhorse_r2v_cli.py"
+timeout_ms = 1800000
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "视频内容描述，必填；用 [Image 1]、[Image 2] 等按 --image 传入顺序指代各参考图并写明运镜，如“[Image 1]中的女性展开[Image 2]中的折扇，镜头推近”。中文上限 2500 字符。"
+required = true
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "images"
+type = "url_or_path_array"
+description = "参考图列表，1-9 张，顺序即 prompt 中 [Image 1]、[Image 2] 的编号；每项为公网 HTTP(S) URL 或 workspace 内本地图片路径（jpg/jpeg/png/webp，短边 ≥400 像素，≤20MB）。"
+required = true
+flag = "--image"
+max_items = 9
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "save"
+type = "path"
+description = "生成的视频保存路径（workspace 内相对路径）；脚本会把扩展名规范化为 .mp4。"
+required = true
+flag = "--save"
+
+[[entrypoints.arguments]]
+name = "resolution"
+type = "enum"
+values = ["480P", "720P", "1080P"]
+description = "视频分辨率档位；省略时使用配置文件默认值。计费为 480P 0.45 元/秒、720P 0.9 元/秒、1080P 1.2 元/秒。"
+flag = "--resolution"
+
+[[entrypoints.arguments]]
+name = "ratio"
+type = "enum"
+values = ["16:9", "9:16", "1:1", "4:3", "3:4", "4:5", "5:4", "9:21", "21:9"]
+description = "画面比例，由参数显式指定（与 i2v 不同，不跟随参考图）；省略时使用配置文件默认值。"
+flag = "--ratio"
+
+[[entrypoints.arguments]]
+name = "duration"
+type = "integer"
+minimum = 3
+maximum = 15
+description = "视频时长秒数，3-15；省略时使用配置文件默认值。"
+flag = "--duration"
+
+[[entrypoints.arguments]]
+name = "watermark"
+type = "boolean"
+description = "传入 true 在视频右下角添加 \"Happy Horse\" 水印；省略时使用配置文件默认值（当前为不加）。"
+flag = "--watermark"
+
+[[entrypoints.arguments]]
+name = "seed"
+type = "integer"
+minimum = 0
+maximum = 2147483647
+description = "随机种子；固定种子可提升多次生成的可复现性。省略时由服务端随机。"
+flag = "--seed"

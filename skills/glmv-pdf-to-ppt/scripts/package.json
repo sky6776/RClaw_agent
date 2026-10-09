@@ -1,0 +1,8 @@
+{
+  "name": "rclaw-glmv-pdf-to-ppt",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "pptxgenjs": "^4.0.1"
+  }
+}

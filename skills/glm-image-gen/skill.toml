@@ -1,0 +1,31 @@
+manifest_version = 1
+
+[skill]
+name = "glm-image-gen"
+
+[[entrypoints]]
+name = "generate-image"
+description = "使用共享 TOML 配置调用 GLM-Image，并把生成图片保存到指定的任务路径。"
+runtime = "python"
+script = "scripts/glm_image_cli.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "完整、具体且不含密钥的图像生成提示词。"
+required = true
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "save"
+type = "path"
+description = "任务目录内的图片输出路径；脚本会按图片字节规范化扩展名。"
+required = true
+flag = "--save"
+
+[[entrypoints.arguments]]
+name = "user_id"
+type = "string"
+description = "可选的 6 到 128 字符终端用户标识，用于内容审核。"
+flag = "--user-id"

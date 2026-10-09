@@ -1,0 +1,33 @@
+[package]
+name = "rclaw-android"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+rclaw-core = { workspace = true }
+rclaw-store = { workspace = true }
+rclaw-llm = { workspace = true }
+rclaw-tools = { workspace = true }
+rclaw-gbrain = { workspace = true }
+rclaw-channels = { workspace = true }
+rclaw-runtime = { workspace = true }
+rclaw-cli = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+secrecy = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+jni = "0.21"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

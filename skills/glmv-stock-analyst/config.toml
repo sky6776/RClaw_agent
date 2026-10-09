@@ -1,0 +1,66 @@
+# glmv-stock-analyst 的独立配置。
+#
+# 股票分析 skill 不读取 glm-master-skill/config.toml，也不从环境变量读取模型或
+# Tushare 配置。填入真实凭据后请勿公开、打印或提交本文件。
+
+# GLM-5V OpenAI 兼容 API 的基础地址。glm5v_report.py 会自动在末尾补
+# /chat/completions；如果这里已经以该路径结尾则不会重复追加。
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+# GLM-5V-Turbo API Key。脚本仅从本文件读取，并用于 Authorization: Bearer 请求头；
+# 空字符串只允许 dry-run，真正生成报告时会立即报错。
+api_key = ""
+
+# 股票图表理解与报告生成请求体中的模型标识。
+model = "GLM-5V-Turbo"
+
+# 鉴权方式兼容性保护项。当前脚本只实现 Bearer 鉴权，必须保持为 "bearer"；
+# 修改为其它值不会切换鉴权协议，而会触发配置错误。
+auth = "bearer"
+
+# 请求体中承载输出 token 上限的字段名。当前智谱接口使用 "max_tokens"；
+# 此项是字段名而非 token 数值，通常不应修改。
+max_tokens_key = "max_tokens"
+
+# 建立 TCP/TLS 连接时最多等待的秒数；连接建立后的流式读取使用 timeout_sec。
+connect_timeout_sec = 8
+
+# 流式响应等待下一段数据的最长秒数，属于读取空闲超时而非整份报告的总时长。
+timeout_sec = 300
+
+# 单次尝试（含连接与整个流式读取）的墙钟上限秒数。思考模式下 GLM-5V-Turbo 对本
+# 技能的深度分析提示词会先输出数千行 reasoning 再写正文，健康的一次完整生成实测
+# 需要 10-25 分钟，因此该上限必须宽于最慢的正常生成，只用来掐死真正的死流。
+attempt_timeout_sec = 1500
+
+# 一次 generate-report 调用的总墙钟预算秒数（覆盖全部尝试与协议返工）。
+# 必须小于 skill.toml 的 timeout_ms（55 分钟），保证脚本先干净报错而非被强杀。
+total_timeout_sec = 3200
+
+# 可重试错误发生后的额外重试次数。3 表示首次失败后最多再试 3 次，
+# 即总共最多 4 次；超时、连接/流中断以及 HTTP 408/504 会触发重试。
+max_retries = 3
+
+# 单次报告回复允许生成的最大 token 数。128000 是 GLM-5V-Turbo 官方最大输出上限；
+# 它只设上限，不强制输出到该长度，长输出可能增加最坏延迟和费用。
+max_tokens = 128000
+
+# 深度思考模式。股票报告的流式读取和安全重试要求始终为 "enabled"；
+# 脚本会把它转换成 thinking = { type = "enabled" }，其它值会被拒绝。
+thinking = "enabled"
+
+# 是否使用 SSE 流式响应。必须保持 true；脚本聚合最终正文、忽略思考过程，
+# 并在流意外中断时丢弃不完整结果后按 max_retries 重试。
+stream = true
+
+# 单次报告最多发送给 GLM-5V 的本地股票图表数量。脚本按收集顺序截取到该上限；
+# 数值越大，图像输入 token、上传体积和处理时间通常越高。
+image_limit = 8
+
+# summary.json 和 data.json 各自写入提示词前允许保留的最大字符数；
+# 超出部分会被压缩/截断，以控制文本输入规模，不影响磁盘上的原始 JSON 文件。
+max_json_chars = 60000
+
+# 可选的 Tushare token，仅由 fetch_all.py 读取。为空时跳过 Tushare 数据源，
+# 其它可用行情来源和 GLM-5V 报告生成仍可继续；该值不是智谱 API Key。
+tushare_token = ""

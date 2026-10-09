@@ -1,0 +1,35 @@
+# =============================================================================
+# rclaw-store：文件系统持久化层
+# -----------------------------------------------------------------------------
+# 负责：
+#   - 初始化 agent 目录布局（agent/{config,memory,sessions,skills} + 关键文件）
+#   - 原子写（tmp + rename，从源头规避半条工具链）
+#   - session JSONL 读写（含历史裁剪、孤儿 tool_result 跳过、原子工具链追加）
+#   - 长期记忆 / daily notes
+#   - skills 摘要抽取
+#   - cron.json 持久化
+#   - 百分号编码的 session 键（channel + chat_id）
+# 依赖 rclaw-core 的消息模型。
+# =============================================================================
+[package]
+name = "rclaw-store"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rclaw-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+lunar-lite = { workspace = true }
+percent-encoding = { workspace = true }
+toml_edit = { workspace = true }
+toml = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

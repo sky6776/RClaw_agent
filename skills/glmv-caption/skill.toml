@@ -1,0 +1,106 @@
+manifest_version = 1
+
+[skill]
+name = "glmv-caption"
+
+[[entrypoints]]
+name = "caption-images"
+description = "使用专用 GLM-5V 描述协议为一组本地或远程图片生成说明。"
+runtime = "python"
+script = "scripts/glmv_caption.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "images"
+type = "url_or_path_array"
+description = "按顺序排列的本地图片路径或 HTTPS 地址。"
+required = true
+flag = "--images"
+repeat_flag = false
+must_exist = true
+max_items = 50
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "可选的自定义描述要求。"
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 JSON 结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 输出。"
+flag = "--pretty"
+
+[[entrypoints]]
+name = "caption-videos"
+description = "使用专用 GLM-5V 描述协议为一组远程视频生成视觉说明。"
+runtime = "python"
+script = "scripts/glmv_caption.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "videos"
+type = "string_array"
+description = "按顺序排列的公开 HTTPS 视频地址。"
+required = true
+flag = "--videos"
+repeat_flag = false
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "可选的自定义描述要求。"
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 JSON 结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 输出。"
+flag = "--pretty"
+
+[[entrypoints]]
+name = "caption-files"
+description = "使用专用 GLM-5V 描述协议为一组远程文档生成内容说明。"
+runtime = "python"
+script = "scripts/glmv_caption.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "files"
+type = "string_array"
+description = "按顺序排列的公开 HTTPS 文档地址。"
+required = true
+flag = "--files"
+repeat_flag = false
+max_items = 50
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "可选的自定义描述要求。"
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 JSON 结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 输出。"
+flag = "--pretty"

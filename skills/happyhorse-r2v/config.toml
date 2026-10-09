@@ -1,0 +1,55 @@
+# HappyHorse-1.1-R2V 参考生视频 skill 的独立配置。
+#
+# 本 skill 不依赖 glm-master-skill 的共享配置，也不读取环境变量；
+# 请求参数只从本文件的 [happyhorse] 表读取。API Key 集中在
+# skills/happyhorse_key.toml（系列共享），本文件不再存 api_key，
+# 残留的 api_key 会被脚本拒绝。
+
+[happyhorse]
+# 参考生视频请求体中的模型标识。同系列还有 happyhorse-1.0-r2v。
+model = "happyhorse-1.1-r2v"
+
+# 提交生成任务的完整接口地址。DashScope 原生异步 API 的经典域名，
+# 支持跨业务空间 Key；如需业务空间专属域名，可改为
+# https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis
+submit_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis"
+
+# 任务查询地址模板，{task_id} 会被替换为提交任务返回的任务 ID。
+task_url_template = "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
+
+# 以下生成参数为默认值，命令行 --resolution/--ratio/--duration/--watermark/--seed 可覆盖。
+# 分辨率档位：480P / 720P / 1080P。
+resolution = "480P"
+
+# 画面比例：16:9 / 9:16 / 1:1 / 4:3 / 3:4 / 4:5 / 5:4 / 9:21 / 21:9。
+# 与 i2v 不同，r2v 支持显式指定 ratio，不由参考图决定。
+ratio = "16:9"
+
+# 视频时长（秒），接口允许 3-15。
+duration = 5
+
+# 是否添加右下角 "Happy Horse" 水印。官方默认 true；这里默认关，
+# 命令行传 --watermark 可开启。
+watermark = false
+
+# 提交/查询单次 HTTP 请求的超时秒数。
+request_timeout_sec = 60
+
+# 下载结果视频的超时秒数；1080P 长视频文件更大，因此长于 request_timeout_sec。
+download_timeout_sec = 300
+
+# 下载视频时允许接收的最大字节数。268435456 等于 256 MiB；
+# 超过上限会中止下载，防止异常响应耗尽磁盘。
+max_download_bytes = 268435456
+
+# 轮询任务状态的间隔秒数。官方建议约 15 秒。
+poll_interval_sec = 15
+
+# 从提交成功起轮询结果的最长等待秒数。官方称任务通常 1-5 分钟完成；
+# 1500 秒（25 分钟）给高负载时段留足余量，并与入口 30 分钟超时、
+# 最长 5 分钟的视频下载共同保持总预算不越界。
+poll_timeout_sec = 1500
+
+# 提交与查询请求的额外重试次数。429 与 GET 轮询的 5xx/网络错误会重试；
+# POST 提交的 5xx 不重试——任务可能已创建，重试会重复计费。
+max_retries = 3

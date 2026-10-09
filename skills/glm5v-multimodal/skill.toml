@@ -1,0 +1,148 @@
+manifest_version = 1
+
+[skill]
+name = "glm5v-multimodal"
+
+[[entrypoints]]
+name = "analyze-images"
+description = "使用 GLM-5V-Turbo 对一组本地或远程图片执行通用视觉分析；精确 OCR 应改用 glmocr。"
+runtime = "python"
+script = "scripts/glm5v.py"
+timeout_ms = 1500000
+
+[entrypoints.constraints]
+at_least_one = [["prompt", "prompt_file"], ["images", "image_urls"]]
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "自包含的分析任务和输出要求。"
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "prompt_file"
+type = "path"
+description = "可选的 UTF-8 长提示词文件。"
+flag = "--prompt-file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "images"
+type = "path_array"
+description = "按顺序排列的本地图片路径。"
+flag = "--image"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "image_urls"
+type = "string_array"
+description = "按顺序排列的 HTTPS 图片地址。"
+flag = "--image-url"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 UTF-8 文本结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "dry_run"
+type = "boolean"
+description = "只校验输入并生成请求摘要，不调用 API。"
+flag = "--dry-run"
+
+[[entrypoints]]
+name = "analyze-videos"
+description = "使用 GLM-5V-Turbo 分析本地视频画面或远程视频；本地视频由脚本抽帧且不处理音频。"
+runtime = "python"
+script = "scripts/glm5v.py"
+timeout_ms = 1500000
+
+[entrypoints.constraints]
+at_least_one = [["prompt", "prompt_file"], ["videos", "video_urls"]]
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "自包含的分析任务和输出要求。"
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "prompt_file"
+type = "path"
+description = "可选的 UTF-8 长提示词文件。"
+flag = "--prompt-file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "videos"
+type = "path_array"
+description = "按顺序排列的本地视频路径。"
+flag = "--video"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "video_urls"
+type = "string_array"
+description = "按顺序排列的 HTTPS 视频地址。"
+flag = "--video-url"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 UTF-8 文本结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "dry_run"
+type = "boolean"
+description = "只校验输入并生成请求摘要，不调用 API。"
+flag = "--dry-run"
+
+[[entrypoints]]
+name = "analyze-files"
+description = "使用 GLM-5V-Turbo 对本地或远程 Office、PDF、表格和文本文件执行通用文档分析。"
+runtime = "python"
+script = "scripts/glm5v.py"
+timeout_ms = 1500000
+
+[entrypoints.constraints]
+at_least_one = [["prompt", "prompt_file"], ["files", "file_urls"]]
+
+[[entrypoints.arguments]]
+name = "prompt"
+type = "string"
+description = "自包含的分析任务和输出要求。"
+flag = "--prompt"
+
+[[entrypoints.arguments]]
+name = "prompt_file"
+type = "path"
+description = "可选的 UTF-8 长提示词文件。"
+flag = "--prompt-file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "files"
+type = "path_array"
+description = "按顺序排列的本地文档路径。"
+flag = "--file"
+must_exist = true
+
+[[entrypoints.arguments]]
+name = "file_urls"
+type = "string_array"
+description = "按顺序排列的 HTTPS 文档地址。"
+flag = "--file-url"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 UTF-8 文本结果文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "dry_run"
+type = "boolean"
+description = "只校验输入并生成请求摘要，不调用 API。"
+flag = "--dry-run"

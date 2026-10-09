@@ -1,0 +1,46 @@
+manifest_version = 1
+
+[skill]
+name = "glmv-resume-screen"
+
+[[entrypoints]]
+name = "screen-resumes"
+description = "使用专用 GLM-5V 招聘协议，根据明确条件筛选一组本地或远程简历。"
+runtime = "python"
+script = "scripts/resume_screen.py"
+timeout_ms = 1500000
+
+[[entrypoints.arguments]]
+name = "files"
+type = "url_or_path_array"
+description = "按顺序排列的本地简历路径或公开 HTTPS 地址。"
+required = true
+flag = "--files"
+repeat_flag = false
+must_exist = true
+max_items = 50
+
+[[entrypoints.arguments]]
+name = "criteria"
+type = "string"
+description = "完整、可审计且与岗位相关的筛选标准。"
+required = true
+flag = "--criteria"
+
+[[entrypoints.arguments]]
+name = "system_prompt"
+type = "string"
+description = "可选的自定义系统角色说明。"
+flag = "--system-prompt"
+
+[[entrypoints.arguments]]
+name = "output"
+type = "path"
+description = "可选的 Markdown 或 JSON 输出文件。"
+flag = "--output"
+
+[[entrypoints.arguments]]
+name = "pretty"
+type = "boolean"
+description = "格式化 JSON 输出。"
+flag = "--pretty"

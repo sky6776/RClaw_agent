@@ -1,0 +1,11 @@
+# HappyHorse 系列 skill（t2v / i2v / r2v）共享的 API Key 配置。
+#
+# 三个 skill 的脚本都从本文件读取 api_key；各 skill 自己的 config.toml
+# 只存模型与请求参数，不再存 key（残留 api_key 会被脚本拒绝）。
+# 填入真实 Key 后请勿公开、打印或提交本文件。
+
+[happyhorse]
+# 阿里云百炼 API Key（普通 sk- 与工作空间 sk-ws- Key 均可），
+# 对 happyhorse 全系列模型通用。空字符串只允许配置检查，
+# 真正提交生成任务时会立即报错。
+api_key = ""

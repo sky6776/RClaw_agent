@@ -1,0 +1,4 @@
+interface:
+  display_name: "国内基金与持仓评估"
+  short_description: "国内多基金比较、组合穿透、底层持仓研究与报告生成投递"
+  default_prompt: "使用 $evaluate-fund，评估这些国内基金和我的当前持仓，穿透组合暴露并生成可发送的报告。"

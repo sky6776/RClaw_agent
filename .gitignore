@@ -1,0 +1,50 @@
+
+# 构建产物
+/target/
+
+# 技能生成的媒体交付物（视频/图片等运行时产物，勿提交）
+/output/
+
+# 本地配置与密钥（勿提交）
+rclaw.toml
+
+# OMC 本地运行态（会话 / 回放 / 调度状态等，运行时生成，勿提交）
+.omc/
+
+# Claude/Codex 本地链接工作树（独立分支与构建产物，勿作为嵌套仓库提交）
+/.claude/worktrees/
+*.pyc
+
+# 桌面版前端：依赖与构建产物（tauri 编译期内嵌 dist，不入库）
+crates/rclaw-desktop/ui/node_modules/
+crates/rclaw-desktop/ui/dist/
+
+# Tauri Android 工程（v2 新基座）：源码提交，构建产物与本地配置忽略。
+crates/rclaw-desktop/gen/schemas/
+crates/rclaw-desktop/gen/android/**/build/
+crates/rclaw-desktop/gen/android/**/.gradle/
+crates/rclaw-desktop/gen/android/local.properties
+crates/rclaw-desktop/gen/android/.idea/
+crates/rclaw-desktop/gen/android/**/*.keystore
+crates/rclaw-desktop/gen/android/app/tauri.properties
+# tauri 构建链往 jniLibs 放 .so 符号链接（Windows 非开发者模式需手工复制）；产物不入库
+crates/rclaw-desktop/gen/android/app/src/main/jniLibs/
+crates/rclaw-desktop/gen/android/.kotlin/
+
+# 自进化产物（agent 在部署侧自建/修改的技能与参考文档）属运行时数据，不入库；
+# 部署目录 ~/.rclaw/agent/skills/ 才是它们的家。以下为已知的手机端自进化内容。
+skills/image-to-md-transcription/
+skills/report-audit-preflight/
+skills/finance-data-tooling-pitfalls/
+skills/ai-berkshire/references/
+# FinMind API token 等本机凭据（twstock 工具按需读取，只存本机）
+skills/ai-berkshire/local/
+skills/glm-image-gen/references/
+crates/rclaw-desktop/gen/android/app/rclaw-release.keystore
+
+# whisper.cpp 上游克隆与构建产物（scripts/build-whisper.bat 首次自动拉取编译）
+third_party/whisper.cpp/
+build-whisper/
+
+# whisper 内置模型（57MB 大文件；build-whisper.bat 缺失时自动下载）
+crates/rclaw-desktop/gen/android/app/src/main/assets/models/
