@@ -18,11 +18,11 @@
 
 ## Android 真机演示
 
+https://github.com/user-attachments/assets/34940b94-c567-4844-862b-e4c987ef0356
+
 [![RClaw Android 真机演示](docs/demo/poster.png)](docs/demo/rclaw-android-demo.mp4)
 
 *点击封面观看完整演示（1 分 25 秒，1080p 真机录屏）：冷启动 → 新建会话 → 输入法打字发消息，看 Agent 带思考过程的流式回复 → 快速走一遍 智能体 / 工具 / 技能 / 工作区 / Agent / 自进化 / 任务概览 / 定时任务 / 配置 / 关于 全部面板 → 主题切换收尾（深色模式）。*
-
-> 注：GitHub 的 README 不内联播放仓库内视频，点击封面会跳转到该 mp4 的文件页在线播放；如需在 README 里直接内联播放，把 `docs/demo/rclaw-android-demo.mp4` 拖进任意 GitHub Issue / Release 上传，用生成的 `user-attachments` 链接替换上方封面链接即可。
 
 ## 平台支持一览
 
