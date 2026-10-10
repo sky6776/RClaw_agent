@@ -100,8 +100,17 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      # runner 镜像自带 Android SDK（ANDROID_HOME 已设、licenses 已接受、sdkmanager 在
-      # PATH 上）；不引入 setup-android action——v3 已因 Google 下线 tools 包而损坏（v4 修复）。
+      # sdkmanager 是 Java 程序：先确保 JDK 17。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # runner 镜像已不自带 Android SDK（首跑 sdkmanager exit 127）：setup-android@v4
+      # 自装 cmdline-tools + 接受 licenses + 设 ANDROID_HOME（v3 因 Google 下线 tools 包
+      # 损坏，v4 起修复）。
+      - uses: android-actions/setup-android@v4
+
       - name: Install NDK
         run: |
           sdkmanager --install "ndk;29.0.14206865" > /dev/null
@@ -123,6 +132,7 @@ jobs:
             cp rclaw.toml.example rclaw.toml   # 填入 api_key
             chmod +x rclaw && ./rclaw
           EOF
+          command -v zip >/dev/null || sudo apt-get install -y zip
           (cd dist/pkg && zip -qr ../RClaw-termux-aarch64.zip .)
           rm -rf dist/pkg
 
@@ -143,6 +153,9 @@ jobs:
       TAURI_ANDROID_PACKAGE_UNESCAPED: ai.rclaw.app
       WRY_ANDROID_LIBRARY: rclaw_desktop
       RCLAW_KEYSTORE_PASSWORD: ${{ secrets.RCLAW_KEYSTORE_PASSWORD }}
+      # Ubuntu 24+ 的 PEP 668 externally-managed 环境会拒绝 pip 装包；
+      # Chaquopy 的 buildPython 经 pip 解析依赖，CI 里放开该限制。
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -164,10 +177,16 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      # runner 镜像自带 Android SDK（ANDROID_HOME 已设、licenses 已接受、sdkmanager 在
-      # PATH 上）；不引入 setup-android action——v3 已因 Google 下线 tools 包而损坏（v4 修复）。
+      # runner 镜像已不自带 Android SDK（首跑 sdkmanager exit 127）：setup-android@v4
+      # 自装 cmdline-tools + 接受 licenses + 设 ANDROID_HOME（v3 因 Google 下线 tools 包
+      # 损坏，v4 起修复）。
+      - uses: android-actions/setup-android@v4
+
       - name: Install SDK components (NDK / platform / build-tools)
         run: |
+          # Chaquopy buildPython：minimal 镜像可能缺 pip
+          command -v python3 >/dev/null 2>&1 || sudo apt-get install -y python3
+          python3 -m pip --version >/dev/null 2>&1 || sudo apt-get install -y python3-pip
           sdkmanager --install "ndk;29.0.14206865" "platforms;android-36" \
             "build-tools;36.0.0" "platform-tools" > /dev/null
           {
@@ -197,6 +216,7 @@ jobs:
 
       - name: Build whisper JNI lib (librclaw_whisper.so)
         run: |
+          command -v cmake >/dev/null || sudo apt-get install -y cmake
           command -v ninja >/dev/null || sudo apt-get install -y ninja-build
           JNI_DIR=crates/rclaw-desktop/gen/android/app/src/main/jniLibs/arm64-v8a
           if [ ! -f "$JNI_DIR/librclaw_whisper.so" ]; then
