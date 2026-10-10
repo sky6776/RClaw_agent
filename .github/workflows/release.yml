@@ -324,8 +324,12 @@ jobs:
           secrets 时为 release 签名；未配置时为 debug 签名（可直接安装，升级安装需同签名）。
           EOF
           gh release delete nightly --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
-          gh release create nightly dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "RClaw Nightly $STAMP $SHORT_SHA" \
-            --notes-file notes.md \
-            --prerelease --latest
+          # --prerelease 与 --latest 互斥（gh 文档），nightly 只标 prerelease
+          if ! gh release create nightly dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "RClaw Nightly $STAMP $SHORT_SHA" \
+              --notes-file notes.md \
+              --prerelease 2> gh_err.txt; then
+            grep -a . gh_err.txt | head -10 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
