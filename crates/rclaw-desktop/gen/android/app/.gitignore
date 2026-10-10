@@ -3,7 +3,8 @@
 /src/main/assets/tauri.conf.json
 /tauri.build.gradle.kts
 /proguard-tauri.pro
-/tauri.properties
+# tauri.properties 是本仓库手工维护的版本号唯一来源（tauri-build 不写它），
+# 入库让 CI 构建与本机同 versionCode/versionName。
 /src/main/java/ai/rclaw/app/proguard-wry.pro
 /src/main/java/ai/rclaw/app/Ipc.kt
 /src/main/java/ai/rclaw/app/Logger.kt

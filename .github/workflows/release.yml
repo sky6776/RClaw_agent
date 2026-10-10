@@ -156,6 +156,7 @@ jobs:
       # Ubuntu 24+ 的 PEP 668 externally-managed 环境会拒绝 pip 装包；
       # Chaquopy 的 buildPython 经 pip 解析依赖，CI 里放开该限制。
       PIP_BREAK_SYSTEM_PACKAGES: "1"
+      ANDROID_DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -269,6 +270,16 @@ jobs:
           fi
         env:
           RCLAW_KEYSTORE_BASE64: ${{ secrets.RCLAW_KEYSTORE_BASE64 }}
+
+      # 用仓库 secrets 里的 debug keystore 替换 runner 现场生成的：与手机上已装的
+      # 本机构建包同签名，CI 包才能直接覆盖安装（否则签名不一致只能卸载重装）。
+      # gradle 的 debug 签名（含 release 无 keystore 时的回退）读 ~/.android/debug.keystore。
+      - name: Restore debug signing key (match device-installed signature)
+        if: env.ANDROID_DEBUG_KEYSTORE_BASE64 != ''
+        run: |
+          mkdir -p "$HOME/.android"
+          echo "$ANDROID_DEBUG_KEYSTORE_BASE64" | base64 -d > "$HOME/.android/debug.keystore"
+          echo "debug 签名：已恢复仓库 secrets 中的 debug.keystore"
 
       - name: Gradle assembleArm64Release (skip rustBuild, .so already in place)
         working-directory: crates/rclaw-desktop/gen/android

@@ -26,7 +26,8 @@ crates/rclaw-desktop/gen/android/**/.gradle/
 crates/rclaw-desktop/gen/android/local.properties
 crates/rclaw-desktop/gen/android/.idea/
 crates/rclaw-desktop/gen/android/**/*.keystore
-crates/rclaw-desktop/gen/android/app/tauri.properties
+# tauri.properties（versionCode/versionName 唯一来源，手工维护）入库：CI 与本机
+# 构建同版本号，否则 CI 包回退 versionCode=1 无法覆盖安装手机上已装的包。
 # tauri 构建链往 jniLibs 放 .so 符号链接（Windows 非开发者模式需手工复制）；产物不入库
 crates/rclaw-desktop/gen/android/app/src/main/jniLibs/
 crates/rclaw-desktop/gen/android/.kotlin/
