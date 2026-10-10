@@ -100,8 +100,8 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      - uses: android-actions/setup-android@v3
-
+      # runner 镜像自带 Android SDK（ANDROID_HOME 已设、licenses 已接受、sdkmanager 在
+      # PATH 上）；不引入 setup-android action——v3 已因 Google 下线 tools 包而损坏（v4 修复）。
       - name: Install NDK
         run: |
           sdkmanager --install "ndk;29.0.14206865" > /dev/null
@@ -164,8 +164,8 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      - uses: android-actions/setup-android@v3
-
+      # runner 镜像自带 Android SDK（ANDROID_HOME 已设、licenses 已接受、sdkmanager 在
+      # PATH 上）；不引入 setup-android action——v3 已因 Google 下线 tools 包而损坏（v4 修复）。
       - name: Install SDK components (NDK / platform / build-tools)
         run: |
           sdkmanager --install "ndk;29.0.14206865" "platforms;android-36" \
