@@ -8,7 +8,7 @@ REM   build-android-apk.bat              build debug APK
 REM   build-android-apk.bat release      build release APK (local signing configured)
 REM   build-android-apk.bat debug matrix run skill script matrix after build - needs device
 REM
-REM Toolchain root defaults to E:\my-android\android-toolchain, override with ANDROID_TOOLCHAIN;
+REM Toolchain root defaults to D:\my-android\android-toolchain (this PC, local_compile branch);
 REM RCLAW_BUILD_PYTHON overrides the Chaquopy buildPython.
 REM Output: crates\rclaw-desktop\gen\android\app\build\outputs\apk\arm64\{debug|release}\
 REM Release signing: gen\android\app\rclaw-release.keystore (not in git) plus
@@ -18,7 +18,7 @@ REM mis-parsed under the GBK console codepage - see build-android-release.bat.
 REM ============================================================================
 setlocal
 
-if "%ANDROID_TOOLCHAIN%"=="" set "ANDROID_TOOLCHAIN=E:\my-android\android-toolchain"
+if "%ANDROID_TOOLCHAIN%"=="" set "ANDROID_TOOLCHAIN=D:\my-android\android-toolchain"
 
 set "PROFILE=%~1"
 if "%PROFILE%"=="" set "PROFILE=debug"

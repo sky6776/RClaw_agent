@@ -13,7 +13,7 @@ REM mis-parsed under the GBK console codepage - see build-android-release.bat.
 REM ============================================================================
 setlocal enabledelayedexpansion
 
-if "%ANDROID_NDK_HOME%"=="" set "ANDROID_NDK_HOME=E:\my-android\android-toolchain\sdk\ndk\29.0.14206865"
+if "%ANDROID_NDK_HOME%"=="" set "ANDROID_NDK_HOME=D:\my-android\android-toolchain\sdk\ndk\29.0.14206865"
 set "REPO=%~dp0.."
 set "JNI_DIR=%REPO%\crates\rclaw-desktop\gen\android\app\src\main\jniLibs\arm64-v8a"
 set "SO=%JNI_DIR%\librclaw_whisper.so"
