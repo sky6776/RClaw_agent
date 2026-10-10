@@ -198,6 +198,9 @@ jobs:
             echo "WRY_ANDROID_KOTLIN_FILES_OUT_DIR=$GITHUB_WORKSPACE/crates/rclaw-desktop/gen/android/app/src/main/java/ai/rclaw/app/generated"
             echo "RCLAW_BUILD_PYTHON=python3"
           } >> "$GITHUB_ENV"
+          # wry 的 build.rs 会对 WRY_ANDROID_KOTLIN_FILES_OUT_DIR 做 canonicalize，
+          # 目录不存在直接 panic；该目录由构建生成、不入库，新克隆需预建。
+          mkdir -p crates/rclaw-desktop/gen/android/app/src/main/java/ai/rclaw/app/generated
 
       - name: Build frontend (ui/dist)
         working-directory: crates/rclaw-desktop/ui
