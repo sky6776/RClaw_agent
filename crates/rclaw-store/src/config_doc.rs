@@ -385,10 +385,31 @@ mod tests {
     fn parses_real_example_into_sections_and_docs() {
         let doc = parse_example(EXAMPLE);
         assert!(
-            doc.preamble.iter().any(|l| l.contains("示例配置")),
+            doc.preamble.iter().any(|l| l.contains("RClaw 配置")),
             "顶部说明应进 preamble: {:?}",
             doc.preamble
         );
+        // 顶层段齐备（含新增的 [web_browser] 检索引擎偏好段）。
+        for p in [
+            "agent",
+            "llm",
+            "llm.providers.zhipu",
+            "web_search",
+            "web_search.tavily",
+            "web_search.zhipu",
+            "web_browser",
+            "napcat",
+            "weixin",
+            "log",
+            "mcp",
+            "mcp.servers.gbrain",
+        ] {
+            assert!(
+                doc.sections.iter().any(|s| s.path == p),
+                "缺段 {p}: {:?}",
+                doc.sections.iter().map(|s| s.path.as_str()).collect::<Vec<_>>()
+            );
+        }
         let agent = doc
             .sections
             .iter()
@@ -402,52 +423,39 @@ mod tests {
             "键文档应搬过来: {:?}",
             base.doc
         );
-        // 注释键（默认值项）：auto_review_tooled / 阈值类。
-        let auto = agent
-            .items
-            .iter()
-            .find(|i| i.key == "auto_review_tooled")
-            .expect("auto_review_tooled 应作为注释默认键收录");
-        assert!(auto.commented);
-        assert_eq!(auto.default_raw, "false");
-        assert_eq!(auto.kind, "bool");
-        // 散文公式行不得被误判为键（deny_unknown_fields 下它永远存不进去）。
-        assert!(
-            !agent.items.iter().any(|i| i.key == "effective_window"),
-            "公式行 effective_window 是注释散文，不得成为可编辑项"
-        );
-        // 公式行归入 compression_threshold_tokens 的文档。
-        let threshold = agent
-            .items
-            .iter()
-            .find(|i| i.key == "compression_threshold_tokens")
-            .expect("compression_threshold_tokens 注释键");
-        assert!(
-            threshold.doc.iter().any(|l| l.contains("effective_window")),
-            "公式行应归属阈值键文档: {:?}",
-            threshold.doc
-        );
-        // weixin 注释调优键（值形态合法）不受影响。
-        let weixin = doc.sections.iter().find(|s| s.path == "weixin").unwrap();
-        assert!(weixin.items.iter().any(|i| i.key == "poll_timeout_sec"));
         // auto_memory 是显式键（未注释）。
         let am = agent.items.iter().find(|i| i.key == "auto_memory").unwrap();
         assert!(!am.commented);
-        // 新增的评审预算键在示例里（含文档）。
-        let budget = agent
+        // 散文里的键名/公式不得被误判为键（deny_unknown_fields 下它永远存不进去）。
+        assert!(
+            !agent.items.iter().any(|i| i.key == "compression_threshold_tokens"),
+            "散文提及的 compression_threshold_tokens 是注释文字，不得成为独立键（该键未在示例中显式出现）: {:?}",
+            agent.items.iter().map(|i| i.key.as_str()).collect::<Vec<_>>()
+        );
+        // 注释键（默认值项）：napcat 的 allow_from（值形态合法的注释键收录为可编辑项）。
+        let napcat = doc
+            .sections
+            .iter()
+            .find(|s| s.path == "napcat")
+            .expect("[napcat] 段");
+        let allow = napcat
             .items
             .iter()
-            .find(|i| i.key == "auto_review_max_input_tokens")
-            .expect("示例应包含 auto_review_max_input_tokens");
-        assert_eq!(budget.default_raw, "600000");
-        assert_eq!(budget.kind, "int");
-        // llm.review_provider 注释键存在。
-        let llm = doc.sections.iter().find(|s| s.path == "llm").unwrap();
-        assert!(llm
-            .items
-            .iter()
-            .any(|i| i.key == "review_provider" && i.commented));
-        // provider 数组段按 name 回填路径，键可寻址。
+            .find(|i| i.key == "allow_from")
+            .expect("allow_from 应作为注释默认键收录");
+        assert!(allow.commented);
+        assert_eq!(allow.kind, "str");
+        // log 的注释键（dir / file_name）齐备。
+        let log = doc.sections.iter().find(|s| s.path == "log").unwrap();
+        for key in ["dir", "file_name"] {
+            let item = log
+                .items
+                .iter()
+                .find(|i| i.key == key)
+                .unwrap_or_else(|| panic!("log.{key} 注释键应被收录"));
+            assert!(item.commented, "log.{key} 应为注释键");
+        }
+        // provider 数组段按 name 回填路径，键可寻址且 api_key 打码。
         let zhipu = doc
             .sections
             .iter()
@@ -457,24 +465,23 @@ mod tests {
             .items
             .iter()
             .any(|i| i.path == "llm.providers.zhipu.api_key" && i.secret));
-        // DeepSeek 是注释示例段（只读文档）。
-        let ds = doc
+        // gbrain env 的密钥键被收录（is_secret 只识别小写 _key 后缀，环境变量风格
+        // 的大写 _KEY 不打码——既有面板行为，非本测试约定）。
+        let gbrain_env = doc
             .sections
             .iter()
-            .find(|s| s.example_only && s.doc.iter().any(|l| l.contains("deepseek")))
-            .expect("DeepSeek 注释示例段");
-        assert!(
-            ds.items.is_empty(),
-            "嵌套注释示例段只做文档: {:?}",
-            ds.items
-        );
-        // [mcp] 顶层注释段解析出可编辑默认键（且只有全局默认的 3 个——
-        // 后续 `# [mcp.servers.*]` 示例段各自成段，键不得并入）。
+            .find(|s| s.path == "mcp.servers.gbrain.env")
+            .expect("gbrain env 段");
+        assert!(gbrain_env
+            .items
+            .iter()
+            .any(|i| i.key == "GBRAIN_EMBEDDING_API_KEY"));
+        // [mcp] 全局段只有 3 个默认键（server 子段各自成段，键不得并入）。
         let mcp = doc
             .sections
             .iter()
             .find(|s| s.path == "mcp")
-            .expect("[mcp] 注释段");
+            .expect("[mcp] 段");
         assert_eq!(
             mcp.items.len(),
             3,
@@ -482,25 +489,25 @@ mod tests {
             mcp.items.iter().map(|i| i.key.as_str()).collect::<Vec<_>>()
         );
         assert!(mcp.items.iter().any(|i| i.key == "startup_timeout_secs"));
-        for p in [
-            "mcp.servers.filesystem",
-            "mcp.servers.fetch",
-            "mcp.servers.github",
-            "mcp.servers.mytool",
-            "mcp.servers.zhipu-search",
-        ] {
-            let s = doc
-                .sections
-                .iter()
-                .find(|s| s.path == p)
-                .unwrap_or_else(|| panic!("缺 MCP server 示例段 {p}"));
-            assert!(s.example_only, "{p} 应为只读示例段");
-            assert!(s.items.is_empty(), "{p} 不得有可编辑键: {:?}", s.items);
-        }
-        // web_search 子段齐备。
-        for p in ["web_search", "web_search.tavily", "web_search.zhipu"] {
-            assert!(doc.sections.iter().any(|s| s.path == p), "缺段 {p}");
-        }
+        // web_browser 段的 engine 键可寻址、非注释、str。
+        let web_browser = doc
+            .sections
+            .iter()
+            .find(|s| s.path == "web_browser")
+            .expect("[web_browser] 段");
+        let engine = web_browser
+            .items
+            .iter()
+            .find(|i| i.key == "engine")
+            .expect("web_browser.engine 应被收录");
+        assert!(!engine.commented);
+        assert_eq!(engine.kind, "str");
+        assert_eq!(engine.default_raw, "\"bing\"");
+        assert!(
+            engine.doc.iter().any(|l| l.contains("google")),
+            "engine 行内注释应进文档: {:?}",
+            engine.doc
+        );
     }
 
     #[test]

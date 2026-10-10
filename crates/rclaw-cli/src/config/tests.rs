@@ -13,14 +13,16 @@ fn example_config_parses() {
     // napcat 段存在且示例默认未启用，ws_url 为示例值。
     assert_eq!(cfg.napcat.enabled, Some(false));
     assert_eq!(cfg.napcat.ws_url.as_deref(), Some("ws://127.0.0.1:3001"));
-    // 默认调优项未被示例显式覆盖时，回退到 NapCatSection::default。
-    assert_eq!(cfg.napcat.group_response_mode, "all");
+    // 示例显式配置的群响应模式是 at_only（群内仅@机器人时响应）。
+    assert_eq!(cfg.napcat.group_response_mode, "at_only");
     assert_eq!(
         cfg.napcat.send_chunk_bytes,
         NapCatConfig::default().send_chunk_bytes
     );
     // 示例显式给出的压缩摘要上限必须是 12_000（不是旧的 2048）。
     assert_eq!(cfg.agent.compression_summary_max_tokens, 12_000);
+    // [web_browser] 段：示例显式给出首选引擎 bing（历史缺省）。
+    assert_eq!(cfg.web_browser.engine, "bing");
 }
 
 #[test]
@@ -455,7 +457,8 @@ api_keys = ["tavily-sensitive-value"]
 #[test]
 fn example_toml_parses() {
     let cfg = parse_config_text(include_str!("../../../../rclaw.toml.example")).unwrap();
-    assert!(!cfg.web_search.enabled);
+    // 示例里 web_search 池是开着的（豆包 Custom / 智谱 / 豆包 Global 配了示例键）。
+    assert!(cfg.web_search.enabled);
 }
 
 #[test]

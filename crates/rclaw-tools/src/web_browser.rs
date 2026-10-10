@@ -13,7 +13,7 @@
 //! 参数校验、URL 构建、结果格式化与 HTML 解析均为纯逻辑，宿主无关。
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -34,6 +34,79 @@ const PAGE_TEXT_MAX_CHARS: usize = 6_000;
 const QUERY_MAX_CHARS: usize = 400;
 /// headless 浏览器 DOM 输出的读取上限（防异常页撑爆内存）。
 const DUMP_MAX_BYTES: usize = 12 * 1024 * 1024;
+
+/// `web_browser` 支持的搜索引擎。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchEngine {
+    Google,
+    #[default]
+    Bing,
+    Baidu,
+}
+
+impl SearchEngine {
+    /// 引擎标识（工具 engine 参数与 rclaw.toml `[web_browser].engine` 的取值）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchEngine::Google => "google",
+            SearchEngine::Bing => "bing",
+            SearchEngine::Baidu => "baidu",
+        }
+    }
+
+    /// 中文名（结果输出标签）。
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchEngine::Google => "谷歌",
+            SearchEngine::Bing => "必应",
+            SearchEngine::Baidu => "百度",
+        }
+    }
+
+    /// 解析引擎标识（大小写不敏感，接受中文名）。空串按 bing（历史缺省）。
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "" => Some(SearchEngine::Bing),
+            "google" | "谷歌" => Some(SearchEngine::Google),
+            "bing" | "必应" => Some(SearchEngine::Bing),
+            "baidu" | "百度" => Some(SearchEngine::Baidu),
+            _ => None,
+        }
+    }
+}
+
+/// 首选引擎的进程级槽位：装配期从 rclaw.toml `[web_browser].engine` 注入，
+/// `/webbrowser` 斜杠命令运行期热切换。工具与斜杠命令分属不同 crate、没有
+/// 共享句柄通路，槽位模式对齐 `skill_entrypoint` 的 `SKILL_OUTPUT_LIMIT`。
+static PREFERRED_ENGINE: OnceLock<RwLock<SearchEngine>> = OnceLock::new();
+
+fn preferred_slot() -> &'static RwLock<SearchEngine> {
+    PREFERRED_ENGINE.get_or_init(|| RwLock::new(SearchEngine::Bing))
+}
+
+/// 设置首选搜索引擎（装配期注入或 `/webbrowser` 热切换）。
+pub fn set_preferred_engine(engine: SearchEngine) {
+    *preferred_slot()
+        .write()
+        .expect("PREFERRED_ENGINE 锁未被毒化") = engine;
+}
+
+/// 当前首选搜索引擎（未注入时为 bing，与历史缺省一致）。
+pub fn preferred_engine() -> SearchEngine {
+    *preferred_slot().read().expect("PREFERRED_ENGINE 锁未被毒化")
+}
+
+/// 缺省（工具调用未显式指定引擎）时的降级链：首选引擎在前，其余按 必应→百度 补齐。
+/// 谷歌只作首选——未配置直连的环境里它大概率不可达，插进链路中段只会白等超时。
+pub fn fallback_chain(primary: SearchEngine) -> Vec<SearchEngine> {
+    let mut chain = vec![primary];
+    for engine in [SearchEngine::Bing, SearchEngine::Baidu] {
+        if engine != primary {
+            chain.push(engine);
+        }
+    }
+    chain
+}
 
 /// 页面提取结果（与 Android 侧 HeadlessBrowser 的提取 JS 字段一一对应）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -87,10 +160,10 @@ impl Tool for WebBrowserTool {
 
     fn description(&self) -> &str {
         "用真实浏览器引擎（无头浏览器）检索或打开网页。action=search 传入检索词\
-         返回结果列表（标题/链接/摘要；默认必应，搜不到自动换百度重试一次，\
-         engine 可显式指定 bing/baidu，已过滤广告条目）；action=open 传入 URL\
-         返回页面标题与正文文本。适合 web_search 未配置、页面需要 JS 渲染、或要读取某个\
-         具体链接内容的场景。"
+         返回结果列表（标题/链接/摘要；默认用配置的首选引擎，无结果时自动依次\
+         换备用引擎，备选顺序 必应→百度；engine 可显式指定 google/bing/baidu，显式指定时\
+         只用该家不降级，已过滤广告条目）；action=open 传入 URL\
+         返回页面标题与正文文本。适合 web_search 未配置、页面动态渲染、或已知链接要读正文的场景。"
     }
 
     fn input_schema(&self) -> Value {
@@ -112,8 +185,10 @@ impl Tool for WebBrowserTool {
                 },
                 "engine": {
                     "type": "string",
-                    "enum": ["bing", "baidu"],
-                    "description": "search 动作的搜索引擎；缺省 bing，且空结果时自动换另一家重试一次（显式指定时不重试）"
+                    "enum": ["google", "bing", "baidu"],
+                    "description": "search 动作的搜索引擎；缺省用配置的首选引擎\
+                     （rclaw.toml [web_browser].engine 或 /webbrowser 设置，默认 bing）。\
+                     显式指定时只用该引擎、不自动降级；缺省时无结果自动依次换备用引擎（备选顺序 必应→百度）"
                 }
             },
             "required": ["action"]
@@ -122,8 +197,6 @@ impl Tool for WebBrowserTool {
 
     async fn execute(&self, input: Value) -> ToolResult {
         let action = input.get("action").and_then(Value::as_str).unwrap_or("");
-        let explicit_engine = input.get("engine").and_then(Value::as_str);
-        let engine = explicit_engine.unwrap_or("bing");
         match action {
             "search" => {
                 let Some(query) = input
@@ -140,33 +213,26 @@ impl Tool for WebBrowserTool {
                         query.chars().count()
                     ));
                 }
-                let Some(url) = build_search_url(engine, query) else {
-                    return ToolResult::err(format!(
-                        "未知搜索引擎 {engine}（支持 bing / baidu）"
-                    ));
-                };
-                let mut payload = match self.fetch(url).await {
-                    Ok(payload) => payload,
-                    Err(error) => return ToolResult::err(error),
-                };
-                let mut used_engine = engine;
-                // 缺省（未显式指定引擎）时必应空结果 → 自动换百度重试一次。
-                // 显式指定不重试：调用方明确要那家引擎的结果。
-                if explicit_engine.is_none()
-                    && engine == "bing"
-                    && payload.results.is_empty()
-                {
-                    if let Ok(baidu_payload) =
-                        self.fetch(build_search_url("baidu", query).unwrap_or_default())
-                            .await
-                    {
-                        if !baidu_payload.results.is_empty() {
-                            payload = baidu_payload;
-                            used_engine = "baidu";
-                        }
+                // 引擎决策：显式参数 > 配置首选。显式指定不降级（调用方明确要那家）。
+                let explicit = input
+                    .get("engine")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let explicit_engine = match explicit.map(SearchEngine::parse) {
+                    Some(Some(engine)) => Some(engine),
+                    Some(None) => {
+                        return ToolResult::err(format!(
+                            "未知搜索引擎 {}（支持 google / bing / baidu）",
+                            explicit.unwrap_or("")
+                        ));
                     }
+                    None => None,
+                };
+                match explicit_engine {
+                    Some(engine) => self.search_single(engine, query).await,
+                    None => self.search_with_fallback(preferred_engine(), query).await,
                 }
-                format_search_page(&payload, used_engine, query)
             }
             "open" => {
                 let Some(url) = input
@@ -193,6 +259,52 @@ impl Tool for WebBrowserTool {
 }
 
 impl WebBrowserTool {
+    /// 显式引擎：单引擎检索，不降级。空结果时走正文兜底文案（页面实际呈现的
+    /// 内容交回模型判断，如验证码页则如实可见）。
+    async fn search_single(&self, engine: SearchEngine, query: &str) -> ToolResult {
+        let Some(url) = build_search_url(engine.as_str(), query) else {
+            return ToolResult::err(format!("未知搜索引擎 {}", engine.as_str()));
+        };
+        match self.fetch(url).await {
+            Ok(payload) => format_search_page(&payload, engine, query),
+            Err(error) => ToolResult::err(error),
+        }
+    }
+
+    /// 首选引擎检索；无结果或引擎失败时沿降级链换下一家（至多全链一遍）。
+    /// 全链落空时，退回第一家有正文的页面做正文兜底；连正文都没有才报错。
+    async fn search_with_fallback(&self, primary: SearchEngine, query: &str) -> ToolResult {
+        let mut errors: Vec<String> = Vec::new();
+        let mut text_only: Option<(PagePayload, SearchEngine)> = None;
+        for engine in fallback_chain(primary) {
+            let Some(url) = build_search_url(engine.as_str(), query) else {
+                continue;
+            };
+            match self.fetch(url).await {
+                Ok(payload) => {
+                    if !payload.results.is_empty() {
+                        return format_search_page(&payload, engine, query);
+                    }
+                    if text_only.is_none() && !payload.text.trim().is_empty() {
+                        text_only = Some((payload, engine));
+                    }
+                }
+                Err(error) => errors.push(format!("{}：{error}", engine.label())),
+            }
+        }
+        if let Some((payload, engine)) = text_only {
+            return format_search_page(&payload, engine, query);
+        }
+        if errors.is_empty() {
+            ToolResult::err(format!(
+                "{}等引擎均未解析出结果（页面可能被拦截或加载失败）",
+                primary.label()
+            ))
+        } else {
+            ToolResult::err(format!("搜索引擎接连失败：{}", errors.join("；")))
+        }
+    }
+
     /// 走后端取一页（阻塞放 spawn_blocking，外层超时兜底）。
     /// 桌面后端（dump-dom）拿不到最终 URL：回填请求 URL 供输出展示；
     /// Android WebView 后端会带真实 final URL，此处不动。
@@ -217,12 +329,12 @@ impl WebBrowserTool {
     }
 }
 
-/// 拼搜索引擎 URL。未知引擎返回 None。
+/// 拼搜索引擎 URL。未知引擎返回 None；空串按 bing（历史缺省）。
 pub fn build_search_url(engine: &str, query: &str) -> Option<String> {
-    let (base, key) = match engine {
-        "bing" | "" => ("https://www.bing.com/search", "q"),
-        "baidu" => ("https://www.baidu.com/s", "wd"),
-        _ => return None,
+    let (base, key) = match SearchEngine::parse(engine)? {
+        SearchEngine::Google => ("https://www.google.com/search", "q"),
+        SearchEngine::Bing => ("https://www.bing.com/search", "q"),
+        SearchEngine::Baidu => ("https://www.baidu.com/s", "wd"),
     };
     reqwest::Url::parse_with_params(base, &[(key, query)])
         .ok()
@@ -231,11 +343,8 @@ pub fn build_search_url(engine: &str, query: &str) -> Option<String> {
 
 /// search 动作输出：结果列表优先，解析不到结果时退回页面正文摘要。
 /// 头部展示原始检索词（SERP 页标题是引擎拼的，不适合当检索词展示）。
-fn format_search_page(page: &PagePayload, engine: &str, query: &str) -> ToolResult {
-    let engine_label = match engine {
-        "baidu" => "百度",
-        _ => "必应",
-    };
+fn format_search_page(page: &PagePayload, engine: SearchEngine, query: &str) -> ToolResult {
+    let engine_label = engine.label();
     let mut out = String::new();
     if !page.results.is_empty() {
         out.push_str(&format!(
@@ -327,7 +436,7 @@ impl PageLoader for HeadlessBrowserLoader {
                 .to_string()
         })?;
         let html = dump_dom(&browser, url)?;
-        Ok(html::parse(&html))
+        Ok(html::parse(&html, url))
     }
 }
 
@@ -452,7 +561,9 @@ mod html {
     use regex::Regex;
 
     /// 从 dump-dom 的 HTML 提取 title / 搜索结果 / 正文文本。
-    pub fn parse(html: &str) -> PagePayload {
+    /// SERP 解析器按请求 URL 分派（谷歌结构无稳定 class 锚点）；必应/百度沿用
+    /// 内容标记（`b_algo` / `content_left`），与 URL 分派叠加避免普通页面误判。
+    pub fn parse(html: &str, url: &str) -> PagePayload {
         let mut page = PagePayload {
             title: tag_inner(html, &Regex::new(r"(?s)<title[^>]*>(.*?)</title>").unwrap())
                 .map(|t| text_from_html(&t))
@@ -461,12 +572,86 @@ mod html {
             text: text_from_html(html),
             results: Vec::new(),
         };
-        if html.contains("b_algo") {
+        let lower_url = url.to_ascii_lowercase();
+        if lower_url.contains("google.") && html.contains("<h3") {
+            page.results = parse_google(html);
+        } else if html.contains("b_algo") {
             page.results = parse_bing(html);
         } else if html.contains("content_left") {
             page.results = parse_baidu(html);
         }
         page
+    }
+
+    /// 谷歌桌面 SERP：结果块内 `<a href="URL" ...><h3>标题</h3></a>`（h3 在 a 内，
+    /// 与必应/百度相反），摘要在 `VwiC3b` 容器。旧形态 `/url?q=REAL` 跳转链接
+    /// （相对/绝对两种写法）解出真实地址；`/aclk` 等广告跳转直接丢弃。
+    fn parse_google(html: &str) -> Vec<super::SearchEntry> {
+        let h3 = Regex::new(r"(?s)<h3[^>]*>(.*?)</h3>").unwrap();
+        let a_href = Regex::new(r#"<a[^>]*href="([^"]+)""#).unwrap();
+        let snippet = Regex::new(r#"(?s)class="[^"]*VwiC3b[^"]*"[^>]*>(.*?)</div>"#).unwrap();
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for caps in h3.captures_iter(html) {
+            if entries.len() >= 10 {
+                break;
+            }
+            // 组 0（整个 h3 元素）必然存在；先后取其跨度做宿主 a / 摘要窗口定位。
+            let Some(h3_match) = caps.get(0) else {
+                continue;
+            };
+            // 标题 h3 的宿主 a 标签：向前取最近一个 `<a ` 的 href（谷歌的 h3
+            // 在 a 内，宿主 a 必然开在 h3 之前）。
+            let before = &html[..h3_match.start()];
+            let Some(href_caps) = before
+                .rfind("<a ")
+                .and_then(|start| a_href.captures(&before[start..]))
+            else {
+                continue;
+            };
+            let mut url = href_caps
+                .get(1)
+                .map(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() || url.starts_with("javascript:") {
+                continue;
+            }
+            // 旧跳转形态（相对 `/url?q=REAL` 或绝对
+            // `https://www.google.com/url?q=REAL`）：解出真实地址（q 缺失视为
+            // 非结果链接）。base_url 对绝对 URL 不生效，两种形态同一解析。
+            if url.contains("/url?") {
+                let resolved = reqwest::Url::options()
+                    .base_url(Some(&reqwest::Url::parse("https://www.google.com/").expect("静态基址")))
+                    .parse(&url);
+                match resolved.ok().and_then(|u| {
+                    u.query_pairs().find(|(k, _)| k == "q").map(|(_, v)| v.into_owned())
+                }) {
+                    Some(real) => url = real,
+                    None => continue,
+                }
+            }
+            if !url.starts_with("http") || url.contains("/aclk") || url.contains("googleadservices")
+            {
+                continue;
+            }
+            if !seen.insert(url.clone()) {
+                continue;
+            }
+            // 摘要在同一结果块内（到下一个 h3 为止）的 VwiC3b 容器，避免跨块错配。
+            let after = &html[h3_match.end()..];
+            let window_end = after.find("<h3").unwrap_or(after.len()).min(4000);
+            entries.push(super::SearchEntry {
+                title: text_from_html(caps.get(1).map(|m| m.as_str()).unwrap_or("")),
+                url,
+                snippet: snippet
+                    .captures(&after[..window_end])
+                    .and_then(|s| s.get(1))
+                    .map(|s| text_from_html(s.as_str()))
+                    .unwrap_or_default(),
+            });
+        }
+        entries
     }
 
     /// 主文区域选择：`<article>` 优先、`<main>` 次之（取首个开标签到最后一个
@@ -670,6 +855,10 @@ mod html {
 mod tests {
     use super::*;
 
+    /// 首选引擎是进程级槽位，且 #[tokio::test] 各自占一个 OS 线程并行跑；
+    /// 依赖/修改槽位的用例持同一把锁串行化，避免互相污染。
+    static PREF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn tool() -> WebBrowserTool {
         // 校验/格式化路径不触后端；load 不会被这些用例走到。
         struct NoopLoader;
@@ -729,6 +918,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_falls_back_to_baidu_when_bing_empty() {
+        let _guard = PREF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_engine(SearchEngine::Bing);
         let loader = FakeLoader::new(vec![
             Ok(PagePayload {
                 title: "必应空页".into(),
@@ -752,7 +943,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn google_preferred_falls_back_to_bing_then_baidu() {
+        let _guard = PREF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_engine(SearchEngine::Google);
+        let loader = FakeLoader::new(vec![
+            Ok(PagePayload {
+                title: "谷歌空页".into(),
+                url: "https://www.google.com/search?q=x".into(),
+                text: "谷歌拦截页正文".into(),
+                results: vec![],
+            }),
+            Ok(page_with_results("bing", &["https://example.com/bing-hit"])),
+        ]);
+        let tool = WebBrowserTool::new(loader.clone());
+        let result = tool
+            .execute(json!({"action": "search", "query": "x"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("必应检索"), "{}", result.content);
+        let calls = loader.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].contains("google.com"), "{calls:?}");
+        assert!(calls[1].contains("bing.com"), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn all_engines_empty_reports_error() {
+        let _guard = PREF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_engine(SearchEngine::Bing);
+        // 两个引擎都返回空页（无正文）：全链落空 → 报错而非空输出。
+        let loader = FakeLoader::new(vec![Ok(PagePayload::default()), Ok(PagePayload::default())]);
+        let tool = WebBrowserTool::new(loader.clone());
+        let result = tool
+            .execute(json!({"action": "search", "query": "x"}))
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert_eq!(loader.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn engine_error_falls_through_to_next_engine() {
+        let _guard = PREF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_engine(SearchEngine::Google);
+        // 首选谷歌加载失败（如不可达）→ 降级链继续，必应出结果。
+        let loader = FakeLoader::new(vec![
+            Err("无头浏览器超时".into()),
+            Ok(page_with_results("bing", &["https://example.com/hit"])),
+        ]);
+        let tool = WebBrowserTool::new(loader.clone());
+        let result = tool
+            .execute(json!({"action": "search", "query": "x"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("必应检索"), "{}", result.content);
+        assert_eq!(loader.calls().len(), 2);
+    }
+
+    #[tokio::test]
     async fn explicit_engine_does_not_fallback() {
+        let _guard = PREF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_engine(SearchEngine::Google);
         let loader = FakeLoader::new(vec![Ok(PagePayload {
             title: "必应空页".into(),
             url: "https://www.bing.com/search?q=x".into(),
@@ -770,7 +1020,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_google_results_are_used_directly() {
+        let _guard = PREF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_engine(SearchEngine::Bing);
+        let loader = FakeLoader::new(vec![Ok(page_with_results("google-serp", &[
+            "https://zhuanlan.zhihu.com/p/1",
+        ]))]);
+        let tool = WebBrowserTool::new(loader.clone());
+        let result = tool
+            .execute(json!({"action": "search", "query": "x", "engine": "google"}))
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("谷歌检索"), "{}", result.content);
+        assert_eq!(loader.calls().len(), 1);
+        assert!(loader.calls()[0].contains("google.com"));
+    }
+
+    #[tokio::test]
     async fn baidu_results_are_used_directly_when_requested() {
+        let _guard = PREF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_preferred_engine(SearchEngine::Bing);
         let loader = FakeLoader::new(vec![Ok(page_with_results("baidu-serp", &[
             "https://zhuanlan.zhihu.com/p/1",
         ]))]);
@@ -796,7 +1065,7 @@ mod tests {
     #[tokio::test]
     async fn search_rejects_unknown_engine() {
         let result = tool()
-            .execute(json!({"action": "search", "query": "x", "engine": "google"}))
+            .execute(json!({"action": "search", "query": "x", "engine": "doge"}))
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("未知搜索引擎"));
@@ -834,9 +1103,46 @@ mod tests {
         assert!(baidu.starts_with("https://www.baidu.com/s?"));
         assert!(baidu.contains("wd=%E5%85%AB%E5%8D%A6%E5%9B%BE"));
 
-        // 空引擎默认 bing；未知引擎 None。
+        let google = build_search_url("google", "八卦图").unwrap();
+        assert!(google.starts_with("https://www.google.com/search?"));
+        assert!(google.contains("q=%E5%85%AB%E5%8D%A6%E5%9B%BE"));
+
+        // 空引擎默认 bing；大小写与中文名均接受；未知引擎 None。
         assert!(build_search_url("", "x").unwrap().contains("bing.com"));
+        assert!(build_search_url("Google", "x").unwrap().contains("google.com"));
+        assert!(build_search_url("谷歌", "x").unwrap().contains("google.com"));
         assert!(build_search_url("doge", "x").is_none());
+    }
+
+    #[test]
+    fn engine_parse_and_fallback_chain() {
+        assert_eq!(SearchEngine::parse("bing"), Some(SearchEngine::Bing));
+        assert_eq!(SearchEngine::parse(""), Some(SearchEngine::Bing));
+        assert_eq!(SearchEngine::parse("doge"), None);
+
+        // 谷歌首选 → bing → baidu（用户示例链）；bing/baidu 首选不掺谷歌
+        // （不可达环境插中段只会白等超时）。
+        assert_eq!(
+            fallback_chain(SearchEngine::Google),
+            vec![SearchEngine::Google, SearchEngine::Bing, SearchEngine::Baidu]
+        );
+        assert_eq!(
+            fallback_chain(SearchEngine::Bing),
+            vec![SearchEngine::Bing, SearchEngine::Baidu]
+        );
+        assert_eq!(
+            fallback_chain(SearchEngine::Baidu),
+            vec![SearchEngine::Baidu, SearchEngine::Bing]
+        );
+    }
+
+    #[test]
+    fn preferred_engine_slot_roundtrip() {
+        let _guard = PREF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let original = preferred_engine();
+        set_preferred_engine(SearchEngine::Google);
+        assert_eq!(preferred_engine(), SearchEngine::Google);
+        set_preferred_engine(original);
     }
 
     #[test]
@@ -862,7 +1168,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let result = format_search_page(&page, "bing", "检索词");
+        let result = format_search_page(&page, SearchEngine::Bing, "检索词");
         assert!(!result.is_error);
         assert!(result.content.contains("8 条结果"));
         assert!(result.content.contains("[1] 结果0"));
@@ -880,7 +1186,7 @@ mod tests {
             text: "页面正文".into(),
             results: vec![],
         };
-        let result = format_search_page(&page, "baidu", "检索词");
+        let result = format_search_page(&page, SearchEngine::Baidu, "检索词");
         assert!(!result.is_error);
         assert!(result.content.contains("未解析出结果"));
         assert!(result.content.contains("页面正文"));
@@ -889,7 +1195,7 @@ mod tests {
     #[test]
     fn search_page_errors_when_nothing_usable() {
         let page = PagePayload::default();
-        let result = format_search_page(&page, "bing", "检索词");
+        let result = format_search_page(&page, SearchEngine::Bing, "检索词");
         assert!(result.is_error);
     }
 
@@ -940,7 +1246,7 @@ mod tests {
 
     #[test]
     fn parse_extracts_bing_results() {
-        let page = html::parse(BING_FIXTURE);
+        let page = html::parse(BING_FIXTURE, "https://www.bing.com/search?q=%E5%85%AB%E5%8D%A6%E5%9B%BE");
         assert_eq!(page.title, "八卦图 起源 - 搜索");
         assert_eq!(page.results.len(), 2);
         assert_eq!(
@@ -955,7 +1261,7 @@ mod tests {
 
     #[test]
     fn parse_text_strips_script_and_decodes_entities() {
-        let page = html::parse(BING_FIXTURE);
+        let page = html::parse(BING_FIXTURE, "https://www.bing.com/search?q=%E5%85%AB%E5%8D%A6%E5%9B%BE");
         assert!(!page.text.contains("var x=1"));
         assert!(page.text.contains("基本含义：八卦以阴、阳二爻为基元。"));
         let decoded = html::text_from_html("<p>a &amp; b &lt;c&gt; &#20843; &#x5366;</p>");
@@ -965,7 +1271,7 @@ mod tests {
     #[test]
     fn parse_baidu_results() {
         let fixture = "<html><head><title>八卦图_百度搜索</title></head><body><div id=\"content_left\"><div class=\"result c-container new-pmd\"><h3 class=\"t\"><a href=\"https://baike.baidu.com/item/八卦图\">八卦图_百度百科</a></h3><div class=\"c-abstract\">八卦源自《周易》。</div></div><div class=\"result c-container\"><h3 class=\"t\"><a href=\"https://zhidao.baidu.com/q/1\">八卦图的起源</a></h3></div></div></body></html>";
-        let page = html::parse(fixture);
+        let page = html::parse(fixture, "https://www.baidu.com/s?wd=八卦图");
         assert_eq!(page.results.len(), 2);
         assert_eq!(page.results[0].url, "https://baike.baidu.com/item/八卦图");
         assert!(page.results[0].snippet.contains("周易"));
@@ -975,7 +1281,7 @@ mod tests {
     #[test]
     fn parse_non_ser_page_keeps_text_only() {
         let fixture = "<html><head><title>文章页</title></head><body><p>第一段</p><p>第二段</p></body></html>";
-        let page = html::parse(fixture);
+        let page = html::parse(fixture, "https://example.com/article");
         assert!(page.results.is_empty());
         assert_eq!(page.text, "第一段\n第二段");
     }
@@ -988,7 +1294,7 @@ mod tests {
 <article><h1>标题党不重要</h1><p>正文第一段，讲清楚来龙去脉。</p><p>正文第二段，给出结论。</p></article>\
 <footer>关于我们 联系方式 版权声明 友情链接</footer>\
 <aside>相关推荐：另一篇文章</aside></body></html>";
-        let page = html::parse(fixture);
+        let page = html::parse(fixture, "https://example.com/article");
         assert!(page.text.contains("正文第一段"));
         assert!(page.text.contains("正文第二段"));
         assert!(!page.text.contains("登录 注册"), "{}", page.text);
@@ -1000,7 +1306,7 @@ mod tests {
     fn parse_bing_drops_ad_entries() {
         // 必应商业推广：b_ad 类名或「赞助商」角标条目丢弃。
         let fixture = r#"<html><head><title>t - 搜索</title></head><body><ul id="b_results"><li class="b_algo"><h2><a href="https://ad.example.com/buy">赞助内容标题</a></h2><div class="b_adBadge">赞助商</div></li><li class="b_algo"><h2><a href="https://organic.example.com/1">自然结果一</a></h2><div class="b_caption"><p>真实摘要</p></div></li><li class="b_algo"><h2><a href="https://ad2.example.com/x">推广二</a></h2><span class="b_ad">Ad</span></li></ul></body></html>"#;
-        let page = html::parse(fixture);
+        let page = html::parse(fixture, "https://www.bing.com/search?q=x");
         let urls: Vec<&str> = page.results.iter().map(|e| e.url.as_str()).collect();
         assert_eq!(urls, vec!["https://organic.example.com/1"], "{urls:?}");
     }
@@ -1012,10 +1318,46 @@ mod tests {
 <div class=\"result c-container\"><h3 class=\"t\"><a href=\"https://www.baidu.com/link?url=AD1\">广告二</a></h3><div class=\"c-abstract\">买它</div></div>\
 <div class=\"result c-container\"><h3 class=\"t\"><a href=\"https://www.baidu.com/link?url=ORGANIC1\">自然结果一</a></h3><div class=\"c-abstract\">真实摘要</div></div>\
 </div></body></html>";
-        let page = html::parse(fixture);
+        let page = html::parse(fixture, "https://www.baidu.com/s?wd=测试");
         let urls: Vec<&str> = page.results.iter().map(|e| e.url.as_str()).collect();
         assert!(urls.contains(&"https://www.baidu.com/link?url=ORGANIC1"), "{urls:?}");
         assert!(!page.results.iter().any(|e| e.title.contains("推广条目")), "{urls:?}");
+    }
+
+    /// 谷歌桌面 SERP fixture：h3 在 a 内、摘要在 VwiC3b 容器（真实结构近似）。
+    #[test]
+    fn parse_extracts_google_results() {
+        let fixture = "<html><head><title>八卦图 - Google 搜索</title></head><body><div id=\"search\">\
+<div class=\"g\"><a href=\"https://zh.wikipedia.org/wiki/八卦\"><h3 class=\"LC20lb\">八卦 - 维基百科</h3></a>\
+<div class=\"VwiC3b\">八卦是《易经》的基本概念。</div></div>\
+<div class=\"g\"><a href=\"/url?q=https%3A%2F%2Fbaike.baidu.com%2Fitem%2F%25E5%2585%25AB%25E5%258D%25A6&sa=U\"><h3>八卦_百度百科</h3></a>\
+<div class=\"VwiC3b\">八卦源于中国古代。</div></div>\
+<div class=\"g\"><a href=\"https://www.google.com/url?q=https%3A%2F%2Fzhidao.baidu.com%2Fq%2F1&sa=U\"><h3>绝对跳转条目</h3></a></div>\
+<div class=\"g\"><a href=\"https://www.google.com/aclk?sa=l&adurl=https://ad.example.com\"><h3>广告条目</h3></a></div>\
+</div></body></html>";
+        let page = html::parse(fixture, "https://www.google.com/search?q=八卦");
+        let urls: Vec<&str> = page.results.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://zh.wikipedia.org/wiki/八卦",
+                "https://baike.baidu.com/item/%E5%85%AB%E5%8D%A6",
+                "https://zhidao.baidu.com/q/1",
+            ],
+            "{urls:?}"
+        );
+        assert_eq!(page.results[0].title, "八卦 - 维基百科");
+        assert!(page.results[0].snippet.contains("《易经》"), "{}", page.results[0].snippet);
+        assert!(page.results[1].snippet.contains("中国古代"));
+    }
+
+    /// 谷歌 URL 但页面无 SERP 结构（拦截页/同意页）→ 不误产出结果条目。
+    #[test]
+    fn parse_google_without_h3_keeps_text_only() {
+        let fixture = "<html><head><title>Before you continue</title></head><body><p>consent</p></body></html>";
+        let page = html::parse(fixture, "https://www.google.com/search?q=x");
+        assert!(page.results.is_empty());
+        assert!(page.text.contains("consent"));
     }
 
     #[test]

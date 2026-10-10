@@ -17,6 +17,8 @@
 //! - `/search dis|en <provider>`：运行期禁用/启用方式并同步写回 rclaw.toml。
 //! - `/searchfallback [on|off]`：开关 `web_search` 的主→辅 fallback（关闭后只用主搜索源，
 //!   失败也不回退），同步写回 rclaw.toml。
+//! - `/webbrowser [google|bing|baidu]`：查看/切换 `web_browser` 无头浏览器检索的
+//!   首选搜索引擎，热切换并同步写回 rclaw.toml 的 `[web_browser].engine`。
 //! - `/skills`：由 turn 命令分发器列出当前 workspace 可发现的 skill 名称、所属技能包与功能。
 //! - `/tools`：由 turn 命令分发器列出当前注册的全部工具名称与说明。
 //! - `/log`：由 turn 命令分发器查看 / 发送 / 删除 agent/logs 下的日志文件。
@@ -26,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rclaw_llm::SwappableProvider;
-use rclaw_tools::{BackendId, WebSearchControl};
+use rclaw_tools::{web_browser, BackendId, WebSearchControl};
 
 /// 斜杠命令处理结果。
 pub enum CommandOutcome {
@@ -124,7 +126,8 @@ impl SlashRegistry {
     /// 尝试把一条消息正文当作斜杠命令处理。
     ///
     /// - 非 `/` 开头 → [`CommandOutcome::NotACommand`]，放行进 LLM；
-    /// - `/` 后是已知命令名（`llmodel` / `search` / `searchfallback` / `help`）→ 执行命令并返回回复；
+    /// - `/` 后是已知命令名（`llmodel` / `search` / `searchfallback` / `webbrowser` /
+    ///   `help`）→ 执行命令并返回回复；
     /// - `/` 后是未知名（如 `/etc/hosts`、`/typo`）→ 也放行进 LLM。
     ///   RClaw 常处理文件路径 / shell 片段，未知名若一律报错会误伤用户想发给模型的内容；
     ///   因此只有明确命中的命令才拦截，用 `/help` 发现可用命令。
@@ -143,6 +146,7 @@ impl SlashRegistry {
             "llmodel" => CommandOutcome::Handled(self.handle_llmodel(args)),
             "search" => CommandOutcome::Handled(self.handle_search(args)),
             "searchfallback" => CommandOutcome::Handled(self.handle_searchfallback(args)),
+            "webbrowser" => CommandOutcome::Handled(self.handle_webbrowser(args)),
             "help" => CommandOutcome::Handled(self.help_text()),
             _ => CommandOutcome::NotACommand,
         }
@@ -335,6 +339,53 @@ impl SlashRegistry {
         )
     }
 
+    /// `/webbrowser [google|bing|baidu]`：查看/切换 web_browser 无头浏览器检索
+    /// 的首选搜索引擎。无参回显当前引擎与降级链；有参热切换（进程级槽位）
+    /// 并同步写回 rclaw.toml 的 `[web_browser].engine`（段缺失时创建）。
+    /// 写盘失败时运行时状态不改动，与 /search 的语义一致。
+    fn handle_webbrowser(&self, args: &str) -> String {
+        let input = args.split_whitespace().next().unwrap_or("");
+        if input.is_empty() {
+            let primary = web_browser::preferred_engine();
+            let chain = web_browser::fallback_chain(primary)
+                .iter()
+                .map(|engine| engine.label())
+                .collect::<Vec<_>>()
+                .join(" → ");
+            return format!(
+                "web_browser 首选搜索引擎：{}（{}）\n无结果自动降级：{}\n用法：/webbrowser <google|bing|baidu>",
+                primary.label(),
+                primary.as_str(),
+                chain
+            );
+        }
+        let Some(engine) = web_browser::SearchEngine::parse(input) else {
+            return format!("未知搜索引擎「{input}」。支持：google / bing / baidu");
+        };
+        let _mutation = match self.config_mutation.lock() {
+            Ok(guard) => guard,
+            Err(_) => return "配置修改锁已损坏，未切换搜索引擎。".into(),
+        };
+        if let Err(error) = rclaw_store::toml_file::RclawToml::new(&self.config_path)
+            .set_web_browser_engine(engine.as_str())
+        {
+            return format!("写入 rclaw.toml 失败，运行时引擎未改动：{error}");
+        }
+        web_browser::set_preferred_engine(engine);
+        tracing::info!(engine = engine.as_str(), "用户通过 /webbrowser 切换首选搜索引擎");
+        format!(
+            "✅ web_browser 首选搜索引擎已切换为 {}（{}）；无结果时自动降级：{}",
+            engine.label(),
+            engine.as_str(),
+            web_browser::fallback_chain(engine)
+                .iter()
+                .skip(1)
+                .map(|next| next.label())
+                .collect::<Vec<_>>()
+                .join(" → ")
+        )
+    }
+
     /// `/help`：列出可用命令。`/search` 行附带当前 web_search 顺序与 fallback 开关状态，
     /// 让用户一眼看出当前主搜索方式及自动降级是否开启。
     fn help_text(&self) -> String {
@@ -354,6 +405,7 @@ impl SlashRegistry {
              /search [方式]       显示状态或把指定方式移到首位 {search_status}\n\
              /search dis|en <方式>  禁用/启用 zhipu、tavily、doubao-custom、doubao-global\n\
              /searchfallback <on|off>  开关 web_search fallback（关闭后只用主搜索源，失败也不回退）；状态见上方 /search 行\n\
+             /webbrowser [引擎]   查看/切换 web_browser 无头浏览器检索的首选引擎（google / bing / baidu，热切换并同步 rclaw.toml）\n\
              /skills            显示当前支持的所有 skill 名称、所属技能包及功能\n\
              /tools             显示当前支持的所有工具名称及说明\n\
              /context           显示当前会话上下文用量（窗口/已用/剩余/使用率）\n\

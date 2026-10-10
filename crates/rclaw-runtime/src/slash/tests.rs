@@ -265,6 +265,129 @@ fn search_commands_do_not_change_runtime_when_persistence_fails() {
     assert!(control.fallback_enabled());
 }
 
+/// /webbrowser 只动进程级首选引擎槽位，测试后恢复原值，避免污染同进程其它用例。
+/// guard 创建即持有进程级互斥锁：cargo test 各用例跑在并行线程上，槽位是
+/// 全局单槽，不串行化会互相踩（与 rclaw-tools 测试的 PREF_LOCK 同一方案）。
+struct PreferredEngineGuard(
+    std::sync::MutexGuard<'static, ()>,
+    rclaw_tools::SearchEngine,
+);
+
+static WEBBROWSER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl PreferredEngineGuard {
+    fn save() -> Self {
+        let lock = WEBBROWSER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        PreferredEngineGuard(lock, rclaw_tools::web_browser::preferred_engine())
+    }
+}
+
+impl Drop for PreferredEngineGuard {
+    fn drop(&mut self) {
+        rclaw_tools::web_browser::set_preferred_engine(self.1);
+    }
+}
+
+#[test]
+fn webbrowser_no_args_shows_current_engine() {
+    let _guard = PreferredEngineGuard::save();
+    rclaw_tools::web_browser::set_preferred_engine(rclaw_tools::SearchEngine::Bing);
+    let reg = make_registry();
+    let CommandOutcome::Handled(resp) = reg.try_handle("/webbrowser") else {
+        panic!("应为 Handled");
+    };
+    assert!(resp.contains("首选搜索引擎"), "{resp}");
+    assert!(resp.contains("用法"), "{resp}");
+}
+
+#[test]
+fn webbrowser_switches_engine_and_persists() {
+    let _guard = PreferredEngineGuard::save();
+    rclaw_tools::web_browser::set_preferred_engine(rclaw_tools::SearchEngine::Bing);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rclaw.toml");
+    std::fs::write(&path, web_search_config_text()).unwrap();
+    let provider = Arc::new(SwappableProvider::new(zhipu_fixture()).expect("build swappable"));
+    let reg = SlashRegistry::new(provider, path.clone(), "zhipu".into());
+
+    let CommandOutcome::Handled(resp) = reg.try_handle("/webbrowser google") else {
+        panic!("应为 Handled");
+    };
+    assert!(resp.contains("谷歌"), "{resp}");
+    assert_eq!(
+        rclaw_tools::web_browser::preferred_engine(),
+        rclaw_tools::SearchEngine::Google
+    );
+    // 段原本不存在 → 创建 [web_browser].engine；web_search 段保真。
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[web_browser]"), "{text}");
+    assert!(text.contains("engine = \"google\""), "{text}");
+    assert!(text.contains("[web_search]"), "{text}");
+
+    // 再切 baidu：覆盖不重复。
+    let CommandOutcome::Handled(resp) = reg.try_handle("/webbrowser baidu") else {
+        panic!("应为 Handled");
+    };
+    assert!(resp.contains("百度"), "{resp}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("engine =").count(), 1, "{text}");
+    assert!(text.contains("engine = \"baidu\""), "{text}");
+
+    // 中文名与大小写容错。
+    let CommandOutcome::Handled(resp) = reg.try_handle("/webbrowser 谷歌") else {
+        panic!("应为 Handled");
+    };
+    assert!(resp.contains("谷歌"), "{resp}");
+    assert_eq!(
+        rclaw_tools::web_browser::preferred_engine(),
+        rclaw_tools::SearchEngine::Google
+    );
+}
+
+#[test]
+fn webbrowser_unknown_engine_rejected() {
+    let _guard = PreferredEngineGuard::save();
+    rclaw_tools::web_browser::set_preferred_engine(rclaw_tools::SearchEngine::Bing);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rclaw.toml");
+    std::fs::write(&path, "[web_browser]\nengine = \"bing\"\n").unwrap();
+    let provider = Arc::new(SwappableProvider::new(zhipu_fixture()).expect("build swappable"));
+    let reg = SlashRegistry::new(provider, path.clone(), "zhipu".into());
+
+    let CommandOutcome::Handled(resp) = reg.try_handle("/webbrowser doge") else {
+        panic!("应为 Handled");
+    };
+    assert!(resp.contains("未知搜索引擎"), "{resp}");
+    // 未识别引擎不落盘、不改运行时。
+    assert_eq!(
+        rclaw_tools::web_browser::preferred_engine(),
+        rclaw_tools::SearchEngine::Bing
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("engine = \"bing\""), "{text}");
+}
+
+#[test]
+fn webbrowser_does_not_change_runtime_when_persistence_fails() {
+    let _guard = PreferredEngineGuard::save();
+    rclaw_tools::web_browser::set_preferred_engine(rclaw_tools::SearchEngine::Bing);
+    let dir = tempfile::tempdir().unwrap();
+    let missing_path = dir.path().join("missing").join("rclaw.toml");
+    let provider = Arc::new(SwappableProvider::new(zhipu_fixture()).expect("build swappable"));
+    let reg = SlashRegistry::new(provider, missing_path, "zhipu".into());
+
+    let CommandOutcome::Handled(resp) = reg.try_handle("/webbrowser google") else {
+        panic!("应为 Handled");
+    };
+    assert!(resp.contains("运行时引擎未改动"), "{resp}");
+    assert_ne!(
+        rclaw_tools::web_browser::preferred_engine(),
+        rclaw_tools::SearchEngine::Google
+    );
+}
+
 fn search_control() -> Arc<WebSearchControl> {
     Arc::new(
         WebSearchControl::new(

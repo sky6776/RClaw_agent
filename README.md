@@ -268,7 +268,7 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 | `memory` | 操作 MEMORY.md / USER.md：list / add / replace / remove / batch，预算制上限 + 写入脱敏 |
 | `session_search` | 跨会话（含归档会话）关键词检索，AND 语义 + 词频计分，召回"上次那个问题怎么解决的" |
 | `web_search` | 多来源高可用搜索池（豆包 Custom / Tavily 多 Key / 智谱 MCP / 豆包 Global），额度与熔断自动切换，可补读正文 |
-| `web_browser` | 浏览器式网页抓取与阅读 |
+| `web_browser` | 浏览器式网页抓取与阅读；检索引擎可配置（`[web_browser].engine` 或 `/webbrowser`，google/bing/baidu，搜不到自动依次换备用引擎，备选顺序 必应→百度） |
 | `tavily_extract` | Tavily 正文抽取 |
 
 ### 技能管理

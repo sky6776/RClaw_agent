@@ -146,6 +146,15 @@ max_results = 20
 max_snippet_tokens = 1000
 
 
+# ── web_browser（可选）：无头浏览器检索的搜索引擎偏好 ─────────────────────────
+# `web_browser` 工具 action=search 的首选引擎。整段可省略（缺省 bing，与历史一致）。
+# 首选引擎搜不到时自动依次换备用引擎（备选顺序：必应 → 百度）；google 只作首选，需要网络直连可达。
+# 用户在对话里显式指定引擎时（如「用 web_browser 搜 bing 上的…」）只用该家，不降级。
+# 会话内热切换用 /webbrowser <google|bing|baidu>（同步写回 rclaw.toml）；改本段需重启生效。
+[web_browser]
+engine = "bing"   # 首选搜索引擎：google / bing / baidu
+
+
 [napcat]
 enabled = false                  # true 启用 NapCatQQ 通道（OneBot 11 over WebSocket）
 ws_url = "ws://127.0.0.1:3001"   # NapCat 的 WebSocket 地址（需以 ws:// 或 wss:// 开头，结尾 / 会自动补齐）

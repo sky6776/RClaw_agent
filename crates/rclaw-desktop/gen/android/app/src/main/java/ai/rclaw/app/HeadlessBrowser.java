@@ -20,7 +20,7 @@ final class HeadlessBrowser {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     + "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-    /** 页面提取 JS：按域名分派（bing/baidu 结果列表选择器，过滤广告条目），
+    /** 页面提取 JS：按域名分派（bing/baidu/google 结果列表选择器，过滤广告条目），
      *  正文按 Readability 式启发式取段落密度最高的主文区域；返回 JSON 字符串
      *  （evaluateJavascript 回调拿到的是它的 JSON 字符串字面量）。 */
     private static final String EXTRACT_JS = "(function () {\n"
@@ -31,6 +31,7 @@ final class HeadlessBrowser {
             + "  }\n"
             + "  var host = location.hostname || \"\";\n"
             + "  var seen = {};\n"
+            + "  function safeDecode(s) { try { return decodeURIComponent(s); } catch (e) { return \"\"; } }\n"
             + "  function push(title, url, snippet) {\n"
             + "    if (!url || seen[url]) return;\n"
             + "    seen[url] = true;\n"
@@ -45,6 +46,21 @@ final class HeadlessBrowser {
             + "      if (!a) continue;\n"
             + "      var cap = li.querySelector(\".b_caption p, .b_algoSlug, .b_caption\");\n"
             + "      push(a.textContent, a.href, cap ? cap.textContent : \"\");\n"
+            + "    }\n"
+            + "  } else if (host.indexOf(\"google.\") >= 0) {\n"
+            + "    var links = document.querySelectorAll(\"a h3\");\n"
+            + "    for (var g = 0; g < links.length && out.results.length < 10; g++) {\n"
+            + "      var gh = links[g];\n"
+            + "      var ga = gh.closest(\"a\");\n"
+            + "      if (!ga || !ga.href) continue;\n"
+            + "      var gurl = ga.href;\n"
+            + "      if (gurl.indexOf(\"/aclk\") >= 0 || gurl.indexOf(\"googleadservices\") >= 0) continue;\n"
+            + "      var gm = gurl.match(/^.*\\/url\\?q=([^&]+)/);\n"
+            + "      if (gm) { gurl = safeDecode(gm[1]); if (!gurl) continue; }\n"
+            + "      if (gurl.indexOf(\"http\") !== 0) continue;\n"
+            + "      var gbox = gh.closest(\"div.g\") || gh.parentElement;\n"
+            + "      var gsnip = gbox ? gbox.querySelector(\".VwiC3b\") : null;\n"
+            + "      push(gh.textContent, gurl, gsnip ? gsnip.textContent : \"\");\n"
             + "    }\n"
             + "  } else if (host.indexOf(\"baidu.com\") >= 0) {\n"
             + "    var links = document.querySelectorAll(\"#content_left h3 a\");\n"

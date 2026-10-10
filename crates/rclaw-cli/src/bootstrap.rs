@@ -138,6 +138,15 @@ pub async fn assemble_core_with(
         None => rclaw_tools::clear_skill_output_limit(),
     }
 
+    // [web_browser] 检索引擎偏好：注入进程级槽位（web_browser 工具与 /webbrowser
+    // 斜杠命令分属不同 crate，槽位模式对齐上面的 set_skill_output_limit）。
+    // 配置已在 finish_load 校验过；解析失败时保留槽位现值（bing），不阻断装配。
+    if let Some(engine) =
+        rclaw_tools::web_browser::SearchEngine::parse(cfg.web_browser.engine.trim())
+    {
+        rclaw_tools::web_browser::set_preferred_engine(engine);
+    }
+
     // Provider（DeepSeek / 智谱等 OpenAI 兼容）。SwappableProvider 支持 /llmodel 热切换。
     let pcfg = cfg.build_provider_config()?;
     let hot = Arc::new(SwappableProvider::new(pcfg)?);

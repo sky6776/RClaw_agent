@@ -56,7 +56,10 @@ pub use skill_usage::{
     SkillLifecycleRecord, SkillOwner, SkillState, SkillUsageStore,
 };
 pub use truncate::{head_tail_truncate, HeadTailBuffer, HeadTailOutput};
-pub use web_browser::{HeadlessBrowserLoader, PageLoader, PagePayload, SearchEntry, WebBrowserTool};
+pub use web_browser::{
+    preferred_engine, set_preferred_engine, HeadlessBrowserLoader, PageLoader, PagePayload,
+    SearchEngine, SearchEntry, WebBrowserTool,
+};
 pub use web_search::{
     BackendError, BackendErrorKind, BackendId, BackendStatus, DoubaoBackend, DoubaoSearchConfig,
     DoubaoVariant, HealthStatus, ProviderSearchTool, ReadResponse, ReaderBackend, SearchBackend,
