@@ -21,8 +21,11 @@ use crate::wizard::{self, WizardParams};
 // 不做自动下载安装；Android 侧载分发 = 重装 APK，桌面 = 下载安装包）。
 // ---------------------------------------------------------------------------
 
-/// 仓库 coordinates：releases 以 GitHub Release 发布（tag 形如 v0.2.0）。
-const UPDATE_REPO_API: &str = "https://api.github.com/repos/sky6776/RClaw/releases/latest";
+/// 仓库 coordinates：releases 以 GitHub Release 发布（tag 形如 v2.5.7）。
+/// 注意 /releases/latest 只返回正式 release（不含 prerelease）——CI 每次推送
+/// 发布的 nightly 是 prerelease，不参与更新检查；发正式版走「升版本号 + 打
+/// 正式 tag」（见 .github/workflows/release.yml 注释）。
+const UPDATE_REPO_API: &str = "https://api.github.com/repos/sky6776/RClaw_agent/releases/latest";
 
 /// 检查更新结果。
 #[derive(Debug, Serialize)]
