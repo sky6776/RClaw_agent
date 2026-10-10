@@ -206,6 +206,10 @@ jobs:
           npm run build
 
       - name: Rust single .so (librclaw_desktop.so, aarch64, apk-host)
+        env:
+          # 全局 CARGO_TERM_COLOR=always 会让 error 行带 ANSI 码，害得诊断 grep 落空；
+          # 此步骤用纯文本输出，失败时 error 行才能被注释步骤按行首 ^error 命中。
+          CARGO_TERM_COLOR: never
         run: |
           set -o pipefail
           cargo ndk -t arm64-v8a build -p rclaw-desktop --features apk-host,tauri/custom-protocol --release 2>&1 | tee ndk_build.log
@@ -214,9 +218,8 @@ jobs:
       - name: Surface cargo errors as annotations
         if: failure()
         run: |
-          grep -E "^error" ndk_build.log | head -25 | while IFS= read -r line; do echo "::error::$line"; done
-          { echo "### ndk_build.log tail"; echo '```'; tail -40 ndk_build.log; echo '```'; } \
-            >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
+          grep -aE "^error" ndk_build.log | head -25 | while IFS= read -r line; do echo "::error::$line"; done
+          tail -40 ndk_build.log > ndk_tail.txt || true
 
       - name: Copy .so to jniLibs
         run: |
