@@ -1,0 +1,295 @@
+# =============================================================================
+# 每次推送到 main：自动构建三种产物并发布到 GitHub Release（rolling tag nightly）。
+#   1. RClaw-android-arm64.apk        安卓 arm64 安装包（debug/release 签名自适应）
+#   2. RClaw-desktop-portable-win64.zip  Windows 桌面免安装版（解压即用）
+#   3. RClaw-termux-aarch64.zip       Termux 用的 aarch64 二进制（release-termux profile）
+#
+# 步骤完全对齐本机构建脚本（build-android-apk.bat / build-windows.cmd）：
+#   - 前端 ui/dist 必须先于 cargo 构建（tauri 编译期内嵌前端资源）；
+#   - APK：cargo ndk 出单 .so → whisper JNI 库 → gradle -x rustBuild（.so 已就位）；
+#     tauri.settings.gradle / tauri.properties 由 tauri-build 在 cargo 步骤生成
+#     （需 TAURI_ANDROID_PROJECT_PATH），因此 cargo 步骤必须先于 gradle。
+#   - 签名：仓库 secrets 配置 RCLAW_KEYSTORE_BASE64 + RCLAW_KEYSTORE_PASSWORD 时
+#     自动启用 release 签名（keystore 解码到 gen/android/app/rclaw-release.keystore，
+#     alias rclaw）；未配置时 gradle 自动回退 debug 签名（可直接安装，与本地行为一致）。
+# =============================================================================
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 桌面免安装版（Windows）：前端 → cargo release → exe 打 zip
+  # ---------------------------------------------------------------------------
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build frontend (ui/dist)
+        working-directory: crates/rclaw-desktop/ui
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Build desktop binary
+        run: cargo build --release -p rclaw-desktop
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\rclaw-desktop.exe dist\
+          @'
+          RClaw 桌面版（免安装版）
+
+          使用：解压到任意目录，双击 rclaw-desktop.exe 运行。
+            - 需要 WebView2 Runtime（Windows 10/11 通常已内置）。
+            - 用户数据目录：%USERPROFILE%\.rclaw（rclaw.toml 与 agent/ 工作区）。
+            - 关闭窗口 = 隐藏到托盘；托盘菜单「退出」才结束进程。
+          '@ | Set-Content -Path dist\README.txt -Encoding utf8
+          Compress-Archive -Path dist\rclaw-desktop.exe, dist\README.txt `
+            -DestinationPath dist\RClaw-desktop-portable-win64.zip -Force
+          Remove-Item dist\rclaw-desktop.exe, dist\README.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-portable
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Termux 二进制（ubuntu 交叉编译 aarch64-linux-android，release-termux profile）
+  # 用 cargo-ndk：除 linker 外还需它导出的目标 C 编译器环境变量（ring 等 C 依赖）
+  # ---------------------------------------------------------------------------
+  termux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          sdkmanager --install "ndk;29.0.14206865" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Build rclaw (release-termux profile)
+        run: cargo ndk -t arm64-v8a build --profile release-termux -p rclaw-cli
+
+      - name: Package termux zip
+        run: |
+          mkdir -p dist/pkg
+          cp target/aarch64-linux-android/release-termux/rclaw dist/pkg/
+          cp rclaw.toml.example dist/pkg/
+          cat > dist/pkg/README.txt <<'EOF'
+          RClaw Termux 版（aarch64）
+
+          使用：解压后在 Termux 里
+            pkg install python            # 技能脚本依赖
+            cp rclaw.toml.example rclaw.toml   # 填入 api_key
+            chmod +x rclaw && ./rclaw
+          EOF
+          (cd dist/pkg && zip -qr ../RClaw-termux-aarch64.zip .)
+          rm -rf dist/pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termux-aarch64
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 安卓 APK（ubuntu）：前端 → cargo ndk .so → whisper JNI 库 → gradle release
+  # ---------------------------------------------------------------------------
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    env:
+      WRY_ANDROID_PACKAGE: ai.rclaw.app
+      TAURI_ANDROID_PACKAGE_UNESCAPED: ai.rclaw.app
+      WRY_ANDROID_LIBRARY: rclaw_desktop
+      RCLAW_KEYSTORE_PASSWORD: ${{ secrets.RCLAW_KEYSTORE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK components (NDK / platform / build-tools)
+        run: |
+          sdkmanager --install "ndk;29.0.14206865" "platforms;android-36" \
+            "build-tools;36.0.0" "platform-tools" > /dev/null
+          {
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865"
+            echo "NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865"
+            echo "NDK_ROOT=$ANDROID_HOME/ndk/29.0.14206865"
+            # tauri-build 据此生成 tauri.settings.gradle / tauri.properties
+            echo "TAURI_ANDROID_PROJECT_PATH=$GITHUB_WORKSPACE/crates/rclaw-desktop/gen/android"
+            echo "WRY_ANDROID_KOTLIN_FILES_OUT_DIR=$GITHUB_WORKSPACE/crates/rclaw-desktop/gen/android/app/src/main/java/ai/rclaw/app/generated"
+            echo "RCLAW_BUILD_PYTHON=python3"
+          } >> "$GITHUB_ENV"
+
+      - name: Build frontend (ui/dist)
+        working-directory: crates/rclaw-desktop/ui
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Rust single .so (librclaw_desktop.so, aarch64, apk-host)
+        run: cargo ndk -t arm64-v8a build -p rclaw-desktop --features apk-host,tauri/custom-protocol --release
+
+      - name: Copy .so to jniLibs
+        run: |
+          JNI_DIR=crates/rclaw-desktop/gen/android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$JNI_DIR"
+          cp target/aarch64-linux-android/release/librclaw_desktop.so "$JNI_DIR/"
+
+      - name: Build whisper JNI lib (librclaw_whisper.so)
+        run: |
+          command -v ninja >/dev/null || sudo apt-get install -y ninja-build
+          JNI_DIR=crates/rclaw-desktop/gen/android/app/src/main/jniLibs/arm64-v8a
+          if [ ! -f "$JNI_DIR/librclaw_whisper.so" ]; then
+            [ -d third_party/whisper.cpp/.git ] || \
+              git clone --depth 1 https://github.com/ggml-org/whisper.cpp third_party/whisper.cpp
+            cmake -S third_party/whisper-jni -B build-whisper/arm64 -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
+            cmake --build build-whisper/arm64 --parallel
+            mkdir -p "$JNI_DIR"
+            cp build-whisper/arm64/librclaw_whisper.so "$JNI_DIR/"
+          fi
+
+      - name: Download bundled whisper model (ggml-base-q5_1.bin)
+        run: |
+          MODEL_DIR=crates/rclaw-desktop/gen/android/app/src/main/assets/models
+          MODEL_FILE="$MODEL_DIR/ggml-base-q5_1.bin"
+          if [ ! -f "$MODEL_FILE" ]; then
+            mkdir -p "$MODEL_DIR"
+            curl -fL --retry 2 -o "$MODEL_FILE" \
+              "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin" \
+            || curl -fL --retry 2 -o "$MODEL_FILE" \
+              "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin"
+          fi
+
+      - name: Restore release keystore from secrets (optional)
+        run: |
+          if [ -n "$RCLAW_KEYSTORE_BASE64" ] && [ -n "$RCLAW_KEYSTORE_PASSWORD" ]; then
+            echo "$RCLAW_KEYSTORE_BASE64" | base64 -d \
+              > crates/rclaw-desktop/gen/android/app/rclaw-release.keystore
+            echo "release 签名：已从 secrets 恢复 keystore"
+          else
+            echo "::notice::未配置 RCLAW_KEYSTORE_BASE64 / RCLAW_KEYSTORE_PASSWORD secrets，release APK 回退 debug 签名（可直接安装）"
+          fi
+        env:
+          RCLAW_KEYSTORE_BASE64: ${{ secrets.RCLAW_KEYSTORE_BASE64 }}
+
+      - name: Gradle assembleArm64Release (skip rustBuild, .so already in place)
+        working-directory: crates/rclaw-desktop/gen/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleArm64Release --no-daemon --no-configuration-cache \
+            -x rustBuildArm64Release -Dkotlin.compiler.execution.strategy=in-process \
+            -PabiList=arm64-v8a -ParchList=arm64 -PtargetList=aarch64
+
+      - name: Collect APK
+        run: |
+          mkdir -p dist
+          cp crates/rclaw-desktop/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk \
+            dist/RClaw-android-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 汇总发布：rolling tag nightly，每次推送删除重建（产物始终最新）
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [desktop, termux, apk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          STAMP="$(date -u +%Y-%m-%d)"
+          cat > notes.md <<EOF
+          自动构建于 push \`$SHORT_SHA\`（$STAMP UTC）。
+
+          | 产物 | 说明 |
+          |---|---|
+          | \`RClaw-android-arm64.apk\` | 安卓 arm64 安装包（Chaquopy Python + whisper 内置） |
+          | \`RClaw-desktop-portable-win64.zip\` | Windows 桌面免安装版（解压即用，需 WebView2 Runtime） |
+          | \`RClaw-termux-aarch64.zip\` | Termux aarch64 二进制（release-termux profile 构建） |
+
+          APK 签名：仓库配置了 \`RCLAW_KEYSTORE_BASE64\` + \`RCLAW_KEYSTORE_PASSWORD\`
+          secrets 时为 release 签名；未配置时为 debug 签名（可直接安装，升级安装需同签名）。
+          EOF
+          gh release delete nightly --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create nightly dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RClaw Nightly $STAMP $SHORT_SHA" \
+            --notes-file notes.md \
+            --prerelease --latest
