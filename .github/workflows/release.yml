@@ -206,7 +206,17 @@ jobs:
           npm run build
 
       - name: Rust single .so (librclaw_desktop.so, aarch64, apk-host)
-        run: cargo ndk -t arm64-v8a build -p rclaw-desktop --features apk-host,tauri/custom-protocol --release
+        run: |
+          set -o pipefail
+          cargo ndk -t arm64-v8a build -p rclaw-desktop --features apk-host,tauri/custom-protocol --release 2>&1 | tee ndk_build.log
+
+      # 失败时把 cargo 的 error 行转成 check-run annotations（API 可读，便于远程诊断）
+      - name: Surface cargo errors as annotations
+        if: failure()
+        run: |
+          grep -E "^error" ndk_build.log | head -25 | while IFS= read -r line; do echo "::error::$line"; done
+          { echo "### ndk_build.log tail"; echo '```'; tail -40 ndk_build.log; echo '```'; } \
+            >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
 
       - name: Copy .so to jniLibs
         run: |
