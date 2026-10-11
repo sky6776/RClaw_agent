@@ -192,10 +192,23 @@ html.android-app textarea {
   border-collapse: collapse;
   margin: 0.5em 0;
 }
+/* 宽表的横向滚动容器（table 组件包了一层 .table-scroll，见 Chat.tsx）：
+   表格按内容取自然宽（w-max），窄于容器时撑满（min-w-full），超出则容器
+   出横向滚动条——列数多时不再把单元格挤成一字一行的竖排。 */
+.md-body .table-scroll {
+  overflow-x: auto;
+}
 .md-body th,
 .md-body td {
   border: 1px solid #2a2f3a;
   padding: 4px 10px;
+  /* 列宽下限：列数多时保住最小可读宽度（不再挤成一字一行）；
+     上限防个别超长单元格把整表撑得过宽，超长文本在格内换行。 */
+  min-width: 3.5rem;
+  max-width: 32rem;
+  overflow-wrap: break-word;
+  white-space: normal;
+  vertical-align: top;
 }
 .md-body a {
   color: #818cf8;
