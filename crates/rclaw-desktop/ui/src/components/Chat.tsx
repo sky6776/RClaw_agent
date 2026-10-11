@@ -932,7 +932,8 @@ export default function Chat({
                 className={`flex flex-col items-end ${
                   selectIds
                     ? "max-w-[70%] cursor-pointer max-md:max-w-[78%]"
-                    : "max-w-full"
+                    : // zcode 同款：窄屏（手机）用户消息可占满全宽，宽屏封顶 36rem。
+                      "max-w-full md:max-w-xl"
                 }`}
                 {...(selectIds ? { onClick: () => toggleSelected(e.id) } : undefined)}
               >
