@@ -264,8 +264,8 @@ function QuoteButton({ onQuote }: { onQuote: () => void }) {
   );
 }
 
-/** 消息一键复制小按钮：贴在气泡下方，点击复制正文（助手消息为剥离媒体
- *  协议行后的文本，与气泡展示一致），短暂显示对勾反馈。 */
+/** 消息一键复制小按钮：贴在消息正文下方，点击复制正文（助手消息为剥离媒体
+ *  协议行后的文本，与消息展示一致），短暂显示对勾反馈。 */
 function CopyButton({
   text,
   onError,
@@ -316,7 +316,7 @@ function ThinkingBlock({
   const body = content.replace(/^💭\s*思考中\.\.\.\n?/, "").trim();
   return (
     <div className="flex justify-start">
-      <div className="max-w-[85%] overflow-hidden rounded-2xl rounded-bl-md border border-dashed border-[#3a4150] bg-[#141821]">
+      <div className="w-full overflow-hidden rounded-2xl rounded-bl-md border border-dashed border-[#3a4150] bg-[#141821]">
         <button
           onClick={(ev) => {
             // 不冒泡：多选模式下点折叠标题不应切换整行选中。
@@ -384,7 +384,7 @@ export default function Chat({
   // 消息多选（null = 非选择模式；Set 为已选条目 id）：长按消息弹统一菜单后
   // 「多选」进入，支持打包发送到其它会话 / 导出文档 / 分享文本。
   const [selectIds, setSelectIds] = useState<Set<number> | null>(null);
-  // 统一消息操作菜单（微信式）：长按 / 右键气泡或媒体卡弹出，含引用 / 复制 /
+  // 统一消息操作菜单（微信式）：长按 / 右键消息或媒体卡弹出，含引用 / 复制 /
   // 多选；长按媒体卡时附带媒体动作（放大 / 保存 / 转发 / 打开）。
   const [msgMenu, setMsgMenu] = useState<{
     entry: Entry;
@@ -565,6 +565,9 @@ export default function Chat({
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+      // 安卓 App：Enter 一律换行不发送（软键盘没有 Shift，回车换行才符合
+      // 手机输入习惯；发送走右侧发送钮）。
+      if (isAndroidDevice()) return;
       e.preventDefault();
       send();
       return;
@@ -929,13 +932,14 @@ export default function Chat({
                 className={`flex flex-col items-end ${
                   selectIds
                     ? "max-w-[70%] cursor-pointer max-md:max-w-[78%]"
-                    : "max-w-[75%] max-md:max-w-[85%]"
+                    : // zcode 同款：窄屏（手机）用户消息可占满全宽，宽屏封顶 36rem。
+                      "max-w-full md:max-w-xl"
                 }`}
                 {...(selectIds ? { onClick: () => toggleSelected(e.id) } : undefined)}
               >
                 <div
-                  className={`rounded-2xl rounded-br-md bg-indigo-600 px-4 py-2 text-sm whitespace-pre-wrap text-white [overflow-wrap:anywhere] max-md:px-3.5 max-md:py-2 max-md:text-[15px] ${
-                    selectIds && selected ? "ring-2 ring-indigo-300" : ""
+                  className={`whitespace-pre-wrap text-sm text-gray-200 [overflow-wrap:anywhere] max-md:text-[15px] max-md:leading-relaxed ${
+                    selectIds && selected ? "rounded-md ring-2 ring-indigo-300" : ""
                   }`}
                 >
                   {e.content}
@@ -986,13 +990,13 @@ export default function Chat({
             )}
             <div
               className={`flex flex-col items-start ${
-                selectIds ? "max-w-[80%] cursor-pointer" : "max-w-[85%]"
+                selectIds ? "max-w-[80%] cursor-pointer" : "w-full"
               }`}
               {...(selectIds ? { onClick: () => toggleSelected(e.id) } : undefined)}
             >
               <div
-                className={`md-body w-full overflow-hidden rounded-2xl rounded-bl-md border border-[#2a2f3a] bg-[#161a22] px-4 py-2 text-sm text-gray-200 max-md:px-3.5 max-md:py-2.5 max-md:text-[15px] max-md:leading-relaxed ${
-                  selectIds && selected ? "ring-2 ring-indigo-400" : ""
+                className={`md-body w-full text-sm text-gray-200 max-md:text-[15px] max-md:leading-relaxed ${
+                  selectIds && selected ? "rounded-md ring-2 ring-indigo-400" : ""
                 }`}
               >
                 {/* 外部链接不在 WebView 内导航（会顶掉 GUI）：http(s) 一律交系统
@@ -1019,6 +1023,13 @@ export default function Chat({
                       >
                         {children}
                       </a>
+                    ),
+                    // 表格放横向滚动容器里（zcode 同款）：宽表不再把单元格挤成
+                    // 一字一行的竖排，超出消息列宽度的部分左右滑动查看。
+                    table: ({ children }) => (
+                      <div className="table-scroll">
+                        <table className="w-max min-w-full">{children}</table>
+                      </div>
                     ),
                   }}
                 >
@@ -1057,7 +1068,7 @@ export default function Chat({
 
   return (
     <div className="chat-bg flex h-full flex-col">
-      {/* 消息流（移动端收窄页边距，把宽度还给气泡） */}
+      {/* 消息流（移动端收窄页边距，把宽度还给消息正文） */}
       <div
         ref={listRef}
         onScroll={handleListScroll}
@@ -1320,7 +1331,9 @@ export default function Chat({
                 ? "RClaw 工作中…（点击方块可停止）"
                 : isMobile
                   ? "输入消息…"
-                  : "输入消息…（Enter 发送，↑↓ 历史，/ 开头为命令）"
+                  : isAndroidDevice()
+                    ? "输入消息…（Enter 换行，↑↓ 历史，/ 开头为命令）"
+                    : "输入消息…（Enter 发送，↑↓ 历史，/ 开头为命令）"
             }
             className="block w-full resize-none bg-transparent px-4 pb-1 pt-3 text-sm text-gray-200 outline-none placeholder:text-gray-600 max-md:px-3.5 max-md:text-[15px]"
           />
