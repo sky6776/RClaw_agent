@@ -111,6 +111,10 @@ async fn main() -> Result<()> {
         core.bots.clone(),
     ));
     let _ = core.bot_router_slot.set(bot_router.clone());
+    // 后台完成通知的批量唤醒（ZCode 移植 · Layer 4）：inbound 总线就绪后接线。
+    core.agent_runtime
+        .background_wake()
+        .attach(inbound_tx.clone());
     let agent = AgentLoop::new(
         core.provider,
         core.review_provider,

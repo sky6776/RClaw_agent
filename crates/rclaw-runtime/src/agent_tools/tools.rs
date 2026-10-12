@@ -592,6 +592,14 @@ impl Tool for ClaudeAgentTool {
             Ok(spec) => spec,
             Err(e) => return ToolResult::err(e),
         };
+        // Layer 2b：model 名在入参校验期把关（运行期解析失败回落主 provider，不静默换模型）。
+        if let Some(model) = spec.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            if !self.runtime.has_model_provider(model) {
+                return ToolResult::err(format!(
+                    "unknown model '{model}': 未在 [[llm.providers]] 中配置同名 provider；可用名称见 /llmodel 或配置文件。"
+                ));
+            }
+        }
         let has_explicit_name = get_str(&input, "name")
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
@@ -616,15 +624,13 @@ impl Tool for ClaudeAgentTool {
         }
         let should_spawn_teammate = resolved_team.is_some() && has_explicit_name;
         let should_run_background = should_spawn_teammate || get_bool(&input, "run_in_background");
+        let description = get_str(&input, "description")
+            .unwrap_or_default()
+            .to_string();
         if should_run_background {
             let output = match self
                 .runtime
-                .launch_background_task(
-                    spec,
-                    get_str(&input, "description")
-                        .unwrap_or_default()
-                        .to_string(),
-                )
+                .launch_background_task(spec, description)
                 .await
             {
                 Ok(output) => output,
@@ -633,7 +639,67 @@ impl Tool for ClaudeAgentTool {
             return ToolResult::ok(output.to_string());
         }
 
-        let result = self.runtime.run_task(spec, None, None).await;
+        // Layer 2a（ZCode 移植）：前台自动转后台。任务从 t=0 起就是登记过的后台执行
+        // 快照（AgentStatus 立即可见），父工具调用与它竞速：预算内完成 → 按旧行为
+        // 返回完整结果；预算到点 → detach（解除父取消联动，父 /cancel 不再波及），
+        // 立即返回 backgrounded 结果，完成通知经团队邮箱 + 合批唤醒接续。
+        let auto_background = self.runtime.opts.subagent_auto_background;
+        if auto_background.is_zero() {
+            let result = self.runtime.run_task(spec, None, None).await;
+            return Self::render_foreground(result);
+        }
+
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<AgentTaskResult>(1);
+        // 父取消联动（attach）：done 触发前父 /cancel 会终止子任务（保持前台
+        // 「cancel 连子代理一起停」语义）；done 触发即 detach，之后不再波及。
+        let done = tokio_util::sync::CancellationToken::new();
+        let linkage = rclaw_tools::turn_state::turn_cancel().map(|parent| (parent, done.clone()));
+        let launched = match self
+            .runtime
+            .launch_background_task_impl(spec, description, Some(result_tx), linkage)
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => return ToolResult::err(error),
+        };
+        let raced = tokio::select! {
+            biased;
+            result = result_rx.recv() => Some(result),
+            _ = tokio::time::sleep(auto_background) => None,
+        };
+        // 竞速结束（完成或转后台）：解除父取消联动，watcher 退出（不泄漏）。
+        done.cancel();
+        match raced {
+            Some(Some(result)) => Self::render_foreground(result),
+            Some(None) => {
+                ToolResult::err("子代理任务异常终止（执行通道关闭，无结果返回）".to_string())
+            }
+            None => {
+                // detach：丢弃竞速接收端——此后子任务完成时 send 必然失败，
+                // run_background_execution 据此判定「未被前台消费」并触发合批唤醒。
+                drop(result_rx);
+                let agent_id = launched
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                ToolResult::ok(
+                    json!({
+                        "status": "backgrounded",
+                        "agentId": agent_id,
+                        "note": "前台执行超过自动转后台预算，任务已在后台继续运行（父取消不再波及；完成通知将入团队邮箱并合批唤醒收集）。不要重复它的工作。",
+                        "next": ["AgentStatus", "AgentWait", "AgentCancel"]
+                    })
+                    .to_string(),
+                )
+            }
+        }
+    }
+}
+
+impl ClaudeAgentTool {
+    /// 前台结果的统一渲染（竞速正常完成与 auto_background=0 旧路径共用）。
+    fn render_foreground(result: AgentTaskResult) -> ToolResult {
         let rendered = format!(
             "status: {}\n\n{}",
             if result.is_error {

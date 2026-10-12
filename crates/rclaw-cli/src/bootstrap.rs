@@ -183,6 +183,11 @@ pub async fn assemble_core_with(
 
     // session_search 工具：跨会话历史检索（B1——agent 能召回自己的过往经历）。
     tools.register(Box::new(SessionSearchTool::new(layout.session_dir.clone())));
+    // session_handoff 工具：跨会话上下文交接（ZCode 移植 · Layer 5，ReadSessionContext
+    // 同源）——按 query 相关性把另一段会话压缩成有界交接素材。
+    tools.register(Box::new(
+        rclaw_runtime::session_handoff::SessionHandoffTool::new(session.clone()),
+    ));
 
     // web_browser 工具：真实浏览器引擎（无头 Chrome/Edge/Chromium）检索/读页，
     // 与 web_search API 互补；Android APK 宿主在 customize 里换成 WebView 后端。
@@ -307,6 +312,22 @@ pub async fn assemble_core_with(
     tools.register(Box::new(SendMessageTool::new(agent_runtime.clone())));
     // 确定性计划工作流：主循环专用（子代理被 is_subagent_blocked_tool 拒绝，计划不可嵌套）。
     tools.register(Box::new(PlanRunTool::new(agent_runtime.clone())));
+    // Layer 3（ZCode 移植）：escalate 提问通道——计划步骤内提问（子代理面），
+    // ResolveWorkflowQuestion 应答（主代理面；对子代理屏蔽）。
+    tools.register(Box::new(rclaw_runtime::agent_tools::EscalateTool::new(
+        agent_runtime.clone(),
+    )));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::ResolveWorkflowQuestionTool::new(agent_runtime.clone()),
+    ));
+    // Layer 5（ZCode 移植）：write/edit/delete 文件 checkpoint + 按 messageId 选点回滚。
+    tools.register(Box::new(rclaw_runtime::turn::rewind::RewindFilesTool::new(
+        agent_runtime.clone(),
+    )));
+    // Layer 3 引擎最小执行器：确定性 JS 脚本编排（主代理专属，子代理被屏蔽表拒绝）。
+    tools.register(Box::new(rclaw_runtime::agent_tools::WorkflowRunTool::new(
+        agent_runtime.clone(),
+    )));
     // Bot Mode（ADR-0006）：bot 注册表 + message_agent 交接工具。registry 在
     // web_search_control 之后构建（bot 提示需要搜索工具面状态）；router 由二进制
     // 建 inbound 总线后经 bot_router_slot 回填。
@@ -319,6 +340,18 @@ pub async fn assemble_core_with(
                 .map(|p| Arc::new(p) as Arc<dyn rclaw_llm::Provider>)
         })
     };
+    // Layer 2b（ZCode 移植）：子代理独立模型/推理级别——Agent 工具的 `model` 入参按
+    // [[llm.providers]] 名字解析为独立 provider（入参校验期已拒绝未知名字）。
+    let agent_model_factory: rclaw_runtime::agent_tools::ModelFactory = {
+        let cfg = cfg.clone();
+        Arc::new(move |name: &str| -> Option<Arc<dyn rclaw_llm::Provider>> {
+            cfg.build_provider_config_for(name)
+                .ok()
+                .and_then(|pcfg| rclaw_llm::SwappableProvider::new(pcfg).ok())
+                .map(|p| Arc::new(p) as Arc<dyn rclaw_llm::Provider>)
+        })
+    };
+    agent_runtime.set_model_factory(agent_model_factory);
     let bots = Arc::new(BotRegistry::new(
         layout,
         provider_factory,

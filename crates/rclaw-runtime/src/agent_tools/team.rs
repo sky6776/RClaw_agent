@@ -116,6 +116,13 @@ pub(super) fn controlled_transition_failure(
 
 tokio::task_local! {
     pub(super) static CURRENT_AGENT: AgentIdentity;
+    /// 当前计划步骤上下文 (plan_id, step_id)（Layer 3：escalate 定位 journal 用）。
+    pub(super) static CURRENT_PLAN: Option<(String, String)>;
+}
+
+/// 当前计划步骤上下文；非计划步骤 / 作用域外返回 None。
+pub(crate) fn current_plan_context() -> Option<(String, String)> {
+    CURRENT_PLAN.try_with(std::clone::Clone::clone).ok().flatten()
 }
 
 #[derive(Clone, Debug)]

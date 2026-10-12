@@ -64,6 +64,7 @@ rust-version = "1.91"
 tokio = { version = "1", features = ["full"] }   # multi-thread runtime，驱动 agent loop / 通道 / SSE
 tokio-stream = "0.1"
 tokio-util = "0.7"                                # CancellationToken：活动 turn 的取消语义（/cancel 中断）
+rquickjs = { version = "0.9", features = ["futures"] }  # Layer 3 引擎：嵌入 QuickJS-ng 确定性脚本沙箱（async 驱动 Promise.all）
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] } # napcat 通道：OneBot 11 over WebSocket（rustls，无 OpenSSL 依赖）
 futures = "0.3"
 

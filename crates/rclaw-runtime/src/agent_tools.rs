@@ -36,6 +36,7 @@ use crate::turn::{
 };
 
 mod plan;
+mod workflow;
 mod subagent;
 mod team;
 mod tools;
@@ -62,6 +63,9 @@ impl RunAdapter for SubagentRunAdapter<'_> {
     }
 }
 
+mod escalate;
+pub use escalate::{EscalateTool, ResolveWorkflowQuestionTool};
+pub use workflow::WorkflowRunTool;
 pub use plan::PlanRunTool;
 use subagent::*;
 pub(crate) use team::sanitize_agent_name;
@@ -134,6 +138,11 @@ fn reset_team_inbox_unread(base: &Path) {
     store_team_inbox_unread(base, 0);
 }
 
+/// 子代理独立模型解析器（ZCode 移植 · Layer 2b）：按 `[[llm.providers]]` 的
+/// provider 名构建独立 provider 实例。bootstrap 装配期经
+/// [`AgentToolRuntime::set_model_factory`] 注入；未注入时 `model` 入参在校验期拒绝。
+pub type ModelFactory = Arc<dyn Fn(&str) -> Option<Arc<dyn Provider>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AgentToolRuntime {
     provider: Arc<dyn Provider>,
@@ -148,6 +157,14 @@ pub struct AgentToolRuntime {
     memory: MemoryStore,
     layout: Layout,
     opts: AgentOptions,
+    /// 后台完成通知的批量唤醒器（ZCode 移植 · Layer 4）：完成入箱后合批投递
+    /// 系统消息驱动收集轮次；inbound 发送端由二进制装配期 attach。
+    background_wake: crate::background_wake::BackgroundWaker,
+    /// 子代理独立模型解析器（Layer 2b）；OnceLock 装配期回填，避免构造签名扩散。
+    model_factory: std::sync::OnceLock<ModelFactory>,
+    /// 待应答的 escalate 问题（Layer 3 实时通道）：question_id → 应答发送端。
+    /// journal 是持久事实源；这张表只覆盖「步骤仍在等待」的进程内窗口。
+    pending_escalations: Arc<StdMutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>,
 }
 
 impl AgentToolRuntime {
@@ -168,6 +185,8 @@ impl AgentToolRuntime {
         ));
         let execution_dir = layout.base.join("task_executions");
         let collaboration = CollaborationState::open(execution_dir);
+        let (wake_enabled, wake_debounce) =
+            (opts.background_wake_enabled, opts.background_wake_debounce);
         AgentToolRuntime {
             provider,
             base_system_prompt,
@@ -176,9 +195,75 @@ impl AgentToolRuntime {
             next_inference_start: Arc::new(Mutex::new(tokio::time::Instant::now())),
             collaboration,
             memory,
-            layout,
+            layout: layout.clone(),
             opts,
+            background_wake: crate::background_wake::BackgroundWaker::new(
+                &layout.base,
+                wake_enabled,
+                wake_debounce,
+            ),
+            model_factory: std::sync::OnceLock::new(),
+            pending_escalations: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// 登记待应答的 escalate 问题（Layer 3 实时通道）；返回阻塞等待的接收端。
+    pub(crate) fn register_escalation(
+        &self,
+        question_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_escalations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(question_id.to_string(), tx);
+        rx
+    }
+
+    /// 投递升级答案：命中等待中的 escalate → true（已实时解锁）。
+    pub(crate) fn resolve_escalation(&self, question_id: &str, answer: &str) -> bool {
+        let sender = self
+            .pending_escalations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(question_id);
+        sender
+            .map(|tx| tx.send(answer.to_string()).is_ok())
+            .unwrap_or(false)
+    }
+
+    /// 等待超时后摘除登记（不投递）。
+    pub(crate) fn cancel_escalation(&self, question_id: &str) {
+        self.pending_escalations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(question_id);
+    }
+
+    /// 注入子代理独立模型解析器（bootstrap 装配期调用一次；重复调用以首次为准）。
+    pub fn set_model_factory(&self, factory: ModelFactory) {
+        let _ = self.model_factory.set(factory);
+    }
+
+    /// 按名字解析子代理独立模型；未配置 factory 或名字未命中 → None。
+    pub(crate) fn resolve_model_provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
+        let factory = self.model_factory.get()?;
+        (factory)(name)
+    }
+
+    /// 工具入参校验用：model 名是否可解析。
+    pub(crate) fn has_model_provider(&self, name: &str) -> bool {
+        self.resolve_model_provider(name).is_some()
+    }
+
+    /// checkpoint 存储布局句柄（Layer 5 rewind_files 工具用）。
+    pub(crate) fn layout(&self) -> &rclaw_store::fs::Layout {
+        &self.layout
+    }
+
+    /// 后台完成唤醒器句柄（二进制装配期 `attach(inbound_tx)` 用）。
+    pub fn background_wake(&self) -> &crate::background_wake::BackgroundWaker {
+        &self.background_wake
     }
 
     fn registry(&self) -> Result<Arc<ToolRegistry>, String> {
@@ -514,7 +599,10 @@ impl AgentToolRuntime {
         team_name: Option<String>,
         identity: Option<AgentIdentity>,
         cancel: CancellationToken,
+        foreground_result_tx: Option<tokio::sync::mpsc::Sender<AgentTaskResult>>,
     ) {
+        // 完成唤醒的路由目标（spec 会被 run_task 消费，提前取出）。
+        let wake_route = (spec.source_channel.clone(), spec.origin_chat_id.clone());
         if let Err(error) = self
             .transition_execution(
                 &agent_id,
@@ -643,12 +731,45 @@ impl AgentToolRuntime {
                 .push(format!("终态持久化失败：{error}"));
         }
         self.publish_background_completion(team_name, &result).await;
+        // Layer 2a：前台竞速通道仍在等待（自动转后台预算内正常完成）→ 结果直接回传
+        // 父工具调用，不再唤醒（父已亲手拿到结果；额外唤醒只会产生一轮冗余收集）。
+        let consumed_by_foreground = match &foreground_result_tx {
+            Some(tx) => tx.send(result.clone()).await.is_ok(),
+            None => false,
+        };
+        // Layer 4（ZCode 移植）：合批唤醒发起会话——父 turn 已收尾时驱动收集轮次；
+        // 父仍在活动 turn 时该消息按既有语义延后为下一轮。窗口内多完成只投一条。
+        if !consumed_by_foreground {
+            self.background_wake.notify(&wake_route.0, &wake_route.1);
+        }
     }
 
     async fn launch_background_task(
         &self,
+        spec: AgentTaskSpec,
+        description: String,
+    ) -> Result<Value, String> {
+        self.launch_background_task_impl(spec, description, None, None)
+            .await
+    }
+
+    /// 后台任务启动（Layer 2a 前台竞速扩展版）。
+    ///
+    /// - `foreground_result_tx`：前台竞速通道——父 Agent 工具调用仍在等待结果时，
+    ///   终态经它回传（自动转后台预算到点后调用方丢弃接收端，任务照常收尾）。
+    /// - `external_linkage = (parent_cancel, done)`：父取消联动（等价 ZCode
+    ///   `taskAbort` 的 attach→detach 两段语义）——`done` 触发前父取消会终止子任务
+    ///   （保持前台「/cancel 连子代理一起停」的既有语义）；`done` 触发即 detach，
+    ///   之后父取消不再波及，子任务只受 collaboration cancel（AgentCancel）管控。
+    pub(crate) async fn launch_background_task_impl(
+        &self,
         mut spec: AgentTaskSpec,
         description: String,
+        foreground_result_tx: Option<tokio::sync::mpsc::Sender<AgentTaskResult>>,
+        external_linkage: Option<(
+            tokio_util::sync::CancellationToken,
+            tokio_util::sync::CancellationToken,
+        )>,
     ) -> Result<Value, String> {
         let resolved_team = self.resolve_agent_team_name(&spec).await?;
         let skill_activity = begin_skill_activity(&self.layout.skills_dir)?;
@@ -684,12 +805,33 @@ impl AgentToolRuntime {
                 return Err(failure);
             }
         };
+        // Layer 2a：父取消联动（attach→detach 两段）。watcher 在 `done` 触发前把
+        // 父取消转发给子任务 cancel；detach（自动转后台）后父取消不再波及。
+        if let Some((parent, done)) = external_linkage {
+            let linked_cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = parent.cancelled() => {
+                        linked_cancel.cancel();
+                    }
+                    _ = done.cancelled() => {}
+                }
+            });
+        }
         let runtime = self.clone();
         let spawned_agent_id = agent_id.clone();
         tokio::spawn(async move {
             let _skill_activity = skill_activity;
             runtime
-                .run_background_execution(spawned_agent_id, spec, team_name, identity, cancel)
+                .run_background_execution(
+                    spawned_agent_id,
+                    spec,
+                    team_name,
+                    identity,
+                    cancel,
+                    foreground_result_tx,
+                )
                 .await;
         });
 
@@ -764,7 +906,7 @@ impl AgentToolRuntime {
         tokio::spawn(async move {
             let _skill_activity = skill_activity;
             runtime
-                .run_background_execution(agent_id_owned, spec, team_name, identity, cancel)
+                .run_background_execution(agent_id_owned, spec, team_name, identity, cancel, None)
                 .await;
         });
         self.execution_payload(agent_id)
@@ -804,38 +946,44 @@ impl AgentToolRuntime {
                 let static_schema =
                     filtered_tool_schemas(&registry.request_schemas(), candidate_patch_only);
                 let mut state = TurnState::new(&static_schema);
-                let result = rclaw_tools::turn_state::scope(async {
-                    if let Some(error) = registration_failure {
-                        return Err(RunTaskFailure::Failed {
-                            error: format!("团队成员注册失败: {error}"),
-                            completed_steps: 0,
-                            media_publish_attempted: false,
-                        });
-                    }
-                    if let Some(identity) = identity.clone() {
-                        CURRENT_AGENT
-                            .scope(
-                                identity.clone(),
-                                self.run_task_inner(
-                                    &spec,
-                                    control.as_ref(),
-                                    &registry,
-                                    &static_schema,
-                                    &mut state,
-                                ),
+                let plan_context = spec
+                    .plan_id
+                    .clone()
+                    .map(|plan_id| (plan_id, spec.step_id.clone().unwrap_or_default()));
+                let result = team::CURRENT_PLAN.scope(plan_context, rclaw_tools::turn_state::scope(
+                    async {
+                        if let Some(error) = registration_failure {
+                            return Err(RunTaskFailure::Failed {
+                                error: format!("团队成员注册失败: {error}"),
+                                completed_steps: 0,
+                                media_publish_attempted: false,
+                            });
+                        }
+                        if let Some(identity) = identity.clone() {
+                            CURRENT_AGENT
+                                .scope(
+                                    identity.clone(),
+                                    self.run_task_inner(
+                                        &spec,
+                                        control.as_ref(),
+                                        &registry,
+                                        &static_schema,
+                                        &mut state,
+                                    ),
+                                )
+                                .await
+                        } else {
+                            self.run_task_inner(
+                                &spec,
+                                control.as_ref(),
+                                &registry,
+                                &static_schema,
+                                &mut state,
                             )
                             .await
-                    } else {
-                        self.run_task_inner(
-                            &spec,
-                            control.as_ref(),
-                            &registry,
-                            &static_schema,
-                            &mut state,
-                        )
-                        .await
-                    }
-                })
+                        }
+                    },
+                ))
                 .await;
                 turn_state = Some(state);
                 result
@@ -964,6 +1112,15 @@ impl AgentToolRuntime {
         state: &mut TurnState,
     ) -> Result<(String, usize, Vec<String>, bool), RunTaskFailure> {
         let candidate_patch_only = spec.isolation == "candidate_patch";
+        // Layer 2b（ZCode 移植）：子代理可指定独立模型/推理级别——spec.model 经
+        // model_factory 解析（bootstrap 从 [[llm.providers]] 构建）；未指定或嵌入方
+        // 未注入 factory 时回落主 provider。名字合法性已在工具入参校验期把关。
+        let provider: Arc<dyn Provider> = match spec.model.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => self
+                .resolve_model_provider(name)
+                .unwrap_or_else(|| self.provider.clone()),
+            _ => self.provider.clone(),
+        };
         // skills 目录扫描每任务一次：动态上下文与激活失效共享该缓存。
         let catalog = SkillCatalog::new(&self.layout);
         let mut system = (*self.base_system_prompt).clone();
@@ -1076,7 +1233,7 @@ impl AgentToolRuntime {
                     .chain(state.dynamic.active_schemas().iter())
                     .cloned()
                     .collect(),
-                max_tokens: self.provider.max_tokens(),
+                max_tokens: provider.max_tokens(),
                 stream: false,
             };
             let max_retries = self.opts.llm_max_retries;
@@ -1094,10 +1251,10 @@ impl AgentToolRuntime {
                                 media_publish_attempted: state.media_publish_attempted,
                             });
                         }
-                        result = self.provider.chat(req.clone()) => result,
+                        result = provider.chat(req.clone()) => result,
                     }
                 } else {
-                    self.provider.chat(req.clone()).await
+                    provider.chat(req.clone()).await
                 };
                 match outcome_result {
                     Ok(result) => {

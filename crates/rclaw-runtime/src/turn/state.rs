@@ -43,6 +43,9 @@ pub(crate) struct TurnState {
     pub(crate) skill_scope_changed: bool,
     /// 批次标志：TaskList 带回新团队消息，旧媒体交付意图作废。
     pub(crate) media_scope_changed: bool,
+    /// Layer 5 选点回滚：本迭代 write/edit/delete 捕获的文件 checkpoint（暂存，
+    /// assistant 消息持久化后由 turn 循环统一落盘）。
+    pub(crate) pending_file_checkpoints: Vec<super::rewind::FileCheckpoint>,
 }
 
 impl TurnState {
@@ -60,6 +63,7 @@ impl TurnState {
             memory_failures: 0,
             skill_scope_changed: false,
             media_scope_changed: false,
+            pending_file_checkpoints: Vec::new(),
         }
     }
 

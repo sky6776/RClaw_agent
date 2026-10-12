@@ -30,6 +30,19 @@ pub struct AgentOptions {
     pub llm_retry_max_delay: Duration,
     /// 相邻子 agent 模型请求的最小起始间隔。只错峰模型请求，不串行化工具执行。
     pub subagent_request_stagger: Duration,
+    /// 前台子代理的【自动转后台】预算（ZCode 移植 · Layer 2a，`autoBackgroundMs` 同源）。
+    ///
+    /// 前台 Agent 调用运行超过该时长且未完成时：任务登记为后台执行快照继续跑
+    /// （父取消不再波及，等价 ZCode `taskAbort.detachParent()`），父工具调用立即
+    /// 返回 `{status:"backgrounded"}`，完成通知经团队邮箱 + 合批唤醒接续。
+    /// `Duration::ZERO` = 关闭（保持旧行为：前台子代理随父 turn 生命周期）。
+    pub subagent_auto_background: Duration,
+    /// escalate 提问的实时等待窗口（秒）（ZCode 移植 · Layer 3）。
+    ///
+    /// PlanRun 前台运行期间编排者被工具调用阻塞、无法实时应答，默认 0 = 提交即挂起
+    /// （走 journal 协议：ResolveWorkflowQuestion + resume_plan_id 在下一轮注入答案）。
+    /// 未来 PlanRun 后台化后可调大，启用真·阻塞式实时应答。
+    pub plan_escalation_wait_secs: u64,
     /// 模型上下文窗口大小（token）。`0` = 未声明，按 [`COMPRESSION_DEFAULT_ASSUMED_CONTEXT_LENGTH`]
     /// （128K）假设。
     ///
@@ -90,6 +103,25 @@ pub struct AgentOptions {
     /// LLM 摘要失败时是否使用确定性 fallback（true，默认）替代丢弃中间窗口；
     /// 关闭则回退到硬裁剪（保留旧路径作为 escape hatch）。
     pub compression_fallback_enabled: bool,
+    /// 是否启用【轮内】上下文管理（ZCode 长程能力移植 · Layer 1）：
+    /// - microcompact：每次模型请求前对请求视图做本地 tool result 剪枝（不落盘）；
+    /// - auto compact：每次迭代前用 anchored 估算检查阈值，超限就地语义压缩并
+    ///   rewrite session（复用 load 期同一套防抖 / fallback / 事件）；
+    /// - reactive compact：LLM 报 context-exceeded 时压缩后原地重试一次。
+    ///
+    /// 关闭时退回旧行为：压缩只发生在轮次开始（`HistoryLoader::load`），长 turn
+    /// 内部没有压缩。默认开启。
+    pub in_turn_compression_enabled: bool,
+    /// 后台子 Agent 完成后是否发送【批量唤醒】消息（ZCode 移植 · Layer 4）。
+    ///
+    /// 完成通知仍先入团队邮箱（未读计数），唤醒器在防抖窗口内合并在同一窗口完成的
+    /// 多个通知，向发起任务的会话投一条 Heartbeat 来源的系统消息驱动新轮次收集结果。
+    /// 火化时未读为 0（已被 TaskList 消费）则跳过。默认开启；防抖窗口见
+    /// [`AgentOptions::background_wake_debounce`]。
+    pub background_wake_enabled: bool,
+    /// 后台完成通知的唤醒防抖窗口。窗口内的多个完成合并为一条唤醒消息，
+    /// 避免大规模并行时按完成数线性放大请求数。
+    pub background_wake_debounce: std::time::Duration,
     /// 是否启用后台自动记忆 review。
     pub auto_memory_enabled: bool,
     /// 是否启用后台自动自进化 review。
@@ -144,6 +176,8 @@ impl Default for AgentOptions {
             llm_retry_base_delay: Duration::from_secs(1),
             llm_retry_max_delay: Duration::from_secs(30),
             subagent_request_stagger: Duration::from_secs(2),
+            subagent_auto_background: Duration::from_secs(600),
+            plan_escalation_wait_secs: 0,
             context_length: COMPRESSION_DEFAULT_ASSUMED_CONTEXT_LENGTH,
             session_compression_enabled: true,
             compression_protect_first: 3,
@@ -161,6 +195,9 @@ impl Default for AgentOptions {
             compression_min_savings_pct: 0.10,
             compression_failure_cooldown_secs: 600,
             compression_fallback_enabled: true,
+            in_turn_compression_enabled: true,
+            background_wake_enabled: true,
+            background_wake_debounce: Duration::from_secs(3),
             auto_memory_enabled: false,
             auto_evolve_enabled: false,
             auto_review_tooled: false,

@@ -9,12 +9,14 @@
 
 pub mod agent_loop;
 pub mod agent_tools;
+pub mod background_wake;
 pub mod bots;
 pub mod context;
 pub mod cron;
 pub(crate) mod dynamic_tools;
 pub mod heartbeat;
 pub mod options;
+pub mod session_handoff;
 pub mod slash;
 pub mod turn;
 
@@ -39,6 +41,8 @@ pub use heartbeat::Heartbeat;
 pub use options::AgentOptions;
 pub use slash::{CommandOutcome, SlashRegistry};
 pub use turn::{estimate_context_usage, ContextUsageSnapshot, TurnKey, TurnManager};
+
+pub use background_wake::BackgroundWaker;
 
 /// inbound 方向发送端类型（channel/cron/heartbeat → agent loop）。
 pub type InboundSender = tokio::sync::mpsc::Sender<rclaw_core::BusMessage>;

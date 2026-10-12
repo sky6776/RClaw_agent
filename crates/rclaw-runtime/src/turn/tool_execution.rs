@@ -23,6 +23,14 @@ impl ToolExecutionPolicy<'_> {
         }
     }
 
+    /// 发起会话的 chat_id（后台完成唤醒的路由目标；Subagent 无后台任务能力，恒为空）。
+    fn source_chat(&self) -> &str {
+        match self {
+            Self::Foreground { message, .. } => &message.chat_id,
+            Self::Subagent { .. } => "",
+        }
+    }
+
     fn candidate_patch_only(&self) -> bool {
         matches!(
             self,
@@ -270,6 +278,7 @@ async fn execute_tool_batch_serial(
                 index += 1;
             }
             let source_channel = policy.source_channel().to_string();
+            let source_chat = policy.source_chat().to_string();
             let loaded_package_skills = &state.loaded_package_skills;
             let futures =
                 outcome.tool_calls[start..index]
@@ -277,6 +286,7 @@ async fn execute_tool_batch_serial(
                     .enumerate()
                     .map(|(offset, tc)| {
                         let source_channel = source_channel.clone();
+                        let source_chat = source_chat.clone();
                         async move {
                             let slot_index = start + offset;
                             let mut input: Value = match serde_json::from_str(&tc.input) {
@@ -292,6 +302,7 @@ async fn execute_tool_batch_serial(
                                 }
                             };
                             patch_runtime_source_channel(&mut input, &source_channel);
+                            patch_runtime_source_chat(&mut input, &source_chat);
                             inject_package_skill_context(&mut input, loaded_package_skills);
                             tracing::debug!(tool = %tc.name, "并发执行 agent 工具");
                             let mut result = registry.execute(&tc.name, input).await;
@@ -433,6 +444,13 @@ async fn execute_tool_batch_serial(
         tracing::debug!(tool = %tc.name, "执行工具");
         // 写形状判定须在执行链 move input 之前完成。
         let memory_write_shape = tc.name == "memory" && is_memory_write_call(&input);
+        // Layer 5 选点回滚：前台 write/edit/delete 在执行前捕获 before 内容
+        // （input 随后会被执行链 move，先解析出需要的字段）。
+        let rewind_capture = if policy.is_foreground() {
+            rewind::capture_before(&tc.name, &input, &layout.base)
+        } else {
+            None
+        };
         // memory 失败上限：同一 turn 内连续失败 ≥3 次后不再执行，返回终态拒绝，
         // 防止记忆触顶/反复未命中把整个回复循环卡到预算耗尽。
         let mut result = if tc.name == "memory" && state.memory_failures >= 3 {
@@ -457,6 +475,12 @@ async fn execute_tool_batch_serial(
             registry.execute(&tc.name, input).await
         };
         tracing::debug!(tool = %tc.name, is_error = result.is_error, "工具返回");
+        // Layer 5：执行成功且文件确有变化 → 入账待落盘（turn 循环持久化后 flush）。
+        if let Some(mut checkpoint) = rewind_capture {
+            if !result.is_error && rewind::finish_capture(&mut checkpoint) {
+                state.pending_file_checkpoints.push(checkpoint);
+            }
+        }
 
         state.media_scope_changed |= tc.name == "TaskList"
             && !result.is_error
@@ -749,6 +773,9 @@ pub(crate) fn is_subagent_blocked_tool(name: &str) -> bool {
             | "cron_add"
             | "cron_list"
             | "cron_remove"
+            // Layer 3：应答与引擎入口都是编排者（主代理）专属；子代理只能 escalate 提问。
+            | "ResolveWorkflowQuestion"
+            | "WorkflowRun"
     )
 }
 

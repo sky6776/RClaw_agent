@@ -10,6 +10,8 @@ enum RuntimeCommand {
     Tools,
     Clear,
     Log,
+    Compact,
+    Rewind,
 }
 
 impl RuntimeCommand {
@@ -23,6 +25,8 @@ impl RuntimeCommand {
             "tools" => Some(Self::Tools),
             "clear" => Some(Self::Clear),
             "log" => Some(Self::Log),
+            "compact" => Some(Self::Compact),
+            "rewind" => Some(Self::Rewind),
             _ => None,
         }
     }
@@ -48,6 +52,10 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
             RuntimeCommand::Tools => render_tools(manager.tools.schemas()),
             RuntimeCommand::Clear => manager.handle_clear(&msg.content),
             RuntimeCommand::Log => manager.handle_log(&msg.channel, &msg.content),
+            RuntimeCommand::Compact => {
+                manager.handle_compact(&msg.channel, &msg.chat_id).await
+            }
+            RuntimeCommand::Rewind => manager.handle_rewind(&msg.channel, &msg.chat_id, &msg.content),
         };
         let _ = manager
             .outbound_tx
@@ -96,6 +104,8 @@ mod tests {
             ("/tools", RuntimeCommand::Tools),
             ("/clear confirm", RuntimeCommand::Clear),
             ("/LOG list", RuntimeCommand::Log),
+            ("/compact", RuntimeCommand::Compact),
+            ("/rewind 1791753207350478000", RuntimeCommand::Rewind),
         ] {
             assert_eq!(RuntimeCommand::parse(input), Some(expected));
         }

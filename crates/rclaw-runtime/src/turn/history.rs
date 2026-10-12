@@ -30,6 +30,10 @@ struct CompressionState {
     ineffective_count: usize,
     ineffective_at_history_len: usize,
     cooldown_until: Option<Instant>,
+    /// rapid-refill breaker（ZCode 移植）：最近一次压缩后的锚定估算「地板」。
+    /// 估算未从地板回升 5% 之前，轮内 auto compact 不再触发——否则低阈值/压缩后
+    /// 仍超阈值的会话会陷入「压缩-仍满-再压缩」的循环，每次循环白耗一次摘要 LLM。
+    in_turn_floor_estimate: usize,
 }
 
 /// A1 usage 锚点：最近一次真实请求的 provider 用量 + 锚点消息指纹。
@@ -40,6 +44,16 @@ struct CompressionState {
 /// 在历史中定位它，其后缀即「新增部分」。
 #[derive(Debug, Clone, Copy)]
 struct UsageAnchor {
+    total_tokens: u64,
+    anchor_hash: u64,
+}
+
+/// usage 锚点的持久化检查点（ZCode 移植 · Layer 5「主 turn 检查点」的落地形态）：
+/// 每次成功 LLM 调用后随内存锚点一起落盘（`agent/sessions/checkpoints/`，/clear 随
+/// 会话一并清除）。进程重启后内存锚点清零，估算退化为纯启发式——检查点让下一轮
+/// turn 恢复「真实用量锚定」的精度，并给运维一个可观测的 turn 进度痕迹。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct UsageAnchorCheckpoint {
     total_tokens: u64,
     anchor_hash: u64,
 }
@@ -61,6 +75,8 @@ pub(crate) struct HistoryLoader {
     compression_state: Arc<Mutex<HashMap<TurnKey, CompressionState>>>,
     /// A1 usage 锚点（每会话一个）：真实用量锚定 token 估算。
     usage_anchors: Arc<Mutex<HashMap<TurnKey, UsageAnchor>>>,
+    /// 检查点文件的读缓存（含负缓存）：进程重启后每 key 只读盘一次。
+    anchor_checkpoint_cache: Arc<Mutex<HashMap<TurnKey, Option<UsageAnchor>>>>,
     /// 压缩摘要 LLM 调用与顶层 turn 共享执行上限，避免压缩放大并发峰值。
     execution_limit: Arc<Semaphore>,
 }
@@ -90,6 +106,7 @@ impl HistoryLoader {
             channels: channels.clone(),
             compression_state: Arc::new(Mutex::new(HashMap::new())),
             usage_anchors: Arc::new(Mutex::new(HashMap::new())),
+            anchor_checkpoint_cache: Arc::new(Mutex::new(HashMap::new())),
             execution_limit,
         }
     }
@@ -108,15 +125,55 @@ impl HistoryLoader {
         if total_tokens == 0 {
             return;
         }
+        let anchor = UsageAnchor {
+            total_tokens,
+            anchor_hash: message_anchor_hash(anchor_message),
+        };
         let mut anchors = self.usage_anchors.lock().expect("usage_anchors 锁未被毒化");
-        anchors.insert(
-            key.clone(),
-            UsageAnchor {
-                total_tokens,
-                anchor_hash: message_anchor_hash(anchor_message),
-            },
-        );
+        anchors.insert(key.clone(), anchor);
+        drop(anchors);
+        // Layer 5 主 turn 检查点：随内存锚点同步落盘（失败只降级为启发式估算，不影响主流程）。
+        let checkpoint = UsageAnchorCheckpoint {
+            total_tokens,
+            anchor_hash: anchor.anchor_hash,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&checkpoint) {
+            if let Err(e) = rclaw_store::fs::atomic_write(&self.checkpoint_path(key), &bytes) {
+                tracing::debug!("usage 锚点检查点写入失败（内存锚点不受影响）: {e}");
+            }
+        }
     }
+
+    /// 检查点文件路径：按会话键哈希命名（免百分号编码歧义），落在 sessions/ 之下，
+    /// `/clear` 清空会话时一并清除。
+    fn checkpoint_path(&self, key: &TurnKey) -> std::path::PathBuf {
+        let fingerprint = format!("{}|{}|{:?}", key.channel, key.chat_id, key.cron_job_id);
+        self.layout
+            .session_dir
+            .join("checkpoints")
+            .join(format!("{:016x}.json", content_hash(&fingerprint)))
+    }
+
+    /// 进程重启后从检查点恢复 usage 锚点（每 key 只读盘一次，含负缓存）。
+    fn load_anchor_checkpoint(&self, key: &TurnKey) -> Option<UsageAnchor> {
+        let mut cache = self
+            .anchor_checkpoint_cache
+            .lock()
+            .expect("anchor_checkpoint_cache 锁未被毒化");
+        if let Some(cached) = cache.get(key) {
+            return *cached;
+        }
+        let loaded = std::fs::read(self.checkpoint_path(key))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<UsageAnchorCheckpoint>(&bytes).ok())
+            .map(|c| UsageAnchor {
+                total_tokens: c.total_tokens,
+                anchor_hash: c.anchor_hash,
+            });
+        cache.insert(key.clone(), loaded);
+        loaded
+    }
+
 
     /// A1 锚定估算：真实锚点 + 锚点之后新增消息的启发式增量。
     ///
@@ -134,6 +191,8 @@ impl HistoryLoader {
             let anchors = self.usage_anchors.lock().expect("usage_anchors 锁未被毒化");
             anchors.get(key).copied()
         };
+        // Layer 5：内存锚点缺失（进程重启后首问）→ 从检查点恢复，估算不退化。
+        let anchor = anchor.or_else(|| self.load_anchor_checkpoint(key));
         let Some(anchor) = anchor else {
             return estimate_request_tokens(Some(system), messages, tools_schema);
         };
@@ -149,6 +208,35 @@ impl HistoryLoader {
             }
             None => estimate_request_tokens(Some(system), messages, tools_schema),
         }
+    }
+
+    /// rapid-refill breaker 判定：估算尚未从最近一次压缩的地板回升 5% → 轮内压缩跳过。
+    /// 回升越过后清零地板（下次压缩重新登记）。
+    pub(crate) fn in_turn_blocked_by_rapid_refill(&self, key: &TurnKey, estimate: usize) -> bool {
+        let mut map = self
+            .compression_state
+            .lock()
+            .expect("compression_state 锁未被毒化");
+        let st = map.entry(key.clone()).or_default();
+        let floor = st.in_turn_floor_estimate;
+        if floor == 0 {
+            return false;
+        }
+        if estimate < floor + floor / 20 {
+            return true;
+        }
+        st.in_turn_floor_estimate = 0;
+        false
+    }
+
+    /// 登记最近一次压缩后的地板估算（load 期与轮内压缩共用）。
+    pub(crate) fn record_compression_floor(&self, key: &TurnKey, post_estimate: usize) {
+        let mut map = self
+            .compression_state
+            .lock()
+            .expect("compression_state 锁未被毒化");
+        let st = map.entry(key.clone()).or_default();
+        st.in_turn_floor_estimate = post_estimate;
     }
 
     /// 压缩触发判定（锚定估算 + 动态尾部消息）。
@@ -314,6 +402,10 @@ impl HistoryLoader {
                         .map_err(|e| e.to_string());
                 }
                 SummaryLoad::Failed => {
+                    // 摘要失败（典型：鉴权 / 连接失败）：设置失败冷却。同一坏 key / 断网
+                    // 在【同一 turn 的轮内压缩】（in_turn）与下一次 load 中都会经
+                    // compression_skip_reason 跳过，不再反复撞摘要调用；原 session 保留。
+                    self.record_compression_outcome(&key, 1, 1, full.len(), true);
                     tracing::warn!(
                         "会话语义压缩摘要生成失败，保留原 session 并回退到常规历史裁剪 ({}:{})",
                         msg.channel,
@@ -339,6 +431,10 @@ impl HistoryLoader {
         let before_bytes = history_serialized_bytes(&full);
         let after_bytes = history_serialized_bytes(&compressed);
         self.record_compression_outcome(&key, before_bytes, after_bytes, full.len(), used_fallback);
+        // rapid-refill breaker：以压缩后的估算为地板，抑制紧接着的轮内重复压缩。
+        let post_estimate =
+            self.anchored_estimate(&key, system, &compressed, tools_schema);
+        self.record_compression_floor(&key, post_estimate);
 
         self.session
             .rewrite(&msg.channel, &msg.chat_id, &compressed)
@@ -559,7 +655,8 @@ impl HistoryLoader {
         }
     }
 
-    fn record_ineffective_compression(
+    /// 同步：记录一次「无效压缩」（轮内压缩模块 `in_turn` 也复用）。
+    pub(crate) fn record_ineffective_compression(
         &self,
         key: &TurnKey,
         reason: &'static str,
@@ -577,6 +674,74 @@ impl HistoryLoader {
             st.ineffective_count,
             key.channel,
             key.chat_id
+        );
+    }
+}
+
+#[cfg(test)]
+mod anchor_checkpoint_tests {
+    use super::*;
+    use rclaw_core::RuntimeChannelInfo;
+
+    /// Layer 5 主 turn 检查点：usage 锚点落盘后，【新构造的 loader】（模拟进程重启、
+    /// 内存锚点为空）应从检查点恢复锚定估算，而不是退化为纯启发式。
+    #[test]
+    fn usage_anchor_checkpoint_survives_process_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path().join("agent"));
+        let session = SessionStore::new(layout.clone());
+        let opts = AgentOptions::default();
+        let channels = RuntimeChannelInfo::default();
+        let key = TurnKey {
+            channel: "cli".into(),
+            chat_id: "console".into(),
+            cron_job_id: None,
+        };
+        let anchor_message = Message::plain(Role::User, "anchor message");
+        let follow_up = Message::plain(Role::Assistant, "ok");
+
+        let loader_a = HistoryLoader::new(
+            &session,
+            &layout,
+            &opts,
+            &channels,
+            Arc::new(Semaphore::new(1)),
+        );
+        loader_a.record_usage_anchor(&key, &anchor_message, 1234);
+
+        // 模拟重启：全新 loader，内存锚点为空，检查点文件仍在。
+        let loader_b = HistoryLoader::new(
+            &session,
+            &layout,
+            &opts,
+            &channels,
+            Arc::new(Semaphore::new(1)),
+        );
+        let messages = vec![anchor_message.clone(), follow_up.clone()];
+        let estimate =
+            loader_b.anchored_estimate(&key, "system", &messages, &[]);
+        // 锚点命中（messages[0]），增量只算其后的 follow_up。
+        assert_eq!(
+            estimate,
+            1234 + estimate_history_tokens(&messages[1..]),
+            "重启后应从检查点恢复锚定估算"
+        );
+
+        // 对照：无检查点的全新 layout 回落纯启发式（估算 != 锚定值）。
+        let layout_fresh = Layout::new(dir.path().join("agent2"));
+        let session_fresh = SessionStore::new(layout_fresh.clone());
+        let loader_c = HistoryLoader::new(
+            &session_fresh,
+            &layout_fresh,
+            &opts,
+            &channels,
+            Arc::new(Semaphore::new(1)),
+        );
+        let fallback =
+            loader_c.anchored_estimate(&key, "system", &messages, &[]);
+        assert_ne!(
+            fallback, estimate,
+            "无锚点时应为纯启发式估算（与锚定值不同）"
         );
     }
 }

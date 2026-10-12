@@ -13,11 +13,26 @@ pub(super) struct AgentTaskSpec {
     // 无法判断应生成哪个外部 channel 的 marker。default 兼容旧执行快照。
     #[serde(default)]
     pub(super) source_channel: String,
+    /// 后台任务的发起会话（chat_id）：完成唤醒消息的路由目标（ZCode 移植 · Layer 4）。
+    /// 与 source_channel 一样由运行时注入（`_rclaw_source_chat`），不暴露在工具 schema。
+    #[serde(default)]
+    pub(super) origin_chat_id: String,
+    /// 子代理独立模型（ZCode 移植 · Layer 2b）：`[[llm.providers]]` 里的 provider 名。
+    /// 运行期经 model_factory 解析；None / 嵌入方未注入 factory 时回落主 provider
+    /// （名字合法性已在工具入参校验期把关）。
+    #[serde(default)]
+    pub(super) model: Option<String>,
+    /// 计划步骤上下文（Layer 3）：由 PlanRun 构造步骤时注入，escalate 用它定位 journal。
+    #[serde(default)]
+    pub(super) plan_id: Option<String>,
+    #[serde(default)]
+    pub(super) step_id: Option<String>,
     pub(super) isolation: String,
     pub(super) max_tool_iter: usize,
     pub(super) max_output_chars: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct AgentTaskResult {
     pub(super) name: String,
     pub(super) role: String,
@@ -97,6 +112,15 @@ pub(super) fn parse_agent_task(input: &Value, idx: usize) -> Result<AgentTaskSpe
         source_channel: get_str(input, "_rclaw_source_channel")
             .unwrap_or_default()
             .to_string(),
+        origin_chat_id: get_str(input, "_rclaw_source_chat")
+            .unwrap_or_default()
+            .to_string(),
+        model: get_str(input, "model")
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string),
+        plan_id: None,
+        step_id: None,
         isolation,
         max_tool_iter: get_usize(input, "max_tool_iter", DEFAULT_MAX_TOOL_ITER, MAX_TOOL_ITER)?,
         max_output_chars: get_usize(

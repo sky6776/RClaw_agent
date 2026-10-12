@@ -472,6 +472,19 @@ pub(crate) fn patch_runtime_source_channel(input: &mut Value, source_channel: &s
     }
 }
 
+/// 给 Agent/Task 工具注入仅供运行时使用的发起会话 chat_id（后台完成唤醒的路由目标）。
+/// 与 `_rclaw_source_channel` 同范式：运行时私有元数据，不暴露在工具 schema，
+/// 模型输入中的旧值一律清除。
+pub(crate) fn patch_runtime_source_chat(input: &mut Value, source_chat: &str) {
+    let Some(input) = input.as_object_mut() else {
+        return;
+    };
+    input.remove("_rclaw_source_chat");
+    if !source_chat.is_empty() {
+        input.insert("_rclaw_source_chat".to_string(), json!(source_chat));
+    }
+}
+
 pub(super) fn is_parallel_agent_tool(name: &str) -> bool {
     matches!(name, "Agent" | "Task" | "PlanRun")
 }
