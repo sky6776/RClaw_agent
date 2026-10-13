@@ -325,7 +325,7 @@ export default function App() {
       const backend = await api.chatList();
       // 后端已确认的会话不再是本地占位（标题此后以服务端为准）。
       backend.forEach((c) => localChatIds.current.delete(c.chat_id));
-      // 后端只列出已有会话文件的会话；本地刚新建、尚未发首条消息的会话还没有文件，
+      // 后端只列出已有消息记录的会话；本地刚新建、尚未发首条消息的会话还没有记录，
       // 直接整体替换会让空新会话从侧栏消失——保留仍是当前会话的本地未持久化项。
       setChats((prev) => {
         const ids = new Set(backend.map((c) => c.chat_id));
@@ -428,7 +428,7 @@ export default function App() {
       // 期间侧栏绿点、齿轮行消失」的问题。
       if (!statusEntry && !payload.intermediate) {
         setBusyByChat((prev) => ({ ...prev, [payload.chat_id]: false }));
-        // turn 收尾时会话文件已落盘（先 append 后 outbound）：刷新列表，
+        // turn 收尾时会话记录已落库（先 append 后 outbound）：刷新列表，
         // 让新会话（bot 收件箱、首次对话）与派生标题及时出现在侧栏。
         void refreshChats();
       }
@@ -506,7 +506,7 @@ export default function App() {
       const chatId = activeId;
       appendEntries(chatId, [{ role: "user", content }]);
       setBusyByChat((prev) => ({ ...prev, [chatId]: true }));
-      // 首条消息发出时后端会话文件尚未落盘，chat_list 扫不到：先本地补一个
+      // 首条消息发出时后端会话记录尚未落库，chat_list 扫不到：先本地补一个
       // 会话条目让侧栏立即显示（否则整个 turn 期间是「暂无会话」，直到收尾
       // 刷新才出现）。「+」新建的本地占位会话（标题还是「新对话」）则用首条
       // 消息更新缩略标题；已确认的会话条目不动。
@@ -1616,8 +1616,9 @@ export default function App() {
               {permQueue[0].path}
             </p>
             <p className="mt-2 text-[10px] text-gray-600">
-              允许后该路径本次运行内不再重复询问；拒绝会让 agent 收到访问被拒提示。也可在
+              允许后本次运行内对该文件的同类操作不再重复询问（其它操作、其它文件仍会询问）；拒绝会让 agent 收到访问被拒提示。也可在
               「配置」页切换为完全访问模式（任意路径免确认）。
+              注意：对某个工作区外文件的首次放行若是写入 / 删除，这一次不记回滚点（放行前不读取它的原文），/rewind 还原不了它；该文件放行之后的写入 / 删除才有回滚点。
             </p>
             <div className="mt-4 flex justify-end gap-2">
               <button
@@ -1961,9 +1962,9 @@ function About({ home }: { home: string }) {
           <h2 className="mb-2 text-sm font-medium text-gray-200">数据目录</h2>
           <p className="font-mono text-xs break-all text-gray-500">{home}</p>
           <p className="mt-1 text-xs text-gray-600">
-            rclaw.toml（配置）、agent/（会话、记忆、技能、日志）都在这里；会话文件在
-            agent/sessions/，归档会话位于 agent/sessions/archived/。关闭窗口仅隐藏到托盘，
-            RClaw 保持常驻。
+            rclaw.toml（配置）、agent/（会话、记忆、技能、日志）都在这里；会话、回滚点与
+            归档标记都存在 agent/state.sqlite（SQLite 单库），导出用 /export 或侧栏「导出」。
+            关闭窗口仅隐藏到托盘，RClaw 保持常驻。
           </p>
         </div>
       </div>

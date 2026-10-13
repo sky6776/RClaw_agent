@@ -29,26 +29,123 @@ pub(super) fn build_auto_review_prompt(review_memory: bool, review_evolve: bool)
     )
 }
 
-pub(super) fn render_messages_for_summary(messages: &[Message], max_chars: usize) -> String {
-    let mut out = String::new();
-    // 判界按字符累计（收尾 truncate_chars 也是字符口径）：String::len 是字节，
-    // CJK 下会提前数倍触发截断，摘要拿到的 transcript 偏短。
-    let mut rendered_chars = 0usize;
-    for (idx, message) in messages.iter().enumerate() {
-        if rendered_chars >= max_chars {
-            out.push_str("\n[transcript truncated]\n");
-            break;
-        }
-        let block = format!(
-            "### Message {} ({:?})\n{}\n\n",
-            idx + 1,
-            message.role,
-            render_message_content(message)
-        );
-        rendered_chars += block.chars().count();
-        out.push_str(&block);
+/// transcript 里单个文本 / 工具结果块的字符上限（`render_message_content`）。
+pub(super) const TRANSCRIPT_TEXT_MAX_CHARS: usize = 2000;
+
+/// transcript 中段省略标记的固定前缀（完整标记见 [`transcript_elided_marker`]）。
+pub(super) const TRANSCRIPT_ELIDED_MARKER_PREFIX: &str = "\n[… transcript middle elided:";
+
+/// transcript 中段省略标记：`omitted` 条消息整条没有列出。放在保留的开头与结尾之间，
+/// 让摘要器知道两段之间还有没列出的内容。
+pub(super) fn transcript_elided_marker(omitted: usize) -> String {
+    format!("{TRANSCRIPT_ELIDED_MARKER_PREFIX} {omitted} message(s) omitted to fit the budget …]\n")
+}
+
+/// [`render_transcript`] 的结果：正文，以及哪些消息没有【整条】进入 transcript。
+pub(super) struct RenderedTranscript {
+    pub(super) text: String,
+    /// 整条被省略的消息下标区间（无省略时为空区间）。
+    pub(super) elided: std::ops::Range<usize>,
+    /// 最后一条消息单独就装不进尾部预算、只按字符保留了开头时，它的下标。
+    pub(super) clipped_last: Option<usize>,
+}
+
+impl RenderedTranscript {
+    /// `idx` 这条消息是否整条进入了 transcript（单块正文超过 [`TRANSCRIPT_TEXT_MAX_CHARS`]
+    /// 的截断不算：那是块级口径，由调用方按正文长度另判）。
+    pub(super) fn fully_rendered(&self, idx: usize) -> bool {
+        !self.elided.contains(&idx) && self.clipped_last != Some(idx)
     }
-    truncate_chars(&out, max_chars)
+}
+
+/// 把消息渲染成摘要 transcript，总量不超过 `max_chars` 个字符。
+///
+/// 超预算时保留【开头】与【结尾】、省略中段（整条为单位，以 [`transcript_elided_marker`]
+/// 隔开；标记计入预算）：素材按时间序排列，开头是前缀 / 任务原文，结尾是紧挨尾窗、模型
+/// 最需要的最新迭代——从末尾截断会把后者砍掉，而那部分既不在视图里也不会再有别的摘要
+/// 覆盖。预算对半分，开头从前往后装整条、装剩的额度全给结尾、结尾从后往前装整条；最后
+/// 一条单独就超出尾部额度时按字符保留它的开头（标题 + 前几个内容块），以 `…` 收尾。
+///
+/// `max_chars` 须大于省略标记本身的长度（几十个字符）：预算比标记还小时头尾都装不下，
+/// 输出只剩标记与 `…`、会略超预算——调用方的预算都是千字符级，这里只在 debug 下断言。
+pub(super) fn render_transcript(messages: &[Message], max_chars: usize) -> RenderedTranscript {
+    // 判界按字符累计（truncate_chars 也是字符口径）：String::len 是字节，CJK 下会提前
+    // 数倍触发省略，摘要拿到的 transcript 偏短。
+    let blocks: Vec<String> = messages
+        .iter()
+        .enumerate()
+        .map(|(idx, message)| render_message_block(idx, message))
+        .collect();
+    let counts: Vec<usize> = blocks.iter().map(|block| block.chars().count()).collect();
+    if counts.iter().sum::<usize>() <= max_chars {
+        return RenderedTranscript {
+            text: blocks.concat(),
+            elided: 0..0,
+            clipped_last: None,
+        };
+    }
+    let marker_reserve = transcript_elided_marker(messages.len()).chars().count();
+    debug_assert!(
+        max_chars > marker_reserve,
+        "transcript 预算 {max_chars} 装不下省略标记（{marker_reserve} 字符）"
+    );
+    let budget = max_chars.saturating_sub(marker_reserve);
+    let head_budget = budget / 2;
+    let mut head_end = 0;
+    let mut head_used = 0;
+    while head_end < blocks.len() && head_used + counts[head_end] <= head_budget {
+        head_used += counts[head_end];
+        head_end += 1;
+    }
+    let tail_budget = budget - head_used;
+    let mut tail_start = blocks.len();
+    let mut tail_used = 0;
+    while tail_start > head_end && tail_used + counts[tail_start - 1] <= tail_budget {
+        tail_used += counts[tail_start - 1];
+        tail_start -= 1;
+    }
+    let clip_last = tail_start == blocks.len() && tail_start > head_end;
+    let elided_end = if clip_last { tail_start - 1 } else { tail_start };
+    let elided = head_end..elided_end;
+    let mut text = String::with_capacity(max_chars.min(head_used + marker_reserve + tail_budget));
+    for block in &blocks[..head_end] {
+        text.push_str(block);
+    }
+    if !elided.is_empty() {
+        text.push_str(&transcript_elided_marker(elided.len()));
+    }
+    if clip_last {
+        let clipped: String = blocks[tail_start - 1]
+            .chars()
+            .take(tail_budget.saturating_sub(1))
+            .collect();
+        text.push_str(&clipped);
+        text.push('…');
+    }
+    for block in &blocks[tail_start..] {
+        text.push_str(block);
+    }
+    RenderedTranscript {
+        text,
+        elided,
+        clipped_last: if clip_last { Some(tail_start - 1) } else { None },
+    }
+}
+
+/// [`render_transcript`] 的正文（生产路径直接用 [`render_transcript`]，此处仅供测试）。
+#[cfg(test)]
+pub(super) fn render_messages_for_summary(messages: &[Message], max_chars: usize) -> String {
+    render_transcript(messages, max_chars).text
+}
+
+/// transcript 里一条消息的渲染块（`idx` 为 0 起的位置；标题按 1 起编号）。
+pub(super) fn render_message_block(idx: usize, message: &Message) -> String {
+    format!(
+        "### Message {} ({:?})\n{}\n\n",
+        idx + 1,
+        message.role,
+        render_message_content(message)
+    )
 }
 
 pub(super) fn render_message_content(message: &Message) -> String {
@@ -58,7 +155,7 @@ pub(super) fn render_message_content(message: &Message) -> String {
     }
     for block in &message.content {
         match block {
-            ContentBlock::Text { text } => parts.push(truncate_chars(text, 2000)),
+            ContentBlock::Text { text } => parts.push(truncate_chars(text, TRANSCRIPT_TEXT_MAX_CHARS)),
             ContentBlock::MediaUrl { kind, url } => parts.push(format!(
                 "[{kind:?} attachment: {}]",
                 truncate_chars(url, 200)
@@ -77,7 +174,7 @@ pub(super) fn render_message_content(message: &Message) -> String {
                 is_error,
             } => parts.push(format!(
                 "[tool_result id={tool_use_id} error={is_error}] {}",
-                truncate_chars(content, 2000)
+                truncate_chars(content, TRANSCRIPT_TEXT_MAX_CHARS)
             )),
         }
     }
@@ -844,6 +941,7 @@ pub(super) async fn execute_review_tools(
         });
     }
     Message {
+        id: 0,
         role: Role::User,
         content: blocks,
         tool_call_id: None,

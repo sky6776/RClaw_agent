@@ -14,7 +14,7 @@ use serde::Serialize;
 use tauri::Emitter;
 use tokio::sync::oneshot;
 
-use rclaw_tools::access::OutsideDecision;
+use rclaw_tools::access::{OutsideDecision, PathConfirmRequest};
 
 /// 授权询问超时（秒）：超时按拒绝处理，防止 turn 挂死在无人应答的弹窗上。
 const ASK_TIMEOUT_SECS: u64 = 120;
@@ -23,8 +23,16 @@ const ASK_TIMEOUT_SECS: u64 = 120;
 #[derive(Debug, Clone, Serialize)]
 pub struct PermissionRequestDto {
     pub id: String,
-    /// 请求访问的工作区外路径（正斜杠展示形式）。
+    /// 弹窗正文：操作 + 真正会被打开的物理落点，请求拼写与落点不同时一并带上
+    /// （`PathConfirmRequest::display`）。工作区内一个指向外部的链接按拼写展示会像是
+    /// 工作区里的路径，用户看不出这是在放行外部文件。
     pub path: String,
+    /// 物理落点（正斜杠）。
+    pub target: String,
+    /// 工具请求时的拼写（正斜杠）。
+    pub requested: String,
+    /// 操作名（读取 / 写入 / 删除 / 列目录 / 搜索 / 作为 shell 工作目录）。
+    pub op: String,
 }
 
 /// 等待应答的请求表（id → 回填通道）。桌面进程内全局唯一。
@@ -32,7 +40,7 @@ static PENDING: LazyLock<Mutex<HashMap<String, oneshot::Sender<bool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 发起一次授权询问：向前端发事件并等待用户决定（由 agent 启动时装进钩子调用）。
-pub async fn ask(app: tauri::AppHandle, path: String) -> OutsideDecision {
+pub async fn ask(app: tauri::AppHandle, request: PathConfirmRequest) -> OutsideDecision {
     // id = 毫秒时间戳 + 4 位十六进制随机数，够前端回填精确配对。
     let id = format!(
         "{}-{:04x}",
@@ -52,7 +60,10 @@ pub async fn ask(app: tauri::AppHandle, path: String) -> OutsideDecision {
         "permission_request",
         PermissionRequestDto {
             id: id.clone(),
-            path,
+            path: request.display(),
+            target: request.target,
+            requested: request.requested,
+            op: request.op.label().to_string(),
         },
     );
     if let Err(e) = emit {

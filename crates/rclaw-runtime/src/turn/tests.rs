@@ -42,6 +42,7 @@ fn tool_outcome(name: &str, input: Value) -> ChatOutcome {
 
 fn tool_result_message(id: &str, content: &str, is_error: bool) -> Message {
     Message {
+        id: 0,
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: id.to_string(),
@@ -1992,7 +1993,7 @@ fn ai_berkshire_package_skill_rejects_symlink_escape() {
         outcome,
         PackageSkillLoad::Failed { ref error, .. } if error.contains("越出 agent 根目录")
     ));
-    assert!(state.loaded_package_skills.is_empty());
+    assert!(loaded_package_skills.is_empty());
 }
 
 #[tokio::test]
@@ -2271,7 +2272,9 @@ fn render_context_usage_shows_no_auto_compression_when_token_threshold_zero() {
     };
     let s = render_context_usage(25_000, 30_000, &opts);
     assert!(s.contains("token 阈值为 0"));
-    assert!(s.contains("不会自动摘要化旧历史"));
+    assert!(s.contains("不会按阈值自动摘要化旧历史"));
+    // reactive 压缩不受阈值开关影响，尾注要说明它仍然存在。
+    assert!(s.contains("上下文超限时仍会就地压缩一次"), "{s}");
     assert!(!s.contains("消息数"));
     assert!(!s.contains("字节"));
     // 不应出现误导性的「约 0 token」，也不应出现 token 触发分支的「超过即摘要化旧历史」。
@@ -2331,6 +2334,7 @@ fn mk_assistant_text(t: &str) -> Message {
 }
 fn mk_tool_use(id: &str, name: &str) -> Message {
     Message {
+        id: 0,
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: id.into(),
@@ -2343,6 +2347,7 @@ fn mk_tool_use(id: &str, name: &str) -> Message {
 }
 fn mk_tool_result(id: &str) -> Message {
     Message {
+        id: 0,
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: id.into(),
@@ -2453,6 +2458,49 @@ fn tail_start_anchors_latest_user_and_assistant() {
 }
 
 #[test]
+fn tail_start_user_anchor_yields_when_anchored_tail_blows_the_budget() {
+    // 上一轮 = 1 条 user + 多次巨型工具迭代：user 锚点若照常回拉，尾窗就是整轮（远超 soft
+    // ceiling），可摘要区只剩前面两条、压了等于没压。预算生效时锚点让位：尾窗从预算收缩
+    // 到的位置起（最新 assistant 锚点不受影响，它本就在尾窗里）。
+    let big_result = |id: &str| Message {
+        id: 0,
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: "x".repeat(8000), // ~2000 tok
+            is_error: false,
+        }],
+        tool_call_id: None,
+        ts: 0,
+    };
+    let hist = vec![
+        mk_user("q1"),
+        mk_assistant_text("a1"),
+        mk_user("giant turn q2"),
+        mk_tool_use("1", "read"),
+        big_result("1"),
+        mk_tool_use("2", "read"),
+        big_result("2"),
+        mk_assistant_text("a2 final"),
+    ];
+    let budgeted = TailPolicy {
+        protect_first: 0,
+        keep_recent: 3,
+        token_budget: 1000,
+        min_floor: 2,
+    };
+    let start = compute_tail_start(&hist, &budgeted);
+    assert!(start > 2, "锚定整轮会超出 soft ceiling，user 锚点应让位：start={start}");
+    assert!(!hist[start].is_tool_result_carrier());
+    // 不带预算时锚点照常生效。
+    let unbudgeted = TailPolicy {
+        token_budget: 0,
+        ..budgeted
+    };
+    assert_eq!(compute_tail_start(&hist, &unbudgeted), 2);
+}
+
+#[test]
 fn tail_start_soft_ceiling_tolerates_up_to_1_5x_budget() {
     // 总 tail ≈1400 token：超过 budget(1000) 但在 soft ceiling(1500) 内。soft ceiling 应让
     // 收缩【提前停止】、保留全部消息（start=0），而非按硬 budget 继续丢到只剩 floor。
@@ -2532,6 +2580,52 @@ fn first_compression_preserves_opening_messages_until_summary_exists() {
     );
 }
 
+/// 回归：受保护头部以 `repair_tool_chains` 现补的占位 tool_result（`id == 0`）收尾时，
+/// `head_until` 必须锚在头部最后一个已持久化 id 上，而不是算成 None（库视图会整段丢头部）。
+/// 头部一个持久化 id 都没有则按「锚点缺 id」只压内存（`tail_from = 0`）。
+#[test]
+fn boundary_anchor_skips_synthesized_head_tail_and_refuses_unanchorable_head() {
+    let mut history = vec![
+        mk_user("opening user"),
+        mk_assistant_text("opening assistant"),
+        mk_tool_use("call-1", "read_file"),
+        mk_tool_result("call-1"),
+        mk_user("old middle user"),
+        mk_assistant_text("old middle answer"),
+        mk_user("active task"),
+        mk_assistant_text("latest answer"),
+    ];
+    for (idx, msg) in history.iter_mut().enumerate() {
+        msg.id = idx as i64 + 1;
+    }
+    // 下标 3 的 tool_result 模拟加载时现补的中止占位符：库里没有这一行。
+    history[3].id = 0;
+    let policy = TailPolicy {
+        protect_first: 3,
+        keep_recent: 2,
+        token_budget: 1,
+        min_floor: 2,
+    };
+    let plan = assemble_compressed_history(&history, &policy);
+    assert_eq!(plan.protected_head, 4, "头部应顺延到 tool_result 载体之后");
+    assert_eq!(
+        plan.boundary_anchor_ids(),
+        (Some(3), 7),
+        "head_until 锚在最后一个真实 id（tool_use），tail_from 为尾窗首条"
+    );
+
+    let mut plan = plan;
+    let head_len = plan.protected_head;
+    for msg in &mut plan.compressed[..head_len] {
+        msg.id = 0;
+    }
+    assert_eq!(
+        plan.boundary_anchor_ids(),
+        (None, 0),
+        "头部没有任何持久化 id 时不得落一条会丢头部的 boundary"
+    );
+}
+
 #[test]
 fn summary_always_user_merges_into_user_tail() {
     // 摘要是压缩后历史首条可见消息，必须为 user
@@ -2588,6 +2682,7 @@ fn merge_keeps_media_before_summary() {
     // 否则旧图片会被模型当成当前新输入。
     let placeholder = context_summary_placeholder_message;
     let tail = Message {
+        id: 0,
         role: Role::User,
         content: vec![
             ContentBlock::text("original user text"),
@@ -3369,6 +3464,7 @@ impl ReplacementDuringChatProvider {
                 ActiveTurn {
                     cancel: CancellationToken::new(),
                     event_tx: replacement_tx.clone(),
+                    touches_history: true,
                 },
             );
         *self.replacement_tx.lock().unwrap() = Some(replacement_tx);
@@ -3664,6 +3760,75 @@ async fn execute_tools_has_no_fixed_agent_batch_limit_and_preserves_order() {
     }
 }
 
+/// `is_session_busy`：同会话（含 cron 分键）有事件通道仍开着的活动 turn 才算忙；接收端
+/// 已丢弃的僵尸条目（turn 主体退出、外壳尚未自移除）不算；别的会话不受影响。
+#[tokio::test]
+async fn is_session_busy_counts_only_live_turns_of_that_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+        reply: "unused".into(),
+    });
+    let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+    let mgr = TurnManager::new(
+        provider,
+        None,
+        session,
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    );
+    assert!(!mgr.is_session_busy(CHANNEL_CLI, "console"));
+
+    // 活动 turn（接收端活着）→ 忙；只对该会话。
+    let (live_tx, live_rx) = mpsc::channel(1);
+    mgr.active.lock().expect("active map 锁未被毒化").insert(
+        TurnKey {
+            channel: CHANNEL_CLI.to_string(),
+            chat_id: "console".to_string(),
+            cron_job_id: Some("job-1".to_string()),
+        },
+        ActiveTurn {
+            cancel: CancellationToken::new(),
+            event_tx: live_tx,
+            touches_history: false,
+        },
+    );
+    assert!(mgr.is_session_busy(CHANNEL_CLI, "console"), "cron 分键同样计入");
+    assert!(!mgr.is_session_busy(CHANNEL_CLI, "other"));
+    assert!(!mgr.is_session_busy("desktop", "console"));
+
+    // 接收端丢弃 → 通道关闭 → 僵尸条目不算忙。
+    drop(live_rx);
+    assert!(!mgr.is_session_busy(CHANNEL_CLI, "console"));
+
+    // SessionLifecycle 句柄走同一判定。
+    let (tx, _rx) = mpsc::channel(1);
+    mgr.active.lock().expect("active map 锁未被毒化").insert(
+        TurnKey {
+            channel: "desktop".to_string(),
+            chat_id: "c1".to_string(),
+            cron_job_id: None,
+        },
+        ActiveTurn {
+            cancel: CancellationToken::new(),
+            event_tx: tx,
+            touches_history: true,
+        },
+    );
+    let mgr = Arc::new(mgr);
+    let lifecycle = crate::SessionLifecycle::for_tests(mgr.clone());
+    assert!(lifecycle.is_session_busy("desktop", "c1"));
+    assert!(!lifecycle.is_session_busy("desktop", "c2"));
+}
+
 #[tokio::test]
 async fn finishing_old_turn_does_not_remove_replacement_active_turn() {
     let dir = tempfile::tempdir().unwrap();
@@ -3702,6 +3867,7 @@ async fn finishing_old_turn_does_not_remove_replacement_active_turn() {
         ActiveTurn {
             cancel: cancel.clone(),
             event_tx: old_tx.clone(),
+            touches_history: true,
         },
     );
 
@@ -3794,6 +3960,7 @@ async fn cancel_treats_closed_active_entry_as_no_task() {
         ActiveTurn {
             cancel: CancellationToken::new(),
             event_tx,
+            touches_history: true,
         },
     );
 
@@ -4583,9 +4750,16 @@ async fn auxiliary_inferences_also_receive_dynamic_status_tail() {
     };
     let summary = mgr
         .history
-        .summarize(&history, &msg, &CancellationToken::new(), 2, &sink)
+        .summarize(
+            &history,
+            &msg,
+            &CancellationToken::new(),
+            mgr.history.tail_policy(2),
+            SummaryExtras::default(),
+            &sink,
+        )
         .await;
-    assert!(matches!(summary, SummaryLoad::Completed { .. }));
+    assert!(matches!(summary, SummaryLoad::Completed(_)));
 
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
@@ -4787,6 +4961,103 @@ fn repeated_compression_updates_latest_summary_only() {
         b.as_text()
             .is_some_and(|t| t.contains("CONTEXT COMPACTION"))
     }));
+}
+
+#[test]
+fn second_compression_summarizes_previous_head_and_merged_carrier_before_tail() {
+    // 上一轮：受保护头部 h0/h1 原样保留，摘要 merge 进尾窗首条 user（"carried user"）。
+    let mut carrier = mk_user("carried user");
+    merge_summary_into_first_tail(&mut carrier, &context_summary_block("old summary"));
+    let history = vec![
+        mk_user("h0"),
+        mk_assistant_text("h1"),
+        carrier,
+        mk_assistant_text("a6"),
+        mk_user("u7"),
+        mk_assistant_text("a7"),
+        mk_user("u8"),
+        mk_assistant_text("a8"),
+    ];
+    // keep_recent 覆盖到载体（tail_start = 2）：尾窗起点必须被推到载体之后。
+    let policy = TailPolicy {
+        protect_first: 2,
+        keep_recent: 6,
+        token_budget: 0,
+        min_floor: 2,
+    };
+    let plan = assemble_compressed_history(&history, &policy);
+    assert_eq!(plan.protected_head, 0);
+    assert_eq!(plan.previous_summary.as_deref(), Some("old summary"));
+
+    let rendered = render_messages_for_summary(&plan.to_summarize, 10_000);
+    assert!(
+        rendered.contains("h0") && rendered.contains("h1"),
+        "上一轮受保护头部不再出现在视图里，必须进入被摘要区: {rendered}"
+    );
+    assert!(rendered.contains("carried user"), "merge 载体中的原 user 正文进入被摘要区");
+    assert!(!rendered.contains("old summary"), "旧摘要正文只经 previous_summary 传递");
+    assert!(!rendered.contains(MERGED_PRIOR_CONTEXT_HEADER));
+    assert!(!rendered.contains("a6"), "载体之后的消息留在尾窗");
+
+    // 压缩视图 = 占位符 + 载体之后的全部消息，尾窗里没有旧摘要残留。
+    assert!(is_context_summary_placeholder(&plan.compressed[0]));
+    assert_eq!(render_message_content(&plan.compressed[1]), "a6");
+    assert_eq!(plan.compressed.len(), 6);
+    assert!(find_latest_context_summary(&plan.compressed[1..], 0, 5).is_none());
+
+    // 载体是最后一条时没有可压缩窗口（不能把尾窗推成空）。
+    let only_carrier = vec![mk_user("h0"), mk_assistant_text("h1"), history[2].clone()];
+    let plan = assemble_compressed_history(&only_carrier, &policy);
+    assert!(plan.to_summarize.is_empty());
+    assert_eq!(plan.compressed.len(), 3);
+}
+
+#[test]
+fn merged_origin_user_message_strips_header_and_summary_only() {
+    let mut carrier = Message {
+        id: 42,
+        role: Role::User,
+        content: vec![
+            ContentBlock::text("look at this"),
+            ContentBlock::media_url(rclaw_core::MediaKind::Image, "file:///tmp/a.png"),
+        ],
+        tool_call_id: None,
+        ts: 7,
+    };
+    merge_summary_into_first_tail(&mut carrier, &context_summary_block("summary body"));
+    let origin = merged_origin_user_message(&carrier).expect("merge 形态应能还原");
+    assert_eq!(origin.id, 42);
+    assert_eq!(origin.ts, 7);
+    assert_eq!(origin.content.len(), 2);
+    assert_eq!(origin.content[0].as_text(), Some("look at this"));
+    assert!(matches!(origin.content[1], ContentBlock::MediaUrl { .. }));
+
+    // 独立形态摘要没有可还原的原文。
+    assert!(merged_origin_user_message(&context_summary_message("s")).is_none());
+    assert!(merged_origin_user_message(&mk_user("plain")).is_none());
+}
+
+#[test]
+fn fold_compaction_view_does_not_merge_into_another_summary() {
+    let standalone = context_summary_message("new summary");
+    let mut merged_next = mk_user("prior user");
+    merge_summary_into_first_tail(&mut merged_next, &context_summary_block("older summary"));
+    let folded = fold_compaction_view(vec![
+        standalone.clone(),
+        merged_next.clone(),
+        mk_assistant_text("a"),
+    ]);
+    assert_eq!(folded.len(), 3, "下一条自身已是摘要载体：不 fold");
+    assert_eq!(folded[0], standalone);
+    assert_eq!(folded[1], merged_next);
+
+    // 常规情形：独立摘要 + 普通 user → fold 成一条。
+    let folded = fold_compaction_view(vec![standalone, mk_user("u"), mk_assistant_text("a")]);
+    assert_eq!(folded.len(), 2);
+    assert_eq!(
+        context_summary_body(&folded[0]).as_deref(),
+        Some("new summary")
+    );
 }
 
 #[test]
@@ -6650,6 +6921,7 @@ api_key = "secret"
 
 fn tool_use_msg(id: &str, name: &str, input: Value) -> Message {
     Message {
+        id: 0,
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: id.into(),
@@ -6663,6 +6935,7 @@ fn tool_use_msg(id: &str, name: &str, input: Value) -> Message {
 
 fn tool_result_msg(id: &str, content: &str) -> Message {
     Message {
+        id: 0,
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: id.into(),
@@ -6772,6 +7045,7 @@ fn prune_keeps_protected_head_raw() {
     let big = "SAME_CONTENT_".repeat(40);
     let long_val = "y".repeat(800);
     let protected_media = Message {
+        id: 0,
         role: Role::User,
         content: vec![ContentBlock::media_url(
             MediaKind::Image,
@@ -7180,6 +7454,123 @@ fn compression_cooldown_after_fallback() {
         mgr.history.compression_skip_reason(&key, 10).is_some(),
         "fallback 后应进入 cooldown 跳过"
     );
+    // 成功的 fallback 压缩留下的冷却只拦自动压缩：provider 已报超限时 reactive 仍可压。
+    assert!(
+        mgr.history.reactive_skip_reason(&key, 10).is_none(),
+        "fallback 冷却不应拦住 reactive compact"
+    );
+    // 摘要 LLM 致命失败（压缩未发生）的冷却则两者都拦：再撞一次只会再失败一次。
+    mgr.history.record_summary_failure(&key);
+    assert!(mgr.history.compression_skip_reason(&key, 10).is_some());
+    assert!(
+        mgr.history.reactive_skip_reason(&key, 10).is_some(),
+        "摘要致命失败的冷却应同样拦住 reactive compact"
+    );
+}
+
+/// rapid-refill 地板与轮内估算必须同尺度：压缩后地板只能先登记启发式值，压缩后第一份
+/// 真实 usage 到达时换成真实单位；之后锚定估算（真实 + 增量）才与它可比。
+#[test]
+fn rapid_refill_floor_switches_to_real_usage_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider { reply: "x".into() });
+    let (outbound_tx, _rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+    let key = TurnKey {
+        channel: CHANNEL_CLI.into(),
+        chat_id: "c".into(),
+        cron_job_id: None,
+    };
+    // 压缩后登记启发式地板 1_000；真实用量 8_000 到达 → 地板换算成 8_000。
+    mgr.history.record_compression_floor(&key, 1_000);
+    let mut anchor_message = mk_user("anchor");
+    anchor_message.id = 7;
+    mgr.history
+        .record_usage_anchor(&key, std::slice::from_ref(&anchor_message), 8_000);
+    assert!(
+        mgr.history.in_turn_blocked_by_rapid_refill(&key, 8_300),
+        "锚定估算 8_300 未从真实地板 8_000 回升 5%，应被拦（若地板仍是 1_000 会误放行）"
+    );
+    assert!(
+        !mgr.history.in_turn_blocked_by_rapid_refill(&key, 8_500),
+        "回升越过 5% 后放行并清零地板"
+    );
+    // 地板清零后，后续真实用量不得再把它「复活」。
+    mgr.history
+        .record_usage_anchor(&key, std::slice::from_ref(&anchor_message), 9_000);
+    assert!(!mgr.history.in_turn_blocked_by_rapid_refill(&key, 100));
+    // 只有压缩后的第一份真实用量会换算地板：第二份不再覆盖。
+    mgr.history.record_compression_floor(&key, 1_000);
+    mgr.history
+        .record_usage_anchor(&key, std::slice::from_ref(&anchor_message), 8_000);
+    mgr.history
+        .record_usage_anchor(&key, std::slice::from_ref(&anchor_message), 20_000);
+    assert!(!mgr.history.in_turn_blocked_by_rapid_refill(&key, 8_500));
+}
+
+/// 宿主删掉单个会话后 `forget_session` 只清该 `(channel, chat_id)`（含 cron 维度键）的
+/// 运行期状态，别的会话不受影响。
+#[test]
+fn forget_session_clears_only_that_chat_including_cron_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider { reply: "x".into() });
+    let (outbound_tx, _rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+    let doomed = TurnKey {
+        channel: "desktop".into(),
+        chat_id: "c-dead".into(),
+        cron_job_id: None,
+    };
+    let doomed_cron = TurnKey {
+        cron_job_id: Some("job".into()),
+        ..doomed.clone()
+    };
+    let other = TurnKey {
+        channel: "desktop".into(),
+        chat_id: "c-alive".into(),
+        cron_job_id: None,
+    };
+    for key in [&doomed, &doomed_cron, &other] {
+        mgr.history.record_summary_failure(key);
+        mgr.history.record_compression_floor(key, 5_000);
+    }
+    mgr.forget_session("desktop", "c-dead");
+    assert!(mgr.history.compression_skip_reason(&doomed, 1).is_none());
+    assert!(mgr.history.compression_skip_reason(&doomed_cron, 1).is_none());
+    assert!(!mgr.history.in_turn_blocked_by_rapid_refill(&doomed, 1));
+    assert!(
+        mgr.history.compression_skip_reason(&other, 1).is_some(),
+        "别的会话的冷却不受影响"
+    );
+    assert!(mgr.history.in_turn_blocked_by_rapid_refill(&other, 1));
 }
 
 /// 连续两次低效压缩后跳过；高效压缩清零计数。
@@ -7236,6 +7627,514 @@ fn compression_ineffective_counter() {
         mgr.history.compression_skip_reason(&key, 11).is_none(),
         "高效压缩应清零低效计数"
     );
+}
+
+/// `/compact` 像 turn 一样占门槽位并登记进 active map：摘要期间 `/clear` 等生命周期操作
+/// 拿不到门、同会话第二个 `/compact` 被拒、`/cancel` 能中止它；结束后槽位与条目都释放。
+#[tokio::test]
+async fn compact_holds_gate_slot_and_is_cancellable() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    for n in 0..20 {
+        let role = if n % 2 == 0 { Role::User } else { Role::Assistant };
+        session
+            .append(CHANNEL_CLI, "console", &Message::plain(role, format!("m{n}")))
+            .unwrap();
+    }
+    let (outbound_tx, _rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        Arc::new(BlockingProvider),
+        None,
+        session,
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            compression_keep_recent: 8,
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+
+    let task_mgr = mgr.clone();
+    let compact = tokio::spawn(async move { task_mgr.handle_compact(CHANNEL_CLI, "console").await });
+    // 摘要调用永远阻塞：等 /compact 登记进 active map。
+    let turn_key = TurnKey {
+        channel: CHANNEL_CLI.into(),
+        chat_id: "console".into(),
+        cron_job_id: None,
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !mgr.has_other_active_turn(CHANNEL_CLI, "console", &turn_key) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("/compact 应登记进 active map");
+
+    assert!(
+        mgr.gate.try_acquire().is_none(),
+        "摘要期间生命周期操作（/clear 等）拿不到静默门"
+    );
+    assert!(
+        mgr.handle_compact(CHANNEL_CLI, "console")
+            .await
+            .contains("有正在运行的任务"),
+        "同会话第二个 /compact 应被拒"
+    );
+    let (matched, _) = mgr.active_cancel_session(CHANNEL_CLI, "console");
+    assert_eq!(matched, 1, "/cancel 应看到正在运行的 /compact");
+    let response = tokio::time::timeout(Duration::from_secs(5), compact)
+        .await
+        .expect("取消后 /compact 应结束")
+        .unwrap();
+    assert_eq!(response, "压缩已取消。");
+    assert!(mgr.gate.is_quiescent(), "结束后门槽位应释放");
+    assert!(
+        mgr.active.lock().unwrap().is_empty(),
+        "结束后 active 条目应移除"
+    );
+    assert!(mgr.gate.try_acquire().is_some(), "生命周期操作此时可以关门");
+}
+
+/// `/compact` 成功路径：预剪枝后的素材进摘要（旧 tool 原文不进 prompt）、boundary 落库、
+/// 回复里的条数 = 完整视图 → 压缩视图、并以压缩后的估算登记 rapid-refill 地板（紧接着的
+/// 轮内压缩在估算回升 5% 之前被压住）。
+#[tokio::test]
+async fn compact_prunes_persists_boundary_and_records_refill_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    let raw_output = "RAWTOOLOUTPUT ".repeat(400);
+    for n in 0..20 {
+        let message = match n {
+            2 => Message {
+                id: 0,
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-old".to_string(),
+                    name: "shell".to_string(),
+                    input: json!({"command": "ls"}),
+                }],
+                tool_call_id: None,
+                ts: 0,
+            },
+            3 => tool_result_message("call-old", &raw_output, false),
+            _ => Message::plain(
+                if n % 2 == 0 { Role::User } else { Role::Assistant },
+                format!("m{n}"),
+            ),
+        };
+        session.append(CHANNEL_CLI, "console", &message).unwrap();
+    }
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let (outbound_tx, _rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        Arc::new(CapturingProvider {
+            requests: requests.clone(),
+            reply: "手动压缩摘要".to_string(),
+        }),
+        None,
+        session,
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            compression_keep_recent: 8,
+            compression_protect_first: 0,
+            compression_prune_protect_count: 4,
+            compression_tail_token_budget: 0,
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+
+    // 同会话有活动 turn（接收端活着）→ 拒绝；接收端丢弃后的僵尸条目不算活动 turn → 放行。
+    let zombie_key = TurnKey {
+        channel: CHANNEL_CLI.to_string(),
+        chat_id: "console".to_string(),
+        cron_job_id: None,
+    };
+    let (live_tx, live_rx) = mpsc::channel(1);
+    mgr.active.lock().unwrap().insert(
+        zombie_key.clone(),
+        ActiveTurn {
+            cancel: CancellationToken::new(),
+            event_tx: live_tx,
+            touches_history: true,
+        },
+    );
+    let refused = mgr.handle_compact(CHANNEL_CLI, "console").await;
+    assert!(refused.contains("正在运行的任务"), "{refused}");
+    assert!(requests.lock().unwrap().is_empty(), "拒绝时不得调用摘要模型");
+    drop(live_rx);
+    // 同 chat 上活着的 cron 轮次既不加载也不持久化会话历史，不挡 /compact（落库前复查同理）。
+    // 判定依据是 spawn 时按消息来源登记的 `touches_history`，不是键的形状（旧式无 job id 的
+    // cron 消息键与普通 turn 同形）。
+    let cron_key = TurnKey {
+        channel: CHANNEL_CLI.to_string(),
+        chat_id: "console".to_string(),
+        cron_job_id: Some("nightly-report".to_string()),
+    };
+    let (cron_tx, _cron_rx) = mpsc::channel(1);
+    mgr.active.lock().unwrap().insert(
+        cron_key.clone(),
+        ActiveTurn {
+            cancel: CancellationToken::new(),
+            event_tx: cron_tx,
+            touches_history: false,
+        },
+    );
+    assert!(
+        !mgr.has_other_active_turn(
+            CHANNEL_CLI,
+            "console",
+            &TurnManager::compact_active_key(CHANNEL_CLI, "console")
+        ),
+        "cron 轮次与僵尸条目都不算与历史视图相关的活动 turn"
+    );
+    // 旧式 cron 消息（键与普通 turn 同形）仍是 cron 任务：spawn_turn 据此登记 false。
+    assert!(
+        rclaw_core::BusMessage::new_cron(CHANNEL_CLI, "console", "tick").is_cron_task(),
+        "旧式 cron 消息应按来源判定为 cron 任务"
+    );
+
+    let response = mgr.handle_compact(CHANNEL_CLI, "console").await;
+    mgr.active.lock().unwrap().remove(&cron_key);
+    let view = mgr.session.load_all(CHANNEL_CLI, "console").unwrap();
+    assert_eq!(
+        context_summary_body(&view[0]).as_deref(),
+        Some("手动压缩摘要"),
+        "首条应为新 boundary 的摘要：{view:#?}"
+    );
+    let compressed = fold_compaction_view(view);
+    assert!(
+        response.contains(&format!("✅ 会话已压缩：20 → {} 条", compressed.len())),
+        "{response}"
+    );
+    assert!(!response.contains("fallback"), "{response}");
+    // 摘要 prompt：旧 tool 原文已被预剪枝成一行摘要；普通消息照常进 transcript。
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0]
+        .messages
+        .first()
+        .and_then(|m| m.content.iter().filter_map(ContentBlock::as_text).next())
+        .map(str::to_string)
+        .unwrap_or_default();
+    assert!(
+        !prompt.contains("RAWTOOLOUTPUT RAWTOOLOUTPUT"),
+        "旧 tool 原文应被预剪枝，不进摘要 prompt"
+    );
+    assert!(prompt.contains("m4"), "{prompt}");
+    {
+        let active = mgr.active.lock().unwrap();
+        assert!(
+            !active.contains_key(&TurnManager::compact_active_key(CHANNEL_CLI, "console")),
+            "结束后 /compact 自己的 active 条目应移除"
+        );
+        assert_eq!(active.len(), 1, "僵尸条目由其外壳自行移除，/compact 不碰");
+    }
+    // rapid-refill 地板 = 压缩后的估算：同一估算立刻再压会被压住，回升超过 5% 放行。
+    let key = zombie_key;
+    let post_estimate = mgr.history.anchored_estimate(
+        &key,
+        &mgr.base_system_prompt,
+        &compressed,
+        &mgr.request_tool_schemas(None),
+    );
+    assert!(
+        mgr.history.in_turn_blocked_by_rapid_refill(&key, post_estimate),
+        "/compact 刚结束时轮内压缩应被 rapid-refill 地板压住"
+    );
+    assert!(!mgr.history.in_turn_blocked_by_rapid_refill(&key, post_estimate * 2));
+}
+
+/// 摘要素材预算：被摘要区优先，被裁掉的前缀只拿剩余额度、从最早的让起；前缀里的旧摘要
+/// 载体不作为正文进 transcript。
+#[test]
+fn merged_summary_material_gives_head_priority_over_trimmed_prefix() {
+    let big = |n: usize| {
+        Message::plain(
+            if n.is_multiple_of(2) { Role::User } else { Role::Assistant },
+            format!("消息 {n}：{}", "字".repeat(1_900)),
+        )
+    };
+    let head: Vec<Message> = (100..120).map(big).collect();
+    let prefix: Vec<Message> = (1..31).map(big).collect();
+
+    let merged =
+        merge_prefix_into_summary_material(&prefix, 0, &head, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(!merged.head_overflows);
+    assert!(
+        merged.omitted_prefix > 0 && merged.omitted_prefix < prefix.len(),
+        "前缀应部分让位：{}",
+        merged.omitted_prefix
+    );
+    let kept_prefix = prefix.len() - merged.omitted_prefix;
+    assert_eq!(merged.material.len(), 1 + kept_prefix + head.len());
+    assert_eq!(merged.material[0].role, Role::System, "首条是让位说明");
+    let transcript =
+        render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(!transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX), "头区不得被省略");
+    assert!(
+        transcript.ends_with(&render_message_block(merged.material.len() - 1, &head[19])),
+        "头区末条必须完整保留在 transcript 末尾"
+    );
+    assert!(transcript.contains("消息 100："), "头区首条");
+    assert!(transcript.contains(&format!("消息 {}：", merged.omitted_prefix + 1)), "保留的前缀首条");
+    assert!(!transcript.contains(&format!("消息 {}：", merged.omitted_prefix)), "被让掉的前缀末条");
+    assert!(transcript.contains(&format!("更早的 {} 条", merged.omitted_prefix)));
+
+    // 被摘要区自身超预算：前缀全部让位，且连让位说明都不加（它只会把被摘要区再挤掉
+    // 一截）；transcript 省略中段、开头的任务原文与结尾的最新迭代都保留，且不超预算。
+    let huge_head: Vec<Message> = (100..130).map(big).collect();
+    let merged =
+        merge_prefix_into_summary_material(&prefix, 0, &huge_head, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(merged.head_overflows);
+    assert_eq!(merged.omitted_prefix, prefix.len());
+    assert_eq!(merged.prefix_total, prefix.len());
+    assert_eq!(merged.material.len(), huge_head.len());
+    let transcript =
+        render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX));
+    assert!(transcript.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(transcript.starts_with(&render_message_block(0, &huge_head[0])), "开头保留");
+    assert!(
+        transcript.ends_with(&render_message_block(29, &huge_head[29])),
+        "紧挨尾窗的最新一条保留"
+    );
+    assert!(!transcript.contains("消息 115："), "中段被省略");
+    // 无前缀时同样要报超预算（load 期 / `/compact` 走这条路）。
+    assert!(
+        merge_prefix_into_summary_material(&[], 0, &huge_head, SUMMARY_TRANSCRIPT_MAX_CHARS)
+            .head_overflows
+    );
+
+    // 预算边缘：被摘要区没超预算，但剩余额度（50 字符）连让位说明都放不下 → 前缀全部让位、
+    // 不加说明，transcript 不被截断。单条正文渲染时截到 2000 字符，所以用多条凑体量。
+    let mut edge_head: Vec<Message> = (0..23)
+        .map(|_| Message::plain(Role::User, "x".repeat(2_500)))
+        .collect();
+    let used: usize = edge_head
+        .iter()
+        .enumerate()
+        .map(|(i, m)| render_message_block(prefix.len() + i, m).chars().count())
+        .sum();
+    let filler_overhead = render_message_block(
+        prefix.len() + edge_head.len(),
+        &Message::plain(Role::User, ""),
+    )
+    .chars()
+    .count();
+    let filler = SUMMARY_TRANSCRIPT_MAX_CHARS - 50 - used - filler_overhead;
+    assert!(filler < 2_000, "填充正文不能触发单条截断：{filler}");
+    edge_head.push(Message::plain(Role::User, "y".repeat(filler)));
+    let merged =
+        merge_prefix_into_summary_material(&prefix, 0, &edge_head, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(!merged.head_overflows);
+    assert_eq!(merged.omitted_prefix, prefix.len());
+    assert_eq!(merged.material.len(), edge_head.len(), "不加让位说明");
+    let transcript =
+        render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(!transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX));
+    assert!(transcript.ends_with(&render_message_block(edge_head.len() - 1, &edge_head[23])));
+
+    // 前缀里的旧摘要载体：独立形态剥掉，merge 形态只留原 user 正文。
+    let mut merged_carrier = Message::plain(Role::User, "原始提问");
+    merge_summary_into_first_tail(&mut merged_carrier, &context_summary_block("更早的摘要"));
+    let prefix_with_summaries = vec![
+        context_summary_message("旧摘要正文"),
+        Message::plain(Role::User, "普通消息"),
+        merged_carrier,
+    ];
+    let merged = merge_prefix_into_summary_material(
+        &prefix_with_summaries,
+        0,
+        &head[..2],
+        SUMMARY_TRANSCRIPT_MAX_CHARS,
+    );
+    assert_eq!(merged.omitted_prefix, 0);
+    let texts: Vec<String> = merged
+        .material
+        .iter()
+        .map(|m| m.content.iter().filter_map(ContentBlock::as_text).collect::<String>())
+        .collect();
+    assert_eq!(texts.len(), 4, "{texts:?}");
+    assert_eq!(texts[0], "普通消息");
+    assert_eq!(texts[1], "原始提问");
+    assert!(merged.material.iter().all(|m| context_summary_body(m).is_none()));
+
+    // 无前缀：素材即被摘要区。
+    let merged =
+        merge_prefix_into_summary_material(&[], 0, &head[..2], SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert_eq!(merged.material.len(), 2);
+    assert_eq!(merged.omitted_prefix, 0);
+    assert!(!merged.head_overflows);
+}
+
+/// 前缀开头属于上一 boundary 受保护头部的几条（会话开头的任务原文，从未被摘要）优先于
+/// 其余前缀占预算：让位从它们之后开始，让位说明紧跟其后、不再声称旧摘要覆盖了被让掉的
+/// 消息；受保护头部自己也装不下时才从它的末尾起让。
+#[test]
+fn merged_summary_material_keeps_previous_protected_head_before_other_prefix() {
+    let big = |n: usize| {
+        Message::plain(
+            if n.is_multiple_of(2) { Role::User } else { Role::Assistant },
+            format!("消息 {n}：{}", "字".repeat(1_900)),
+        )
+    };
+    let head: Vec<Message> = (100..120).map(big).collect();
+    // 前缀 = 受保护头部 3 条（短）+ 旧摘要载体 + 26 条大消息。
+    let mut prefix: Vec<Message> = vec![
+        Message::plain(Role::User, "消息 1：最初的任务"),
+        Message::plain(Role::Assistant, "消息 2：好的"),
+        Message::plain(Role::User, "消息 3：补充约束"),
+        context_summary_message("旧摘要正文"),
+    ];
+    prefix.extend((5..31).map(big));
+
+    let merged = merge_prefix_into_summary_material(&prefix, 3, &head, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(!merged.head_overflows);
+    assert_eq!(merged.prefix_total, prefix.len() - 1, "载体不计入分母");
+    assert!(
+        merged.omitted_prefix > 0 && merged.omitted_prefix < merged.prefix_total - 3,
+        "其余前缀应部分让位：{}",
+        merged.omitted_prefix
+    );
+    let texts: Vec<String> = merged
+        .material
+        .iter()
+        .map(|m| m.content.iter().filter_map(ContentBlock::as_text).collect::<String>())
+        .collect();
+    assert!(texts[0].starts_with("消息 1："), "{texts:?}");
+    assert!(texts[1].starts_with("消息 2："));
+    assert!(texts[2].starts_with("消息 3："));
+    assert_eq!(merged.material[3].role, Role::System, "让位说明紧跟受保护头部");
+    assert!(texts[3].contains(&format!("更早的 {} 条", merged.omitted_prefix)));
+    assert!(!texts[3].contains("PREVIOUS COMPACTED SUMMARY"), "被让掉的消息没有被任何摘要覆盖");
+    // 让掉的是紧跟受保护头部之后、最早的那段；保留的是紧挨被摘要区的一段。
+    let first_kept = 5 + merged.omitted_prefix;
+    assert!(texts[4].starts_with(&format!("消息 {first_kept}：")), "{}", texts[4]);
+    assert!(!texts.iter().any(|t| t.starts_with(&format!("消息 {}：", first_kept - 1))));
+    assert!(merged.material.iter().all(|m| context_summary_body(m).is_none()));
+    let transcript = render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(!transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX), "头区不得被省略");
+    assert!(transcript.contains("最初的任务"));
+
+    // 受保护头部本身是巨型消息、预算只够装下第一条：从它的末尾起让，其余前缀全部让位。
+    let mut huge_opening: Vec<Message> = (1..4).map(big).collect();
+    huge_opening.extend((5..8).map(big));
+    let tight_head: Vec<Message> = (100..122).map(big).collect();
+    let merged =
+        merge_prefix_into_summary_material(&huge_opening, 3, &tight_head, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(!merged.head_overflows);
+    let kept_opening = merged
+        .material
+        .iter()
+        .take_while(|m| m.role != Role::System)
+        .count();
+    assert!((1..3).contains(&kept_opening), "受保护头部部分保留：{kept_opening}");
+    assert_eq!(merged.omitted_prefix, huge_opening.len() - kept_opening);
+    assert_eq!(merged.material.len(), kept_opening + 1 + tight_head.len());
+}
+
+#[test]
+fn transcript_over_budget_elides_the_middle_and_keeps_both_ends() {
+    let messages: Vec<Message> = (0..5)
+        .map(|n| Message::plain(Role::User, format!("消息 {n}：{}", "字".repeat(500))))
+        .collect();
+    // 预算充足：原样渲染，无标记，末条完整，没有消息被省略。
+    let full = render_transcript(&messages, 100_000);
+    assert!(!full.text.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX));
+    assert!(full.text.ends_with(&render_message_block(4, &messages[4])));
+    assert!((0..5).all(|i| full.fully_rendered(i)));
+    // 预算不足：开头、结尾各留整条，中段省略并以标记隔开；总量不超预算。
+    let cut = render_transcript(&messages, 1_200);
+    assert!(cut.text.chars().count() <= 1_200, "{}", cut.text.chars().count());
+    assert!(cut.text.starts_with(&render_message_block(0, &messages[0])));
+    assert!(cut.text.ends_with(&render_message_block(4, &messages[4])));
+    assert!(cut.text.contains(&transcript_elided_marker(3)));
+    assert!(!cut.text.contains("消息 2："));
+    assert_eq!(cut.elided, 1..4);
+    assert!(cut.fully_rendered(0) && cut.fully_rendered(4) && !cut.fully_rendered(2));
+    assert_eq!(cut.clipped_last, None);
+    // 恰好在条目边界越界（总量只超 1 个字符）：只省略一条中段消息。
+    let total = full.text.chars().count();
+    let cut = render_transcript(&messages, total - 1);
+    assert!(cut.text.chars().count() < total);
+    assert_eq!(cut.elided.len(), 1);
+    assert!(cut.text.contains(&transcript_elided_marker(1)));
+    assert_eq!(render_messages_for_summary(&messages, total), full.text);
+    // 预算连一条整的都装不下：按字符保留最后一条的开头，以 … 收尾，其余整条省略。
+    let tiny = render_transcript(&messages, 400);
+    assert!(tiny.text.chars().count() <= 400, "{}", tiny.text.chars().count());
+    assert_eq!(tiny.elided, 0..4);
+    assert_eq!(tiny.clipped_last, Some(4));
+    assert!(tiny.text.contains("### Message 5 (User)"));
+    assert!(tiny.text.ends_with('…'));
+    assert!(!tiny.fully_rendered(4));
+}
+
+/// `## Active Task` 要逐字保留：素材里最后一条真实 user 消息在 transcript 里被单块上限截掉
+/// 或整条落在被省略的中段时，prompt 另给一个 verbatim 块；完整在 transcript 里时不重复给。
+#[test]
+fn summary_prompt_carries_latest_user_input_verbatim_when_transcript_cannot() {
+    let msg = BusMessage::new("cli", "console", "x");
+    let long_task = format!("请按下面的规格实现：{}END-OF-SPEC", "细".repeat(TRANSCRIPT_TEXT_MAX_CHARS + 500));
+    // 1) 正文超过单块上限：transcript 里被截，verbatim 块给全文。
+    let material = vec![
+        mk_user("q1"),
+        mk_assistant_text("a1"),
+        mk_user(&long_task),
+        mk_tool_use("1", "read"),
+        mk_tool_result("1"),
+        mk_assistant_text("a2 final"),
+    ];
+    let prompt = build_session_summary_prompt(&material, &msg, None);
+    assert!(prompt.contains("LATEST USER INPUT IN THE TRANSCRIPT (Message 3, verbatim"));
+    assert!(prompt.contains(&long_task), "verbatim 块必须含完整原文");
+    assert_eq!(prompt.matches("END-OF-SPEC").count(), 1, "transcript 里的那份被截，只有 verbatim 块含结尾");
+    // 2) 短正文、完整在 transcript 里：不重复给。
+    let material = vec![mk_user("q1"), mk_assistant_text("a1"), mk_user("短任务"), mk_assistant_text("a2")];
+    let prompt = build_session_summary_prompt(&material, &msg, None);
+    assert!(!prompt.contains("LATEST USER INPUT IN THE TRANSCRIPT"));
+    assert!(prompt.contains("短任务"));
+    // 3) 短正文但整条落在被省略的中段：verbatim 块给出。
+    let big = |n: usize| mk_assistant_text(&format!("消息 {n}：{}", "字".repeat(1_900)));
+    let mut material: Vec<Message> = (0..14).map(big).collect();
+    material.push(mk_user("中段里的任务"));
+    material.extend((15..30).map(big));
+    let rendered = render_transcript(&material, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(rendered.elided.contains(&14), "测试前提：user 消息落在被省略的中段 {:?}", rendered.elided);
+    let prompt = build_session_summary_prompt(&material, &msg, None);
+    assert!(prompt.contains("LATEST USER INPUT IN THE TRANSCRIPT (Message 15, verbatim"));
+    assert!(prompt.contains("中段里的任务"));
+    // 4) 超长正文按上限截断，并明确标成「前缀」而不是「逐字全文」。
+    let huge = "长".repeat(ACTIVE_TASK_VERBATIM_MAX_CHARS + 10);
+    let material = vec![mk_user(&huge), mk_assistant_text("a")];
+    let input = latest_user_input_verbatim(&material, &render_transcript(&material, SUMMARY_TRANSCRIPT_MAX_CHARS)).unwrap();
+    assert_eq!(input.idx, 0);
+    assert!(input.truncated);
+    assert_eq!(input.text.chars().count(), ACTIVE_TASK_VERBATIM_MAX_CHARS);
+    assert!(input.text.ends_with('…'));
+    let prompt = build_session_summary_prompt(&material, &msg, None);
+    assert!(
+        prompt.contains(&format!(
+            "LATEST USER INPUT IN THE TRANSCRIPT (Message 1, first {ACTIVE_TASK_VERBATIM_MAX_CHARS} chars only — the original is longer"
+        )),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("(Message 1, verbatim"));
 }
 
 // ===========================================================================
@@ -7431,8 +8330,9 @@ fn usage_anchor_estimates_real_value_plus_increment() {
         cron_job_id: None,
     };
 
-    // 锚点消息 + 锚点之后新增的一条消息。
-    let anchor_message = Message::plain(Role::User, "锚点消息");
+    // 锚点消息（已持久化，有 id）+ 锚点之后新增的一条消息。
+    let mut anchor_message = Message::plain(Role::User, "锚点消息");
+    anchor_message.id = 42;
     let new_message = Message::plain(Role::Assistant, "锚点之后新增");
     let history = vec![
         Message::plain(Role::User, "第一条"),
@@ -7441,8 +8341,9 @@ fn usage_anchor_estimates_real_value_plus_increment() {
         new_message.clone(),
     ];
 
+    // 锚定请求 = 历史到锚点为止；锚点取请求里最后一条有 id 的消息。
     mgr.history
-        .record_usage_anchor(&key, &anchor_message, 1_000);
+        .record_usage_anchor(&key, &history[..3], 1_000);
     let anchored = mgr.history.anchored_estimate(&key, "sys", &history, &[]);
     assert_eq!(
         anchored,
@@ -7450,7 +8351,7 @@ fn usage_anchor_estimates_real_value_plus_increment() {
         "锚定估算 = 真实总量 + 锚点后缀启发式增量（不再重复加 system+tools）"
     );
 
-    // 锚点指纹在历史中找不到 → 回退纯启发式（与旧行为一致）。
+    // 锚点 id 在历史中找不到（已被压缩进摘要）→ 回退纯启发式（与旧行为一致）。
     let fresh_history = vec![Message::plain(Role::User, "全新历史")];
     let fallback = mgr
         .history
@@ -7461,13 +8362,33 @@ fn usage_anchor_estimates_real_value_plus_increment() {
     );
 
     // total=0 的 usage 不应产生锚点（防 provider 空对象污染）。
-    mgr.history.record_usage_anchor(&key, &new_message, 0);
+    let key_zero = TurnKey {
+        channel: CHANNEL_CLI.into(),
+        chat_id: "zero".into(),
+        cron_job_id: None,
+    };
+    mgr.history
+        .record_usage_anchor(&key_zero, &history[..3], 0);
     let still_fallback = mgr
         .history
-        .anchored_estimate(&key, "sys", &fresh_history, &[]);
+        .anchored_estimate(&key_zero, "sys", &history, &[]);
     assert_eq!(
         still_fallback,
-        estimate_request_tokens(Some("sys"), &fresh_history, &[])
+        estimate_request_tokens(Some("sys"), &history, &[])
+    );
+
+    // 请求里没有任何已持久化消息（全部 id=0，如 cron 自有消息）→ 不记录锚点。
+    let key_ephemeral = TurnKey {
+        channel: CHANNEL_CLI.into(),
+        chat_id: "ephemeral".into(),
+        cron_job_id: None,
+    };
+    mgr.history
+        .record_usage_anchor(&key_ephemeral, &fresh_history, 777);
+    assert_eq!(
+        mgr.history
+            .anchored_estimate(&key_ephemeral, "sys", &fresh_history, &[]),
+        fallback
     );
 }
 

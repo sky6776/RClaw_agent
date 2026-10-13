@@ -267,7 +267,9 @@ pub fn refresh_idle() {
                     return;
                 }
             };
-            let used = usage.history_used + usage.request_used;
+            // request_used 已含历史（历史 + system prompt + 动态上下文 + 静态工具面），
+            // 与 /context、桌面 UsageDto 同口径；再加 history_used 会把历史算两遍。
+            let used = usage.request_used;
             let rss_mb = crate::commands::process_rss_bytes() / 1024 / 1024;
             // context_length=0 是「未知」哨兵（按 128K 假设的口径见 turn.rs）；
             // 通知里只展示可用数字，不猜。

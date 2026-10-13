@@ -439,6 +439,57 @@ fn ensure_dir_is_real(
     Ok(())
 }
 
+/// 清空 state.sqlite 的会话状态与 memory/ 目录下的全部内容，返回人可读的清理摘要。
+///
+/// 会话状态走 [`SessionStore::clear_all_sessions`]（单事务删除消息 / 文件 checkpoint /
+/// usage 锚点并 VACUUM；PlanRun / WorkflowRun 等 journal 不属于会话，保留）。记忆复用
+/// [`rclaw_store::fs::clear_dir_contents`]（保留目录本身，删除文件 + 子目录）。
+/// 删除后系统自愈：`read_long_term` 对缺失 MEMORY.md 返回空、写入路径经 `ensure_parent_dir`
+/// 自动重建所需文件，故无需手动 re-init。遇到首个无法删除的条目即返回错误（已删的保持已删）。
+///
+/// memory 先经 [`ensure_dir_is_real`] 安全闸：拒绝 reparse point（symlink/junction），
+/// 即便它指向 agent base 之内（防 memory → skills 这类 junction 把目标目录一并清掉）。
+///
+/// 阻塞函数（SQLite 删除 + VACUUM + 目录遍历删除）：调用方应放到 `spawn_blocking`。
+///
+/// 失败时带回 [`ClearFailure::sessions_cleared`]：会话删除事务是否已经提交——决定调用方
+/// 要不要连带归零会话级运行期状态（安全闸 / 统计失败时什么都没删，不该动它）。
+fn clear_agent_state(
+    session: &SessionStore,
+    layout: &Layout,
+) -> std::result::Result<String, ClearFailure> {
+    let before_delete = |message: String| ClearFailure {
+        sessions_cleared: false,
+        message,
+    };
+    ensure_dir_is_real(&layout.memory_dir, &layout.base).map_err(before_delete)?;
+    let sessions = session
+        .session_stats()
+        .map(|stats| stats.active + stats.archived)
+        .map_err(|e| before_delete(e.to_string()))?;
+    session
+        .clear_all_sessions()
+        .map_err(|e| before_delete(e.to_string()))?;
+    let memory = rclaw_store::fs::clear_dir_contents(&layout.memory_dir).map_err(|e| {
+        ClearFailure {
+            sessions_cleared: true,
+            message: e.to_string(),
+        }
+    })?;
+    Ok(format!(
+        "• state.sqlite：删除 {sessions} 个会话（含当前会话）及其文件 checkpoint、用量锚点\n\
+         • memory/：删除 {memory} 个顶层条目（MEMORY.md、daily/、session_summaries/）\n\
+         \n记忆与历史已重置；下一次写入会自动重建所需记录与文件。"
+    ))
+}
+
+/// [`clear_agent_state`] 的失败信息。
+struct ClearFailure {
+    /// `state.sqlite` 的会话删除事务是否已提交（之后的 memory/ 清理才失败）。
+    sessions_cleared: bool,
+    message: String,
+}
+
 /// 纯函数：渲染 `/context` 回显（上下文窗口 / 已用 / 剩余 / 使用率）。
 ///
 /// 抽成纯函数便于单测。窗口由 `opts.context_length` 决定（`0` = 未声明，按
@@ -476,20 +527,42 @@ fn render_context_usage(history_used: usize, request_used: usize, opts: &AgentOp
 pub struct ContextUsageSnapshot {
     /// 会话历史 token 估算（不含 system prompt / 工具 schema）。
     pub history_used: u64,
-    /// 请求压力估算（历史 + system prompt + 动态上下文 + 工具 schema），
-    /// 与压缩触发同口径；无真实 usage 锚点时即纯启发式估算。
+    /// 请求压力估算（历史 + system prompt + 动态上下文 + 静态工具面）。与压缩触发用同一个
+    /// 估算器与同一份工具面，但【纯启发式】：没有 turn 内记下的真实 usage 锚点
+    /// （`anchored_estimate` 只在 TurnManager 里），长会话上可能与 `/context` 的锚定值有出入；
+    /// Bot 会话的 `denied_tools` 收窄也不在此计入（面板展示的是主会话）。
     pub request_used: u64,
     /// 上下文窗口（`opts.context_length`，0 按 128K 假设，与 `/context` 一致）。
     pub context_length: u64,
 }
 
-/// [`TurnManager::handle_context`] 的无锚数值版：同一套估算器，但不需要 TurnManager
-/// 句柄——输入全部是装配期可克隆的组件（桌面版 RunningAgent 都有）。历史读取失败时
-/// 返回 `Err`（面板可显示错误而不是静默归零）。
+/// 一个 turn 实际发出的【静态】工具面：注册表全量滤除用户禁用项（`request_schemas`）→ 滤除
+/// `/search dis` 关掉的 backend 直连工具。Bot Mode 的 `denied_tools` 收窄由
+/// [`TurnManager::request_tool_schemas`] 在此之上再做。
+fn static_request_schemas(
+    tools: &ToolRegistry,
+    search: Option<&rclaw_tools::WebSearchControl>,
+) -> Vec<ToolSchema> {
+    let mut static_schema: Vec<ToolSchema> = tools.request_schemas();
+    if let Some(control) = search {
+        static_schema.retain(|schema| {
+            context::search_tool_backend(&schema.name)
+                .map(|backend| control.is_enabled(backend))
+                .unwrap_or(true)
+        });
+    }
+    static_schema
+}
+
+/// [`TurnManager::handle_context`] 的无锚数值版：同一套估算器与同一份静态工具面
+/// （[`static_request_schemas`]），但不需要 TurnManager 句柄——输入全部是装配期可克隆的
+/// 组件（桌面版 RunningAgent 都有）；没有 usage 锚点，见 [`ContextUsageSnapshot::request_used`]。
+/// 历史读取失败时返回 `Err`（面板可显示错误而不是静默归零）。
 ///
-/// 历史走只读变体 [`SessionStore::load_history_view`]：本函数供轮询调用方使用，会与
-/// 活动 turn 的 load→append 并发，不能像 `/context` 那样触发物理压缩写回（裁剪口径相同，
-/// 估算数值不受影响）。
+/// 历史走 store 的只读视图（[`history::load_request_view_uncompressed`]，裁剪口径与
+/// turn / `/context` 相同）：本函数供轮询调用方使用，会与活动 turn 的 load→append 并发
+/// ——进程内共用一条连接（互斥锁串行），本次读最多排在 turn 的一笔短写事务之后，不会读到
+/// 半截状态。
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_context_usage(
     session: &SessionStore,
@@ -502,8 +575,7 @@ pub fn estimate_context_usage(
     channel: &str,
     chat_id: &str,
 ) -> Result<ContextUsageSnapshot, String> {
-    let history = session
-        .load_history_view(channel, chat_id, opts.max_history, opts.max_history_bytes)
+    let history = history::load_request_view_uncompressed(session, opts, channel, chat_id)
         .map_err(|e| format!("读取会话历史失败：{e}"))?;
     let history_used = estimate_history_tokens(&history) as u64;
     // 与 TurnManager::new 同源：system prompt 由同一构建器重建（含 web_search 描述段）。
@@ -529,8 +601,12 @@ pub fn estimate_context_usage(
         opts.daemon,
         &status,
     ));
-    let request_used =
-        estimate_request_tokens(Some(&system), &request_messages, tools.schemas()) as u64;
+    // 工具面与 turn 实际发出的静态工具面同一口径（用户禁用项 / 关掉的搜索 backend 不计）。
+    let request_used = estimate_request_tokens(
+        Some(&system),
+        &request_messages,
+        &static_request_schemas(tools, search),
+    ) as u64;
     let context_length = if opts.context_length > 0 {
         opts.context_length
     } else {
@@ -547,19 +623,22 @@ pub fn estimate_context_usage(
 ///
 /// - 压缩关闭（`session_compression_enabled = false`）：提示只做硬裁剪；
 /// - token 阈值 > 0：显示 token 触发阈值（与「已用」同口径，故使用率与触发点直接可比）；
-/// - token 阈值 = 0：token 触发已关闭，不会自动摘要化旧历史。显示禁用提示，而不是
+/// - token 阈值 = 0：token 触发已关闭，不会按阈值自动摘要化旧历史。显示禁用提示，而不是
 ///   误导性的「约 0 token」。
+///
+/// 阈值之外还有 reactive 压缩：模型报上下文超限时轮内就地压缩一次再重试（`in_turn`），
+/// 不受阈值开关影响、只受压缩总开关影响——尾注一并说明，免得用户以为阈值是唯一触发点。
 fn context_footer(opts: &AgentOptions) -> String {
     if !opts.session_compression_enabled {
         return "会话语义压缩已关闭：超过窗口时只做硬裁剪，不会摘要化旧历史。".to_string();
     }
     if opts.compression_threshold_tokens > 0 {
         return format!(
-            "压缩触发阈值：约 {} token（超过即摘要化旧历史）。",
+            "压缩触发阈值：约 {} token（超过即摘要化旧历史；模型报上下文超限时也会就地压缩一次再重试）。",
             opts.compression_threshold_tokens
         );
     }
-    "压缩触发阈值未启用（token 阈值为 0）：不会自动摘要化旧历史。".to_string()
+    "压缩触发阈值未启用（token 阈值为 0）：不会按阈值自动摘要化旧历史；模型报上下文超限时仍会就地压缩一次再重试。".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -587,8 +666,36 @@ struct ActiveTurn {
     cancel: CancellationToken,
     /// 向该 turn 投递插队事件的发送端（路由层持克隆副本，不阻塞地 `try_send`）。
     event_tx: mpsc::Sender<Interjection>,
+    /// 该 turn 是否加载 / 持久化会话历史——`/compact` 落 boundary 前要让路的对象。普通 turn
+    /// 与另一个 `/compact` 为 true；cron 轮次（`run_turn_inner` 的 `is_cron` 分支，含旧式
+    /// 无 job id 的 cron 消息——它的键与普通 turn 同形，不能从键上推断）既不加载也不持久化
+    /// 会话历史，为 false，同 chat 上跑着的 cron 任务不该把用户的 `/compact` 挡掉。
+    touches_history: bool,
     // 注意：不存放 turn 任务的 `JoinHandle`。tokio 的 spawned 任务在句柄 drop 时自动
     // detach（继续在后台跑），而取消走 `CancellationToken`（不用 join.abort()），故无需持有句柄。
+}
+
+/// `/compact` 登记进 active map 时使用的 `cron_job_id`（见 [`TurnManager::compact_active_key`]）。
+const COMPACT_ACTIVE_JOB: &str = "/compact";
+
+/// `/compact` 的 active 登记 + 静默门槽位守卫：Drop 时移除自己的 active 条目并释放槽位
+/// （任何退出路径——正常返回、取消、panic——都不会留下僵尸条目或泄漏槽位）。
+///
+/// `_event_rx` 必须活到 Drop：`active_cancel_session` 把发送端已关闭的条目当僵尸清掉，
+/// 接收端若先 drop，`/cancel` 就看不到这次压缩了。
+struct CompactRegistration<'a> {
+    manager: &'a TurnManager,
+    key: TurnKey,
+    event_tx: mpsc::Sender<Interjection>,
+    _event_rx: mpsc::Receiver<Interjection>,
+}
+
+impl Drop for CompactRegistration<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .active_remove_if_same_event_tx(&self.key, &self.event_tx);
+        self.manager.gate.end_turn();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +818,19 @@ impl TurnManager {
     // 跨线程执行（agent loop 的 run / 各 turn 任务都是 spawned）。把锁操作收进【同步】辅助函数，
     // guard 只活在同步调用栈上、绝不进入任何 async future 的状态，于是 future 仍是 `Send`。
     // 这些临界段都是纯同步操作（无 await），用 `std::sync::Mutex` 即可。
+
+    /// 同步：某会话（含其 cron 分键）此刻是否还有活动 turn。宿主删除会话前用它拒绝
+    /// 「边跑边删」——否则 turn 收尾时会把消息 / 检查点写回刚清空的 chat。事件通道已关闭
+    /// 的僵尸条目（turn 主体已退出、外壳尚未自移除）不算。
+    pub fn is_session_busy(&self, channel: &str, chat_id: &str) -> bool {
+        self.active
+            .lock()
+            .expect("active map 锁未被毒化")
+            .iter()
+            .any(|(key, turn)| {
+                key.channel == channel && key.chat_id == chat_id && !turn.event_tx.is_closed()
+            })
+    }
 
     /// 同步：取某会话活动 turn 的插队事件发送端（克隆），不持有锁返回。
     fn active_event_tx(&self, key: &TurnKey) -> Option<mpsc::Sender<Interjection>> {
@@ -867,24 +987,110 @@ impl TurnManager {
         }
     }
 
-    /// 同步：该会话是否有活动 turn（/compact 等重写会话的操作用）。
-    pub(crate) fn has_active_turn(&self, channel: &str, chat_id: &str) -> bool {
+    /// `/compact` 在 active map 里的登记键：`cron_job_id` 维度取一个 cron job 不会用的
+    /// 名字，与普通 turn（`None`）和 cron turn 都不同——普通消息仍按自己的键开新 turn；
+    /// `/cancel`、同会话的第二个 `/compact` 按 `(channel, chat_id)` 匹配时能看到它。
+    fn compact_active_key(channel: &str, chat_id: &str) -> TurnKey {
+        TurnKey {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            cron_job_id: Some(COMPACT_ACTIVE_JOB.to_string()),
+        }
+    }
+
+    /// 一个 turn 实际发出的静态工具面：注册表全量滤除用户禁用项 → 滤除 /search dis 的
+    /// backend 直连工具（控制面执行闸之外的工具面同步）→ Bot Mode 再滤除该 bot 定义里
+    /// `denied_tools` 收窄的工具。`run_turn_inner`、`/compact` 记 rapid-refill 地板、`/context`
+    /// 估算用量都走这一口径：地板与轮内估算必须同单位，否则 bot 会话里 5% 回升的比较会
+    /// 偏严或偏松。
+    fn request_tool_schemas(&self, persona: Option<&crate::bots::BotPersona>) -> Vec<ToolSchema> {
+        let mut static_schema = static_request_schemas(
+            &self.tools,
+            self.slash
+                .as_ref()
+                .and_then(|s| s.web_search_control())
+                .as_deref(),
+        );
+        if let Some(denied) = persona.map(|p| p.def.denied_tools.as_slice()) {
+            if !denied.is_empty() {
+                static_schema.retain(|schema| !denied.contains(&schema.name));
+            }
+        }
+        static_schema
+    }
+
+    /// 同步：除 `own` 之外，该会话是否还有与历史视图相关的活动 turn（`/compact` 落库前的
+    /// 复查）。僵尸条目（事件通道已关闭）不算，口径同 [`Self::is_session_busy`]；cron 轮次
+    /// 不算，见 [`ActiveTurn::touches_history`]。
+    fn has_other_active_turn(&self, channel: &str, chat_id: &str, own: &TurnKey) -> bool {
         self.active
             .lock()
             .expect("active map 锁未被毒化")
-            .keys()
-            .any(|key| key.channel == channel && key.chat_id == chat_id)
+            .iter()
+            .any(|(key, turn)| {
+                key != own
+                    && key.channel == channel
+                    && key.chat_id == chat_id
+                    && turn.touches_history
+                    && !turn.event_tx.is_closed()
+            })
     }
 
     /// `/compact`：手动立即压缩当前会话（ZCode Layer 1 manual `/compact` 的移植面）。
     ///
-    /// 与自动压缩共用同一套摘要 / 确定性 fallback / session 重写管线，但忽略阈值与
-    /// 防抖（用户显式意图优先）；有活动 turn 时拒绝（避免与 turn 的原子追加交错）。
+    /// 与自动压缩共用同一套摘要 / 确定性 fallback / compaction boundary 管线，但忽略阈值与
+    /// 防抖（用户显式意图优先）；有活动 turn 时拒绝（它持有的内存视图不会看到新 boundary）。
+    ///
+    /// 并发口径：本命令在独立任务上运行（见 `commands::dispatch`），不【关】全局静默门——
+    /// 摘要 LLM 调用可达一分钟，关门会让其它会话也无法开 turn。但它和 turn 一样【占】一个
+    /// 门槽位并登记进 active map，于是：
+    /// - `/clear` / skill 生命周期 / curator 归档拿不到门，不会在摘要生成到一半时删掉本次
+    ///   boundary 要落的会话（落库时才报「会话不存在」、防抖状态在清空后复活）；
+    /// - `/cancel` 能取消它（摘要调用中止、历史不动）；
+    /// - 同会话的第二个 `/compact` 与「开始前」检查在同一把锁内互斥，不会重复落两条 boundary；
+    /// - 摘要调用与顶层 turn 共享 `execution_limit`（与 load 期压缩一致）。
+    ///
+    /// 普通消息仍按自己的键开新 turn：落库前再查一次本会话有无【其它】活动 turn，有则放弃
+    /// （历史未改动）。残余窗口（复查与 append 之间）由 store 的锚点校验兜底：即便 boundary
+    /// 落在 turn 之后，也只是该 turn 的内存视图比库里长，不会损坏历史。
     async fn handle_compact(&self, channel: &str, chat_id: &str) -> String {
-        if self.has_active_turn(channel, chat_id) {
-            return "⏳ 该会话有正在运行的任务，/compact 已中止：请先 /cancel 或等其结束后重试。"
-                .to_string();
+        if !self.gate.try_begin_turn() {
+            return "⏳ 系统正在执行清理 / 维护操作，/compact 已中止，请稍后重试。".to_string();
         }
+        let own_key = Self::compact_active_key(channel, chat_id);
+        let cancel = CancellationToken::new();
+        let (event_tx, event_rx) = mpsc::channel(1);
+        {
+            let mut active = self.active.lock().expect("active map 锁未被毒化");
+            // 僵尸条目（turn 主体已退出、外壳尚未自移除）不算活动 turn（同 is_session_busy）；
+            // 同 chat 的 cron 轮次不碰会话历史，也不算（见 ActiveTurn::touches_history）。
+            if active.iter().any(|(key, turn)| {
+                key.channel == channel
+                    && key.chat_id == chat_id
+                    && turn.touches_history
+                    && !turn.event_tx.is_closed()
+            }) {
+                drop(active);
+                self.gate.end_turn();
+                return "⏳ 该会话有正在运行的任务，/compact 已中止：请先 /cancel 或等其结束后重试。"
+                    .to_string();
+            }
+            active.insert(
+                own_key.clone(),
+                ActiveTurn {
+                    cancel: cancel.clone(),
+                    event_tx: event_tx.clone(),
+                    touches_history: true,
+                },
+            );
+        }
+        // 任何退出路径（含取消）都移除 active 条目并释放门槽位。
+        let _registration = CompactRegistration {
+            manager: self,
+            key: own_key.clone(),
+            event_tx,
+            _event_rx: event_rx,
+        };
         let persona = self.bots.persona_for_chat(channel, chat_id);
         let turn_memory = persona
             .as_ref()
@@ -895,44 +1101,107 @@ impl TurnManager {
             .and_then(|p| p.provider.clone())
             .unwrap_or_else(|| self.provider.clone());
         let full = match self.session.load_all(channel, chat_id) {
-            Ok(history) => history,
+            Ok(history) => fold_compaction_view(history),
             Err(e) => return format!("读取会话历史失败：{e}"),
         };
         let keep_recent = self.opts.compression_keep_recent.max(8);
-        if full.len() <= keep_recent + 2 {
+        // 门槛与 load 期 / 轮内同一口径（按尾窗策略推导，见 history_too_short_to_compress）：
+        // 几十条巨型工具输出撑爆窗口的会话也要能用 /compact 救回来，而不是只能 /clear。
+        let policy = self.history.tail_policy(keep_recent);
+        if history_too_short_to_compress(full.len(), &policy) {
             return format!("会话只有 {} 条消息，没有可压缩的窗口。", full.len());
         }
+        // 与 load 期同一套便宜预剪枝（剥离旧媒体、摘要化 / 去重旧 tool result、裁剪大
+        // tool_use input）再送摘要：否则手动压缩的摘要素材里塞满原始工具输出与图片，
+        // 摘要 prompt 的 transcript 预算被它们吃光，近期对话反而进不了摘要。
+        let full_len = full.len();
+        let prune_protect_head = protected_head_end(
+            &full,
+            self.opts.compression_protect_first,
+            find_latest_context_summary(&full, 0, full_len).is_some(),
+        );
+        let (full, pruned_count) = prune_old_tool_results(
+            &full,
+            self.opts.compression_prune_protect_count,
+            self.opts.compression_tail_token_budget,
+            prune_protect_head,
+        );
+        if pruned_count > 0 {
+            tracing::debug!(
+                "/compact 预剪枝：压缩 {pruned_count} 个旧 tool/media 输出 / 大 tool_use input ({channel}:{chat_id})"
+            );
+        }
         let msg = BusMessage::new(channel.to_string(), chat_id.to_string(), String::new());
-        let cancel = CancellationToken::new();
         let sink = crate::turn::history::CompressionSink {
             memory: turn_memory,
             provider,
         };
+        // 摘要 LLM 调用与顶层 turn 共享执行上限；等许可期间同样受 /cancel 中断。
+        let _execution_permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return "压缩已取消。".to_string(),
+            p = self.execution_limit.acquire() => p.expect("execution_limit semaphore 不会关闭"),
+        };
         match self
             .history
-            .summarize(&full, &msg, &cancel, keep_recent, &sink)
+            .summarize(
+                &full,
+                &msg,
+                &cancel,
+                policy,
+                SummaryExtras::default(),
+                &sink,
+            )
             .await
         {
-            SummaryLoad::Completed {
-                summary,
-                compressed,
-                used_fallback,
-            } => {
+            SummaryLoad::Completed(completed) => {
+                // 摘要已回来、boundary 还没落库的窗口里 /cancel 到达：承诺是「历史不动」，
+                // 这里仍可兑现。
+                if cancel.is_cancelled() {
+                    return "压缩已取消。".to_string();
+                }
+                if self.has_other_active_turn(channel, chat_id, &own_key) {
+                    return "⏳ 压缩期间该会话开始了新任务，本次 /compact 已放弃（历史未改动）；\
+                            请等其结束后重试。"
+                        .to_string();
+                }
                 let key = TurnKey {
                     channel: channel.to_string(),
                     chat_id: chat_id.to_string(),
                     cron_job_id: None,
                 };
-                // 与自动压缩同源：fallback 记冷却、低效记防抖计数。
-                self.history.record_compression_outcome(
-                    &key,
-                    history_serialized_bytes(&full),
-                    history_serialized_bytes(&compressed),
-                    full.len(),
-                    used_fallback,
-                );
-                match self.session.rewrite(channel, chat_id, &compressed) {
-                    Ok(()) => {
+                let before_bytes = history_serialized_bytes(&full);
+                let after_bytes = history_serialized_bytes(&completed.compressed);
+                let used_fallback = completed.used_fallback;
+                let summary = completed.summary.clone();
+                // 手动压缩没有内存视图：落库失败什么都没生效，不作废 / 不挂起 usage 锚点。
+                match self.history.persist_compaction(&key, completed, false) {
+                    (compressed, None) => {
+                        // 与自动压缩同源：fallback 记冷却、低效记防抖计数。只在落库成功后记——
+                        // 写失败时什么都没生效（手动压缩不像 load / 轮内那样还会用内存视图），
+                        // 却给会话记上一次低效 / 冷却，会把随后的自动压缩无故压住。
+                        self.history.record_compression_outcome(
+                            &key,
+                            before_bytes,
+                            after_bytes,
+                            history_watermark(&full),
+                            used_fallback,
+                        );
+                        // rapid-refill breaker：与自动压缩一样以压缩后的估算为新地板，否则
+                        // 下一 turn 的轮内压缩还拿着上一次自动压缩留下的旧地板比较——
+                        // 手动压缩后的估算早已低于它，一回升 5% 就又触发一次摘要调用。
+                        // 口径与 turn 内一致：bot 会话用 bot 的基础提示与收窄后的工具面。
+                        let system = match &persona {
+                            Some(p) => p.base_prompt.as_str(),
+                            None => self.base_system_prompt.as_str(),
+                        };
+                        let post_estimate = self.history.anchored_estimate(
+                            &key,
+                            system,
+                            &compressed,
+                            &self.request_tool_schemas(persona.as_deref()),
+                        );
+                        self.history.record_compression_floor(&key, post_estimate);
                         if let Err(e) =
                             sink.memory
                                 .write_session_summary(channel, chat_id, &summary)
@@ -940,8 +1209,8 @@ impl TurnManager {
                             tracing::warn!("/compact 摘要文件写入失败（不影响 session）: {e}");
                         }
                         format!(
-                            "✅ 会话已压缩：{} → {} 条{}。摘要已写入会话记忆。",
-                            full.len(),
+                            "✅ 会话已压缩：{} → {} 条{}。摘要已写入会话记忆；完整历史仍保留在 state.sqlite（/export 可导出）。",
+                            full_len,
                             compressed.len(),
                             if used_fallback {
                                 "（LLM 摘要不可用，使用确定性 fallback）"
@@ -950,7 +1219,7 @@ impl TurnManager {
                             }
                         )
                     }
-                    Err(e) => format!("压缩结果写入失败（原会话保留）：{e}"),
+                    (_, Some(e)) => format!("压缩结果写入失败（原会话保留）：{e}"),
                 }
             }
             SummaryLoad::Cancelled => "压缩已取消。".to_string(),
@@ -963,50 +1232,136 @@ impl TurnManager {
         }
     }
 
-    /// `/rewind [message_id]`：列出可回滚点或按 messageId 恢复文件
+    /// `/rewind [回滚点 id]`：列出可回滚点或按回滚点 id 恢复文件
     /// （Layer 5 选点回滚；恢复前 hash 校验，外部改动整组拒绝）。
-    fn handle_rewind(&self, channel: &str, chat_id: &str, content: &str) -> String {
+    ///
+    /// 恢复期间持静默门：拿到 = 无 turn / review 在跑，且持门期间新 turn 无法启动，
+    /// 文件回滚与 turn 内工具写入之间不存在竞态窗口（与 `/clear` 同一机制，
+    /// 替代 check-then-act 的活动 turn 检查）。
+    async fn handle_rewind(&self, channel: &str, chat_id: &str, content: &str) -> String {
         let mut parts = content.split_whitespace();
         let _command = parts.next();
+        let session = self.session.clone();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
         match parts.next() {
             None => {
-                let groups = rewind::list_groups(&self.layout, channel, chat_id);
+                let groups = tokio::task::spawn_blocking(move || {
+                    rewind::list_groups(&session, &channel, &chat_id)
+                })
+                .await
+                .unwrap_or_default();
                 if groups.is_empty() {
                     return "当前会话没有可回滚的文件 checkpoint（仅 write/edit/delete 会被记录）。"
                         .to_string();
                 }
                 let mut out = format!("可回滚点（最近 {} 组，新在前）：", groups.len());
-                for (message_id, files) in &groups {
-                    out.push_str(&format!("\n\n- 消息 {message_id}（{} 个文件）", files.len()));
-                    for (path, _) in files {
+                for (rewind_id, files) in &groups {
+                    out.push_str(&format!(
+                        "\n\n- 回滚点 {rewind_id}（{}，{} 个文件）",
+                        rewind::format_rewind_time(*rewind_id),
+                        files.len()
+                    ));
+                    for path in files {
                         out.push_str(&format!("\n  - {path}"));
                     }
                 }
                 out.push_str(
-                    "\n\n回滚：/rewind <message_id>（恢复前校验文件 hash，被外部改动过则整组拒绝）",
+                    "\n\n回滚：/rewind <回滚点 id>（恢复前校验文件 hash，被外部改动过则整组拒绝）",
                 );
                 out
             }
             Some(id_text) => {
-                if self.has_active_turn(channel, chat_id) {
-                    return "⏳ 有任务正在运行，/rewind 已中止：请先 /cancel 或等其结束后重试。"
-                        .to_string();
-                }
-                let Ok(message_id) = id_text.parse::<i64>() else {
-                    return format!("非法 messageId「{id_text}」：应为 /rewind 列表中的数字。");
+                let Ok(rewind_id) = id_text.parse::<i64>() else {
+                    return format!("非法回滚点 id「{id_text}」：应为 /rewind 列表中的数字。");
                 };
-                match rewind::restore_to_message(&self.layout, channel, chat_id, message_id) {
-                    Ok(report) => report,
-                    Err(error) => format!("⚠️ {error}"),
+                let Some(_quiescent) = self.gate.try_acquire() else {
+                    let (turns, _reviews) = self.gate.running();
+                    if turns > 0 {
+                        return "⏳ 有任务正在运行，/rewind 已中止：请先 /cancel 或等其结束后重试。"
+                            .to_string();
+                    }
+                    return "⏳ 后台 review / 维护操作仍在运行，/rewind 已中止：请稍后重试。"
+                        .to_string();
+                };
+                let restored = tokio::task::spawn_blocking(move || {
+                    rewind::restore_to_point(&session, &channel, &chat_id, rewind_id)
+                })
+                .await;
+                match restored {
+                    Ok(Ok(report)) => report,
+                    Ok(Err(error)) => format!("⚠️ {error}"),
+                    Err(error) => format!("⚠️ rewind 任务执行异常: {error}"),
                 }
             }
         }
     }
 
+    /// `/export [all]`：把当前会话（或全部会话）的完整记录导出为 JSONL 文件。
+    ///
+    /// 导出的是 `state.sqlite` 里的完整 transcript（含被压缩进摘要的消息与 compaction
+    /// boundary 行，按 id 升序，每行一条 `Message` JSON 并带 `id`；boundary 行另带
+    /// `meta.compaction` 锚点），而不是 provider 可见的压缩视图；文件写到
+    /// `agent/exports/<channel>_<chat_id>_<时间戳>.jsonl`。
+    /// 只读操作，不受活动 turn 影响。
+    async fn handle_export(&self, channel: &str, chat_id: &str, content: &str) -> String {
+        let all = content
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|arg| arg.eq_ignore_ascii_case("all"));
+        let session = self.session.clone();
+        let layout = self.layout.clone();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        let exported = tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
+            let targets: Vec<(String, String)> = if all {
+                session
+                    .list_sessions(None)
+                    .map_err(|e| format!("读取会话列表失败：{e}"))?
+                    .into_iter()
+                    .map(|summary| (summary.channel, summary.chat_id))
+                    .collect()
+            } else {
+                vec![(channel, chat_id)]
+            };
+            if targets.is_empty() {
+                return Ok("没有可导出的会话。".to_string());
+            }
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+            let mut lines = Vec::with_capacity(targets.len());
+            for (channel, chat_id) in &targets {
+                let jsonl = session
+                    .export_transcript_jsonl(channel, chat_id)
+                    .map_err(|e| format!("读取会话 {channel}:{chat_id} 失败：{e}"))?;
+                let count = jsonl.lines().count();
+                let path = layout.export_path(channel, chat_id, &stamp);
+                rclaw_store::fs::ensure_parent_dir(&path).map_err(|e| e.to_string())?;
+                std::fs::write(&path, jsonl)
+                    .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+                lines.push(format!(
+                    "- {channel}:{chat_id} → {}（{count} 条）",
+                    path.display()
+                ));
+            }
+            Ok(format!(
+                "✅ 已导出 {} 个会话的完整记录（含已被压缩的消息）：\n{}",
+                targets.len(),
+                lines.join("\n")
+            ))
+        })
+        .await;
+        match exported {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => format!("⚠️ 导出失败：{error}"),
+            Err(error) => format!("⚠️ 导出任务执行异常: {error}"),
+        }
+    }
+
     /// `/context` 的内容生成：当前模型上下文窗口 + 历史估算 + 请求压力估算 + 剩余 + 使用率。
     ///
-    /// 复用 `SessionStore::load_history`（与 turn 同样的 max_history / max_history_bytes 裁剪窗口）
-    /// 与 `estimate_request_tokens`（与压缩触发口径一致）。窗口取 `AgentOptions::context_length`，
+    /// 历史取 [`history::load_request_view_uncompressed`]（与 turn 不压缩时同一裁剪口径：
+    /// 压缩开启的会话按 microcompact 后的体量量 `max_history_bytes`，而不是原始字节），
+    /// 估算走 `anchored_estimate`（与压缩触发口径一致）。窗口取 `AgentOptions::context_length`，
     /// `0`（未声明）按 `COMPRESSION_DEFAULT_ASSUMED_CONTEXT_LENGTH`（128K）假设。
     ///
     /// # 两条口径说明（避免 /context 显示与系统实际行为产生误解）
@@ -1024,11 +1379,11 @@ impl TurnManager {
             .as_ref()
             .map(|p| p.memory.clone())
             .unwrap_or_else(|| self.memory.clone());
-        let history = match self.session.load_history(
+        let history = match history::load_request_view_uncompressed(
+            &self.session,
+            &self.opts,
             channel,
             chat_id,
-            self.opts.max_history,
-            self.opts.max_history_bytes,
         ) {
             Ok(msgs) => msgs,
             Err(e) => return format!("读取会话历史失败：{e}"),
@@ -1066,7 +1421,7 @@ impl TurnManager {
             },
             &system,
             &request_messages,
-            self.tools.schemas(),
+            &self.request_tool_schemas(persona.as_deref()),
         );
         render_context_usage(history_used, request_used, &self.opts)
     }
@@ -1180,19 +1535,26 @@ impl TurnManager {
         }
     }
 
-    /// `/clear`：清空当前会话 + 删除 agent/memory、agent/sessions 下全部文件（不可逆）。
+    /// `/clear`：清空全部会话状态（`agent/state.sqlite`）+ 删除 agent/memory 下全部文件（不可逆）。
     ///
     /// 四道闸（按序）：
     /// 1. `/clear confirm`（或 `/clear yes`）二次确认——未确认只回显将删除的内容；
-    /// 2. 静默门确认没有活动 turn——否则它会在清空后把已加载的旧历史/记忆 append 或 rewrite
+    /// 2. 静默门确认没有活动 turn——否则它会在清空后把已加载的旧历史/记忆 append
     ///    写回，造成「已清空但状态复活」；
     /// 3. 静默门确认没有后台 review 在途——auto_memory/auto_evolve 触发的 review 是 detach
     ///    任务、不进 `active`；若不拦，它会基于清空前的 messages 把记忆写回（P2）；
-    /// 4. [`Self::clear_agent_state`] 的 symlink/junction 安全闸 + 实际删除。
-    fn handle_clear(&self, content: &str) -> String {
+    /// 4. [`clear_agent_state`] 的 symlink/junction 安全闸 + 实际删除。
+    ///
+    /// 删除 + `VACUUM` 是阻塞 IO（大库上整库重写），放到 `spawn_blocking`；静默门守卫跨
+    /// 该 await 持有，期间新 turn / review 仍无法启动。
+    ///
+    /// 「永久删除」指的是逻辑层面：删除事务一提交，任何连接都读不到旧数据。物理残留
+    /// （WAL 文件里被覆盖前的旧页）由 store 的 `VACUUM` + TRUNCATE checkpoint 尽力清掉，
+    /// 它们失败只影响磁盘痕迹，不改变「已清空」的结论（见 `SessionStore::clear_all_sessions`）。
+    async fn handle_clear(&self, content: &str) -> String {
         if !clear_confirmed(content) {
             return "⚠️ /clear 会【永久删除】以下内容，不可恢复：\n\
-                    • 全部会话历史（agent/sessions/，含当前会话）\n\
+                    • 全部会话历史（agent/state.sqlite：所有会话的消息、文件 checkpoint 与用量锚点，含当前会话）\n\
                     • 全部长期记忆（agent/memory/：MEMORY.md、daily/、session_summaries/）\n\
                     \n确认请输入：/clear confirm"
                 .to_string();
@@ -1213,32 +1575,30 @@ impl TurnManager {
             }
             return "⏳ 系统正在执行清理 / 维护操作，请稍后重试：/clear confirm".to_string();
         };
-        match self.clear_agent_state() {
-            Ok(summary) => format!("✅ 已清空 agent 本地状态：\n{summary}"),
-            Err(e) => format!("⚠️ 清空失败（可能部分文件被占用，可重试 /clear confirm）：{e}"),
+        let session = self.session.clone();
+        let layout = self.layout.clone();
+        let cleared =
+            tokio::task::spawn_blocking(move || clear_agent_state(&session, &layout)).await;
+        // 会话级运行期状态（usage 锚点、压缩防抖 / 冷却）随库一起归零：只要删除事务已提交，
+        // 即便 memory/ 清理失败也不能让旧防抖判断留给新历史。安全闸 / 统计阶段失败时库没动，
+        // 状态保留；任务 panic 时无从得知进度，按「可能已删」归零（多归零一次只丢防抖状态）。
+        let sessions_cleared = match &cleared {
+            Ok(Ok(_)) | Err(_) => true,
+            Ok(Err(failure)) => failure.sessions_cleared,
+        };
+        if sessions_cleared {
+            self.history.reset_runtime_state();
         }
-    }
-
-    /// 删除 sessions/ 与 memory/ 目录下的全部内容，返回人可读的清理摘要。
-    ///
-    /// 复用 [`rclaw_store::fs::clear_dir_contents`]（保留目录本身，删除文件 + 子目录）。
-    /// 删除后系统自愈：`read_long_term` 对缺失 MEMORY.md 返回空、写入路径经 `ensure_parent_dir`
-    /// 自动重建所需文件，故无需手动 re-init。遇到首个无法删除的条目即返回错误（已删的保持已删）。
-    ///
-    /// 先经 [`ensure_dir_is_real`] 安全闸：拒绝 sessions/memory 是 reparse point（symlink/junction），
-    /// 即便它指向 agent base 之内（防 memory → skills 这类 junction 把目标目录一并清掉）。
-    fn clear_agent_state(&self) -> std::result::Result<String, String> {
-        ensure_dir_is_real(&self.layout.session_dir, &self.layout.base)?;
-        ensure_dir_is_real(&self.layout.memory_dir, &self.layout.base)?;
-        let sessions = rclaw_store::fs::clear_dir_contents(&self.layout.session_dir)
-            .map_err(|e| e.to_string())?;
-        let memory = rclaw_store::fs::clear_dir_contents(&self.layout.memory_dir)
-            .map_err(|e| e.to_string())?;
-        Ok(format!(
-            "• sessions/：删除 {sessions} 个会话文件（含当前会话）\n\
-             • memory/：删除 {memory} 个顶层条目（MEMORY.md、daily/、session_summaries/）\n\
-             \n记忆与历史已重置；下一次写入会自动重建所需文件。"
-        ))
+        match cleared {
+            Ok(Ok(summary)) => format!("✅ 已清空 agent 本地状态：\n{summary}"),
+            Ok(Err(failure)) => {
+                format!(
+                    "⚠️ 清空失败（可能部分文件被占用，可重试 /clear confirm）：{}",
+                    failure.message
+                )
+            }
+            Err(e) => format!("⚠️ 清空任务执行异常: {e}"),
+        }
     }
 
     /// `/log`：查看 / 发送 / 删除 agent/logs 下的日志文件。
@@ -1510,6 +1870,8 @@ impl TurnManager {
             let mgr = self.clone();
             let cancel_for_task = cancel.clone();
             let event_tx_for_task = event_tx.clone();
+            // 与 run_turn_inner 的 `is_cron` 分支同源：cron 轮次不加载也不持久化会话历史。
+            let touches_history = !msg.is_cron_task();
             // turn 任务的真正执行
             // spawn 返回的 JoinHandle 立即 drop：tokio spawned 任务在句柄 drop 时继续运行
             // （detach），取消改由 `cancel` 控制，故无需保存句柄。
@@ -1517,9 +1879,23 @@ impl TurnManager {
                 mgr.run_turn(msg, cancel_for_task, event_rx, event_tx_for_task)
                     .await;
             });
-            active.insert(key, ActiveTurn { cancel, event_tx });
+            active.insert(
+                key,
+                ActiveTurn {
+                    cancel,
+                    event_tx,
+                    touches_history,
+                },
+            );
             return true;
         }
+    }
+
+    /// 宿主在 agent loop 之外直接删掉库里的某个会话后调用：清掉该会话的运行期状态
+    /// （usage 锚点、压缩防抖 / 冷却 / rapid-refill 地板），与 `/clear` 对全部会话做的
+    /// 归零同源。只动内存缓存，不读写库；活动 turn 下调用也安全（状态按需重建）。
+    pub fn forget_session(&self, channel: &str, chat_id: &str) {
+        self.history.forget_session(channel, chat_id);
     }
 
     /// 测试 / 观测用：是否所有会话都没有活动 turn（review 不计入——它不阻塞下一轮 turn）。
@@ -1657,7 +2033,8 @@ impl TurnManager {
     ///
     /// `key` 由调用方持有（msg 的 TurnKey 是确定性派生，turn 生命周期内不变）；
     /// `schemas` 由调用方按当前快照收集（静态面 + 动态激活面）——每个迭代重建一次，
-    /// 供 anchored 估算在锚点失配（压缩重写历史）时回退纯启发式使用。
+    /// 供 anchored 估算在锚点缺失（压缩后已失效 / 从未记录）时回退纯启发式使用。
+    #[allow(clippy::too_many_arguments)]
     fn in_turn_ctx<'a>(
         &'a self,
         key: &'a TurnKey,
@@ -1666,9 +2043,10 @@ impl TurnManager {
         system: &'a str,
         schemas: &'a [ToolSchema],
         sink: &'a crate::turn::history::CompressionSink,
+        view: &'a ViewProvenance,
+        prefix_unavailable: &'a std::sync::atomic::AtomicBool,
     ) -> in_turn::InTurnContext<'a> {
         in_turn::InTurnContext {
-            session: &self.session,
             history: &self.history,
             opts: &self.opts,
             key,
@@ -1677,6 +2055,8 @@ impl TurnManager {
             system,
             schemas,
             sink,
+            view,
+            prefix_unavailable,
         }
     }
 
@@ -1713,22 +2093,8 @@ impl TurnManager {
             .unwrap_or_else(|| self.provider.clone());
 
         // 静态 schema 只读；共享循环状态（含动态 Manifest 工具集）由 TurnState 拥有。
-        // 工具面 = 注册表全量滤除用户禁用项（桌面版禁能开关从下一 turn 生效）；
-        // 再滤除 /search dis 的 backend 直连工具（控制面执行闸之外的工具面同步）；
-        // Bot Mode：再滤除该 bot 定义里 denied_tools 收窄的工具。
-        let mut static_schema: Vec<ToolSchema> = self.tools.request_schemas();
-        if let Some(control) = self.slash.as_ref().and_then(|s| s.web_search_control()) {
-            static_schema.retain(|schema| {
-                context::search_tool_backend(&schema.name)
-                    .map(|backend| control.is_enabled(backend))
-                    .unwrap_or(true)
-            });
-        }
-        if let Some(denied) = persona.as_ref().map(|p| p.def.denied_tools.as_slice()) {
-            if !denied.is_empty() {
-                static_schema.retain(|schema| !denied.contains(&schema.name));
-            }
-        }
+        // 工具面口径见 `request_tool_schemas`（桌面版禁能开关从下一 turn 生效）。
+        let static_schema = self.request_tool_schemas(persona.as_deref());
         let mut state = TurnState::new(&static_schema);
         // skills 目录扫描每 turn 一次：激活检测与动态上下文共享该缓存。
         let catalog = SkillCatalog::new(&self.layout);
@@ -1766,6 +2132,12 @@ impl TurnManager {
             memory: turn_memory.clone(),
             provider: turn_provider.clone(),
         };
+        // 内存视图的来源（完整 / 裁剪后缀）：轮内压缩据此决定头区能否再保护。cron 轮次
+        // 没有历史，按完整视图处理（轮内压缩对 cron 本就不启用）。
+        let mut view_provenance = ViewProvenance::COMPLETE;
+        // 裁剪后缀视图上「被裁掉的前缀取不回来」的 turn 级记忆：置位后本轮不再尝试轮内压缩
+        // （见 in_turn::InTurnContext::prefix_unavailable）。
+        let prefix_unavailable = std::sync::atomic::AtomicBool::new(false);
         let mut messages: Vec<Message> = if is_cron {
             Vec::new()
         } else {
@@ -1781,7 +2153,10 @@ impl TurnManager {
                 )
                 .await
             {
-                Ok(HistoryLoad::Messages(m)) => m,
+                Ok(HistoryLoad::Messages(loaded)) => {
+                    view_provenance = loaded.provenance;
+                    loaded.messages
+                }
                 Ok(HistoryLoad::Cancelled) => {
                     tracing::info!(
                         "turn 在会话压缩阶段被取消 ({}:{})",
@@ -1826,38 +2201,42 @@ impl TurnManager {
         // 3) 当前 user 消息：先持久化（cron 不持久化），再追加进本轮内存 messages。
         //    user 落盘失败必须中止本轮：否则后续 assistant / tool 记录仍可能被保存，
         //    历史会变成「只有回答没有问题」。
-        let user_msg = Message::plain(Role::User, msg.content.clone());
+        let mut user_msg = Message::plain(Role::User, msg.content.clone());
         if !is_cron {
-            if let Err(e) = self.session.append(&msg.channel, &msg.chat_id, &user_msg) {
-                tracing::error!("user 消息持久化失败，中止本轮以避免历史残缺: {e}");
-                let _ = self
-                    .outbound_tx
-                    .send(BusMessage::new(
-                        msg.channel.clone(),
-                        msg.chat_id.clone(),
-                        // 详细错误（与「加载会话历史失败」同风格）：含 StoreError 的 IO/超限/路径原因。
-                        format!("保存消息失败: {e}"),
-                    ))
-                    .await;
-                if let Some(router) = &self.bot_router {
-                    router.notify(
-                        &msg.channel,
-                        &msg.chat_id,
-                        msg.handoff_id(),
-                        crate::bots::HandoffOutcome::Failed(format!("保存消息失败: {e}")),
-                    );
+            match self.session.append(&msg.channel, &msg.chat_id, &user_msg) {
+                Ok(id) => user_msg.id = id,
+                Err(e) => {
+                    tracing::error!("user 消息持久化失败，中止本轮以避免历史残缺: {e}");
+                    let _ = self
+                        .outbound_tx
+                        .send(BusMessage::new(
+                            msg.channel.clone(),
+                            msg.chat_id.clone(),
+                            // 详细错误（与「加载会话历史失败」同风格）：含 StoreError 的 IO/超限/路径原因。
+                            format!("保存消息失败: {e}"),
+                        ))
+                        .await;
+                    if let Some(router) = &self.bot_router {
+                        router.notify(
+                            &msg.channel,
+                            &msg.chat_id,
+                            msg.handoff_id(),
+                            crate::bots::HandoffOutcome::Failed(format!("保存消息失败: {e}")),
+                        );
+                    }
+                    return drain_leftovers(&mut event_rx);
                 }
-                return drain_leftovers(&mut event_rx);
             }
         }
         messages.push(user_msg);
 
         // ---- 轮内上下文管理（ZCode 移植 · Layer 1）----
-        // turn_start = 本轮 user 消息的下标：[..turn_start] 是加载期历史（与磁盘一致），
-        // [turn_start..] 是本轮追加。ephemeral 跟踪本轮【不落盘】的临时上下文消息
-        // （skill_context / 媒体附件），轮内压缩 rewrite session 时剔除、内存保留。
-        let mut turn_start = messages.len();
-        let mut ephemeral: Vec<usize> = Vec::new();
+        // turn_start = 本轮 user 消息的下标（刚 push 的那条）：[..turn_start] 是加载期历史
+        // （与 store 视图一致），[turn_start..] 是本轮区——本轮 user 消息 + 本轮追加（含
+        // skill_context / 媒体附件这类不落盘、id 为 0 的临时上下文）。轮内压缩只动头区，
+        // 尾区整段原样保留：本轮任务原文不进摘要素材，也不会被摘要 merge 进去
+        // （`apply_summary_to_compressed_history` 只会 merge 头区尾窗的首条 user）。
+        let mut turn_start = messages.len() - 1;
         // 轮内压缩共享的会话键（msg 的确定性派生，turn 生命周期内不变）。
         let turn_key = TurnKey::from_msg(&msg);
 
@@ -1878,6 +2257,9 @@ impl TurnManager {
         // 清理阶段连同 aborted 占位结果一起落盘（ADR-0004），让模型下轮知道上次
         // 干到哪、哪些调用没有结果。
         let mut interrupted_chain: Option<Message> = None;
+        // Layer 5：当前工具迭代的 rewind 分组 id（本迭代 write/edit/delete 的 checkpoint
+        // 以它归属；取消清理阶段也用它落盘未 flush 的 checkpoint）。
+        let mut checkpoint_group_id: i64 = 0;
         // 非用户插队消息不能注入当前 LLM；保留原始 BusMessage，turn 结束后重路由。
         let mut deferred_messages: Vec<BusMessage> = Vec::new();
 
@@ -1927,24 +2309,27 @@ impl TurnManager {
                 }
 
                 // 轮内 auto compact（ZCode 移植 · Layer 1b）：每次迭代检查一次预算。
-                // 头区（[..turn_start]）超阈值就地基摘要 + rewrite session；本轮尾区
-                // 永远保留，原始任务消息由尾窗锚点保护不被摘要化。估算 / 防抖 / 失败
-                // 冷却与 load 期同一套状态。
-                if !is_cron && self.opts.in_turn_compression_enabled {
+                // 请求超阈值时就地摘要头区（[..turn_start]）并追加 compaction boundary；
+                // 本轮尾区（本轮 user 消息起）永远原样保留，原始任务消息不进摘要；头区里
+                // 上一轮的 user / assistant 由尾窗锚点留在尾窗。估算 / 防抖 / 失败冷却与
+                // load 期同一套状态。
+                if !is_cron && in_turn::in_turn_compression_allowed(&self.opts) {
                     let schemas_now: Vec<ToolSchema> = static_schema
                         .iter()
                         .chain(state.dynamic.active_schemas().iter())
                         .cloned()
                         .collect();
-                    let ctx =
-                        self.in_turn_ctx(&turn_key, &msg, &cancel, &system, &schemas_now, &in_turn_sink);
-                    in_turn::maybe_auto_compress(
-                        &ctx,
-                        &mut messages,
-                        &mut turn_start,
-                        &mut ephemeral,
-                    )
-                    .await;
+                    let ctx = self.in_turn_ctx(
+                        &turn_key,
+                        &msg,
+                        &cancel,
+                        &system,
+                        &schemas_now,
+                        &in_turn_sink,
+                        &view_provenance,
+                        &prefix_unavailable,
+                    );
+                    in_turn::maybe_auto_compress(&ctx, &mut messages, &mut turn_start).await;
                 }
 
                 // 「working」状态：非 CLI / 非 system / 非 weixin / 非 cron，且仅首轮下发一次。
@@ -1979,7 +2364,11 @@ impl TurnManager {
                 // 每迭代一次的 reactive compact 预算：超限压缩后若本迭代再次超限，
                 // 不再重复压缩（由普通错误路径收尾），避免「压缩-超限」循环。
                 let mut reactive_done = false;
-                'retry: for attempt in 0..=max_retries {
+                // 手动计数而非 `for attempt in 0..=max_retries`：reactive compact 后的原地
+                // 重试不消耗重试预算（它不是「同样的请求再试一次」），否则 max_retries=0
+                // 时压缩成功却因循环耗尽而既无结果也无错误文案地结束本轮。
+                let mut attempt: u32 = 0;
+                'retry: loop {
                     if cancel.is_cancelled() {
                         cancelled = true;
                         break 'retry;
@@ -2023,7 +2412,8 @@ impl TurnManager {
                     // 旧媒体剥离、旧 tool result 摘要化、大 tool_use input 裁剪，保护窗口
                     // 内的最近消息原样保留。只改请求视图，不动内存/磁盘（下一轮 load 仍
                     // 能取回完整内容），长 turn 不再把巨大的工具输出一路带进每次请求。
-                    let mut request_messages = if self.opts.in_turn_compression_enabled {
+                    // 会话压缩整体关闭时（load 期只做硬裁剪）视图也不剪枝，与选项文档一致。
+                    let mut request_messages = if in_turn::in_turn_compression_allowed(&self.opts) {
                         in_turn::microcompact_view(&messages, &self.opts)
                     } else {
                         messages.clone()
@@ -2044,7 +2434,7 @@ impl TurnManager {
                     // 本次推理尾部（非持久化、不唤醒）——父在下一个自然迭代即可看到结果
                     // 已就绪并自行决定何时用 TaskList 查看，不再「干等 or 漏看」二选一。
                     let team_inbox_unread =
-                        crate::agent_tools::read_team_inbox_unread(&self.layout.base);
+                        crate::agent_tools::read_team_inbox_unread(&self.session.journal());
                     if team_inbox_unread > 0 {
                         tail_message.content.push(ContentBlock::text(format!(
                             "\n[System hint] 团队邮箱有 {team_inbox_unread} 条未读的后台子 Agent \
@@ -2092,13 +2482,11 @@ impl TurnManager {
                             // 下一轮历史加载用「锚点真实值 + 增量启发式」代替纯启发式，
                             // 避免估算漂移导致自动压缩触发时机失准。
                             if let Some(usage) = &oc.usage {
-                                if let Some(anchor_message) = messages.last() {
-                                    self.history.record_usage_anchor(
-                                        &TurnKey::from_msg(&msg),
-                                        anchor_message,
-                                        usage.total(),
-                                    );
-                                }
+                                self.history.record_usage_anchor(
+                                    &TurnKey::from_msg(&msg),
+                                    &messages,
+                                    usage.total(),
+                                );
                             }
                             outcome_opt = Some(oc);
                             break 'retry;
@@ -2122,15 +2510,13 @@ impl TurnManager {
                                     &system,
                                     &schemas_now,
                                     &in_turn_sink,
+                                    &view_provenance,
+                                    &prefix_unavailable,
                                 );
-                                if in_turn::reactive_compress(
-                                    &ctx,
-                                    &mut messages,
-                                    &mut turn_start,
-                                    &mut ephemeral,
-                                )
-                                .await
+                                if in_turn::reactive_compress(&ctx, &mut messages, &mut turn_start)
+                                    .await
                                 {
+                                    // 预算中性：不计入 attempt。
                                     continue 'retry;
                                 }
                             }
@@ -2155,6 +2541,7 @@ impl TurnManager {
                                     }
                                     _ = tokio::time::sleep(backoff) => {}
                                 }
+                                attempt += 1;
                             } else {
                                 let class = match e.class() {
                                     LlmErrorClass::Retryable => "retryable",
@@ -2368,11 +2755,12 @@ impl TurnManager {
                 }
 
                 // 构造 assistant(tool_calls)。若任一 tool_use 入参非法，放弃本轮、不持久化。
-                let assistant_msg = match build_assistant_message(&outcome) {
-                    Ok(mut m) => {
-                        // Layer 5 选点回滚：预分配持久 messageId（纳秒单调，append 保留
-                        // 非 0 ts），本迭代 write/edit/delete 的 checkpoint 以它归属。
-                        m.ts = rewind::next_message_id();
+                let mut assistant_msg = match build_assistant_message(&outcome) {
+                    Ok(m) => {
+                        // Layer 5 选点回滚：为本迭代分配 rewind 分组 id（纳秒时间戳，与消息
+                        // 自增 id 无关；`Message.ts` 仍是秒级 Unix 时间戳），write/edit/delete
+                        // 的 checkpoint 以它归属。
+                        checkpoint_group_id = rewind::next_rewind_id();
                         m
                     }
                     Err(e) => {
@@ -2396,17 +2784,25 @@ impl TurnManager {
                         ));
                         break 'react;
                     }
-                    let tool_result = build_loop_circuit_result(&outcome, &fingerprints);
+                    let mut tool_result = build_loop_circuit_result(&outcome, &fingerprints);
                     run.record_tool_results(&outcome, &tool_result);
                     if !is_cron {
-                        if let Err(e) = self.session.append_tool_chain(
+                        match self.session.append_tool_chain(
                             &msg.channel,
                             &msg.chat_id,
                             &assistant_msg,
                             &tool_result,
                         ) {
-                            tracing::error!("循环熔断工具链持久化失败 ({e})，放弃本轮");
-                            break 'react;
+                            Ok((assistant_id, result_id)) => {
+                                assistant_msg.id = assistant_id;
+                                tool_result.id = result_id;
+                            }
+                            Err(e) => {
+                                tracing::error!("循环熔断工具链持久化失败 ({e})，放弃本轮");
+                                // 带着真实原因收尾，而不是让循环末尾把它报成「达到迭代上限」。
+                                llm_error = Some(format!("工具链持久化失败，本轮中止：{e}"));
+                                break 'react;
+                            }
                         }
                     }
                     messages.push(assistant_msg);
@@ -2416,7 +2812,7 @@ impl TurnManager {
                 // 工具执行（cancel-aware）：取消时 drop `execute_tools` future，
                 // 内部 `Shell` 子进程靠 `kill_on_drop(true)` 被 kill；此时 assistant(tool_calls)
                 // 尚未落盘，B1 在清理阶段把它与 aborted 占位结果一起补写进历史（ADR-0004）。
-                let tool_exec = tokio::select! {
+                let mut tool_exec = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
                         interrupted_chain = Some(assistant_msg);
@@ -2439,43 +2835,63 @@ impl TurnManager {
                 }
                 run.record_tool_results(&outcome, &tool_exec.tool_result);
 
-                // 原子持久化 assistant(tool_calls) + tool_result（单次 write_all）。
-                if !is_cron {
-                    if let Err(e) = self.session.append_tool_chain(
+                // Layer 5：本迭代捕获的文件 checkpoint 以 rewind 分组 id 落库——前台路径与
+                // 工具链同一事务（要么都在、要么都不在）；cron 轮次不持久化消息，checkpoint
+                // 单独落库。文件已经改了，回滚点不能因历史持久化失败而丢失：事务失败时补落库。
+                let checkpoints =
+                    rewind::into_records(std::mem::take(&mut state.pending_file_checkpoints));
+                if is_cron {
+                    rewind::flush_records(
+                        &self.session,
+                        &msg.channel,
+                        &msg.chat_id,
+                        checkpoint_group_id,
+                        &checkpoints,
+                    );
+                } else {
+                    // 原子持久化 assistant(tool_calls) + tool_result + checkpoint（单事务）。
+                    match self.session.append_tool_chain_with_checkpoints(
                         &msg.channel,
                         &msg.chat_id,
                         &assistant_msg,
                         &tool_exec.tool_result,
+                        checkpoint_group_id,
+                        &checkpoints,
                     ) {
-                        tracing::error!("工具链原子持久化失败 ({e})，放弃本轮");
-                        break 'react;
+                        Ok((assistant_id, result_id)) => {
+                            assistant_msg.id = assistant_id;
+                            tool_exec.tool_result.id = result_id;
+                        }
+                        Err(e) => {
+                            tracing::error!("工具链原子持久化失败 ({e})，放弃本轮");
+                            rewind::flush_records(
+                                &self.session,
+                                &msg.channel,
+                                &msg.chat_id,
+                                checkpoint_group_id,
+                                &checkpoints,
+                            );
+                            // 带着真实原因收尾（工具已执行、结果没能落库），而不是让循环
+                            // 末尾把它报成「达到 ReAct 迭代上限」。
+                            llm_error = Some(format!("工具链持久化失败，本轮中止：{e}"));
+                            break 'react;
+                        }
                     }
                 }
-                // Layer 5：本迭代捕获的文件 checkpoint 以 assistant messageId 落盘。
-                rewind::flush(
-                    &self.layout,
-                    &msg.channel,
-                    &msg.chat_id,
-                    assistant_msg.ts,
-                    std::mem::take(&mut state.pending_file_checkpoints),
-                );
 
                 messages.push(assistant_msg);
                 messages.push(tool_exec.tool_result);
-                // skill_context / 媒体附件是本轮临时上下文（不落盘）：记录下标，
-                // 轮内压缩 rewrite session 时剔除、内存保留供模型继续参考。
+                // skill_context / 媒体附件是本轮临时上下文（不落盘，id 保持 0）：留在本轮
+                // 尾区，轮内压缩只动头区，模型可继续参考。
                 if let Some(skill_context_msg) = tool_exec.skill_context_message {
                     messages.push(skill_context_msg);
-                    ephemeral.push(messages.len() - 1);
                 }
                 if let Some(media_msg) = tool_exec.media_message {
                     if turn_provider.supports_multimodal() {
                         messages.push(media_msg);
-                        ephemeral.push(messages.len() - 1);
                     } else {
                         tracing::info!("当前模型不支持多模态输入，跳过 read 工具返回的媒体附件");
                         messages.push(multimodal_unsupported_message());
-                        ephemeral.push(messages.len() - 1);
                     }
                 }
             }
@@ -2494,15 +2910,17 @@ impl TurnManager {
             // assistant(tool_calls) 与 aborted 占位结果补写为一条【闭合】工具链
             // ——模型下轮知道哪些调用没有结果、不会重复已做的工作；
             // 其余情况不留任何未闭合链。
+            // Layer 5：被打断前已完成的文件写入照样落 checkpoint（文件已改，回滚点不能
+            // 因取消丢失；cron turn 同理）。
+            rewind::flush(
+                &self.session,
+                &msg.channel,
+                &msg.chat_id,
+                checkpoint_group_id,
+                std::mem::take(&mut state.pending_file_checkpoints),
+            );
             if !is_cron {
                 if let Some(assistant_msg) = interrupted_chain.take() {
-                    rewind::flush(
-                        &self.layout,
-                        &msg.channel,
-                        &msg.chat_id,
-                        assistant_msg.ts,
-                        std::mem::take(&mut state.pending_file_checkpoints),
-                    );
                     let ids = assistant_msg
                         .content
                         .iter()
@@ -2548,13 +2966,14 @@ impl TurnManager {
                 text.clone()
             };
             if !is_cron {
-                let final_msg = if had_tool_iter {
+                let mut final_msg = if had_tool_iter {
                     // 结构化（含 reasoning），满足思考模式跨轮回传。
                     let mut blocks = vec![ContentBlock::text(text.clone())];
                     if let Some(r) = &final_reasoning {
                         blocks.push(ContentBlock::reasoning(r));
                     }
                     Message {
+                        id: 0,
                         role: Role::Assistant,
                         content: blocks,
                         tool_call_id: None,
@@ -2563,8 +2982,9 @@ impl TurnManager {
                 } else {
                     Message::plain(Role::Assistant, &text)
                 };
-                if let Err(e) = self.session.append(&msg.channel, &msg.chat_id, &final_msg) {
-                    tracing::warn!("最终回复持久化失败: {e}");
+                match self.session.append(&msg.channel, &msg.chat_id, &final_msg) {
+                    Ok(id) => final_msg.id = id,
+                    Err(e) => tracing::warn!("最终回复持久化失败: {e}"),
                 }
                 messages.push(final_msg);
             }

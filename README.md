@@ -68,7 +68,7 @@ auth = "bearer"
 
 注意：配置从**当前工作目录**读取 `rclaw.toml`，在哪个目录启动就从哪里找；缺 Key 会启动期直接报错（fail-fast，刻意设计）。完整配置项（通道、搜索池、gbrain、MCP、日志、压缩阈值等）见 [`rclaw.toml.example`](rclaw.toml.example)，内含逐项注释。
 
-常用命令：`cargo run --release -- --daemon` 后台常驻部署；会话内 `/skills` 查看技能、`/tools` 查看工具、`/search` 管理搜索源。
+常用命令：`cargo run --release -- --daemon` 后台常驻部署；会话内 `/skills` 查看技能、`/tools` 查看工具、`/search` 管理搜索源，全部命令见 [斜杠命令](#斜杠命令)。
 
 ## 桌面版（Windows GUI）
 
@@ -253,6 +253,7 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 |---|---|
 | `read` / `write` / `edit` / `delete` | 工作区文件读写、精确替换编辑、删除（默认沙箱在 `agent/` 目录内） |
 | `list` / `grep` | 目录列举与正则内容检索 |
+| `rewind_files` | 按回滚点 id 回滚 write / edit / delete 留下的文件 checkpoint（恢复前 hash 校验 + checkpoint 校验链，被外部改动过则整组拒绝；不动会话历史） |
 
 ### 执行
 
@@ -267,6 +268,7 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 |---|---|
 | `memory` | 操作 MEMORY.md / USER.md：list / add / replace / remove / batch，预算制上限 + 写入脱敏 |
 | `session_search` | 跨会话（含归档会话）关键词检索，AND 语义 + 词频计分，召回"上次那个问题怎么解决的" |
+| `session_handoff` | 把另一段会话（含归档）的脉络带进当前会话：query 相关的更早消息 + 最近消息原文，按 4K–48K 字符预算填充，结果标注为历史素材而非指令 |
 | `web_search` | 多来源高可用搜索池（豆包 Custom / Tavily 多 Key / 智谱 MCP / 豆包 Global），额度与熔断自动切换，可补读正文 |
 | `web_browser` | 浏览器式网页抓取与阅读；检索引擎可配置（`[web_browser].engine` 或 `/webbrowser`，google/bing/baidu，搜不到自动依次换备用引擎，备选顺序 必应→百度） |
 | `tavily_extract` | Tavily 正文抽取 |
@@ -292,6 +294,9 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 | `TeamCreate` / `TeamDelete` / `TaskCreate` / `TaskUpdate` / `TaskList` / `TaskGet` / `SendMessage` | 团队协作：共享任务表 + 成员邮箱 |
 | `AgentStatus` / `AgentCancel` / `AgentWait` / `AgentResume` | 子代理生命周期管理 |
 | `PlanRun` | 依赖序多步计划：JSON 步骤表 + 并行波次执行 + 逐步事件日志 |
+| `WorkflowRun` | 程序化编排：JS 脚本在确定性沙箱里经 `agent(name).ask()` 驱动子代理，问答写 journal 支持零调用重放 / amend 热修 |
+| `escalate` | 计划步骤内的子代理向编排者阻塞式提问（不编造答案），问答进计划 journal 支持重放 |
+| `ResolveWorkflowQuestion` | 编排者应答 `escalate` 提出的问题，实时解锁等待中的步骤并记入 journal |
 | `message_agent` | bot 间交接：带不可伪造交接链的消息投递（深度上限 3，防环路） |
 
 ### 扩展
@@ -299,6 +304,21 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 | 工具 | 说明 |
 |---|---|
 | MCP `<server>__<tool>` | 在 `[mcp]` 段配置的任意 MCP server（stdio / streamable-http），工具自动注册，与内置工具同面调用 |
+
+## 斜杠命令
+
+会话内以 `/` 开头的消息由路由层直接处理、不进入 LLM，`/help` 列出全部：
+
+| 命令 | 说明 |
+|---|---|
+| `/llmodel <模型名>` | 热切换 LLM 模型，同步写回 `rclaw.toml` |
+| `/search` / `/searchfallback` / `/webbrowser` | 搜索源顺序、fallback 开关与无头浏览器引擎管理 |
+| `/skills` / `/tools` | 列出当前技能与工具 |
+| `/context` | 当前会话上下文用量（窗口 / 已用 / 剩余 / 使用率） |
+| `/compact` | 立即压缩当前会话历史（忽略阈值与防抖；有任务运行时拒绝） |
+| `/rewind [回滚点 id]` | 不带参数列出可回滚的文件 checkpoint（每个回滚点 = 一次工具迭代，附时间）；带列表给出的回滚点 id 回滚该点及之后的文件写入（hash 校验，被外部改动过则整组拒绝） |
+| `/export [all]` | 把当前会话（或全部会话）的完整记录导出为 JSONL 到 `agent/exports/`（含已被压缩进摘要的消息；压缩只影响模型可见视图，不删除历史） |
+| `/cancel` / `/clear [confirm]` / `/log` | 停止当前任务 / 清空会话状态（`agent/state.sqlite`）与记忆 / 查看日志文件 |
 
 ## Workspace 布局
 

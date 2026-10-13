@@ -162,6 +162,15 @@ impl ContentBlock {
 /// （等价于单个文本块）。后者用于兼容「纯文本消息」的简洁写法。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
+    /// 持久化身份（`state.sqlite` 的 `message.id`，全局单调递增）。
+    ///
+    /// `0` = 尚未持久化（内存中新建、临时注入、cron 轮次不落库等）。store 在插入时分配，
+    /// 调用方按需回填；加载时以数据库行为准。压缩锚点、usage 锚点等「定位某条消息」
+    /// 的逻辑一律按 id，不再按位置或内容 hash（rewind 的文件 checkpoint 分组用独立的
+    /// 纳秒级 `group_id`，与本字段无关）。
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub id: i64,
+
     pub role: Role,
 
     /// 内容块序列。自定义 (de)serialize 以兼容「字符串或数组」两种来源。
@@ -181,6 +190,7 @@ impl Message {
     /// 构造一条纯文本消息（content 为单个 Text 块）。
     pub fn plain(role: Role, text: impl Into<String>) -> Self {
         Message {
+            id: 0,
             role,
             content: vec![ContentBlock::text(text)],
             tool_call_id: None,
@@ -523,6 +533,7 @@ mod tests {
     #[test]
     fn media_url_block_roundtrip() {
         let m = Message {
+            id: 0,
             role: Role::User,
             content: vec![
                 ContentBlock::media_url(MediaKind::Image, "data:image/png;base64,abc"),
@@ -542,6 +553,7 @@ mod tests {
     #[test]
     fn detects_tool_result_carrier() {
         let m = Message {
+            id: 0,
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".into(),

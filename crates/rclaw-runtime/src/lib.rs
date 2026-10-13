@@ -20,7 +20,7 @@ pub mod session_handoff;
 pub mod slash;
 pub mod turn;
 
-pub use agent_loop::AgentLoop;
+pub use agent_loop::{AgentLoop, SessionLifecycle};
 pub use agent_tools::{
     AgentCancelTool, AgentResumeTool, AgentStatusTool, AgentToolRuntime, AgentWaitTool,
     ClaudeAgentTool, PlanRunTool, SendMessageTool, TaskCreateTool, TaskGetTool, TaskListTool,

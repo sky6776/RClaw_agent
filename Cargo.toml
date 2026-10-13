@@ -97,6 +97,11 @@ qrcode = "0.14"         # weixin-login：终端二维码渲染（纯 Rust，无 
 # read 工具 PDF 透明路由（ADR-0003）：检测 PDF 类型 + 本地提取文本。
 # 只用默认 features（纯 Rust）；绝不开 ocr feature——拉 PDFium/ONNX C 依赖，破坏 Termux。
 pdf-inspector = "1.17"
+# 机器状态库（agent/state.sqlite：会话 / rewind checkpoint / usage 锚点 / journal）。
+# bundled 自带 SQLite C 源，Windows / Termux / NDK 一致；rclaw-gbrain 同版共用——
+# libsqlite3-sys 的 `links` 约束只允许 workspace 内存在一个 rusqlite 版本。
+# functions：注册 Rust 标量函数（`rclaw_lower`，Unicode 小写；SQLite 内建 lower() 只折 ASCII）。
+rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 
 # ---- 内部 crate 互引（用 workspace 相对路径）----
 rclaw-core     = { path = "crates/rclaw-core" }

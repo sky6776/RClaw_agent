@@ -12,6 +12,7 @@ enum RuntimeCommand {
     Log,
     Compact,
     Rewind,
+    Export,
 }
 
 impl RuntimeCommand {
@@ -27,6 +28,7 @@ impl RuntimeCommand {
             "log" => Some(Self::Log),
             "compact" => Some(Self::Compact),
             "rewind" => Some(Self::Rewind),
+            "export" => Some(Self::Export),
             _ => None,
         }
     }
@@ -50,12 +52,45 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
             RuntimeCommand::Context => manager.handle_context(&msg.channel, &msg.chat_id),
             RuntimeCommand::Skills => manager.handle_skills_command(&msg.content),
             RuntimeCommand::Tools => render_tools(manager.tools.schemas()),
-            RuntimeCommand::Clear => manager.handle_clear(&msg.content),
+            RuntimeCommand::Clear => manager.handle_clear(&msg.content).await,
             RuntimeCommand::Log => manager.handle_log(&msg.channel, &msg.content),
             RuntimeCommand::Compact => {
-                manager.handle_compact(&msg.channel, &msg.chat_id).await
+                // 手动压缩要调一次摘要 LLM（十几秒到一分钟）：不能在路由任务上 await，
+                // 否则期间所有会话的入站消息都排队。放到独立任务，结果经 outbound 回送。
+                let manager = manager.clone();
+                let channel = msg.channel.clone();
+                let chat_id = msg.chat_id.clone();
+                tokio::spawn(async move {
+                    let response = manager.handle_compact(&channel, &chat_id).await;
+                    let _ = manager
+                        .outbound_tx
+                        .send(BusMessage::new(channel, chat_id, response))
+                        .await;
+                });
+                return true;
             }
-            RuntimeCommand::Rewind => manager.handle_rewind(&msg.channel, &msg.chat_id, &msg.content),
+            RuntimeCommand::Rewind => {
+                manager
+                    .handle_rewind(&msg.channel, &msg.chat_id, &msg.content)
+                    .await
+            }
+            RuntimeCommand::Export => {
+                // 导出要把整段 transcript（可能上千条）读出来并渲染、落盘：虽然走的是
+                // spawn_blocking，但在路由任务上 await 它同样会让别的会话排队。与 /compact
+                // 一样放独立任务，结果经 outbound 回送。
+                let manager = manager.clone();
+                let channel = msg.channel.clone();
+                let chat_id = msg.chat_id.clone();
+                let content = msg.content.clone();
+                tokio::spawn(async move {
+                    let response = manager.handle_export(&channel, &chat_id, &content).await;
+                    let _ = manager
+                        .outbound_tx
+                        .send(BusMessage::new(channel, chat_id, response))
+                        .await;
+                });
+                return true;
+            }
         };
         let _ = manager
             .outbound_tx
@@ -106,6 +141,8 @@ mod tests {
             ("/LOG list", RuntimeCommand::Log),
             ("/compact", RuntimeCommand::Compact),
             ("/rewind 1791753207350478000", RuntimeCommand::Rewind),
+            ("/export", RuntimeCommand::Export),
+            ("/export all", RuntimeCommand::Export),
         ] {
             assert_eq!(RuntimeCommand::parse(input), Some(expected));
         }
@@ -117,6 +154,7 @@ mod tests {
             "/tool",
             "/login",
             "/clearing",
+            "/exports",
             "/llmodel glm-5.3",
         ] {
             assert_eq!(RuntimeCommand::parse(input), None, "input={input}");

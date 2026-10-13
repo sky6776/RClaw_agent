@@ -32,15 +32,18 @@ pub(super) async fn drain_append_interjections(
 /// 把一条补充文本作为 user 消息：先持久化到 session 安全位置（tail），再追加进内存 messages。
 ///
 /// 即使持久化失败也仍注入内存（保证本轮 LLM 能看到），仅告警——本轮后续的 assistant
-/// 若成功落盘，下轮 load_history 仍能拿到这条 user（持久化是尽力而为）。
+/// 若成功落盘，下轮 load_history 仍能拿到这条 user（持久化是尽力而为）。落库成功时回填
+/// `id`：usage 锚点按「请求里最后一条已持久化消息」定位，没有 id 的插队消息会让锚点退回
+/// 更早的消息、把这条的 token 在下一轮重复计入增量。
 pub(super) async fn persist_and_push_user(
     session: &SessionStore,
     messages: &mut Vec<Message>,
     msg: &BusMessage,
 ) {
-    let m = Message::plain(Role::User, msg.content.clone());
-    if let Err(e) = session.append(&msg.channel, &msg.chat_id, &m) {
-        tracing::warn!("插队补充消息持久化失败（仍注入内存）: {e}");
+    let mut m = Message::plain(Role::User, msg.content.clone());
+    match session.append(&msg.channel, &msg.chat_id, &m) {
+        Ok(id) => m.id = id,
+        Err(e) => tracing::warn!("插队补充消息持久化失败（仍注入内存）: {e}"),
     }
     messages.push(m);
 }
@@ -381,6 +384,7 @@ pub(super) fn build_assistant_message(
         });
     }
     Ok(Message {
+        id: 0,
         role: Role::Assistant,
         content: blocks,
         tool_call_id: None,
@@ -398,6 +402,7 @@ pub(crate) fn build_loop_circuit_result(
         fingerprints.join(", ")
     );
     Message {
+        id: 0,
         role: Role::User,
         content: outcome
             .tool_calls

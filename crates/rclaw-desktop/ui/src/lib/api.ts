@@ -206,7 +206,14 @@ export interface UploadResult {
 /** 工作区外访问授权请求（permission_request 事件载荷）。 */
 export interface PermissionRequest {
   id: string;
+  /** 弹窗正文：操作 + 真正会被打开的物理落点（请求拼写与落点不同时一并带上）。 */
   path: string;
+  /** 物理落点（正斜杠）。 */
+  target: string;
+  /** 工具请求时的拼写（正斜杠）。 */
+  requested: string;
+  /** 操作名（读取 / 写入 / 删除 / 列目录 / 搜索 / 作为 shell 工作目录）。 */
+  op: string;
 }
 
 /** 工具权限模式：default = 工作区外需确认；full = 完全访问免确认。 */
@@ -319,7 +326,7 @@ export const api = {
 
   chatRestore: (chatId: string) => invoke<void>("chat_restore", { chatId }),
 
-  /** 删除会话（会话文件 + 自定义标题；前端先弹确认）。 */
+  /** 删除会话（state.sqlite 里的会话记录 + 自定义标题；前端先弹确认）。 */
   chatDelete: (chatId: string) => invoke<void>("chat_delete", { chatId }),
 
   /** 重命名会话；标题去空白后为空 = 恢复自动派生标题（首条用户消息截断）。 */
@@ -506,7 +513,7 @@ export const api = {
   saveToGallery: (rel: string, kind: "photo" | "video" | "audio") =>
     invoke<string>("save_to_gallery", { rel, kind }),
 
-  /** 放弃采集产物（删除工作区里的临时文件）。 */
+  /** 放弃采集产物（只删 uploads/ 里的临时文件）。 */
   discardCapture: (rel: string) => invoke<void>("discard_capture", { rel }),
 
   /** 编辑后的照片落盘（画布导出的 JPEG base64），返回相对 agent/ 路径。 */

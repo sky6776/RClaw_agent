@@ -44,8 +44,9 @@ jni = { version = "0.21", optional = true }
 [target.'cfg(target_os = "android")'.build-dependencies]
 tauri-build = { version = "2", features = [] }
 # 进程内存读取（状态面板）：仅在 Windows 路径用到；版本对齐依赖树已有条目，不引新包。
-# 后三个 feature 是状态条复制路径的 Win32 剪贴板 API（CF_UNICODETEXT 直写，
-# 规避 clip.exe 按控制台代码页解码导致非 ASCII 路径乱码）。
+# 中间三个 feature 是状态条复制路径的 Win32 剪贴板 API（CF_UNICODETEXT 直写，
+# 规避 clip.exe 按控制台代码页解码导致非 ASCII 路径乱码）；Win32_Storage_FileSystem
+# 供文件面板写入时 FILE_FLAG_OPEN_REPARSE_POINT（不跟随叶子链接）与 8.3 短名测试用。
 [target.'cfg(all(not(target_os = "android"), windows))'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_System_ProcessStatus",
@@ -54,7 +55,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
 ] }
+
+# 文件面板写入时 O_NOFOLLOW / O_NONBLOCK（不跟随叶子链接、不被 FIFO 挂死）；版本对齐依赖树已有条目。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dependencies]
 serde = { workspace = true }
@@ -62,7 +68,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-percent-encoding = { workspace = true }
 chrono = { workspace = true }
 toml_edit = { workspace = true }
 tokio-util = { workspace = true }

@@ -200,6 +200,7 @@ pub(crate) async fn execute_tool_batch(
     }
 
     let tool_result = Message {
+        id: 0,
         role: Role::User,
         content: slots.into_iter().flatten().collect(),
         tool_call_id: None,
@@ -214,6 +215,7 @@ pub(crate) async fn execute_tool_batch(
         ));
         content.extend(media_blocks);
         Some(Message {
+            id: 0,
             role: Role::User,
             content,
             tool_call_id: None,
@@ -795,6 +797,9 @@ pub(crate) fn is_candidate_patch_tool_allowed(name: &str) -> bool {
             | "TaskList"
             | "TaskGet"
             | "SendMessage"
+            // Layer 3：编码类计划步骤走 candidate_patch 隔离，但提问通道必须可见，
+            // 否则 PlanRun 步骤永远无法向编排者 escalate（纯提问，只写计划 journal）。
+            | "escalate"
     )
 }
 

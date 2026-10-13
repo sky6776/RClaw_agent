@@ -566,8 +566,8 @@ export default function Chat({
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       // 安卓 App：Enter 一律换行不发送（软键盘没有 Shift，回车换行才符合
-      // 手机输入习惯；发送走右侧发送钮）。
-      if (isAndroidDevice()) return;
+      // 手机输入习惯；发送走右侧发送钮）。外接硬件键盘用 Ctrl/⌘+Enter 发送。
+      if (isAndroidDevice() && !(e.ctrlKey || e.metaKey)) return;
       e.preventDefault();
       send();
       return;
@@ -912,6 +912,8 @@ export default function Chat({
           return (
             <div
               key={e.id}
+              role="group"
+              aria-label="用户消息"
               className="flex justify-end"
               {...(selectIds ? undefined : bubblePressHandlers(e))}
             >
@@ -937,9 +939,13 @@ export default function Chat({
                 }`}
                 {...(selectIds ? { onClick: () => toggleSelected(e.id) } : undefined)}
               >
+                {/* zcode 同款角色提示（MessageContent is-user：rounded-lg + 次级底色 +
+                    内边距，贴右收缩到内容宽）：无气泡全宽布局下用户消息一换行就与
+                    助手消息分不开（同色同号、右对齐在满宽时消失），底色随换行块
+                    延伸始终可见；浅色主题由 index.css 对 bg-[#1a1f29] 的定向覆盖接管。 */}
                 <div
-                  className={`whitespace-pre-wrap text-sm text-gray-200 [overflow-wrap:anywhere] max-md:text-[15px] max-md:leading-relaxed ${
-                    selectIds && selected ? "rounded-md ring-2 ring-indigo-300" : ""
+                  className={`whitespace-pre-wrap rounded-lg bg-[#1a1f29] px-4 py-2 text-sm text-gray-200 [overflow-wrap:anywhere] max-md:px-3.5 max-md:text-[15px] max-md:leading-relaxed ${
+                    selectIds && selected ? "ring-2 ring-indigo-300" : ""
                   }`}
                 >
                   {e.content}
@@ -972,6 +978,8 @@ export default function Chat({
         return (
           <div
             key={e.id}
+            role="group"
+            aria-label="助手消息"
             className="flex justify-start"
             {...(selectIds ? undefined : bubblePressHandlers(e))}
           >

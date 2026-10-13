@@ -1,14 +1,16 @@
 # =============================================================================
-# rclaw-store：文件系统持久化层
+# rclaw-store：持久化层（文件系统 + agent/state.sqlite）
 # -----------------------------------------------------------------------------
 # 负责：
-#   - 初始化 agent 目录布局（agent/{config,memory,sessions,skills} + 关键文件）
-#   - 原子写（tmp + rename，从源头规避半条工具链）
-#   - session JSONL 读写（含历史裁剪、孤儿 tool_result 跳过、原子工具链追加）
+#   - 初始化 agent 目录布局（agent/{config,memory,skills} + 关键文件）
+#   - 原子写（tmp + rename，人读改的文件）
+#   - state.sqlite：会话消息（事务级工具链追加、非破坏压缩 boundary、历史裁剪、
+#     孤儿 tool_result 修复）、rewind 文件 checkpoint、usage 锚点、PlanRun /
+#     WorkflowRun / 团队 journal 与 kv
 #   - 长期记忆 / daily notes
 #   - skills 摘要抽取
 #   - cron.json 持久化
-#   - 百分号编码的 session 键（channel + chat_id）
+#   - 百分号编码的导出文件名（channel + chat_id）
 # 依赖 rclaw-core 的消息模型。
 # =============================================================================
 [package]
@@ -30,6 +32,7 @@ percent-encoding = { workspace = true }
 toml_edit = { workspace = true }
 toml = { workspace = true }
 rand = { workspace = true }
+rusqlite = { workspace = true }   # agent/state.sqlite：会话 / checkpoint / 锚点 / journal
 
 [dev-dependencies]
 tempfile = "3"

@@ -57,7 +57,8 @@ impl Tool for TeamCreateTool {
             json!({
                 "team_name": team.name,
                 "description": team.description,
-                "team_file_path": format!("agent/teams/{}.json", team.name),
+                // 团队状态不落独立文件：在 state.sqlite 的 team_state 事件流里（整表快照）。
+                "team_state": format!("state.sqlite journal {JOURNAL_TEAM_STATE}"),
                 "lead_agent_id": team.lead_agent_id
             })
             .to_string(),
@@ -367,7 +368,7 @@ impl Tool for TaskListTool {
             // M1：team-lead（主循环）亲自消费邮箱 → 未读完成通知计数清零。
             // 子 agent 消费自己的邮箱不影响主循环的计数。
             if current_name == "team-lead" {
-                super::reset_team_inbox_unread(&self.runtime.layout.base);
+                super::reset_team_inbox_unread(&self.runtime.journal);
             }
             if !lines.is_empty() {
                 lines.push(String::new());
@@ -652,7 +653,10 @@ impl Tool for ClaudeAgentTool {
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<AgentTaskResult>(1);
         // 父取消联动（attach）：done 触发前父 /cancel 会终止子任务（保持前台
         // 「cancel 连子代理一起停」语义）；done 触发即 detach，之后不再波及。
+        // drop_guard：本工具 future 被整体丢弃（工具批被放弃等）时同样触发 done，
+        // watcher 不会一直挂到父 token 取消才退出。
         let done = tokio_util::sync::CancellationToken::new();
+        let _done_guard = done.clone().drop_guard();
         let linkage = rclaw_tools::turn_state::turn_cancel().map(|parent| (parent, done.clone()));
         let launched = match self
             .runtime
@@ -662,11 +666,20 @@ impl Tool for ClaudeAgentTool {
             Ok(output) => output,
             Err(error) => return ToolResult::err(error),
         };
-        let raced = tokio::select! {
+        let mut raced = tokio::select! {
             biased;
             result = result_rx.recv() => Some(result),
             _ = tokio::time::sleep(auto_background) => None,
         };
+        if raced.is_none() {
+            // detach：先关闭接收端（此后子任务的 send 必然失败，run_background_execution
+            // 据此判定「未被前台消费」并入箱 + 合批唤醒），再把关闭前恰好送达的结果
+            // 捞出来——否则这条结果既被子任务视为「父已拿到」又被父丢弃，凭空消失。
+            result_rx.close();
+            if let Ok(result) = result_rx.try_recv() {
+                raced = Some(Some(result));
+            }
+        }
         // 竞速结束（完成或转后台）：解除父取消联动，watcher 退出（不泄漏）。
         done.cancel();
         match raced {
@@ -675,9 +688,6 @@ impl Tool for ClaudeAgentTool {
                 ToolResult::err("子代理任务异常终止（执行通道关闭，无结果返回）".to_string())
             }
             None => {
-                // detach：丢弃竞速接收端——此后子任务完成时 send 必然失败，
-                // run_background_execution 据此判定「未被前台消费」并触发合批唤醒。
-                drop(result_rx);
                 let agent_id = launched
                     .get("agentId")
                     .and_then(Value::as_str)

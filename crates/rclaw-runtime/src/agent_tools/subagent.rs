@@ -242,6 +242,7 @@ pub(super) fn build_assistant_message(
         });
     }
     Ok(Message {
+        id: 0,
         role: Role::Assistant,
         content: blocks,
         tool_call_id: None,
@@ -466,11 +467,30 @@ pub(super) fn render_foreground_result(result: &AgentTaskResult) -> String {
     out
 }
 
+/// `truncate_chars` 截断后追加的标记：下游（plan verdict 解析）据此判断输出是否完整。
+pub(super) const OUTPUT_TRUNCATED_MARKER: &str = "\n\n[已按 max_output_chars 截断]";
+
 pub(super) fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }
     let mut out = s.chars().take(max_chars).collect::<String>();
-    out.push_str("\n\n[已按 max_output_chars 截断]");
+    out.push_str(OUTPUT_TRUNCATED_MARKER);
+    out
+}
+
+/// 非模型输出的文本（任务文本、依赖摘要、提问、诊断、报告摘录）被裁短时的后缀。
+/// 不复用 `OUTPUT_TRUNCATED_MARKER`：那个标记专指子代理【输出】按 max_output_chars 被截，
+/// plan 的 verdict 解析靠它判定验证者输出是否完整——一段被裁短的依赖摘要带上它，读起来
+/// 就成了「输出被截断」。
+pub(super) const TEXT_TRUNCATED_SUFFIX: &str = "…[截断]";
+
+/// 按字符数裁短非输出文本，超长时追加 [`TEXT_TRUNCATED_SUFFIX`]。
+pub(super) fn truncate_text(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = s.chars().take(max_chars).collect::<String>();
+    out.push_str(TEXT_TRUNCATED_SUFFIX);
     out
 }

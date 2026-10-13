@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
+use crate::files::helpers::join_workspace_path;
 use crate::shell_jobs::{spawn_background_job, ShellJobTable};
 use crate::{truncate::HeadTailBuffer, Tool, ToolResult};
 
@@ -75,7 +76,7 @@ impl Tool for Shell {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": format!("Working directory (outside {}/ requires unrestricted access). Defaults to the agent storage root.", base_str(&self.base))
+                    "description": format!("Working directory: absolute, or relative to {}/ (outside it requires unrestricted access). Defaults to the agent storage root.", base_str(&self.base))
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -248,9 +249,12 @@ fn parse_timeout_ms(input: &Value) -> Result<u64, ToolResult> {
     Ok(ms)
 }
 
+/// 解析 `cwd`：缺省为 agent 根；相对拼写相对 agent 根（与文件工具同一规则，见
+/// [`join_workspace_path`]——否则会相对【进程】的当前目录解析，随 cd 漂移：`cwd:"memory"`
+/// 要么指到进程目录下的同名目录、要么以一个裸相对串去弹窗）。
 async fn resolve_cwd(base: &Path, cwd: Option<&str>) -> Result<PathBuf, ToolResult> {
     let path = match cwd {
-        Some(s) if !s.trim().is_empty() => PathBuf::from(s),
+        Some(s) if !s.trim().is_empty() => join_workspace_path(base, s)?,
         _ => base.to_path_buf(),
     };
     // Unrestricted（max 权限）直放任意目录；工作区内直放；工作区外在宿主注册了
@@ -258,6 +262,7 @@ async fn resolve_cwd(base: &Path, cwd: Option<&str>) -> Result<PathBuf, ToolResu
     crate::access::ensure_path_allowed(
         base,
         &path,
+        crate::access::PathOp::ShellCwd,
         &format!("cwd 必须位于 {}/ 之下且不能包含 '..'", base_str(base)),
     )
     .await?;
@@ -524,6 +529,23 @@ mod tests {
             .await;
         assert!(r.is_error);
         assert!(r.content.contains("cwd 必须位于"), "{}", r.content);
+    }
+
+    /// 相对 `cwd` 相对 agent 根解析（与文件工具同一规则），不是相对进程的当前目录；
+    /// 带根目录名前缀的旧式写法不重复拼接。
+    #[tokio::test]
+    async fn shell_resolves_relative_cwd_against_the_agent_root() {
+        let b = base();
+        std::fs::create_dir_all(b.join("memory")).unwrap();
+        let base_name = b.file_name().unwrap().to_string_lossy().into_owned();
+        for cwd in ["memory", &format!("{base_name}/memory")] {
+            let resolved = resolve_cwd(&b, Some(cwd)).await.unwrap_or_else(|e| panic!("{cwd}: {}", e.content));
+            assert_eq!(resolved, b.join("memory"), "{cwd}");
+        }
+        let err = resolve_cwd(&b, Some("missing")).await.unwrap_err();
+        assert!(err.content.contains("cwd 不可访问"), "{}", err.content);
+        let err = resolve_cwd(&b, Some("../elsewhere")).await.unwrap_err();
+        assert!(err.content.contains("cwd 必须位于"), "{}", err.content);
     }
 
     #[tokio::test]

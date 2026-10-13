@@ -105,19 +105,19 @@ pub struct AgentOptions {
     pub compression_fallback_enabled: bool,
     /// 是否启用【轮内】上下文管理（ZCode 长程能力移植 · Layer 1）：
     /// - microcompact：每次模型请求前对请求视图做本地 tool result 剪枝（不落盘）；
-    /// - auto compact：每次迭代前用 anchored 估算检查阈值，超限就地语义压缩并
-    ///   rewrite session（复用 load 期同一套防抖 / fallback / 事件）；
+    /// - auto compact：每次迭代前用 anchored 估算检查阈值，超限就地语义压缩并向
+    ///   `state.sqlite` 追加一条 compaction boundary（复用 load 期同一套防抖 / fallback）；
     /// - reactive compact：LLM 报 context-exceeded 时压缩后原地重试一次。
     ///
     /// 关闭时退回旧行为：压缩只发生在轮次开始（`HistoryLoader::load`），长 turn
-    /// 内部没有压缩。默认开启。
+    /// 内部没有压缩。默认开启；[`Self::session_compression_enabled`] 关闭时整体不生效。
     pub in_turn_compression_enabled: bool,
     /// 后台子 Agent 完成后是否发送【批量唤醒】消息（ZCode 移植 · Layer 4）。
     ///
     /// 完成通知仍先入团队邮箱（未读计数），唤醒器在防抖窗口内合并在同一窗口完成的
     /// 多个通知，向发起任务的会话投一条 Heartbeat 来源的系统消息驱动新轮次收集结果。
-    /// 火化时未读为 0（已被 TaskList 消费）则跳过。默认开启；防抖窗口见
-    /// [`AgentOptions::background_wake_debounce`]。
+    /// 火化时未读为 0（已被 TaskList 消费 / 任务无团队邮箱）则降级为一条轻量核对提醒，
+    /// 不驱动专门的收集轮次。默认开启；防抖窗口见 [`AgentOptions::background_wake_debounce`]。
     pub background_wake_enabled: bool,
     /// 后台完成通知的唤醒防抖窗口。窗口内的多个完成合并为一条唤醒消息，
     /// 避免大规模并行时按完成数线性放大请求数。

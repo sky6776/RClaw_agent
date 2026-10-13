@@ -14,7 +14,6 @@
 //! 唤醒补的是「turn 结束后无人驱动」的空窗。
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -22,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use rclaw_core::BusMessage;
+use rclaw_store::journal::JournalStore;
 
 use crate::agent_tools::read_team_inbox_unread;
 
@@ -38,8 +38,8 @@ pub struct BackgroundWaker {
 
 struct Inner {
     tx: OnceLock<WakeTx>,
-    /// agent 根目录：火化时读团队邮箱未读计数（与尾部提示同源）。
-    base: PathBuf,
+    /// state.sqlite journal/kv 句柄：火化时读团队邮箱未读计数（与尾部提示同源）。
+    journal: JournalStore,
     /// 待唤醒目标（去重集合）：防抖窗口内同一会话的多个完成只留一条。
     pending: Mutex<HashSet<(String, String)>>,
     /// 是否已有防抖定时器在跑（避免每个完成各起一个 task）。
@@ -49,11 +49,11 @@ struct Inner {
 }
 
 impl BackgroundWaker {
-    pub fn new(base: &Path, enabled: bool, debounce: Duration) -> Self {
+    pub fn new(journal: JournalStore, enabled: bool, debounce: Duration) -> Self {
         BackgroundWaker {
             inner: Arc::new(Inner {
                 tx: OnceLock::new(),
-                base: base.to_path_buf(),
+                journal,
                 pending: Mutex::new(HashSet::new()),
                 timer_running: AtomicBool::new(false),
                 enabled,
@@ -98,7 +98,12 @@ impl BackgroundWaker {
         let waker = self.clone();
         let debounce = inner.debounce;
         tokio::spawn(async move {
+            // 定时器任务若在到期前被丢弃（所在 runtime 关闭），复位标志：否则 timer_running
+            // 永远为 true，之后每次 notify 的 CAS 都失败，pending 只进不出、再也不会唤醒。
+            // 正常到期由 fire() 在锁内清标志，这里解除守卫即可。
+            let mut reset = TimerReset(Some(waker.clone()));
             tokio::time::sleep(debounce).await;
+            reset.0.take();
             waker.fire();
         });
     }
@@ -117,7 +122,7 @@ impl BackgroundWaker {
         let Some(tx) = inner.tx.get() else {
             return;
         };
-        let unread = read_team_inbox_unread(&inner.base);
+        let unread = read_team_inbox_unread(&inner.journal);
         for (channel, chat_id) in targets {
             let content = if unread > 0 {
                 format!(
@@ -140,18 +145,33 @@ impl BackgroundWaker {
     }
 }
 
+/// 防抖定时器任务的复位守卫：持有 `Some` 时 Drop 复位 `timer_running`（任务被丢弃路径）；
+/// 正常到期前 `take()` 解除，交由 `fire()` 在锁内清标志。
+struct TimerReset(Option<BackgroundWaker>);
+
+impl Drop for TimerReset {
+    fn drop(&mut self) {
+        if let Some(waker) = self.0.take() {
+            waker.inner.timer_running.store(false, Ordering::Release);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn waker_for_test() -> BackgroundWaker {
+    fn test_journal(name: &str) -> JournalStore {
         let dir = std::env::temp_dir().join(format!(
-            "rclaw-wake-test-{}-{}",
+            "rclaw-wake-{name}-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        BackgroundWaker::new(&dir, true, Duration::from_millis(20))
+        JournalStore::open(&rclaw_store::fs::Layout::new(dir.join("agent"))).unwrap()
+    }
+
+    fn waker_for_test() -> BackgroundWaker {
+        BackgroundWaker::new(test_journal("test"), true, Duration::from_millis(20))
     }
 
     #[tokio::test]
@@ -176,16 +196,12 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_or_unattached_waker_is_noop() {
-        let dir = std::env::temp_dir().join(format!(
-            "rclaw-wake-off-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let journal = test_journal("off");
         let (tx, mut rx) = mpsc::channel::<BusMessage>(8);
-        let disabled = BackgroundWaker::new(&dir, false, Duration::from_millis(10));
+        let disabled = BackgroundWaker::new(journal.clone(), false, Duration::from_millis(10));
         disabled.attach(tx.clone());
         disabled.notify("cli", "console");
-        let unattached = BackgroundWaker::new(&dir, true, Duration::from_millis(10));
+        let unattached = BackgroundWaker::new(journal, true, Duration::from_millis(10));
         unattached.notify("cli", "console");
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(rx.try_recv().is_err(), "禁用/未 attach 时不应投递");

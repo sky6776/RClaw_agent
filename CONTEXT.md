@@ -78,7 +78,7 @@ _Avoid_: 进化结论、错误日志（它不是日志，是评审输入）
 candidate_patch 编码子代理完成后，用只读 mini 循环（read/list/grep）独立核实其结构化交接的可选过程；结论附在 handoff 之后，验证失败不阻塞交付。
 
 **plan 工件（plan artifact）**:
-PlanRun 工具的确定性多步计划：JSON 步骤表（id/task/depends_on）+ 依赖序执行（并行波次、失败传染为 skipped、不重试）+ agent/plans/ 下的逐步事件日志。步骤本体是带全部门禁的子代理；计划不可嵌套。见 ADR-0005。
+PlanRun 工具的确定性多步计划：JSON 步骤表（id/task/depends_on）+ 依赖序执行（并行波次、失败传染为 skipped、不重试）+ agent/state.sqlite 计划 journal（流 plan/<plan_id>）里的逐步事件日志。步骤本体是带全部门禁的子代理；计划不可嵌套。见 ADR-0005。
 
 **review（复盘）**:
 turn 结束后的记忆整理与自进化审查过程。

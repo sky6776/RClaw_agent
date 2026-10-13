@@ -31,7 +31,7 @@ pinyin = "0.10"
 pulldown-cmark = "0.12"
 quick-xml = "0.37"
 regex = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { workspace = true }
 serde_yaml = "0.9"
 sha2 = "0.10"
 sqlite-vec = "0.1"

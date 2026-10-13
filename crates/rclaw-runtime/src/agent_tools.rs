@@ -5,11 +5,7 @@
 //! summaries, and ordinary tools, but does not write to the user-visible
 //! conversation session.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, OpenOptions};
-use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -18,6 +14,10 @@ use async_trait::async_trait;
 use rclaw_core::{ChatRequest, ContentBlock, Message, Role, ToolSchema};
 use rclaw_llm::Provider;
 use rclaw_store::fs::Layout;
+use rclaw_store::journal::{
+    JournalStore, JOURNAL_EXEC_LOG, JOURNAL_PLAN, JOURNAL_TEAM_STATE, JOURNAL_WORKFLOW,
+    KV_TEAM_INBOX,
+};
 use rclaw_store::memory::MemoryStore;
 use rclaw_tools::{begin_skill_activity, Tool, ToolRegistry, ToolResult, WebSearchControl};
 use serde::{Deserialize, Serialize};
@@ -76,66 +76,191 @@ use verify::verify_candidate_patch;
 // ---------------------------------------------------------------------------
 // M1：后台子 Agent 完成通知的「未读」计数。
 //
-// 完成通知只入 team-lead 邮箱（不唤醒主循环）；主循环在每次推理前从该计数文件
-// 得知「有 N 条未读完成通知」，下一个自然迭代即可用 TaskList 查看内容——
-// 解决「并行投研下父干等 or 漏看」的二选一，而不引入任何唤醒机制。
+// 完成通知入 team-lead 邮箱并计未读；主循环在每次推理前从该计数（`state.sqlite` kv
+// `team_inbox`）得知「有 N 条未读完成通知」，下一个自然迭代即可用 TaskList 查看内容——
+// 解决「并行投研下父干等 or 漏看」的二选一。父 turn 已结束时由 Layer 4 的批量唤醒器
+// （`background_wake`）合批投一条系统消息驱动收集轮次，未读计数决定其文案。
 // ---------------------------------------------------------------------------
 
-/// 未读计数的存放目录（与 CollaborationState 的事件目录同源）。
-pub(crate) const TEAM_EXECUTIONS_DIR: &str = "task_executions";
-/// 未读计数文件名。
-const TEAM_INBOX_FILE: &str = "team_inbox.json";
-
-/// 未读计数文件路径。
-fn team_inbox_path(base: &Path) -> PathBuf {
-    base.join(TEAM_EXECUTIONS_DIR).join(TEAM_INBOX_FILE)
-}
-
-/// 读取未读的后台完成通知数（文件缺失/损坏时按 0）。
-pub(crate) fn read_team_inbox_unread(base: &Path) -> usize {
-    std::fs::read_to_string(team_inbox_path(base))
+/// 读取未读的后台完成通知数（记录缺失/损坏时按 0）。
+pub(crate) fn read_team_inbox_unread(journal: &JournalStore) -> usize {
+    journal
+        .kv_get(KV_TEAM_INBOX)
         .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .flatten()
         .and_then(|value| value.get("unread").and_then(Value::as_u64))
         .unwrap_or(0) as usize
 }
 
-fn load_team_inbox_unread(base: &Path) -> i64 {
-    read_team_inbox_unread(base) as i64
+fn load_team_inbox_unread(journal: &JournalStore) -> i64 {
+    read_team_inbox_unread(journal) as i64
 }
 
-fn store_team_inbox_unread(base: &Path, unread: i64) {
+fn store_team_inbox_unread(journal: &JournalStore, unread: i64) {
     let value = json!({
         "unread": unread.max(0),
         "updated_at": chrono::Utc::now().to_rfc3339(),
     });
-    if let Err(error) =
-        rclaw_store::fs::atomic_write(team_inbox_path(base), value.to_string().as_bytes())
-    {
+    if let Err(error) = journal.kv_set(KV_TEAM_INBOX, &value) {
         tracing::warn!("持久化团队邮箱未读计数失败: {error}");
     }
 }
 
 /// 未读计数的读-改-写串行锁：多个后台子 Agent 可并发完成并 bump 计数，
-/// TaskList 也可能并发 reset；不串行化会丢更新（文件本身经 atomic_write
-/// 不会撕裂，但 load→store 之间的交错会让计数少加/回退）。
+/// TaskList 也可能并发 reset；不串行化会丢更新（单条 kv 写入是原子的，
+/// 但 load→store 之间的交错会让计数少加/回退）。
 static TEAM_INBOX_RW_LOCK: StdMutex<()> = StdMutex::new(());
 
 /// 完成通知入箱后：未读 +1。
-fn bump_team_inbox_unread(base: &Path) {
+fn bump_team_inbox_unread(journal: &JournalStore) {
     let _guard = TEAM_INBOX_RW_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let next = load_team_inbox_unread(base).saturating_add(1);
-    store_team_inbox_unread(base, next);
+    let next = load_team_inbox_unread(journal).saturating_add(1);
+    store_team_inbox_unread(journal, next);
 }
 
 /// TaskList 消费邮箱后：未读清零。
-fn reset_team_inbox_unread(base: &Path) {
+fn reset_team_inbox_unread(journal: &JournalStore) {
     let _guard = TEAM_INBOX_RW_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    store_team_inbox_unread(base, 0);
+    store_team_inbox_unread(journal, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 事件 journal 流句柄（PlanRun / WorkflowRun）：`state.sqlite` 的 `journal_event` 表，
+// 以 (kind, stream) 定位一条追加式事件流，取代旧的 agent/plans|workflows/<id>.jsonl。
+// ---------------------------------------------------------------------------
+
+/// 一条事件流的句柄（kind 固定、stream = plan_id / run_id）。
+#[derive(Clone)]
+pub(crate) struct EventLog {
+    journal: JournalStore,
+    kind: &'static str,
+    stream: String,
+}
+
+impl EventLog {
+    pub(crate) fn new(journal: &JournalStore, kind: &'static str, stream: impl Into<String>) -> Self {
+        EventLog {
+            journal: journal.clone(),
+            kind,
+            stream: stream.into(),
+        }
+    }
+
+    /// PlanRun 事件流（stream = plan_id）。
+    pub(crate) fn plan(journal: &JournalStore, plan_id: &str) -> Self {
+        Self::new(journal, JOURNAL_PLAN, plan_id)
+    }
+
+    /// WorkflowRun 事件流（stream = run_id）。
+    pub(crate) fn workflow(journal: &JournalStore, run_id: &str) -> Self {
+        Self::new(journal, JOURNAL_WORKFLOW, run_id)
+    }
+
+    /// 人可读定位（报告 / 错误文案里替代旧的文件路径）。
+    pub(crate) fn locator(&self) -> String {
+        format!("state.sqlite journal {}/{}", self.kind, self.stream)
+    }
+
+    /// 流是否已有事件；读失败返回 Err（resume 入口据此区分「计划不存在」与「库暂不可读」）。
+    pub(crate) fn exists(&self) -> Result<bool, String> {
+        self.journal
+            .exists(self.kind, &self.stream)
+            .map_err(|error| format!("读取 {} 失败：{error}", self.locator()))
+    }
+
+    /// 追加一条事件，返回其 seq。
+    ///
+    /// journal 是 PlanRun / WorkflowRun 的重放事实源：`step_escalated` / `escalation_resolved`
+    /// / `run_started` 这类决定 resume 语义的事件写不进去，调用方必须拿到错误并中止或
+    /// 降级（否则「提了问题」「已应答」在下一次 resume 里凭空消失）。进度 / 诊断类事件
+    /// 用 [`EventLog::append_lossy`]。
+    pub(crate) fn append(&self, payload: &Value) -> Result<u64, String> {
+        self.journal
+            .append(self.kind, &self.stream, payload)
+            .map_err(|error| format!("{} 事件写入失败: {error}", self.locator()))
+    }
+
+    /// 追加一条非关键事件：失败只告警，不阻断执行。
+    pub(crate) fn append_lossy(&self, payload: &Value) {
+        if let Err(error) = self.append(payload) {
+            tracing::warn!("{error}");
+        }
+    }
+
+    /// 「先读整条流、再决定是否追加」的原子版本（同一个写事务，跨连接 / 跨进程有效，
+    /// 见 [`JournalStore::append_guarded`]）：返回（追加事件的 seq，闭包的裁决）。
+    pub(crate) fn append_guarded<T>(
+        &self,
+        decide: impl FnOnce(&[(u64, Value)]) -> (Option<Value>, T),
+    ) -> Result<(Option<u64>, T), String> {
+        self.journal
+            .append_guarded(self.kind, &self.stream, decide)
+            .map_err(|error| format!("{} 读取或写入失败: {error}", self.locator()))
+    }
+
+    /// 读取整个事件流（seq 升序）；读失败返回 Err（调用方决定是否当「不存在」处理）。
+    pub(crate) fn load(&self) -> Result<Vec<(u64, Value)>, String> {
+        self.journal
+            .load(self.kind, &self.stream)
+            .map_err(|error| format!("读取 {} 失败：{error}", self.locator()))
+    }
+}
+
+/// 发起方 turn 的 task-local 上下文快照：工具沙箱权限 / 当前会话键 / Bot Mode 上下文。
+///
+/// 前台子代理内联运行在父 turn 的 task 里，天然继承这些值；后台 spawn 会丢掉它们。
+/// 不带过去就会出现「同一个子代理前台 Unrestricted、自动转后台后变 Sandboxed」
+/// 「后台子代理里 rewind_files / 会话交接工具丢失会话键（报缺少会话上下文或回落 cli）」
+/// 「bot 会话派生的子代理丢失 bot 身份」这类语义漂移，所以后台启动都在 spawn 边界重新
+/// 建立作用域。（rewind checkpoint 本身与此无关：采集只在前台策略下进行、由顶层 turn
+/// 冲刷，子代理不记 checkpoint。）
+///
+/// 进程重启后的恢复（`AgentResume`）没有发起方 task 可抓：会话键从快照的
+/// `source_channel` / `origin_chat_id` 重建，权限按快照持久化的 `ToolAccess` 还原——
+/// 见 [`InheritedTurnContext::for_recovered`]，不继承「谁来 resume 谁的权限」。
+#[derive(Clone)]
+struct InheritedTurnContext {
+    access: rclaw_core::ToolAccess,
+    chat: Option<(String, String)>,
+    bot_ctx: Option<crate::bots::BotTurnCtx>,
+}
+
+impl InheritedTurnContext {
+    fn capture() -> Self {
+        InheritedTurnContext {
+            access: rclaw_tools::access::current_access(),
+            chat: crate::turn::rewind::current_chat(),
+            bot_ctx: crate::bots::current_bot_ctx(),
+        }
+    }
+
+    /// 进程重启后恢复的执行：没有发起方 task 可抓，按快照重建——会话键取任务规格里持久化
+    /// 的发起会话（缺省则 None，与「无会话上下文」同义），权限取快照持久化的发起方权限。
+    /// bot 身份不持久化（恢复后的子代理以无 bot 身份运行，与崩溃前后台任务的既有口径一致）。
+    fn for_recovered(spec: &AgentTaskSpec, access: rclaw_core::ToolAccess) -> Self {
+        let chat = (!spec.source_channel.is_empty() && !spec.origin_chat_id.is_empty())
+            .then(|| (spec.source_channel.clone(), spec.origin_chat_id.clone()));
+        InheritedTurnContext {
+            access,
+            chat,
+            bot_ctx: None,
+        }
+    }
+
+    async fn run<F: std::future::Future>(self, fut: F) -> F::Output {
+        let fut = crate::turn::rewind::CURRENT_CHAT.scope(
+            self.chat,
+            rclaw_tools::access::scope_access(self.access, fut),
+        );
+        match self.bot_ctx {
+            Some(ctx) => crate::bots::scope_bot_ctx(ctx, fut).await,
+            None => fut.await,
+        }
+    }
 }
 
 /// 子代理独立模型解析器（ZCode 移植 · Layer 2b）：按 `[[llm.providers]]` 的
@@ -156,22 +281,32 @@ pub struct AgentToolRuntime {
     collaboration: CollaborationState,
     memory: MemoryStore,
     layout: Layout,
+    /// `state.sqlite` journal / kv 句柄（PlanRun / WorkflowRun 事件流、团队收件箱计数）。
+    journal: JournalStore,
     opts: AgentOptions,
     /// 后台完成通知的批量唤醒器（ZCode 移植 · Layer 4）：完成入箱后合批投递
     /// 系统消息驱动收集轮次；inbound 发送端由二进制装配期 attach。
     background_wake: crate::background_wake::BackgroundWaker,
     /// 子代理独立模型解析器（Layer 2b）；OnceLock 装配期回填，避免构造签名扩散。
-    model_factory: std::sync::OnceLock<ModelFactory>,
+    /// 包一层 Arc：工具注册拿到的是本结构的 clone，回填必须对所有 clone 可见，
+    /// 否则在 `set_model_factory` 之前 clone 出去的工具永远解析不到 `model`。
+    model_factory: Arc<std::sync::OnceLock<ModelFactory>>,
+    /// 按名字缓存已构建的独立模型 provider：factory 每次调用都新建一个带 HTTP 客户端的
+    /// provider，而入参校验期与运行期各要解析一次；缓存后每个名字只构建一份，同名子代理
+    /// 共用一个实例（与主 provider 被所有 turn 共享是同一口径）。
+    model_cache: Arc<StdMutex<HashMap<String, Arc<dyn Provider>>>>,
     /// 待应答的 escalate 问题（Layer 3 实时通道）：question_id → 应答发送端。
     /// journal 是持久事实源；这张表只覆盖「步骤仍在等待」的进程内窗口。
     pending_escalations: Arc<StdMutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>,
 }
 
 impl AgentToolRuntime {
+    #[allow(clippy::too_many_arguments)] // 装配期一次性注入的组件集合
     pub fn new(
         provider: Arc<dyn Provider>,
         memory: MemoryStore,
         layout: Layout,
+        journal: JournalStore,
         opts: AgentOptions,
         registry: RegistryLink,
         channels: rclaw_core::RuntimeChannelInfo,
@@ -183,8 +318,7 @@ impl AgentToolRuntime {
             opts.recent_days,
             search.as_deref(),
         ));
-        let execution_dir = layout.base.join("task_executions");
-        let collaboration = CollaborationState::open(execution_dir);
+        let collaboration = CollaborationState::open(journal.clone());
         let (wake_enabled, wake_debounce) =
             (opts.background_wake_enabled, opts.background_wake_debounce);
         AgentToolRuntime {
@@ -195,14 +329,16 @@ impl AgentToolRuntime {
             next_inference_start: Arc::new(Mutex::new(tokio::time::Instant::now())),
             collaboration,
             memory,
-            layout: layout.clone(),
-            opts,
+            layout,
             background_wake: crate::background_wake::BackgroundWaker::new(
-                &layout.base,
+                journal.clone(),
                 wake_enabled,
                 wake_debounce,
             ),
-            model_factory: std::sync::OnceLock::new(),
+            journal,
+            opts,
+            model_factory: Arc::new(std::sync::OnceLock::new()),
+            model_cache: Arc::new(StdMutex::new(HashMap::new())),
             pending_escalations: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
@@ -240,25 +376,36 @@ impl AgentToolRuntime {
             .remove(question_id);
     }
 
-    /// 注入子代理独立模型解析器（bootstrap 装配期调用一次；重复调用以首次为准）。
+    /// 注入子代理独立模型解析器（bootstrap 装配期调用一次；重复调用以首次为准；
+    /// 对本结构的全部 clone 同时生效）。
     pub fn set_model_factory(&self, factory: ModelFactory) {
         let _ = self.model_factory.set(factory);
     }
 
     /// 按名字解析子代理独立模型；未配置 factory 或名字未命中 → None。
+    /// 命中缓存直接复用；未命中时在锁外调用 factory（可能构建 HTTP 客户端），并发首建
+    /// 以先入缓存者为准。
     pub(crate) fn resolve_model_provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
+        if let Some(provider) = self
+            .model_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(name)
+        {
+            return Some(provider.clone());
+        }
         let factory = self.model_factory.get()?;
-        (factory)(name)
+        let provider = (factory)(name)?;
+        let mut cache = self
+            .model_cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Some(cache.entry(name.to_string()).or_insert(provider).clone())
     }
 
-    /// 工具入参校验用：model 名是否可解析。
+    /// 工具入参校验用：model 名是否可解析（解析结果进缓存，运行期不再重复构建）。
     pub(crate) fn has_model_provider(&self, name: &str) -> bool {
         self.resolve_model_provider(name).is_some()
-    }
-
-    /// checkpoint 存储布局句柄（Layer 5 rewind_files 工具用）。
-    pub(crate) fn layout(&self) -> &rclaw_store::fs::Layout {
-        &self.layout
     }
 
     /// 后台完成唤醒器句柄（二进制装配期 `attach(inbound_tx)` 用）。
@@ -564,8 +711,9 @@ impl AgentToolRuntime {
         self.collaboration
             .publish_background_completion(team_name, result_name, message)
             .await;
-        // M1：入箱即计未读，主循环下个自然迭代可见（不唤醒）。
-        bump_team_inbox_unread(&self.layout.base);
+        // M1：入箱即计未读，主循环下个自然迭代可见；跨 turn 的唤醒由调用方随后经
+        // background_wake 合批投递（本函数只负责邮箱与计数）。
+        bump_team_inbox_unread(&self.journal);
     }
 
     async fn transition_execution(
@@ -586,10 +734,11 @@ impl AgentToolRuntime {
         &self,
         agent_id: String,
         spec: AgentTaskSpec,
+        access: rclaw_core::ToolAccess,
         cancel: CancellationToken,
     ) -> Result<(), String> {
         self.collaboration
-            .insert_queued_execution(agent_id, spec, cancel)
+            .insert_queued_execution(agent_id, spec, access, cancel)
             .await
     }
     async fn run_background_execution(
@@ -730,18 +879,20 @@ impl AgentToolRuntime {
                 .open_risks
                 .push(format!("终态持久化失败：{error}"));
         }
-        self.publish_background_completion(team_name, &result).await;
         // Layer 2a：前台竞速通道仍在等待（自动转后台预算内正常完成）→ 结果直接回传
-        // 父工具调用，不再唤醒（父已亲手拿到结果；额外唤醒只会产生一轮冗余收集）。
+        // 父工具调用，不再入箱、不再唤醒（父已亲手拿到结果；再投一份到 team-lead 邮箱
+        // 就是同一结果的双份交付，unread 也会多计一次）。
         let consumed_by_foreground = match &foreground_result_tx {
             Some(tx) => tx.send(result.clone()).await.is_ok(),
             None => false,
         };
+        if consumed_by_foreground {
+            return;
+        }
+        self.publish_background_completion(team_name, &result).await;
         // Layer 4（ZCode 移植）：合批唤醒发起会话——父 turn 已收尾时驱动收集轮次；
         // 父仍在活动 turn 时该消息按既有语义延后为下一轮。窗口内多完成只投一条。
-        if !consumed_by_foreground {
-            self.background_wake.notify(&wake_route.0, &wake_route.1);
-        }
+        self.background_wake.notify(&wake_route.0, &wake_route.1);
     }
 
     async fn launch_background_task(
@@ -761,7 +912,7 @@ impl AgentToolRuntime {
     ///   `taskAbort` 的 attach→detach 两段语义）——`done` 触发前父取消会终止子任务
     ///   （保持前台「/cancel 连子代理一起停」的既有语义）；`done` 触发即 detach，
     ///   之后父取消不再波及，子任务只受 collaboration cancel（AgentCancel）管控。
-    pub(crate) async fn launch_background_task_impl(
+    pub(in crate::agent_tools) async fn launch_background_task_impl(
         &self,
         mut spec: AgentTaskSpec,
         description: String,
@@ -782,8 +933,16 @@ impl AgentToolRuntime {
         let team_name = resolved_team;
         let prompt = spec.task.clone();
         let cancel = CancellationToken::new();
-        self.insert_queued_execution(agent_id.clone(), spec.clone(), cancel.clone())
-            .await?;
+        // 此处仍在发起方 turn 的 task 里：权限 / 会话键 / bot 身份都在这里抓；权限随快照
+        // 持久化，进程重启后的恢复按它还原沙箱。
+        let inherited = InheritedTurnContext::capture();
+        self.insert_queued_execution(
+            agent_id.clone(),
+            spec.clone(),
+            inherited.access,
+            cancel.clone(),
+        )
+        .await?;
         let identity = match self.register_agent_member(&spec).await {
             Ok(identity) => identity,
             Err(error) => {
@@ -821,7 +980,7 @@ impl AgentToolRuntime {
         }
         let runtime = self.clone();
         let spawned_agent_id = agent_id.clone();
-        tokio::spawn(async move {
+        tokio::spawn(inherited.run(async move {
             let _skill_activity = skill_activity;
             runtime
                 .run_background_execution(
@@ -833,14 +992,14 @@ impl AgentToolRuntime {
                     foreground_result_tx,
                 )
                 .await;
-        });
+        }));
 
         Ok(json!({
             "status": "queued",
             "agentId": agent_id,
             "description": description,
             "prompt": prompt,
-            "eventLog": self.collaboration.execution_log_path(&agent_id),
+            "eventLog": execution_log_ref(&agent_id),
             "next": ["AgentStatus", "AgentWait", "AgentCancel"]
         }))
     }
@@ -879,7 +1038,7 @@ impl AgentToolRuntime {
 
     async fn resume_execution(&self, agent_id: &str) -> Result<Value, String> {
         let skill_activity = begin_skill_activity(&self.layout.skills_dir)?;
-        let spec = self.collaboration.resumable_spec(agent_id).await?;
+        let (spec, access) = self.collaboration.resumable_spec(agent_id).await?;
         let identity = match self.register_agent_member(&spec).await {
             Ok(identity) => identity,
             Err(error) => {
@@ -903,12 +1062,16 @@ impl AgentToolRuntime {
             .and_then(|identity| identity.team_name.clone());
         let runtime = self.clone();
         let agent_id_owned = agent_id.to_string();
-        tokio::spawn(async move {
+        // 恢复者的会话 / 权限与原发起方无关：作用域按快照重建（原发起会话 + 持久化的权限），
+        // 否则沙箱会话发起的任务会以恢复者的 Unrestricted 跑起来（反之亦然），rewind_files /
+        // 会话交接也会指向恢复者的会话。
+        let inherited = InheritedTurnContext::for_recovered(&spec, access);
+        tokio::spawn(inherited.run(async move {
             let _skill_activity = skill_activity;
             runtime
                 .run_background_execution(agent_id_owned, spec, team_name, identity, cancel, None)
                 .await;
-        });
+        }));
         self.execution_payload(agent_id)
             .await
             .ok_or_else(|| format!("unknown agent execution: {agent_id}"))
@@ -1469,7 +1632,9 @@ impl AgentToolRuntime {
                 &outcome,
                 SubagentToolContext {
                     registry: registry.as_ref(),
-                    supports_multimodal: self.provider.supports_multimodal(),
+                    // 多模态能力按本任务实际使用的 provider（spec.model 解析结果）判定，
+                    // 不能看主 provider：否则纯文本子模型会收到图片块、反之则丢附件。
+                    supports_multimodal: provider.supports_multimodal(),
                     source_channel: &spec.source_channel,
                     layout: &self.layout,
                     candidate_patch_only,

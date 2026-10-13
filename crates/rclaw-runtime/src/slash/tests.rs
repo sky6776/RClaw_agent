@@ -269,7 +269,8 @@ fn search_commands_do_not_change_runtime_when_persistence_fails() {
 /// guard 创建即持有进程级互斥锁：cargo test 各用例跑在并行线程上，槽位是
 /// 全局单槽，不串行化会互相踩（与 rclaw-tools 测试的 PREF_LOCK 同一方案）。
 struct PreferredEngineGuard(
-    std::sync::MutexGuard<'static, ()>,
+    // 只为持锁到 drop，不读取。
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
     rclaw_tools::SearchEngine,
 );
 

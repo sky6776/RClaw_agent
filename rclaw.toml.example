@@ -5,7 +5,8 @@
 # RClaw 会在这里派生并维护：
 #   config/SOUL.md、config/USER.md
 #   memory/MEMORY.md、memory/daily/、memory/session_summaries/
-#   sessions/、skills/、cron.json、HEARTBEAT.md
+#   state.sqlite（会话 / 回滚点 / journal）、skills/、cron.json、HEARTBEAT.md
+#   logs/（运行日志）、exports/（/export 产出的 JSONL）
 # 改这个值相当于切换一套独立的记忆、会话、技能和定时任务数据。
 base_dir = "agent"
 
@@ -67,6 +68,9 @@ auto_memory = true
 # 只把建议以 [自进化] 前缀写入 MEMORY.md，不直接改技能。
 auto_evolve = true
 
+# 带工具 review 的显式开关（缺省 = 跟随 auto_evolve；false = 强制 legacy JSON 路径）。
+# auto_review_tooled = true
+
 # Skill Curator 使用 `.usage.json` 遥测做确定性生命周期维护：active -> stale -> archive。
 # 自动维护只会修改/归档 agent-owned Skill；repository/user-owned 与 pinned Skill 不会被碰。
 # 归档位于 skills/.archive，可通过 `/skills restore <name>` 恢复。
@@ -78,6 +82,8 @@ skill_archive_after_days = 90
 
 [llm]
 provider = "zhipu"
+# 覆盖选中 provider 的默认模型（缺省 = 该 provider 条目的 model）。
+# model = "glm-5.3-flash"
 stream = true
 max_tokens = 128000
 request_timeout_secs = 300      # 单次 LLM 请求总超时；深度投研长上下文建议不少于 300 秒

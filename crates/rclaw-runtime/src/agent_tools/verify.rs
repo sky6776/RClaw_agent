@@ -116,6 +116,7 @@ pub(super) async fn verify_candidate_patch(
         }
         messages.push(assistant);
         messages.push(Message {
+            id: 0,
             role: Role::User,
             content: blocks,
             tool_call_id: None,

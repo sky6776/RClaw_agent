@@ -60,6 +60,10 @@ pub(super) struct ExecutionSnapshot {
     /// 即使发布失败也要保留尝试状态，避免父 Agent 随后声称附件已经发送。
     #[serde(default)]
     pub(super) media_publish_attempted: bool,
+    /// 发起方 turn 的文件工具权限是否为 Unrestricted（max 权限会话）。恢复（AgentResume）
+    /// 按它还原沙箱，而不是继承恢复者所在会话的权限；缺省 false = 沙箱（安全方向）。
+    #[serde(default)]
+    pub(super) unrestricted: bool,
     pub(super) created_at: String,
     pub(super) updated_at: String,
     pub(super) recovered: bool,
@@ -154,19 +158,65 @@ pub(super) struct CollaborationState {
     /// 200ms 轮询。唤醒只作用于【自己选择等待中】的工具调用——没有任何机制能让
     /// SendMessage 中断或调度主循环（root 的邮箱只在它自然的轮次边界被读取）。
     mailbox_notifies: Arc<Mutex<MailboxNotifyMap>>,
-    execution_dir: PathBuf,
+    /// `state.sqlite` journal：团队运行态快照流 + 每个子 agent 的执行事件流。
+    journal: JournalStore,
+    /// 测试注入：模拟持久化失败（旧实现靠把事件目录换成文件触发 IO 错误）。
+    #[cfg(test)]
+    fail_persistence: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CollaborationState {
-    pub(super) fn open(execution_dir: PathBuf) -> Self {
-        let teams = recover_team_state(&execution_dir);
-        let executions = recover_execution_records(&execution_dir);
+    pub(super) fn open(journal: JournalStore) -> Self {
+        let teams = recover_team_state(&journal);
+        let executions = recover_execution_records(&journal);
         Self {
             teams: Arc::new(Mutex::new(teams)),
             executions: Arc::new(Mutex::new(executions)),
             mailbox_notifies: Arc::new(Mutex::new(HashMap::new())),
-            execution_dir,
+            journal,
+            #[cfg(test)]
+            fail_persistence: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// 团队状态变更落 journal（先写后提交内存态；写失败则状态不变）。
+    fn persist_team_state(&self, event: &str, state: &TeamRuntimeState) -> Result<(), String> {
+        self.check_persistence_injection()?;
+        append_team_state_log(&self.journal, event, state)
+    }
+
+    /// 执行事件落 journal（同上：持久化成功才提交内存态）。
+    fn persist_execution(&self, entry: &ExecutionLogEntry) -> Result<(), String> {
+        self.check_persistence_injection()?;
+        append_execution_log(&self.journal, entry)
+    }
+
+    #[cfg(test)]
+    fn check_persistence_injection(&self) -> Result<(), String> {
+        if self
+            .fail_persistence
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err("测试注入：事件持久化失败".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn check_persistence_injection(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// 之后所有事件持久化都失败（验证「写失败不提交状态」的测试用）。
+    #[cfg(test)]
+    pub(super) fn fail_persistence_for_test(&self) {
+        self.fail_persistence
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn journal(&self) -> &JournalStore {
+        &self.journal
     }
 
     /// 取（或建）某成员邮箱的 Notify 句柄（等待方先注册 `notified()`，再复查邮箱）。
@@ -194,7 +244,7 @@ impl CollaborationState {
         let mut next = state.clone();
         let (result, changed) = mutate(&mut next)?;
         if changed {
-            append_team_state_log(&self.execution_dir, event, &next)?;
+            self.persist_team_state(event, &next)?;
             *state = next;
         }
         Ok(result)
@@ -327,7 +377,7 @@ impl CollaborationState {
             return;
         }
         // 若 lead 正在自己的工具调用里等待邮箱（TaskList wait），立即送达；
-        // 这不是唤醒主循环——主循环只能被用户 / cron 消息驱动。
+        // 这不是唤醒主循环——跨 turn 的唤醒另由 Layer 4 的 background_wake 合批投递。
         self.wake_mailbox(&team_name_for_wake, "team-lead").await;
     }
 
@@ -725,7 +775,7 @@ impl CollaborationState {
                 timestamp: snapshot.updated_at.clone(),
                 snapshot: snapshot.clone(),
             };
-            append_execution_log(&self.execution_dir, &entry)?;
+            self.persist_execution(&entry)?;
             record.snapshot = snapshot.clone();
             if record.snapshot.state.is_terminal() {
                 record.cancel = None;
@@ -742,6 +792,7 @@ impl CollaborationState {
         &self,
         agent_id: String,
         spec: AgentTaskSpec,
+        access: rclaw_core::ToolAccess,
         cancel: CancellationToken,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
@@ -758,6 +809,7 @@ impl CollaborationState {
             error: None,
             validated_media_markers: Vec::new(),
             media_publish_attempted: false,
+            unrestricted: access == rclaw_core::ToolAccess::Unrestricted,
             created_at: now.clone(),
             updated_at: now.clone(),
             recovered: false,
@@ -767,7 +819,7 @@ impl CollaborationState {
             timestamp: now,
             snapshot: snapshot.clone(),
         };
-        append_execution_log(&self.execution_dir, &entry)?;
+        self.persist_execution(&entry)?;
         self.executions.lock().await.insert(
             agent_id,
             ExecutionRecord {
@@ -798,7 +850,7 @@ impl CollaborationState {
         Some(json!({
             "execution": record.snapshot,
             "events": events,
-            "eventLog": execution_log_path(&self.execution_dir, agent_id),
+            "eventLog": execution_log_ref(agent_id),
             "cancellable": record.cancel.is_some() && !record.snapshot.state.is_terminal(),
             "resumable": record.cancel.is_none() && record.snapshot.state == ExecutionState::Waiting,
         }))
@@ -866,7 +918,7 @@ impl CollaborationState {
                 timestamp: snapshot.updated_at.clone(),
                 snapshot: snapshot.clone(),
             };
-            if let Err(error) = append_execution_log(&self.execution_dir, &entry) {
+            if let Err(error) = self.persist_execution(&entry) {
                 // 持久化异常不能阻止真实取消句柄触发；否则“取消失败”的恰恰是最需要停止的任务。
                 cancel.cancel();
                 return Err(error);
@@ -917,7 +969,11 @@ impl CollaborationState {
             .ok_or_else(|| format!("unknown agent execution: {agent_id}"))
     }
 
-    pub(super) async fn resumable_spec(&self, agent_id: &str) -> Result<AgentTaskSpec, String> {
+    /// 可恢复执行的任务规格与发起方权限（恢复时据此重建子代理的运行作用域）。
+    pub(super) async fn resumable_spec(
+        &self,
+        agent_id: &str,
+    ) -> Result<(AgentTaskSpec, rclaw_core::ToolAccess), String> {
         let executions = self.executions.lock().await;
         let record = executions
             .get(agent_id)
@@ -928,7 +984,12 @@ impl CollaborationState {
                 record.snapshot.state
             ));
         }
-        Ok(record.snapshot.spec.clone())
+        let access = if record.snapshot.unrestricted {
+            rclaw_core::ToolAccess::Unrestricted
+        } else {
+            rclaw_core::ToolAccess::Sandboxed
+        };
+        Ok((record.snapshot.spec.clone(), access))
     }
 
     pub(super) async fn commit_resume(
@@ -961,21 +1022,12 @@ impl CollaborationState {
             timestamp: snapshot.updated_at.clone(),
             snapshot: snapshot.clone(),
         };
-        append_execution_log(&self.execution_dir, &entry)?;
+        self.persist_execution(&entry)?;
         record.snapshot = snapshot;
         record.cancel = Some(cancel.clone());
         record.events.push(entry);
         trim_execution_events(&mut record.events);
         Ok((cancel, Arc::clone(&record.notify)))
-    }
-
-    pub(super) fn execution_log_path(&self, agent_id: &str) -> PathBuf {
-        execution_log_path(&self.execution_dir, agent_id)
-    }
-
-    #[cfg(test)]
-    pub(super) fn storage_dir(&self) -> &Path {
-        &self.execution_dir
     }
 
     #[cfg(test)]
@@ -1106,16 +1158,36 @@ pub(super) fn format_agent_id(name: &str, team_name: &str) -> String {
     )
 }
 
+/// 名字 / id 归一：保留字母数字与 `-` `_`、小写化、空白转 `-`、其余丢弃；纯符号输入回落
+/// 成 "agent"。
+///
+/// 结果是【不动点】：`sanitize(sanitize(x)) == sanitize(x)`。`escalate` / `workflow` 用
+/// `sanitize(id) == id` 校验模型回传的 id 是否原样来自我们生成的 id，不是不动点就会把合法
+/// id 当成伪造拒掉（计划永远无法解锁）。单字符小写映射可能产出多个字符（如 'İ' →
+/// "i\u{307}"，其中组合附加符不是字母数字），因此小写后的每个字符再过一遍同一判据，并
+/// 迭代到稳定为止。
 pub(crate) fn sanitize_agent_name(s: &str) -> String {
-    let mut out = String::new();
-    for ch in s.trim().chars() {
-        if ch.is_alphanumeric() || ch == '-' || ch == '_' {
-            for lower in ch.to_lowercase() {
-                out.push(lower);
+    fn keep(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '-' || ch == '_'
+    }
+    fn once(s: &str) -> String {
+        let mut out = String::new();
+        for ch in s.trim().chars() {
+            if keep(ch) {
+                out.extend(ch.to_lowercase().filter(|lower| keep(*lower)));
+            } else if ch.is_whitespace() {
+                out.push('-');
             }
-        } else if ch.is_whitespace() {
-            out.push('-');
         }
+        out
+    }
+    let mut out = once(s);
+    loop {
+        let again = once(&out);
+        if again == out {
+            break;
+        }
+        out = again;
     }
     if out.is_empty() {
         "agent".to_string()
@@ -1189,73 +1261,70 @@ pub(super) fn next_execution_id(name: &str) -> String {
     )
 }
 
-pub(super) fn execution_log_path(dir: &Path, agent_id: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    agent_id.hash(&mut hasher);
-    dir.join(format!(
-        "{}-{:016x}.jsonl",
-        sanitize_agent_name(agent_id),
-        hasher.finish()
-    ))
+/// 子 agent 执行事件流的人可读定位（工具输出里替代旧的 jsonl 路径）。
+pub(super) fn execution_log_ref(agent_id: &str) -> String {
+    format!("state.sqlite journal {JOURNAL_EXEC_LOG}/{agent_id}")
 }
 
-pub(super) fn append_execution_log(dir: &Path, entry: &ExecutionLogEntry) -> Result<(), String> {
-    fs::create_dir_all(dir)
-        .map_err(|error| format!("创建任务事件目录失败（{}）: {error}", dir.display()))?;
-    let path = execution_log_path(dir, &entry.snapshot.agent_id);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| format!("打开任务事件日志失败（{}）: {error}", path.display()))?;
-    let line =
-        serde_json::to_string(entry).map_err(|error| format!("序列化任务事件失败: {error}"))?;
-    file.write_all(line.as_bytes())
-        .and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.flush())
-        .map_err(|error| format!("写入任务事件日志失败（{}）: {error}", path.display()))
+pub(super) fn append_execution_log(
+    journal: &JournalStore,
+    entry: &ExecutionLogEntry,
+) -> Result<(), String> {
+    let payload =
+        serde_json::to_value(entry).map_err(|error| format!("序列化任务事件失败: {error}"))?;
+    journal
+        .append(JOURNAL_EXEC_LOG, &entry.snapshot.agent_id, &payload)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "写入任务事件日志失败（{}）: {error}",
+                execution_log_ref(&entry.snapshot.agent_id)
+            )
+        })
 }
 
-pub(super) fn team_state_log_path(dir: &Path) -> PathBuf {
-    dir.join("team-state.jsonl")
-}
+/// 团队运行态快照流只有一条 stream。
+const TEAM_STATE_STREAM: &str = "";
 
 pub(super) fn append_team_state_log(
-    dir: &Path,
+    journal: &JournalStore,
     event: &str,
     state: &TeamRuntimeState,
 ) -> Result<(), String> {
-    fs::create_dir_all(dir)
-        .map_err(|error| format!("创建团队事件目录失败（{}）: {error}", dir.display()))?;
-    let path = team_state_log_path(dir);
     let entry = TeamStateLogEntry {
         event: event.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         state: state.clone(),
     };
-    let line =
-        serde_json::to_string(&entry).map_err(|error| format!("序列化团队事件失败: {error}"))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| format!("打开团队事件日志失败（{}）: {error}", path.display()))?;
-    file.write_all(line.as_bytes())
-        .and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.flush())
-        .map_err(|error| format!("写入团队事件日志失败（{}）: {error}", path.display()))
+    let payload =
+        serde_json::to_value(&entry).map_err(|error| format!("序列化团队事件失败: {error}"))?;
+    journal
+        .append(JOURNAL_TEAM_STATE, TEAM_STATE_STREAM, &payload)
+        .map(|_| ())
+        .map_err(|error| format!("写入团队事件日志失败（state.sqlite journal {JOURNAL_TEAM_STATE}）: {error}"))
 }
 
-pub(super) fn recover_team_state(dir: &Path) -> TeamRuntimeState {
-    let path = team_state_log_path(dir);
-    let Ok(file) = fs::File::open(&path) else {
-        return TeamRuntimeState::default();
+/// 读取团队运行态快照流的全部事件（测试 / 诊断用；无法解析的事件跳过）。
+#[cfg(test)]
+pub(super) fn load_team_state_log(journal: &JournalStore) -> Vec<TeamStateLogEntry> {
+    journal
+        .load(JOURNAL_TEAM_STATE, TEAM_STATE_STREAM)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, value)| serde_json::from_value::<TeamStateLogEntry>(value).ok())
+        .collect()
+}
+
+pub(super) fn recover_team_state(journal: &JournalStore) -> TeamRuntimeState {
+    let latest = match journal.latest(JOURNAL_TEAM_STATE, TEAM_STATE_STREAM) {
+        Ok(latest) => latest,
+        Err(error) => {
+            tracing::warn!("读取团队运行态快照失败，按空状态启动: {error}");
+            return TeamRuntimeState::default();
+        }
     };
-    let Some(mut state) = BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str::<TeamStateLogEntry>(&line).ok())
-        .last()
+    let Some(mut state) = latest
+        .and_then(|value| serde_json::from_value::<TeamStateLogEntry>(value).ok())
         .map(|entry| entry.state)
     else {
         return TeamRuntimeState::default();
@@ -1295,35 +1364,41 @@ pub(super) fn recover_team_state(dir: &Path) -> TeamRuntimeState {
         }
     }
     if changed {
-        if let Err(error) = append_team_state_log(dir, "recovered_after_restart", &state) {
+        if let Err(error) = append_team_state_log(journal, "recovered_after_restart", &state) {
             tracing::warn!("{error}");
         }
     }
     state
 }
 
-pub(super) fn recover_execution_records(dir: &Path) -> HashMap<String, ExecutionRecord> {
+pub(super) fn recover_execution_records(
+    journal: &JournalStore,
+) -> HashMap<String, ExecutionRecord> {
     let mut records = HashMap::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return records;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-            continue;
+    let streams = match journal.streams(JOURNAL_EXEC_LOG) {
+        Ok(streams) => streams,
+        Err(error) => {
+            tracing::warn!("枚举子 agent 执行事件流失败，跳过恢复: {error}");
+            return records;
         }
-        let Ok(file) = fs::File::open(&path) else {
-            continue;
-        };
-        let mut events = BufReader::new(file)
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_str::<ExecutionLogEntry>(&line).ok())
+    };
+    for stream in streams {
+        // 登记表只保留每条执行的尾部事件（EXECUTION_EVENT_TAIL），恢复时也只读尾部：
+        // 长寿命安装里执行流越积越多，整条读取会让每次启动按历史总量线性变慢。
+        let mut events = journal
+            .load_tail(JOURNAL_EXEC_LOG, &stream, EXECUTION_EVENT_TAIL)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, value)| serde_json::from_value::<ExecutionLogEntry>(value).ok())
             .collect::<Vec<_>>();
         let Some(last) = events.last().cloned() else {
             continue;
         };
         let mut snapshot = last.snapshot;
+        // 上次重启已恢复成 Waiting、此后无人 AgentResume 的执行原样装载，不再每次重启都
+        // 追加一条 recovered_waiting。
+        let already_recovered =
+            last.event == "recovered_waiting" && snapshot.state == ExecutionState::Waiting;
         if snapshot.state == ExecutionState::Cancelling {
             snapshot.state = ExecutionState::Cancelled;
             snapshot.progress.stage = "进程重启后确认原取消请求已生效".to_string();
@@ -1334,11 +1409,11 @@ pub(super) fn recover_execution_records(dir: &Path) -> HashMap<String, Execution
                 timestamp: snapshot.updated_at.clone(),
                 snapshot: snapshot.clone(),
             };
-            if let Err(error) = append_execution_log(dir, &recovered) {
+            if let Err(error) = append_execution_log(journal, &recovered) {
                 tracing::warn!("{error}");
             }
             events.push(recovered);
-        } else if !snapshot.state.is_terminal() {
+        } else if !snapshot.state.is_terminal() && !already_recovered {
             snapshot.state = ExecutionState::Waiting;
             snapshot.progress.stage =
                 "进程重启后已恢复任务记录；调用 AgentResume 继续执行".to_string();
@@ -1349,7 +1424,7 @@ pub(super) fn recover_execution_records(dir: &Path) -> HashMap<String, Execution
                 timestamp: snapshot.updated_at.clone(),
                 snapshot: snapshot.clone(),
             };
-            if let Err(error) = append_execution_log(dir, &recovered) {
+            if let Err(error) = append_execution_log(journal, &recovered) {
                 tracing::warn!("{error}");
             }
             events.push(recovered);

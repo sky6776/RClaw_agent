@@ -1,8 +1,9 @@
 //! B6 学习洞察：从既有持久化产物聚合桌面「自进化」面板的使用统计。
 //!
-//! 数据源（零新埋点、零索引，按需有界扫描）：
-//! - `agent/sessions/**/*.jsonl`：逐条统计日活跃（user/assistant 消息数）与
-//!   工具调用 Top N（assistant 消息的 ToolUse 块）；跳过 system 通道（心跳）。
+//! 数据源（零新埋点、零索引，按需扫描）：
+//! - `agent/state.sqlite` 的全部会话消息（完整 transcript，含被压缩进摘要的消息）：
+//!   逐条统计日活跃（user/assistant 消息数）与工具调用 Top N（assistant 消息的
+//!   ToolUse 块）；跳过 system 通道（心跳）。
 //! - 技能 lifecycle 元数据：use/view/patch 计数 Top N（SkillUsageStore::records）。
 //! - `skills/.ledger/ledger.jsonl`：最近技能变更时间线（M2 台账）。
 //! - MEMORY.md 占用 / 预算（usage_report）。
@@ -14,6 +15,7 @@ use chrono::{Local, TimeZone};
 use serde::Serialize;
 
 use rclaw_core::{ContentBlock, Message, Role};
+use rclaw_store::session::{SessionStore, SessionSummary};
 use rclaw_store::{MemoryStore, MemoryTarget};
 use rclaw_tools::{SkillLifecycleRecord, SkillUsageStore};
 
@@ -23,10 +25,8 @@ const DAYS: usize = 14;
 const TOP_N: usize = 8;
 /// 最近技能变更条数。
 const RECENT_MUTATIONS: usize = 8;
-/// 单会话文件扫描上限（防异常巨型文件）。
-const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
-/// 单次聚合扫描的文件数上限。
-const MAX_FILES: usize = 200;
+/// 心跳会话所在通道（不是用户会话：不计入会话数，也不参与扫描）。
+const HEARTBEAT_CHANNEL: &str = "system";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DayActivity {
@@ -63,7 +63,7 @@ pub struct LedgerLineDto {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InsightsDto {
-    /// 活跃会话数（sessions/ 根下的 jsonl 文件数，不含归档与心跳）。
+    /// 活跃会话数（未归档，不含心跳）。
     pub total_chats: u64,
     pub archived_chats: u64,
     /// 扫描窗口内统计到的消息数（排除 tool_result 载体与压缩摘要行）。
@@ -80,15 +80,24 @@ pub struct InsightsDto {
 }
 
 /// 聚合全部洞察数据。IO 失败均降级为空值（面板显示为零），不报错阻断。
-pub fn compute(sessions_dir: &Path, skills_dir: &Path, memory: &MemoryStore) -> InsightsDto {
+pub fn compute(session: &SessionStore, skills_dir: &Path, memory: &MemoryStore) -> InsightsDto {
     let mut agg = SessionAgg::default();
-    for (path, archived) in session_files(sessions_dir) {
-        if archived {
+    for summary in session.list_sessions(None).unwrap_or_default() {
+        if is_heartbeat_session(&summary) {
+            continue;
+        }
+        if summary.archived {
             agg.archived_chats += 1;
         } else {
             agg.total_chats += 1;
         }
-        scan_session_file(&path, &mut agg);
+    }
+    if let Err(error) = session.scan_messages(None, |summary, msg| {
+        if !is_heartbeat_session(summary) {
+            scan_message(msg, &mut agg);
+        }
+    }) {
+        tracing::debug!("insights 会话扫描失败（面板按零显示）: {error}");
     }
 
     let days = day_buckets(&agg.day_user, &agg.day_assistant);
@@ -133,84 +142,41 @@ struct SessionAgg {
     day_assistant: BTreeMap<String, u64>,
 }
 
-/// 枚举 sessions 根 + archived/ 的会话文件，返回 (路径, 是否归档)。
-fn session_files(sessions_dir: &Path) -> Vec<(std::path::PathBuf, bool)> {
-    let mut out = Vec::new();
-    for (dir, archived) in [
-        (sessions_dir.to_path_buf(), false),
-        (sessions_dir.join("archived"), true),
-    ] {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            // 心跳（system 通道）不是用户会话：不计入会话数，也不参与扫描。
-            if p.extension().and_then(|x| x.to_str()) == Some("jsonl") && !is_heartbeat_session(&p)
-            {
-                out.push((p, archived));
-            }
-        }
-    }
-    out.truncate(MAX_FILES);
-    out
-}
-
-/// 单文件扫描：角色计数 + 日活跃 + 工具调用计数。心跳（system 通道）在文件层跳过。
-fn scan_session_file(path: &Path, agg: &mut SessionAgg) {
-    if is_heartbeat_session(path) {
+/// 单条消息扫描：角色计数 + 日活跃 + 工具调用计数（tool_result 载体与压缩摘要行不计）。
+fn scan_message(msg: &Message, agg: &mut SessionAgg) {
+    if msg.is_tool_result_carrier() {
         return;
     }
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    if meta.len() > MAX_FILE_BYTES {
+    let text: String = msg
+        .content
+        .iter()
+        .filter_map(|b| b.as_text())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.trim().starts_with("[CONTEXT COMPACTION") {
         return;
     }
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return;
-    };
-    for line in raw.lines() {
-        let Ok(msg) = serde_json::from_str::<Message>(line) else {
-            continue;
-        };
-        if msg.is_tool_result_carrier() {
-            continue;
+    match msg.role {
+        Role::User => {
+            bump_day(&mut agg.day_user, msg.ts);
+            agg.total_messages += 1;
         }
-        let text: String = msg
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if text.trim().starts_with("[CONTEXT COMPACTION") {
-            continue;
-        }
-        match msg.role {
-            Role::User => {
-                bump_day(&mut agg.day_user, msg.ts);
-                agg.total_messages += 1;
-            }
-            Role::Assistant => {
-                bump_day(&mut agg.day_assistant, msg.ts);
-                agg.total_messages += 1;
-                for block in &msg.content {
-                    if let ContentBlock::ToolUse { name, .. } = block {
-                        *agg.tool_counts.entry(name.clone()).or_default() += 1;
-                    }
+        Role::Assistant => {
+            bump_day(&mut agg.day_assistant, msg.ts);
+            agg.total_messages += 1;
+            for block in &msg.content {
+                if let ContentBlock::ToolUse { name, .. } = block {
+                    *agg.tool_counts.entry(name.clone()).or_default() += 1;
                 }
             }
-            _ => {}
         }
+        _ => {}
     }
 }
 
-/// 心跳会话文件：`<enc("system")>_heartbeat.jsonl`。
-fn is_heartbeat_session(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.starts_with("system_"))
-        .unwrap_or(false)
+/// 心跳会话：`system` 通道。
+fn is_heartbeat_session(summary: &SessionSummary) -> bool {
+    summary.channel == HEARTBEAT_CHANNEL
 }
 
 fn bump_day(map: &mut BTreeMap<String, u64>, ts: i64) {
@@ -333,6 +299,7 @@ mod tests {
 
     fn msg_assistant_tool(ts: i64) -> Message {
         Message {
+            id: 0,
             role: Role::Assistant,
             content: vec![
                 ContentBlock::Text {
@@ -353,12 +320,11 @@ mod tests {
     fn compute_aggregates_sessions_skills_and_ledger() {
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join("agent");
-        let sessions = agent.join("sessions");
         let skills = agent.join("skills");
-        std::fs::create_dir_all(&sessions).unwrap();
         std::fs::create_dir_all(&skills).unwrap();
+        let session = SessionStore::new(rclaw_store::Layout::new(&agent));
 
-        // 主会话：user×2 + assistant 工具轮；心跳文件应被跳过；归档 1 条。
+        // 主会话：user×2 + assistant 工具轮；心跳会话应被跳过；归档 1 条。
         let today = Local::now().format("%Y-%m-%d").to_string();
         let ts = Local
             .with_ymd_and_hms(
@@ -372,33 +338,20 @@ mod tests {
             .single()
             .unwrap()
             .timestamp();
-        let mut body = String::new();
         for m in [
             msg_user("hello world", ts),
             msg_user("[CONTEXT COMPACTION — REFERENCE ONLY] summary", ts),
             msg_assistant_tool(ts),
         ] {
-            body.push_str(&serde_json::to_string(&m).unwrap());
-            body.push('\n');
+            session.append("desktop", "main", &m).unwrap();
         }
-        std::fs::write(sessions.join("desktop_main.jsonl"), body).unwrap();
-        std::fs::write(
-            sessions.join("system_heartbeat.jsonl"),
-            format!(
-                "{}\n",
-                serde_json::to_string(&msg_user("heartbeat", ts)).unwrap()
-            ),
-        )
-        .unwrap();
-        std::fs::create_dir_all(sessions.join("archived")).unwrap();
-        std::fs::write(
-            sessions.join("archived").join("desktop_old.jsonl"),
-            format!(
-                "{}\n",
-                serde_json::to_string(&msg_user("old chat", ts)).unwrap()
-            ),
-        )
-        .unwrap();
+        session
+            .append("system", "heartbeat", &msg_user("heartbeat", ts))
+            .unwrap();
+        session
+            .append("desktop", "old", &msg_user("old chat", ts))
+            .unwrap();
+        assert!(session.set_archived("desktop", "old", true).unwrap());
 
         // 技能 lifecycle + 台账。
         let usage = SkillUsageStore::new(skills.clone());
@@ -421,7 +374,7 @@ mod tests {
         .unwrap();
 
         let memory = MemoryStore::new(rclaw_store::Layout::new(&agent));
-        let out = compute(&sessions, &skills, &memory);
+        let out = compute(&session, &skills, &memory);
 
         // 心跳不计、归档单独计、压缩摘要行不计数。
         assert_eq!(out.total_chats, 1);

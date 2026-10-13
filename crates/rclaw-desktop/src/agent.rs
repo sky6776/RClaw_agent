@@ -158,6 +158,11 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
         core.bots.clone(),
     ));
     let _ = core.bot_router_slot.set(bot_router.clone());
+    // 后台完成通知的批量唤醒（ZCode 移植 · Layer 4）：inbound 总线就绪后接线，
+    // 与 CLI main.rs 同一装配点；不接线则桌面端父 turn 结束后无人驱动收集轮次。
+    core.agent_runtime
+        .background_wake()
+        .attach(inbound_tx.clone());
 
     // 会话存储克隆一份给状态层（多会话列表 / 历史 / 归档），本体进 agent loop。
     let session_for_state = core.session.clone();
@@ -184,6 +189,8 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
         core.bots.clone(),
         Some(bot_router.clone()),
     );
+    // 删会话时清运行期状态用的句柄：必须在 agent 被 move 进任务前取走。
+    let session_lifecycle = agent.session_lifecycle();
     tauri::async_runtime::spawn(agent.run());
 
     // cron + heartbeat 后台服务（与 CLI 相同语义）。
@@ -213,6 +220,7 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
         inbound_tx,
         cron: core.cron,
         session: session_for_state,
+        session_lifecycle,
         agent_runtime: core.agent_runtime,
         tools: tools_for_state,
         layout: layout_for_state,
@@ -259,10 +267,10 @@ async fn outbound_bridge(app: tauri::AppHandle, mut rx: mpsc::Receiver<BusMessag
 
 /// 注册工具工作区外路径确认钩子：默认权限下 shell / 文件工具碰到 agent 工作区
 /// 之外的路径时，经 [`permissions::ask`] 弹窗询问用户；允许才放行（每次授权按
-/// 精确路径缓存在工具层）。完全访问模式的消息直接带 `Unrestricted`，不经过此钩子。
+/// （操作, 物理落点）缓存在工具层）。完全访问模式的消息直接带 `Unrestricted`，不经过此钩子。
 fn install_permission_hook(app: tauri::AppHandle) {
-    let hook: rclaw_tools::access::PathConfirmHook = Arc::new(move |path| {
-        Box::pin(crate::permissions::ask(app.clone(), path))
+    let hook: rclaw_tools::access::PathConfirmHook = Arc::new(move |request| {
+        Box::pin(crate::permissions::ask(app.clone(), request))
     });
     if !rclaw_tools::access::set_path_confirm_hook(hook) {
         tracing::debug!("工具权限确认钩子已注册过，跳过");
@@ -294,7 +302,8 @@ pub async fn send(app: &tauri::AppHandle, chat_id: String, content: String) -> R
 }
 
 /// 会话 id 白名单：字母 / 数字 / `-` / `_`，1..=64 字符。
-/// chat_id 会进入 percent-encoded 会话文件名，收紧字符集避免路径注入。
+/// chat_id 会进入 `/export` 的 percent-encoded 导出文件名，也是 state.sqlite 的会话键，
+/// 收紧字符集避免路径注入与键歧义。
 pub fn is_valid_chat_id(chat_id: &str) -> bool {
     !chat_id.is_empty()
         && chat_id.len() <= 64
@@ -359,7 +368,7 @@ pub fn read_chat_titles(home: &std::path::Path) -> std::collections::BTreeMap<St
 }
 
 /// 写入 / 清除自定义会话名（标题去空白后为空 = 删除该键，恢复自动派生标题；
-/// 读-改-写保留偏好文件中的其它键）。归档 / 恢复只移动 .jsonl、chat_id 不变，
+/// 读-改-写保留偏好文件中的其它键）。归档 / 恢复只改会话标记、chat_id 不变，
 /// 自定义标题天然跟随会话。
 pub fn write_chat_title(home: &std::path::Path, chat_id: &str, title: &str) -> Result<(), String> {
     let title = title.trim();
@@ -584,6 +593,7 @@ fn clone_running_agent(running: &RunningAgent) -> RunningAgent {
         inbound_tx: running.inbound_tx.clone(),
         cron: running.cron.clone(),
         session: running.session.clone(),
+        session_lifecycle: running.session_lifecycle.clone(),
         agent_runtime: running.agent_runtime.clone(),
         tools: running.tools.clone(),
         layout: running.layout.clone(),
@@ -745,6 +755,10 @@ pub(crate) async fn assemble_apk_agent(
         core.bots.clone(),
     ));
     let _ = core.bot_router_slot.set(bot_router.clone());
+    // 后台完成通知的批量唤醒（Layer 4）：Android 路径同样接线。
+    core.agent_runtime
+        .background_wake()
+        .attach(inbound_tx.clone());
 
     let session_for_state = core.session.clone();
     let tools_for_state = core.tools.clone();
@@ -768,6 +782,7 @@ pub(crate) async fn assemble_apk_agent(
         core.bots.clone(),
         Some(bot_router.clone()),
     );
+    let session_lifecycle = agent.session_lifecycle();
     tokio::spawn(agent.run());
     tokio::spawn(
         CronService::new(
@@ -823,6 +838,7 @@ pub(crate) async fn assemble_apk_agent(
             inbound_tx,
             cron: core.cron,
             session: session_for_state,
+            session_lifecycle,
             agent_runtime: core.agent_runtime,
             tools: tools_for_state,
             layout: layout_for_state,

@@ -30,6 +30,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 rquickjs = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }     # rewind checkpoint 的文件内容 hash（持久化身份需跨 Rust 版本稳定）
 
 [dev-dependencies]
 tempfile = "3"

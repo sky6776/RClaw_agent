@@ -153,6 +153,11 @@ html.android-app textarea {
 .md-body p {
   margin: 0.35em 0;
 }
+/* 内联 Markdown 图片：消息列去掉 overflow-hidden 后不再被裁切，必须自身限宽。 */
+.md-body img {
+  max-width: 100%;
+  height: auto;
+}
 .md-body pre {
   background: #161a22;
   border: 1px solid #2a2f3a;

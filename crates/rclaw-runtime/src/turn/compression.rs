@@ -11,21 +11,87 @@ pub(super) struct AutoReviewOutput {
 }
 
 pub(super) enum HistoryLoad {
-    Messages(Vec<Message>),
+    Messages(LoadedHistory),
     Cancelled,
+}
+
+/// 一次加载得到的内存历史视图 + 它相对 store 活动视图的来源信息。
+///
+/// 轮内压缩（`in_turn`）要在这份视图上再切头区、落 compaction boundary：它必须知道视图
+/// 是不是 store 活动视图的【完整】形态——被 `max_history` / `max_history_bytes` 裁掉前缀
+/// 的后缀视图里，`[..protect_first]` 不是会话真正的开头，不能再当受保护头部锚进 boundary。
+pub(super) struct LoadedHistory {
+    pub(super) messages: Vec<Message>,
+    pub(super) provenance: ViewProvenance,
+}
+
+impl LoadedHistory {
+    /// 来源无法判断（store 侧按条数 / 字节裁剪的常规加载）：按不完整视图处理。
+    pub(super) fn unverified(messages: Vec<Message>) -> Self {
+        Self {
+            messages,
+            provenance: ViewProvenance {
+                complete: false,
+                trimmed_summary: None,
+            },
+        }
+    }
+}
+
+/// 内存视图相对 store 活动视图的来源（load 期一次性确定，整个 turn 不变）。
+pub(super) struct ViewProvenance {
+    /// 视图完整（= store 活动视图归一后的全部消息，或加载期压缩刚产出的压缩视图）。
+    /// `false` = 前缀被裁掉过（或来源无法判断，如 store 侧裁剪的常规加载），轮内压缩
+    /// 不保护头部（`protect_first = 0`）。
+    pub(super) complete: bool,
+    /// 被裁掉的前缀里上一 boundary 的摘要正文：视图不完整且旧摘要随前缀一起被裁掉时，
+    /// 轮内压缩拿它做 previous_summary 增量更新，而不是让旧摘要随新 boundary 一起消失。
+    pub(super) trimmed_summary: Option<String>,
+}
+
+impl ViewProvenance {
+    /// 完整视图（无裁剪）。
+    pub(super) const COMPLETE: ViewProvenance = ViewProvenance {
+        complete: true,
+        trimmed_summary: None,
+    };
+}
+
+/// 压缩防抖的「历史水位」：视图里最大的已持久化 `Message::id`（没有则 0）。
+///
+/// 「连续低效压缩」防抖要比较「登记时的历史」与「现在的历史」是否增长。按消息条数比会
+/// 因口径不同失真：加载期拿的是完整活动视图的条数，轮内拿的是裁剪后视图 + 本轮消息的
+/// 条数，裁剪过的会话里后者长期小于前者，轮内压缩会被无故压住。消息 id 单调递增、与
+/// 视图裁剪无关，两条路径比的是同一把尺子。
+pub(super) fn history_watermark(messages: &[Message]) -> i64 {
+    messages.iter().map(|m| m.id).max().unwrap_or(0)
 }
 
 pub(super) enum SummaryLoad {
     /// 摘要就绪。`used_fallback=true` 表示是确定性 fallback 而非 LLM 输出
     /// （调用方据此设置失败 cooldown）。
-    Completed {
-        summary: String,
-        compressed: Vec<Message>,
-        used_fallback: bool,
-    },
+    Completed(CompletedCompaction),
     IneffectivePlan,
     Failed,
     Cancelled,
+}
+
+/// 一次成功的压缩：内存视图 + 持久化所需的 compaction boundary 描述。
+///
+/// 持久化是**非破坏性**的（参考 ZCode）：不重写历史，只向 `state.sqlite` 追加一条
+/// boundary 行（`summary_message` + `head_until` / `tail_from` 锚点），store 加载时按
+/// 锚点拼出同一个视图。`compressed` 是 provider 可见形态（摘要可能已 merge 进尾窗首条
+/// user 消息），`summary_message` 永远是独立形态（落库用）。
+pub(super) struct CompletedCompaction {
+    pub(super) summary: String,
+    pub(super) compressed: Vec<Message>,
+    pub(super) used_fallback: bool,
+    /// 独立形态的摘要消息（`role=user`，正文 = 摘要块）。
+    pub(super) summary_message: Message,
+    /// 受保护头部最后一条消息的 id（无受保护头部 = None）。
+    pub(super) head_until: Option<i64>,
+    /// 尾窗第一条保留消息的 id；`0` = 该消息尚未持久化，boundary 无法落库（只压内存）。
+    pub(super) tail_from: i64,
 }
 
 pub(super) struct CompressionPlan {
@@ -33,6 +99,72 @@ pub(super) struct CompressionPlan {
     pub(super) to_summarize: Vec<Message>,
     pub(super) compressed: Vec<Message>,
     pub(super) previous_summary: Option<String>,
+}
+
+impl CompressionPlan {
+    /// compaction boundary 锚点：`(head_until, tail_from)`。
+    ///
+    /// `compressed` = `head[..protected_head] ++ [占位符] ++ tail`，尾窗首条是
+    /// `compressed[protected_head + 1]`。`head_until` 取受保护头部里【最后一个已持久化 id】：
+    /// 头部末尾可能是 `repair_tool_chains` 现补的中止占位符（`id == 0`，库里没有这一行），
+    /// 只看最后一条会把 `head_until` 算成 None——boundary 落库后库视图整段丢掉头部，而内存
+    /// 视图与摘要都还按「头部受保护」处理。锚在最后一个真实 id 上即可：占位符在加载时会被
+    /// 重新补出来。头部非空却一个持久化 id 都没有时返回 `tail_from = 0`（按「锚点缺 id」
+    /// 只压内存），不落一条会丢头部的 boundary。
+    /// 调用方须在 `apply_summary_to_compressed_history`（可能移除占位符）之前取值。
+    pub(super) fn boundary_anchor_ids(&self) -> (Option<i64>, i64) {
+        let head = &self.compressed[..self.protected_head.min(self.compressed.len())];
+        let head_until = head.iter().rev().map(|m| m.id).find(|id| *id > 0);
+        if !head.is_empty() && head_until.is_none() {
+            return (None, 0);
+        }
+        let tail_from = self
+            .compressed
+            .get(self.protected_head + 1)
+            .map(|m| m.id)
+            .unwrap_or(0);
+        (head_until, tail_from)
+    }
+}
+
+/// 把 store 返回的活动视图归一成 provider 可见形态：独立 boundary 摘要若紧跟一条 user
+/// 消息，则 fold 进该消息（避免 user/user 连续，与 [`apply_summary_to_compressed_history`]
+/// 同一规则）。只影响内存视图，不落盘；幂等。
+pub(crate) fn fold_compaction_view(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut iter = messages.into_iter().peekable();
+    while let Some(message) = iter.next() {
+        let is_standalone_summary = message.role == Role::User
+            && !is_context_summary_placeholder(&message)
+            && message
+                .content
+                .iter()
+                .filter_map(ContentBlock::as_text)
+                .next()
+                .is_some_and(|t| t.trim_start().starts_with(CONTEXT_SUMMARY_PREFIX));
+        // merge 目标必须是普通 user 消息：不是 tool_result 载体，自身也不是（独立或 merge
+        // 形态的）摘要——否则两份摘要叠进一条消息，`context_summary_body` 只能识别其一。
+        let next_is_plain_user = iter.peek().is_some_and(|next| {
+            next.role == Role::User
+                && !next.is_tool_result_carrier()
+                && context_summary_body(next).is_none()
+        });
+        if is_standalone_summary && next_is_plain_user {
+            let block = message
+                .content
+                .iter()
+                .filter_map(ContentBlock::as_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(mut next) = iter.next() {
+                merge_summary_into_first_tail(&mut next, &block);
+                out.push(next);
+            }
+            continue;
+        }
+        out.push(message);
+    }
+    out
 }
 
 pub(super) const CONTEXT_SUMMARY_PREFIX: &str = "[CONTEXT COMPACTION — REFERENCE ONLY]";
@@ -854,9 +986,21 @@ pub(super) fn assemble_compressed_history(
             previous_summary: None,
         };
     }
-    let has_previous_summary = find_latest_context_summary(history, 0, history.len()).is_some();
+    let latest_summary = find_latest_context_summary(history, 0, history.len());
+    let has_previous_summary = latest_summary.is_some();
     let head_end = protected_head_end(history, policy.protect_first, has_previous_summary);
-    let tail_start = compute_tail_start_after_head(history, policy, head_end);
+    let mut tail_start = compute_tail_start_after_head(history, policy, head_end);
+    // 上一轮摘要的载体必须落进被摘要区、不能留在尾窗：否则新 boundary 的摘要与尾窗里的旧
+    // 摘要同时进入 prompt，下次加载还会把尾窗里那条（下标更大）误判成「最新摘要」。
+    // 载体之后的首条非 tool_result 消息即新尾窗起点；越界则本次无可压缩窗口。
+    if let Some((summary_idx, _)) = &latest_summary {
+        if tail_start <= *summary_idx {
+            tail_start = summary_idx + 1;
+            while tail_start < history.len() && history[tail_start].is_tool_result_carrier() {
+                tail_start += 1;
+            }
+        }
+    }
     if tail_start <= head_end || tail_start >= history.len() {
         return CompressionPlan {
             protected_head: head_end,
@@ -866,11 +1010,24 @@ pub(super) fn assemble_compressed_history(
         };
     }
 
-    let (summary_start, previous_summary) = find_latest_context_summary(history, 0, tail_start)
-        .map(|(idx, body)| (idx + 1, Some(body)))
-        .unwrap_or((head_end, None));
-    let summary_start = summary_start.max(head_end);
-    let to_summarize = history[summary_start..tail_start].to_vec();
+    // 被摘要区 = `[head_end, tail_start)` 去掉上一轮摘要本体：摘要正文另以 previous_summary
+    // 交给 summarizer 做增量更新；载体若是 merge 形态，其中的【原 user 正文】还原成一条
+    // 普通 user 消息留在被摘要区（它是真实对话内容，不能随摘要块一起被剥掉）。上一轮
+    // 受保护头部（位于载体之前，这一轮 head_end = 0）同样进入被摘要区——它们不再出现在
+    // 压缩视图里，不摘要就等于永久丢失。
+    let mut to_summarize = Vec::with_capacity(tail_start - head_end);
+    let mut previous_summary = None;
+    match &latest_summary {
+        Some((summary_idx, body)) => {
+            to_summarize.extend(history[head_end..*summary_idx].iter().cloned());
+            if let Some(origin) = merged_origin_user_message(&history[*summary_idx]) {
+                to_summarize.push(origin);
+            }
+            to_summarize.extend(history[summary_idx + 1..tail_start].iter().cloned());
+            previous_summary = Some(body.clone());
+        }
+        None => to_summarize.extend(history[head_end..tail_start].iter().cloned()),
+    }
     let mut compressed = Vec::with_capacity(head_end + history.len() - tail_start + 1);
     compressed.extend(history[..head_end].iter().cloned());
     compressed.push(context_summary_placeholder_message());
@@ -890,6 +1047,26 @@ pub(super) struct TailPolicy {
     pub(super) keep_recent: usize,
     pub(super) token_budget: usize,
     pub(super) min_floor: usize,
+}
+
+/// 「历史太短、不可能有可摘要窗口」的廉价前置判断（load 期 / 轮内 / `/compact` 共用）。
+///
+/// 尾窗只按条数保留时（无 token 预算），不多于 `keep_recent + 2` 条就当作切不出有意义的
+/// 被摘要区（`protect_first = 0` 时理论上还能切出 1–2 条，压它们毫无价值）；但尾窗带
+/// token 预算时 [`compute_tail_start_after_head`] 会把尾窗一路收到 `min_floor` 条（锚点另算），
+/// 几十条巨型工具输出就能撑爆窗口、确实需要压——按 `keep_recent`（默认 80）一刀切会让
+/// 这类会话在 reactive / `/compact` 上都「没有可压缩的窗口」，只能 `/clear`。预算生效时
+/// 下限改为「受保护头部 + 最小尾窗」（视图已有旧摘要时受保护头部实为 0，这里仍按
+/// `protect_first` 算，比 `assemble` 略保守）。真正的可行性仍由
+/// [`assemble_compressed_history`] 决定（无窗口 → `SummaryLoad::IneffectivePlan`，不花 LLM
+/// 调用），这里只挡掉明显不可能的情况。
+pub(super) fn history_too_short_to_compress(len: usize, policy: &TailPolicy) -> bool {
+    let min_len = if policy.token_budget > 0 {
+        policy.protect_first + policy.min_floor.max(1)
+    } else {
+        policy.keep_recent + 2
+    };
+    len <= min_len
 }
 
 pub(super) fn protected_head_end(
@@ -918,6 +1095,9 @@ pub(super) fn protected_head_end(
 ///   summary）——前者保住「当前活跃任务」，
 ///   后者保住「上一条可见回复」不被悄悄卷进摘要。
 ///   锚点只把 `start` 向回拉（tail 只增不减）。
+///   user 锚点受预算约束：从它起的尾段估算已超过 soft ceiling 时不回拉——否则「1 条 user
+///   加上百次工具迭代」的上一轮会被整轮钉在尾窗，剩下可摘要的只有一两条，轮内 / reactive
+///   压缩每次都是无效计划、自愈链路卡死；此时用户原文由摘要模板的 `## Active Task` 兜底。
 /// - 全程角色对齐：`tail_start` 不得落在 `tool_result` 载体上，避免留下孤儿 tool_result。
 ///
 /// 预算按模型 context 窗口派生；RClaw CLI 会在
@@ -939,11 +1119,11 @@ pub(super) fn compute_tail_start_after_head(
     while start < n && history[start].is_tool_result_carrier() {
         start += 1;
     }
+    // soft ceiling：允许超预算至 1.5× 再停止丢弃，避免为压到预算而丢掉近期整条消息
+    // 避免切在超大 tool result/图片边界后还继续硬丢。
+    let soft_ceiling = policy.token_budget + policy.token_budget / 2;
     if policy.token_budget > 0 && n > min_tail && head_end < n {
         let min_start = n.saturating_sub(min_tail).max(head_end);
-        // soft ceiling：允许超预算至 1.5× 再停止丢弃，避免为压到预算而丢掉近期整条消息
-        // 避免切在超大 tool result/图片边界后还继续硬丢。
-        let soft_ceiling = policy.token_budget + policy.token_budget / 2;
         while start < min_start {
             let tail_tokens = history[start..]
                 .iter()
@@ -959,8 +1139,16 @@ pub(super) fn compute_tail_start_after_head(
         }
     }
     // 显式锚点：最新真实 user 与最新 assistant 必须留在 tail。
+    // user 锚点受预算约束：回拉后的尾段若已超过 soft ceiling（上一轮是「1 条 user + 上百次
+    // 工具迭代」），回拉只会把整轮钉在尾窗、让计划退化成压一两条的无效计划（轮内 / reactive
+    // 自愈链路由此卡死）——这种情况不回拉，用户原文由摘要模板的 Active Task 段兜底。
     if let Some(lu) = last_real_user_index(history) {
-        start = start.min(lu);
+        let anchored_tail_fits = policy.token_budget == 0
+            || lu >= start
+            || history[lu..].iter().map(estimate_message_tokens).sum::<usize>() <= soft_ceiling;
+        if anchored_tail_fits {
+            start = start.min(lu);
+        }
     }
     if let Some(la) = last_assistant_index(history) {
         start = start.min(la);
@@ -1009,15 +1197,15 @@ pub(super) fn last_assistant_index(history: &[Message]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-pub(super) fn apply_summary_to_compressed_history(
-    mut compressed: Vec<Message>,
-    summary: &str,
-) -> Vec<Message> {
-    if compressed.is_empty() {
-        return compressed;
-    }
+/// 独立形态的摘要消息（`role=user`，正文 = [`context_summary_block`]）：落库的 boundary 行。
+pub(super) fn context_summary_message(summary: &str) -> Message {
+    Message::plain(Role::User, context_summary_block(summary))
+}
+
+/// 摘要块全文：PREFIX 说明 + HEADING + 正文 + END marker。
+pub(super) fn context_summary_block(summary: &str) -> String {
     let body = summary.trim();
-    let summary_block = format!(
+    format!(
         "{CONTEXT_SUMMARY_PREFIX}\n\
          Earlier turns in this session were compacted into the summary below. \
          This is a handoff from a previous context window — treat it as background \
@@ -1033,7 +1221,17 @@ pub(super) fn apply_summary_to_compressed_history(
          Your persistent memory (MEMORY.md, USER.md) is ALWAYS authoritative — \
          never deprioritize it due to this note.\n\n\
          {CONTEXT_SUMMARY_HEADING}\n\n{body}\n\n{CONTEXT_SUMMARY_END}"
-    );
+    )
+}
+
+pub(super) fn apply_summary_to_compressed_history(
+    mut compressed: Vec<Message>,
+    summary: &str,
+) -> Vec<Message> {
+    if compressed.is_empty() {
+        return compressed;
+    }
+    let summary_block = context_summary_block(summary);
     let Some(summary_idx) = compressed.iter().position(is_context_summary_placeholder) else {
         return compressed;
     };
@@ -1054,7 +1252,10 @@ pub(super) fn apply_summary_to_compressed_history(
             merge_summary_into_first_tail(first, &summary_block);
         }
     } else {
+        // 保留占位符可能携带的 id（已落库 boundary 的 id 由调用方回填）。
+        let id = compressed[summary_idx].id;
         compressed[summary_idx] = Message::plain(Role::User, summary_block);
+        compressed[summary_idx].id = id;
     }
     compressed
 }
@@ -1108,16 +1309,273 @@ pub(super) fn merge_summary_into_first_tail(msg: &mut Message, summary_block: &s
     msg.content = new_content;
 }
 
+/// [`merge_summary_into_first_tail`] 的逆操作：从 merge 形态的摘要载体里还原【原 user 消息】
+/// （去掉 header 文本块与 delimiter 之后的摘要块，其余块按原顺序保留，含多模态块）。
+///
+/// 独立形态摘要（没有 delimiter）或还原后没有任何内容时返回 `None`。还原消息保留载体
+/// 的 `id` / `ts`，只用于喂给 summarizer，不回写视图。
+pub(super) fn merged_origin_user_message(carrier: &Message) -> Option<Message> {
+    let is_merged = carrier
+        .content
+        .iter()
+        .filter_map(ContentBlock::as_text)
+        .any(|t| t.contains(MERGED_SUMMARY_DELIMITER));
+    if !is_merged {
+        return None;
+    }
+    let mut content = Vec::with_capacity(carrier.content.len());
+    for block in &carrier.content {
+        match block.as_text() {
+            Some(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() || trimmed.starts_with(MERGED_PRIOR_CONTEXT_HEADER) {
+                    continue;
+                }
+                // delimiter 之后是摘要块：整段剥掉，只留它之前的原文（通常 delimiter 独占一块）。
+                let kept = match text.split_once(MERGED_SUMMARY_DELIMITER) {
+                    Some((before, _)) => before.trim(),
+                    None => trimmed,
+                };
+                if !kept.is_empty() {
+                    content.push(ContentBlock::text(kept.to_string()));
+                }
+            }
+            None => content.push(block.clone()),
+        }
+    }
+    if content.is_empty() {
+        return None;
+    }
+    Some(Message {
+        id: carrier.id,
+        role: Role::User,
+        content,
+        tool_call_id: None,
+        ts: carrier.ts,
+    })
+}
+
+/// 摘要 prompt 里 transcript 的字符预算（`render_transcript` 超出即省略中段、保留开头与结尾）。
+pub(super) const SUMMARY_TRANSCRIPT_MAX_CHARS: usize = 48_000;
+
+/// 摘要素材里最后一条真实 user 消息单独逐字交给摘要器时的字符上限：transcript 里单块正文
+/// 只有 [`TRANSCRIPT_TEXT_MAX_CHARS`]，粘贴的规格说明这类长任务原文在那里必然被截，而
+/// `## Active Task` 要求逐字保留（见 [`latest_user_input_verbatim`]）。
+pub(super) const ACTIVE_TASK_VERBATIM_MAX_CHARS: usize = 8_000;
+
+/// `HistoryLoader::summarize` 的视图外补充素材。
+#[derive(Default)]
+pub(super) struct SummaryExtras<'a> {
+    /// 被压缩的视图里找不到上一轮摘要时的增量更新底本——轮内压缩的视图可能被裁掉了带
+    /// 旧摘要的前缀（见 [`ViewProvenance::trimmed_summary`]）；视图里有摘要时以视图为准。
+    pub(super) fallback_previous_summary: Option<&'a str>,
+    /// 视图之前被 load 期裁掉的活动消息（裁剪后缀视图上的轮内压缩，见
+    /// `in_turn::load_trimmed_prefix`）。只是摘要素材：压缩计划（尾窗 / 锚点 / boundary）
+    /// 只在视图上算——否则尾窗锚点会把 `tail_start` 拉进前缀、让被裁掉的消息复活进压缩
+    /// 视图；前缀并入被摘要区最前面，按 transcript 预算从前缀【前端】让位
+    /// （[`merge_prefix_into_summary_material`]）。完整视图留空。
+    pub(super) trimmed_prefix: &'a [Message],
+    /// `trimmed_prefix` 开头属于上一 boundary 受保护头部的条数：这几条从未被摘要过，本次
+    /// boundary 落库后也不再在活动视图里，并入素材时优先于其余前缀占预算。
+    pub(super) trimmed_prefix_opening: usize,
+}
+
+/// [`merge_prefix_into_summary_material`] 的结果。
+pub(super) struct MergedSummaryMaterial {
+    /// 摘要素材：保留下来的前缀（时间序在前）++ 被摘要区。
+    pub(super) material: Vec<Message>,
+    /// 剥掉摘要载体后参与分配的前缀条数（`omitted_prefix` 的分母）。
+    pub(super) prefix_total: usize,
+    /// 前缀里因预算从【前端】让掉的条数（最早的先让）。
+    pub(super) omitted_prefix: usize,
+    /// 被摘要区自身已超出预算：transcript 会省略它的中段（开头与最新的结尾保留）。前缀为空
+    /// 时同样判定（load 期 / `/compact` / 完整视图上的轮内压缩都走这条路，超预算必须可见）。
+    pub(super) head_overflows: bool,
+}
+
+/// 前缀让位后替代被让掉那段的提示（System 角色：transcript 里是一条说明，确定性
+/// fallback 不会把它当成用户请求收集）。
+///
+/// 被让掉的消息没有任何摘要覆盖过——上一 boundary 的摘要只覆盖它自己的
+/// `head_until..tail_from` 中段，而前缀里能出现的只有它的受保护头部、尾窗与之后的消息
+/// （或根本没有过 boundary）——所以提示只说明省略，不声称「要点见上一份摘要」。
+fn prefix_omission_note(omitted_prefix: usize) -> Message {
+    Message::plain(
+        Role::System,
+        format!(
+            "[此处省略更早的 {omitted_prefix} 条历史消息（摘要预算所限；这些消息未被任何摘要覆盖）]"
+        ),
+    )
+}
+
+/// 把裁剪后缀视图上被裁掉的前缀并入摘要素材，并按 transcript 字符预算分配：
+///
+/// transcript 超预算时省略中段（`render_transcript`），而素材按时间序排列——前缀若
+/// 不加约束地整段放在最前面，会把被摘要区（模型实际工作过、boundary 之后只剩这份摘要
+/// 代表的部分）的大半挤进被省略的中段。所以预算分三档：
+///
+/// 1. 被摘要区优先占预算；
+/// 2. 前缀开头 `opening_len` 条（上一 boundary 的受保护头部：会话开头的任务原文，从未被
+///    摘要过，本次 boundary 落库后也不再在视图里）其次，从前往后装——load 期在完整视图上
+///    压缩时它们在 transcript 最前面、中段省略保开头，总能活下来，轮内不能因为视图被裁过
+///    就先丢它们；
+/// 3. 其余前缀只拿剩余额度，放不下时从【前端】（最早的）让起，保留紧挨被摘要区的那一段。
+///
+/// 被让掉的（受保护头部装不下的尾部 + 其余前缀的前端，时间序上连续）以一条提示代替。
+///
+/// 前缀里上一 boundary 的摘要载体不作为正文进 transcript（它另以 previous_summary 交给
+/// 摘要器做增量更新；载体若是 merge 形态，其中的原 user 正文还原成普通 user 消息保留），
+/// 与 [`assemble_compressed_history`] 处理被摘要区里摘要载体的口径一致。
+pub(super) fn merge_prefix_into_summary_material(
+    prefix: &[Message],
+    opening_len: usize,
+    to_summarize: &[Message],
+    max_chars: usize,
+) -> MergedSummaryMaterial {
+    // 被摘要区的渲染体量按它在最终素材里可能的最大下标估（标题里的编号位数只会更少；
+    // 前缀为空时就是它的真实下标）。
+    let head_chars: usize = to_summarize
+        .iter()
+        .enumerate()
+        .map(|(i, m)| render_message_block(prefix.len() + i, m).chars().count())
+        .sum();
+    let head_overflows = head_chars >= max_chars;
+    if prefix.is_empty() {
+        return MergedSummaryMaterial {
+            material: to_summarize.to_vec(),
+            prefix_total: 0,
+            omitted_prefix: 0,
+            head_overflows,
+        };
+    }
+    let strip_carrier = |m: &Message| {
+        if context_summary_body(m).is_some() {
+            merged_origin_user_message(m)
+        } else {
+            Some(m.clone())
+        }
+    };
+    let opening_len = opening_len.min(prefix.len());
+    let opening: Vec<Message> = prefix[..opening_len].iter().filter_map(strip_carrier).collect();
+    let rest: Vec<Message> = prefix[opening_len..].iter().filter_map(strip_carrier).collect();
+    let prefix_total = opening.len() + rest.len();
+    // 预留让位提示那一条的体量（按最大可能条数估；它的下标是 `opening_kept`，按上界
+    // `opening.len()` 估编号位数，实际只会更少），保证最终 transcript 不会反过来省略被摘要区。
+    let note_reserve = render_message_block(opening.len(), &prefix_omission_note(prefix_total))
+        .chars()
+        .count();
+    let mut budget = max_chars.saturating_sub(head_chars + note_reserve);
+    // 受保护头部从前往后装，装不下即停。
+    let mut opening_kept = 0;
+    for (i, m) in opening.iter().enumerate() {
+        let block_chars = render_message_block(i, m).chars().count();
+        if block_chars > budget {
+            break;
+        }
+        budget -= block_chars;
+        opening_kept += 1;
+    }
+    // 其余前缀从末尾往前装，装不下即停：保留的是紧挨被摘要区的那一段。
+    let mut keep_from = rest.len();
+    while keep_from > 0 {
+        let block_chars = render_message_block(opening_kept + keep_from, &rest[keep_from - 1])
+            .chars()
+            .count();
+        if block_chars > budget {
+            break;
+        }
+        budget -= block_chars;
+        keep_from -= 1;
+    }
+    let omitted_prefix = (opening.len() - opening_kept) + keep_from;
+    let mut material = Vec::with_capacity(prefix_total - omitted_prefix + to_summarize.len() + 1);
+    material.extend(opening.iter().take(opening_kept).cloned());
+    if omitted_prefix > 0 {
+        let note = prefix_omission_note(omitted_prefix);
+        // 被摘要区几乎占满预算、连提示都放不下（预算区间 `max − note < head < max`）时不加
+        // 提示：否则 transcript 会反过来省略被摘要区的一截。让位情况仍由调用方按返回值记日志。
+        if head_chars + render_message_block(opening_kept, &note).chars().count() <= max_chars {
+            material.push(note);
+        }
+    }
+    material.extend(rest.iter().skip(keep_from).cloned());
+    material.extend(to_summarize.iter().cloned());
+    MergedSummaryMaterial {
+        material,
+        prefix_total,
+        omitted_prefix,
+        head_overflows,
+    }
+}
+
+/// 素材里最后一条真实 user 消息没有【逐字完整】出现在 transcript 里（某个正文块超过单块
+/// 上限被截、或整条落在被省略的中段 / 被按字符裁掉的末条）时，把它单独拿出来：
+/// `## Active Task` 要求逐字保留用户最近一条未完成输入，摘要器得先看得到原文。正文按
+/// [`ACTIVE_TASK_VERBATIM_MAX_CHARS`] 截（截过的标 `truncated`，prompt 里据此改标题——
+/// 不能把一段前缀当「逐字全文」交给摘要器）；完整在 transcript 里或没有正文时为 `None`
+/// （不重复给）。
+pub(super) fn latest_user_input_verbatim(
+    messages: &[Message],
+    rendered: &RenderedTranscript,
+) -> Option<LatestUserInput> {
+    let idx = last_real_user_index(messages)?;
+    let texts: Vec<&str> = messages[idx].content.iter().filter_map(|b| b.as_text()).collect();
+    let text = texts.join("\n");
+    if text.trim().is_empty() {
+        return None;
+    }
+    let fully_in_transcript = rendered.fully_rendered(idx)
+        && texts.iter().all(|t| t.chars().count() <= TRANSCRIPT_TEXT_MAX_CHARS);
+    if fully_in_transcript {
+        return None;
+    }
+    let truncated = text.chars().count() > ACTIVE_TASK_VERBATIM_MAX_CHARS;
+    Some(LatestUserInput {
+        idx,
+        text: truncate_chars(&text, ACTIVE_TASK_VERBATIM_MAX_CHARS),
+        truncated,
+    })
+}
+
+/// [`latest_user_input_verbatim`] 的结果。
+pub(super) struct LatestUserInput {
+    /// 素材下标（0 起；transcript 标题按 1 起编号）。
+    pub(super) idx: usize,
+    /// 正文（最多 [`ACTIVE_TASK_VERBATIM_MAX_CHARS`] 字符）。
+    pub(super) text: String,
+    /// 原文更长，`text` 只是前缀。
+    pub(super) truncated: bool,
+}
+
 /// 摘要 prompt：结构化 12-section 模板 + temporal anchoring + 跟随用户语言 + 脱敏。
 ///
-/// `## Active Task` 是最关键字段：逐字保留用户最近一条未完成输入。
+/// `## Active Task` 是最关键字段：逐字保留用户最近一条未完成输入——transcript 里放不下
+/// 原文时（单块 2000 字符上限 / 中段省略），原文另以 verbatim 块给出
+/// （[`latest_user_input_verbatim`]）。
 pub(super) fn build_session_summary_prompt(
     messages: &[Message],
     msg: &BusMessage,
     previous_summary: Option<&str>,
 ) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let transcript = redact_sensitive_text(&render_messages_for_summary(messages, 48_000));
+    let rendered = render_transcript(messages, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    let transcript = redact_sensitive_text(&rendered.text);
+    let latest_user_input = latest_user_input_verbatim(messages, &rendered)
+        .map(|input| {
+            let extent = if input.truncated {
+                format!(
+                    "first {ACTIVE_TASK_VERBATIM_MAX_CHARS} chars only — the original is longer; say so in Active Task"
+                )
+            } else {
+                "verbatim".to_string()
+            };
+            format!(
+                "LATEST USER INPUT IN THE TRANSCRIPT (Message {}, {extent}; the transcript below truncates or omits it — quote from here when filling Active Task):\n\n{}\n\n",
+                input.idx + 1,
+                redact_sensitive_text(&input.text)
+            )
+        })
+        .unwrap_or_default();
     let previous = previous_summary
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
@@ -1164,6 +1622,7 @@ Current session key: channel={channel} chat_id={chat_id}\n\
 TEMPORAL ANCHORING: The current date is {today}. When an action has already been carried out, phrase it as a completed, dated, past-tense fact rather than an open instruction (e.g. \"于 {today} 完成…\"). Never leave a finished action worded as if it still needs doing, and never invent a date for work that has not happened.\n\n\
 Write only the summary body.\n\n\
 {previous}\
+{latest_user_input}\
 Transcript (sensitive values redacted):\n\n{transcript}",
         channel = msg.channel,
         chat_id = msg.chat_id,

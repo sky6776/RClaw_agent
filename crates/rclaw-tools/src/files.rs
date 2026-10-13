@@ -1,9 +1,13 @@
 //! 文件类内置工具：read / write / edit / list / grep。
 //!
 //! 安全约束：
-//! - Sandboxed 权限下路径必须位于 `base`（agent/）内，且不含 `..`（防目录穿越）；
-//!   Unrestricted 权限可访问任意路径。Sandboxed 的符号链接逃逸由
-//!   [`rclaw_store::validate_agent_path`] 的解析层兜底；
+//! - Sandboxed 权限下路径默认必须位于 `base`（agent/）内，且不含 `..`（防目录穿越）；
+//!   工作区之外的路径只有宿主注册了确认钩子（桌面版弹窗）且用户逐个放行时才可访问
+//!   （见 [`crate::access::ensure_path_allowed`]；CLI 等无钩子环境一律拒绝）。Unrestricted
+//!   权限可访问任意路径。Sandboxed 的符号链接逃逸由 [`rclaw_store::validate_agent_path`]
+//!   的解析层兜底。盘符相对路径（`C:foo`）任何权限下都拒绝；
+//! - 任何权限下都不经文件工具读写工作区根下的运行时数据库 `state.sqlite`（及伴生文件），
+//!   不删工作区根 / 文件系统根 / 挂载点；
 //! - `read` 分页流式读取（offset/limit），不再以 32KB 整篇上限硬拒大文件，改为按
 //!   「每次调用」的行数/字节预算保护上下文；
 //! - `edit` 需要完整原文才能安全替换，保留 128MB 整篇载入上限；
@@ -25,6 +29,7 @@ use walkdir::WalkDir;
 
 use rclaw_store::StoreError;
 
+use crate::access::PathOp;
 use crate::{Tool, ToolResult};
 
 /// `edit` 整篇载入的最大字节数（edit 需要完整原文才能安全替换）。
@@ -59,8 +64,9 @@ const MAX_GREP_FILE_SCAN: usize = 64 * 1024 * 1024;
 /// `grep` 单行输出的最大字节数，超出截断。
 const MAX_GREP_LINE_BYTES: usize = 2048;
 
-mod helpers;
+pub(crate) mod helpers;
 use helpers::*;
+pub use helpers::{is_dos_device_name, open_regular_file};
 
 mod pdf;
 // ===========================================================================
@@ -108,7 +114,7 @@ impl Tool for Read {
             Some(p) => p,
             None => return ToolResult::err("缺少 'path' 或 'url' 字段"),
         };
-        let path = match resolve_path(&self.base, path).await {
+        let path = match resolve_path(&self.base, path, PathOp::Read).await {
             Ok(path) => path,
             Err(error) => return error,
         };
@@ -232,10 +238,20 @@ impl Tool for WriteFile {
                 MAX_FILE_SIZE / 1024 / 1024
             ));
         }
-        let path = match resolve_path(&self.base, path).await {
-            Ok(path) => path.to_string_lossy().into_owned(),
+        let path = match resolve_path(&self.base, path, PathOp::Write).await {
+            Ok(path) => path,
             Err(error) => return error,
         };
+        // 工作区根自己的条目（`agent` / `./agent` / 其绝对路径）不能当文件写：根是真实目录时
+        // atomic_write 会拒绝目录，但根是符号链接（`agent -> /data/real`）时 rename 会把这个
+        // 入口换成一个普通文件，工作区就此失联。
+        if is_workspace_root_entry(&self.base, &path) {
+            return ToolResult::err(format!(
+                "不能把工作区根目录 {} 当文件写入",
+                base_str(&self.base)
+            ));
+        }
+        let path = path.to_string_lossy().into_owned();
         let expected_sha256 = get_str(&input, "expected_sha256");
         if input.get("expected_sha256").is_some() && expected_sha256.is_none() {
             return ToolResult::err("expected_sha256 必须是字符串");
@@ -300,19 +316,55 @@ impl Tool for DeleteFile {
             Some(p) => p,
             None => return ToolResult::err("缺少 'path' 字段"),
         };
-        let path = match resolve_path(&self.base, path).await {
-            Ok(p) => p.to_string_lossy().into_owned(),
+        // 根下叫保留名的【真实目录】允许删（它不可能是库文件，却会让 SQLite 开不了库；
+        // 没有这个口子它就永远删不掉）；库文件本身与指向它的链接仍拒绝。
+        let path = match resolve_path_with(
+            &self.base,
+            path,
+            PathOp::Delete,
+            ReservedDirPolicy::AllowRealDirectory,
+        )
+        .await
+        {
+            Ok(p) => p,
             Err(error) => return error,
         };
+        // 工作区根（`.` / `agent` / 其绝对路径）及其祖先不能删：目录会连同打开着的
+        // state.sqlite 一起被 remove_dir_all，等于绕过数据库守卫删库——与桌面端
+        // 「不能删除工作区根目录」同口径。
+        if contains_workspace_root(&self.base, &path) {
+            return ToolResult::err(format!(
+                "不能删除工作区根目录 {}（或其上级目录）：运行时数据库 state.sqlite 在其中；\
+                 请逐个删除其下的文件 / 子目录",
+                base_str(&self.base)
+            ));
+        }
+        // 文件系统根 / 盘符根 / 挂载点与工作区是什么关系都不能删（Unrestricted 下别的盘的
+        // 根不是工作区祖先，上一道拦不住）。
+        if is_filesystem_root(&path) {
+            return ToolResult::err(format!(
+                "不能删除文件系统根 / 盘符根 / 挂载点 {}",
+                path.display()
+            ));
+        }
         // 用 symlink_metadata 判类型（不跟随符号链接）：把符号链接本身当作条目删除，
         // 而非顺着链接删除其目标内容。
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return ToolResult::err(format!("文件不存在：{path}"));
+                return ToolResult::err(format!("文件不存在：{}", path.display()));
             }
             Err(e) => return ToolResult::err(format!("读取元数据失败：{e}")),
         };
+        // 解析时按「真实目录」放行的保留名，到这里若已不是目录（两次 stat 之间被换成了
+        // 文件），按库文件口径重新拒绝：remove_file 删掉的会是一个叫保留名的文件。
+        if !meta.is_dir() && is_state_db_file(&self.base, &path) {
+            return ToolResult::err(format!(
+                "拒绝删除运行时数据库文件 {}（state.sqlite 及其伴生文件）",
+                path.display()
+            ));
+        }
+        let path = path.to_string_lossy().into_owned();
         let kind = if meta.is_dir() { "目录" } else { "文件" };
         let skill_scripts_before_remove = if meta.is_dir() {
             collect_skill_scripts_under(&path)
@@ -321,6 +373,8 @@ impl Tool for DeleteFile {
         };
         let result = if meta.is_dir() {
             fs::remove_dir_all(&path)
+        } else if meta.file_type().is_symlink() {
+            remove_symlink(Path::new(&path))
         } else {
             fs::remove_file(&path)
         };
@@ -393,7 +447,7 @@ impl Tool for EditFile {
             Some(s) => s,
             None => return ToolResult::err("缺少 'new_string' 字段"),
         };
-        let path = match resolve_path(&self.base, path).await {
+        let path = match resolve_path(&self.base, path, PathOp::Write).await {
             Ok(path) => path.to_string_lossy().into_owned(),
             Err(error) => return error,
         };
@@ -472,7 +526,7 @@ impl Tool for ListDir {
         // 可选 path：遍历根（默认 agent 存储根）。agent/ 之外路径需 unrestricted 访问——
         // Sandboxed 下 resolve_path 会拒绝；Unrestricted 下可列任意目录。
         let root: PathBuf = match get_str(&input, "path") {
-            Some(p) if !p.is_empty() => match resolve_path(&self.base, p).await {
+            Some(p) if !p.is_empty() => match resolve_path(&self.base, p, PathOp::List).await {
                 Ok(path) => path,
                 Err(error) => return error,
             },
@@ -650,7 +704,7 @@ impl Tool for Grep {
             Ok(re) => re,
             Err(e) => return ToolResult::err(format!("非法正则: {e}")),
         };
-        let path = match resolve_path(&self.base, path).await {
+        let path = match resolve_path(&self.base, path, PathOp::Search).await {
             Ok(path) => path,
             Err(error) => return error,
         };
@@ -684,6 +738,11 @@ impl Tool for Grep {
                 };
                 // 只搜普通文件；符号链接（is_file()==false）跳过，绝不跟随。
                 if !entry.file_type().is_file() {
+                    continue;
+                }
+                // 运行时数据库不参与全文搜索：read 会拒绝它，grep 从目录遍历进来也不能
+                // 绕过（否则把二进制页里的会话明文当匹配行喂回模型）。
+                if walk_entry_is_state_db(&self.base, entry.path()) {
                     continue;
                 }
                 let display = entry.path().to_string_lossy().replace('\\', "/");
@@ -751,9 +810,10 @@ fn search_file(
     real_path: &str,
     max_results: usize,
 ) {
-    let f = match fs::File::open(real_path) {
+    // 非阻塞打开 + 句柄类型核对：遍历到的条目在 walk 与 open 之间被换成 FIFO 也挂不住。
+    let f = match open_regular_file(Path::new(real_path)) {
         Ok(f) => f,
-        Err(_) => return, // 打不开（权限/竞态）跳过单个文件。
+        Err(_) => return, // 打不开（权限/竞态/非普通文件）跳过单个文件。
     };
     let mut reader = std::io::BufReader::new(f);
     let mut buf = Vec::new();

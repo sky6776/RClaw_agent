@@ -3,10 +3,9 @@
 //! 命令面刻意保持最小——对话消息（含斜杠命令）统一走 inbound 总线，
 //! 配置类操作（/llmodel 等）复用既有 slash 管道，不另开配置命令。
 //! 多会话以 chat_id 区分（同一 desktop 通道，TurnManager 按 (channel, chat_id)
-//! 各自维护活动 turn）；归档 = 移动会话文件到 `sessions/archived/`。
+//! 各自维护活动 turn）；归档 = `state.sqlite` 里的 `archived_at` 标记（消息不动）。
 
-use std::time::UNIX_EPOCH;
-
+use rclaw_tools::files::is_dos_device_name;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
@@ -373,79 +372,70 @@ pub async fn cancel(app: AppHandle, chat_id: String) -> Result<(), String> {
 pub struct ChatDto {
     pub chat_id: String,
     /// 用户自定义名（desktop_prefs.json 的 chat_titles，经 /chat_rename 写入）优先；
-    /// 无自定义名时 = 首条用户消息截断（读取会话文件头部提取）。
+    /// 无自定义名时 = 首条用户消息截断。
     pub title: String,
-    /// 最后修改时间（unix 毫秒）。
+    /// 最后修改时间（unix 毫秒；每次追加消息时刷新）。
     pub updated_at: u64,
     pub archived: bool,
 }
 
-/// 归档目录名（挂在 sessions/ 之下；列表扫描天然跳过子目录）。
-const ARCHIVED_DIR: &str = "archived";
+/// 会话相关命令都是同步 SQLite 读写（`SessionStore` 单连接 + 互斥锁：正在跑的
+/// turn 写事务期间读会排队）。放到阻塞线程池执行，不占 Tauri 异步运行时的工作线程。
+async fn run_blocking<T, F>(label: &str, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("{label}任务失败: {e}"))?
+}
 
 #[tauri::command]
 pub async fn chat_list(state: State<'_, AppState>) -> Result<Vec<ChatDto>, String> {
     let session = state.session().ok_or("agent 尚未启动")?;
-    let dir = session.sessions_dir();
-    // 用户自定义会话名（desktop_prefs.json）优先于派生标题。
-    let custom_titles = agent::read_chat_titles(&state.home);
-    let mut out = Vec::new();
-    for (archived, scan_dir) in [(false, dir.clone()), (true, dir.join(ARCHIVED_DIR))] {
-        let Ok(entries) = std::fs::read_dir(&scan_dir) else {
-            continue;
-        };
-        let prefix = format!("{}_", rclaw_store::percent_encode_key(CHANNEL_DESKTOP));
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Some(rest) = name
-                .strip_prefix(&prefix)
-                .and_then(|r| r.strip_suffix(".jsonl"))
-            else {
-                continue;
-            };
-            let chat_id = percent_encoding::percent_decode_str(rest)
-                .decode_utf8_lossy()
-                .to_string();
+    let layout = state.layout();
+    let home = state.home.clone();
+    run_blocking("读取会话列表", move || {
+        // 用户自定义会话名（desktop_prefs.json）优先于派生标题。
+        let custom_titles = agent::read_chat_titles(&home);
+        let summaries = session
+            .list_sessions(Some(CHANNEL_DESKTOP))
+            .map_err(|e| format!("读取会话列表失败: {e}"))?;
+        let mut out = Vec::new();
+        for summary in summaries {
+            let chat_id = summary.chat_id;
             // Bot Mode：群成员会话（grp-…）是编排内部会话，不进用户会话列表。
             if chat_id.starts_with("grp-") {
                 continue;
             }
-            let (title, updated_at) = {
-                let meta = entry.metadata().ok();
-                let updated_at = meta
+            let mut derived = extract_title(&session, &chat_id);
+            // Bot Mode：bot 收件箱的首条「用户」消息往往是队友交接信封
+            // （Message from 🤖 …），原文当标题不可读；改用 bot 显示名。
+            if let Some(name) = chat_id.strip_prefix("bot-") {
+                if let Some(def) = layout
                     .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let mut derived = extract_title(&entry.path());
-                // Bot Mode：bot 收件箱的首条「用户」消息往往是队友交接信封
-                // （Message from 🤖 …），原文当标题不可读；改用 bot 显示名。
-                if let Some(name) = chat_id.strip_prefix("bot-") {
-                    if let Some(def) = state
-                        .layout()
-                        .and_then(|layout| rclaw_store::BotStore::new(&layout.base).get(name).ok())
-                    {
-                        derived = format!("🤖 {}", def.title);
-                    }
+                    .and_then(|layout| rclaw_store::BotStore::new(&layout.base).get(name).ok())
+                {
+                    derived = format!("🤖 {}", def.title);
                 }
-                let title = custom_titles.get(&chat_id).cloned().unwrap_or(derived);
-                (title, updated_at)
-            };
+            }
+            let title = custom_titles.get(&chat_id).cloned().unwrap_or(derived);
             out.push(ChatDto {
                 chat_id,
                 title,
-                updated_at,
-                archived,
+                updated_at: summary.updated_at.max(0) as u64,
+                archived: summary.archived,
             });
         }
-    }
-    out.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
-    Ok(out)
+        out.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
+        Ok(out)
+    })
+    .await
 }
 
 /// 重命名会话（双击 / 右键菜单触发行内编辑）。标题去空白后为空 = 恢复自动派生标题。
-/// 仅写 desktop_prefs.json 的 chat_titles 映射，不动会话文件。
+/// 仅写 desktop_prefs.json 的 chat_titles 映射，不动 state.sqlite 里的会话记录。
 #[tauri::command]
 pub async fn chat_rename(
     state: State<'_, AppState>,
@@ -458,21 +448,34 @@ pub async fn chat_rename(
     if title.trim().chars().count() > 120 {
         return Err("会话名过长（上限 120 字符）".to_string());
     }
-    agent::write_chat_title(&state.home, &chat_id, &title)
+    // desktop_prefs.json 的读-改-写是同步文件 IO，不占异步运行时线程。
+    let home = state.home.clone();
+    run_blocking("重命名会话", move || {
+        agent::write_chat_title(&home, &chat_id, &title)
+    })
+    .await
 }
 
 /// 导出完整聊天记录为 Markdown 文本（不做条数裁剪，前端触发下载）。
-/// 直接读会话 JSONL 原文，绕过 load_history_view 的 200 条窗口。
+/// 读完整 transcript（含被压缩进摘要的消息），不是 provider 可见的压缩视图。
 #[tauri::command]
 pub async fn chat_export(state: State<'_, AppState>, chat_id: String) -> Result<String, String> {
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
-    let path = session.session_path_pub(CHANNEL_DESKTOP, &chat_id);
-    use std::io::BufRead;
-    let file = std::fs::File::open(&path).map_err(|e| format!("读取会话失败: {e}"))?;
-    let reader = std::io::BufReader::new(file);
+    let transcript = run_blocking("读取会话", {
+        let chat_id = chat_id.clone();
+        move || {
+            session
+                .load_transcript(CHANNEL_DESKTOP, &chat_id)
+                .map_err(|e| format!("读取会话失败: {e}"))
+        }
+    })
+    .await?;
+    if transcript.is_empty() {
+        return Err(format!("会话 {chat_id} 不存在或没有记录"));
+    }
     let stamp = |ts: i64| -> String {
         if ts <= 0 {
             return String::new();
@@ -488,10 +491,7 @@ pub async fn chat_export(state: State<'_, AppState>, chat_id: String) -> Result<
         "# 聊天记录：{chat_id}\n\n- 导出时间：{}\n\n---\n\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
     );
-    for line in reader.lines().map_while(Result::ok) {
-        let Ok(msg) = serde_json::from_str::<rclaw_core::Message>(&line) else {
-            continue;
-        };
+    for msg in transcript {
         if msg.is_tool_result_carrier() {
             continue;
         }
@@ -537,18 +537,13 @@ pub async fn chat_export(state: State<'_, AppState>, chat_id: String) -> Result<
     Ok(out)
 }
 
-/// 从会话文件头部提取标题：首条非压缩摘要的用户文本，截 60 字符。
-fn extract_title(path: &std::path::Path) -> String {
-    use std::io::BufRead;
+/// 从会话最早的几条用户消息提取标题：首条非压缩摘要的用户文本，截 60 字符。
+fn extract_title(session: &rclaw_store::session::SessionStore, chat_id: &str) -> String {
     const CONTEXT_SUMMARY_PREFIX: &str = "[CONTEXT COMPACTION";
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(messages) = session.first_user_messages(CHANNEL_DESKTOP, chat_id, 8) else {
         return String::new();
     };
-    let reader = std::io::BufReader::new(file);
-    for line in reader.lines().take(64).map_while(Result::ok) {
-        let Ok(msg) = serde_json::from_str::<rclaw_core::Message>(&line) else {
-            continue;
-        };
+    for msg in messages {
         if msg.role != rclaw_core::Role::User || msg.is_tool_result_carrier() {
             continue;
         }
@@ -573,7 +568,12 @@ pub struct HistoryMsgDto {
     pub content: String,
 }
 
-/// 读取指定会话的持久化历史（最近 200 条，经 repair / 裁剪），映射为转录条目。
+/// 读取指定会话的持久化历史（完整 transcript 里最近 200 条可回放行 / 4 MB），映射为转录条目。
+///
+/// 与 `chat_export` 同源读 transcript，而不是 provider 可见的压缩视图：压缩是非破坏性的，
+/// 回放若按压缩视图渲染，压缩点处会无提示地缺一段中间对话（boundary 行只是摘要，还被
+/// 过滤掉）。boundary 行与工具结果载体由 store 在 SQL 层筛掉、不占 200 条的额度（否则
+/// 工具密集的会话首屏只剩几条对话）；下面的过滤只是兜底。
 #[tauri::command]
 pub async fn chat_history(
     state: State<'_, AppState>,
@@ -583,10 +583,14 @@ pub async fn chat_history(
         return Err(format!("非法会话 id: {chat_id}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
-    // 只读视图：目标会话可能正有 turn 在追加，普通 load_history 的压缩写回会与之竞争。
-    let msgs = session
-        .load_history_view(CHANNEL_DESKTOP, &chat_id, 200, 4 * 1024 * 1024)
-        .map_err(|e| e.to_string())?;
+    // 只读，不改库（目标会话可能正有 turn 在追加：进程内共用一条连接、按互斥锁串行，
+    // 这里只是排在写事务之后读到一致快照，不与之交错）。
+    let msgs = run_blocking("读取会话历史", move || {
+        session
+            .load_transcript_tail(CHANNEL_DESKTOP, &chat_id, 200, 4 * 1024 * 1024)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
     let mut out = Vec::new();
     for msg in msgs {
         if msg.is_tool_result_carrier() {
@@ -647,89 +651,83 @@ pub async fn chat_history(
     Ok(out)
 }
 
-/// 归档会话：把会话文件移入 `sessions/archived/`（恢复 = 移回）。
+/// 归档会话：打 `archived_at` 标记（恢复 = 清除标记）；消息、chat_id 都不动。
 #[tauri::command]
 pub async fn chat_archive(state: State<'_, AppState>, chat_id: String) -> Result<(), String> {
-    move_chat(&state, &chat_id, true)
+    set_chat_archived(&state, chat_id, true).await
 }
 
 /// 恢复归档会话。
 #[tauri::command]
 pub async fn chat_restore(state: State<'_, AppState>, chat_id: String) -> Result<(), String> {
-    move_chat(&state, &chat_id, false)
+    set_chat_archived(&state, chat_id, false).await
 }
 
-fn move_chat(state: &AppState, chat_id: &str, archive: bool) -> Result<(), String> {
-    if !is_valid_chat_id(chat_id) {
+async fn set_chat_archived(state: &AppState, chat_id: String, archive: bool) -> Result<(), String> {
+    if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
-    move_session_file(&session, chat_id, archive)
+    run_blocking("更新会话归档状态", move || {
+        set_session_archived(&session, &chat_id, archive)
+    })
+    .await
 }
 
-/// 归档 / 恢复的核心：只做会话文件移动，与 Tauri 状态解耦便于测试。
-fn move_session_file(
+/// 归档 / 恢复的核心：只改会话标记，与 Tauri 状态解耦便于测试。
+///
+/// /clear 会在 UI 列表刷新前删掉会话；会话已不在 = 无事可做，视为成功，
+/// 让前端刷新列表清掉幽灵条目，而不是报错把条目卡死。
+fn set_session_archived(
     session: &rclaw_store::session::SessionStore,
     chat_id: &str,
     archive: bool,
 ) -> Result<(), String> {
-    let dir = session.sessions_dir();
-    let from = if archive {
-        session.session_path_pub(CHANNEL_DESKTOP, chat_id)
-    } else {
-        dir.join(ARCHIVED_DIR).join(
-            session
-                .session_path_pub(CHANNEL_DESKTOP, chat_id)
-                .file_name()
-                .ok_or("非法文件名")?,
-        )
-    };
-    let to_dir = if archive { dir.join(ARCHIVED_DIR) } else { dir };
-    // /clear 会在 UI 列表刷新前删掉会话文件；文件已不在 = 无需移动，视为成功，
-    // 让前端刷新列表清掉幽灵条目，而不是报错把条目卡死。
-    if !from.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&to_dir).map_err(|e| e.to_string())?;
-    let file_name = from.file_name().ok_or("非法文件名")?;
-    let to = to_dir.join(file_name);
-    if to.exists() {
-        return Err("目标位置已存在同名会话文件".into());
-    }
-    std::fs::rename(&from, &to).map_err(|e| format!("移动会话文件失败: {e}"))?;
-    Ok(())
+    session
+        .set_archived(CHANNEL_DESKTOP, chat_id, archive)
+        .map(|_existed| ())
+        .map_err(|e| format!("更新会话归档状态失败: {e}"))
 }
 
-/// 删除会话：删掉会话文件（活动与已归档两处都清）并移除自定义标题。
-/// 正在工作的会话由前端拦截（turn 收尾还会向原路径追加）；文件已不在 = 幂等成功。
+/// 删除会话：删掉会话记录（消息、文件 checkpoint、用量锚点一并级联）并移除自定义标题，
+/// 再清掉 agent loop 里该会话的运行期状态（内存 usage 锚点、压缩防抖 / 冷却 / 地板）——
+/// 库与内存一起归零，不给同名会话留下旧历史形态的判断。
+/// 正在工作的会话由前端拦截（turn 收尾还会向该会话追加）；会话已不在 = 幂等成功。
 #[tauri::command]
 pub async fn chat_delete(state: State<'_, AppState>, chat_id: String) -> Result<(), String> {
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
-    delete_session_files(&session, &chat_id)?;
-    // 自定义标题随会话一起清掉（空标题 = 删除该键）。
-    agent::write_chat_title(&state.home, &chat_id, "")
+    let lifecycle = state.session_lifecycle().ok_or("agent 尚未启动")?;
+    let home = state.home.clone();
+    run_blocking("删除会话", move || {
+        // 正在跑的会话不删：turn 收尾会把消息 / 检查点写回刚清空的 chat，变成一个只有
+        // 半截历史的「幽灵会话」。后端兜底，不依赖前端是否按运行态禁用了删除按钮。
+        // 残余窗口：判定只看 active map，一条已入 inbound 队列、尚未 spawn 成 turn 的消息
+        // 看不见，它随后仍会在被删会话上开 turn（新会话、只有本轮历史）。正常 UI 流程里
+        // 发送与删除同一会话不会并发；这里不为它持锁跨越整段删除（锁也挡不住队列里的
+        // 消息），接受这一窗口。
+        if lifecycle.is_session_busy(CHANNEL_DESKTOP, &chat_id) {
+            return Err("该会话还有正在进行的回复，请先 /cancel 或等它结束再删除".into());
+        }
+        delete_session_record(&session, &chat_id)?;
+        lifecycle.forget_session(CHANNEL_DESKTOP, &chat_id);
+        // 自定义标题随会话一起清掉（空标题 = 删除该键）。
+        agent::write_chat_title(&home, &chat_id, "")
+    })
+    .await
 }
 
-/// 删除的核心：只做会话文件删除（活动 + 归档两处），与 Tauri 状态解耦便于测试。
-fn delete_session_files(
+/// 删除的核心：只做会话记录删除（活动 / 归档同一张表），与 Tauri 状态解耦便于测试。
+fn delete_session_record(
     session: &rclaw_store::session::SessionStore,
     chat_id: &str,
 ) -> Result<(), String> {
-    let dir = session.sessions_dir();
-    let name = session
-        .session_path_pub(CHANNEL_DESKTOP, chat_id)
-        .file_name()
-        .ok_or("非法文件名")?
-        .to_owned();
-    for path in [dir.join(&name), dir.join(ARCHIVED_DIR).join(&name)] {
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| format!("删除会话文件失败: {e}"))?;
-        }
-    }
-    Ok(())
+    session
+        .delete_session(CHANNEL_DESKTOP, chat_id)
+        .map(|_existed| ())
+        .map_err(|e| format!("删除会话失败: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -751,8 +749,10 @@ pub async fn agents_list(state: State<'_, AppState>) -> Result<serde_json::Value
 pub struct UsageDto {
     /// 会话历史 token 估算（不含 system prompt / 工具 schema）。
     pub history_used: u64,
-    /// 请求压力估算（历史 + system prompt + 动态上下文 + 工具 schema），
-    /// 与自动压缩触发同口径。
+    /// 请求压力估算（历史 + system prompt + 动态上下文 + 静态工具面）。与自动压缩触发用
+    /// 同一个估算器与同一份工具面，但是纯启发式——没有 turn 内记下的真实 usage 锚点
+    /// （见 `rclaw_runtime::ContextUsageSnapshot::request_used`），长会话上可能与 `/context`
+    /// 的锚定值有出入。
     pub request_used: u64,
     /// 上下文窗口（token）。
     pub context_length: u64,
@@ -1023,9 +1023,9 @@ pub async fn insights(state: State<'_, AppState>) -> Result<crate::insights::Ins
         .map_err(|e| format!("加载配置失败: {e}"))?;
     let memory = rclaw_store::MemoryStore::new(layout.clone())
         .with_char_limits(cfg.agent.memory_char_limit, cfg.agent.user_char_limit);
-    // 有界扫描（≤200 文件 × 32MB）放到阻塞线程池，不卡 async 运行时。
+    // 全库消息扫描放到阻塞线程池，不卡 async 运行时。
     tauri::async_runtime::spawn_blocking(move || {
-        crate::insights::compute(&session.sessions_dir(), &layout.skills_dir, &memory)
+        crate::insights::compute(&session, &layout.skills_dir, &memory)
     })
     .await
     .map_err(|e| format!("insights 计算失败: {e}"))
@@ -1506,13 +1506,26 @@ pub async fn upload_file(
         let safe = if safe.is_empty() { "file" } else { safe };
         let dir = home.join("agent").join("uploads");
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建上传目录失败: {e}"))?;
-        let file_name = format!(
-            "{}-{:04x}_{safe}",
-            chrono::Local::now().format("%Y%m%d-%H%M%S"),
-            rand::random::<u16>(),
-        );
-        let path = dir.join(&file_name);
-        std::fs::write(&path, &bytes).map_err(|e| format!("写入上传文件失败: {e}"))?;
+        // 文件名可预测（时间戳 + 随机后缀），工作区里能事先摆一条同名的悬空链接指向外部：
+        // 用不跟随链接的 CREATE_NEW 打开，撞上已有条目就换个序号重试，绝不顺着链接写出去。
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let nonce = rand::random::<u16>();
+        let path = write_fresh_file(
+            &dir,
+            "写入上传文件失败",
+            |n| {
+                if n == 1 {
+                    format!("{stamp}-{nonce:04x}_{safe}")
+                } else {
+                    format!("{stamp}-{nonce:04x}-{n}_{safe}")
+                }
+            },
+            |file| std::io::Write::write_all(file, &bytes),
+        )?;
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Ok(UploadDto {
             rel_path: format!("uploads/{file_name}"),
             abs_path: path.to_string_lossy().replace('\\', "/"),
@@ -1642,65 +1655,104 @@ mod tests {
     use super::merge_archived_skills;
     use rclaw_tools::{SkillOwner, SkillUsageStore};
 
-    #[test]
-    fn move_session_file_tolerates_missing_session_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = rclaw_store::session::SessionStore::new(rclaw_store::fs::Layout::new(
-            dir.path().join("agent"),
-        ));
-        // /clear 删除会话文件后 UI 仍有幽灵条目：归档/恢复都应幂等成功，
-        // 让前端刷新列表清掉条目，而不是报「会话文件不存在」。
-        assert!(super::move_session_file(&session, "main", true).is_ok());
-        assert!(super::move_session_file(&session, "main", false).is_ok());
+    fn test_session(dir: &std::path::Path) -> rclaw_store::session::SessionStore {
+        rclaw_store::session::SessionStore::new(rclaw_store::fs::Layout::new(dir.join("agent")))
+    }
+
+    fn archived_flag(session: &rclaw_store::session::SessionStore, chat_id: &str) -> Option<bool> {
+        session
+            .session_summary(super::CHANNEL_DESKTOP, chat_id)
+            .unwrap()
+            .map(|summary| summary.archived)
     }
 
     #[test]
-    fn move_session_file_archives_existing_session() {
+    fn set_session_archived_tolerates_missing_session() {
         let dir = tempfile::tempdir().unwrap();
-        let session = rclaw_store::session::SessionStore::new(rclaw_store::fs::Layout::new(
-            dir.path().join("agent"),
-        ));
-        let from = session.session_path_pub(super::CHANNEL_DESKTOP, "main");
-        std::fs::create_dir_all(from.parent().unwrap()).unwrap();
-        std::fs::write(&from, "{}\n").unwrap();
-
-        super::move_session_file(&session, "main", true).unwrap();
-        let archived = session
-            .sessions_dir()
-            .join(super::ARCHIVED_DIR)
-            .join(from.file_name().unwrap());
-        assert!(!from.exists());
-        assert!(archived.exists());
-
-        // 文件已移走后再归档同一会话 → 幂等成功。
-        assert!(super::move_session_file(&session, "main", true).is_ok());
-
-        super::move_session_file(&session, "main", false).unwrap();
-        assert!(from.exists());
-        assert!(!archived.exists());
+        let session = test_session(dir.path());
+        // /clear 删除会话后 UI 仍有幽灵条目：归档/恢复都应幂等成功，
+        // 让前端刷新列表清掉条目，而不是报「会话不存在」。
+        assert!(super::set_session_archived(&session, "main", true).is_ok());
+        assert!(super::set_session_archived(&session, "main", false).is_ok());
+        assert_eq!(archived_flag(&session, "main"), None, "不应凭空创建会话");
     }
 
     #[test]
-    fn delete_session_files_removes_active_and_archived() {
+    fn set_session_archived_flags_existing_session() {
         let dir = tempfile::tempdir().unwrap();
-        let session = rclaw_store::session::SessionStore::new(rclaw_store::fs::Layout::new(
-            dir.path().join("agent"),
-        ));
-        // 活动与归档两处各放一份同名会话文件：一次删除全部清掉；再删幂等成功。
-        let active = session.session_path_pub(super::CHANNEL_DESKTOP, "main");
-        std::fs::create_dir_all(active.parent().unwrap()).unwrap();
-        std::fs::write(&active, "{}\n").unwrap();
-        let archived = session
-            .sessions_dir()
-            .join(super::ARCHIVED_DIR)
-            .join(active.file_name().unwrap());
-        std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
-        std::fs::write(&archived, "{}\n").unwrap();
+        let session = test_session(dir.path());
+        session
+            .append(
+                super::CHANNEL_DESKTOP,
+                "main",
+                &rclaw_core::Message::plain(rclaw_core::Role::User, "hello"),
+            )
+            .unwrap();
 
-        assert!(super::delete_session_files(&session, "main").is_ok());
-        assert!(!active.exists());
-        assert!(!archived.exists());
-        assert!(super::delete_session_files(&session, "main").is_ok());
+        super::set_session_archived(&session, "main", true).unwrap();
+        assert_eq!(archived_flag(&session, "main"), Some(true));
+        // 再归档同一会话 → 幂等成功。
+        assert!(super::set_session_archived(&session, "main", true).is_ok());
+        assert_eq!(archived_flag(&session, "main"), Some(true));
+
+        super::set_session_archived(&session, "main", false).unwrap();
+        assert_eq!(archived_flag(&session, "main"), Some(false));
+        // 归档不动消息。
+        assert_eq!(
+            session
+                .load_all(super::CHANNEL_DESKTOP, "main")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn delete_session_record_removes_active_and_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_session(dir.path());
+        for chat_id in ["main", "old"] {
+            session
+                .append(
+                    super::CHANNEL_DESKTOP,
+                    chat_id,
+                    &rclaw_core::Message::plain(rclaw_core::Role::User, "hello"),
+                )
+                .unwrap();
+        }
+        session
+            .set_archived(super::CHANNEL_DESKTOP, "old", true)
+            .unwrap();
+
+        // 活动与归档会话都能删；再删幂等成功。
+        assert!(super::delete_session_record(&session, "main").is_ok());
+        assert!(super::delete_session_record(&session, "old").is_ok());
+        assert_eq!(archived_flag(&session, "main"), None);
+        assert_eq!(archived_flag(&session, "old"), None);
+        assert!(super::delete_session_record(&session, "main").is_ok());
+    }
+
+    #[test]
+    fn extract_title_skips_compaction_summary_and_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_session(dir.path());
+        assert_eq!(super::extract_title(&session, "none"), "");
+        let long = "标题".repeat(50);
+        for text in [
+            "[CONTEXT COMPACTION — REFERENCE ONLY] summary",
+            long.as_str(),
+        ] {
+            session
+                .append(
+                    super::CHANNEL_DESKTOP,
+                    "main",
+                    &rclaw_core::Message::plain(rclaw_core::Role::User, text),
+                )
+                .unwrap();
+        }
+        let title = super::extract_title(&session, "main");
+        assert_eq!(title.chars().count(), 60);
+        assert!(title.starts_with("标题"));
     }
 
     #[test]
@@ -1712,12 +1764,481 @@ mod tests {
         // 命中真实文件：canonical 与 base 同源（copy/delete/rename 共用此校验）。
         let (base, canon) = super::resolve_workspace_entry(&root, "media/a.txt").unwrap();
         assert!(canon.starts_with(&base));
-        // 穿越 / 反斜杠 / 绝对路径 / 空路径 / 不存在一律拒绝。
-        assert!(super::resolve_workspace_entry(&root, "../a.txt").is_err());
-        assert!(super::resolve_workspace_entry(&root, "a\\b").is_err());
-        assert!(super::resolve_workspace_entry(&root, "/etc/passwd").is_err());
-        assert!(super::resolve_workspace_entry(&root, "").is_err());
-        assert!(super::resolve_workspace_entry(&root, "nope.txt").is_err());
+        // 叶子就是条目本身（父目录 canonical + 原名），供 delete/rename 直接操作。
+        assert_eq!(canon, base.join("media").join("a.txt"));
+        // 穿越 / 反斜杠 / 绝对路径 / 空路径 / `.` / 空分量 / 不存在一律拒绝。
+        for bad in ["../a.txt", "a\\b", "/etc/passwd", "", ".", "media/", "media//a.txt", "nope.txt"] {
+            assert!(super::resolve_workspace_entry(&root, bad).is_err(), "{bad:?}");
+        }
+        #[cfg(windows)]
+        for bad in ["C:evil", "media/a.txt:ads", "media/a.txt.", "media /a.txt"] {
+            assert!(super::resolve_workspace_entry(&root, bad).is_err(), "{bad:?}");
+        }
+        #[cfg(unix)]
+        {
+            // 叶子链接不跟随：返回的是链接自身，删除 / 重命名作用在链接上。
+            std::os::unix::fs::symlink(root.join("media/a.txt"), root.join("media/link")).unwrap();
+            let (base, entry) = super::resolve_workspace_entry(&root, "media/link").unwrap();
+            assert_eq!(entry, base.join("media").join("link"));
+            assert!(std::fs::symlink_metadata(&entry).unwrap().file_type().is_symlink());
+            // 复制要读内容：跟随后仍在工作区内的普通文件才放行。
+            assert_eq!(
+                super::resolve_workspace_file_content(&base, &entry).unwrap(),
+                base.join("media").join("a.txt")
+            );
+            // 指向工作区外 / 指向运行时数据库的链接：条目可删可改名，但内容不可复制。
+            std::os::unix::fs::symlink("/etc/passwd", root.join("media/escape")).unwrap();
+            let (base, entry) = super::resolve_workspace_entry(&root, "media/escape").unwrap();
+            assert!(super::resolve_workspace_file_content(&base, &entry).is_err());
+            std::fs::write(root.join("state.sqlite"), b"db").unwrap();
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("media/dblink")).unwrap();
+            let (base, entry) = super::resolve_workspace_entry(&root, "media/dblink").unwrap();
+            assert_eq!(
+                super::resolve_workspace_file_content(&base, &entry).unwrap_err(),
+                super::STATE_DB_PROTECTED
+            );
+            // 数据库本体也不可复制。
+            let (base, entry) = super::resolve_workspace_entry(&root, "state.sqlite").unwrap();
+            assert_eq!(
+                super::resolve_workspace_file_content(&base, &entry).unwrap_err(),
+                super::STATE_DB_PROTECTED
+            );
+        }
+    }
+
+    #[test]
+    fn agent_and_upload_paths_resolve_inside_uploads_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let root = home.join("agent");
+        std::fs::create_dir_all(root.join("uploads").join("sub")).unwrap();
+        std::fs::write(root.join("uploads/photo.jpg"), b"jpg").unwrap();
+        std::fs::write(root.join("uploads/sub/clip.mp4"), b"mp4").unwrap();
+        std::fs::write(root.join("notes.md"), b"n").unwrap();
+        std::fs::write(root.join("state.sqlite"), b"db").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        // 只读解析：工作区内任意已存在文件；数据库 / 越区 / 不存在 / 非法拼写拒绝。
+        assert_eq!(
+            super::resolve_agent_path(home, "notes.md").unwrap(),
+            canonical_root.join("notes.md")
+        );
+        assert_eq!(
+            super::resolve_agent_path(home, "uploads/sub/clip.mp4").unwrap(),
+            canonical_root.join("uploads").join("sub").join("clip.mp4")
+        );
+        assert_eq!(super::resolve_agent_path(home, "state.sqlite").unwrap_err(), super::STATE_DB_PROTECTED);
+        for bad in ["../agent/notes.md", "uploads/../../x", "/etc/passwd", "missing.md", "", "a\\b"] {
+            assert!(super::resolve_agent_path(home, bad).is_err(), "{bad:?}");
+        }
+        // 采集产物入口：必须落在 uploads/ 之内；uploads 本身、工作区别处、数据库都不行。
+        assert_eq!(
+            super::resolve_upload_path(home, "uploads/photo.jpg").unwrap(),
+            canonical_root.join("uploads").join("photo.jpg")
+        );
+        for bad in ["uploads", "uploads/", "notes.md", "state.sqlite", "uploads/../notes.md", "uploads/nope.jpg"] {
+            assert!(super::resolve_upload_path(home, bad).is_err(), "{bad:?}");
+        }
+        #[cfg(unix)]
+        {
+            // uploads/ 里指向数据库 / 工作区外的链接：按真实落点判，一律拒绝；指向 uploads/
+            // 内文件的链接放行（落点仍在 uploads/ 内）。
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("uploads/dblink")).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", root.join("uploads/escape")).unwrap();
+            std::os::unix::fs::symlink(root.join("notes.md"), root.join("uploads/outside")).unwrap();
+            std::os::unix::fs::symlink(root.join("uploads/photo.jpg"), root.join("uploads/inside")).unwrap();
+            assert_eq!(super::resolve_upload_path(home, "uploads/dblink").unwrap_err(), super::STATE_DB_PROTECTED);
+            assert!(super::resolve_upload_path(home, "uploads/escape").is_err());
+            assert!(super::resolve_upload_path(home, "uploads/outside").is_err());
+            assert_eq!(
+                super::resolve_upload_path(home, "uploads/inside").unwrap(),
+                canonical_root.join("uploads").join("photo.jpg")
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_rel_paths_are_plain_segments() {
+        for ok in ["a.md", "dir/sub/x.txt", "名字.md", "a..b.md", "state.sqlite"] {
+            assert!(super::validate_workspace_rel_path(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", ".", "..", "../x", "a/../b", "a/./b/..", "/abs", "a\\b", "a//b", "a/", "tab\tx",
+            "\\\\?\\C:\\x",
+        ] {
+            assert!(super::validate_workspace_rel_path(bad).is_err(), "{bad:?}");
+        }
+        #[cfg(windows)]
+        for bad in ["C:evil", "a:b", "a/b.", "a /b", "a<b", "a|b", "a?b", "a*b", "a\"b"] {
+            assert!(super::validate_workspace_rel_path(bad).is_err(), "{bad:?}");
+        }
+        // Windows DOS 设备名：分量主干（第一个点之前）命中即拒，不分大小写；类 Unix 是普通名。
+        #[cfg(windows)]
+        {
+            for bad in ["con", "CON", "nul.md", "dir/Com1/x.txt", "lpt9.log", "aux.tar.gz", "prn", "COM¹.md", "dir/lpt³/x.txt"] {
+                assert!(super::validate_workspace_rel_path(bad).is_err(), "{bad:?}");
+            }
+            // 上标数字 ¹²³ 也是设备名尾字符（按字符数而非字节数判断）。
+            for bad in ["con", "CON", "nul.md", "Com1", "lpt9.log", "aux.tar.gz", "prn", "COM¹", "com²", "LPT³.txt"] {
+                assert!(super::validate_entry_name(bad).is_err(), "{bad:?}");
+            }
+            for ok in ["console.md", "com10.txt", "com0", "nulls", "lpt", "aux-notes.md", "prnt", "com⁴", "lpt¹x"] {
+                assert!(super::validate_workspace_rel_path(ok).is_ok(), "{ok}");
+                assert!(super::validate_entry_name(ok).is_ok(), "{ok}");
+            }
+        }
+        #[cfg(not(windows))]
+        for ok in ["con", "nul.md", "dir/Com1/x.txt"] {
+            assert!(super::validate_workspace_rel_path(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn state_db_names_and_entries_are_recognized_case_insensitively() {
+        for name in ["state.sqlite", "STATE.SQLITE", "State.SQLite-wal", "state.sqlite-shm", "state.sqlite-journal"] {
+            assert!(super::is_state_db_name(name), "{name}");
+        }
+        // Unicode 大小写折叠后同形（长 s `ſ` 的大写是 `S`）：大小写不敏感的文件系统把它们
+        // 当同一个名字，`eq_ignore_ascii_case` 看不见。
+        for name in ["ſtate.sqlite", "ſtate.ſqlite-wal", "STATE.SQLITE-JOURNAL"] {
+            assert!(super::is_state_db_name(name), "{name}");
+        }
+        for name in ["state.sqlite-backup", "state.sqlite2", "my-state.sqlite", "rclaw.toml", ""] {
+            assert!(!super::is_state_db_name(name), "{name}");
+        }
+        // Win32 会静默剥掉尾随点 / 空格：落盘名就是保留名。
+        #[cfg(windows)]
+        for name in ["state.sqlite-journal.", "state.sqlite ", "state.sqlite-wal.."] {
+            assert!(super::is_state_db_name(name), "{name:?}");
+        }
+        #[cfg(not(windows))]
+        assert!(!super::is_state_db_name("state.sqlite-journal."));
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agent");
+        std::fs::create_dir_all(root.join("backups")).unwrap();
+        let base = root.canonicalize().unwrap();
+        // 只有根下直接子项算；子目录里的同名文件、根本身都不算。
+        assert!(super::is_state_db_entry(&base, &base.join("state.sqlite")));
+        assert!(super::is_state_db_entry(&base, &base.join("STATE.SQLITE-WAL")));
+        assert!(!super::is_state_db_entry(&base, &base.join("backups").join("state.sqlite")));
+        assert!(!super::is_state_db_entry(&base, &base));
+        assert!(!super::is_state_db_entry(&base, &base.join("notes.md")));
+    }
+
+    #[test]
+    fn copy_workspace_file_never_follows_a_planted_destination_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let root = home.join("agent");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/notes.md"), b"hello").unwrap();
+        std::fs::write(root.join("state.sqlite"), b"db").unwrap();
+
+        // 普通复制：同目录「-副本」命名，冲突递增。
+        assert_eq!(
+            super::copy_workspace_file(&home, "docs/notes.md").unwrap(),
+            "docs/notes-副本.md"
+        );
+        assert_eq!(std::fs::read(root.join("docs/notes-副本.md")).unwrap(), b"hello");
+        assert_eq!(
+            super::copy_workspace_file(&home, "docs/notes.md").unwrap(),
+            "docs/notes-副本2.md"
+        );
+        // 运行时数据库不可复制。
+        assert_eq!(
+            super::copy_workspace_file(&home, "state.sqlite").unwrap_err(),
+            super::STATE_DB_PROTECTED
+        );
+        assert!(!root.join("state-副本.sqlite").exists());
+
+        #[cfg(unix)]
+        {
+            // 事先摆好的悬空链接 `plan-副本.md -> <工作区外>`：exists() 看它是空位，fs::copy
+            // 会顺着链接把内容写到工作区外；现在它算「已占用」，副本落到下一个候选名，
+            // 链接目标不被创建。
+            std::fs::write(root.join("docs/plan.md"), b"plan").unwrap();
+            let outside = dir.path().join("outside.md");
+            std::os::unix::fs::symlink(&outside, root.join("docs/plan-副本.md")).unwrap();
+            assert_eq!(
+                super::copy_workspace_file(&home, "docs/plan.md").unwrap(),
+                "docs/plan-副本2.md"
+            );
+            assert!(!outside.exists(), "不得顺着悬空链接在工作区外创建文件");
+            assert!(std::fs::symlink_metadata(root.join("docs/plan-副本.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read(root.join("docs/plan-副本2.md")).unwrap(), b"plan");
+            // 指向库文件的链接：内容不可复制。
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("docs/dblink.md")).unwrap();
+            assert_eq!(
+                super::copy_workspace_file(&home, "docs/dblink.md").unwrap_err(),
+                super::STATE_DB_PROTECTED
+            );
+        }
+    }
+
+    /// 覆盖写的打开路径：悬空链接在打开处就失败，链接目标【不被创建】（`O_CREAT` 单独
+    /// 会先把它建出来）；普通文件正常打开，`create_new` 撞上已有链接报 AlreadyExists。
+    #[cfg(unix)]
+    #[test]
+    fn open_for_write_nofollow_never_creates_a_dangling_link_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(super::open_for_write_nofollow(&link, false).is_err());
+        assert!(!outside.exists(), "不得顺着悬空链接创建目标文件");
+        assert_eq!(
+            super::open_for_write_nofollow(&link, true).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(!outside.exists());
+        // 指向已有文件的链接同样拒绝，目标内容不动。
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, b"keep").unwrap();
+        let link2 = dir.path().join("link2.txt");
+        std::os::unix::fs::symlink(&real, &link2).unwrap();
+        assert!(super::open_for_write_nofollow(&link2, false).is_err());
+        assert_eq!(std::fs::read(&real).unwrap(), b"keep");
+        // 普通文件：覆盖写与新建都正常。
+        let mut file = super::open_for_write_nofollow(&real, false).unwrap();
+        file.set_len(0).unwrap();
+        std::io::Write::write_all(&mut file, b"new").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+        let fresh = dir.path().join("fresh.txt");
+        drop(super::open_for_write_nofollow(&fresh, true).unwrap());
+        assert!(fresh.is_file());
+    }
+
+    #[test]
+    fn delete_workspace_entry_can_remove_stray_reserved_directory_but_not_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let root = home.join("agent");
+        std::fs::create_dir_all(root.join("state.sqlite-journal").join("sub")).unwrap();
+        std::fs::write(root.join("state.sqlite-journal/sub/x.txt"), b"x").unwrap();
+        std::fs::write(root.join("state.sqlite"), b"db").unwrap();
+        std::fs::write(root.join("note.md"), b"note").unwrap();
+
+        // 库文件本身拒绝；叫保留名的【真实目录】可删（它只会让 SQLite 开不了库）。
+        assert_eq!(
+            super::delete_workspace_entry(&home, "state.sqlite").unwrap_err(),
+            super::STATE_DB_PROTECTED
+        );
+        super::delete_workspace_entry(&home, "state.sqlite-journal").unwrap();
+        assert!(!root.join("state.sqlite-journal").exists());
+        assert_eq!(std::fs::read(root.join("state.sqlite")).unwrap(), b"db");
+        // 普通条目照删；根本身 / 非法路径拒绝。
+        super::delete_workspace_entry(&home, "note.md").unwrap();
+        assert!(!root.join("note.md").exists());
+        assert!(super::delete_workspace_entry(&home, "").is_err());
+        assert!(super::delete_workspace_entry(&home, "../agent").is_err());
+
+        #[cfg(unix)]
+        {
+            // 叫保留名的链接不是真实目录：仍拒绝。普通目录链接删的是链接本身。
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("state.sqlite-wal")).unwrap();
+            assert_eq!(
+                super::delete_workspace_entry(&home, "state.sqlite-wal").unwrap_err(),
+                super::STATE_DB_PROTECTED
+            );
+            std::fs::create_dir_all(root.join("docs")).unwrap();
+            std::fs::write(root.join("docs/keep.md"), b"keep").unwrap();
+            std::os::unix::fs::symlink(root.join("docs"), root.join("docs-link")).unwrap();
+            super::delete_workspace_entry(&home, "docs-link").unwrap();
+            assert!(std::fs::symlink_metadata(root.join("docs-link")).is_err());
+            assert_eq!(std::fs::read(root.join("docs/keep.md")).unwrap(), b"keep");
+        }
+    }
+
+    #[test]
+    fn rename_workspace_entry_guards_db_and_renames_leaf_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let root = home.join("agent");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/a.md"), b"a").unwrap();
+        std::fs::write(root.join("b.md"), b"b").unwrap();
+        std::fs::write(root.join("state.sqlite"), b"db").unwrap();
+
+        // 普通改名；目标已存在 / 非法名 / 根 / 不存在的条目拒绝。
+        super::rename_workspace_entry(&home, "docs/a.md", " a2.md ").unwrap();
+        assert_eq!(std::fs::read(root.join("docs/a2.md")).unwrap(), b"a");
+        std::fs::write(root.join("docs/taken.md"), b"t").unwrap();
+        assert!(super::rename_workspace_entry(&home, "docs/a2.md", "taken.md").is_err());
+        assert!(super::rename_workspace_entry(&home, "docs/a2.md", "x/y.md").is_err());
+        assert!(super::rename_workspace_entry(&home, "", "x.md").is_err());
+        assert!(super::rename_workspace_entry(&home, "nope.md", "x.md").is_err());
+        // 库文件不能被改名；根下别的文件也不能改成保留名（伴生名此刻不存在同样拦）。
+        assert_eq!(
+            super::rename_workspace_entry(&home, "state.sqlite", "backup.sqlite").unwrap_err(),
+            super::STATE_DB_PROTECTED
+        );
+        for reserved in ["state.sqlite-wal", "STATE.SQLITE-JOURNAL"] {
+            assert_eq!(
+                super::rename_workspace_entry(&home, "b.md", reserved).unwrap_err(),
+                super::STATE_DB_PROTECTED,
+                "{reserved}"
+            );
+        }
+        // 子目录里叫保留名无妨。
+        super::rename_workspace_entry(&home, "docs/taken.md", "state.sqlite-wal").unwrap();
+        assert!(root.join("docs/state.sqlite-wal").exists());
+        assert_eq!(std::fs::read(root.join("state.sqlite")).unwrap(), b"db");
+        // 根下叫保留名的【真实目录】与 delete 同口径可改名（它不是库文件，改走名字同样
+        // 能让 SQLite 重新打开库）。
+        std::fs::create_dir(root.join("state.sqlite-journal")).unwrap();
+        super::rename_workspace_entry(&home, "state.sqlite-journal", "stray-dir").unwrap();
+        assert!(root.join("stray-dir").is_dir());
+        assert!(!root.join("state.sqlite-journal").exists());
+
+        #[cfg(unix)]
+        {
+            // 链接改名改的是链接本身；指向库文件的链接与库同口径拒绝。
+            std::os::unix::fs::symlink(root.join("docs"), root.join("docs-link")).unwrap();
+            super::rename_workspace_entry(&home, "docs-link", "docs-link2").unwrap();
+            assert!(std::fs::symlink_metadata(root.join("docs-link2"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(root.join("docs/a2.md").exists());
+            // 悬空链接也占着名字：不能被 rename 静默换掉。
+            std::os::unix::fs::symlink(root.join("missing"), root.join("dangling")).unwrap();
+            assert!(super::rename_workspace_entry(&home, "b.md", "dangling").is_err());
+            assert!(std::fs::symlink_metadata(root.join("dangling"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read(root.join("b.md")).unwrap(), b"b");
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("dblink")).unwrap();
+            assert_eq!(
+                super::rename_workspace_entry(&home, "dblink", "renamed").unwrap_err(),
+                super::STATE_DB_PROTECTED
+            );
+            assert_eq!(
+                super::delete_workspace_entry(&home, "dblink").unwrap_err(),
+                super::STATE_DB_PROTECTED
+            );
+        }
+    }
+
+    /// Windows 8.3 短名是同一文件的另一个合法拼写：`STATE~1.SQL` 过得了名字校验、字面又不是
+    /// 保留名，删除 / 重命名必须按真实落点识别出它就是库。卷上关了 8.3 生成时拿不到短名，
+    /// 直接跳过。
+    #[cfg(windows)]
+    #[test]
+    fn delete_and_rename_refuse_windows_short_name_alias_of_the_db() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let root = home.join("agent");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("state.sqlite"), b"db").unwrap();
+        let wide: Vec<u16> = root
+            .join("state.sqlite")
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buf = vec![0u16; 1024];
+        let len = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                wide.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        };
+        assert!(len > 0 && (len as usize) < buf.len(), "GetShortPathNameW 失败");
+        let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]));
+        let Some(alias) = short.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            panic!("短名不可解析: {short:?}");
+        };
+        if alias.eq_ignore_ascii_case("state.sqlite") {
+            eprintln!("卷未启用 8.3 短名生成，跳过");
+            return;
+        }
+        assert!(!super::is_state_db_name(&alias), "{alias} 字面不是保留名，才是本测试要挡的别名");
+        assert_eq!(
+            super::delete_workspace_entry(&home, &alias).unwrap_err(),
+            super::STATE_DB_PROTECTED
+        );
+        assert_eq!(
+            super::rename_workspace_entry(&home, &alias, "gone.sqlite").unwrap_err(),
+            super::STATE_DB_PROTECTED
+        );
+        assert_eq!(std::fs::read(root.join("state.sqlite")).unwrap(), b"db");
+    }
+
+    #[test]
+    fn admit_pasted_file_moves_from_staging_and_refuses_reserved_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let root = home.join("agent");
+        std::fs::create_dir_all(&root).unwrap();
+        let base = root.canonicalize().unwrap();
+        let staging = home.join(super::PASTE_STAGING_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+
+        // 普通文件：搬进目标目录，暂存清空，返回 ok:<名>。
+        std::fs::write(staging.join("notes.txt"), b"hello").unwrap();
+        assert_eq!(
+            super::admit_pasted_file(&home, &base, true, &staging, "ok:notes.txt").unwrap(),
+            "ok:notes.txt"
+        );
+        assert_eq!(std::fs::read(base.join("notes.txt")).unwrap(), b"hello");
+        assert!(!staging.join("notes.txt").exists());
+        // 同名已存在：按「名(n).扩展」递增，不覆盖。
+        std::fs::write(staging.join("notes.txt"), b"second").unwrap();
+        assert_eq!(
+            super::admit_pasted_file(&home, &base, true, &staging, "ok:notes.txt").unwrap(),
+            "ok:notes(1).txt"
+        );
+        assert_eq!(std::fs::read(base.join("notes.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(base.join("notes(1).txt")).unwrap(), b"second");
+        // 根下的运行时数据库保留名：暂存文件删掉、拒绝，工作区根从未出现过它。
+        std::fs::write(staging.join("state.sqlite-journal"), b"fake").unwrap();
+        assert_eq!(
+            super::admit_pasted_file(&home, &base, true, &staging, "ok:state.sqlite-journal")
+                .unwrap_err(),
+            super::STATE_DB_PROTECTED
+        );
+        assert!(!staging.join("state.sqlite-journal").exists());
+        assert!(!base.join("state.sqlite-journal").exists());
+        // 子目录不是根：同名放行。
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(staging.join("state.sqlite-journal"), b"fake").unwrap();
+        assert_eq!(
+            super::admit_pasted_file(&home, &sub, false, &staging, "ok:state.sqlite-journal")
+                .unwrap(),
+            "ok:state.sqlite-journal"
+        );
+        // 桥接返回异常 / 非法名：不碰文件系统。
+        assert!(super::admit_pasted_file(&home, &base, true, &staging, "error:x").is_err());
+        assert!(super::admit_pasted_file(&home, &base, true, &staging, "ok:").is_err());
+        assert!(super::admit_pasted_file(&home, &base, true, &staging, "ok:a/b.txt").is_err());
+        assert!(super::admit_pasted_file(&home, &base, true, &staging, "ok:..").is_err());
+    }
+
+    #[test]
+    fn entry_names_must_be_single_plain_components() {
+        for ok in ["笔记.md", "a-b_c.txt", "no-ext", "state.sqlite-backup", "x.y.z", "a..b.md"] {
+            assert!(super::validate_entry_name(ok).is_ok(), "{ok}");
+            // 单分量名 join 后父目录不变（rename / new_folder 的二次核对依赖此性质）。
+            let joined = std::path::Path::new("parent").join(ok);
+            assert_eq!(joined.parent(), Some(std::path::Path::new("parent")), "{ok}");
+        }
+        for bad in [
+            "", ".", "..", "a/b", "a\\b", "../x", "C:evil", "C:\\evil", "state.sqlite:ads",
+            "a<b", "a>b", "a|b", "a?b", "a*b", "a\"b", "tab\tname", "trailing.", "trailing ",
+            "\\\\?\\C:\\x",
+        ] {
+            assert!(super::validate_entry_name(bad).is_err(), "{bad:?}");
+        }
+        let long = "名".repeat(121);
+        assert!(super::validate_entry_name(&long).is_err());
     }
 
     #[test]
@@ -2080,7 +2601,7 @@ pub async fn bot_save(
     Ok(())
 }
 
-/// 删除 bot 定义与其数据目录（会话文件保留，可手动清理）。
+/// 删除 bot 定义与其数据目录（会话记录仍留在 state.sqlite，可在会话列表里逐个删除）。
 #[tauri::command]
 pub async fn bot_delete(state: State<'_, AppState>, name: String) -> Result<(), String> {
     let (registry, _) = bot_components(&state)?;
@@ -2958,10 +3479,212 @@ fn config_entry_dto(home: &std::path::Path) -> WorkspaceEntryDto {
     }
 }
 
+/// 运行时数据库文件名（`agent/state.sqlite` 及 SQLite 的 WAL / SHM / 回滚日志伴生文件）。
+/// 进程持有打开的连接：文件面板删除 / 重命名 / 以此为名新建都会撕裂正在写入的库，
+/// 一律拒绝。读写本来就被文本扩展名白名单挡住，这里补齐剩余入口。
+const STATE_DB_NAMES: &[&str] = &[
+    "state.sqlite",
+    "state.sqlite-wal",
+    "state.sqlite-shm",
+    "state.sqlite-journal",
+];
+
+/// 条目名是否是运行时数据库保留名。Windows 另剥掉 Win32 会静默丢弃的尾随点/空格
+/// （`state.sqlite-journal.` 落盘后就是 `state.sqlite-journal`，一个假 hot journal 足以
+/// 让下次打开时读坏库）。除 ASCII 大小写外还按 Unicode 大小写折叠比一次：NTFS / APFS
+/// 这类大小写不敏感文件系统把 `ſtate.sqlite`（长 s）这类折叠后同形的名字当同一条目。
+fn is_state_db_name(name: &str) -> bool {
+    #[cfg(windows)]
+    let name = name.trim_end_matches(['.', ' ']);
+    STATE_DB_NAMES.iter().any(|db| {
+        name.eq_ignore_ascii_case(db)
+            || name.to_lowercase() == *db
+            || name.to_uppercase() == db.to_uppercase()
+    })
+}
+
+/// 已解析（canonical）的工作区条目是否就是根下的运行时数据库文件。
+/// 按真实路径判断而不是入参字面——`./state.sqlite`、尾随点等拼写差异不影响结论。
+/// 叶子未 canonicalize 的调用方（删除 / 重命名）要用 [`is_state_db_target`]。
+fn is_state_db_entry(base: &std::path::Path, canonical: &std::path::Path) -> bool {
+    canonical.parent() == Some(base)
+        && canonical
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_state_db_name)
+}
+
+/// 叶子【未跟随】解析出的条目是否落在运行时数据库文件上：先按条目自己的名字判，再按
+/// `canonicalize` 后的真实落点判。后者挡住两类别名：Windows 8.3 短名——`STATE~1.SQL` 是
+/// `state.sqlite` 的另一个合法拼写，`symlink_metadata` 能探到、字面却不是保留名；以及指向
+/// 库文件的符号链接（删 / 改名链接本身无害，但与 rclaw-tools 同口径一律拒绝，省得为一个
+/// 没人需要的操作留判断分支）。真实目录不可能是库文件，由调用方按 `symlink_metadata`
+/// 先行放行。
+fn is_state_db_target(base: &std::path::Path, entry: &std::path::Path) -> bool {
+    is_state_db_entry(base, entry)
+        || entry
+            .canonicalize()
+            .is_ok_and(|real| is_state_db_entry(base, &real))
+}
+
+/// 以「不跟随叶子链接」的方式打开待写入的文件（`create_new` = 必须新建，否则覆盖或新建）。
+///
+/// 先 `symlink_metadata` 再写仍留下检查与打开之间的窗口：一条此刻被摆进来的悬空链接
+/// `x -> /别处/新文件` 会让 `fs::write` / Windows 的 `CREATE_NEW` 顺着链接把内容写到工作区外
+/// （Windows 的 CreateFile 先穿越 reparse point 再应用 CREATE_NEW；POSIX 的 `O_EXCL` 不跟随，
+/// 但覆盖写用的 `O_CREAT` 跟随——它会先把链接目标【创建】出来）。所以打开本身就不跟随，
+/// 再用句柄核对，核对通过前不截断、不写：
+/// - Windows：`FILE_FLAG_OPEN_REPARSE_POINT` 让 CreateFile 停在 reparse point 本身，`CREATE_NEW`
+///   撞上已有链接报 AlreadyExists；覆盖写时看句柄的 `is_symlink()`。不是链接 / junction 的
+///   reparse point（OneDrive 云占位、WOF 压缩、去重文件）也拒绝：绕过其过滤驱动裸写会损坏它，
+///   而正常打开又会丢掉不跟随链接的保证。
+/// - Unix：`O_NOFOLLOW` 让 open 在链接处直接失败（ELOOP），不会创建链接目标；`O_NONBLOCK`
+///   让换成 FIFO 的路径不把阻塞线程挂死。再比较 `lstat(path)` 与 `fstat(fd)` 的 (dev, ino)
+///   兜底：路径此刻已被换成别的文件时二者不一致。
+fn open_for_write_nofollow(
+    path: &std::path::Path,
+    create_new: bool,
+) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let handle_meta = file.metadata()?;
+    let not_plain_file = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "目标是符号链接或非普通文件，不跟随链接写入",
+        )
+    };
+    if handle_meta.file_type().is_symlink() || !handle_meta.is_file() {
+        return Err(not_plain_file());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if handle_meta.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "目标是云占位 / 压缩等特殊文件（reparse point），文件面板不直接写入；请先在资源管理器里\
+                 将其设为「始终保留在此设备上」或取消压缩",
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let path_meta = std::fs::symlink_metadata(path)?;
+        if path_meta.file_type().is_symlink()
+            || (path_meta.dev(), path_meta.ino()) != (handle_meta.dev(), handle_meta.ino())
+        {
+            return Err(not_plain_file());
+        }
+    }
+    Ok(file)
+}
+
+const STATE_DB_PROTECTED: &str =
+    "state.sqlite 是 RClaw 运行时数据库（会话 / 回滚点 / journal），不能在文件面板里删除、重命名、复制或覆盖；要导出会话请在聊天里用 /export";
+
+/// 校验前端传来的工作区相对路径（`a/b/c.md`；空串是否代表根由各命令自行决定）。
+///
+/// 只过滤 `..` / `\` / 前导 `/` 不够：Windows 上 `base.join("C:evil")` 会整个替换成盘符
+/// 相对路径，`name:stream` 打开的是备用数据流。逐段要求是普通分量（非空、非 `.` / `..`、
+/// 无控制字符），Windows 再加 `:<>"|?*` 与尾随点 / 空格；最后用 `components()` 兜底，
+/// 任何 Prefix / RootDir / ParentDir 都拒绝。面板列出的现有条目名来自 `read_dir`，
+/// 类 Unix 允许 `:` 等字符出现在文件名里，所以那组字符只在 Windows 上拦。
+fn validate_workspace_rel_path(path: &str) -> Result<(), String> {
+    if path.contains('\\') || path.starts_with('/') {
+        return Err("非法路径".into());
+    }
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err("非法路径".into());
+        }
+        if segment.chars().any(char::is_control) {
+            return Err("路径不能包含控制字符".into());
+        }
+        #[cfg(windows)]
+        if segment
+            .chars()
+            .any(|c| matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+            || segment.ends_with('.')
+            || segment.ends_with(' ')
+        {
+            return Err("路径不能包含 : < > \" | ? * 或以点 / 空格结尾".into());
+        }
+        if is_dos_device_name(segment) {
+            return Err("路径分量不能是 Windows 设备名（CON / NUL / COM1 / LPT1 …）".into());
+        }
+    }
+    if !std::path::Path::new(path)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err("非法路径".into());
+    }
+    Ok(())
+}
+
+/// 校验「新建 / 重命名」给出的条目名：必须是单个普通路径分量。
+///
+/// 只过滤 `/`、`\`、`..` 不够：Windows 上 `parent.join("C:evil")` 会整个替换成盘符相对路径
+/// `C:evil`（落到 C: 当前目录），`name:stream` 打开的是备用数据流。统一在所有平台拒绝
+/// `:<>"|?*` 与控制字符、尾随点 / 空格（Win32 会静默剥掉，落盘名与显示名不一致），并要求
+/// `Path::new(name)` 恰好解析为一个 `Normal` 分量且原样等于 name（挡住 `.`、`..`、
+/// 盘符、根、`\\?\` 前缀等一切非普通分量）。
+fn validate_entry_name(name: &str) -> Result<(), String> {
+    // 按字符数限长（len() 是字节数，中文名会被压到 40 字）。
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err("名称不能为空且不超过 120 字符".into());
+    }
+    // `..` 本身由下面的「恰好一个 Normal 分量」检查拒绝；`a..b.md` 这种含连续点的普通名
+    // 与工作区路径校验口径一致地放行（否则面板能打开却不能新建 / 改成这个名字）。
+    if name.contains('/') || name.contains('\\') {
+        return Err("名称不能包含路径分隔符".into());
+    }
+    if name
+        .chars()
+        .any(|c| matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*') || c.is_control())
+    {
+        return Err("名称不能包含 : < > \" | ? * 或控制字符".into());
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err("名称不能以点或空格结尾".into());
+    }
+    if is_dos_device_name(name) {
+        return Err("名称不能是 Windows 设备名（CON / NUL / COM1 / LPT1 …）".into());
+    }
+    let mut components = std::path::Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(only)), None) if only == name => Ok(()),
+        _ => Err("名称必须是单个文件名，不能是路径".into()),
+    }
+}
+
 /// 解析工作区相对目录（空 = agent 根）：拒绝越区，必须真实存在且是目录。
 fn resolve_workspace_dir(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
-    if rel.contains("..") || rel.contains('\\') || rel.starts_with('/') {
-        return Err("非法目录路径".into());
+    if !rel.is_empty() {
+        validate_workspace_rel_path(rel).map_err(|_| "非法目录路径".to_string())?;
     }
     let base = root
         .canonicalize()
@@ -3030,7 +3753,7 @@ pub async fn workspace_list(
     .map_err(|e| format!("列目录任务失败: {e}"))?
 }
 
-/// 文本编辑上限：1MB（会话 jsonl / 大日志只读浏览，编辑走外部导出）。
+/// 文本编辑上限：1MB（大日志 / 导出文件只读浏览，编辑走外部导出）。
 const WORKSPACE_TEXT_MAX_BYTES: u64 = 1024 * 1024;
 
 /// 可编辑文本的扩展名白名单（无扩展名文件经 NUL 探测放行，如 LICENSE）。
@@ -3052,9 +3775,7 @@ fn is_workspace_editable_text(name: &str) -> bool {
 pub async fn workspace_read(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let home = state.home.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if path.contains("..") || path.contains('\\') || path.starts_with('/') {
-            return Err("非法文件路径".into());
-        }
+        validate_workspace_rel_path(&path).map_err(|_| "非法文件路径".to_string())?;
         let root = home.join("agent");
         // 主配置虚拟条目：读 home 根的实体。
         if is_config_virtual(&root, &path) {
@@ -3109,9 +3830,7 @@ pub async fn workspace_write(
 ) -> Result<(), String> {
     let home = state.home.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if path.contains("..") || path.contains('\\') || path.starts_with('/') {
-            return Err("非法文件路径".into());
-        }
+        validate_workspace_rel_path(&path).map_err(|_| "非法文件路径".to_string())?;
         let root = home.join("agent");
         // 主配置虚拟条目：完整校验（TOML 解析 + Config 校验 + provider 引用
         // 一致性）通过才落盘，与配置栏目「从文件导入」同一通道（错误文案
@@ -3145,17 +3864,36 @@ pub async fn workspace_write(
         if content.len() as u64 > WORKSPACE_TEXT_MAX_BYTES {
             return Err("内容超过 1MB 上限".into());
         }
+        // 叶子不跟随符号链接：`notes.md -> state.sqlite`（或指向工作区外的文件）能过扩展名
+        // 白名单，fs::write 却会顺着链接写到目标上。已存在的目标必须是普通文件。
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err("目标是符号链接，应用内编辑不跟随链接写入".into());
+            }
+            Ok(meta) if !meta.is_file() => return Err("目标不是文件".into()),
+            _ => {}
+        }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
         }
-        std::fs::write(&target, content).map_err(|e| format!("保存失败: {e}"))?;
+        // 上面的探测与这里的打开之间仍有窗口（悬空链接被摆进来）：打开后按句柄核对，
+        // 核对通过才截断、写入。
+        let mut file = open_for_write_nofollow(&target, false)
+            .map_err(|e| format!("保存失败: {e}"))?;
+        file.set_len(0)
+            .and_then(|()| std::io::Write::write_all(&mut file, content.as_bytes()))
+            .map_err(|e| format!("保存失败: {e}"))?;
         Ok(())
     })
     .await
     .map_err(|e| format!("保存任务失败: {e}"))?
 }
 
-/// 解析工作区内已存在的文件/目录（copy/delete 共用）：返回 (base, canonical)。
+/// 解析工作区内已存在的文件/目录（copy/delete/rename 共用）：返回 (base, entry)。
+///
+/// 只 canonicalize 父目录，叶子用 `symlink_metadata` 探存在性、**不跟随**：删除 / 重命名
+/// 的对象是条目本身——`link -> notes/` 删的该是链接而不是 notes/ 里的内容，改名改的也是
+/// 链接。需要读内容的调用方（复制）自己再对叶子 canonicalize 一次校验真实落点。
 fn resolve_workspace_entry(
     root: &std::path::Path,
     path: &str,
@@ -3163,20 +3901,74 @@ fn resolve_workspace_entry(
     if path.is_empty() {
         return Err("路径不能为空".into());
     }
-    if path.contains("..") || path.contains('\\') || path.starts_with('/') {
-        return Err("非法路径".into());
-    }
+    validate_workspace_rel_path(path).map_err(|_| "非法路径".to_string())?;
     let base = root
         .canonicalize()
         .map_err(|e| format!("工作区不可用: {e}"))?;
-    let canonical = base
-        .join(path)
+    let joined = base.join(path);
+    let (parent, name) = match (joined.parent(), joined.file_name()) {
+        (Some(parent), Some(name)) => (parent.to_path_buf(), name.to_os_string()),
+        _ => return Err("非法路径".into()),
+    };
+    let canonical_parent = parent
         .canonicalize()
         .map_err(|e| format!("不存在: {e}"))?;
-    if !canonical.starts_with(&base) {
+    if !canonical_parent.starts_with(&base) {
         return Err("路径越出工作区".into());
     }
-    Ok((base, canonical))
+    let entry = canonical_parent.join(name);
+    std::fs::symlink_metadata(&entry).map_err(|e| format!("不存在: {e}"))?;
+    Ok((base, entry))
+}
+
+/// 删除符号链接本身（不碰目标）。Windows 的目录链接 / junction 要用 `remove_dir`，
+/// 文件链接用 `remove_file`：按条目自己的类型选删法，两种都试、报与类型相符的那个错误
+/// （文件链接因共享冲突删不掉时，不能用 `remove_dir` 的「目录名无效」盖掉真因）。
+fn remove_symlink(entry: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        type RemoveFn = fn(&std::path::Path) -> std::io::Result<()>;
+        let is_dir_link = std::fs::symlink_metadata(entry)
+            .is_ok_and(|meta| meta.file_type().is_symlink_dir());
+        let (first, second): (RemoveFn, RemoveFn) = if is_dir_link {
+            (|p| std::fs::remove_dir(p), |p| std::fs::remove_file(p))
+        } else {
+            (|p| std::fs::remove_file(p), |p| std::fs::remove_dir(p))
+        };
+        match first(entry) {
+            Ok(()) => Ok(()),
+            Err(e) => second(entry).map_err(|_| e),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(entry)
+    }
+}
+
+/// 复制类命令要读条目内容，跟随叶子链接解析到真实文件：落点仍须在工作区内，且不能是
+/// 运行时数据库（`copyme -> state.sqlite` 这类链接名字无害、内容却是正在写的库）。
+fn resolve_workspace_file_content(
+    base: &std::path::Path,
+    entry: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let target = entry
+        .canonicalize()
+        .map_err(|e| format!("不存在: {e}"))?;
+    if !target.starts_with(base) {
+        return Err("链接指向工作区外，拒绝复制".into());
+    }
+    if is_state_db_entry(base, entry) || is_state_db_entry(base, &target) {
+        return Err(STATE_DB_PROTECTED.into());
+    }
+    let meta = target
+        .metadata()
+        .map_err(|e| format!("读取文件信息失败: {e}"))?;
+    if !meta.is_file() {
+        return Err("仅支持复制文件（目录请进入后逐个复制）".into());
+    }
+    Ok(target)
 }
 
 /// 复制工作区文件为同目录副本（自动命名「原名-副本.扩展」，冲突递增）。
@@ -3186,78 +3978,110 @@ pub async fn workspace_copy_file(
     path: String,
 ) -> Result<String, String> {
     let home = state.home.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        // 主配置虚拟条目：复制为 agent 根下的真实副本（改动主配置前的手动备份路径）。
-        if is_config_virtual(&home.join("agent"), &path) {
-            let src = home.join(CONFIG_NAME);
-            let bytes =
-                std::fs::read(&src).map_err(|e| format!("读取主配置失败: {e}"))?;
-            let base = home
-                .join("agent")
-                .canonicalize()
-                .map_err(|e| format!("工作区不可用: {e}"))?;
-            let mut n = 1u32;
-            loop {
-                let candidate = if n == 1 {
+    tauri::async_runtime::spawn_blocking(move || copy_workspace_file(&home, &path))
+        .await
+        .map_err(|e| format!("复制任务失败: {e}"))?
+}
+
+/// 在 `dir` 下找一个尚不存在的副本名并把 `write` 的内容写进去（最多 999 个候选）。
+///
+/// 「尚不存在」用 `symlink_metadata` 判（`exists()` 会跟随链接：一条事先摆好的悬空链接
+/// `x-副本.md -> /别处/新文件` 会被当成空位，`fs::copy` / `fs::write` 顺着链接把内容写到
+/// 工作区外）；创建用 [`open_for_write_nofollow`]（POSIX `O_EXCL` 不跟随；Windows 加
+/// `FILE_FLAG_OPEN_REPARSE_POINT` 才不跟随）兜住检查与创建之间的窗口。
+fn write_fresh_copy(
+    dir: &std::path::Path,
+    candidate_name: impl Fn(u32) -> String,
+    write: impl Fn(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<std::path::PathBuf, String> {
+    write_fresh_file(dir, "复制失败", candidate_name, write)
+}
+
+/// [`write_fresh_copy`] 的通用形式：`failure` 是错误文案前缀（复制 / 上传 / 保存各自措辞）。
+/// 上传、照片编辑保存这类落到 `uploads/` 下、名字可预测（时间戳）的新文件也走这里：
+/// 事先摆好的同名悬空链接不会被 `fs::write` 顺着写到工作区外。
+fn write_fresh_file(
+    dir: &std::path::Path,
+    failure: &str,
+    candidate_name: impl Fn(u32) -> String,
+    write: impl Fn(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<std::path::PathBuf, String> {
+    for n in 1..=999u32 {
+        let dest = dir.join(candidate_name(n));
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            continue;
+        }
+        let mut file = match open_for_write_nofollow(&dest, true) {
+            Ok(file) => file,
+            // 刚被别人占了名字：换下一个候选。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{failure}: {e}")),
+        };
+        if let Err(e) = write(&mut file) {
+            drop(file);
+            let _ = std::fs::remove_file(&dest);
+            return Err(format!("{failure}: {e}"));
+        }
+        return Ok(dest);
+    }
+    Err(format!("{failure}: 同名文件过多，请手动整理"))
+}
+
+/// [`workspace_copy_file`] 的核心（与 Tauri 状态解耦便于测试）：返回相对工作区根的副本路径。
+fn copy_workspace_file(home: &std::path::Path, path: &str) -> Result<String, String> {
+    let root = home.join("agent");
+    // 主配置虚拟条目：复制为 agent 根下的真实副本（改动主配置前的手动备份路径）。
+    if is_config_virtual(&root, path) {
+        let bytes =
+            std::fs::read(home.join(CONFIG_NAME)).map_err(|e| format!("读取主配置失败: {e}"))?;
+        let base = root
+            .canonicalize()
+            .map_err(|e| format!("工作区不可用: {e}"))?;
+        let dest = write_fresh_copy(
+            &base,
+            |n| {
+                if n == 1 {
                     "rclaw-副本.toml".to_string()
                 } else {
                     format!("rclaw-副本{n}.toml")
-                };
-                let dest = base.join(&candidate);
-                if !dest.exists() {
-                    std::fs::write(&dest, &bytes).map_err(|e| format!("复制失败: {e}"))?;
-                    return Ok(candidate);
                 }
-                n += 1;
-                if n > 999 {
-                    return Err("同名副本过多，请手动整理".into());
-                }
-            }
-        }
-        let (base, canonical) = resolve_workspace_entry(&home.join("agent"), &path)?;
-        let meta = canonical
-            .metadata()
-            .map_err(|e| format!("读取文件信息失败: {e}"))?;
-        if !meta.is_file() {
-            return Err("仅支持复制文件（目录请进入后逐个复制）".into());
-        }
-        let src_name = canonical
+            },
+            |file| std::io::Write::write_all(file, &bytes),
+        )?;
+        return Ok(dest
             .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("文件名不可解析")?;
-        let (stem, ext) = match src_name.rsplit_once('.') {
-            Some((s, e)) => (s, Some(e)),
-            None => (src_name, None),
-        };
-        let parent = canonical.parent().ok_or("父目录不可解析")?;
-        let mut n = 1u32;
-        loop {
-            let candidate = match (n, ext) {
-                (1, Some(e)) => format!("{stem}-副本.{e}"),
-                (1, None) => format!("{stem}-副本"),
-                (i, Some(e)) => format!("{stem}-副本{i}.{e}"),
-                (i, None) => format!("{stem}-副本{i}"),
-            };
-            let dest = parent.join(&candidate);
-            if !dest.exists() {
-                std::fs::copy(&canonical, &dest).map_err(|e| format!("复制失败: {e}"))?;
-                // 相对工作区根的返回路径（供前端刷新定位；base 已 canonicalize，
-                // 剥前缀得到相对分量）。
-                let rel = dest
-                    .strip_prefix(&base)
-                    .map_err(|_| "结果路径异常".to_string())?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                return Ok(rel);
-            }
-            n += 1;
-            if n > 999 {
-                return Err("同名副本过多，请手动整理".into());
-            }
-        }
-    })
-    .await
-    .map_err(|e| format!("复制任务失败: {e}"))?
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default());
+    }
+    let (base, entry) = resolve_workspace_entry(&root, path)?;
+    // 副本放在条目所在目录、以条目名命名；内容取跟随链接后的真实文件（已校验落点与保留名）。
+    let source = resolve_workspace_file_content(&base, &entry)?;
+    let src_name = entry
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("文件名不可解析")?;
+    let (stem, ext) = match src_name.rsplit_once('.') {
+        Some((s, e)) => (s, Some(e)),
+        None => (src_name, None),
+    };
+    let parent = entry.parent().ok_or("父目录不可解析")?;
+    // 副本名一定含「-副本」，不可能撞上根目录保留名（state.sqlite*），无需再核。
+    let candidate_name = |n: u32| match (n, ext) {
+        (1, Some(e)) => format!("{stem}-副本.{e}"),
+        (1, None) => format!("{stem}-副本"),
+        (i, Some(e)) => format!("{stem}-副本{i}.{e}"),
+        (i, None) => format!("{stem}-副本{i}"),
+    };
+    let dest = write_fresh_copy(parent, candidate_name, |file| {
+        let mut from = std::fs::File::open(&source)?;
+        std::io::copy(&mut from, file).map(|_| ())
+    })?;
+    // 相对工作区根的返回路径（供前端刷新定位；base 已 canonicalize，剥前缀得到相对分量）。
+    Ok(dest
+        .strip_prefix(&base)
+        .map_err(|_| "结果路径异常".to_string())?
+        .to_string_lossy()
+        .replace('\\', "/"))
 }
 
 /// 删除工作区文件或目录（目录递归删除；拒绝删除 agent 根自身）。
@@ -3268,22 +4092,36 @@ pub async fn workspace_delete(state: State<'_, AppState>, path: String) -> Resul
         if is_config_virtual(&home.join("agent"), &path) {
             return Err("主配置 rclaw.toml 是虚拟条目，不能删除（可清空内容或复制副本）".into());
         }
-        let (base, canonical) = resolve_workspace_entry(&home.join("agent"), &path)?;
-        if canonical == base {
-            return Err("不能删除工作区根目录".into());
-        }
-        let meta = canonical
-            .metadata()
-            .map_err(|e| format!("读取信息失败: {e}"))?;
-        if meta.is_dir() {
-            std::fs::remove_dir_all(&canonical).map_err(|e| format!("删除目录失败: {e}"))?;
-        } else {
-            std::fs::remove_file(&canonical).map_err(|e| format!("删除文件失败: {e}"))?;
-        }
-        Ok(())
+        delete_workspace_entry(&home, &path)
     })
     .await
     .map_err(|e| format!("删除任务失败: {e}"))?
+}
+
+/// [`workspace_delete`] 的核心（与 Tauri 状态解耦便于测试）。
+fn delete_workspace_entry(home: &std::path::Path, path: &str) -> Result<(), String> {
+    let (base, entry) = resolve_workspace_entry(&home.join("agent"), path)?;
+    // 路径校验已保证非空且全是普通分量，解析不到根本身；留作兜底。
+    if entry == base {
+        return Err("不能删除工作区根目录".into());
+    }
+    // 叶子不跟随链接：删的是链接本身，不是它指向的目录 / 文件。
+    let meta = std::fs::symlink_metadata(&entry).map_err(|e| format!("读取信息失败: {e}"))?;
+    // 运行时数据库守卫只拦库文件本身与叫保留名的链接：一个叫 `state.sqlite-journal/` 的
+    // 【真实目录】不可能是库文件，却会让 SQLite 下次打开失败——安卓上文件面板是应用私有
+    // 目录唯一的文件管理器，不放行它用户就只剩清空应用数据一条路。
+    // 字面之外还按真实落点判（Windows 8.3 短名 `STATE~1.SQL`、指向库文件的链接）。
+    if !meta.is_dir() && is_state_db_target(&base, &entry) {
+        return Err(STATE_DB_PROTECTED.into());
+    }
+    if meta.file_type().is_symlink() {
+        remove_symlink(&entry).map_err(|e| format!("删除链接失败: {e}"))?;
+    } else if meta.is_dir() {
+        std::fs::remove_dir_all(&entry).map_err(|e| format!("删除目录失败: {e}"))?;
+    } else {
+        std::fs::remove_file(&entry).map_err(|e| format!("删除文件失败: {e}"))?;
+    }
+    Ok(())
 }
 
 /// 重命名文件/目录（仅名字，不换目录）：新名不含分隔符/..，目标不得已存在。
@@ -3294,37 +4132,51 @@ pub async fn workspace_rename(
     new_name: String,
 ) -> Result<(), String> {
     let home = state.home.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let name = new_name.trim();
-        // 按字符数限长（len() 是字节数，中文名会被压到 40 字）。
-        if name.is_empty() || name.chars().count() > 120 {
-            return Err("名称不能为空且不超过 120 字符".into());
-        }
-        if name.contains('/') || name.contains('\\') || name.contains("..") {
-            return Err("名称不能包含路径分隔符".into());
-        }
-        let root = home.join("agent");
-        if is_config_virtual(&root, &path) {
-            return Err("主配置 rclaw.toml 不能重命名".into());
-        }
-        let (_base, canonical) = resolve_workspace_entry(&root, &path)?;
-        let parent = canonical.parent().ok_or("父目录不可解析")?;
-        let target = parent.join(name);
-        if target.exists() {
-            return Err("同名文件/目录已存在".into());
-        }
-        // 根目录的 rclaw.toml 保留给主配置虚拟条目（target.exists() 探不到
-        // 虚拟名；path 不含分隔符即位于根）。
-        if !path.contains('/')
-            && config_virtual_active(&root)
-            && name.eq_ignore_ascii_case(CONFIG_NAME)
-        {
-            return Err("rclaw.toml 是主配置保留名（在根目录直接编辑即改主配置）".into());
-        }
-        std::fs::rename(&canonical, &target).map_err(|e| format!("重命名失败: {e}"))
-    })
-    .await
-    .map_err(|e| format!("重命名任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || rename_workspace_entry(&home, &path, &new_name))
+        .await
+        .map_err(|e| format!("重命名任务失败: {e}"))?
+}
+
+/// [`workspace_rename`] 的核心（与 Tauri 状态解耦便于测试）。
+fn rename_workspace_entry(home: &std::path::Path, path: &str, new_name: &str) -> Result<(), String> {
+    let name = new_name.trim();
+    validate_entry_name(name)?;
+    let root = home.join("agent");
+    if is_config_virtual(&root, path) {
+        return Err("主配置 rclaw.toml 不能重命名".into());
+    }
+    // 叶子不跟随链接：改名改的是条目本身（链接就改链接，不动它指向的文件）。
+    let (base, entry) = resolve_workspace_entry(&root, path)?;
+    // 路径校验已保证解析不到根本身（改名根 = 把整个工作区连库搬走）；留作兜底。
+    if entry == base {
+        return Err("不能重命名工作区根目录".into());
+    }
+    let parent = entry.parent().ok_or("父目录不可解析")?;
+    let at_root = parent == base;
+    // 运行时数据库：既不能被改名（含 8.3 短名 / 指向它的链接，见 is_state_db_target），
+    // 也不能让别的文件改成它的名字（伴生文件可能此刻不存在，一个假 WAL 足以让 SQLite
+    // 读坏库）。叫保留名的【真实目录】与 delete 同口径放行：它不是库文件，改走名字
+    // 同样能让 SQLite 重新打开库。
+    let meta = std::fs::symlink_metadata(&entry).map_err(|e| format!("读取信息失败: {e}"))?;
+    if (!meta.is_dir() && is_state_db_target(&base, &entry)) || (at_root && is_state_db_name(name))
+    {
+        return Err(STATE_DB_PROTECTED.into());
+    }
+    let target = parent.join(name);
+    // 名字已校验为单个普通分量，join 不可能换目录；再核一遍以免校验与 join 语义脱节。
+    if target.parent() != Some(parent) {
+        return Err("名称必须是单个文件名，不能是路径".into());
+    }
+    // 占用判定不跟随链接：悬空链接也算占着这个名字（与 write_fresh_copy 同口径；
+    // `exists()` 会把它当成空位，rename 随后静默换掉链接条目）。
+    if std::fs::symlink_metadata(&target).is_ok() {
+        return Err("同名文件/目录已存在".into());
+    }
+    // 根目录的 rclaw.toml 保留给主配置虚拟条目（目录里探不到虚拟名）。
+    if at_root && config_virtual_active(&root) && name.eq_ignore_ascii_case(CONFIG_NAME) {
+        return Err("rclaw.toml 是主配置保留名（在根目录直接编辑即改主配置）".into());
+    }
+    std::fs::rename(&entry, &target).map_err(|e| format!("重命名失败: {e}"))
 }
 
 /// 在工作区目录下新建文件夹（dir 为当前目录，空 = 根）。
@@ -3337,29 +4189,101 @@ pub async fn workspace_new_folder(
     let home = state.home.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let clean = name.trim();
-        // 按字符数限长（同 rename；中文名不被字节数误伤）。
-        if clean.is_empty() || clean.chars().count() > 120 {
-            return Err("名称不能为空且不超过 120 字符".into());
-        }
-        if clean.contains('/') || clean.contains('\\') || clean.contains("..") {
-            return Err("名称不能包含路径分隔符".into());
-        }
+        validate_entry_name(clean)?;
+        let root = home
+            .join("agent")
+            .canonicalize()
+            .map_err(|e| format!("工作区不可用: {e}"))?;
         let base = resolve_workspace_dir(&home.join("agent"), &dir)?;
+        // 「位于根」按解析后的目录判断（空 dir = 根；指向根的目录链接解析后也是根）。
+        let at_root = base == root;
         let target = base.join(clean);
-        if target.exists() {
+        if target.parent() != Some(base.as_path()) {
+            return Err("名称必须是单个文件名，不能是路径".into());
+        }
+        // 占用判定不跟随链接（悬空链接也占名字，与 rename / write_fresh_copy 同口径）。
+        if std::fs::symlink_metadata(&target).is_ok() {
             return Err("同名文件/目录已存在".into());
         }
-        // 根目录的 rclaw.toml 保留给主配置虚拟条目（exists() 探不到虚拟名）。
-        if dir.is_empty()
-            && config_virtual_active(&home.join("agent"))
-            && clean.eq_ignore_ascii_case(CONFIG_NAME)
-        {
+        // 根目录的 rclaw.toml 保留给主配置虚拟条目（目录里探不到虚拟名）。
+        if at_root && config_virtual_active(&root) && clean.eq_ignore_ascii_case(CONFIG_NAME) {
             return Err("rclaw.toml 是主配置保留名（在根目录直接编辑即改主配置）".into());
+        }
+        // 运行时数据库伴生文件名同样保留（此刻可能不存在，一个同名目录会让 SQLite 开不了 WAL）。
+        if at_root && is_state_db_name(clean) {
+            return Err(STATE_DB_PROTECTED.into());
         }
         std::fs::create_dir(&target).map_err(|e| format!("创建文件夹失败: {e}"))
     })
     .await
     .map_err(|e| format!("新建文件夹任务失败: {e}"))?
+}
+
+/// 系统剪贴板粘贴的暂存目录（home 下、工作区 `agent/` 之外，文件面板看不到）。
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const PASTE_STAGING_DIR: &str = ".clipboard-staging";
+
+/// 把 Java 侧落在暂存目录里的剪贴板文件搬进目标目录（[`workspace_paste_from_clipboard`]
+/// 的收尾；与 Tauri / JNI 解耦便于在桌面上测试）。`result` 是桥接返回的 `ok:<文件名>`。
+///
+/// 名字先过关再搬：根目录下的主配置保留名、运行时数据库保留名一律删掉暂存文件并拒绝
+/// （`uniqueClipFile` 只对已存在的名字加后缀，此刻不存在的伴生文件名会原名落地）。搬运用
+/// [`write_fresh_copy`]：目标目录已有同名条目时按 Java 侧同一口径「名(n).扩展」递增，
+/// 且永不跟随目标位置上的链接。返回搬运后的 `ok:<最终文件名>`。
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn admit_pasted_file(
+    home: &std::path::Path,
+    base: &std::path::Path,
+    at_root: bool,
+    staging: &std::path::Path,
+    result: &str,
+) -> Result<String, String> {
+    let Some(landed) = result.strip_prefix("ok:") else {
+        return Err(format!("剪贴板桥接返回异常: {result}"));
+    };
+    // 桥接只返回文件名；防御性地要求它确实是单个普通分量，否则不碰文件系统。
+    let is_single_component = {
+        let mut components = std::path::Path::new(landed).components();
+        matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(first)), None) if first == landed
+        )
+    };
+    if landed.is_empty() || !is_single_component {
+        return Err(format!("剪贴板桥接返回了非法文件名: {landed}"));
+    }
+    let staged = staging.join(landed);
+    if at_root {
+        if landed.eq_ignore_ascii_case(CONFIG_NAME) && config_virtual_active(&home.join("agent")) {
+            let _ = std::fs::remove_file(&staged);
+            return Err("rclaw.toml 是主配置保留名（在根目录直接编辑即改主配置）".into());
+        }
+        if is_state_db_name(landed) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(STATE_DB_PROTECTED.into());
+        }
+    }
+    let (stem, ext) = match landed.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
+        _ => (landed, None),
+    };
+    let candidate_name = |n: u32| match (n, ext) {
+        (1, _) => landed.to_string(),
+        (i, Some(e)) => format!("{stem}({}).{e}", i - 1),
+        (i, None) => format!("{stem}({})", i - 1),
+    };
+    let moved = write_fresh_copy(base, candidate_name, |file| {
+        let mut from = std::fs::File::open(&staged)?;
+        std::io::copy(&mut from, file).map(|_| ())
+    });
+    let _ = std::fs::remove_file(&staged);
+    let dest = moved.map_err(|e| e.replace("复制失败", "粘贴失败"))?;
+    Ok(format!(
+        "ok:{}",
+        dest.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ))
 }
 
 /// 读系统剪贴板落盘到工作区目录（安卓）：文本 →「剪贴板-时间.txt」，
@@ -3375,31 +4299,24 @@ pub async fn workspace_paste_from_clipboard(
         let home = state.home.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let base = resolve_workspace_dir(&home.join("agent"), &dir)?;
-            let result = rclaw_android::read_clipboard_to_file(
-                &base.to_string_lossy(),
-            )
-            .map_err(|e| format!("读取剪贴板失败: {e}"))?;
+            // Java 先落到工作区【外】的暂存目录，Rust 校验名字后再搬进目标目录：保留名
+            // （state.sqlite-journal 这类假 hot journal）从不在工作区根出现，哪怕一瞬间。
+            let staging = home.join(PASTE_STAGING_DIR);
+            std::fs::create_dir_all(&staging).map_err(|e| format!("创建暂存目录失败: {e}"))?;
+            let result = rclaw_android::read_clipboard_to_file(&staging.to_string_lossy())
+                .map_err(|e| format!("读取剪贴板失败: {e}"))?;
             if result == "empty" {
                 return Err("剪贴板没有文本或文件（微信/QQ 内容请用「分享到 RClaw」导入）".into());
             }
             if let Some(reason) = result.strip_prefix("error:") {
                 return Err(reason.to_string());
             }
-            // 文件 URI 粘贴的原名撞上根目录保留名：删除已落地文件并拒绝，
-            // 免得虚拟条目与真实文件同名并列。
-            if dir.is_empty() {
-                if let Some(landed) = result.strip_prefix("ok:") {
-                    if landed.eq_ignore_ascii_case(CONFIG_NAME)
-                        && config_virtual_active(&home.join("agent"))
-                    {
-                        let _ = std::fs::remove_file(base.join(landed));
-                        return Err(
-                            "rclaw.toml 是主配置保留名（在根目录直接编辑即改主配置）".into(),
-                        );
-                    }
-                }
-            }
-            Ok(result)
+            let at_root = home
+                .join("agent")
+                .canonicalize()
+                .map(|root| root == base)
+                .unwrap_or(dir.is_empty());
+            admit_pasted_file(&home, &base, at_root, &staging, &result)
         })
         .await
         .map_err(|e| format!("粘贴任务失败: {e}"))?
@@ -3426,14 +4343,9 @@ pub async fn workspace_copy_to_clipboard(
             let abs = if is_config_virtual(&home.join("agent"), &path) {
                 home.join(CONFIG_NAME)
             } else {
-                let (_base, canonical) = resolve_workspace_entry(&home.join("agent"), &path)?;
-                let meta = canonical
-                    .metadata()
-                    .map_err(|e| format!("读取文件信息失败: {e}"))?;
-                if !meta.is_file() {
-                    return Err("仅支持复制文件到系统剪贴板".into());
-                }
-                canonical
+                // 跟随链接取真实文件；落点越区 / 运行时数据库 / 目录都拒绝。
+                let (base, entry) = resolve_workspace_entry(&home.join("agent"), &path)?;
+                resolve_workspace_file_content(&base, &entry)?
             };
             rclaw_android::copy_file_to_clipboard(&abs.to_string_lossy())
                 .map_err(|e| format!("复制到系统剪贴板失败: {e}"))
@@ -3621,21 +4533,26 @@ pub async fn record_cancel() -> Result<(), String> {
     }
 }
 
-/// 工作区相对路径校验 + 绝对路径解析（uploads/ 下的采集产物）。
+/// 工作区相对路径校验 + 绝对路径解析（只读用途：保存到相册 / 转写等，目标须已存在
+/// 且落在 agent 根内）。会删文件的入口用 [`resolve_upload_path`]。
+///
+/// 与文件面板同一套路径校验（[`validate_workspace_rel_path`]）；运行时数据库不经任何
+/// 宿主命令读取 / 复制——哪怕只是「保存到相册」，没有 -wal 的快照也是一份不一致的库。
 fn resolve_agent_path(
     home: &std::path::Path,
     rel: &str,
 ) -> Result<std::path::PathBuf, String> {
-    if rel.is_empty() || rel.contains("..") || rel.contains('\\') || rel.starts_with('/') {
-        return Err("非法文件路径".into());
-    }
-    let full = home.join("agent").join(rel);
-    let canonical = full
+    validate_workspace_rel_path(rel).map_err(|_| "非法文件路径".to_string())?;
+    let root = home.join("agent").canonicalize().map_err(|e| format!("工作区不可用: {e}"))?;
+    let canonical = root
+        .join(rel)
         .canonicalize()
         .map_err(|e| format!("文件不存在: {e}"))?;
-    let root = home.join("agent").canonicalize().map_err(|e| format!("工作区不可用: {e}"))?;
     if !canonical.starts_with(&root) {
         return Err("路径越出工作区".into());
+    }
+    if is_state_db_entry(&root, &canonical) {
+        return Err(STATE_DB_PROTECTED.into());
     }
     Ok(canonical)
 }
@@ -3652,38 +4569,77 @@ pub async fn save_to_gallery(
         return Err("不支持的媒体类型".into());
     }
     let home = state.home.clone();
-    let abs = resolve_agent_path(&home, &rel)?;
-    let abs = abs.to_string_lossy().to_string();
-    #[cfg(target_os = "android")]
-    {
-        let result = rclaw_android::save_to_gallery(&abs, &kind)
-            .map_err(|e| format!("保存到相册失败: {e}"))?;
-        if let Some(reason) = result.strip_prefix("error:") {
-            return Err(reason.to_string());
+    // 路径解析（canonicalize）、MediaStore 写入 / 桌面文件拷贝都是同步 IO，放阻塞线程池。
+    run_blocking("保存到相册", move || {
+        // 采集 / 编辑产物都落在 uploads/（上传、拍摄、photo-edited-*），与「放弃采集」同一
+        // 口径只认 uploads/ 下的文件：工作区别处的文件（更不用说根下的 state.sqlite）不经
+        // 此入口复制到相册。
+        let abs = resolve_upload_path(&home, &rel)?;
+        let abs = abs.to_string_lossy().to_string();
+        #[cfg(target_os = "android")]
+        {
+            let result = rclaw_android::save_to_gallery(&abs, &kind)
+                .map_err(|e| format!("保存到相册失败: {e}"))?;
+            if let Some(reason) = result.strip_prefix("error:") {
+                return Err(reason.to_string());
+            }
+            Ok(result)
         }
-        Ok(result)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        // 桌面兜底：拷贝到用户图片目录的 RClaw 子目录。
-        let base = std::env::var("USERPROFILE")
-            .map(|p| std::path::PathBuf::from(p).join("Pictures"))
-            .unwrap_or_else(|_| home.clone());
-        let dir = base.join("RClaw");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
-        std::fs::copy(&abs, dir.join(std::path::Path::new(&abs).file_name().unwrap_or_default()))
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = kind;
+            // 桌面兜底：拷贝到用户图片目录的 RClaw 子目录。
+            let base = std::env::var("USERPROFILE")
+                .map(|p| std::path::PathBuf::from(p).join("Pictures"))
+                .unwrap_or_else(|_| home.clone());
+            let dir = base.join("RClaw");
+            std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+            std::fs::copy(
+                &abs,
+                dir.join(std::path::Path::new(&abs).file_name().unwrap_or_default()),
+            )
             .map_err(|e| format!("保存失败: {e}"))?;
-        Ok("ok".into())
-    }
+            Ok("ok".into())
+        }
+    })
+    .await
 }
 
-/// 放弃采集产物：删除工作区里的临时文件（用户点了取消）。
+/// 采集产物路径：在 [`resolve_agent_path`] 之上再要求落在 `uploads/` 内。放弃采集是
+/// 一个删除入口、保存到相册是一个复制出去的入口，都只允许碰这里的临时文件——工作区
+/// 别处的文件（包括根下的 state.sqlite）不经这两个入口删除 / 复制；按解析后的真实路径
+/// 判断，`./uploads/..` 等拼写不影响。
+fn resolve_upload_path(
+    home: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf, String> {
+    let canonical = resolve_agent_path(home, rel)?;
+    let uploads = home
+        .join("agent")
+        .join("uploads")
+        .canonicalize()
+        .map_err(|e| format!("uploads 目录不可用: {e}"))?;
+    if canonical == uploads || !canonical.starts_with(&uploads) {
+        return Err("只能操作 uploads/ 下的采集产物".into());
+    }
+    Ok(canonical)
+}
+
+/// 放弃采集产物：删除 uploads/ 里的临时文件（用户点了取消）。
 #[tauri::command]
 pub async fn discard_capture(state: State<'_, AppState>, rel: String) -> Result<(), String> {
     let home = state.home.clone();
-    let abs = resolve_agent_path(&home, &rel)?;
-    let _ = std::fs::remove_file(abs);
-    Ok(())
+    // 三次 canonicalize + 删除都是同步文件系统调用，与其它文件命令一样下放阻塞线程。
+    run_blocking("放弃采集产物", move || {
+        let abs = resolve_upload_path(&home, &rel)?;
+        match std::fs::remove_file(&abs) {
+            Ok(()) => Ok(()),
+            // 解析后到删除之间被别处清掉：目标状态已达成，不算失败。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("删除采集产物失败: {e}")),
+        }
+    })
+    .await
 }
 
 /// 编辑后的照片落盘（前端画布导出的 JPEG base64）。返回相对 agent/ 的路径。
@@ -3703,10 +4659,26 @@ pub async fn save_edited_photo(
         }
         let dir = home.join("agent").join("uploads");
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
-        let rel = format!("uploads/photo-edited-{}.jpg", chrono_like_ts());
-        std::fs::write(dir.join(&rel["uploads/".len()..]), &bytes)
-            .map_err(|e| format!("写盘失败: {e}"))?;
-        Ok(rel)
+        // 文件名按毫秒时间戳可预测：事先摆好的同名悬空链接不能让 `fs::write` 顺着写到
+        // 工作区外——用不跟随链接的 CREATE_NEW 创建，撞上已有条目换序号重试。
+        let stamp = chrono_like_ts();
+        let path = write_fresh_file(
+            &dir,
+            "写盘失败",
+            |n| {
+                if n == 1 {
+                    format!("photo-edited-{stamp}.jpg")
+                } else {
+                    format!("photo-edited-{stamp}-{n}.jpg")
+                }
+            },
+            |file| std::io::Write::write_all(file, &bytes),
+        )?;
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(format!("uploads/{file_name}"))
     })
     .await
     .map_err(|e| format!("保存编辑照片任务失败: {e}"))?

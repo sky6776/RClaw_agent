@@ -136,6 +136,7 @@ fn non_zhipu_stream_request_omits_tool_stream() {
 #[test]
 fn converts_assistant_tool_use_and_tool_result_to_wire() {
     let assistant = Message {
+        id: 0,
         role: Role::Assistant,
         content: vec![
             ContentBlock::text("thinking"),
@@ -149,6 +150,7 @@ fn converts_assistant_tool_use_and_tool_result_to_wire() {
         ts: 0,
     };
     let user_tool_result = Message {
+        id: 0,
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "call_1".into(),
@@ -177,6 +179,7 @@ fn converts_assistant_tool_use_and_tool_result_to_wire() {
 #[test]
 fn converts_user_media_to_openai_content_array() {
     let user = Message {
+        id: 0,
         role: Role::User,
         content: vec![
             ContentBlock::media_url(rclaw_core::MediaKind::Image, "data:image/png;base64,abc"),
@@ -200,6 +203,7 @@ fn converts_user_media_to_openai_content_array() {
 #[test]
 fn omits_user_media_for_non_multimodal_model() {
     let user = Message {
+        id: 0,
         role: Role::User,
         content: vec![
             ContentBlock::media_url(rclaw_core::MediaKind::Image, "data:image/png;base64,abc"),
@@ -225,6 +229,7 @@ fn omits_user_media_for_non_multimodal_model() {
 /// 形成无前序 tool_calls 的孤儿消息 → 下游 400。现在应直接报错。
 fn bad_assistant_tool_use_history(empty_name: bool, input: Value) -> ChatRequest {
     let assistant = Message {
+        id: 0,
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: "call_1".into(),
@@ -239,6 +244,7 @@ fn bad_assistant_tool_use_history(empty_name: bool, input: Value) -> ChatRequest
         ts: 0,
     };
     let tool_result = Message {
+        id: 0,
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "call_1".into(),
@@ -511,6 +517,7 @@ fn done_marker() {
 #[test]
 fn rejects_tool_message_without_tool_call_id() {
     let bad = Message {
+        id: 0,
         role: Role::Tool,
         content: vec![ContentBlock::text("result")],
         tool_call_id: None, // 缺失
@@ -525,6 +532,7 @@ fn rejects_tool_message_without_tool_call_id() {
 #[test]
 fn rejects_tool_message_with_empty_tool_call_id() {
     let bad = Message {
+        id: 0,
         role: Role::Tool,
         content: vec![ContentBlock::text("result")],
         tool_call_id: Some(String::new()), // 空串
@@ -556,6 +564,7 @@ fn cfg_none_reasoning() -> ProviderConfig {
 fn none_reasoning_field_omits_reasoning_in_request() {
     let cfg = cfg_none_reasoning();
     let assistant = Message {
+        id: 0,
         role: Role::Assistant,
         content: vec![
             ContentBlock::text("answer"),

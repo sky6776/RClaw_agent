@@ -25,16 +25,8 @@ where
     scope_inner(None, None, fut)
 }
 
-/// 带 bot persona 记忆运行一个 turn（Bot Mode：bot 会话的 memory 工具写入
-/// bot 自己的 MemoryStore，而非主 persona 的）。
-pub fn scope_with_persona<F>(memory: Option<MemoryStore>, fut: F) -> impl Future<Output = F::Output>
-where
-    F: Future,
-{
-    scope_inner(memory, None, fut)
-}
-
-/// 顶层 turn 作用域：persona 记忆 + 当前 turn 取消令牌（Layer 2a detachParent 联动）。
+/// 顶层 turn 作用域：persona 记忆（Bot Mode：bot 会话的 memory 工具写入 bot 自己的
+/// MemoryStore，而非主 persona 的）+ 当前 turn 取消令牌（Layer 2a detachParent 联动）。
 pub fn scope_top_level<F>(
     memory: Option<MemoryStore>,
     cancel: Option<CancellationToken>,

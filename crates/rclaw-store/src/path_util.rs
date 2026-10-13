@@ -1,17 +1,21 @@
 //! 路径工具：session 键的百分号编码、agent 存储路径校验。
 //!
-//! 百分号编码（避免串档）与路径校验：
-//! `validate_path`（工具读写文件时的安全校验）。
+//! - [`percent_encode_key`]：把 channel / chat_id 一一映射成合法文件名片段（避免串档）。
+//!   会话正文本身在 `state.sqlite` 里、不再按会话落文件，现在只有会话摘要
+//!   `memory/session_summaries/<ch>_<id>.md` 与 `/export` 的导出文件名还用它；
+//! - [`validate_agent_path`] / [`resolve_within_base`]：工具读写文件时的沙箱校验。
 
 use std::ffi::OsString;
 use std::path::{Component, Path};
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
-/// 「安全字符」集合：字母、数字、下划线、连字符原样保留，其余 %XX 编码。
+/// 「安全字符」集合：字母、数字、连字符、`.`、`~` 原样保留，其余 %XX 编码。
 /// **一一映射**（旧实现用 '_' 替换是有损多对一，会串档）。
 ///
-/// 这里额外把 `_.-~` 之外的全部编码，保证生成的是合法且无歧义的文件名片段。
+/// `_` 也要编码：调用方把两个键拼成 `<ch>_<id>`，分隔符若能出现在编码结果里，
+/// `("a_b", "c")` 与 `("a", "b_c")` 就会撞成同一个文件名——编码掉它，`_` 在拼接结果里
+/// 只可能是分隔符，整个文件名对 `(channel, chat_id)` 才是单射。
 const SAFE: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'/')
@@ -24,11 +28,13 @@ const SAFE: &AsciiSet = &CONTROLS
     .add(b'"')
     .add(b'<')
     .add(b'>')
-    .add(b'|');
+    .add(b'|')
+    .add(b'_');
 
-/// 对 session 键（channel 或 chat_id）做百分号编码，作为文件名片段。
+/// 对 session 键（channel 或 chat_id）做百分号编码，作为会话摘要 / 导出文件的文件名片段。
 ///
-/// 不同输入必定产生不同输出，杜绝跨 channel/跨用户串档。
+/// 不同输入必定产生不同输出；结果里不含 `_`，所以用 `_` 拼接两个编码结果仍是单射，
+/// 杜绝跨 channel/跨用户串档。
 pub fn percent_encode_key(s: &str) -> String {
     utf8_percent_encode(s, SAFE).to_string()
 }
@@ -128,7 +134,21 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(b, c);
-        assert_eq!(c, "a_b"); // 下划线原样保留
+        // 下划线是拼接分隔符，必须编码掉，编码结果里不得再出现 `_`。
+        assert_eq!(c, "a%5Fb");
+        assert!(!percent_encode_key("x_y_z%_").contains('_'));
+        assert_eq!(percent_encode_key("chat-1.2~x"), "chat-1.2~x");
+    }
+
+    /// `<ch>_<id>` 拼接对 `(channel, chat_id)` 必须是单射：`("a_b","c")` 与 `("a","b_c")`
+    /// 不能撞成同一个会话摘要 / 导出文件名。
+    #[test]
+    fn joined_keys_are_injective() {
+        let join = |ch: &str, id: &str| format!("{}_{}", percent_encode_key(ch), percent_encode_key(id));
+        assert_ne!(join("a_b", "c"), join("a", "b_c"));
+        assert_ne!(join("a", "b_c"), join("a_b", "c"));
+        assert_ne!(join("", "a_b"), join("a", "b"));
+        assert_eq!(join("a_b", "c").matches('_').count(), 1);
     }
 
     /// 基本校验：用真实（绝对、已存在）的 base，避免相对路径让 canonicalize 失败。

@@ -80,9 +80,13 @@ pub struct CoreComponents {
 ///   桌面版为用户数据目录下的 `rclaw.toml`）。
 ///
 /// 行为保真说明：`main.rs` 原实现给 [`AgentToolRuntime`] 传的是「精简 opts」
-///（仅 stream/daemon），给 AgentLoop 传「完整 opts」（压缩预算派生等）。两份
-/// opts 的差异只影响子 agent 的压缩派生输入（子 agent 不做历史压缩），此处按原
-/// 行为保留，避免静默改变既有运行语义。
+///（stream/daemon/verify_candidate_patches，其余取默认），给 AgentLoop 传「完整 opts」
+///（压缩预算派生等）。子 agent 不做历史压缩，所以压缩相关差异无影响；但 ZCode 移植的
+/// 子代理选项（`background_wake_*`、`subagent_auto_background`、`subagent_request_stagger`、
+/// `plan_escalation_wait_secs`）只被 AgentToolRuntime 读取——目前没有 toml 配置项、两边
+/// 都是默认值；将来若接入配置，必须写进 `runtime_opts`，写进 AgentLoop 的 `opts` 不会
+/// 生效。`recent_days` 两边都读（TurnManager 的推理尾部 / 摘要 / `/context`，与子代理的
+/// 近期笔记注入），接入配置时必须两份 opts 都写。
 pub async fn assemble_core(
     cfg: &Config,
     layout: &Layout,
@@ -163,8 +167,9 @@ pub async fn assemble_core_with(
         }
     };
 
-    // 存储句柄。MEMORY.md / USER.md 的字符上限由配置决定。
-    let session = SessionStore::new(layout.clone());
+    // 存储句柄：会话状态库 agent/state.sqlite（打开失败 = 启动失败，不能带着无法落盘的
+    // 会话跑）。MEMORY.md / USER.md 的字符上限由配置决定。
+    let session = SessionStore::open(layout.clone())?;
     let memory = MemoryStore::new(layout.clone())
         .with_char_limits(cfg.agent.memory_char_limit, cfg.agent.user_char_limit);
 
@@ -182,7 +187,7 @@ pub async fn assemble_core_with(
     tools.register(Box::new(SkillListTool::new(layout.skills_dir.clone())));
 
     // session_search 工具：跨会话历史检索（B1——agent 能召回自己的过往经历）。
-    tools.register(Box::new(SessionSearchTool::new(layout.session_dir.clone())));
+    tools.register(Box::new(SessionSearchTool::new(session.clone())));
     // session_handoff 工具：跨会话上下文交接（ZCode 移植 · Layer 5，ReadSessionContext
     // 同源）——按 query 相关性把另一段会话压缩成有界交接素材。
     tools.register(Box::new(
@@ -279,9 +284,10 @@ pub async fn assemble_core_with(
     // 宿主定制点（APK：进程内 gbrain 工具等）；默认空操作。
     customize(&mut tools);
 
-    // 精简 opts：与原 main.rs 一致，传给 AgentToolRuntime（见函数注释）。
-    // verify_candidate_patches 是子代理行为开关（交叉验证在 run_task_inner 里跑），
-    // 必须随配置传入，否则永远停在默认 false。
+    // 精简 opts：与原 main.rs 一致，传给 AgentToolRuntime（见函数注释）——
+    // stream/daemon 之外只多一个 verify_candidate_patches：它是子代理行为开关
+    //（交叉验证在 run_task_inner 里跑），必须随配置传入，否则永远停在默认 false。
+    // 子代理专属选项（唤醒 / 自动转后台 / 升级等待等）当前无配置项，取默认值。
     let runtime_opts = AgentOptions {
         stream_enabled: cfg.llm.stream,
         daemon,
@@ -289,16 +295,34 @@ pub async fn assemble_core_with(
         ..AgentOptions::default()
     };
 
+    // 按 [[llm.providers]] 名字构建独立 provider 的解析器：Bot Mode 的 BotRegistry
+    // 与子代理 `model` 入参（Layer 2b）共用同一套语义，只建一份。
+    let provider_factory: rclaw_runtime::agent_tools::ModelFactory = {
+        let cfg = cfg.clone();
+        Arc::new(move |name: &str| -> Option<Arc<dyn rclaw_llm::Provider>> {
+            cfg.build_provider_config_for(name)
+                .ok()
+                .and_then(|pcfg| rclaw_llm::SwappableProvider::new(pcfg).ok())
+                .map(|p| Arc::new(p) as Arc<dyn rclaw_llm::Provider>)
+        })
+    };
+
     // 多 agent 工具：子 agent 共享同一套普通工具；OnceLock 延迟回填避免自引用构造。
     let agent_runtime = AgentToolRuntime::new(
         provider.clone(),
         memory.clone(),
         layout.clone(),
+        session.journal(),
         runtime_opts,
         agent_tools_registry.clone(),
         channel_info.clone(),
         web_search_control.clone(),
     );
+    // Layer 2b（ZCode 移植）：子代理独立模型/推理级别——Agent 工具的 `model` 入参按
+    // [[llm.providers]] 名字解析为独立 provider（入参校验期已拒绝未知名字）。
+    // 必须在任何 clone 交给工具之前注入（factory 槽位对全部 clone 共享，这里只是
+    // 让装配顺序一眼可见）。
+    agent_runtime.set_model_factory(provider_factory.clone());
     tools.register(Box::new(TeamCreateTool::new(agent_runtime.clone())));
     tools.register(Box::new(TeamDeleteTool::new(agent_runtime.clone())));
     tools.register(Box::new(TaskCreateTool::new(agent_runtime.clone())));
@@ -320,9 +344,10 @@ pub async fn assemble_core_with(
     tools.register(Box::new(
         rclaw_runtime::agent_tools::ResolveWorkflowQuestionTool::new(agent_runtime.clone()),
     ));
-    // Layer 5（ZCode 移植）：write/edit/delete 文件 checkpoint + 按 messageId 选点回滚。
+    // Layer 5（ZCode 移植）：write/edit/delete 文件 checkpoint + 按 messageId 选点回滚
+    //（checkpoint 与会话消息同库，按当前会话键隔离）。
     tools.register(Box::new(rclaw_runtime::turn::rewind::RewindFilesTool::new(
-        agent_runtime.clone(),
+        session.clone(),
     )));
     // Layer 3 引擎最小执行器：确定性 JS 脚本编排（主代理专属，子代理被屏蔽表拒绝）。
     tools.register(Box::new(rclaw_runtime::agent_tools::WorkflowRunTool::new(
@@ -331,27 +356,6 @@ pub async fn assemble_core_with(
     // Bot Mode（ADR-0006）：bot 注册表 + message_agent 交接工具。registry 在
     // web_search_control 之后构建（bot 提示需要搜索工具面状态）；router 由二进制
     // 建 inbound 总线后经 bot_router_slot 回填。
-    let provider_factory = {
-        let cfg = cfg.clone();
-        Arc::new(move |name: &str| -> Option<Arc<dyn rclaw_llm::Provider>> {
-            cfg.build_provider_config_for(name)
-                .ok()
-                .and_then(|pcfg| rclaw_llm::SwappableProvider::new(pcfg).ok())
-                .map(|p| Arc::new(p) as Arc<dyn rclaw_llm::Provider>)
-        })
-    };
-    // Layer 2b（ZCode 移植）：子代理独立模型/推理级别——Agent 工具的 `model` 入参按
-    // [[llm.providers]] 名字解析为独立 provider（入参校验期已拒绝未知名字）。
-    let agent_model_factory: rclaw_runtime::agent_tools::ModelFactory = {
-        let cfg = cfg.clone();
-        Arc::new(move |name: &str| -> Option<Arc<dyn rclaw_llm::Provider>> {
-            cfg.build_provider_config_for(name)
-                .ok()
-                .and_then(|pcfg| rclaw_llm::SwappableProvider::new(pcfg).ok())
-                .map(|p| Arc::new(p) as Arc<dyn rclaw_llm::Provider>)
-        })
-    };
-    agent_runtime.set_model_factory(agent_model_factory);
     let bots = Arc::new(BotRegistry::new(
         layout,
         provider_factory,

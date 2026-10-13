@@ -18,7 +18,9 @@ use crate::Result;
 /// agent/
 ///   config/  { SOUL.md  USER.md }
 ///   memory/  { MEMORY.md  daily/  session_summaries/ }
-///   sessions/
+///   state.sqlite   （会话 / rewind checkpoint / usage 锚点 / journal / kv，WAL 模式，
+///                     旁有 state.sqlite-wal / -shm）
+///   exports/       （/export 产出的 JSONL，按需创建）
 ///   skills/
 ///   logs/  { rclaw.log.YYYY-MM-DD }
 ///   cron.json
@@ -31,9 +33,12 @@ pub struct Layout {
     pub memory_dir: PathBuf,
     pub memory_daily_dir: PathBuf,
     pub session_summary_dir: PathBuf,
-    pub session_dir: PathBuf,
     pub skills_dir: PathBuf,
     pub logs_dir: PathBuf,
+    /// 机器状态单库（会话 / rewind checkpoint / usage 锚点 / journal / kv）。
+    pub db_file: PathBuf,
+    /// `/export` 的 JSONL 输出目录（按需创建）。
+    pub exports_dir: PathBuf,
     pub memory_file: PathBuf,
     pub soul_file: PathBuf,
     pub user_file: PathBuf,
@@ -50,9 +55,10 @@ impl Layout {
         Layout {
             memory_daily_dir: memory_dir.join("daily"),
             session_summary_dir: memory_dir.join("session_summaries"),
-            session_dir: base.join("sessions"),
             skills_dir: base.join("skills"),
             logs_dir: base.join("logs"),
+            db_file: base.join("state.sqlite"),
+            exports_dir: base.join("exports"),
             memory_file: memory_dir.join("MEMORY.md"),
             soul_file: config_dir.join("SOUL.md"),
             user_file: config_dir.join("USER.md"),
@@ -64,12 +70,11 @@ impl Layout {
         }
     }
 
-    /// 由 channel + chat_id 计算对应 session 文件路径。
-    /// 文件名 `<percent(channel)>_<percent(chat_id)>.jsonl`。
-    pub fn session_path(&self, channel: &str, chat_id: &str) -> PathBuf {
+    /// `/export` 输出文件路径：`exports/<percent(channel)>_<percent(chat_id)>_<stamp>.jsonl`。
+    pub fn export_path(&self, channel: &str, chat_id: &str, stamp: &str) -> PathBuf {
         let ch = crate::percent_encode_key(channel);
         let id = crate::percent_encode_key(chat_id);
-        self.session_dir.join(format!("{ch}_{id}.jsonl"))
+        self.exports_dir.join(format!("{ch}_{id}_{stamp}.jsonl"))
     }
 }
 
@@ -96,7 +101,7 @@ pub fn ensure_parent_dir(path: impl AsRef<Path>) -> Result<()> {
 ///
 /// **安全闸（P2）**：用 [`fs::symlink_metadata`]（不 follow）检查根路径本身——若是符号链接
 /// 或非目录，直接返回 [`StoreError::InvalidPath`]。否则 `exists()`/`read_dir` 会跟随根路径的
-/// 符号链接，把外部目录（agent/memory 或 agent/sessions 被替换成 symlink/junction 时）的内容
+/// 符号链接，把外部目录（agent/memory 或 agent/skills 被替换成 symlink/junction 时）的内容
 /// 删掉。注意：Windows junction 是 reparse mount point，`FileType::is_symlink()` 检测不到，
 /// 需调用方再用 canonicalize 兜底（见 turn.rs `ensure_dir_is_real`）。
 ///
@@ -169,7 +174,6 @@ pub fn init_layout(layout: &Layout) -> Result<()> {
     ensure_dir(&layout.memory_dir)?;
     ensure_dir(&layout.memory_daily_dir)?;
     ensure_dir(&layout.session_summary_dir)?;
-    ensure_dir(&layout.session_dir)?;
     ensure_dir(&layout.skills_dir)?;
     ensure_dir(&layout.logs_dir)?;
 
@@ -228,12 +232,26 @@ pub fn init_layout(layout: &Layout) -> Result<()> {
 ///
 /// 落盘失败（`ENOSPC` / `EIO`）必须让调用方感知，否则会把「未真正落盘的写入」当成功，
 /// 与本函数的持久化保证相矛盾。因此这里用 `f.sync_all()?` 传播错误（而不是 `let _ =`）。
-/// session 层的 [`crate::session::append_lines`] 做同样处理。
+/// 会话 / journal 数据不走本函数：它们在 `agent/state.sqlite` 里由 SQLite 事务保证落盘。
 pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     let path = path.as_ref();
     ensure_parent_dir(path)?;
 
     let backup = backup_path_for(path);
+
+    // 目标是指向目录的符号链接（含 Windows 目录链接 / junction）时拒绝：主路径的 rename 对
+    // 链接条目是「原子替换条目」——会把 `agent -> /data/real` 这样的工作区入口换成一个普通
+    // 文件，目标目录完好但再也找不到。真实目录由主路径的 rename 自己失败、再被兜底路径
+    // 拒绝；链接到目录的情况 rename 不会失败，只能在动手之前看条目（`symlink_metadata`）
+    // 与落点（`metadata`）各一眼。
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+        && fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+    {
+        return Err(crate::StoreError::Other(format!(
+            "atomic_write 拒绝覆盖指向目录的符号链接: {}",
+            path.display()
+        )));
+    }
 
     // 0) 崩溃自愈：若存在上次崩溃遗留的 sidecar 备份、且目标缺失，先把备份还原为目标
     //    （见上文「兜底路径的崩溃窗口」）。
@@ -265,10 +283,11 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     //    关键：绝不能「先删目标再 rename tmp」——那样 rename 失败会让原文件消失。
     //    先清理可能残留的旧 sidecar 备份。
     let _ = fs::remove_file(&backup);
-    // P1 修复：进入兜底路径前，先用 symlink_metadata 检查目标是否为目录/非普通文件。
+    // P1 修复：进入兜底路径前，先用 symlink_metadata 检查目标是否为目录。
     // 若 write 工具错误地以目录路径（如 agent/memory）为目标，旧代码会在下面的
     // rename(path, backup) 里把整个目录挪成 .bak 隐藏备份，然后用普通文件占掉路径，
-    // 破坏 agent 目录结构。这里提前拒绝目录/符号链接等非普通文件，并清理 tmp sidecar。
+    // 破坏 agent 目录结构。这里提前拒绝目录并清理 tmp sidecar（指向目录的链接已在写
+    // tmp 之前拒绝；指向文件的链接按条目覆盖——链接本身被换成普通文件，目标不动）。
     let had_target = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
             // 目标是个目录 —— 这是工具层写入了错误路径（如写到目录名而非目录内文件）。

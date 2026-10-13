@@ -76,6 +76,14 @@ impl AgentLoop {
         }
     }
 
+    /// 会话生命周期句柄（在 `run()` 之前取走、可跨任务持有）：宿主在 agent loop 之外
+    /// 直接删库里的会话后，用它把该会话的运行期状态一并清掉。
+    pub fn session_lifecycle(&self) -> SessionLifecycle {
+        SessionLifecycle {
+            turn_mgr: self.turn_mgr.clone(),
+        }
+    }
+
     /// 运行主循环：收到一条 inbound 就交给 [`TurnManager::route`]，直到 inbound 关闭。
     ///
     /// `route` 自身不阻塞在长 turn 上（turn 在独立任务里跑），因此 loop 能持续路由新消息。
@@ -85,5 +93,30 @@ impl AgentLoop {
             self.turn_mgr.route(msg).await;
         }
         tracing::info!("Agent loop 退出");
+    }
+}
+
+/// 会话生命周期句柄：对 [`TurnManager`] 的薄封装，只暴露宿主删会话时需要的那两个入口，
+/// 不把核心组件本身交给前端 / 宿主层。
+#[derive(Clone)]
+pub struct SessionLifecycle {
+    turn_mgr: Arc<TurnManager>,
+}
+
+impl SessionLifecycle {
+    #[cfg(test)]
+    pub(crate) fn for_tests(turn_mgr: Arc<TurnManager>) -> Self {
+        Self { turn_mgr }
+    }
+
+    /// 某会话此刻是否还有活动 turn（见 [`TurnManager::is_session_busy`]）：宿主删会话前
+    /// 先问一句，正在跑的会话拒绝删除，让用户先 `/cancel` 或等它结束。
+    pub fn is_session_busy(&self, channel: &str, chat_id: &str) -> bool {
+        self.turn_mgr.is_session_busy(channel, chat_id)
+    }
+
+    /// 清掉某会话的运行期状态（见 [`TurnManager::forget_session`]）。
+    pub fn forget_session(&self, channel: &str, chat_id: &str) {
+        self.turn_mgr.forget_session(channel, chat_id);
     }
 }

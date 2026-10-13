@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use rclaw_core::{BusMessage, RuntimeChannelInfo};
-use rclaw_runtime::{AgentOptions, AgentToolRuntime, BotRegistry, BotRouter};
+use rclaw_runtime::{AgentOptions, AgentToolRuntime, BotRegistry, BotRouter, SessionLifecycle};
 use rclaw_store::fs::Layout;
 use rclaw_store::memory::MemoryStore;
 use rclaw_store::session::SessionStore;
@@ -22,6 +22,9 @@ pub struct RunningAgent {
     pub cron: Arc<CronController>,
     /// 会话存储（多会话列表 / 历史 / 归档直接读它）。
     pub session: SessionStore,
+    /// 会话生命周期句柄：删会话时同步清掉 agent loop 里该会话的运行期状态
+    /// （usage 锚点、压缩防抖 / 冷却），库与内存一起归零。
+    pub session_lifecycle: SessionLifecycle,
     /// 多 agent 工具运行时（Agent 状态面板读后台执行快照）。
     pub agent_runtime: AgentToolRuntime,
     /// 工具注册表（工具面板的列表与禁能开关）。
@@ -105,6 +108,15 @@ impl AppState {
             .expect("AppState.agent 锁未被毒化")
             .as_ref()
             .map(|a| a.session.clone())
+    }
+
+    /// 会话生命周期句柄克隆。
+    pub fn session_lifecycle(&self) -> Option<SessionLifecycle> {
+        self.agent
+            .read()
+            .expect("AppState.agent 锁未被毒化")
+            .as_ref()
+            .map(|a| a.session_lifecycle.clone())
     }
 
     /// 多 agent 运行时句柄克隆。

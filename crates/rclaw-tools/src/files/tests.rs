@@ -228,6 +228,582 @@ async fn rejects_path_traversal() {
 }
 
 #[tokio::test]
+async fn file_tools_refuse_runtime_state_db() {
+    let b = base();
+    fs::write(b.join("state.sqlite"), b"not really a db").unwrap();
+    let abs = format!("{}/state.sqlite", b.to_string_lossy().replace('\\', "/"));
+    // 相对 / 绝对 / 伴生文件（即使此刻不存在）/ 大小写变体，读写删一律拒绝。
+    for path in [
+        "state.sqlite".to_string(),
+        "STATE.SQLITE".to_string(),
+        "state.sqlite-wal".to_string(),
+        "agent/state.sqlite-shm".to_string(),
+        abs,
+    ] {
+        let r = Read::new(b.clone()).execute(json!({"path": path})).await;
+        assert!(r.is_error, "read {path} must be refused: {}", r.content);
+        assert!(r.content.contains("运行时数据库"), "{}", r.content);
+        let r = WriteFile::new(b.clone())
+            .execute(json!({"path": path, "content": "x"}))
+            .await;
+        assert!(r.is_error, "write {path} must be refused");
+        let r = DeleteFile::new(b.clone()).execute(json!({"path": path})).await;
+        assert!(r.is_error, "delete {path} must be refused");
+    }
+    assert_eq!(fs::read(b.join("state.sqlite")).unwrap(), b"not really a db");
+    // 别处的同名文件不受影响。
+    let r = WriteFile::new(b.clone())
+        .execute(json!({"path": "backups/state.sqlite", "content": "copy"}))
+        .await;
+    assert!(!r.is_error, "{}", r.content);
+    // grep 从目录遍历进来也搜不到库文件的内容（别处的副本照常可搜）。
+    let r = Grep::new(b.clone())
+        .execute(json!({"pattern": "not really", "path": "."}))
+        .await;
+    assert!(!r.is_error, "{}", r.content);
+    assert!(r.content.contains("未找到匹配"), "{}", r.content);
+    let r = Grep::new(b.clone())
+        .execute(json!({"pattern": "copy", "path": "."}))
+        .await;
+    assert!(r.content.contains("backups/state.sqlite"), "{}", r.content);
+
+    // 拼写别名在 Unrestricted 下也拦得住——那时沙箱的 `..` 过滤不再运行，只剩这道
+    // 守卫：`.` / `..` 词法回退（Win32 打开前按词法消解，`agent/<不存在>/..` 仍是根）、
+    // 保留名目录被 `..` 折掉（POSIX 的 create_dir_all 会先把它建出来）、指向库文件的
+    // 符号链接；Windows 另有尾随点/空格归一、8.3 短名与 `\\?\` / `\\.\` 前缀 + 大小写变体。
+    let mut aliases = vec![
+        "./state.sqlite".to_string(),
+        "agent/./state.sqlite-wal".to_string(),
+        "agent/nonexistent/../state.sqlite".to_string(),
+        "agent/nonexistent/../state.sqlite-journal".to_string(),
+        "state.sqlite-journal/../x.txt".to_string(),
+        "agent/state.sqlite-wal/./../y.txt".to_string(),
+        // 非紧邻的 `..`：create_dir_all 逐段 mkdir 同样会先建出保留名目录。
+        "state.sqlite-journal/sub/../../x.txt".to_string(),
+        "state.sqlite-wal/a/b/../../../z.txt".to_string(),
+    ];
+    #[cfg(windows)]
+    aliases.extend([
+        "state.sqlite.".to_string(),
+        "state.sqlite ".to_string(),
+        "state.sqlite-journal.".to_string(),
+        "state.sqlite:ads".to_string(),
+        format!("\\\\?\\{}\\state.sqlite", b.to_string_lossy().to_uppercase()),
+        format!("\\\\.\\{}\\state.sqlite-wal", b.to_string_lossy()),
+    ]);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(b.join("state.sqlite"), b.join("link-to-db")).unwrap();
+        aliases.push("link-to-db".to_string());
+    }
+    crate::access::scope_access(ToolAccess::Unrestricted, async {
+        for path in aliases {
+            let r = Read::new(b.clone()).execute(json!({"path": path})).await;
+            assert!(r.is_error, "read {path} must be refused: {}", r.content);
+            assert!(r.content.contains("运行时数据库"), "{path}: {}", r.content);
+            let r = WriteFile::new(b.clone())
+                .execute(json!({"path": path, "content": "x"}))
+                .await;
+            assert!(r.is_error, "write {path} must be refused: {}", r.content);
+            let r = DeleteFile::new(b.clone()).execute(json!({"path": path})).await;
+            assert!(r.is_error, "delete {path} must be refused: {}", r.content);
+        }
+    })
+    .await;
+    assert_eq!(fs::read(b.join("state.sqlite")).unwrap(), b"not really a db");
+    for name in ["state.sqlite-journal", "state.sqlite-wal", "x.txt", "y.txt", "z.txt"] {
+        assert!(!b.join(name).exists(), "不得借归一化创建假 hot journal / 副产物: {name}");
+    }
+
+    // 保留名作【目录】也拦（任何权限）：write 会 create_dir_all 出 agent/state.sqlite-journal/，
+    // SQLite 下次打开把它当热 journal 读、读目录失败 → 整个库打不开。
+    for path in [
+        "state.sqlite-journal/x.txt",
+        "agent/state.sqlite-wal/deep/x.txt",
+        "State.SQLite-shm/x.txt",
+    ] {
+        let r = WriteFile::new(b.clone())
+            .execute(json!({"path": path, "content": "x"}))
+            .await;
+        assert!(r.is_error, "write {path} must be refused: {}", r.content);
+        assert!(r.content.contains("运行时数据库"), "{path}: {}", r.content);
+        let r = Read::new(b.clone()).execute(json!({"path": path})).await;
+        assert!(r.content.contains("运行时数据库"), "{path}: {}", r.content);
+    }
+    for name in ["state.sqlite-journal", "state.sqlite-wal", "State.SQLite-shm"] {
+        assert!(!b.join(name).exists(), "不得以保留名建目录: {name}");
+    }
+    // 非保留名的目录照常可建。
+    let r = WriteFile::new(b.clone())
+        .execute(json!({"path": "state.sqlite-backup/x.txt", "content": "x"}))
+        .await;
+    assert!(!r.is_error, "{}", r.content);
+}
+
+/// 真正交给 `execute` 的「祖先」只有 tempdir 里多套的一层 `outer`：守卫一旦回归，最坏也只
+/// 删掉本测试自己的临时目录，而不是 %TEMP% 或盘根（那两类只做纯函数断言，见下一个测试）。
+#[tokio::test]
+async fn delete_refuses_workspace_root_and_its_ancestors() {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let b = outer.join("agent");
+    fs::create_dir_all(&b).unwrap();
+    fs::write(b.join("state.sqlite"), b"not really a db").unwrap();
+    fs::write(b.join("note.md"), b"keep me").unwrap();
+    fs::write(outer.join("sibling.txt"), b"outer").unwrap();
+    let root = b.to_string_lossy().replace('\\', "/");
+    let parent = outer.to_string_lossy().replace('\\', "/");
+    let root_spellings = [
+        ".".to_string(),
+        "./".to_string(),
+        "agent".to_string(),
+        "agent/.".to_string(),
+        root.clone(),
+        format!("{root}/"),
+    ];
+    let ancestor_spellings = ["..".to_string(), parent];
+    // Unrestricted：根的各种拼法（相对 `.` / `agent` 前缀 / 绝对）与上级目录都由
+    // contains_workspace_root 拒绝。
+    crate::access::scope_access(ToolAccess::Unrestricted, async {
+        for path in root_spellings.iter().chain(ancestor_spellings.iter()) {
+            let r = DeleteFile::new(b.clone()).execute(json!({"path": path})).await;
+            assert!(r.is_error, "delete {path} must be refused: {}", r.content);
+            assert!(
+                r.content.contains("工作区根目录") || r.content.contains("运行时数据库"),
+                "{path}: {}",
+                r.content
+            );
+        }
+    })
+    .await;
+    // 沙箱：根的拼法走到同一道守卫；上级目录在沙箱门就被拒。
+    for path in &root_spellings {
+        let r = DeleteFile::new(b.clone()).execute(json!({"path": path})).await;
+        assert!(r.is_error, "delete {path} must be refused: {}", r.content);
+        assert!(
+            r.content.contains("工作区根目录") || r.content.contains("运行时数据库"),
+            "{path}: {}",
+            r.content
+        );
+    }
+    for path in &ancestor_spellings {
+        let r = DeleteFile::new(b.clone()).execute(json!({"path": path})).await;
+        assert!(r.is_error, "delete {path} must be refused: {}", r.content);
+    }
+    assert!(b.join("state.sqlite").exists());
+    assert_eq!(fs::read(b.join("note.md")).unwrap(), b"keep me");
+    assert_eq!(fs::read(outer.join("sibling.txt")).unwrap(), b"outer");
+    // 根下的普通条目仍可删。
+    let r = DeleteFile::new(b.clone())
+        .execute(json!({"path": "note.md"}))
+        .await;
+    assert!(!r.is_error, "{}", r.content);
+    assert!(!b.join("note.md").exists());
+}
+
+/// 盘根 / 文件系统根绝不交给 `execute`（任何一道守卫回归都意味着 `remove_dir_all("C:\\")`）：
+/// 只断言守卫函数本身。盘根从【规范化后的】base 祖先链取：%TEMP% 挂在 junction / subst
+/// 盘上时词法祖先（`C:\`）与物理落点（`\\?\D:\…`）不在同一个盘，而守卫比的是物理落点。
+#[test]
+fn root_guards_recognise_drive_and_filesystem_roots() {
+    let b = base();
+    let canonical = b.canonicalize().unwrap();
+    let drive_root = canonical.ancestors().last().unwrap().to_path_buf();
+    assert!(drive_root.parent().is_none(), "{drive_root:?}");
+    // 工作区所在盘的根是工作区祖先；同时也是文件系统根。
+    assert!(contains_workspace_root(&b, &drive_root));
+    assert!(is_filesystem_root(&drive_root));
+    // 根上再 `..`：push_lexical 对 RootDir / Prefix 后的 `..` 不弹栈，仍停在根上。
+    assert!(is_filesystem_root(&drive_root.join("..").join("..")));
+    assert!(contains_workspace_root(&b, &drive_root.join("..").join("..")));
+    // 与工作区无关的根：不是工作区祖先，但仍是根。只拿【不存在】的盘符试（存在的盘可能是
+    // subst 盘，canonicalize 会解析到真实目录），它只走词法折叠分支；扩展长度前缀同理。
+    #[cfg(windows)]
+    {
+        let missing = ('D'..='Z')
+            .rev()
+            .map(|letter| format!("{letter}:\\"))
+            .find(|root| !Path::new(root).exists())
+            .expect("总有一个不存在的盘符");
+        let spellings = [
+            missing.clone(),
+            format!("{missing}..\\.."),
+            format!("\\\\?\\{missing}"),
+            format!("{}../..", missing.replace('\\', "/")),
+        ];
+        for spelling in &spellings {
+            assert!(is_filesystem_root(Path::new(spelling)), "{spelling}");
+            assert!(!contains_workspace_root(&b, Path::new(spelling)), "{spelling}");
+        }
+    }
+    #[cfg(unix)]
+    for spelling in ["/", "/../..", "/."] {
+        assert!(is_filesystem_root(Path::new(spelling)), "{spelling}");
+    }
+    // 工作区自身、其子目录、其父目录都不是根。
+    assert!(!is_filesystem_root(&b));
+    assert!(!is_filesystem_root(&b.join("sub")));
+    assert!(!is_filesystem_root(b.parent().unwrap()));
+    // 叶子是指向根的链接：删的是链接条目本身，两道守卫都不按根算；带 `/.` 的拼写解析到
+    // 根目录本身，仍按根拒绝。
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/", b.join("rootlink")).unwrap();
+        assert!(!is_filesystem_root(&b.join("rootlink")));
+        assert!(!contains_workspace_root(&b, &b.join("rootlink")));
+        assert!(is_filesystem_root(&b.join("rootlink").join(".")));
+    }
+}
+
+/// 根下叫保留名的【真实目录】（外部工具 / shell 建出来的假 hot journal）必须能从工具层
+/// 删掉——它不是库文件，却会让 SQLite 开不了库；库文件本身、指向库文件的链接照旧拒绝，
+/// 读 / 写 / 列目录对这个目录也依然拒绝（只开 delete 一个口子）。
+#[tokio::test]
+async fn delete_can_remove_stray_reserved_name_directory() {
+    let b = base();
+    fs::write(b.join("state.sqlite"), b"not really a db").unwrap();
+    fs::create_dir_all(b.join("state.sqlite-journal").join("sub")).unwrap();
+    fs::write(b.join("state.sqlite-journal").join("sub").join("x.txt"), b"x").unwrap();
+
+    let r = Read::new(b.clone())
+        .execute(json!({"path": "state.sqlite-journal/sub/x.txt"}))
+        .await;
+    assert!(r.is_error && r.content.contains("运行时数据库"), "{}", r.content);
+    let r = ListDir::new(b.clone())
+        .execute(json!({"path": "state.sqlite-journal"}))
+        .await;
+    assert!(r.is_error && r.content.contains("运行时数据库"), "{}", r.content);
+
+    // 口子开给保留名目录下的【真实目录】（目录本身及其子目录：都不可能是库文件）；
+    // 目录里的文件仍按库文件口径拒绝。
+    let r = DeleteFile::new(b.clone())
+        .execute(json!({"path": "state.sqlite-journal/sub/x.txt"}))
+        .await;
+    assert!(r.is_error && r.content.contains("运行时数据库"), "{}", r.content);
+    assert!(b.join("state.sqlite-journal").join("sub").join("x.txt").exists());
+    // 目录可删（递归），库文件本身仍不可删。
+    let r = DeleteFile::new(b.clone())
+        .execute(json!({"path": "state.sqlite-journal"}))
+        .await;
+    assert!(!r.is_error, "{}", r.content);
+    assert!(!b.join("state.sqlite-journal").exists());
+    let r = DeleteFile::new(b.clone())
+        .execute(json!({"path": "state.sqlite"}))
+        .await;
+    assert!(r.is_error, "{}", r.content);
+    assert_eq!(fs::read(b.join("state.sqlite")).unwrap(), b"not really a db");
+
+    #[cfg(unix)]
+    {
+        // 叫保留名、指向库文件的链接：物理落点就是库文件，照旧拒绝（不是真实目录，不开口子）。
+        std::os::unix::fs::symlink(b.join("state.sqlite"), b.join("state.sqlite-wal")).unwrap();
+        let r = DeleteFile::new(b.clone())
+            .execute(json!({"path": "state.sqlite-wal"}))
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(fs::symlink_metadata(b.join("state.sqlite-wal")).is_ok());
+        // 叫保留名、指向别处的链接（假 journal 残留）：write / edit / read 拒绝——原子写的
+        // rename 会把链接换成一个真的叫保留名的文件；delete 放行，删的是链接条目本身。
+        fs::write(b.join("note.md"), b"note").unwrap();
+        std::os::unix::fs::symlink(b.join("note.md"), b.join("state.sqlite-journal")).unwrap();
+        let r = WriteFile::new(b.clone())
+            .execute(json!({"path": "state.sqlite-journal", "content": "fake journal"}))
+            .await;
+        assert!(r.is_error && r.content.contains("运行时数据库"), "{}", r.content);
+        let r = EditFile::new(b.clone())
+            .execute(json!({"path": "state.sqlite-journal", "old_string": "note", "new_string": "x"}))
+            .await;
+        assert!(r.is_error && r.content.contains("运行时数据库"), "{}", r.content);
+        let r = Read::new(b.clone())
+            .execute(json!({"path": "state.sqlite-journal"}))
+            .await;
+        assert!(r.is_error && r.content.contains("运行时数据库"), "{}", r.content);
+        assert!(
+            fs::symlink_metadata(b.join("state.sqlite-journal")).unwrap().file_type().is_symlink(),
+            "链接必须原样保留，不能被换成真实文件"
+        );
+        assert_eq!(fs::read(b.join("note.md")).unwrap(), b"note");
+        let r = DeleteFile::new(b.clone())
+            .execute(json!({"path": "state.sqlite-journal"}))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(fs::symlink_metadata(b.join("state.sqlite-journal")).is_err());
+        assert_eq!(fs::read(b.join("note.md")).unwrap(), b"note", "删的是链接，不是目标");
+        // 指向工作区根的链接：删的是链接条目本身，不是工作区——必须放行，且根完好。
+        std::os::unix::fs::symlink(&b, b.join("selflink")).unwrap();
+        let r = DeleteFile::new(b.clone())
+            .execute(json!({"path": "selflink"}))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(fs::symlink_metadata(b.join("selflink")).is_err());
+        assert_eq!(fs::read(b.join("state.sqlite")).unwrap(), b"not really a db");
+        // 带尾随分隔符 / `.` 的拼写解析到目录本身：仍按根拒绝。
+        std::os::unix::fs::symlink(&b, b.join("selflink")).unwrap();
+        for spelling in ["selflink/", "selflink/."] {
+            let r = DeleteFile::new(b.clone())
+                .execute(json!({"path": spelling}))
+                .await;
+            assert!(r.is_error, "{spelling}: {}", r.content);
+        }
+        assert!(fs::symlink_metadata(b.join("selflink")).is_ok());
+        assert_eq!(fs::read(b.join("state.sqlite")).unwrap(), b"not really a db");
+        // 叫 `state.sqlite` 本名的链接：可能就是库的入口（用户把库挪走后留下的链接），
+        // delete 也拒绝；伴生名的链接（上面的 state.sqlite-journal）仍可清理。
+        fs::rename(b.join("state.sqlite"), b.join("real.sqlite")).unwrap();
+        std::os::unix::fs::symlink(b.join("real.sqlite"), b.join("state.sqlite")).unwrap();
+        let r = DeleteFile::new(b.clone())
+            .execute(json!({"path": "state.sqlite"}))
+            .await;
+        assert!(r.is_error && r.content.contains("运行时数据库"), "{}", r.content);
+        assert!(fs::symlink_metadata(b.join("state.sqlite")).unwrap().file_type().is_symlink());
+        fs::remove_file(b.join("state.sqlite")).unwrap();
+        fs::write(b.join("note2.md"), b"n").unwrap();
+        std::os::unix::fs::symlink(b.join("note2.md"), b.join("state.sqlite")).unwrap();
+        let r = DeleteFile::new(b.clone())
+            .execute(json!({"path": "state.sqlite"}))
+            .await;
+        assert!(r.is_error, "本名链接不看落点一律拒绝: {}", r.content);
+        assert!(fs::symlink_metadata(b.join("state.sqlite")).is_ok());
+    }
+}
+
+/// 工作区根本身是一个符号链接（`agent -> /data/real`）时：删 / 写这个条目等于把工作区入口
+/// 拆掉（下次启动在原处新建一个空工作区）。「链接只删条目」的口子不适用于 base 自己的条目。
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_workspace_root_entry_is_neither_deletable_nor_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    // 落点放在【另一个】临时目录：链接条目所在目录的保护（`contains_workspace_root` 第三条）
+    // 只有在「落点不在该目录下」时才是决定性的——同一目录下按落点比就已经命中，分支测不到。
+    let real_dir = tempfile::tempdir().unwrap();
+    let real = real_dir.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("state.sqlite"), b"not really a db").unwrap();
+    let b = dir.path().join("agent");
+    std::os::unix::fs::symlink(&real, &b).unwrap();
+    std::mem::forget(dir);
+    let abs = b.to_string_lossy().into_owned();
+    // `./agent` 不是根的拼法：`Path::starts_with` 按分量比，前导 `./` 让它不走「以根目录名
+    // 开头的旧式相对路径」规则，落在工作区内的 `<base>/agent`（不存在）——与 rewind 的
+    // `resolve_like_file_tool` 同口径，这里只确认它既不删根也不报根。
+    let spellings = [
+        "agent".to_string(),
+        "agent/.".to_string(),
+        abs.clone(),
+        ".".to_string(),
+        "./".to_string(),
+    ];
+    let r = DeleteFile::new(b.clone()).execute(json!({"path": "./agent"})).await;
+    assert!(r.is_error && r.content.contains("文件不存在"), "{}", r.content);
+    for access in [ToolAccess::Sandboxed, ToolAccess::Unrestricted] {
+        crate::access::scope_access(access, async {
+            for path in &spellings {
+                let r = DeleteFile::new(b.clone()).execute(json!({"path": path})).await;
+                assert!(r.is_error, "{access:?} delete {path}: {}", r.content);
+                assert!(
+                    r.content.contains("工作区根目录") || r.content.contains("运行时数据库"),
+                    "{access:?} {path}: {}",
+                    r.content
+                );
+                let r = WriteFile::new(b.clone())
+                    .execute(json!({"path": path, "content": "x"}))
+                    .await;
+                assert!(r.is_error, "{access:?} write {path}: {}", r.content);
+            }
+        })
+        .await;
+    }
+    assert!(fs::symlink_metadata(&b).unwrap().file_type().is_symlink(), "入口链接必须原样保留");
+    assert_eq!(fs::read(real.join("state.sqlite")).unwrap(), b"not really a db");
+    // 链接条目所在的目录及其祖先也不能删（递归删除会把入口条目一起带走）：按落点比
+    // （real 不在 parent 下）看不见这一层，要按条目所在目录比。上一级只断言守卫。
+    let parent = b.parent().unwrap().to_path_buf();
+    assert!(
+        !physical_normalize(&b).starts_with(physical_normalize(&parent)),
+        "测试前提：落点不在链接所在目录下，否则第三条分支不是决定性的"
+    );
+    assert!(contains_workspace_root(&b, &parent));
+    assert!(contains_workspace_root(&b, parent.parent().unwrap()));
+    assert!(!contains_workspace_root(&b, &real.join("sub")), "工作区内的子目录不算");
+    assert!(contains_workspace_root(&b, real_dir.path()), "落点的上级目录按落点比命中（第二条）");
+    crate::access::scope_access(ToolAccess::Unrestricted, async {
+        let r = DeleteFile::new(b.clone())
+            .execute(json!({"path": parent.to_string_lossy()}))
+            .await;
+        assert!(r.is_error && r.content.contains("工作区根目录"), "{}", r.content);
+    })
+    .await;
+    assert!(fs::symlink_metadata(&b).unwrap().file_type().is_symlink());
+    // 同一父目录下、名字不同但落点与 base 相同的链接按根条目算（大小写不敏感文件系统 /
+    // 8.3 短名的别名走的就是这条：名字对不上、落点相同）；落点不同的兄弟链接不算。
+    std::os::unix::fs::symlink(&real, parent.join("alias")).unwrap();
+    fs::create_dir_all(parent.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(parent.join("elsewhere"), parent.join("other")).unwrap();
+    assert!(is_workspace_root_entry(&b, &parent.join("alias")));
+    assert!(contains_workspace_root(&b, &parent.join("alias")));
+    assert!(!is_workspace_root_entry(&b, &parent.join("other")));
+    assert!(!contains_workspace_root(&b, &parent.join("other")));
+    // 工作区里的普通文件照常读写删。
+    let r = WriteFile::new(b.clone())
+        .execute(json!({"path": "note.md", "content": "hi"}))
+        .await;
+    assert!(!r.is_error, "{}", r.content);
+    assert_eq!(fs::read(real.join("note.md")).unwrap(), b"hi");
+    let r = DeleteFile::new(b.clone()).execute(json!({"path": "note.md"})).await;
+    assert!(!r.is_error, "{}", r.content);
+    // atomic_write 自己也拒绝覆盖指向目录的链接（工具守卫之外的第二道）。
+    let err = rclaw_store::atomic_write(&b, b"x").unwrap_err().to_string();
+    assert!(err.contains("指向目录的符号链接"), "{err}");
+    assert!(fs::symlink_metadata(&b).unwrap().file_type().is_symlink());
+}
+
+/// Windows 盘符相对路径（`C:`、`C:foo`）：落点是该盘的进程级「当前目录」，不表示一个确定的
+/// 文件；任何权限下都拒绝。类 Unix 下 `C:foo` 只是个普通文件名。
+#[tokio::test]
+async fn drive_relative_paths_are_refused_on_windows() {
+    let b = base();
+    #[cfg(windows)]
+    {
+        let drive = b
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .chars()
+            .next()
+            .unwrap();
+        for access in [ToolAccess::Sandboxed, ToolAccess::Unrestricted] {
+            crate::access::scope_access(access, async {
+                for path in [format!("{drive}:"), format!("{drive}:foo.txt"), "Z:".to_string(), "Z:x".to_string()] {
+                    let r = Read::new(b.clone()).execute(json!({"path": path})).await;
+                    assert!(r.is_error && r.content.contains("盘符相对路径"), "{access:?} read {path}: {}", r.content);
+                    let r = WriteFile::new(b.clone())
+                        .execute(json!({"path": path, "content": "x"}))
+                        .await;
+                    assert!(r.is_error && r.content.contains("盘符相对路径"), "{access:?} write {path}: {}", r.content);
+                    let r = DeleteFile::new(b.clone()).execute(json!({"path": path})).await;
+                    assert!(r.is_error && r.content.contains("盘符相对路径"), "{access:?} delete {path}: {}", r.content);
+                    let r = ListDir::new(b.clone()).execute(json!({"path": path})).await;
+                    assert!(r.is_error && r.content.contains("盘符相对路径"), "{access:?} list {path}: {}", r.content);
+                }
+            })
+            .await;
+        }
+        // 带根的盘符路径照常按沙箱 / 数据库规则处理（沙箱下工作区外被拒，但不是「盘符相对」）。
+        let r = Read::new(b.clone()).execute(json!({"path": format!("{drive}:\\")})).await;
+        assert!(r.is_error && !r.content.contains("盘符相对路径"), "{}", r.content);
+    }
+    #[cfg(not(windows))]
+    {
+        let r = WriteFile::new(b.clone())
+            .execute(json!({"path": "C:foo.txt", "content": "x"}))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(fs::read(b.join("C:foo.txt")).unwrap(), b"x");
+    }
+}
+
+/// `expected_sha256` 校验要先按 metadata 确认是普通文件再打开：FIFO 的 `open` 会一直等到有
+/// 写端出现，工具调用就挂死了。
+#[cfg(unix)]
+#[tokio::test]
+async fn write_version_check_does_not_open_special_files() {
+    let b = base();
+    let fifo = b.join("pipe");
+    if !std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        WriteFile::new(b.clone()).execute(json!({
+            "path": "pipe",
+            "content": "x",
+            "expected_sha256": "0".repeat(64)
+        })),
+    )
+    .await
+    .expect("版本校验不得阻塞在 FIFO 的 open 上");
+    assert!(r.is_error && r.content.contains("不是普通文件"), "{}", r.content);
+}
+
+/// Linux：挂载点按根处理（`/proc` 与 `/` 不在同一设备）；`/proc/self` 是链接，叶子链接不算。
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_points_count_as_filesystem_roots() {
+    if !Path::new("/proc/self").exists() {
+        return;
+    }
+    assert!(is_filesystem_root(Path::new("/proc")));
+    assert!(!is_filesystem_root(Path::new("/proc/self")));
+    // 挂载点之下的普通目录不是根。
+    assert!(!is_filesystem_root(Path::new("/proc/sys")));
+}
+
+/// Windows junction（`mklink /J`）：`is_symlink` 为真，删除只摘条目；指向工作区根的 junction
+/// 可删且目标完好——Win32 在路径规范化阶段就把尾随 `\.` 折掉，所以 `selflink\.` 与 `selflink`
+/// 是同一个条目（不像 POSIX 那样穿过链接），两种拼写都只摘 junction；指向盘根的 junction
+/// 只断言守卫；叫保留名的 junction 可清理（不是库文件、不是本名）。
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_junctions_are_removed_as_entries_only() {
+    let b = base();
+    fs::write(b.join("state.sqlite"), b"not really a db").unwrap();
+    let mklink = |link: &Path, target: &Path| {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    if !mklink(&b.join("selflink"), &b) {
+        return;
+    }
+    assert!(fs::symlink_metadata(b.join("selflink")).unwrap().file_type().is_symlink());
+    let r = DeleteFile::new(b.clone()).execute(json!({"path": "selflink"})).await;
+    assert!(!r.is_error, "{}", r.content);
+    assert!(fs::symlink_metadata(b.join("selflink")).is_err());
+    assert_eq!(fs::read(b.join("state.sqlite")).unwrap(), b"not really a db");
+    // Win32 把 `selflink\.` / `selflink/.` 规范化成 `selflink` 本身（symlink_metadata 看到的
+    // 就是 junction），所以删的仍只是条目，工作区内容完好。
+    for spelling in ["selflink\\.", "selflink/."] {
+        assert!(mklink(&b.join("selflink"), &b));
+        let r = DeleteFile::new(b.clone()).execute(json!({"path": spelling})).await;
+        assert!(!r.is_error, "{spelling}: {}", r.content);
+        assert!(fs::symlink_metadata(b.join("selflink")).is_err(), "{spelling}");
+        assert_eq!(fs::read(b.join("state.sqlite")).unwrap(), b"not really a db");
+    }
+    // 指向盘根的 junction：与 unix 的 rootlink 同口径只断言守卫（盘根绝不交给 execute）——
+    // 叶子是链接时两道守卫都不按根算；`rootlink\.` 被 Win32 折成 junction 本身，同样是
+    // 链接条目（POSIX 上才会穿过链接落到根）。
+    let drive_root = b.canonicalize().unwrap().ancestors().last().unwrap().to_path_buf();
+    assert!(mklink(&b.join("rootlink"), &drive_root));
+    for spelling in [b.join("rootlink"), b.join("rootlink").join(".")] {
+        assert!(!is_filesystem_root(&spelling), "{}", spelling.display());
+        assert!(!contains_workspace_root(&b, &spelling), "{}", spelling.display());
+    }
+    fs::remove_dir(b.join("rootlink")).unwrap();
+    assert!(drive_root.exists());
+    // 叫伴生保留名的 junction：read / write 拒绝，delete 清理条目。
+    fs::create_dir_all(b.join("dir")).unwrap();
+    assert!(mklink(&b.join("state.sqlite-journal"), &b.join("dir")));
+    let r = WriteFile::new(b.clone())
+        .execute(json!({"path": "state.sqlite-journal", "content": "x"}))
+        .await;
+    assert!(r.is_error && r.content.contains("运行时数据库"), "{}", r.content);
+    let r = DeleteFile::new(b.clone())
+        .execute(json!({"path": "state.sqlite-journal"}))
+        .await;
+    assert!(!r.is_error, "{}", r.content);
+    assert!(fs::symlink_metadata(b.join("state.sqlite-journal")).is_err());
+    assert!(b.join("dir").exists(), "删的是 junction 条目，不是目标目录");
+}
+
+#[tokio::test]
 async fn read_attaches_local_media_file() {
     let b = base();
     let root = b.to_string_lossy().replace('\\', "/");

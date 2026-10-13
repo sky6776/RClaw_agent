@@ -409,7 +409,10 @@ impl SlashRegistry {
              /skills            显示当前支持的所有 skill 名称、所属技能包及功能\n\
              /tools             显示当前支持的所有工具名称及说明\n\
              /context           显示当前会话上下文用量（窗口/已用/剩余/使用率）\n\
-             /clear [confirm]   清空当前会话并删除 agent/memory、agent/sessions 全部文件（需 /clear confirm）\n\
+             /compact           立即压缩当前会话历史（忽略阈值；有任务运行时拒绝）\n\
+             /rewind [回滚点 id]  列出可回滚的文件 checkpoint，或按列表给出的回滚点 id 回滚文件（hash 校验，外部改动整组拒绝）\n\
+             /export [all]      把当前会话（或全部会话）的完整记录导出为 JSONL（agent/exports/，含已压缩的消息）\n\
+             /clear [confirm]   清空全部会话状态（agent/state.sqlite）并删除 agent/memory 全部文件（需 /clear confirm）\n\
              /log [子命令]      查看 / 发送 / 删除 agent/logs 日志文件（list / get / del）\n\
              /cancel            停止当前会话正在运行的任务（路由层即时生效，不进入 LLM）\n\
              /help              显示本帮助\n\
