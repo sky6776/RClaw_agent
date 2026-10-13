@@ -9,11 +9,12 @@
 ## 核心特性
 
 - **多通道并发**：控制台 CLI、桌面 GUI、微信（iLink Bot 扫码接入）、QQ（NapCat OneBot 11 over WebSocket）可同时在线，各通道独立会话与并发控制。
-- **ReAct 内核**：工具批次并行执行、失败重试退避、完成闸门、用户插队与取消；超长会话自动语义压缩（CONTEXT COMPACTION + 摘要落盘）。
+- **ReAct 内核**：工具批次并行执行、失败重试退避、完成闸门、用户插队与取消；三层上下文管理（加载期压缩 + 轮内 microcompact/auto/reactive + 超预算工具结果落盘为「预览 + 路径」引用句柄），长任务不撑爆窗口。
 - **内置工具**：文件读写/编辑/列表/grep（默认沙箱在 `agent/` 目录内）、shell、联网搜索（多来源高可用池 + 熔断降级）、记忆、定时任务（cron）。
 - **技能系统**：SKILL.md 激活即用，技能可声明 manifest 动态工具；仓库内置 30+ 技能（投研、OCR、图像/视频生成等），支持 Python 技能运行时与自助安装。
 - **gbrain 知识库（Android APK 内置）**：进程内知识库子系统——embedding 语义检索、文档 OCR 管线、RAPTOR 递归摘要树、制品路由；数据自动落在应用私有目录。
 - **模型接入**：OpenAI 兼容协议，默认智谱 GLM，可切换 DeepSeek 等任意兼容服务；流式 SSE、思考字段适配。
+- **长程任务编排**（ZCode 长程能力移植）：`PlanRun` 依赖序多步计划（并行波次、对抗验证环、波次边界暂停/继续）与 `WorkflowRun` 确定性 JS 沙箱编排（问答 journal 零调用重放、amend 热修、`.ask<T>` 类型化提问自动编译 JSON schema 校验）；会话任意消息锚点 `/fork` 分叉新会话、`/goal` 会话级长期目标提醒、跨会话交接与选点文件回滚。
 - **安全设计**：文件工具 fail-safe 沙箱（默认拒绝，提权需显式配置）、输出敏感信息自动脱敏（key/令牌/手机号）、每通道消息身份→权限单向链。
 
 ## Android 真机演示
@@ -72,7 +73,7 @@ auth = "bearer"
 
 ## 桌面版（Windows GUI）
 
-基于 Tauri 的桌面应用（React + Vite 前端），在 CLI 全部能力之上提供图形界面：会话聊天、文件工作区管理、主配置 `rclaw.toml` 在工作区内直接编辑（带完整校验、双向同步），以及技能 / 工具 / 定时任务 / 媒体库等面板。
+基于 Tauri 的桌面应用（React + Vite 前端，与安卓 APK 共用同一前端），在 CLI 全部能力之上提供图形界面：会话聊天、文件工作区管理、主配置 `rclaw.toml` 在工作区内直接编辑（带完整校验、双向同步），以及技能 / 工具 / 定时任务 / 媒体库等面板。会话内支持消息下方「⑂ 分叉」到新会话、多步流程的可折叠步骤卡片与侧栏 todo、agent 运行期间的排队消息（可删除 / 编辑 /「立即」插队投递）与计划暂停/继续按钮。
 
 ```bat
 build-windows.cmd
@@ -293,8 +294,8 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 | `Agent` | 子代理委派（目标式 / 契约式两档，带拆分理由门控） |
 | `TeamCreate` / `TeamDelete` / `TaskCreate` / `TaskUpdate` / `TaskList` / `TaskGet` / `SendMessage` | 团队协作：共享任务表 + 成员邮箱 |
 | `AgentStatus` / `AgentCancel` / `AgentWait` / `AgentResume` | 子代理生命周期管理 |
-| `PlanRun` | 依赖序多步计划：JSON 步骤表 + 并行波次执行 + 逐步事件日志 |
-| `WorkflowRun` | 程序化编排：JS 脚本在确定性沙箱里经 `agent(name).ask()` 驱动子代理，问答写 journal 支持零调用重放 / amend 热修 |
+| `PlanRun` | 依赖序多步计划：JSON 步骤表 + 并行波次执行（可达 8 步/波）+ 对抗验证环 + 逐步事件日志；支持波次边界暂停/继续与 journal 断点续跑 |
+| `WorkflowRun` | 程序化编排：JS 脚本在确定性沙箱里经 `agent(name).ask()` / `.ask<T>()`（内联类型自动编译 JSON schema 校验答案）驱动子代理，问答写 journal 支持零调用重放 / amend 热修 |
 | `escalate` | 计划步骤内的子代理向编排者阻塞式提问（不编造答案），问答进计划 journal 支持重放 |
 | `ResolveWorkflowQuestion` | 编排者应答 `escalate` 提出的问题，实时解锁等待中的步骤并记入 journal |
 | `message_agent` | bot 间交接：带不可伪造交接链的消息投递（深度上限 3，防环路） |
@@ -317,6 +318,8 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 | `/context` | 当前会话上下文用量（窗口 / 已用 / 剩余 / 使用率） |
 | `/compact` | 立即压缩当前会话历史（忽略阈值与防抖；有任务运行时拒绝） |
 | `/rewind [回滚点 id]` | 不带参数列出可回滚的文件 checkpoint（每个回滚点 = 一次工具迭代，附时间）；带列表给出的回滚点 id 回滚该点及之后的文件写入（hash 校验，被外部改动过则整组拒绝） |
+| `/fork [消息 id]` | 不带参数列出可分叉锚点（最近用户消息）；带消息 id 从该消息（含）复制出一个新会话分支——原会话与文件都不动，桌面/安卓也可直接点消息下方的「⑂ 分叉」按钮 |
+| `/goal [目标文本\|clear]` | 设定会话级长期目标：此后每次回复都收到目标提醒（按证据核对、不自行宣告完成）；`/goal` 查看、`/goal clear` 收尾 |
 | `/export [all]` | 把当前会话（或全部会话）的完整记录导出为 JSONL 到 `agent/exports/`（含已被压缩进摘要的消息；压缩只影响模型可见视图，不删除历史） |
 | `/cancel` / `/clear [confirm]` / `/log` | 停止当前任务 / 清空会话状态（`agent/state.sqlite`）与记忆 / 查看日志文件 |
 
@@ -344,6 +347,7 @@ crates/
 RClaw 站在开源社区的肩膀上——从起源项目到同类 agent 的机制借鉴：
 
 - **[CClaw](https://github.com/sky6776/CClaw)**——RClaw 最初是 CClaw 的 Rust 实现，后续逐步扩展为独立的多通道自进化 agent 运行时。
+- **[ZCode](https://github.com/zai-org/ZCode)**（zai-org / 智谱）——长程任务能力的参照系：轮内三层压缩（microcompact / auto / reactive）、工具结果落盘与引用句柄、会话任意锚点 fork、后台完成合批唤醒、确定性工作流沙箱与 `.ask<T>` 类型编译、`/goal` 目标提醒等机制移植自此（逐轮对照记录见 `docs/zcode-port-longhorizon.md`）。
 - **[Hermes Agent](https://github.com/NousResearch/hermes-agent)**（NousResearch）——同谱系的自进化 agent。RClaw 的自进化体系（后台评审、记忆 / 技能 review、curator 策展），以及跨会话检索、评审成本控制（token 预算 + digest 重放）、技能 sha256 台账回滚、记忆加载期复扫与漂移检测等机制，均借鉴自 Hermes。
 - **[Blockcell](https://github.com/blockcell-labs/blockcell)**（blockcell-labs）——Rust 构建的 agent 框架，RClaw 的 NapCat（QQ 通道）实现借鉴自该项目。
 - **[ai-berkshire](https://github.com/xbtlin/ai-berkshire)**（xbtlin）——`skills/ai-berkshire` 投研技能包从该 Claude Code 仓库修改适配而来，四大师价值投资研究法的原始出处。
