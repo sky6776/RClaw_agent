@@ -83,19 +83,28 @@ pub(crate) fn build_dependency_graph(script: &str) -> Option<DependencyGraph> {
     };
     walker.visit_program(&program);
 
-    // 分组：join 组（Promise.all 成员）按组内最小源序排，未入组的节点各自成串行组。
+    // 分组：join 组（Promise.all 成员）按组内最小源偏移排，未入组的节点各自成串行组。
     let mut node_group: Vec<usize> = vec![usize::MAX; walker.nodes.len()];
     let mut groups: Vec<(Vec<usize>, bool)> = Vec::new(); // (成员下标, parallel)
     for members in &walker.join_members {
-        if members.is_empty() {
+        // 复用的 promise（`const p = h.ask(..)` 进了两个 Promise.all）只归第一个组：
+        // 同一 ask 节点进两组会产生组间自环边，Kahn 分层对环报不出波次。
+        let mut unique: Vec<usize> = Vec::new();
+        for &node_index in members {
+            if node_index < node_group.len()
+                && node_group[node_index] == usize::MAX
+                && !unique.contains(&node_index)
+            {
+                unique.push(node_index);
+            }
+        }
+        if unique.is_empty() {
             continue;
         }
         let group_index = groups.len();
-        groups.push((members.clone(), true));
-        for &node_index in members {
-            if node_index < node_group.len() {
-                node_group[node_index] = group_index;
-            }
+        groups.push((unique.clone(), true));
+        for &node_index in &unique {
+            node_group[node_index] = group_index;
         }
     }
     for (index, group) in node_group.iter_mut().enumerate() {
@@ -411,18 +420,32 @@ pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<
         });
     };
     // 类型别名表（`type X = ...`，无泛型参数）。包裹脚本是单个表达式语句（括号包住的
-    // async 函数），别名藏在函数体里——用 Visit 深入收集，不做语句形态假设。
+    // async 函数），别名藏在函数体里——用 Visit 深入收集，不做语句形态假设。同名
+    // 别名（不同作用域互相遮蔽）不支持：扁平表无法表达作用域，第二个声明报错，
+    // 不静默覆盖（外层类型被内层同名声明偷换）。
     let mut alias_collector = AliasCollector {
         allocator: &allocator,
         aliases: HashMap::new(),
         spans: Vec::new(),
+        diagnostics: Vec::new(),
     };
     alias_collector.visit_program(&program);
     let AliasCollector {
         aliases,
         spans,
+        diagnostics: alias_diagnostics,
         ..
     } = alias_collector;
+    if !alias_diagnostics.is_empty() {
+        let source = &wrapped[WRAPPER_HEAD.len()..];
+        return Err(alias_diagnostics
+            .into_iter()
+            .map(|(offset, message)| {
+                let (line, col) = line_col(source, offset);
+                FacadeDiagnostic { line, col, message }
+            })
+            .collect());
+    }
 
     let mut walker = TypedAskWalker {
         replacements: Vec::new(),
@@ -474,6 +497,8 @@ struct AliasCollector<'a> {
     aliases: HashMap<String, AliasDef<'a>>,
     /// 别名声明的作者脚本字节区间（已去包裹头）。
     spans: Vec<(usize, usize)>,
+    /// 同名别名重复声明（作用域遮蔽不支持）——(wrapped 偏移, 消息)。
+    diagnostics: Vec<(u32, String)>,
 }
 
 /// 一条类型别名定义：泛型参数名（按声明序，无泛型为空）+ 类型体（arena 克隆）。
@@ -504,8 +529,20 @@ impl<'a> Visit<'a> for AliasCollector<'a> {
                     .collect()
             })
             .unwrap_or_default();
+        let name = it.id.name.as_str().to_string();
+        // 同名声明拒绝（保留首个）：别名表是扁平的，作用域化遮蔽（外层 `type X` +
+        // 函数内 `type X`）表达不了——静默覆盖会让外层调用点用上内层的类型。
+        if self.aliases.contains_key(&name) {
+            self.diagnostics.push((
+                it.span.start,
+                format!(
+                    "类型别名 `{name}` 重复声明（不同作用域的同名别名不支持）：请改名或合并声明"
+                ),
+            ));
+            return;
+        }
         self.aliases.insert(
-            it.id.name.as_str().to_string(),
+            name,
             AliasDef {
                 params,
                 body: it.type_annotation.clone_in(self.allocator),
@@ -607,7 +644,11 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
             let schema_json = schema.to_string();
             let receiver = self.slice(object.span()).trim();
             let question_src = self.slice(question.span());
-            let replacement = format!("{receiver}.askJson({question_src}, {schema_json})");
+            // schema 以 JSON 文本 → JS 字符串字面量 → JSON.parse 嵌入：直接内联对象
+            // 字面量会把 `__proto__` 键变成原型设置而非自有属性（JSON.stringify 随即
+            // 丢掉该约束，校验被静默放宽）；parse 路径的键语义与 JSON 完全一致。
+            let schema_literal = serde_json::to_string(&schema_json).unwrap_or_default();
+            let replacement = format!("{receiver}.askJson({question_src}, JSON.parse({schema_literal}))");
             if let Some((start, end)) = self.script_span(it.span) {
                 // 嵌套 typed ask（`ask<T>(await ask<U>(...))` 的参数里又有一层）拒绝：
                 // 外层替换的文本取自原文，内层重写无法嵌进外层的固定 span 里——支持它
@@ -1048,14 +1089,15 @@ mod tests {
                       result(r.host);\n";
         let transform = compile_typed_asks(script).expect("编译应成功");
         // serde_json 的键序按字母排（默认 BTreeMap）：不依赖键序，断言片段各自存在。
+        // schema 经 JSON.parse 字符串嵌入（对象字面量的 __proto__ 键会被当原型设置）。
         assert!(
             transform
                 .exec_script
-                .contains("scout.askJson(\"找一个主机\", {"),
+                .contains("scout.askJson(\"找一个主机\", JSON.parse("),
             "{}",
             transform.exec_script
         );
-        assert!(transform.exec_script.contains("\"type\":\"object\""));
+        assert!(transform.exec_script.contains("\\\"type\\\":\\\"object\\\""));
         assert!(!transform.exec_script.contains(".ask<"));
         assert_eq!(transform.typed_asks.len(), 1);
         let (_, schema) = &transform.typed_asks[0];
@@ -1323,5 +1365,62 @@ mod extended_type_tests {
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0]["const"], "ok");
         assert_eq!(branches[1]["type"], "string");
+    }
+
+    #[test]
+    fn duplicate_alias_declarations_are_rejected() {
+        // 回归：扁平别名表无法表达作用域，函数内同名声明曾静默覆盖顶层——外层调用
+        // 点用上内层类型。现在明确拒绝（不猜测作用域）。
+        let script = concat!(
+            "type Answer = string;\n",
+            "function helper() { type Answer = number; }\n",
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<Answer>(\"问\");\n",
+            "result(r);\n"
+        );
+        let diagnostics = compile_typed_asks(script).unwrap_err();
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("重复声明")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn schema_is_embedded_via_json_parse_not_object_literal() {
+        // 回归：schema 直接内联 JS 对象字面量时 `__proto__` 键变成原型设置而非自有
+        // 属性（JSON.stringify 随即丢掉该约束）——必须经 JSON.parse 字符串嵌入。
+        let script = concat!(
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<{ \"__proto__\": string }>(\"原型键\");\n",
+            "result(JSON.stringify(r));\n"
+        );
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        assert!(
+            transform.exec_script.contains("JSON.parse("),
+            "{}",
+            transform.exec_script
+        );
+        // schema 本体保留该属性（校验在 Rust 侧按 Value 走，不受嵌入形态影响）。
+        let (_, schema) = &transform.typed_asks[0];
+        assert!(schema["properties"].get("__proto__").is_some(), "{schema}");
+    }
+
+    #[test]
+    fn reused_promise_joins_do_not_create_self_edges() {
+        // 回归：同一个 promise 进两个 Promise.all 时节点曾重复入组——组间连边出现
+        // 自环，Kahn 分层报不出波次。
+        let script = "const a = agent(\"a\");\n\
+                      const p = a.ask(\"只问一次\");\n\
+                      const [x] = await Promise.all([p]);\n\
+                      const [y] = await Promise.all([p]);\n";
+        let graph = build_dependency_graph(script).expect("AST 解析应成功");
+        let ids: Vec<String> = graph.nodes.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ids, vec!["ask-2"], "复用 promise 只产生一个 ask 节点");
+        assert!(
+            !graph.edges.iter().any(|(from, to)| from == to),
+            "不得有自环边: {:?}",
+            graph.edges
+        );
+        assert!(!graph.waves.is_empty(), "无环才能分层: {:?}", graph.waves);
     }
 }

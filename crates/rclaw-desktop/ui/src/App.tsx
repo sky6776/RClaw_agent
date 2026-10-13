@@ -760,32 +760,36 @@ export default function App() {
 
   // 消息「分叉到新会话」（ZCode fork 同款，第十二轮）：解析该消息的持久化行 id，
   // fork 后切到新会话。恢复的历史条目自带 msgId；直播条目（本会话内发出）没有——
-  // 按【第 N 次出现】在 chat_history 里定位（"继续"这类重复文本的同名消息，从尾往
-  // 前找会命中最新一条，点旧消息就 fork 错锚点了）。
+  // chat_history 只回尾部窗口，按「从头数第 N 次出现」会在长会话里对不上窗口偏移；
+  // 改按【从尾部数第 N+1 个匹配】定位（直播条目必然靠近尾部，它之后的条目一定在
+  // 窗口内），"继续"这类重复文本也能命中点选的那一条。
   const handleFork = useCallback(
     async (entry: Entry, full = false, files = false) => {
       let anchorId = entry.msgId ?? null;
       if (anchorId === null) {
         const transcript = entriesByChat[activeId] ?? [];
-        // 该条目是同 (role, content) 条目里的第几次出现（含自身，0 起）。
-        let occurrence = 0;
+        // 该条目之后还有几条同 (role, content) 条目（碰到自身即清零重计）。
+        let laterMatches = 0;
         for (const existing of transcript) {
-          if (existing === entry) break;
-          if (existing.role === entry.role && existing.content === entry.content) {
-            occurrence += 1;
+          if (existing === entry) {
+            laterMatches = 0;
+          } else if (existing.role === entry.role && existing.content === entry.content) {
+            laterMatches += 1;
           }
         }
         try {
           const history = await api.chatHistory(activeId);
           const wantRole = entry.role === "user" ? "user" : "assistant";
-          let seen = 0;
-          for (const msg of history) {
+          let skip = laterMatches;
+          for (let i = history.length - 1; i >= 0; i--) {
+            const msg = history[i];
             if (msg.role === wantRole && msg.content === entry.content) {
-              if (seen === occurrence) {
-                anchorId = msg.id;
-                break;
+              if (skip > 0) {
+                skip -= 1;
+                continue;
               }
-              seen += 1;
+              anchorId = msg.id;
+              break;
             }
           }
         } catch {

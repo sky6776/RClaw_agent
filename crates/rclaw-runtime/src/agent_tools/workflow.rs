@@ -474,6 +474,18 @@ fn type_check_with_tsc(script: &str) -> Option<Vec<FacadeDiagnostic>> {
 /// array.items/prefixItems/minItems/maxItems。覆盖 facade 契约场景（含 `.ask<T>` 编译出的
 /// 字面量 / 联合 / 元组 / 交叉 schema，第十二轮）；超出子集的字段忽略；未知类型名与
 /// 超深嵌套（> 8）按错误处理。
+/// JSON Schema 语义的值相等：数值按数学值比较（serde_json 的 `Value` 相等区分
+/// 整数 / 浮点表示——`1` ≠ `1.0`，而 ask<1> 的答案序列化成 `1.0` / `1e0` 应放行）；
+/// 其余类型退回结构相等。
+fn json_schema_equal(a: &Value, b: &Value) -> bool {
+    if let (Some(left), Some(right)) = (a.as_f64(), b.as_f64()) {
+        if a.is_number() && b.is_number() {
+            return left == right;
+        }
+    }
+    a == b
+}
+
 fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(), String> {
     if depth > 8 {
         return Err("schema 嵌套超过深度上限 8".to_string());
@@ -506,12 +518,12 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
         }
     }
     if let Some(expected_const) = schema.get("const") {
-        if value != expected_const {
+        if !json_schema_equal(value, expected_const) {
             return Err(format!("常量不符：期望 {expected_const}，实际 {value}"));
         }
     }
     if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
-        if !variants.contains(value) {
+        if !variants.iter().any(|variant| json_schema_equal(variant, value)) {
             return Err(format!(
                 "枚举不符：期望 {} 之一，实际 {value}",
                 serde_json::to_string(variants).unwrap_or_default()
@@ -2721,6 +2733,20 @@ mod validator_tests {
         );
         // 无分支通过照旧整体拒绝。
         assert!(validate_json_schema(&json!("标量"), &schema, 0).is_err());
+    }
+
+    #[test]
+    fn numeric_consts_and_enums_compare_by_value() {
+        // 回归：serde_json 的 Value 相等区分整数 / 浮点表示（1 ≠ 1.0），JSON Schema
+        // 的数值相等是数学值——ask<1> 的答案序列化成 1.0 / 1e0 曾被误拒。
+        assert!(validate_json_schema(&json!(1.0), &json!({"const": 1}), 0).is_ok());
+        assert!(validate_json_schema(&json!(1e0), &json!({"const": 1}), 0).is_ok());
+        assert!(validate_json_schema(&json!(2.0), &json!({"const": 1}), 0).is_err());
+        let enum_schema = json!({"enum": [1, 2]});
+        assert!(validate_json_schema(&json!(2.0), &enum_schema, 0).is_ok());
+        assert!(validate_json_schema(&json!(3.0), &enum_schema, 0).is_err());
+        // 字符串等非数值不受影响（"1" 仍不等 1）。
+        assert!(validate_json_schema(&json!("1"), &json!({"const": 1}), 0).is_err());
     }
 }
 
