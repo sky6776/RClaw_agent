@@ -1790,6 +1790,22 @@ impl Tool for PlanRunTool {
                 .iter()
                 .filter(|record| record.answer.is_none() && status.contains_key(&record.step))
                 .count();
+            // 装载后的权威每步状态随事件落盘：验证对耗尽保持 Failed（与普通失败重跑
+            // 回 Pending 不同），只看事件流的投影无法区分这两种「failed」——投影端
+            // （plan_status 步骤卡片）照单全收，避免恢复后把保持失败的步骤画成待跑。
+            let states: serde_json::Map<String, Value> = status
+                .iter()
+                .map(|(step_id, state)| {
+                    let label = match state {
+                        StepStatus::Pending => "pending",
+                        StepStatus::Verifying => "verifying",
+                        StepStatus::Succeeded => "succeeded",
+                        StepStatus::Failed => "failed",
+                        StepStatus::Skipped => "skipped",
+                    };
+                    (step_id.clone(), Value::String(label.to_string()))
+                })
+                .collect();
             append_plan_event(
                 &plan_log,
                 "plan_seeded",
@@ -1799,6 +1815,7 @@ impl Tool for PlanRunTool {
                     "journal_entries": seeded.len(),
                     "pending_escalations": pending_escalations,
                     "injected_answers": injected.len(),
+                    "states": states,
                 }),
             );
         }

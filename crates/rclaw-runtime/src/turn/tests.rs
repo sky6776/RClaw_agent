@@ -1875,7 +1875,16 @@ async fn oversized_tool_result_spills_to_artifact_with_reference_handle() {
         "artifact 应按会话键归档: {artifact_path}"
     );
     let disk = std::fs::read_to_string(artifact_path).expect("artifact 文件应存在");
-    assert_eq!(disk.len(), body.len(), "落盘的是工具返回的全文");
+    // 落盘是分行形态（按 ~2KB 补换行，便于 read 行式分页取回）：两侧对称去掉换行后
+    // 必须与原文一致（分行只插入换行，不动任何内容字节）。
+    assert_eq!(
+        disk.replace('\n', ""),
+        body.replace('\n', ""),
+        "落盘内容去掉换行后应与工具返回的全文逐字节一致"
+    );
+    for line in disk.lines() {
+        assert!(line.len() <= 2048 + 4, "每行不超过行宽上限: {}", line.len());
+    }
     assert!(handle.contains("x".repeat(99).as_str()), "头尾预览保留");
     assert!(handle.contains("已省略"), "{handle}");
 

@@ -751,6 +751,20 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
                 }
                 plan.paused = false;
             }
+            // resume 装载（plan_seeded）：执行器给出的【权威】每步状态——succeeded
+            // 继承、验证对耗尽保持 failed（与普通失败重跑回 pending 不同，事件流
+            // 启发式区分不了）、Verifying 待补跑验证者。照单全收覆盖启发式结果。
+            Some("plan_seeded") => {
+                if let Some(states) = event.get("states").and_then(serde_json::Value::as_object) {
+                    for (id, state) in states {
+                        if let Some(label) = state.as_str() {
+                            if let Some(step) = plan.steps.iter_mut().find(|s| &s.id == id) {
+                                step.status = label.to_string();
+                            }
+                        }
+                    }
+                }
+            }
             Some("plan_completed") => {
                 plan.completed = true;
                 plan.succeeded = event.get("succeeded").and_then(serde_json::Value::as_u64);
@@ -5578,5 +5592,37 @@ mod plan_projection_tests {
         );
         assert_eq!(verifying.steps[0].status, "verifying", "等验证者的目标跨代保留");
         assert_eq!(verifying.steps[1].status, "pending");
+    }
+
+    #[test]
+    fn plan_seeded_states_are_authoritative() {
+        // 回归：验证对耗尽时 resume 保持 failed（seed_verdict_replay 不重跑也不重报
+        // 事件），投影的继承启发式曾把它重置回 pending——恢复后的计划永远显示待跑。
+        // plan_seeded 的 states 是权威状态表，照单全收。
+        let mut plan = blank_plan();
+        project_plan_events(
+            &mut plan,
+            &[
+                event("plan_started", serde_json::json!({"name": "n", "steps": [{"id": "impl", "task": "干"}, {"id": "prove", "task": "验"}]})),
+                event("step_finished", serde_json::json!({"step": "impl", "outcome": "succeeded", "awaiting_verdict": true})),
+                event("step_finished", serde_json::json!({"step": "prove", "outcome": "failed", "verdict": "fail", "target": "impl"})),
+                event("verdict_failed", serde_json::json!({"verifier": "prove", "target": "impl", "round": 2, "exhausted": true})),
+                event("plan_completed", serde_json::json!({"succeeded": 0})),
+                // resume：新一代开始（启发式只继承 succeeded/verifying，impl/prove 都会
+                // 归零），随后 plan_seeded 给出权威状态。
+                event("plan_started", serde_json::json!({"name": "n", "steps": [{"id": "impl", "task": "干"}, {"id": "prove", "task": "验"}]})),
+                event("plan_resumed", serde_json::json!({})),
+                event("plan_seeded", serde_json::json!({
+                    "inherited": 0,
+                    "states": {"impl": "failed", "prove": "failed"}
+                })),
+            ],
+        );
+        assert!(!plan.completed, "resume 复位收尾态");
+        assert_eq!(
+            plan.steps[0].status, "failed",
+            "验证对耗尽保持 failed（权威状态表覆盖启发式）"
+        );
+        assert_eq!(plan.steps[1].status, "failed");
     }
 }

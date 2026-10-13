@@ -744,6 +744,20 @@ fn schema_size(value: &Value) -> usize {
 }
 
 impl<'a> SchemaCompiler<'a> {
+    /// 数字常量的 schema 形态：整数值归一成整数表示（json!(f64) 会产出 `1.0`，
+    /// 而类型注解 `<1>` 的自然预期是 `1`；校验端两种表示都按数值相等接受）。
+    fn number_const(value: f64) -> Value {
+        if value.is_finite()
+            && value.fract() == 0.0
+            && value >= i64::MIN as f64
+            && value <= i64::MAX as f64
+        {
+            json!(value as i64)
+        } else {
+            json!(value)
+        }
+    }
+
     /// 预算入账 + 超限判定：超限只报一次诊断，之后所有 compile 调用 O(1) 快速返回。
     fn charge(&mut self, nodes: usize, offset: u32) {
         self.budget.nodes = self.budget.nodes.saturating_add(nodes);
@@ -898,8 +912,22 @@ impl<'a> SchemaCompiler<'a> {
     fn compile_literal(&mut self, literal: &TSLiteral<'a>) -> Value {
         match literal {
             TSLiteral::StringLiteral(text) => json!({"const": text.value.as_str()}),
-            TSLiteral::NumericLiteral(number) => json!({"const": number.value}),
+            TSLiteral::NumericLiteral(number) => json!({"const": Self::number_const(number.value)}),
             TSLiteral::BooleanLiteral(flag) => json!({"const": flag.value}),
+            TSLiteral::UnaryExpression(unary) => {
+                // 负数字面量（`ask<-1 | 0>` 的 -1）：oxc 把类型位置的一元负号解析成
+                // UnaryExpression 而不是 NumericLiteral——按符号值给 const。
+                if unary.operator == UnaryOperator::UnaryNegation {
+                    if let Expression::NumericLiteral(number) = &unary.argument {
+                        return json!({"const": Self::number_const(-number.value)});
+                    }
+                }
+                self.diagnostics.push((
+                    literal.span().start,
+                    "只支持 string / number / boolean 字面量类型（负号仅限数字字面量）".to_string(),
+                ));
+                json!({})
+            }
             other => {
                 self.diagnostics.push((
                     other.span().start,
@@ -1568,6 +1596,26 @@ mod extended_type_tests {
                 .any(|d| d.message.contains("展开超过") || d.message.contains("字符上限")),
             "{diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn negative_numeric_literals_compile_to_signed_consts() {
+        let script = "const h = agent(\"h\");\n\
+                      const r = await h.ask<-1 | 0>(\"符号\");\n\
+                      result(String(r));\n";
+        let transform = compile_typed_asks(script).expect("负数字面量应编译");
+        assert_eq!(transform.typed_asks[0].1["enum"], json!([-1, 0]));
+        // 负号作用在非数字上（`-'x'`）：oxc 无法解析该类型 → 编译按「原样返回」降级
+        //（不产出任何 typed ask，语法交给 check_script 的探针把关），绝不静默编出
+        // 错误的 schema。
+        let bad = compile_typed_asks("const h = agent(\"h\");\nconst r = await h.ask<-'x'>(\"q\");\n");
+        if let Ok(transform) = bad {
+            assert!(
+                transform.typed_asks.is_empty(),
+                "解析失败的类型不得编出 schema: {:?}",
+                transform.typed_asks
+            );
+        }
     }
 
     #[test]

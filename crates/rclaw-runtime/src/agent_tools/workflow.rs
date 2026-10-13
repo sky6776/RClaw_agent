@@ -474,12 +474,32 @@ fn type_check_with_tsc(script: &str) -> Option<Vec<FacadeDiagnostic>> {
 /// array.items/prefixItems/minItems/maxItems。覆盖 facade 契约场景（含 `.ask<T>` 编译出的
 /// 字面量 / 联合 / 元组 / 交叉 schema，第十二轮）；超出子集的字段忽略；未知类型名与
 /// 超深嵌套（> 8）按错误处理。
-/// JSON Schema 语义的值相等：数值按数学值比较（serde_json 的 `Value` 相等区分
-/// 整数 / 浮点表示——`1` ≠ `1.0`，而 ask<1> 的答案序列化成 `1.0` / `1e0` 应放行）；
-/// 整数值跨表示比较时走【精确整数】路径——f64 在 2^53 以上会合并相邻整数
-/// （9007199254740992 与 ...993 转换后相等，const / enum 校验被静默绕过）；
-/// 其余类型退回结构相等。
+/// JSON Schema 语义的值相等（递归）：数值按数学值比较（serde_json 的 `Value` 相等
+/// 区分整数 / 浮点表示——`1` ≠ `1.0`，而 ask<1> 的答案序列化成 `1.0` / `1e0` 应放行）；
+/// 对象 / 数组逐成员递归（`{"const":{"score":1}}` 接受 `{"score":1.0}`）；整数值跨
+/// 表示比较走【精确整数】路径——f64 在 2^53 以上会合并相邻整数（9007199254740992
+/// 与 ...993 转换后相等，const / enum 校验被静默绕过）；其余标量退回结构相等。
 fn json_schema_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .all(|(key, value)| right.get(key).is_some_and(|other| json_schema_equal(value, other)))
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(m, n)| json_schema_equal(m, n))
+        }
+        _ => scalar_numeric_equal(a, b),
+    }
+}
+
+/// 标量的 JSON Schema 数值相等（非数值退回结构相等）。
+fn scalar_numeric_equal(a: &Value, b: &Value) -> bool {
     if let (Some(left), Some(right)) = (a.as_i64(), b.as_i64()) {
         return left == right;
     }
@@ -2779,6 +2799,38 @@ mod validator_tests {
         assert!(
             validate_json_schema(&json!(9007199254740992.0f64), &big_const, 0).is_ok(),
             "整数与它的浮点形态相等"
+        );
+    }
+
+    #[test]
+    fn compound_consts_compare_members_recursively() {
+        // 回归：嵌套 const / enum 曾退回结构相等——{"score":1} 拒绝 {"score":1.0}，
+        // 违反 JSON Schema 的数值相等语义；逐成员递归用同一数值规则。
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "result": {"const": {"score": 1, "tags": ["a", 2]}}
+            },
+            "required": ["result"]
+        });
+        assert!(validate_json_schema(
+            &json!({"result": {"score": 1.0, "tags": ["a", 2.0]}}),
+            &schema,
+            0
+        )
+        .is_ok());
+        assert!(
+            validate_json_schema(&json!({"result": {"score": 2, "tags": ["a", 2]}}), &schema, 0)
+                .is_err()
+        );
+        assert!(
+            validate_json_schema(&json!({"result": {"score": 1, "tags": ["a"]}}), &schema, 0)
+                .is_err(),
+            "数组长度不同不得相等"
+        );
+        // 键集合不同不得相等。
+        assert!(
+            validate_json_schema(&json!({"result": {"score": 1}}), &schema, 0).is_err()
         );
     }
 }

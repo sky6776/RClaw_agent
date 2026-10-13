@@ -65,6 +65,28 @@ fn absolute_base(base: &Path) -> PathBuf {
     }
 }
 
+/// 落盘行宽（字节）：read 的 offset/limit 是【行式】分页，单行超长内容（压缩 JSON、
+/// 长正则串）靠它永远取不到中段，而 grep 会截断长行、受限子代理（candidate_patch
+/// 的只读小循环）没有 shell 不能按字节取段——把内容按约 2KB 的字符边界分行，行式
+/// 分页对任何调用方都可用。
+const SPILL_LINE_BYTES: usize = 2048;
+
+/// 按 [`SPILL_LINE_BYTES`] 的字符边界把内容分段补 '\n'：内容字节原样（顺序不变，
+/// 只在段间插入换行），拼回时删掉这些换行即原文。
+fn chunked_lines(content: &str) -> String {
+    let mut out = String::with_capacity(content.len() + content.len() / SPILL_LINE_BYTES + 16);
+    let mut line_bytes = 0usize;
+    for ch in content.chars() {
+        out.push(ch);
+        line_bytes += ch.len_utf8();
+        if line_bytes >= SPILL_LINE_BYTES {
+            out.push('\n');
+            line_bytes = 0;
+        }
+    }
+    out
+}
+
 /// artifact 文件名：纳秒单调 id（复用 rewind 的分配器语义，进程内严格递增、可读时间）
 /// + 工具名（工具名来自注册表，仍做白名单清洗防御未知来源）。
 fn artifact_file_name(tool: &str) -> String {
@@ -104,7 +126,8 @@ pub(crate) fn spill_if_over_budget(
     let dir = artifacts_dir(&absolute_base(base), &sanitize_chat_key(channel, chat_id));
     let path = dir.join(artifact_file_name(tool));
     // atomic_write 自带 ensure_parent_dir；失败静默回退（artifact 只是上下文优化）。
-    if let Err(error) = rclaw_store::fs::atomic_write(&path, content.as_bytes()) {
+    // 落盘的是分行形态（见 chunked_lines）：内容字节原样、段间补换行。
+    if let Err(error) = rclaw_store::fs::atomic_write(&path, chunked_lines(content).as_bytes()) {
         tracing::warn!(
             tool,
             path = %path.display(),
@@ -121,9 +144,9 @@ pub(crate) fn spill_if_over_budget(
     *content = format!(
         "[工具输出超出预算已落盘：原始 {total} 字节（预算 {} 字节）]\n\
          完整内容已存至: {display_path}\n\
-         取回中段：多行内容用 read 工具按 offset/limit 分页读取该文件；单行长内容\n\
-         （如压缩 JSON）read 按行分页无效，改用 shell 字节分页，例如\n\
-         head -c 32768 \"{display_path}\" | tail -c 4096（每次取一小段，不要整读）。\n\n\
+         （文件按 ~2KB 分行以便按行取回；删除文件里的换行即原文）\n\
+         取回中段：用 read 工具按 offset/limit 分页读取该文件（文件已按 ~2KB 分行，\n\
+         单行长内容也能取回任意段，不会越读越超预算）。\n\n\
          预览（头尾合计 {} 字节，中段已省略）：\n{}",
         spill.threshold_bytes,
         PREVIEW_BYTES,
@@ -207,11 +230,22 @@ mod tests {
         let path =
             spill_if_over_budget(&spill, dir.path(), "cli", "console", "grep", &mut content)
                 .expect("超预算应落盘");
-        // 落盘的是【全文】。
+        // 落盘的是【全文】（分行形态：内容字节原样，段间补换行——删掉换行即原文）。
         let disk = std::fs::read_to_string(&path).unwrap();
         assert!(disk.starts_with("HEAD LINE\n"));
-        assert!(disk.contains(&middle));
+        assert!(
+            disk.replace('\n', "").contains(&middle),
+            "分行后的文件去掉补入的换行必须能拼回中段"
+        );
         assert!(disk.ends_with("TAIL LINE\n"));
+        // 落盘按 ~2KB 分行：read 的行式分页才能取回任意段（受限子代理没有 shell）。
+        for line in disk.lines() {
+            assert!(
+                line.len() <= SPILL_LINE_BYTES + 4,
+                "每行不超过行宽上限: {}",
+                line.len()
+            );
+        }
         // 模型收到的是小句柄：路径 + 头尾预览 + 中段省略标记。
         let display_path = path.to_string_lossy().replace('\\', "/");
         assert!(content.contains(&display_path), "{content}");
@@ -220,10 +254,8 @@ mod tests {
         assert!(content.contains("bytes omitted"), "{content}");
         assert!(!content.contains(&middle), "中段不得整段进入句柄");
         assert!(content.len() < PREVIEW_BYTES + 900, "{}", content.len());
-        // 句柄必须给出读取指引（read 行分页 + shell 字节分页兜底——单行长内容
-        // offset/limit 取不到中段）。
+        // 句柄必须给出读取指引（read 行分页；文件已分行，单行内容也能取回）。
         assert!(content.contains("offset/limit"), "{content}");
-        assert!(content.contains("head -c"), "{content}");
     }
 
     #[test]
