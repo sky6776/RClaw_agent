@@ -767,6 +767,15 @@ export default function App() {
     async (entry: Entry, full = false, files = false) => {
       let anchorId = entry.msgId ?? null;
       if (anchorId === null) {
+        // 文本反查只在会话空闲时可靠：直播条目落库要等 turn 启动（运行时按会话串行，
+        // 排队中的消息还没写进库），忙碌期按「从尾数第 N 个匹配」会把尚未落库的这条
+        // 配到前面同文本的旧消息上，fork 到错误锚点（文件联动跟着回滚错）。
+        if (busyByChat[activeId]) {
+          setErrorToast(
+            "会话运行中，该消息可能尚未落库：请等任务收尾后再分叉，或用 /fork 查看已落库的锚点",
+          );
+          return;
+        }
         const transcript = entriesByChat[activeId] ?? [];
         // 该条目之后还有几条同 (role, content) 条目（碰到自身即清零重计）。
         let laterMatches = 0;
@@ -821,7 +830,7 @@ export default function App() {
         setErrorToast(`分叉失败: ${String(e)}`);
       }
     },
-    [activeId, entriesByChat, openChat, refreshChats, setErrorToast],
+    [activeId, busyByChat, entriesByChat, openChat, refreshChats, setErrorToast],
   );
 
   // 工作区外访问授权（默认权限下工具触达工作区之外时后端推送）：
@@ -1655,7 +1664,7 @@ export default function App() {
             onForwardToChat={forwardToChat}
             sessionKey={activeId}
             onFork={handleFork}
-            plan={latestPlan}
+            plans={plans}
             onPlanPause={handlePlanPause}
             queue={queueByChat[activeId] ?? []}
             onQueueEnqueue={(text) => enqueueQueued(activeId, text)}

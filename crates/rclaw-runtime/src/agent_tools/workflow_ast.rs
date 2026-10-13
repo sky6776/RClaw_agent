@@ -356,9 +356,11 @@ impl<'a> Visit<'a> for GraphWalker<'a> {
                 return;
             }
         }
-        // `const p = h.ask(...)` / `const p = await h.ask(...)` → promise 绑定
-        //（初始化式里恰好一个 ask 节点时才算——多个 ask 的表达式无法归一到单节点）。
-        if let Some(_ask) = ask_call_of(init) {
+        // `const p = h.ask(...)` → promise 绑定（初始化式里恰好一个 ask 节点时才算——
+        // 多个 ask 的表达式无法归一到单节点）。**带 await 的不算**：`const x = await
+        // h.ask(...)` 是已完成的答案，不是待并行的 promise——并进 Promise.all 会把
+        // 本来串行的两个 ask 凭空合并成一个并行波，拆掉顺序依赖。
+        if !matches!(init, Expression::AwaitExpression(_)) && ask_call_of(init).is_some() {
             let pushed: Vec<usize> = (nodes_before..self.nodes.len()).collect();
             if pushed.len() == 1 {
                 self.promise_defs.insert(name, pushed[0]);
@@ -683,10 +685,10 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
 
 struct SchemaCompiler<'a> {
     aliases: &'a HashMap<String, AliasDef<'a>>,
-    /// 泛型实例化栈：别名参数名 → 实参【已编译 schema】。实参在【调用方】的类型
-    /// 环境里先解析再入栈——若按原始引用入栈，`type Outer<T> = Inner<T>` 的 Inner
-    /// 帧会把参数 T 绑到「自己的 T」，body 里再引用就在同一帧里自吞尾巴（反复命中
-    /// 直到深度上限，合法脚本被误拒）。compile_reference 命中参数名时栈顶向下查。
+    /// 当前正在实例化的别名的参数帧：参数名 → 实参【已编译 schema】。实参在
+    /// 【调用方】环境解析后入栈，body 编译期间栈里【只有这一帧】——外层帧不得
+    /// 泄漏进无参别名体（同名标识符是全局别名，不是调用方的参数）。
+    /// compile_reference 命中参数名时查这帧；查不到落到全局别名表。
     type_args: Vec<HashMap<String, Value>>,
     diagnostics: Vec<(u32, String)>,
 }
@@ -967,15 +969,18 @@ impl<'a> SchemaCompiler<'a> {
             return json!({});
         }
         // 语法层代入：实参先在【调用方】环境（当前栈）里解析成 schema，再以参数名
-        // 入栈编译 body（body 里引用参数名的 TSTypeReference 在上方栈查找命中已解析
-        // 的 schema，不会再撞上 callee 自己的同名参数）。
+        // 入栈；body 只在本别名的【参数帧】里编译（TS 作用域语义）——带着外层帧编
+        // body 会让无参别名体里的同名标识符被调用方参数偷换（`type T = number;
+        // type Box = { v: T }; type Outer<T> = Box` 的 Outer<string> 会把全局
+        // T=number 错编成 string）。
         let mut frame: HashMap<String, Value> = HashMap::new();
         for (param, argument) in alias.params.iter().zip(arguments) {
             frame.insert(param.clone(), self.compile(argument, depth + 1, alias_depth));
         }
-        self.type_args.push(frame);
+        let outer_frames = std::mem::take(&mut self.type_args);
+        self.type_args = vec![frame];
         let compiled = self.compile(&alias.body, depth + 1, alias_depth + 1);
-        self.type_args.pop();
+        self.type_args = outer_frames;
         compiled
     }
 }
@@ -1068,6 +1073,26 @@ mod tests {
         assert_eq!(graph.edges.len(), 2, "{:?}", graph.edges);
         assert!(graph.edges.contains(&("ask-3".into(), "ask-6".into())));
         assert!(graph.edges.contains(&("ask-4".into(), "ask-6".into())));
+        assert_eq!(graph.waves.len(), 2, "{:?}", graph.waves);
+
+        // 回归：`const x = await a.ask(..)` 是已完成的答案，不是待并行的 promise——
+        // 之后把它们列进 Promise.all 不得把两个串行 ask 合并成并行波。
+        let awaited = "const a = agent(\"a\");\n\
+                       const b = agent(\"b\");\n\
+                       const x = await a.ask(\"先\");\n\
+                       const y = await b.ask(\"后\");\n\
+                       const rs = await Promise.all([x, y]);\n";
+        let graph = build_dependency_graph(awaited).expect("AST 解析应成功");
+        assert_eq!(node_ids(&graph), vec!["ask-3", "ask-4"]);
+        assert!(
+            !graph.nodes.iter().all(|n| n.parallel),
+            "await 过的 ask 不得进并行波"
+        );
+        assert!(
+            graph.edges.contains(&("ask-3".into(), "ask-4".into())),
+            "顺序依赖保留: {:?}",
+            graph.edges
+        );
         assert_eq!(graph.waves.len(), 2, "{:?}", graph.waves);
 
         // inline agent("x").ask(...)：无绑定也能解析 actor。
@@ -1365,6 +1390,38 @@ mod extended_type_tests {
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0]["const"], "ok");
         assert_eq!(branches[1]["type"], "string");
+    }
+
+    #[test]
+    fn alias_bodies_compile_in_their_own_parameter_scope() {
+        // 回归：别名 body 曾带着调用方的参数帧编译——`type T = number; type Box =
+        // { v: T }; type Outer<T> = Box` 的 Outer<string> 会把全局 T=number 偷换成
+        // string（合法数值答案被拒、字符串答案被放行）。body 只见本别名自己的帧。
+        let script = concat!(
+            "type T = number;\n",
+            "type Box = { v: T };\n",
+            "type Outer<U> = Box;\n",
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<Outer<string>>(\"作用域\");\n",
+            "result(r.v);\n"
+        );
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        let (_, schema) = &transform.typed_asks[0];
+        assert_eq!(
+            schema["properties"]["v"]["type"], "number",
+            "Box 体里的 T 是全局别名，不受调用方 U=string 影响: {schema}"
+        );
+
+        // 对照：真正的泛型透传（Outer<U> = Inner<U>）仍然在调用方环境解析实参。
+        let passthrough = compile_typed_asks(
+            "type Inner<T> = { v: T };\n\
+             type Outer<U> = Inner<U>;\n\
+             const h = agent(\"h\");\n\
+             const r = await h.ask<Outer<string>>(\"透传\");\n",
+        )
+        .expect("泛型透传应成功");
+        let (_, schema) = &passthrough.typed_asks[0];
+        assert_eq!(schema["properties"]["v"]["type"], "string", "{schema}");
     }
 
     #[test]

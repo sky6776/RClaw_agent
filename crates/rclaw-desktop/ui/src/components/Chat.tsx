@@ -59,8 +59,8 @@ interface Props {
   sessionKey: string;
   /** 从该消息锚点分叉出新会话（full = 携带完整转录；files = 同时回滚工作区文件）。 */
   onFork?: (entry: Entry, full?: boolean, files?: boolean) => void;
-  /** 最近的 PlanRun 计划状态（流程步骤卡片；null = 无计划数据）。 */
-  plan: PlanStatus | null;
+  /** 最近的 PlanRun 计划状态（流程步骤卡片；完整列表，最多 6 条）。 */
+  plans: PlanStatus[];
   /** 暂停 / 继续计划（步骤卡片展开时的 ⏸/▶ 按钮）。 */
   onPlanPause?: (planId: string, paused: boolean) => void;
   /** 当前会话的排队消息（App 级状态；Chat 随页面切换卸载，队列不能活在组件里）。 */
@@ -485,7 +485,7 @@ export default function Chat({
   onForwardToChat,
   sessionKey,
   onFork,
-  plan,
+  plans,
   onPlanPause,
   queue,
   onQueueEnqueue,
@@ -1303,10 +1303,19 @@ export default function Chat({
       {/* 输入区（移动端贴底并让出手势条/安全区；桌面 p-4 不变）。 */}
       <div className="border-t border-[#2a2f3a] p-4 max-md:px-2.5 max-md:pt-2 max-md:pb-[calc(env(safe-area-inset-bottom)+0.5rem)]">
 
-        {/* PlanRun 流程步骤卡片（可折叠）：最近的计划步骤清单，随 plan_status 轮询刷新。 */}
-        {plan && plan.steps.length > 0 && (
-          <PlanStepsCard plan={plan} onPlanPause={onPlanPause} />
-        )}
+        {/* PlanRun 流程步骤卡片：全部【未收尾】计划各一张（随 plan_status 轮询刷新）
+            ——只展示最新的会把被顶到后面的暂停计划藏没：暂停中的执行器在等恢复
+            标志，Resume 按钮必须任何时候都够得着；没有未收尾计划时保留最新已
+            收尾计划当摘要卡。计划无会话归属（journal 全局），在哪个会话都能操作。 */}
+        {(() => {
+          const visible = plans.filter((p) => !p.completed && p.steps.length > 0);
+          if (visible.length === 0 && plans[0]?.steps.length) {
+            visible.push(plans[0]);
+          }
+          return visible.slice(0, 4).map((p) => (
+            <PlanStepsCard key={p.plan_id} plan={p} onPlanPause={onPlanPause} />
+          ));
+        })()}
 
         {/* 排队消息（zcode 同款，第十二轮）：agent 运行期间发送的消息在此排队，
             可删除 / 编辑 / 立即投递；会话收尾后由 App 逐条自动发出（App 级状态，

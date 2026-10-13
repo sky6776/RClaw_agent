@@ -107,7 +107,9 @@ pub(crate) fn spill_if_over_budget(
     *content = format!(
         "[工具输出超出预算已落盘：原始 {total} 字节（预算 {} 字节）]\n\
          完整内容已存至: {display_path}\n\
-         需要中段细节时用 read 工具按 offset/limit 分页读取该文件，不要重新执行工具。\n\n\
+         取回中段：多行内容用 read 工具按 offset/limit 分页读取该文件；单行长内容\n\
+         （如压缩 JSON）read 按行分页无效，改用 shell 字节分页，例如\n\
+         head -c 32768 \"{display_path}\" | tail -c 4096（每次取一小段，不要整读）。\n\n\
          预览（头尾合计 {} 字节，中段已省略）：\n{}",
         spill.threshold_bytes,
         PREVIEW_BYTES,
@@ -203,9 +205,11 @@ mod tests {
         assert!(content.contains("TAIL LINE"));
         assert!(content.contains("bytes omitted"), "{content}");
         assert!(!content.contains(&middle), "中段不得整段进入句柄");
-        assert!(content.len() < PREVIEW_BYTES + 600, "{}", content.len());
-        // 句柄必须给出读取指引。
+        assert!(content.len() < PREVIEW_BYTES + 900, "{}", content.len());
+        // 句柄必须给出读取指引（read 行分页 + shell 字节分页兜底——单行长内容
+        // offset/limit 取不到中段）。
         assert!(content.contains("offset/limit"), "{content}");
+        assert!(content.contains("head -c"), "{content}");
     }
 
     #[test]

@@ -646,12 +646,15 @@ pub(crate) fn restore_to_message(
         .iter()
         .filter(|record| !record.is_rewind && record.anchor_message_id.is_none())
         .count();
-    // 窗口起点 = 锚点消息自身的第一行 checkpoint（链起点，其写入保留）；其后全部写入
-    // （> 锚点，回滚目标）+ 不早于起点的重锚标记参与校验链。漏掉锚点自身的 checkpoint
-    // 会让链起点悬空——锚点与其后写入之间的未记录改动（shell / 外部编辑）将无法检出
-    // （测试曾以此失败形态验证）。重锚标记若【全量】纳入，更早的历史标记会与被排除的
-    // 迁移前/锚点前 checkpoint 断链，把合法回滚误判成「未记录的改动」——标记必须与
-    // 窗口在时间上一致（只留起点之后的）。
+    // 窗口起点 = 锚点消息自身的第一行 checkpoint（链起点，其写入保留）；其后全部
+    // 写入（> 锚点，回滚目标）+ 不早于起点的重锚标记与独立 checkpoint 参与校验链。
+    // 漏掉锚点自身的 checkpoint 会让链起点悬空——锚点与其后写入之间的未记录改动
+    // （shell / 外部编辑）将无法检出（测试曾以此失败形态验证）。窗口外的历史标记
+    // 若全量纳入会与被排除的锚点前 checkpoint 断链，把合法回滚误判成「未记录的
+    // 改动」——所有辅助行（标记 / 独立 checkpoint）必须与窗口在时间上一致。
+    // 独立 checkpoint（cron / 取消清理的 flush，anchor 为 NULL，现行运行时也会产生）
+    // 落在两次锚定写入之间时是真实的链环节：排除它会让 broken_chains 比对不相邻的
+    // hash 而误报断链——保留在窗口里（in_targets 只认有锚行，它们不会成为回滚目标）。
     let window_start = all_meta
         .iter()
         .find(|record| {
@@ -664,20 +667,26 @@ pub(crate) fn restore_to_message(
     let window: Vec<FileCheckpointMeta> = all_meta
         .iter()
         .filter(|record| {
-            if record.is_rewind {
-                window_start.is_none_or(|start| record.id >= start)
-            } else {
-                record
-                    .anchor_message_id
-                    .is_some_and(|anchor| anchor >= anchor_message_id)
+            let in_range = window_start.is_none_or(|start| record.id >= start);
+            if !in_range {
+                return false;
+            }
+            match record.anchor_message_id {
+                Some(anchor) => anchor >= anchor_message_id,
+                // 标记与独立 checkpoint：在窗口内即保留（参与链，不作目标）。
+                None => true,
             }
         })
         .cloned()
         .collect();
-    if window
-        .iter()
-        .all(|record| record.is_rewind || record.anchor_message_id == Some(anchor_message_id))
-    {
+    // 「没有可回滚写入」按锚定目标行判定（独立行只参与链，不算目标）。
+    let has_rollbackable = all_meta.iter().any(|record| {
+        !record.is_rewind
+            && record
+                .anchor_message_id
+                .is_some_and(|anchor| anchor > anchor_message_id)
+    });
+    if !has_rollbackable {
         return Err(format!(
             "锚点消息 {anchor_message_id} 之后没有可回滚的文件写入（仅 write/edit/delete 被              checkpoint，且迁移前的旧记录不参与按消息回滚）"
         ));
@@ -1366,6 +1375,41 @@ mod message_rollback_tests {
         assert!(report.contains("1 个文件恢复原内容"), "{report}");
 
         // m2 之后无写入：仍明确报错。
+        let err = restore_to_message(&session, "cli", "console", m2).unwrap_err();
+        assert!(err.contains("没有可回滚"), "{err}");
+    }
+
+    #[test]
+    fn restore_to_message_keeps_flush_checkpoints_in_the_chain() {
+        // 回归：cron / 取消清理的独立 checkpoint（anchor 为 NULL，现行运行时也产生）
+        // 落在两次锚定写入之间时是真实的链环节——把它排除会让 broken_chains 比对
+        // 不相邻的 hash 而误报断链。
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_store(dir.path());
+        let base = session.layout().base.clone();
+        let file_a = base.join("a.txt");
+        write_file(&file_a, "v1");
+
+        let (m1, _) = toolchain_write(&session, &base, "a.txt", Some("v2"), 0);
+        // 独立落库（无工具链，如取消清理的 flush）：v2 → v2.5，无锚。
+        let mut c = capture_before("write", &json!({"path": "a.txt"}), &base).unwrap();
+        write_file(&file_a, "v2.5");
+        assert!(finish_capture(&mut c), "内容有变化必须入账");
+        let records = into_records(vec![c]);
+        session
+            .append_file_checkpoints("cli", "console", next_rewind_id(), &records)
+            .unwrap();
+
+        let (m2, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
+
+        // 回滚到 m1：目标 = m2 的 before = v2.5；独立 checkpoint 在链中衔接 m1→m2。
+        let report =
+            restore_to_message(&session, "cli", "console", m1).expect("独立 checkpoint 不得造成误断链");
+        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v2.5");
+        assert!(report.contains("1 个文件恢复原内容"), "{report}");
+
+        // 独立行不成为回滚目标：回滚到它之后、m2 之前的消息……此场景没有这样的消息
+        //（独立行无锚），直接验证 m2 自身：没有 > m2 的写入 → 明确报错。
         let err = restore_to_message(&session, "cli", "console", m2).unwrap_err();
         assert!(err.contains("没有可回滚"), "{err}");
     }
