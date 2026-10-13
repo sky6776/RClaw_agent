@@ -129,14 +129,20 @@ mod tests {
 
     #[test]
     fn chat_key_sanitizes_and_buckets_subagents() {
-        assert_eq!(sanitize_chat_key("cli", "console"), "cli-console");
-        assert_eq!(sanitize_chat_key("napcat", "12345"), "napcat-12345");
+        // 键 = 可读前缀 + FNV 摘要（规则单一事实源在 store::artifact_chat_key；
+        // 摘要防长 id 截断碰撞，具体形态测试在 store 侧）。
+        assert!(sanitize_chat_key("cli", "console").starts_with("cli-console-"));
+        assert!(sanitize_chat_key("napcat", "12345").starts_with("napcat-12345-"));
         // 路径分隔符与空白替换成下划线，不允许逃出目录。
-        assert_eq!(sanitize_chat_key("a/b", "c\\d e"), "a_b-c_d_e");
+        assert!(sanitize_chat_key("a/b", "c\\d e").starts_with("a_b-c_d_e-"));
         // 子代理（无源会话）按来源通道归档。
-        assert_eq!(sanitize_chat_key("desktop", ""), "subagent-desktop");
-        // 超长键截断（规则在 store::artifact_chat_key，长度 64）。
-        assert_eq!(sanitize_chat_key("x", &"9".repeat(200)).chars().count(), 64);
+        assert!(sanitize_chat_key("desktop", "").starts_with("subagent-desktop-"));
+        // 超长键截断（规则在 store::artifact_chat_key，总长 ≤ 63）。
+        assert!(sanitize_chat_key("x", &"9".repeat(200)).chars().count() <= 63);
+        // 只差尾字符的两个长 chat_id 不得共享目录（纯截断曾会）。
+        let long_a = format!("{}A", "x".repeat(56));
+        let long_b = format!("{}B", "x".repeat(56));
+        assert_ne!(sanitize_chat_key("desktop", &long_a), sanitize_chat_key("desktop", &long_b));
     }
 
     #[test]
@@ -210,7 +216,16 @@ mod tests {
         let mut b = "b".repeat(100);
         let pa = spill_if_over_budget(&spill, dir.path(), "cli", "chat-a", "read", &mut a).unwrap();
         let pb = spill_if_over_budget(&spill, dir.path(), "cli", "chat-b", "read", &mut b).unwrap();
-        assert!(pa.starts_with(dir.path().join("artifacts").join("cli-chat-a")));
-        assert!(pb.starts_with(dir.path().join("artifacts").join("cli-chat-b")));
+        let key_a = dir
+            .path()
+            .join("artifacts")
+            .join(sanitize_chat_key("cli", "chat-a"));
+        let key_b = dir
+            .path()
+            .join("artifacts")
+            .join(sanitize_chat_key("cli", "chat-b"));
+        assert!(pa.starts_with(&key_a), "{pa:?}");
+        assert!(pb.starts_with(&key_b), "{pb:?}");
+        assert_ne!(key_a, key_b, "不同会话不得共享目录");
     }
 }

@@ -1815,8 +1815,12 @@ impl Tool for PlanRunTool {
             // 任务暂停 / 继续（ZCode 同款语义，第十二轮）：kv 里挂了暂停标志时，当前波
             // 跑完、后续波不派发——在波次边界轮询（300ms），恢复后继续。进入暂停与
             // 恢复各写一次 journal 事件（暂停态的持久事实源；plan_status 投影显示）。
-            // 工具 future 被丢弃（父 /cancel）时本循环随 future 一并终止，暂停不改
-            // 取消语义。失败传染等收口逻辑都在暂停检查之后——暂停期间不推进状态机。
+            // 事件名用 plan_paused / plan_unpaused——**不是** plan_resumed：后者是
+            // resume（新一代执行）的代际锚点（open_escalations_from_journal 据它判定
+            // 提问归属），波次边界的挂起/恢复不换代，混用会把挂起前未消费的答案误判
+            // 成「上一代已送达」。工具 future 被丢弃（父 /cancel）时本循环随 future
+            // 一并终止，暂停不改取消语义。失败传染等收口逻辑都在暂停检查之后——
+            // 暂停期间不推进状态机。
             {
                 let mut announced = false;
                 while self
@@ -1837,7 +1841,7 @@ impl Tool for PlanRunTool {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
                 if announced {
-                    append_plan_event(&plan_log, "plan_resumed", json!({"plan_id": plan_id}));
+                    append_plan_event(&plan_log, "plan_unpaused", json!({"plan_id": plan_id}));
                 }
             }
             // 失败传染：依赖未全部成功的待执行步骤标 skipped（无重试是显式策略）。

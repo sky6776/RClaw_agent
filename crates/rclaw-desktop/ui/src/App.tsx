@@ -470,7 +470,14 @@ export default function App() {
           if ((prev[chatId]?.length ?? 0) > 0) return prev;
           return {
             ...prev,
-            [chatId]: history.map((m) => ({ id: next_entry_id++, role: m.role, content: m.content })),
+            // msgId = 持久化行 id：消息「分叉到新会话」的锚点（丢掉它就只能按
+            // 文本反查，重复文本的会话会 fork 到错误的锚点）。
+            [chatId]: history.map((m) => ({
+              id: next_entry_id++,
+              role: m.role,
+              content: m.content,
+              msgId: m.id,
+            })),
           };
         });
       } catch {
@@ -717,19 +724,34 @@ export default function App() {
     [setErrorToast],
   );
 
-  // 消息「分叉到新会话」（ZCode fork 同款，第十二轮）：解析该消息的持久化行 id
-  // （直播条目缺省时从 chat_history 按 role+content 从尾往前匹配），fork 后切到新会话。
+  // 消息「分叉到新会话」（ZCode fork 同款，第十二轮）：解析该消息的持久化行 id，
+  // fork 后切到新会话。恢复的历史条目自带 msgId；直播条目（本会话内发出）没有——
+  // 按【第 N 次出现】在 chat_history 里定位（"继续"这类重复文本的同名消息，从尾往
+  // 前找会命中最新一条，点旧消息就 fork 错锚点了）。
   const handleFork = useCallback(
     async (entry: Entry, full = false, files = false) => {
       let anchorId = entry.msgId ?? null;
       if (anchorId === null) {
+        const transcript = entriesByChat[activeId] ?? [];
+        // 该条目是同 (role, content) 条目里的第几次出现（含自身，0 起）。
+        let occurrence = 0;
+        for (const existing of transcript) {
+          if (existing === entry) break;
+          if (existing.role === entry.role && existing.content === entry.content) {
+            occurrence += 1;
+          }
+        }
         try {
           const history = await api.chatHistory(activeId);
           const wantRole = entry.role === "user" ? "user" : "assistant";
-          for (let i = history.length - 1; i >= 0; i--) {
-            if (history[i].role === wantRole && history[i].content === entry.content) {
-              anchorId = history[i].id;
-              break;
+          let seen = 0;
+          for (const msg of history) {
+            if (msg.role === wantRole && msg.content === entry.content) {
+              if (seen === occurrence) {
+                anchorId = msg.id;
+                break;
+              }
+              seen += 1;
             }
           }
         } catch {
@@ -761,7 +783,7 @@ export default function App() {
         setErrorToast(`分叉失败: ${String(e)}`);
       }
     },
-    [activeId, openChat, refreshChats, setErrorToast],
+    [activeId, entriesByChat, openChat, refreshChats, setErrorToast],
   );
 
   // 工作区外访问授权（默认权限下工具触达工作区之外时后端推送）：
@@ -1367,7 +1389,9 @@ export default function App() {
                               ? "text-gray-600"
                               : step.status === "running"
                                 ? "text-indigo-400"
-                                : "text-amber-400"
+                                : step.status === "verifying"
+                                  ? "text-amber-300"
+                                  : "text-amber-400"
                       }
                     >
                       {step.status === "succeeded"
@@ -1378,7 +1402,9 @@ export default function App() {
                             ? "⤼"
                             : step.status === "running"
                               ? "◌"
-                              : "☐"}
+                              : step.status === "verifying"
+                                ? "🔍"
+                                : "☐"}
                     </span>
                     <span
                       className="min-w-0 truncate text-gray-400"

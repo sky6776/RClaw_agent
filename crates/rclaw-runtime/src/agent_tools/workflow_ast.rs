@@ -382,32 +382,41 @@ pub(crate) struct TypedAskTransform {
 }
 
 /// 脚本（字符串/注释遮蔽后）是否包含 `.ask<`——typed ask 的快速预判，无则零开销跳过。
+///
+/// **只作观测用途**（洞察 / 测试），不作编译开关：`.ask <T>`（空格）与模板串插值里的
+/// typed ask 都不含 `.ask<` 字节序列，靠文本预判会漏——提交路径一律走
+/// [`compile_typed_asks`]（AST 判定，无 typed ask 时原样返回）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn has_typed_asks(script: &str) -> bool {
     super::workflow::mask_strings_and_comments(script).contains(".ask<")
 }
 
 /// 把所有 `h.ask<T>(question)` 编译重写为 `h.askJson(question, <schema>)`。
-/// 编译失败（不支持的类型 / 非法形状）返回诊断列表（提交期拒绝，只回模型）。
+/// 不支持的类型 / 非法形状 / 嵌套 typed ask 返回诊断列表（提交期拒绝，只回模型）。
+/// oxc 拒绝的脚本（极端语法 / 语法错误）原样返回——重写层不设第二道语法门禁，
+/// 语法由 `check_script` 的探针把关（typed ask 只会出现在 oxc 能解析的脚本里）。
 pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<FacadeDiagnostic>> {
     let allocator = Allocator::default();
     let wrapped = format!("{WRAPPER_HEAD}{script}{WRAPPER_TAIL}");
     let Some(program) = parse(&allocator, &wrapped) else {
-        return Err(vec![FacadeDiagnostic {
-            line: 1,
-            col: 1,
-            message: "脚本含 `.ask<...>` 类型注解但无法被解析为合法 TypeScript：\
-                      请检查类型语法（仅支持内联类型字面量 / 基本类型 / 数组 / 类型别名）"
-                .to_string(),
-        }]);
+        return Ok(TypedAskTransform {
+            exec_script: script.to_string(),
+            typed_asks: Vec::new(),
+        });
     };
     // 类型别名表（`type X = ...`，无泛型参数）。包裹脚本是单个表达式语句（括号包住的
     // async 函数），别名藏在函数体里——用 Visit 深入收集，不做语句形态假设。
     let mut alias_collector = AliasCollector {
         allocator: &allocator,
         aliases: HashMap::new(),
+        spans: Vec::new(),
     };
     alias_collector.visit_program(&program);
-    let aliases = alias_collector.aliases;
+    let AliasCollector {
+        aliases,
+        spans,
+        ..
+    } = alias_collector;
 
     let mut walker = TypedAskWalker {
         replacements: Vec::new(),
@@ -420,8 +429,24 @@ pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<
     if !walker.diagnostics.is_empty() {
         return Err(walker.diagnostics);
     }
-    // 按起始偏移降序应用替换（后面的先改，前面替换的偏移不受影响）。
-    let mut exec_script = script.to_string();
+    // 别名声明是纯 TS：QuickJS 不认，必须从可执行脚本里抹掉（置空格保留换行，行列与
+    // 偏移都不动，后按原文偏移应用 ask 替换不受影响——别名声明与 ask 调用的 span
+    // 天然不相交）。
+    let mut exec_bytes = script.as_bytes().to_vec();
+    for (start, end) in spans {
+        let (start, end) = (start.min(exec_bytes.len()), end.min(exec_bytes.len()));
+        if start < end {
+            for byte in &mut exec_bytes[start..end] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+        }
+    }
+    let mut exec_script =
+        String::from_utf8(exec_bytes).expect("span 按字符边界替换，UTF-8 不受破坏");
+    // 按起始偏移降序应用替换（后面的先改，前面替换的偏移不受影响）。嵌套 typed ask
+    // 已在收集期拒绝（见 TypedAskWalker），此处不再有重叠 span。
     let mut replacements = walker.replacements;
     replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0));
     for (start, end, text) in replacements {
@@ -436,10 +461,13 @@ pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<
 }
 
 /// `type X = T;` 收集（带泛型参数的别名跳过——不支持）。Visit 的节点引用只在回调内
-/// 有效，别名类型经 `CloneIn` 克隆进 arena 后跨回调保存。
+/// 有效，别名类型经 `CloneIn` 克隆进 arena 后跨回调保存；声明 span 一并记录（编译期
+/// 从可执行脚本里抹除 TS 别名——QuickJS 不认 `type`）。
 struct AliasCollector<'a> {
     allocator: &'a Allocator,
     aliases: HashMap<String, AliasDef<'a>>,
+    /// 别名声明的作者脚本字节区间（已去包裹头）。
+    spans: Vec<(usize, usize)>,
 }
 
 /// 一条类型别名定义：泛型参数名（按声明序，无泛型为空）+ 类型体（arena 克隆）。
@@ -451,6 +479,14 @@ pub(crate) struct AliasDef<'a> {
 
 impl<'a> Visit<'a> for AliasCollector<'a> {
     fn visit_ts_type_alias_declaration(&mut self, it: &TSTypeAliasDeclaration<'a>) {
+        // 声明 span（去包裹头）记录下来，编译期从可执行脚本抹除（TS-only 语法）。
+        let (start, end) = (
+            it.span.start as usize,
+            it.span.end as usize,
+        );
+        if start >= WRAPPER_HEAD.len() && end >= WRAPPER_HEAD.len() {
+            self.spans.push((start - WRAPPER_HEAD.len(), end - WRAPPER_HEAD.len()));
+        }
         let params: Vec<String> = it
             .type_parameters
             .as_ref()
@@ -567,6 +603,23 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
             let question_src = self.slice(question.span());
             let replacement = format!("{receiver}.askJson({question_src}, {schema_json})");
             if let Some((start, end)) = self.script_span(it.span) {
+                // 嵌套 typed ask（`ask<T>(await ask<U>(...))` 的参数里又有一层）拒绝：
+                // 外层替换的文本取自原文，内层重写无法嵌进外层的固定 span 里——支持它
+                // 需要递归改写，误产出碎片比明确报错更糟；模型把内层存变量即可绕开。
+                if self
+                    .replacements
+                    .iter()
+                    .any(|(other_start, other_end, _)| start < *other_end && *other_start < end)
+                {
+                    self.diag(
+                        it.span.start,
+                        "ask<T> 嵌套不支持（参数里又出现一层 ask<T>）：先把内层结果存到变量，\
+                         再把变量作为问题文本传入"
+                            .to_string(),
+                    );
+                    walk_call_expression(self, it);
+                    return;
+                }
                 self.replacements.push((start, end, replacement));
                 let source = &self.wrapped[WRAPPER_HEAD.len()..];
                 let (line, _) = line_col(source, it.span.start);
@@ -650,6 +703,9 @@ impl<'a> SchemaCompiler<'a> {
             }
             TSType::TSIntersectionType(intersection) => {
                 // 交叉 = 对象合并：properties 合并、required 并集；非对象分量不支持。
+                // 同名属性在各成员都有约束 = TS 语义的属性级交集（`{v:"ok"} & {v:string}`
+                // 里 v 必须同时满足两者）——合并成 allOf 让校验器逐分支核对，直接覆盖
+                // 会把字面量约束悄悄放宽。
                 let mut properties = serde_json::Map::new();
                 let mut required: Vec<String> = Vec::new();
                 for member in &intersection.types {
@@ -662,7 +718,24 @@ impl<'a> SchemaCompiler<'a> {
                         continue;
                     };
                     for (key, value) in object {
-                        properties.insert(key.clone(), value.clone());
+                        match properties.entry(key.clone()) {
+                            serde_json::map::Entry::Occupied(mut occupied) => {
+                                // 同名属性已有约束 → 属性级 allOf（存量已是 allOf 则追加分支）。
+                                let existing = occupied.get().clone();
+                                let branches = match existing.get("allOf") {
+                                    Some(Value::Array(earlier)) => {
+                                        let mut branches = earlier.clone();
+                                        branches.push(value.clone());
+                                        branches
+                                    }
+                                    _ => vec![existing, value.clone()],
+                                };
+                                occupied.insert(json!({"allOf": branches}));
+                            }
+                            serde_json::map::Entry::Vacant(vacant) => {
+                                vacant.insert(value.clone());
+                            }
+                        }
                     }
                     if let Some(member_required) = schema.get("required").and_then(Value::as_array)
                     {
@@ -1117,5 +1190,94 @@ mod extended_type_tests {
         .expect("嵌套实例化应成功");
         let (_, schema) = &nested.typed_asks[0];
         assert_eq!(schema["properties"]["value"]["properties"]["value"]["type"], "string");
+    }
+
+    #[test]
+    fn alias_declarations_are_erased_from_exec_script() {
+        // 回归：别名只参与 schema 编译，声明本身是 TS 语法——留在可执行脚本里会被
+        // QuickJS 探针整只拒绝。
+        let script = concat!(
+            "type Host = { name: string };\n",
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<Host>(\"问\");\n",
+            "result(r.name);\n"
+        );
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        assert!(
+            !transform.exec_script.contains("type Host"),
+            "别名声明必须抹除: {}",
+            transform.exec_script
+        );
+        assert!(transform.exec_script.contains(".askJson("));
+        // 抹除置空格不换行：askJson 行号 = 原文行号（诊断/定位不漂移）。
+        let rewrite_line = transform
+            .exec_script
+            .lines()
+            .position(|line| line.contains(".askJson("))
+            .expect("重写行存在");
+        let original_line = script
+            .lines()
+            .position(|line| line.contains("ask<Host>"))
+            .expect("原行存在");
+        assert_eq!(rewrite_line, original_line);
+        assert!(transform.exec_script.contains("result(r.name);"), "后续代码原样保留");
+    }
+
+    #[test]
+    fn nested_typed_asks_are_rejected_with_diagnostic() {
+        // 回归：嵌套 typed ask 的替换 span 相互包含，按原文 span 重写会产出残缺 JS——
+        // 编译期明确拒绝（模型把内层存变量即可绕开）。
+        let script = "const h = agent(\"h\");\n\
+                      const r = await h.ask<{ v: string }>(`外层 ${await h.ask<string>(\"内层\")}`);\n";
+        let diagnostics = compile_typed_asks(script).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("嵌套不支持")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn typed_asks_are_found_regardless_of_formatting() {
+        // 回归：`.ask <T>`（空格）与模板串插值里的 typed ask 都不含 `.ask<` 字节序列，
+        // 文本预判曾漏掉它们（TS 语法漏到 QuickJS 才报错）。编译路径现在始终走 AST。
+        let spaced = "const h = agent(\"h\");\nconst r = await h.ask <number>(\"间距\");\nresult(String(r));\n";
+        let transform = compile_typed_asks(spaced).expect("空格形态应编译");
+        assert_eq!(transform.typed_asks.len(), 1);
+        assert_eq!(transform.typed_asks[0].1["type"], "number");
+        assert!(transform.exec_script.contains(".askJson("));
+
+        // 模板串 ${} 插值里的 typed ask：遮蔽函数把整个模板视作字符串，文本预判
+        // 曾漏掉——AST 路径必须能找到并重写插值内的调用。
+        let interpolated = "const h = agent(\"h\");\n\
+                            const tag = `值 ${await h.ask<number>(\"几\")}`;\n\
+                            result(tag);\n";
+        let transform = compile_typed_asks(interpolated).expect("插值内调用应编译");
+        assert_eq!(transform.typed_asks.len(), 1);
+        assert_eq!(transform.typed_asks[0].1["type"], "number");
+        assert!(
+            transform.exec_script.contains("${await h.askJson("),
+            "插值内调用应被重写: {}",
+            transform.exec_script
+        );
+    }
+
+    #[test]
+    fn intersection_overlapping_properties_intersect_via_allof() {
+        // 回归：`{v: "ok"} & {v: string}` 的 v 曾被第二个成员覆盖（字面量约束被悄悄
+        // 放宽）——同名属性必须合成 allOf，答案要同时满足两个分支。
+        let script = concat!(
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<{ v: \"ok\" } & { v: string }>(\"交叉\");\n",
+            "result(r.v);\n"
+        );
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        let (_, schema) = &transform.typed_asks[0];
+        let v = &schema["properties"]["v"];
+        let branches = v["allOf"].as_array().expect("同名属性合成 allOf");
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0]["const"], "ok");
+        assert_eq!(branches[1]["type"], "string");
     }
 }

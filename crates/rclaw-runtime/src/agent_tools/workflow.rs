@@ -470,12 +470,20 @@ fn type_check_with_tsc(script: &str) -> Option<Vec<FacadeDiagnostic>> {
 // ---------------------------------------------------------------------------
 
 /// 极简 JSON Schema 子集校验（递归）：type（string/number/integer/boolean/object/array/null，
-/// 可为 `["T", "null"]` 数组）、const、enum、anyOf、object.properties/required、array.items。
-/// 覆盖 facade 契约场景（含 `.ask<T>` 编译出的字面量 / 联合 schema，第十二轮）；
-/// 超出子集的字段忽略；未知类型名与超深嵌套（> 8）按错误处理。
+/// 可为 `["T", "null"]` 数组）、const、enum、anyOf、allOf、object.properties/required、
+/// array.items/prefixItems/minItems/maxItems。覆盖 facade 契约场景（含 `.ask<T>` 编译出的
+/// 字面量 / 联合 / 元组 / 交叉 schema，第十二轮）；超出子集的字段忽略；未知类型名与
+/// 超深嵌套（> 8）按错误处理。
 fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(), String> {
     if depth > 8 {
         return Err("schema 嵌套超过深度上限 8".to_string());
+    }
+    // allOf：每个分支都必须通过（交叉类型的属性级交集走这里）。
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for (index, branch) in branches.iter().enumerate() {
+            validate_json_schema(value, branch, depth + 1)
+                .map_err(|error| format!("allOf[{index}]: {error}"))?;
+        }
     }
     // anyOf：任一分支通过即可（先于 type 校验——联合的每个分支自带 type/const）。
     if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
@@ -1712,15 +1720,13 @@ impl Tool for WorkflowRunTool {
         // Layer 3 `.ask<T>` 泛型编译（第十二轮）：内联类型注解编译成 JSON schema，调用点
         // 重写为 askJson(question, schema)。script hash 仍按【作者原文】计算（resume 的
         // 逐字节一致语义不变）；语法 / lint 检查与引擎执行都走重写后的 exec_script。
-        // 编译在 blocking 线程（oxc 解析是纯 CPU）。
+        // 编译在 blocking 线程（oxc 解析是纯 CPU）。**始终编译**（无 typed ask 时原样
+        // 返回）——typed ask 的判定必须走 AST：`.ask <T>`（空格）与模板串插值里的调用
+        // 都不含 `.ask<` 字节序列，文本预判会漏，漏掉的 TS 语法会一路漏到 QuickJS。
         let compile_input = script.clone();
         let compiled = tokio::task::spawn_blocking(move || {
-            if super::workflow_ast::has_typed_asks(&compile_input) {
-                super::workflow_ast::compile_typed_asks(&compile_input)
-                    .map(|transform| (transform.exec_script, transform.typed_asks))
-            } else {
-                Ok((compile_input.clone(), Vec::new()))
-            }
+            super::workflow_ast::compile_typed_asks(&compile_input)
+                .map(|transform| (transform.exec_script, transform.typed_asks))
         })
         .await
         .unwrap_or_else(|error| {
@@ -2646,14 +2652,37 @@ mod validator_tests {
             },
             "required": ["zone"]
         });
-        assert!(validate_json_schema(
-            &json!({"zone": "a", "tags": ["x", "x"]}),
-            &compiled,
-            0
-        )
+        assert!(validate_json_schema(&json!({"zone": "a", "tags": ["x", "x"]}), &compiled, 0)
         .is_ok());
         assert!(validate_json_schema(&json!({"zone": "c"}), &compiled, 0).is_err());
         assert!(validate_json_schema(&json!({"zone": "a", "tags": ["y"]}), &compiled, 0).is_err());
+    }
+
+    #[test]
+    fn validator_requires_every_allof_branch() {
+        // allOf：交叉类型的属性级交集（`{v:"ok"} & {v:string}`）——每个分支都要通过，
+        // 只满足其一不放行。
+        let intersection = json!({
+            "type": "object",
+            "properties": {
+                "v": {"allOf": [{"const": "ok"}, {"type": "string"}]}
+            },
+            "required": ["v"]
+        });
+        assert!(validate_json_schema(&json!({"v": "ok"}), &intersection, 0).is_ok());
+        assert!(
+            validate_json_schema(&json!({"v": "wrong"}), &intersection, 0).is_err(),
+            "只满足 string 分支不得放行（字面量约束不能被放宽）"
+        );
+        // 嵌套对象里的 allOf 照样逐分支核对。
+        let nested = json!({
+            "type": "object",
+            "properties": {
+                "inner": {"allOf": [{"type": "object", "properties": {"a": {"const": 1}}, "required": ["a"]}]}
+            }
+        });
+        assert!(validate_json_schema(&json!({"inner": {"a": 1}}), &nested, 0).is_ok());
+        assert!(validate_json_schema(&json!({"inner": {"a": 2}}), &nested, 0).is_err());
     }
 }
 

@@ -3702,8 +3702,11 @@ async fn paused_plan_waits_at_wave_boundary_and_resumes() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 
     // journal：执行器记录了暂停/恢复与 step_started（运行中状态的持久事实源）。
+    // 恢复事件是 plan_unpaused——plan_resumed 是 resume 的代际锚点，二者不可混用
+    //（open_escalations 据它判定提问归属）。
     let log = plan_journal_text(&runtime.journal, &plan_id);
     assert!(log.contains("plan_paused"), "{log}");
-    assert!(log.contains("plan_resumed"), "{log}");
+    assert!(log.contains("plan_unpaused"), "{log}");
+    assert!(!log.contains("\"plan_resumed\""), "波次恢复不得写代际锚点事件: {log}");
     assert!(log.contains("step_started"), "{log}");
 }

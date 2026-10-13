@@ -72,8 +72,10 @@ fn fork_lineage_key(channel: &str, chat_id: &str) -> String {
 }
 
 /// artifact 目录的会话键（与 runtime `turn::artifact` 同一规则，单一事实源在此）：
-/// `[A-Za-z0-9._-]` 之外替换成 `_`（防 chat_id 里的路径分隔符逃出目录），截断 64 字符；
-/// 子代理等无源会话场景由调用方传 `chat_id = ""`（归档为 `subagent-<channel>`）。
+/// `[A-Za-z0-9._-]` 之外替换成 `_`（防 chat_id 里的路径分隔符逃出目录），取前 46 字符
+/// 后拼 `-` + 完整原始键的 FNV-1a 64 位摘要（16 hex，总长 ≤63）——纯截断会把只差尾部
+/// 的两个长会话 id 合并进同一目录，删其一就端掉另一家的落盘产物；摘要保证不同会话
+/// 必不同键。子代理等无源会话场景由调用方传 `chat_id = ""`（归档为 `subagent-<channel>`）。
 pub fn artifact_chat_key(channel: &str, chat_id: &str) -> String {
     let raw = if chat_id.is_empty() {
         format!("subagent-{channel}")
@@ -90,7 +92,18 @@ pub fn artifact_chat_key(channel: &str, chat_id: &str) -> String {
             }
         })
         .collect();
-    sanitized.chars().take(64).collect()
+    // FNV-1a 64：无依赖、跨版本稳定（std 的 DefaultHasher 不保证跨版本一致，
+    // 磁盘键要的是「同一输入永远同一输出」）。
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in raw.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut key = String::with_capacity(64);
+    key.extend(sanitized.chars().take(46));
+    key.push('-');
+    key.push_str(&format!("{hash:016x}"));
+    key
 }
 
 /// 删除某会话的 artifact 目录（工具结果落盘句柄的实体；会话删除时级联清理）。
@@ -581,6 +594,9 @@ impl SessionStore {
     ///   `{parent, anchor}`（查回用 [`Self::fork_parent`]）。
     /// - `new_chat_id` 由调用方给出（桌面命令/斜杠命令负责生成与字符集校验）；已存在
     ///   则报错——fork 是显式动作，不静默覆盖别人的历史。
+    /// - 消息体里引用源会话 artifact（工具结果落盘句柄）的路径统一改写到新会话自己的
+    ///   artifact 目录（事务提交后整目录复制）——否则父会话删除会连带删掉新分支还在
+    ///   引用的全文，转录里只剩预览。
     /// - 整个复制在一个事务里：中途失败新会话一个字节都不留。
     pub fn fork_session(
         &self,
@@ -591,7 +607,17 @@ impl SessionStore {
         full_transcript: bool,
     ) -> Result<SessionFork> {
         let now = now_ms();
-        self.db.transaction(|tx| {
+        // 句柄重写前缀：与落盘侧同一正斜杠形态（artifact 句柄进转录前已统一）。
+        let base_display = self.layout.base.to_string_lossy().replace('\\', "/");
+        let source_prefix = format!(
+            "{base_display}/artifacts/{}/",
+            artifact_chat_key(channel, chat_id)
+        );
+        let target_prefix = format!(
+            "{base_display}/artifacts/{}/",
+            artifact_chat_key(channel, new_chat_id)
+        );
+        let fork = self.db.transaction(|tx| {
             if session_id(tx, channel, new_chat_id)?.is_some() {
                 return Err(StoreError::Other(format!(
                     "会话 {channel}/{new_chat_id} 已存在，fork 拒绝覆盖"
@@ -649,6 +675,13 @@ impl SessionStore {
                 let (role, ts): (String, i64) = stmt.query_row(params![sid, id], |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })?;
+                // artifact 句柄重写：命中源会话目录前缀的路径改指新会话目录（事务提交后
+                // 整目录复制补上实体文件）；不含句柄的行原样复制。
+                let data = if data.contains(source_prefix.as_str()) {
+                    data.replace(source_prefix.as_str(), &target_prefix)
+                } else {
+                    data.clone()
+                };
                 tx.execute(
                     "INSERT INTO message(session_id, role, ts, data, meta) VALUES (?1, ?2, ?3, ?4, NULL)",
                     params![new_sid, role, ts, data],
@@ -669,7 +702,49 @@ impl SessionStore {
                 copied: prefix.len(),
                 anchor_message_id,
             })
-        })
+        })?;
+        // 事务提交成功后才复制 artifact 目录（复制失败不回滚 fork：句柄丢失是可感知、
+        // 可重新执行工具的小损失，会话分叉本身不该因此失败）。
+        self.copy_artifact_dir(channel, chat_id, new_chat_id);
+        Ok(fork)
+    }
+
+    /// fork 时把源会话的 artifact 目录整份复制到新会话键下（配合消息体里的路径重写，
+    /// 新分支的落盘句柄自持，父会话删除不再牵连）。best-effort：源目录不存在静默跳过，
+    /// 复制失败只告警。
+    fn copy_artifact_dir(&self, channel: &str, source_chat: &str, target_chat: &str) {
+        let source = self
+            .layout
+            .base
+            .join("artifacts")
+            .join(artifact_chat_key(channel, source_chat));
+        let target = self
+            .layout
+            .base
+            .join("artifacts")
+            .join(artifact_chat_key(channel, target_chat));
+        if !source.is_dir() {
+            return;
+        }
+        if let Err(error) = std::fs::create_dir_all(&target) {
+            tracing::warn!("artifact 目录复制失败（{}）: {error}", target.display());
+            return;
+        }
+        let entries = match std::fs::read_dir(&source) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!("artifact 目录读取失败（{}）: {error}", source.display());
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if let Err(error) = std::fs::copy(entry.path(), target.join(entry.file_name())) {
+                tracing::warn!("artifact 文件复制失败（{}）: {error}", entry.path().display());
+            }
+        }
     }
 
     /// fork 出的会话的父会话（非 fork 会话 / 血缘损坏 → None）。

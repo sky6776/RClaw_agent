@@ -8858,11 +8858,20 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
     ));
     mgr.handle_goal("cli", "console", "/goal 完成迁移").await;
     let key = TurnManager::goal_key("cli", "console");
-    assert!(mgr.session.journal().kv_get(&key).unwrap().is_some());
+    let created_at = mgr
+        .session
+        .journal()
+        .kv_get(&key)
+        .unwrap()
+        .expect("目标已设定")
+        .get("created_at")
+        .and_then(serde_json::Value::as_i64)
+        .expect("目标带 created_at 版本");
 
-    // 审计确认 → goal 清除 + 系统回执。
+    // 审计确认 → goal 清除 + 系统回执（intermediate：不得解除忙碌态）。
     mgr.spawn_goal_audit(
         "完成迁移".to_string(),
+        created_at,
         "迁移完成：cargo test 1144 全部通过".to_string(),
         "cli".to_string(),
         "console".to_string(),
@@ -8870,16 +8879,27 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
     let mut receipt = None;
     for _ in 0..100 {
         if let Ok(msg) = outbound_rx.try_recv() {
-            receipt = Some(msg.content);
+            receipt = Some((msg.content.clone(), msg.is_intermediate()));
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(receipt.is_some(), "审计通过应投系统回执");
+    let (receipt, intermediate) = receipt.expect("审计通过应投系统回执");
+    assert!(receipt.contains("已达成"), "{receipt}");
+    assert!(intermediate, "回执必须按 intermediate 投递（不得解除忙碌态）");
     assert!(mgr.session.journal().kv_get(&key).unwrap().is_none(), "目标应被清除");
 
     // 审计不确认 → 目标保持。
     mgr.handle_goal("cli", "console", "/goal 另一个目标").await;
+    let created_at2 = mgr
+        .session
+        .journal()
+        .kv_get(&key)
+        .unwrap()
+        .expect("目标已设定")
+        .get("created_at")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap();
     let deny = Arc::new(TurnManager::new(
         Arc::new(ScriptedProvider {
             reply: r#"{"goal_met": false, "evidence_summary": "仅部分完成"}"#.to_string(),
@@ -8904,6 +8924,7 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
     // 用 deny 实例（同库）跑审计。
     deny.spawn_goal_audit(
         "另一个目标".to_string(),
+        created_at2,
         "还在进行中".to_string(),
         "cli".to_string(),
         "console".to_string(),
@@ -8912,5 +8933,40 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
     assert!(
         mgr.session.journal().kv_get(&key).unwrap().is_some(),
         "审计不确认时目标必须保持"
+    );
+
+    // 版本错配：审计的是旧目标 A，kv 里已是新目标 B——确认版审计也不得清掉 B。
+    let stale = Arc::new(TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: r#"{"goal_met": true, "evidence_summary": "旧目标的证据"}"#.to_string(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout.clone(),
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        {
+            let (tx, _rx) = mpsc::channel(1);
+            tx
+        },
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+    stale.spawn_goal_audit(
+        "另一个目标".to_string(),
+        created_at.saturating_sub(1_000),
+        "旧目标的汇报".to_string(),
+        "cli".to_string(),
+        "console".to_string(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let still_there = mgr.session.journal().kv_get(&key).unwrap().expect("新目标必须保留");
+    assert_eq!(
+        still_there.get("created_at").and_then(serde_json::Value::as_i64),
+        Some(created_at2),
+        "过期版本的审计通过也不得清掉现目标"
     );
 }

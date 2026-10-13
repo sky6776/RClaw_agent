@@ -347,6 +347,8 @@ function PlanStepsCard({
     if (status === "skipped") return <span className="text-gray-600">⤼</span>;
     if (status === "running")
       return <span className="inline-block animate-spin text-indigo-400">◌</span>;
+    // 执行成功、等验证者裁决（Programmer/Prover 对抗环）——不是终态成功。
+    if (status === "verifying") return <span className="text-amber-300">🔍</span>;
     return <span className="text-amber-400">⏳</span>;
   };
   return (
@@ -602,13 +604,13 @@ export default function Chat({
     setShowJumpDown(false);
     // 切会话清附件与 ↑↓ 浏览态（附件发错对象/历史错位）；草稿清空由 App 的
     // openChat/newChat 入口同步完成——若在此清，分享确认「先切会话再并入」
-    // 的文本会被这个后跑的 effect 抹掉。排队消息同样清空（发错对象比丢输入更糟）。
+    // 的文本会被这个后跑的 effect 抹掉。排队消息不清：每条都绑着自己的会话
+    // （queue item.chat），只显示/投递当前会话的，切回来还在。
     setAttachments([]);
     setHistoryIndex(null);
     setQuote(null);
     setSelectIds(null);
     setExportResult(null);
-    setQueue([]);
     draftRef.current = "";
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -616,8 +618,13 @@ export default function Chat({
 
   // 排队消息（第十二轮 · zcode 同款）：agent 运行期间发送的消息进入本地队列，
   // 显示在输入框上方，可删除 / 编辑 / 「立即」强制投递（走运行中的 turn 的插队
-  // 通道）；turn 收尾（busy 翻回 false）时按序自动发出。
-  const [queue, setQueue] = useState<string[]>([]);
+  // 通道）；turn 收尾（busy 翻回 false）时逐条自动发出。每条绑定发出时的会话 id：
+  // Chat 是跨会话复用的同一实例，「切会话触发 busy false 翻转」若不校验归属，会把
+  // A 会话的排队消息发进 B（onSend 闭包里的 activeId 已经换了）。
+  type QueueItem = { id: number; chat: string; text: string };
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const queueIdRef = useRef(0);
+  const visibleQueue = queue.filter((item) => item.chat === sessionKey);
 
   const send = () => {
     const content = draft.trim();
@@ -634,7 +641,9 @@ export default function Chat({
           .join("\n");
         body = `> 引用${quote.who}消息：\n${quoted}\n\n${content}`;
       }
-      setQueue((prev) => [...prev, [...lines, body].filter(Boolean).join("\n")]);
+      const text = [...lines, body].filter(Boolean).join("\n");
+      queueIdRef.current += 1;
+      setQueue((prev) => [...prev, { id: queueIdRef.current, chat: sessionKey, text }]);
       onDraftChange("");
       setAttachments([]);
       setHistoryIndex(null);
@@ -661,32 +670,30 @@ export default function Chat({
   };
 
   /** 「立即」发送排队消息：绕过 busy 直接投递（运行时把消息作为插队并入当前 turn）。 */
-  const sendQueuedNow = (index: number) => {
-    const item = queue[index];
-    if (item === undefined) return;
-    setQueue((prev) => prev.filter((_, i) => i !== index));
-    onSend(item);
+  const sendQueuedNow = (item: QueueItem) => {
+    setQueue((prev) => prev.filter((queued) => queued.id !== item.id));
+    onSend(item.text);
   };
 
   /** 编辑排队消息：回填输入框并从队列移除。 */
-  const editQueued = (index: number) => {
-    const item = queue[index];
-    if (item === undefined) return;
-    setQueue((prev) => prev.filter((_, i) => i !== index));
-    onDraftChange(item);
+  const editQueued = (item: QueueItem) => {
+    setQueue((prev) => prev.filter((queued) => queued.id !== item.id));
+    onDraftChange(item.text);
     inputRef.current?.focus();
   };
 
-  // turn 收尾（busy 翻回 false）：按序自动发出全部排队消息（各自开新 turn，
-  // 运行时按会话串行处理）。
+  // turn 收尾（busy 翻回 false）：逐条发出当前会话的排队消息——每轮只出队一条，
+  // 发送会把 busy 翻回 true，下一个 turn 收尾后再发下一条。一次全发会让后续消息
+  // 变成运行中 turn 的插队（route 把非首条并入活动 turn），排队语义就没了。
+  // queue 也在依赖里：排队期间被删到空 / 切回一个闲会话时同样能推进。
   useEffect(() => {
-    if (busy || queue.length === 0) return;
-    setQueue([]);
-    for (const item of queue) {
-      onSend(item);
-    }
+    if (busy) return;
+    const next = queue.find((item) => item.chat === sessionKey);
+    if (!next) return;
+    setQueue((prev) => prev.filter((item) => item.id !== next.id));
+    onSend(next.text);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy]);
+  }, [busy, sessionKey, queue]);
 
   // 历史回填：写入输入框并把光标移到末尾（否则光标停在原位，连续 ↑↓ 会被
   // 文本框默认的光标移动吃掉一次按键）。
@@ -1304,27 +1311,27 @@ export default function Chat({
         )}
 
         {/* 排队消息（zcode 同款，第十二轮）：agent 运行期间发送的消息在此排队，
-            可删除 / 编辑 / 立即投递；turn 收尾后按序自动发出。 */}
-        {queue.length > 0 && (
+            可删除 / 编辑 / 立即投递；turn 收尾后逐条自动发出。只显示当前会话的。 */}
+        {visibleQueue.length > 0 && (
           <div className="mb-2 space-y-1.5">
-            {queue.map((item, index) => (
+            {visibleQueue.map((item) => (
               <div
-                key={`${index}-${item.slice(0, 16)}`}
+                key={item.id}
                 className="flex items-center gap-1.5 rounded-xl border border-[#2a2f3a] bg-[#141821] px-3 py-1.5"
               >
                 <span className="shrink-0 text-[10px] text-amber-400/80">⏳ 排队</span>
-                <span className="min-w-0 flex-1 truncate text-xs text-gray-300" title={item}>
-                  {item}
+                <span className="min-w-0 flex-1 truncate text-xs text-gray-300" title={item.text}>
+                  {item.text}
                 </span>
                 <button
-                  onClick={() => sendQueuedNow(index)}
+                  onClick={() => sendQueuedNow(item)}
                   title="立即发送（作为插队消息并入当前任务）"
                   className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-300 transition hover:bg-indigo-500/15"
                 >
                   立即
                 </button>
                 <button
-                  onClick={() => editQueued(index)}
+                  onClick={() => editQueued(item)}
                   title="编辑（回填输入框）"
                   aria-label="编辑排队消息"
                   className="shrink-0 rounded px-1 py-0.5 text-gray-500 transition hover:text-gray-200"
@@ -1332,7 +1339,7 @@ export default function Chat({
                   <PencilIcon />
                 </button>
                 <button
-                  onClick={() => setQueue((prev) => prev.filter((_, i) => i !== index))}
+                  onClick={() => setQueue((prev) => prev.filter((queued) => queued.id !== item.id))}
                   title="删除"
                   aria-label="删除排队消息"
                   className="shrink-0 rounded px-1.5 py-0.5 text-gray-500 transition hover:text-red-300"

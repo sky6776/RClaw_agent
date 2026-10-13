@@ -1623,10 +1623,14 @@ fn recent_user_anchors_list_real_user_messages_newest_first() {
 fn delete_session_cascades_artifact_dir_and_clear_wipes_root() {
     let (_g, s) = store();
     let base = s.layout().base.clone();
-    let a_dir = base.join("artifacts").join("cli-console");
+    let a_dir = base
+        .join("artifacts")
+        .join(crate::session::artifact_chat_key("cli", "console"));
     std::fs::create_dir_all(&a_dir).unwrap();
     std::fs::write(a_dir.join("1799-read.txt"), "big output").unwrap();
-    let other_dir = base.join("artifacts").join("cli-other");
+    let other_dir = base
+        .join("artifacts")
+        .join(crate::session::artifact_chat_key("cli", "other"));
     std::fs::create_dir_all(&other_dir).unwrap();
     // 无关会话的 artifact 也在（键规则与 runtime artifact.rs 同源）。
     s.append("cli", "console", &Message::plain(Role::User, "m")).unwrap();
@@ -1643,6 +1647,98 @@ fn delete_session_cascades_artifact_dir_and_clear_wipes_root() {
     // /clear：全部会话清空时 artifacts 根一并移除。
     s.clear_all_sessions().unwrap();
     assert!(!base.join("artifacts").exists(), "clear 应清空 artifacts 根");
+}
+
+// ---------------------------------------------------------------------------
+// artifact 会话键（FNV 摘要防碰撞）与 fork 的 artifact 保全
+// ---------------------------------------------------------------------------
+
+#[test]
+fn artifact_chat_key_is_collision_resistant_and_stable() {
+    use crate::session::artifact_chat_key;
+    // 常规键：可读前缀 + 摘要，长度 ≤ 63。
+    let key = artifact_chat_key("cli", "console");
+    assert!(key.starts_with("cli-console-"), "{key}");
+    assert!(key.len() <= 63, "{key}");
+    assert_eq!(key, artifact_chat_key("cli", "console"), "同一输入恒同键");
+
+    // 纯截断曾把只差尾字符的两个合法长 chat_id 合并进同一目录（删其一端掉另一家）；
+    // 摘要后必须不同。
+    let long_a = format!("{}A", "x".repeat(56));
+    let long_b = format!("{}B", "x".repeat(56));
+    assert_ne!(artifact_chat_key("desktop", &long_a), artifact_chat_key("desktop", &long_b));
+
+    // 路径分隔符 / 空白替换成下划线，不允许逃出目录；摘要仍区分。
+    assert_eq!(
+        artifact_chat_key("a/b", "c\\d e"),
+        artifact_chat_key("a/b", "c\\d e")
+    );
+    assert!(artifact_chat_key("a/b", "c\\d e").starts_with("a_b-c_d_e-"));
+    // 子代理（无源会话）按来源通道归档。
+    assert!(artifact_chat_key("desktop", "").starts_with("subagent-desktop-"));
+}
+
+#[test]
+fn fork_rewrites_and_copies_artifact_handles() {
+    let (_g, s) = store();
+    let base = s.layout().base.clone();
+    let anchor = s
+        .append("cli", "c", &Message::plain(Role::User, "锚点"))
+        .unwrap();
+    // 源会话的落盘产物 + 一条引用它的消息（句柄路径 = spill 时的正斜杠形态）。
+    let src_dir = base
+        .join("artifacts")
+        .join(crate::session::artifact_chat_key("cli", "c"));
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("42-grep.txt"), "full tool output").unwrap();
+    let handle = format!(
+        "完整内容已存至: {}/artifacts/{}/42-grep.txt",
+        base.to_string_lossy().replace('\\', "/"),
+        crate::session::artifact_chat_key("cli", "c")
+    );
+    let handle_msg = s
+        .append("cli", "c", &Message::plain(Role::Assistant, handle))
+        .unwrap();
+
+    let fork = s.fork_session("cli", "c", handle_msg, "c-fork", false).unwrap();
+    assert_eq!(fork.copied, 2, "前缀含锚点（句柄消息）与其前的锚点消息");
+
+    // 新会话的消息句柄已改指自己的目录，且实体文件在那里。
+    let fork_dir = base
+        .join("artifacts")
+        .join(crate::session::artifact_chat_key("cli", "c-fork"));
+    assert!(
+        fork_dir.join("42-grep.txt").exists(),
+        "fork 应把引用到的 artifact 实体复制过来"
+    );
+    let history = s.load_transcript("cli", "c-fork").unwrap();
+    let text = history
+        .iter()
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| b.as_text())
+                .collect::<String>()
+        })
+        .collect::<String>();
+    assert!(
+        text.contains(&format!("/artifacts/{}/42-grep.txt", crate::session::artifact_chat_key("cli", "c-fork"))),
+        "句柄应重写到新目录: {text}"
+    );
+    assert!(!text.contains("/artifacts/cli-c-") || text.contains(&crate::session::artifact_chat_key("cli", "c-fork")), "不得残留源目录句柄: {text}");
+
+    // 父会话删除不再牵连 fork 的副本。
+    assert!(s.delete_session("cli", "c").unwrap());
+    assert!(fork_dir.join("42-grep.txt").exists(), "删父会话不得删 fork 的 artifact");
+}
+
+#[test]
+fn fork_without_artifacts_stays_clean() {
+    let (_g, s) = store();
+    let anchor = s.append("cli", "c", &Message::plain(Role::User, "m")).unwrap();
+    // 源会话没有 artifact 目录：fork 照常成功（best-effort 跳过）。
+    let fork = s.fork_session("cli", "c", anchor, "c-fork", false).unwrap();
+    assert_eq!(fork.copied, 1);
 }
 
 #[test]

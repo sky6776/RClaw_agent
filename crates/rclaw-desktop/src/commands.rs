@@ -629,7 +629,7 @@ pub async fn chat_fork(
 #[derive(Debug, Serialize)]
 pub struct PlanStepDto {
     pub id: String,
-    /// pending | running | succeeded | failed | skipped。
+    /// pending | running | verifying | succeeded | failed | skipped。
     pub status: String,
     /// 步骤任务文本（plan_started 里截断到 80 字符）。
     pub task: String,
@@ -644,7 +644,7 @@ pub struct PlanDto {
     pub name: String,
     /// 计划是否已整体收尾（plan_completed）。
     pub completed: bool,
-    /// 用户暂停中（最后的 plan_paused/plan_resumed 事件 + kv 标志共同决定）。
+    /// 用户暂停中（最后的 plan_paused / plan_resumed|plan_unpaused 事件决定）。
     pub paused: bool,
     /// plan_completed 携带的成功步骤数。
     pub succeeded: Option<u64>,
@@ -655,11 +655,17 @@ pub struct PlanDto {
 
 /// 把一条 plan journal 流的事件投影进 PlanDto（纯函数，可单测）。
 ///
-/// 事件语义：`plan_started` 定步骤全集与名字（兼容旧版 id 数组 / 新版 {id, task}）；
-/// `step_finished{outcome}` / `step_skipped|step_unverified` 定步骤终态；
-/// `plan_paused` / `plan_resumed` 按事件序翻转暂停态（**必须是独立分支**——合并进
-/// plan_started 的写法会吞掉 resumed，暂停投影翻不回 false，clippy unreachable_patterns
-/// 曾揪出此 bug）；`plan_completed` 定整体收尾（收尾后暂停无意义，强制清除）。
+/// 事件语义：`plan_started` 定步骤全集与名字（兼容旧版 id 数组 / 新版 {id, task}），
+/// 同一流上的第二次 started = resume 新一代执行——整体收尾态复位，上一代 succeeded /
+/// verifying 的步骤按 resume 语义继承（执行器不重跑也不重报它们）；带
+/// `awaiting_verdict` 的 step_finished 投影成 verifying（终局由 `verdict_passed` /
+/// `verdict_failed` 判定——直接 ✓ 会把验证否决的目标亮成成功，`verdict_failed` 未耗尽
+/// 轮次时目标回 pending 重跑）；`step_skipped` 定 skipped，`step_unverified` 定 failed
+/// （验证者不可用时目标终局就是 Failed，执行器侧传染口径一致）；
+/// `plan_paused` / `plan_resumed|plan_unpaused` 按事件序翻转暂停态（**必须是独立
+/// 分支**——合并进 plan_started 的写法会吞掉 resumed，暂停投影翻不回 false，clippy
+/// unreachable_patterns 曾揪出此 bug）；`plan_completed` 定整体收尾（收尾后暂停无意义，
+/// 强制清除）。
 fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) {
     for (_seq, event) in events {
         // journal 的 ts 是 RFC3339 字符串（plan_event_record 形态）；毫秒 int 只在
@@ -685,39 +691,61 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
                 if let Some(name) = event.get("name").and_then(serde_json::Value::as_str) {
                     plan.name = name.to_string();
                 }
+                // resume 复用同一 journal 流：新一代执行开始必须复位上一代的整体收尾态。
+                plan.completed = false;
+                plan.succeeded = None;
+                plan.paused = false;
                 // 兼容两种形态：旧版 steps 为 id 数组，新版为 {id, task} 数组。
                 if let Some(steps) = event.get("steps").and_then(serde_json::Value::as_array) {
+                    // resume 语义的投影对位：上一代 succeeded 的步骤执行器直接继承
+                    // （不重跑、不重发 step_finished），全量归零会让它永远停在 pending；
+                    // 等验证者的目标（verifying）同样保留——resume 只补跑验证者。
+                    let inherited: std::collections::HashMap<&str, &PlanStepDto> = plan
+                        .steps
+                        .iter()
+                        .filter(|s| s.status == "succeeded" || s.status == "verifying")
+                        .map(|s| (s.id.as_str(), s))
+                        .collect();
                     plan.steps = steps
                         .iter()
-                        .filter_map(|entry| match entry {
-                            serde_json::Value::String(id) => Some(PlanStepDto {
-                                id: id.clone(),
-                                status: "pending".into(),
-                                task: String::new(),
-                                summary: String::new(),
-                            }),
-                            serde_json::Value::Object(_) => Some(PlanStepDto {
-                                id: entry
-                                    .get("id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                status: "pending".into(),
-                                task: entry
-                                    .get("task")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                summary: String::new(),
-                            }),
-                            _ => None,
+                        .filter_map(|entry| {
+                            let mut step = match entry {
+                                serde_json::Value::String(id) => PlanStepDto {
+                                    id: id.clone(),
+                                    status: "pending".into(),
+                                    task: String::new(),
+                                    summary: String::new(),
+                                },
+                                serde_json::Value::Object(_) => PlanStepDto {
+                                    id: entry
+                                        .get("id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    status: "pending".into(),
+                                    task: entry
+                                        .get("task")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    summary: String::new(),
+                                },
+                                _ => return None,
+                            };
+                            if let Some(prev) = inherited.get(step.id.as_str()) {
+                                step.status = prev.status.clone();
+                                step.summary = prev.summary.clone();
+                            }
+                            Some(step)
                         })
                         .collect();
                 }
             }
-            // resume 事件不带 steps（步骤清单在 plan_started 里，已装载）；
-            // 事件流顺序处理：paused → resumed 按最后一条事件决定投影态。
-            Some("plan_resumed") => {
+            // resume / 波次边界恢复都不带 steps（清单在 plan_started 里，已装载）；
+            // 事件流顺序处理：paused → resumed 按最后一条事件决定投影态。波次边界的
+            // 挂起/恢复事件是 plan_unpaused（plan_resumed 是 resume 的代际锚点，
+            // open_escalations 据它判定提问归属，二者不可混用）。
+            Some("plan_resumed") | Some("plan_unpaused") => {
                 if let Some(name) = event.get("name").and_then(serde_json::Value::as_str) {
                     plan.name = name.to_string();
                 }
@@ -750,17 +778,75 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
                 if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
-                    step.status = outcome.to_string();
+                    // 被验证步骤「执行成功、等待 verdict」→ verifying（非终态）。
+                    let awaiting = event
+                        .get("awaiting_verdict")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    step.status = if awaiting { "verifying".into() } else { outcome.to_string() };
                     step.summary = summary.chars().take(160).collect();
                 }
             }
-            Some("step_skipped") | Some("step_unverified") => {
+            // 对抗环 verdict 落到目标头上：pass → succeeded；fail 且轮次耗尽 → failed
+            //（验证者自己的 step_finished 只覆盖验证者）；fail 未耗尽 → 目标带着失败
+            // 原因回到待跑（执行器会重跑它）。
+            Some("verdict_passed") => {
+                let id = event
+                    .get("target")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
+                    step.status = "succeeded".into();
+                }
+            }
+            Some("verdict_failed") => {
+                let id = event
+                    .get("target")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let exhausted =
+                    event.get("exhausted").and_then(serde_json::Value::as_bool) == Some(true);
+                if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
+                    step.status = if exhausted { "failed".into() } else { "pending".into() };
+                    let reasons = event
+                        .get("reasons")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                        .unwrap_or_default();
+                    if !reasons.is_empty() {
+                        step.summary = reasons.chars().take(160).collect();
+                    }
+                }
+            }
+            Some("step_skipped") => {
                 let id = event
                     .get("step")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
                 if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
                     step.status = "skipped".into();
+                    step.summary = event
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                }
+            }
+            // 验证者不可用 / 未给出 verdict 的终局：目标按 Failed 收口（与执行器传染
+            // 口径一致），投影成 failed 而不是 skipped。
+            Some("step_unverified") => {
+                let id = event
+                    .get("step")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
+                    step.status = "failed".into();
                     step.summary = event
                         .get("reason")
                         .and_then(serde_json::Value::as_str)
@@ -817,7 +903,7 @@ pub async fn plan_status(state: State<'_, AppState>) -> Result<Vec<PlanDto>, Str
 }
 
 /// 暂停 / 继续一个 PlanRun 计划（ZCode 任务暂停/继续，第十二轮）：写 kv 暂停标志
-/// + 追加 `plan_paused` / `plan_resumed` 事件。执行器在【波次边界】协作式读取——
+/// + 追加 `plan_paused` / `plan_unpaused` 事件。执行器在【波次边界】协作式读取——
 /// 当前在飞的步骤跑完、后续波次等待恢复；不影响取消语义（/cancel 照常终止）。
 #[tauri::command]
 pub async fn plan_pause(
@@ -842,7 +928,10 @@ pub async fn plan_pause(
                 journal.kv_set(&key, &serde_json::json!({"at": chrono::Utc::now().timestamp_millis()})),
             )
         } else {
-            ("plan_resumed", journal.kv_delete(&key))
+            // 恢复事件是 plan_unpaused——不是 plan_resumed：后者是 resume 的代际锚点
+            // （open_escalations 据它判定提问归属），波次边界的恢复不换代，混用会把
+            // 挂起前未消费的升级答案误判成「上一代已送达」。
+            ("plan_unpaused", journal.kv_delete(&key))
         };
         write.map_err(|e| e.to_string())?;
         journal
@@ -5307,6 +5396,19 @@ mod plan_projection_tests {
         project_plan_events(&mut plan, &events);
         assert!(!plan.paused, "恢复事件必须清除暂停态");
 
+        // 波次边界恢复（UI / 执行器写 plan_unpaused）：同样翻回非暂停。
+        let mut held = blank_plan();
+        project_plan_events(
+            &mut held,
+            &[
+                event("plan_started", serde_json::json!({"steps": [{"id": "a", "task": "t"}]})),
+                event("plan_paused", serde_json::json!({})),
+                event("plan_unpaused", serde_json::json!({})),
+            ],
+        );
+        assert!(!held.paused, "plan_unpaused 必须清除暂停态");
+        assert_eq!(held.steps[0].status, "pending");
+
         // 最后一条是暂停 → paused；收尾事件强制清除暂停（收尾后暂停无意义）。
         let mut paused = blank_plan();
         project_plan_events(&mut paused, &[event("plan_paused", serde_json::json!({}))]);
@@ -5316,5 +5418,109 @@ mod plan_projection_tests {
             &[event("plan_completed", serde_json::json!({"succeeded": 0}))],
         );
         assert!(!paused.paused && paused.completed);
+    }
+
+    #[test]
+    fn projection_tracks_verification_lifecycle() {
+        // 目标执行成功但等待 verdict → verifying（不是 ✓）；verdict 判定终局。
+        let mut plan = blank_plan();
+        project_plan_events(
+            &mut plan,
+            &[
+                event("plan_started", serde_json::json!({"steps": [{"id": "t", "task": "干活"}, {"id": "v", "task": "验证"}]})),
+                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true, "summary": "产出"})),
+            ],
+        );
+        assert_eq!(plan.steps[0].status, "verifying", "awaiting_verdict 不是终态成功");
+
+        // 未耗尽：目标带失败原因回 pending（执行器重跑）。
+        project_plan_events(
+            &mut plan,
+            &[event("verdict_failed", serde_json::json!({"verifier": "v", "target": "t", "round": 1, "reasons": ["缺测试", "断言错"]}))],
+        );
+        assert_eq!(plan.steps[0].status, "pending");
+        assert!(plan.steps[0].summary.contains("缺测试"), "{}", plan.steps[0].summary);
+
+        // 重跑 → verifying → 轮次耗尽：目标 failed（验证者自己的 step_finished 不覆盖目标）。
+        project_plan_events(
+            &mut plan,
+            &[
+                event("step_started", serde_json::json!({"step": "t"})),
+                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true})),
+                event("verdict_failed", serde_json::json!({"verifier": "v", "target": "t", "round": 2, "exhausted": true, "reasons": ["仍缺测试"]})),
+            ],
+        );
+        assert_eq!(plan.steps[0].status, "failed", "轮次耗尽必须落 failed");
+
+        // pass → 目标 succeeded（verdict_passed 是目标的终局事实源）。
+        project_plan_events(
+            &mut plan,
+            &[
+                event("step_started", serde_json::json!({"step": "t"})),
+                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true})),
+                event("verdict_passed", serde_json::json!({"verifier": "v", "target": "t", "round": 3})),
+            ],
+        );
+        assert_eq!(plan.steps[0].status, "succeeded");
+
+        // 验证者不可用（step_unverified）：目标终局 failed，不是 skipped。
+        let mut unverified = blank_plan();
+        project_plan_events(
+            &mut unverified,
+            &[
+                event("plan_started", serde_json::json!({"steps": [{"id": "t", "task": "t"}]})),
+                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true})),
+                event("step_unverified", serde_json::json!({"step": "t", "verifier": "v", "reason": "验证者不可用"})),
+            ],
+        );
+        assert_eq!(unverified.steps[0].status, "failed");
+    }
+
+    #[test]
+    fn projection_resumes_generation_resets_completion_and_inherits_success() {
+        // 第一代：a 成功、b 失败、整体收尾。
+        let mut plan = blank_plan();
+        project_plan_events(
+            &mut plan,
+            &[
+                event("plan_started", serde_json::json!({"name": "巡检", "steps": [{"id": "a", "task": "收集"}, {"id": "b", "task": "汇总"}]})),
+                event("step_finished", serde_json::json!({"step": "a", "outcome": "succeeded", "summary": "数据就绪"})),
+                event("step_finished", serde_json::json!({"step": "b", "outcome": "failed", "summary": "源挂了"})),
+                event("plan_completed", serde_json::json!({"succeeded": 1})),
+            ],
+        );
+        assert!(plan.completed);
+
+        // resume（同一 journal 流上的第二个 plan_started + plan_resumed）：
+        // 整体收尾态复位（否则恢复中的计划永远「已完成」，todo 与暂停按钮全消失）；
+        // a 按 resume 语义继承 succeeded（执行器不重跑也不重报），b 回 pending。
+        project_plan_events(
+            &mut plan,
+            &[
+                event("plan_started", serde_json::json!({"name": "巡检", "steps": [{"id": "a", "task": "收集"}, {"id": "b", "task": "汇总改"}]})),
+                event("plan_resumed", serde_json::json!({})),
+            ],
+        );
+        assert!(!plan.completed, "resume 必须复位 completed");
+        assert_eq!(plan.succeeded, None);
+        assert!(!plan.paused);
+        assert_eq!(plan.steps[0].status, "succeeded", "上代成功步骤继承");
+        assert_eq!(plan.steps[0].summary, "数据就绪");
+        assert_eq!(plan.steps[0].task, "收集");
+        assert_eq!(plan.steps[1].status, "pending", "失败步骤重跑");
+        assert_eq!(plan.steps[1].task, "汇总改");
+
+        // verifying 的目标同样跨代保留（resume 只补跑验证者）。
+        let mut verifying = blank_plan();
+        project_plan_events(
+            &mut verifying,
+            &[
+                event("plan_started", serde_json::json!({"steps": [{"id": "t", "task": "t"}, {"id": "v", "task": "v"}]})),
+                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true})),
+                event("plan_started", serde_json::json!({"steps": [{"id": "t", "task": "t"}, {"id": "v", "task": "v"}]})),
+            ],
+        );
+        assert_eq!(verifying.steps[0].status, "verifying", "等验证者的目标跨代保留");
+        assert_eq!(verifying.steps[1].status, "pending");
     }
 }

@@ -341,14 +341,19 @@ jobs:
           APK 签名：仓库配置了 \`RCLAW_KEYSTORE_BASE64\` + \`RCLAW_KEYSTORE_PASSWORD\`
           secrets 时为 release 签名；未配置时为 debug 签名（可直接安装，升级安装需同签名）。
           EOF
-          # rolling nightly 才删除重建；正式 tag 重跑时同 tag 覆盖（先删该 tag 的旧 release）。
-          if [ "$TAG" = "nightly" ] || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete "$TAG" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          # rolling nightly 删除重建；正式 tag 重跑只删 release 本体——版本 tag 指向的
+          # 提交必须原样保留（--cleanup-tag 会把 tag 一并删掉，gh release create 随后
+          # 在默认分支 HEAD 上重建它，tag / 源码包从此对不上产物）。
+          if [ "$TAG" = "nightly" ]; then
+            gh release delete nightly --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          elif gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --repo "$GITHUB_REPOSITORY" || true
           fi
           if ! gh release create "$TAG" dist/* \
               --repo "$GITHUB_REPOSITORY" \
               --title "$TITLE" \
               --notes-file notes.md \
+              --target "$GITHUB_SHA" \
               $( [ "$TAG" = "nightly" ] && echo --prerelease ) 2> gh_err.txt; then
             grep -a . gh_err.txt | head -10 | while IFS= read -r line; do echo "::error::$line"; done
             exit 1

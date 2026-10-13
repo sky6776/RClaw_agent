@@ -1324,9 +1324,14 @@ impl TurnManager {
     /// 目标完成审计（无工具小推理；ZCode completion verifier 轻量对位）：
     /// 判定「本轮汇报是否以可核对证据证实目标达成」。达成 → 清 goal + 系统回执；
     /// 其余情况静默（失败只告警，绝不误清目标）。
+    ///
+    /// `goal_created_at` 是被审计目标的版本令牌（/goal 每次设定都会刷新）：审计是
+    /// 异步小推理，期间用户可能 /goal clear 后又设了新目标——无条件 kv_delete 会把
+    /// 新目标一并端掉。清除前重读 kv，只清自己审计的那一份。
     fn spawn_goal_audit(
         &self,
         objective: String,
+        goal_created_at: i64,
         final_reply: String,
         channel: String,
         chat_id: String,
@@ -1363,6 +1368,19 @@ impl TurnManager {
             match verdict {
                 Some((true, summary)) => {
                     let key = Self::goal_key(&channel, &chat_id);
+                    // 只清被审计的那一份：kv 里目标已更换（created_at 变化）或已被
+                    // 用户清除时不动作（读不到 kv 即视为已清除）。
+                    let same_goal = session
+                        .journal()
+                        .kv_get(&key)
+                        .ok()
+                        .flatten()
+                        .and_then(|goal| goal.get("created_at").and_then(Value::as_i64))
+                        == Some(goal_created_at);
+                    if !same_goal {
+                        tracing::debug!("目标审计通过，但目标已被更换/清除（不动现状态）");
+                        return;
+                    }
                     if let Err(error) = session.journal().kv_delete(&key) {
                         tracing::warn!("目标审计通过但清除失败（目标保留）：{error}");
                         return;
@@ -1372,8 +1390,10 @@ impl TurnManager {
                     } else {
                         format!("🎯 会话目标已达成（完成审计确认：{summary}），goal 已自动清除。")
                     };
+                    // intermediate：回执可能落在下一个 turn 进行中——按最终回复投递会
+                    // 把进行中的 turn 误判收尾（忙碌态丢失、排队消息被提前放行）。
                     let _ = outbound
-                        .send(BusMessage::new(channel, chat_id, receipt))
+                        .send(BusMessage::new(channel, chat_id, receipt).with_intermediate())
                         .await;
                 }
                 Some((false, _)) => {
@@ -3322,21 +3342,26 @@ impl TurnManager {
             // 本会话有活动目标时，成功收尾后用一次无工具的小推理审计「本轮汇报是否以
             // 可核对证据证实目标达成」。达成 → 清除 goal + 投一条系统回执；未达成 /
             // 审计失败 → 不动（下轮提醒继续驱动）。异步执行，不阻塞收尾回复。
-            let goal_objective = self
+            // created_at 随目标一并带进审计：异步窗口里 /goal 换目标时审计不得误清新目标。
+            let active_goal = self
                 .session
                 .journal()
                 .kv_get(&Self::goal_key(&msg.channel, &msg.chat_id))
                 .ok()
                 .flatten()
                 .and_then(|goal| {
-                    goal.get("objective")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
+                    Some((
+                        goal.get("objective")
+                            .and_then(serde_json::Value::as_str)?
+                            .to_string(),
+                        goal.get("created_at").and_then(serde_json::Value::as_i64)?,
+                    ))
                 });
             if self.opts.goal_audit_enabled && !text.is_empty() {
-                if let Some(objective) = goal_objective {
+                if let Some((objective, created_at)) = active_goal {
                     self.spawn_goal_audit(
                         objective,
+                        created_at,
                         text.clone(),
                         msg.channel.clone(),
                         msg.chat_id.clone(),
