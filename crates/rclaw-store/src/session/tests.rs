@@ -1682,7 +1682,7 @@ fn artifact_chat_key_is_collision_resistant_and_stable() {
 fn fork_rewrites_and_copies_artifact_handles() {
     let (_g, s) = store();
     let base = s.layout().base.clone();
-    let anchor = s
+    let _anchor = s
         .append("cli", "c", &Message::plain(Role::User, "锚点"))
         .unwrap();
     // 源会话的落盘产物 + 一条引用它的消息（句柄路径 = spill 时的正斜杠形态）。
@@ -1739,6 +1739,35 @@ fn fork_without_artifacts_stays_clean() {
     // 源会话没有 artifact 目录：fork 照常成功（best-effort 跳过）。
     let fork = s.fork_session("cli", "c", anchor, "c-fork", false).unwrap();
     assert_eq!(fork.copied, 1);
+}
+
+#[test]
+fn session_goal_kv_is_cascaded_on_delete_and_clear() {
+    let (_g, s) = store();
+    let journal = s.journal();
+    let key = crate::session::session_goal_key("cli", "console");
+    journal.kv_set(&key, &serde_json::json!({"objective": "旧目标"})).unwrap();
+    // 非 会话级 的 kv（plan / workflow 等）不受牵连。
+    journal.kv_set("plan-pause/plan-1", &serde_json::json!({"at": 0})).unwrap();
+    s.append("cli", "console", &Message::plain(Role::User, "m")).unwrap();
+
+    // 单会话删除：目标 kv 级联，其余 kv 保留。
+    assert!(s.delete_session("cli", "console").unwrap());
+    assert_eq!(journal.kv_get(&key).unwrap(), None, "会话删除应级联清目标");
+    assert!(journal.kv_get("plan-pause/plan-1").unwrap().is_some());
+
+    // 全清：所有 session-goal 键清空，plan 等 journal kv 保留。
+    s.append("cli", "c2", &Message::plain(Role::User, "m")).unwrap();
+    journal
+        .kv_set(&crate::session::session_goal_key("cli", "c2"), &serde_json::json!({"objective": "x"}))
+        .unwrap();
+    s.clear_all_sessions().unwrap();
+    assert_eq!(
+        journal.kv_get(&crate::session::session_goal_key("cli", "c2")).unwrap(),
+        None,
+        "/clear 应清空全部会话目标"
+    );
+    assert!(journal.kv_get("plan-pause/plan-1").unwrap().is_some());
 }
 
 #[test]

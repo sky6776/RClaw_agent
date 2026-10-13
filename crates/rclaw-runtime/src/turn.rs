@@ -1302,7 +1302,20 @@ impl TurnManager {
 
     /// 会话目标的 kv 键（`state.sqlite` 的 kv 表；/goal 设定，按会话隔离）。
     fn goal_key(channel: &str, chat_id: &str) -> String {
-        format!("session-goal/{channel}/{chat_id}")
+        // 键规则单一事实源在 store：会话删除 / 全清的级联清理用同一函数定位键。
+        rclaw_store::session::session_goal_key(channel, chat_id)
+    }
+
+    /// 命令回复投递：会话【还有活动 turn】时按 intermediate 投——命令是插队处理的，
+    /// 回复若按最终回复形态到达，桌面端会把它当成收尾（busy 翻 false、停止按钮消失、
+    /// 排队消息被提前放行）。空闲会话照常非 intermediate：命令消息自身的忙碌态靠
+    /// 这条回复解除。
+    async fn send_command_reply(&self, channel: &str, chat_id: &str, response: String) {
+        let mut reply = BusMessage::new(channel.to_string(), chat_id.to_string(), response);
+        if self.is_session_busy(channel, chat_id) {
+            reply = reply.with_intermediate();
+        }
+        let _ = self.outbound_tx.send(reply).await;
     }
 
     /// 解析审计输出：正文里第一个平衡 JSON 对象里的 `goal_met`（布尔）与
@@ -1368,22 +1381,23 @@ impl TurnManager {
             match verdict {
                 Some((true, summary)) => {
                     let key = Self::goal_key(&channel, &chat_id);
-                    // 只清被审计的那一份：kv 里目标已更换（created_at 变化）或已被
-                    // 用户清除时不动作（读不到 kv 即视为已清除）。
-                    let same_goal = session
-                        .journal()
-                        .kv_get(&key)
-                        .ok()
-                        .flatten()
-                        .and_then(|goal| goal.get("created_at").and_then(Value::as_i64))
-                        == Some(goal_created_at);
-                    if !same_goal {
-                        tracing::debug!("目标审计通过，但目标已被更换/清除（不动现状态）");
-                        return;
-                    }
-                    if let Err(error) = session.journal().kv_delete(&key) {
-                        tracing::warn!("目标审计通过但清除失败（目标保留）：{error}");
-                        return;
+                    // 只清被审计的那一份，且比对与删除必须原子（kv_delete_if 单条
+                    // SQL）：kv_get → kv_delete 两步之间 /goal 可以换目标，无条件删
+                    // 会端掉新目标。没删成 = 目标已更换/清除，不动也不发回执。
+                    let expected = serde_json::json!({
+                        "objective": objective,
+                        "created_at": goal_created_at,
+                    });
+                    match session.journal().kv_delete_if(&key, &expected) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::debug!("目标审计通过，但目标已被更换/清除（不动现状态）");
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::warn!("目标审计通过但清除失败（目标保留）：{error}");
+                            return;
+                        }
                     }
                     let receipt = if summary.is_empty() {
                         "🎯 会话目标已达成（完成审计确认），goal 已自动清除。".to_string()
@@ -1429,7 +1443,7 @@ impl TurnManager {
     /// - `clear` / `done` / `完成` / `清除`：删除目标；
     /// - 其它文本：设定（覆盖旧目标）。
     ///
-    /// 目标存 `kv` 表（按 channel+chat 隔离，/clear 随会话清理之外不自动过期）；
+    /// 目标存 `kv` 表（按 channel+chat 隔离；随会话删除 / 全清级联清理）；
     /// 设定后【本会话每次推理的尾部上下文】都会注入目标提醒（原文 + 完成前持续
     /// 工作 + 逐项核对证据 + 不自行宣告完成），对齐 ZCode 的 goal reminder 语义。
     /// RClaw 没有运行时完成校验器：完成判定靠模型按证据自评 + 用户 `/goal clear`
@@ -1437,8 +1451,21 @@ impl TurnManager {
     async fn handle_goal(&self, channel: &str, chat_id: &str, content: &str) -> String {
         let journal = self.session.journal();
         let key = Self::goal_key(channel, chat_id);
-        let rest = content.trim().strip_prefix('/').unwrap_or(content);
-        let arg = rest.trim_start_matches("goal").trim();
+        // 命令头消费与 [`RuntimeCommand::parse`] 同规则（`/` 后可有空白、命令名大小写
+        // 不敏感）：dispatch 把整条原文传进来，`/GOAL clear`、`/ goal clear` 若按
+        // 大小写敏感的前缀剥离，命令名剥不掉，会被当成设定目标「GOAL clear」。
+        let after_slash = content
+            .trim()
+            .strip_prefix('/')
+            .map(str::trim_start)
+            .unwrap_or_else(|| content.trim());
+        let mut tokens = after_slash.splitn(2, char::is_whitespace);
+        let name = tokens.next().unwrap_or("");
+        let arg = if name.eq_ignore_ascii_case("goal") {
+            tokens.next().unwrap_or("").trim()
+        } else {
+            after_slash.trim()
+        };
         match arg {
             "" => match journal.kv_get(&key) {
                 Ok(Some(value)) => {

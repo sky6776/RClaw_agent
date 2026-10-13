@@ -485,16 +485,25 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
                 .map_err(|error| format!("allOf[{index}]: {error}"))?;
         }
     }
-    // anyOf：任一分支通过即可（先于 type 校验——联合的每个分支自带 type/const）。
+    // anyOf：任一分支通过即可。命中后【继续】走本层的 type / required / properties
+    // 等同级约束——显式 askJson 的 schema 可以把 anyOf 与其它约束组合（编译产物是
+    // 纯 anyOf 不受影响），提前 return 会把 `{"type":"object","required":["host"],
+    // "anyOf":[...]}` 的 required 整个跳掉。
     if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
         let mut failures = Vec::new();
+        let mut matched = false;
         for variant in variants {
             match validate_json_schema(value, variant, depth + 1) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    matched = true;
+                    break;
+                }
                 Err(error) => failures.push(error),
             }
         }
-        return Err(format!("不满足任一联合分支：{}", failures.join("; ")));
+        if !matched {
+            return Err(format!("不满足任一联合分支：{}", failures.join("; ")));
+        }
     }
     if let Some(expected_const) = schema.get("const") {
         if value != expected_const {
@@ -657,6 +666,11 @@ pub(crate) struct DependencyNode {
     pub(crate) actor: String,
     /// 所在行号（1 起）。
     pub(crate) line: usize,
+    /// 源字节偏移（作者脚本内，0 起；文本降级路径不产 offset 恒 0）。组排序用它——
+    /// 单行脚本里「串行 ask / Promise.all 波 / 串行 ask」行号相同，按行排序会打平，
+    /// 插入序（join 组先发现）就把并行波排到前一个串行 ask 之前了。
+    #[serde(skip)]
+    pub(crate) offset: usize,
     /// 是否位于 Promise.all（并行波内）。
     pub(crate) parallel: bool,
     /// 所属 Promise.all 波编号（0 = 不在波内；可跨行）。
@@ -824,6 +838,7 @@ fn asks_on_line(
             id,
             actor,
             line: line_no,
+            offset: 0,
             parallel: false,
             wave: 0,
         });
@@ -2683,6 +2698,29 @@ mod validator_tests {
         });
         assert!(validate_json_schema(&json!({"inner": {"a": 1}}), &nested, 0).is_ok());
         assert!(validate_json_schema(&json!({"inner": {"a": 2}}), &nested, 0).is_err());
+    }
+
+    #[test]
+    fn anyof_success_still_checks_sibling_constraints() {
+        // 回归：anyOf 命中后提前 return，把同级 type / required / properties 整个跳掉
+        // ——`{"type":"object","required":["host"],"anyOf":[{}]}` 曾放行 `{}`。
+        let schema = json!({
+            "type": "object",
+            "required": ["host"],
+            "properties": {"host": {"type": "string"}},
+            "anyOf": [{"type": "object"}]
+        });
+        assert!(validate_json_schema(&json!({"host": "h"}), &schema, 0).is_ok());
+        assert!(
+            validate_json_schema(&json!({}), &schema, 0).is_err(),
+            "anyOf 分支通过不等于整个 schema 通过"
+        );
+        assert!(
+            validate_json_schema(&json!({"host": 1}), &schema, 0).is_err(),
+            "同级 properties 约束仍然生效"
+        );
+        // 无分支通过照旧整体拒绝。
+        assert!(validate_json_schema(&json!("标量"), &schema, 0).is_err());
     }
 }
 

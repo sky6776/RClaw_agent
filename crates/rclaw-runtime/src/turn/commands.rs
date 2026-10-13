@@ -66,10 +66,7 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                 let chat_id = msg.chat_id.clone();
                 tokio::spawn(async move {
                     let response = manager.handle_compact(&channel, &chat_id).await;
-                    let _ = manager
-                        .outbound_tx
-                        .send(BusMessage::new(channel, chat_id, response))
-                        .await;
+                    manager.send_command_reply(&channel, &chat_id, response).await;
                 });
                 return true;
             }
@@ -87,10 +84,7 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                 let content = msg.content.clone();
                 tokio::spawn(async move {
                     let response = manager.handle_fork(&channel, &chat_id, &content).await;
-                    let _ = manager
-                        .outbound_tx
-                        .send(BusMessage::new(channel, chat_id, response))
-                        .await;
+                    manager.send_command_reply(&channel, &chat_id, response).await;
                 });
                 return true;
             }
@@ -105,21 +99,13 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                 let content = msg.content.clone();
                 tokio::spawn(async move {
                     let response = manager.handle_export(&channel, &chat_id, &content).await;
-                    let _ = manager
-                        .outbound_tx
-                        .send(BusMessage::new(channel, chat_id, response))
-                        .await;
+                    manager.send_command_reply(&channel, &chat_id, response).await;
                 });
                 return true;
             }
         };
-        let _ = manager
-            .outbound_tx
-            .send(BusMessage::new(
-                msg.channel.clone(),
-                msg.chat_id.clone(),
-                response,
-            ))
+        manager
+            .send_command_reply(&msg.channel, &msg.chat_id, response)
             .await;
         return true;
     }
@@ -135,13 +121,8 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
         msg.channel,
         msg.chat_id
     );
-    let _ = manager
-        .outbound_tx
-        .send(BusMessage::new(
-            msg.channel.clone(),
-            msg.chat_id.clone(),
-            response,
-        ))
+    manager
+        .send_command_reply(&msg.channel, &msg.chat_id, response)
         .await;
     true
 }

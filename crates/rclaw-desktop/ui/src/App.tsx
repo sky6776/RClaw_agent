@@ -19,7 +19,7 @@ import {
   type UsageSnapshot,
 } from "./lib/api";
 import Wizard from "./components/Wizard";
-import Chat, { type Entry } from "./components/Chat";
+import Chat, { type Entry, type QueueItem } from "./components/Chat";
 import AgentsPanel from "./components/AgentsPanel";
 import BotsPanel from "./components/BotsPanel";
 import ToolsPanel from "./components/ToolsPanel";
@@ -509,9 +509,9 @@ export default function App() {
 
   const busyFor = (chatId: string) => busyByChat[chatId] ?? false;
 
-  const handleSend = useCallback(
-    (content: string) => {
-      const chatId = activeId;
+  /** 向指定会话发送消息（排队投递也走它——收尾时用户可能在别的会话/页面）。 */
+  const sendTo = useCallback(
+    (chatId: string, content: string) => {
       appendEntries(chatId, [{ role: "user", content }]);
       setBusyByChat((prev) => ({ ...prev, [chatId]: true }));
       // 首条消息发出时后端会话记录尚未落库，chat_list 扫不到：先本地补一个
@@ -547,8 +547,42 @@ export default function App() {
       });
       void refreshChats();
     },
-    [activeId, appendEntries, refreshChats],
+    [appendEntries, refreshChats],
   );
+
+  const handleSend = useCallback(
+    (content: string) => sendTo(activeId, content),
+    [activeId, sendTo],
+  );
+
+  // ---- 排队消息（第十二轮 · zcode 同款）----
+  // 队列按会话分桶放在 App：Chat 随页面切换（工作区/设置面板）会整体卸载，组件内
+  // state 会把排着队的文本一起丢掉；投递由下面的收尾监听统一驱动——某会话空闲且
+  // 队非空就出队一条发送，人在哪个页面/会话都不影响。
+  const [queueByChat, setQueueByChat] = useState<Record<string, QueueItem[]>>({});
+  const queueIdRef = useRef(0);
+  const enqueueQueued = useCallback((chatId: string, text: string) => {
+    queueIdRef.current += 1;
+    const item = { id: queueIdRef.current, text };
+    setQueueByChat((prev) => ({ ...prev, [chatId]: [...(prev[chatId] ?? []), item] }));
+  }, []);
+  const removeQueued = useCallback((chatId: string, id: number) => {
+    setQueueByChat((prev) => ({
+      ...prev,
+      [chatId]: (prev[chatId] ?? []).filter((queued) => queued.id !== id),
+    }));
+  }, []);
+  // 逐条投递：一次 effect 只出队一条（发送把该会话 busy 翻回 true，下一轮收尾再发
+  // 下一条）——一次全发会让后续消息变成运行中 turn 的插队，排队语义就没了。
+  useEffect(() => {
+    for (const [chatId, items] of Object.entries(queueByChat)) {
+      const next = items[0];
+      if (!next || busyByChat[chatId]) continue;
+      removeQueued(chatId, next.id);
+      sendTo(chatId, next.text);
+      break;
+    }
+  }, [queueByChat, busyByChat, removeQueued, sendTo]);
 
   const handleCancel = useCallback(() => {
     void api.cancel(activeId).catch(() => {
@@ -1619,6 +1653,9 @@ export default function App() {
             onFork={handleFork}
             plan={latestPlan}
             onPlanPause={handlePlanPause}
+            queue={queueByChat[activeId] ?? []}
+            onQueueEnqueue={(text) => enqueueQueued(activeId, text)}
+            onQueueRemove={(id) => removeQueued(activeId, id)}
             futureThinkingCollapsed={futureThinkingCollapsed[activeId] ?? false}
             onToggleThinking={(collapsed) =>
               setFutureThinkingCollapsed((prev) => ({ ...prev, [activeId]: collapsed }))

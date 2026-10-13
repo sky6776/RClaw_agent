@@ -71,6 +71,12 @@ fn fork_lineage_key(channel: &str, chat_id: &str) -> String {
     format!("session-fork/{channel}/{chat_id}")
 }
 
+/// 会话目标（/goal）的 kv 键。规则单一事实源在此：runtime 的 goal 读写与 store 的
+/// 会话删除 / 全清级联清理用同一规则。
+pub fn session_goal_key(channel: &str, chat_id: &str) -> String {
+    format!("session-goal/{channel}/{chat_id}")
+}
+
 /// artifact 目录的会话键（与 runtime `turn::artifact` 同一规则，单一事实源在此）：
 /// `[A-Za-z0-9._-]` 之外替换成 `_`（防 chat_id 里的路径分隔符逃出目录），取前 46 字符
 /// 后拼 `-` + 完整原始键的 FNV-1a 64 位摘要（16 hex，总长 ≤63）——纯截断会把只差尾部
@@ -558,13 +564,18 @@ impl SessionStore {
         })
     }
 
-    /// 删除会话（消息 / checkpoint 级联；usage 锚点一并删除，artifact 目录级联清理）。
-    /// 返回会话是否存在。
+    /// 删除会话（消息 / checkpoint 级联；usage 锚点与会话目标 kv 一并删除，artifact
+    /// 目录级联清理）。返回会话是否存在。
     pub fn delete_session(&self, channel: &str, chat_id: &str) -> Result<bool> {
         let existed = self.db.transaction(|tx| {
             tx.execute(
                 "DELETE FROM usage_anchor WHERE channel = ?1 AND chat_id = ?2",
                 params![channel, chat_id],
+            )?;
+            // 会话级 kv（/goal 目标）随会话删除：目标活不过它的会话。
+            tx.execute(
+                "DELETE FROM kv WHERE key = ?1",
+                params![session_goal_key(channel, chat_id)],
             )?;
             let n = tx.execute(
                 "DELETE FROM session WHERE channel = ?1 AND chat_id = ?2",
@@ -838,6 +849,10 @@ impl SessionStore {
                 "DELETE FROM file_checkpoint; DELETE FROM message; DELETE FROM session; \
                  DELETE FROM usage_anchor;",
             )?;
+            // 会话全清，会话级 kv（/goal 目标）一并删除——否则 /clear 后旧目标还挂在
+            // kv 里，goal reminder 会把它注进「全新」的会话。plan / workflow 等
+            // 运行时 journal 与其 kv 不属会话，保留。
+            tx.execute("DELETE FROM kv WHERE key LIKE 'session-goal/%'", [])?;
             Ok(())
         })?;
         if let Err(e) = self.db.vacuum() {

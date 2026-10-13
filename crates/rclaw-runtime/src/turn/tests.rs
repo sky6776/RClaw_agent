@@ -8970,3 +8970,56 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
         "过期版本的审计通过也不得清掉现目标"
     );
 }
+
+#[tokio::test]
+async fn goal_command_parsing_matches_dispatch_rules() {
+    // dispatch（RuntimeCommand::parse）接受 `/` 后空白与大小写不敏感的命令名；
+    // handle_goal 的命令头消费必须同规则——否则 `/GOAL clear` 会把「GOAL clear」
+    // 当成新目标覆盖旧目标。
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: "unused".to_string(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout.clone(),
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+    let key = TurnManager::goal_key("cli", "console");
+    mgr.handle_goal("cli", "console", "/goal 原目标").await;
+    assert!(mgr.session.journal().kv_get(&key).unwrap().is_some());
+
+    // /GOAL clear / / goal clear / /Goal clear：命令名与 dispatch 同规则（大小写
+    // 不敏感、允许 `/` 后空白），全部按清除命令走，不写目标。
+    for text in ["/GOAL clear", "/ goal clear", "/Goal clear", "/goal 清除"] {
+        mgr.handle_goal("cli", "console", text).await;
+        assert!(
+            mgr.session.journal().kv_get(&key).unwrap().is_none(),
+            "{text} 应清除目标"
+        );
+    }
+
+    // 设定方向同样大小写不敏感（/GOAL <文本> 设的是 <文本>，不带命令头）。
+    mgr.handle_goal("cli", "console", "/GOAL 新目标文本").await;
+    let stored = mgr
+        .session
+        .journal()
+        .kv_get(&key)
+        .unwrap()
+        .expect("大写命令名应能设定目标");
+    assert_eq!(
+        stored.get("objective").and_then(serde_json::Value::as_str),
+        Some("新目标文本"),
+        "命令头不得混进目标文本"
+    );
+}

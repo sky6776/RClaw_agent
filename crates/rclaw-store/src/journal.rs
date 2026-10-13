@@ -191,6 +191,23 @@ impl JournalStore {
             Ok(())
         })
     }
+
+    /// 条件删除（原子）：仅当现值与 `expected` 完全一致时删除，返回是否真的删了。
+    ///
+    /// 「读到 → 比对 → 删」三步各自进出数据库互斥锁，并发写可以插在中间把值换掉，
+    /// 最后一步的无条件删就会端掉别人的数据——比对与删除必须在同一条 SQL 里。
+    /// 序列化形态确定（serde_json BTreeMap 键序），`kv_set` 写入的值与 `kv_get` 读回
+    /// 再序列化的结果逐字节一致，字符串比较可靠。
+    pub fn kv_delete_if(&self, key: &str, expected: &Value) -> Result<bool> {
+        let text = serde_json::to_string(expected)?;
+        self.db.with(|conn| {
+            let deleted = conn.execute(
+                "DELETE FROM kv WHERE key = ?1 AND value = ?2",
+                params![key, text],
+            )?;
+            Ok(deleted > 0)
+        })
+    }
 }
 
 /// 在给定连接 / 事务上追加一条事件，返回其 `seq`。`seq = max(seq) + 1` 必须与 INSERT 同在
@@ -281,6 +298,21 @@ mod tests {
         assert_eq!(j.kv_get(KV_TEAM_INBOX).unwrap(), Some(json!({"unread": 0})));
         j.kv_delete(KV_TEAM_INBOX).unwrap();
         assert_eq!(j.kv_get(KV_TEAM_INBOX).unwrap(), None);
+    }
+
+    #[test]
+    fn kv_delete_if_only_removes_the_expected_value() {
+        let (_dir, j) = store();
+        j.kv_set("k", &json!({"created_at": 1, "objective": "A"})).unwrap();
+        // 值不符（目标已被 /goal 换掉）：不删，返回 false。
+        assert!(!j.kv_delete_if("k", &json!({"created_at": 0, "objective": "A"})).unwrap());
+        assert!(j.kv_get("k").unwrap().is_some());
+        // 值一致（读回的 Value 再序列化与库内文本逐字节一致）：原子删除。
+        let current = j.kv_get("k").unwrap().unwrap();
+        assert!(j.kv_delete_if("k", &current).unwrap());
+        assert_eq!(j.kv_get("k").unwrap(), None);
+        // 键不存在：false 而非错误（幂等）。
+        assert!(!j.kv_delete_if("k", &current).unwrap());
     }
 
     #[test]

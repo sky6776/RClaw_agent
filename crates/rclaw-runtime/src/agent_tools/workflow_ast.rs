@@ -104,16 +104,17 @@ pub(crate) fn build_dependency_graph(script: &str) -> Option<DependencyGraph> {
             groups.push((vec![index], false));
         }
     }
-    // 组按成员最小源序稳定排列（walker.join_members 的发现序即源序；单例组插入后
-    // 需要与 join 组统一按位置排序）。
+    // 组按成员最小【源偏移】稳定排列（单行脚本里所有组行号相同，按行排序会打平、
+    // 插入序又把 join 组排到它前面的串行 ask 之前——偏移才是真实源序）。
     let mut order: Vec<usize> = (0..groups.len()).collect();
     order.sort_by_key(|&g| {
-        groups[g]
+        let (offset, line) = groups[g]
             .0
             .iter()
-            .map(|&n| walker.nodes[n].line)
+            .map(|&n| (walker.nodes[n].offset, walker.nodes[n].line))
             .min()
-            .unwrap_or(0)
+            .unwrap_or((0, 0));
+        (offset, line)
     });
 
     // 边：相邻组全连（前组出口 → 后组入口）；join 组内部无边。
@@ -250,9 +251,13 @@ impl<'a> GraphWalker<'a> {
             return false;
         }
         let actor = self.actor_of_receiver(object);
-        let line = {
+        let (line, offset) = {
             let source = &self.wrapped[WRAPPER_HEAD.len()..];
-            line_col(source, call.span.start).0
+            let (line, _) = line_col(source, call.span.start);
+            (
+                line,
+                (call.span.start as usize).saturating_sub(WRAPPER_HEAD.len()),
+            )
         };
         let same_line = self.nodes.iter().filter(|n| n.line == line).count();
         let id = if same_line == 0 {
@@ -265,6 +270,7 @@ impl<'a> GraphWalker<'a> {
             id,
             actor,
             line,
+            offset,
             parallel: false,
             wave: 0,
         });
@@ -636,9 +642,11 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
 
 struct SchemaCompiler<'a> {
     aliases: &'a HashMap<String, AliasDef<'a>>,
-    /// 泛型实例化栈（别名参数名 → 实参类型引用）：compile_reference 命中参数名时
-    /// 栈顶向下查找代入。
-    type_args: Vec<HashMap<String, &'a TSType<'a>>>,
+    /// 泛型实例化栈：别名参数名 → 实参【已编译 schema】。实参在【调用方】的类型
+    /// 环境里先解析再入栈——若按原始引用入栈，`type Outer<T> = Inner<T>` 的 Inner
+    /// 帧会把参数 T 绑到「自己的 T」，body 里再引用就在同一帧里自吞尾巴（反复命中
+    /// 直到深度上限，合法脚本被误拒）。compile_reference 命中参数名时栈顶向下查。
+    type_args: Vec<HashMap<String, Value>>,
     diagnostics: Vec<(u32, String)>,
 }
 
@@ -881,10 +889,11 @@ impl<'a> SchemaCompiler<'a> {
             };
             return json!({"type": "array", "items": self.compile(element, depth + 1, alias_depth)});
         }
-        // 泛型实例化栈优先：别名 body 内引用参数名（T / U…）→ 代入实参编译。
+        // 泛型实例化栈优先：别名 body 内引用参数名（T / U…）→ 返回调用方环境里
+        // 已解析的实参 schema。
         for frame in self.type_args.iter().rev() {
-            if let Some(argument) = frame.get(name) {
-                return self.compile(argument, depth + 1, alias_depth);
+            if let Some(schema) = frame.get(name) {
+                return schema.clone();
             }
         }
         // 类型别名（脚本顶层 `type X = ...`，可带泛型参数，引用点实例化）。
@@ -916,11 +925,12 @@ impl<'a> SchemaCompiler<'a> {
             ));
             return json!({});
         }
-        // 语法层代入：参数名 → 实参引用 入栈，编译 body 后弹栈（body 里引用参数名
-        // 的 TSTypeReference 在上方栈查找命中）。生命周期：实参引用来自同一 arena。
-        let mut frame: HashMap<String, &TSType<'a>> = HashMap::new();
+        // 语法层代入：实参先在【调用方】环境（当前栈）里解析成 schema，再以参数名
+        // 入栈编译 body（body 里引用参数名的 TSTypeReference 在上方栈查找命中已解析
+        // 的 schema，不会再撞上 callee 自己的同名参数）。
+        let mut frame: HashMap<String, Value> = HashMap::new();
         for (param, argument) in alias.params.iter().zip(arguments) {
-            frame.insert(param.clone(), argument);
+            frame.insert(param.clone(), self.compile(argument, depth + 1, alias_depth));
         }
         self.type_args.push(frame);
         let compiled = self.compile(&alias.body, depth + 1, alias_depth + 1);
@@ -978,6 +988,26 @@ mod tests {
         let graph = build_dependency_graph(script).expect("AST 解析应成功");
         assert_eq!(node_ids(&graph), vec!["ask-4"]);
         assert_eq!(actors(&graph), vec!["a"]);
+    }
+
+    #[test]
+    fn single_line_groups_sort_by_source_offset_not_line() {
+        // 回归：单行脚本「串行 ask → Promise.all 波 → 串行 ask」里所有组行号相同，
+        // 按行排序会打平，插入序（join 组先发现）把并行波排到前一个串行 ask 之前。
+        let script = "const a = agent(\"a\"); \
+                      const first = await a.ask(\"先\"); \
+                      const [x, y] = await Promise.all([a.ask(\"并1\"), a.ask(\"并2\")]); \
+                      const last = await a.ask(\"后\");";
+        let graph = build_dependency_graph(script).expect("AST 解析应成功");
+        assert_eq!(node_ids(&graph), vec!["ask-1", "ask-1-2", "ask-1-3", "ask-1-4"]);
+        assert!(!graph.nodes[0].parallel, "首个串行 ask 不在波内");
+        assert!(graph.nodes[1].parallel && graph.nodes[2].parallel);
+        assert!(!graph.nodes[3].parallel);
+        // 边：串行出口 → 波内每个成员 → 末尾串行（4 条：1→2、1→3、2→4、3→4）。
+        assert_eq!(graph.edges.len(), 4, "{:?}", graph.edges);
+        assert!(graph.edges.contains(&("ask-1".into(), "ask-1-2".into())));
+        assert!(graph.edges.contains(&("ask-1".into(), "ask-1-3".into())));
+        assert!(!graph.edges.contains(&("ask-1-2".into(), "ask-1".into())), "{:?}", graph.edges);
     }
 
     #[test]
@@ -1190,6 +1220,20 @@ mod extended_type_tests {
         .expect("嵌套实例化应成功");
         let (_, schema) = &nested.typed_asks[0];
         assert_eq!(schema["properties"]["value"]["properties"]["value"]["type"], "string");
+
+        // 回归：别名链上实参本身是上层参数名（`type Outer<T> = Inner<T>`，ask<
+        // Outer<string>>）——实参必须先在调用方环境解析再入栈，否则 Inner 帧把
+        // 参数 T 绑到「自己的 T」，body 引用时同帧自吞尾巴直到深度上限。
+        let chained = compile_typed_asks(
+            "type Inner<T> = { v: T };\n\
+             type Outer<T> = Inner<T>;\n\
+             const h = agent(\"h\");\n\
+             const r = await h.ask<Outer<string>>(\"链式\");\n\
+             result(r.v);\n",
+        )
+        .expect("别名链实例化应成功");
+        let (_, schema) = &chained.typed_asks[0];
+        assert_eq!(schema["properties"]["v"]["type"], "string", "{schema}");
     }
 
     #[test]
