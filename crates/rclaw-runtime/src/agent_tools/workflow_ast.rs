@@ -587,8 +587,10 @@ impl<'a> TypedAskWalker<'a> {
 
 impl<'a> Visit<'a> for TypedAskWalker<'a> {
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
-        let (property, object) = match &it.callee {
-            Expression::StaticMemberExpression(member) => (&member.property.name, &member.object),
+        let (property, object, member_optional) = match &it.callee {
+            Expression::StaticMemberExpression(member) => {
+                (&member.property.name, &member.object, member.optional)
+            }
             _ => {
                 walk_call_expression(self, it);
                 return;
@@ -637,6 +639,8 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
             aliases: self.aliases,
             type_args: Vec::new(),
             diagnostics: Vec::new(),
+            nodes: 0,
+            over_budget: false,
         };
         let schema = compiler.compile(type_node, 0, 0);
         for (offset, message) in compiler.diagnostics {
@@ -650,7 +654,11 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
             // 字面量会把 `__proto__` 键变成原型设置而非自有属性（JSON.stringify 随即
             // 丢掉该约束，校验被静默放宽）；parse 路径的键语义与 JSON 完全一致。
             let schema_literal = serde_json::to_string(&schema_json).unwrap_or_default();
-            let replacement = format!("{receiver}.askJson({question_src}, JSON.parse({schema_literal}))");
+            // 可选链（h?.ask<T>(..)）重写后必须保留：`?.` 与 `.` 混用会改变语义——
+            // h 为空时合法跳过的调用变成 TypeError，且问题参数的副作用不再被短路。
+            let chain = if member_optional { "?." } else { "." };
+            let replacement =
+                format!("{receiver}{chain}askJson({question_src}, JSON.parse({schema_literal}))");
             if let Some((start, end)) = self.script_span(it.span) {
                 // 嵌套 typed ask（`ask<T>(await ask<U>(...))` 的参数里又有一层）拒绝：
                 // 外层替换的文本取自原文，内层重写无法嵌进外层的固定 span 里——支持它
@@ -691,10 +699,48 @@ struct SchemaCompiler<'a> {
     /// compile_reference 命中参数名时查这帧；查不到落到全局别名表。
     type_args: Vec<HashMap<String, Value>>,
     diagnostics: Vec<(u32, String)>,
+    /// 展开预算（近似 schema 节点数，含从帧里 clone 出来的实参子树）：深度上限 8
+    /// 挡不住「宽别名 × 嵌套实例化」的指数展开（32 字段别名嵌 6 层 ≈ 10^9 叶子），
+    /// 而编译发生在 QuickJS 的内存/执行限制之前——一条短脚本就能耗尽宿主内存，
+    /// 必须自带预算，超限报错拒绝。
+    nodes: usize,
+    over_budget: bool,
+}
+
+/// schema 展开的节点数预算。正常 facade schema 远小于此（几十到几百节点）。
+const MAX_SCHEMA_NODES: usize = 50_000;
+
+/// schema 树的近似节点数（对象 / 数组的值逐个计入）。
+fn schema_size(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => 1 + map.values().map(schema_size).sum::<usize>(),
+        Value::Array(items) => 1 + items.iter().map(schema_size).sum::<usize>(),
+        _ => 1,
+    }
+}
+
+impl<'a> SchemaCompiler<'a> {
+    /// 预算入账 + 超限判定：超限只报一次诊断，之后所有 compile 调用 O(1) 快速返回。
+    fn charge(&mut self, nodes: usize, offset: u32) {
+        self.nodes = self.nodes.saturating_add(nodes);
+        if self.nodes > MAX_SCHEMA_NODES && !self.over_budget {
+            self.over_budget = true;
+            self.diagnostics.push((
+                offset,
+                format!(
+                    "类型展开超过 {MAX_SCHEMA_NODES} 节点上限：缩小别名宽度或实例化嵌套层数"
+                ),
+            ));
+        }
+    }
 }
 
 impl<'a> SchemaCompiler<'a> {
     fn compile(&mut self, ty: &'a TSType<'a>, depth: usize, alias_depth: usize) -> Value {
+        self.charge(1, ty.span().start);
+        if self.over_budget {
+            return json!({});
+        }
         if depth > MAX_TYPE_DEPTH {
             self.diagnostics.push((
                 ty.span().start,
@@ -932,12 +978,21 @@ impl<'a> SchemaCompiler<'a> {
             };
             return json!({"type": "array", "items": self.compile(element, depth + 1, alias_depth)});
         }
-        // 泛型实例化栈优先：别名 body 内引用参数名（T / U…）→ 返回调用方环境里
-        // 已解析的实参 schema。
-        for frame in self.type_args.iter().rev() {
-            if let Some(schema) = frame.get(name) {
-                return schema.clone();
-            }
+        // 泛型实例化帧优先：别名 body 内引用参数名（T / U…）→ 返回调用方环境里
+        // 已解析的实参 schema。clone 的是整棵子树，其尺寸计入展开预算——否则
+        // 「body 里 N 处引用 × 实参子树大小」的乘法绕过构造期计数。
+        let hit = self
+            .type_args
+            .iter()
+            .rev()
+            .find_map(|frame| frame.get(name).cloned());
+        if let Some(schema) = hit {
+            self.charge(schema_size(&schema), span_start);
+            return if self.over_budget {
+                json!({})
+            } else {
+                schema
+            };
         }
         // 类型别名（脚本顶层 `type X = ...`，可带泛型参数，引用点实例化）。
         let Some(alias) = self.aliases.get(name) else {
@@ -1422,6 +1477,55 @@ mod extended_type_tests {
         .expect("泛型透传应成功");
         let (_, schema) = &passthrough.typed_asks[0];
         assert_eq!(schema["properties"]["v"]["type"], "string", "{schema}");
+    }
+
+    #[test]
+    fn optional_chaining_survives_the_rewrite() {
+        // 回归：`h?.ask<T>(..)` 的 `?.` 曾被重写成 `.`——h 为空时合法跳过的调用变成
+        // TypeError，问题参数的副作用也不再被短路。
+        let script = "const h = agent(\"h\");\n\
+                      const r = await h?.ask<number>(\"可选\");\n\
+                      result(String(r));\n";
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        assert!(
+            transform.exec_script.contains("h?.askJson("),
+            "{}",
+            transform.exec_script
+        );
+        assert!(!transform.exec_script.contains(".ask<"));
+        // 普通点号调用不受影响。
+        let plain = compile_typed_asks("const h = agent(\"h\");\nconst r = await h.ask<number>(\"普通\");\n")
+            .expect("编译应成功");
+        assert!(plain.exec_script.contains("h.askJson("), "{}", plain.exec_script);
+    }
+
+    #[test]
+    fn schema_expansion_is_bounded() {
+        // 回归：宽别名 × 嵌套实例化是指数展开（16 字段别名嵌 5 层 ≈ 10^6 叶子），
+        // 编译发生在 QuickJS 内存限制之前——必须自带节点预算，超限报错而不是耗尽
+        // 宿主内存。
+        let fields = (0..16)
+            .map(|index| format!("f{index}: T"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut script = format!("type Wide<T> = {{ {fields} }};\n");
+        script.push_str("const h = agent(\"h\");\n");
+        script.push_str("const r = await h.ask<Wide<Wide<Wide<Wide<Wide<number>>>>>>(\"爆\");\n");
+        let diagnostics = compile_typed_asks(&script).unwrap_err();
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("展开超过")),
+            "{diagnostics:?}"
+        );
+
+        // 预算内的正常展开不受影响。
+        let small = compile_typed_asks(
+            "type Pair<T> = { a: T, b: T };\nconst h = agent(\"h\");\nconst r = await h.ask<Pair<Pair<number>>>(\"正常\");\n",
+        )
+        .expect("预算内展开应成功");
+        assert_eq!(
+            small.typed_asks[0].1["properties"]["a"]["properties"]["b"]["type"],
+            "number"
+        );
     }
 
     #[test]

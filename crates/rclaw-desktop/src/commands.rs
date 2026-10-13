@@ -626,7 +626,7 @@ pub async fn chat_fork(
 }
 
 /// 计划（PlanRun）的一个步骤状态。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PlanStepDto {
     pub id: String,
     /// pending | running | verifying | succeeded | failed | skipped。
@@ -638,7 +638,7 @@ pub struct PlanStepDto {
 }
 
 /// 一个计划的状态投影（供会话面板 / 消息流的流程步骤卡片轮询）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PlanDto {
     pub plan_id: String,
     pub name: String,
@@ -862,6 +862,24 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
     }
 }
 
+/// 计划列表的可见性收口：截断只用于【已收尾】的历史（6 条），未收尾（运行中 /
+/// 暂停中）的计划全量保留——暂停中的执行器在等恢复标志，一旦被更新的计划挤出
+/// 返回窗口，GUI 就再也没有它的「继续」按钮，任务永远挂起。
+fn retain_visible_plans(mut plans: Vec<PlanDto>) -> Vec<PlanDto> {
+    plans.sort_by_key(|plan| std::cmp::Reverse(plan.updated_at));
+    let unfinished: Vec<PlanDto> = plans
+        .iter()
+        .filter(|plan| !plan.completed)
+        .cloned()
+        .collect();
+    let mut completed: Vec<PlanDto> = plans.into_iter().filter(|p| p.completed).collect();
+    completed.truncate(6);
+    let mut result = unfinished;
+    result.extend(completed);
+    result.sort_by_key(|plan| std::cmp::Reverse(plan.updated_at));
+    result
+}
+
 /// 最近若干个 PlanRun 计划的状态（journal `plan/<plan_id>` 流的只读投影）。
 ///
 /// 步骤状态由事件流推导：`step_finished{outcome}` / `step_skipped{reason}` 定终态，
@@ -896,8 +914,7 @@ pub async fn plan_status(state: State<'_, AppState>) -> Result<Vec<PlanDto>, Str
             plans.push(plan);
         }
         plans.sort_by_key(|plan| std::cmp::Reverse(plan.updated_at));
-        plans.truncate(6);
-        Ok(plans)
+        Ok(retain_visible_plans(plans))
     })
     .await
 }
@@ -5348,6 +5365,45 @@ mod plan_projection_tests {
             &[(5, serde_json::json!({"ts": 1400, "event": "step_started", "step": "a"}))],
         );
         assert_eq!(plan.steps[0].status, "running");
+    }
+
+    #[test]
+    fn paused_plans_survive_the_recent_history_limit() {
+        // 回归：可见性截断曾对全部计划一刀切 6 条——7 个更晚的计划（哪怕已收尾）
+        // 会把一个暂停中的计划挤出返回窗口，「继续」按钮从此无处可点，执行器在
+        // 暂停标志上永远挂起。未收尾计划必须全量保留。
+        let mut plans: Vec<PlanDto> = (0..8)
+            .map(|index| {
+                let mut plan = blank_plan();
+                plan.plan_id = format!("done-{index}");
+                plan.updated_at = 1000 + index;
+                plan.completed = true;
+                plan
+            })
+            .collect();
+        let mut paused = blank_plan();
+        paused.plan_id = "paused-old".into();
+        paused.paused = true;
+        paused.updated_at = 1; // 最早，按旧截断必被挤掉
+        plans.push(paused);
+
+        let visible = retain_visible_plans(plans);
+        assert!(
+            visible.iter().any(|p| p.plan_id == "paused-old"),
+            "暂停中的计划不得被挤出: {:?}",
+            visible.iter().map(|p| &p.plan_id).collect::<Vec<_>>()
+        );
+        // 已收尾历史仍截断到 6 条。
+        assert_eq!(
+            visible.iter().filter(|p| p.completed).count(),
+            6,
+            "已完成历史截断保留"
+        );
+        // 结果整体按 updated_at 倒序。
+        let times: Vec<i64> = visible.iter().map(|p| p.updated_at).collect();
+        let mut sorted = times.clone();
+        sorted.sort_unstable_by_key(|t| std::cmp::Reverse(*t));
+        assert_eq!(times, sorted);
     }
 
     #[test]

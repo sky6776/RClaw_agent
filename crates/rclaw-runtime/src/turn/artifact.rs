@@ -51,6 +51,20 @@ pub(crate) fn sanitize_chat_key(channel: &str, chat_id: &str) -> String {
     rclaw_store::session::artifact_chat_key(channel, chat_id)
 }
 
+/// agent 根的绝对形态：CLI 的 base_dir 默认是相对路径（"agent"），句柄里的落盘
+/// 路径若保持相对，read / shell 都会按【各自的工作目录】再解析一次——shell 在
+/// agent 根里执行，"agent/artifacts/..." 会变成 agent/agent/... 而扑空。相对 base
+/// 按进程 CWD 展开；已是绝对路径原样返回。
+fn absolute_base(base: &Path) -> PathBuf {
+    if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(base))
+            .unwrap_or_else(|_| base.to_path_buf())
+    }
+}
+
 /// artifact 文件名：纳秒单调 id（复用 rewind 的分配器语义，进程内严格递增、可读时间）
 /// + 工具名（工具名来自注册表，仍做白名单清洗防御未知来源）。
 fn artifact_file_name(tool: &str) -> String {
@@ -87,7 +101,7 @@ pub(crate) fn spill_if_over_budget(
     if !spill.enabled || content.len() <= spill.threshold_bytes {
         return None;
     }
-    let dir = artifacts_dir(base, &sanitize_chat_key(channel, chat_id));
+    let dir = artifacts_dir(&absolute_base(base), &sanitize_chat_key(channel, chat_id));
     let path = dir.join(artifact_file_name(tool));
     // atomic_write 自带 ensure_parent_dir；失败静默回退（artifact 只是上下文优化）。
     if let Err(error) = rclaw_store::fs::atomic_write(&path, content.as_bytes()) {

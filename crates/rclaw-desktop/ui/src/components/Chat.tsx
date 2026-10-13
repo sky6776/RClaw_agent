@@ -1306,12 +1306,15 @@ export default function Chat({
         {/* PlanRun 流程步骤卡片：全部【未收尾】计划各一张（随 plan_status 轮询刷新）
             ——只展示最新的会把被顶到后面的暂停计划藏没：暂停中的执行器在等恢复
             标志，Resume 按钮必须任何时候都够得着；没有未收尾计划时保留最新已
-            收尾计划当摘要卡。计划无会话归属（journal 全局），在哪个会话都能操作。 */}
+            收尾计划当摘要卡。卡片超过 4 张时暂停中的排前面（它们是唯一卡住任务
+            的），其余按 updated_at 序截断。计划无会话归属（journal 全局），在哪个
+            会话都能操作。 */}
         {(() => {
           const visible = plans.filter((p) => !p.completed && p.steps.length > 0);
           if (visible.length === 0 && plans[0]?.steps.length) {
             visible.push(plans[0]);
           }
+          visible.sort((a, b) => Number(b.paused) - Number(a.paused));
           return visible.slice(0, 4).map((p) => (
             <PlanStepsCard key={p.plan_id} plan={p} onPlanPause={onPlanPause} />
           ));
