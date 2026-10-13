@@ -66,8 +66,37 @@ export interface AppVersions {
 }
 
 export interface HistoryMsg {
+  /** 消息行 id（state.sqlite 的 message.id；消息「分叉到新会话」的锚点）。 */
+  id: number;
   role: "user" | "assistant" | "status";
   content: string;
+}
+
+/** chat_fork 结果：新会话 id 与复制的消息条数。 */
+export interface ChatForkResult {
+  chat_id: string;
+  copied: number;
+}
+
+/** PlanRun 计划的一个步骤状态（plan_status 轮询）。 */
+export interface PlanStep {
+  id: string;
+  /** pending | succeeded | failed | skipped。 */
+  status: string;
+  task: string;
+  summary: string;
+}
+
+/** PlanRun 计划的状态投影。 */
+export interface PlanStatus {
+  plan_id: string;
+  name: string;
+  completed: boolean;
+  /** 用户暂停中（波次边界协作式暂停：当前波跑完后等待恢复）。 */
+  paused: boolean;
+  succeeded: number | null;
+  updated_at: number;
+  steps: PlanStep[];
 }
 
 export interface WizardInput {
@@ -321,6 +350,17 @@ export const api = {
   chatList: () => invoke<ChatMeta[]>("chat_list"),
 
   chatHistory: (chatId: string) => invoke<HistoryMsg[]>("chat_history", { chatId }),
+
+  /** 从任意消息锚点分叉出新会话（原会话不动）。 */
+  chatFork: (chatId: string, anchorMessageId: number) =>
+    invoke<ChatForkResult>("chat_fork", { chatId, anchorMessageId }),
+
+  /** 最近若干个 PlanRun 计划的状态（流程步骤 / todo 轮询）。 */
+  planStatus: () => invoke<PlanStatus[]>("plan_status"),
+
+  /** 暂停 / 继续一个计划（波次边界生效；当前在飞的步骤跑完后等待恢复）。 */
+  planPause: (planId: string, paused: boolean) =>
+    invoke<void>("plan_pause", { planId, paused }),
 
   chatArchive: (chatId: string) => invoke<void>("chat_archive", { chatId }),
 

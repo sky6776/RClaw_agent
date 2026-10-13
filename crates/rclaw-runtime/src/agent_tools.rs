@@ -37,6 +37,8 @@ use crate::turn::{
 
 mod plan;
 mod workflow;
+/// AST 级工作流脚本分析（oxc：依赖图 + .ask<T>→schema 编译，第十二轮）。
+pub(crate) mod workflow_ast;
 mod subagent;
 mod team;
 mod tools;
@@ -1641,6 +1643,7 @@ impl AgentToolRuntime {
                     channels: &self.channels,
                     state,
                     catalog: &catalog,
+                    opts: &self.opts,
                 },
             );
             let tool_execution = if let Some(control) = control {

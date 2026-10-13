@@ -11,6 +11,9 @@ rclaw.toml
 # OMC 本地运行态（会话 / 回放 / 调度状态等，运行时生成，勿提交）
 .omc/
 
+# CodeGraph 本地代码索引（63MB+ 运行时数据库，勿提交）
+.codegraph/
+
 # Claude/Codex 本地链接工作树（独立分支与构建产物，勿作为嵌套仓库提交）
 /.claude/worktrees/
 *.pyc

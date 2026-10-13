@@ -259,6 +259,8 @@ pub(super) struct SubagentToolContext<'a> {
     pub(super) channels: &'a rclaw_core::RuntimeChannelInfo,
     pub(super) state: &'a mut TurnState,
     pub(super) catalog: &'a SkillCatalog,
+    /// 工具结果落盘配置（来自 AgentToolRuntime 的 AgentOptions；子代理与前台同一套阈值）。
+    pub(super) opts: &'a crate::options::AgentOptions,
 }
 
 pub(super) async fn execute_subagent_tools(
@@ -278,6 +280,7 @@ pub(super) async fn execute_subagent_tools(
                 candidate_patch_only: context.candidate_patch_only,
                 supports_multimodal: context.supports_multimodal,
             },
+            spill: crate::turn::artifact::ToolResultSpill::from_options(context.opts),
         },
     )
     .await

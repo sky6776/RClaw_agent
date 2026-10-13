@@ -83,9 +83,9 @@ fn compression_summary_max_tokens_default_is_12000() {
 }
 
 #[test]
-fn max_concurrent_turns_defaults_to_six_and_parses_override() {
+fn max_concurrent_turns_defaults_to_eight_and_parses_override() {
     let default_cfg: Config = toml::from_str("").unwrap();
-    assert_eq!(default_cfg.agent.max_concurrent_turns, 6);
+    assert_eq!(default_cfg.agent.max_concurrent_turns, 8);
 
     let configured: Config = toml::from_str("[agent]\nmax_concurrent_turns = 7\n").unwrap();
     assert_eq!(configured.agent.max_concurrent_turns, 7);

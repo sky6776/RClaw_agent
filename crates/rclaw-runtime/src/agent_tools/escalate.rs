@@ -240,10 +240,8 @@ fn question_state_from_events(events: &[(u64, Value)], question_id: &str) -> Jou
             continue;
         }
         match event.get("event").and_then(Value::as_str) {
-            Some("step_escalated") => {
-                if state == JournalQuestionState::Unknown {
-                    state = JournalQuestionState::Open;
-                }
+            Some("step_escalated") if state == JournalQuestionState::Unknown => {
+                state = JournalQuestionState::Open;
             }
             Some("escalation_resolved") => state = JournalQuestionState::Resolved,
             _ => {}

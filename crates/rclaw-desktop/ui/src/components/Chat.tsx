@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, parseToolStatusLine, type PermissionMode } from "../lib/api";
+import { api, parseToolStatusLine, type PermissionMode, type PlanStatus } from "../lib/api";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { parseMediaItems } from "./MediaPreviews";
@@ -23,6 +23,8 @@ export interface Entry {
   content: string;
   /** 条目到达时间（毫秒）；历史恢复的条目没有，思考块据此显示持续时长。 */
   ts?: number;
+  /** 持久化消息行 id（历史恢复路径携带；「分叉到新会话」的锚点，直播条目缺省）。 */
+  msgId?: number;
 }
 
 /** 待随消息发送的上传附件（已落入 agent 工作区 uploads/）。 */
@@ -55,6 +57,12 @@ interface Props {
   onForwardToChat?: (text: string) => void;
   /** 当前会话 id：变化时重置滚动跟随并直达新会话底部（Chat 不随会话重挂载）。 */
   sessionKey: string;
+  /** 从该消息锚点分叉出新会话（ZCode 式 fork；桌面按钮 / 移动端菜单项共用）。 */
+  onFork?: (entry: Entry) => void;
+  /** 最近的 PlanRun 计划状态（流程步骤卡片；null = 无计划数据）。 */
+  plan: PlanStatus | null;
+  /** 暂停 / 继续计划（步骤卡片展开时的 ⏸/▶ 按钮）。 */
+  onPlanPause?: (planId: string, paused: boolean) => void;
 }
 
 /** 工具名 → 中文动作标签（未收录的工具显示原名）。 */
@@ -297,6 +305,102 @@ function CopyButton({
   );
 }
 
+/** 消息「分叉到新会话」小按钮（桌面内联形态）：从该消息（含）复制出一条新会话
+ *  分支，原会话不动（ZCode fork 同款语义，第十二轮）。移动端走长按菜单项。 */
+function ForkButton({ onFork }: { onFork: () => void }) {
+  return (
+    <button
+      onClick={onFork}
+      title="从这里分叉出新会话（原会话保留）"
+      aria-label="分叉到新会话"
+      className="mt-0.5 flex items-center gap-1 rounded px-1 py-0.5 text-[10px] text-gray-500 transition hover:text-gray-200"
+    >
+      ⑂ 分叉
+    </button>
+  );
+}
+
+/** PlanRun 流程步骤卡片（可折叠）：当前最近的计划步骤清单钉在输入区上方，
+ *  步骤状态随 plan_status 轮询刷新（zcode 的 todo 卡片同款信息位，第十二轮）。
+ *  展开时提供暂停 / 继续按钮（ZCode 任务暂停同款：波次边界协作式暂停）。 */
+function PlanStepsCard({
+  plan,
+  onPlanPause,
+}: {
+  plan: PlanStatus;
+  onPlanPause?: (planId: string, paused: boolean) => void;
+}) {
+  const pending = plan.steps.filter((s) => s.status === "pending").length;
+  // 未收尾的计划默认展开，收尾后默认收起（只留标题行当摘要）。
+  const [open, setOpen] = useState(!plan.completed);
+  // 计划切换（新 PlanRun 启动）时按新计划的收尾态重置折叠。
+  const planKeyRef = useRef(plan.plan_id);
+  useEffect(() => {
+    if (planKeyRef.current !== plan.plan_id) {
+      planKeyRef.current = plan.plan_id;
+      setOpen(!plan.completed);
+    }
+  }, [plan.plan_id, plan.completed]);
+  const icon = (status: string) => {
+    if (status === "succeeded") return <span className="text-emerald-400">✓</span>;
+    if (status === "failed") return <span className="text-red-400">✗</span>;
+    if (status === "skipped") return <span className="text-gray-600">⤼</span>;
+    return <span className="text-amber-400">⏳</span>;
+  };
+  return (
+    <div className="mb-2 overflow-hidden rounded-xl border border-[#2a2f3a] bg-[#141821]">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-xs text-gray-300 transition hover:text-gray-100"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="shrink-0">📋 流程步骤</span>
+          <span className="min-w-0 truncate text-[11px] text-gray-500">
+            {plan.name}
+            {plan.paused && " · ⏸ 已暂停"}
+            {plan.completed
+              ? ` · 完成 ${plan.succeeded ?? "?"}/${plan.steps.length}`
+              : ` · 待办 ${pending}/${plan.steps.length}`}
+          </span>
+        </span>
+        <span className="shrink-0 text-[10px] text-gray-600">{open ? "▾" : "▸"}</span>
+      </button>
+      {/* 暂停 / 继续（展开时可见；未收尾的计划才有意义）——ZCode 任务暂停同款：
+          当前波跑完后挂起，后续波次等待恢复；/cancel 取消语义不受影响。 */}
+      {open && !plan.completed && onPlanPause && (
+        <div className="flex justify-end border-t border-[#2a2f3a] px-3 py-1">
+          <button
+            onClick={() => onPlanPause(plan.plan_id, !plan.paused)}
+            className={`rounded px-2 py-0.5 text-[11px] transition ${
+              plan.paused
+                ? "text-emerald-300 hover:bg-emerald-500/15"
+                : "text-amber-300 hover:bg-amber-500/15"
+            }`}
+          >
+            {plan.paused ? "▶ 继续" : "⏸ 暂停"}
+          </button>
+        </div>
+      )}
+      {open && (
+        <ol className="border-t border-[#2a2f3a] px-4 py-2 text-xs text-gray-300 max-md:px-3">
+          {plan.steps.map((step) => (
+            <li key={step.id} className="flex items-start gap-2 py-0.5" title={step.summary}>
+              <span className="mt-0.5 shrink-0 w-4 text-center">{icon(step.status)}</span>
+              <span className="min-w-0">
+                <span className="text-gray-500">{step.id}</span>
+                {step.task && <span className="ml-1.5">{step.task}</span>}
+                {step.summary && !step.task && (
+                  <span className="ml-1.5 truncate text-gray-500">{step.summary}</span>
+                )}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
 /** 可折叠的思考过程块：点击标题行（或右侧箭头）收起 / 展开。
  *  durationSecs = 下一条消息到达与本块到达的时间差（历史恢复无时间戳则不显示）。
  *  defaultOpen 只在本块挂载时生效；手动收起 / 展开经 onToggle 上报，作为之后
@@ -363,6 +467,9 @@ export default function Chat({
   onCapture,
   onForwardToChat,
   sessionKey,
+  onFork,
+  plan,
+  onPlanPause,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -493,20 +600,45 @@ export default function Chat({
     setShowJumpDown(false);
     // 切会话清附件与 ↑↓ 浏览态（附件发错对象/历史错位）；草稿清空由 App 的
     // openChat/newChat 入口同步完成——若在此清，分享确认「先切会话再并入」
-    // 的文本会被这个后跑的 effect 抹掉。
+    // 的文本会被这个后跑的 effect 抹掉。排队消息同样清空（发错对象比丢输入更糟）。
     setAttachments([]);
     setHistoryIndex(null);
     setQuote(null);
     setSelectIds(null);
     setExportResult(null);
+    setQueue([]);
     draftRef.current = "";
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [sessionKey]);
 
+  // 排队消息（第十二轮 · zcode 同款）：agent 运行期间发送的消息进入本地队列，
+  // 显示在输入框上方，可删除 / 编辑 / 「立即」强制投递（走运行中的 turn 的插队
+  // 通道）；turn 收尾（busy 翻回 false）时按序自动发出。
+  const [queue, setQueue] = useState<string[]>([]);
+
   const send = () => {
     const content = draft.trim();
-    if ((!content && attachments.length === 0 && !quote) || busy || uploading) return;
+    if (!content && attachments.length === 0 && !quote) return;
+    if (uploading) return;
+    // 运行中：入队等待（不再丢弃输入）；空闲：直接发送。
+    if (busy) {
+      const lines = attachments.map((a) => `[附件] ${a.rel}（已放入 agent 工作区）`);
+      let body = content;
+      if (quote) {
+        const quoted = quote.text
+          .split("\n")
+          .map((l) => `> ${l}`)
+          .join("\n");
+        body = `> 引用${quote.who}消息：\n${quoted}\n\n${content}`;
+      }
+      setQueue((prev) => [...prev, [...lines, body].filter(Boolean).join("\n")]);
+      onDraftChange("");
+      setAttachments([]);
+      setHistoryIndex(null);
+      setQuote(null);
+      return;
+    }
     // 附件以工作区相对路径逐行注入消息头，模型可以直接 read。
     const lines = attachments.map((a) => `[附件] ${a.rel}（已放入 agent 工作区）`);
     // 引用块：markdown 引用行拼在正文前，模型与会话历史文件都天然可读。
@@ -525,6 +657,34 @@ export default function Chat({
     onSend([...lines, body].filter(Boolean).join("\n"));
     scrollListToBottom(); // 回到底部跟随新回复
   };
+
+  /** 「立即」发送排队消息：绕过 busy 直接投递（运行时把消息作为插队并入当前 turn）。 */
+  const sendQueuedNow = (index: number) => {
+    const item = queue[index];
+    if (item === undefined) return;
+    setQueue((prev) => prev.filter((_, i) => i !== index));
+    onSend(item);
+  };
+
+  /** 编辑排队消息：回填输入框并从队列移除。 */
+  const editQueued = (index: number) => {
+    const item = queue[index];
+    if (item === undefined) return;
+    setQueue((prev) => prev.filter((_, i) => i !== index));
+    onDraftChange(item);
+    inputRef.current?.focus();
+  };
+
+  // turn 收尾（busy 翻回 false）：按序自动发出全部排队消息（各自开新 turn，
+  // 运行时按会话串行处理）。
+  useEffect(() => {
+    if (busy || queue.length === 0) return;
+    setQueue([]);
+    for (const item of queue) {
+      onSend(item);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy]);
 
   // 历史回填：写入输入框并把光标移到末尾（否则光标停在原位，连续 ↑↓ 会被
   // 文本框默认的光标移动吃掉一次按键）。
@@ -968,6 +1128,7 @@ export default function Chat({
                     <QuoteButton
                       onQuote={() => setQuote({ who: "用户", text: buildQuoteText(e.content) })}
                     />
+                    {onFork && <ForkButton onFork={() => onFork(e)} />}
                   </div>
                 )}
               </div>
@@ -1062,6 +1223,7 @@ export default function Chat({
                   <QuoteButton
                     onQuote={() => setQuote({ who: "助手", text: buildQuoteText(e.content) })}
                   />
+                  {onFork && <ForkButton onFork={() => onFork(e)} />}
                 </div>
               )}
             </div>
@@ -1069,9 +1231,11 @@ export default function Chat({
         );
       }),
     // 行内闭包只触达 setState / ref（openMsgMenu、toggleSelected 等），不列入
-    // 依赖是刻意的；onError 需要稳定身份（App 侧已 useCallback）。
+    // 依赖是刻意的；onError 需要稳定身份（App 侧已 useCallback）；onFork 随会话
+    // 变化（依赖 activeId），必须列入——否则分叉闭包捕获旧会话 id，切会话后
+    // 点「分叉」会 fork 到上一个会话。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, selectIds, isMobile, futureThinkingCollapsed, onError],
+    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork],
   );
 
   return (
@@ -1131,6 +1295,52 @@ export default function Chat({
 
       {/* 输入区（移动端贴底并让出手势条/安全区；桌面 p-4 不变）。 */}
       <div className="border-t border-[#2a2f3a] p-4 max-md:px-2.5 max-md:pt-2 max-md:pb-[calc(env(safe-area-inset-bottom)+0.5rem)]">
+
+        {/* PlanRun 流程步骤卡片（可折叠）：最近的计划步骤清单，随 plan_status 轮询刷新。 */}
+        {plan && plan.steps.length > 0 && (
+          <PlanStepsCard plan={plan} onPlanPause={onPlanPause} />
+        )}
+
+        {/* 排队消息（zcode 同款，第十二轮）：agent 运行期间发送的消息在此排队，
+            可删除 / 编辑 / 立即投递；turn 收尾后按序自动发出。 */}
+        {queue.length > 0 && (
+          <div className="mb-2 space-y-1.5">
+            {queue.map((item, index) => (
+              <div
+                key={`${index}-${item.slice(0, 16)}`}
+                className="flex items-center gap-1.5 rounded-xl border border-[#2a2f3a] bg-[#141821] px-3 py-1.5"
+              >
+                <span className="shrink-0 text-[10px] text-amber-400/80">⏳ 排队</span>
+                <span className="min-w-0 flex-1 truncate text-xs text-gray-300" title={item}>
+                  {item}
+                </span>
+                <button
+                  onClick={() => sendQueuedNow(index)}
+                  title="立即发送（作为插队消息并入当前任务）"
+                  className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-300 transition hover:bg-indigo-500/15"
+                >
+                  立即
+                </button>
+                <button
+                  onClick={() => editQueued(index)}
+                  title="编辑（回填输入框）"
+                  aria-label="编辑排队消息"
+                  className="shrink-0 rounded px-1 py-0.5 text-gray-500 transition hover:text-gray-200"
+                >
+                  <PencilIcon />
+                </button>
+                <button
+                  onClick={() => setQueue((prev) => prev.filter((_, i) => i !== index))}
+                  title="删除"
+                  aria-label="删除排队消息"
+                  className="shrink-0 rounded px-1.5 py-0.5 text-gray-500 transition hover:text-red-300"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* 选择模式操作栏：长按消息进入；打包发送到其它会话 / 导出文档 /
             分享文本（安卓）。 */}
@@ -1336,7 +1546,9 @@ export default function Chat({
             rows={Math.min(5, draft.split("\n").length)}
             placeholder={
               busy
-                ? "RClaw 工作中…（点击方块可停止）"
+                ? isMobile
+                  ? "RClaw 工作中…输入可排队，点「⏳ 排队」入队"
+                  : "RClaw 工作中…输入将排队（Enter 入队，可选「立即」插队）"
                 : isMobile
                   ? "输入消息…"
                   : isAndroidDevice()
@@ -1500,6 +1712,17 @@ export default function Chat({
               className="hidden"
               onChange={(e) => void onFilesPicked(e.target.files)}
             />
+            {/* 运行中且有草稿：排队发送按钮（桌面也可 Enter 入队；移动端无 Enter
+                发送语义，这是唯一入队入口）。 */}
+            {busy && draft.trim() && (
+              <button
+                onClick={send}
+                title="排队发送（任务结束后自动发出，可点「立即」插队）"
+                className="flex h-10 items-center gap-1 rounded-lg px-2 text-[11px] text-amber-300 transition hover:bg-amber-500/15"
+              >
+                ⏳ 排队
+              </button>
+            )}
             {/* 卡片内右下角圆形按钮（与工具钮同排）：空闲 = ↑ 发送；工作中 = ■ 停止 */}
             <button
               onClick={stopOrSend}
@@ -1644,6 +1867,16 @@ export default function Chat({
             >
               多选
             </button>
+            {/* 分叉到新会话（用户/助手消息；从该消息复制出新会话分支，原会话不动）。 */}
+            {onFork &&
+              (msgMenu.entry.role === "user" || msgMenu.entry.role === "assistant") && (
+                <button
+                  className={MENU_ITEM}
+                  onClick={closeMenuAnd((m) => onFork(m.entry))}
+                >
+                  ⑂ 从这里分叉到新会话
+                </button>
+              )}
           </div>
         </div>
       )}

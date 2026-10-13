@@ -1,5 +1,6 @@
 # =============================================================================
-# 每次推送到 main：自动构建三种产物并发布到 GitHub Release（rolling tag nightly）。
+# 仅打 tag 推送（v* 版本 tag）时构建三种产物并发布到 GitHub Release；
+# 普通推送 main 不再触发（需要产物时打版本 tag，或手动 workflow_dispatch）。
 #   1. RClaw-android-arm64.apk        安卓 arm64 安装包（debug/release 签名自适应）
 #   2. RClaw-desktop-portable-win64.zip  Windows 桌面免安装版（解压即用）
 #   3. RClaw-termux-aarch64.zip       Termux 用的 aarch64 二进制（release-termux profile）
@@ -18,7 +19,7 @@ name: release
 
 on:
   push:
-    branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -302,7 +303,8 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # 汇总发布：rolling tag nightly，每次推送删除重建（产物始终最新）
+  # 汇总发布：tag 触发 → 以 tag 名发布（正式版）；手动 dispatch → rolling
+  # nightly（删除重建，保持旧行为兜底）。
   # ---------------------------------------------------------------------------
   release:
     needs: [desktop, termux, apk]
@@ -316,14 +318,19 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish nightly release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           STAMP="$(date -u +%Y-%m-%d)"
+          # tag 推送（refs/tags/v*）用 tag 名发布；手动触发（分支 ref）回退 nightly。
+          case "$GITHUB_REF" in
+            refs/tags/*) TAG="$GITHUB_REF_NAME"; TITLE="RClaw $TAG ($SHORT_SHA)" ;;
+            *)            TAG="nightly";        TITLE="RClaw Nightly $STAMP $SHORT_SHA" ;;
+          esac
           cat > notes.md <<EOF
-          自动构建于 push \`$SHORT_SHA\`（$STAMP UTC）。
+          构建于 \`$SHORT_SHA\`（$STAMP UTC，${TAG}）。
 
           | 产物 | 说明 |
           |---|---|
@@ -334,13 +341,15 @@ jobs:
           APK 签名：仓库配置了 \`RCLAW_KEYSTORE_BASE64\` + \`RCLAW_KEYSTORE_PASSWORD\`
           secrets 时为 release 签名；未配置时为 debug 签名（可直接安装，升级安装需同签名）。
           EOF
-          gh release delete nightly --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
-          # --prerelease 与 --latest 互斥（gh 文档），nightly 只标 prerelease
-          if ! gh release create nightly dist/* \
+          # rolling nightly 才删除重建；正式 tag 重跑时同 tag 覆盖（先删该 tag 的旧 release）。
+          if [ "$TAG" = "nightly" ] || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          fi
+          if ! gh release create "$TAG" dist/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "RClaw Nightly $STAMP $SHORT_SHA" \
+              --title "$TITLE" \
               --notes-file notes.md \
-              --prerelease 2> gh_err.txt; then
+              $( [ "$TAG" = "nightly" ] && echo --prerelease ) 2> gh_err.txt; then
             grep -a . gh_err.txt | head -10 | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi

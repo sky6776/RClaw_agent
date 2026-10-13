@@ -11,6 +11,10 @@ pub struct AgentOptions {
     /// 历史保留的最大消息条数（裁剪窗口）。
     pub max_history: usize,
     /// 可同时执行的顶层 turn 数量。同一普通会话仍由 [`crate::turn::TurnManager`] 保证串行。
+    ///
+    /// 大规模并行的直接闸门（第十二轮提升 6→8）：唤醒合批（Layer 4）已消除完成通知的
+    /// 线性放大，turn 之间的模型请求由 [`Self::subagent_request_stagger`] 错峰，提高并发
+    /// 不再按 turn 数放大请求尖峰。运行时按 `Semaphore::MAX_PERMITS` 夹上限。
     pub max_concurrent_turns: usize,
     /// 单 turn 内工具调用迭代上限。
     pub max_tool_iter: usize,
@@ -154,6 +158,16 @@ pub struct AgentOptions {
     pub skill_curator_interval_hours: u64,
     pub skill_stale_after_days: u64,
     pub skill_archive_after_days: u64,
+    /// 是否启用【工具结果落盘 + 引用句柄】（ZCode artifact 策略，第十二轮）。
+    ///
+    /// 工具结果超过 [`Self::tool_result_artifact_bytes`] 时，全文写入
+    /// `<agent根>/artifacts/<会话键>/<序号>-<工具名>.txt`（写入的是脱敏后的内容），
+    /// 模型只收到头尾预览（4KB）+ 文件路径，需要中段时用 `read` 分页取回——与
+    /// microcompact 互补：超预算结果从进入上下文的第一刻起就是小句柄，而不是先膨胀
+    /// 再等旧消息被剪枝。落盘失败静默回退原内容（不让一次成功的工具调用变失败）。
+    pub tool_result_artifact_enabled: bool,
+    /// 触发工具结果落盘的字节预算（默认 32KB；0 视为 1）。
+    pub tool_result_artifact_bytes: usize,
     /// candidate_patch 编码子代理完成后，是否跑一次只读交叉验证
     /// （read/list/grep mini 循环核实结构化交接，结论附在 handoff 后）。
     ///
@@ -166,7 +180,7 @@ impl Default for AgentOptions {
         AgentOptions {
             daemon: false,
             max_history: 256,
-            max_concurrent_turns: 6,
+            max_concurrent_turns: 8,
             max_tool_iter: 256,
             max_history_bytes: 512 * 1024,
             stream_enabled: true,
@@ -211,6 +225,8 @@ impl Default for AgentOptions {
             // 2026-09 由 30/90 收紧——闲置技能更快让位）。
             skill_stale_after_days: 14,
             skill_archive_after_days: 30,
+            tool_result_artifact_enabled: true,
+            tool_result_artifact_bytes: 32 * 1024,
             verify_candidate_patches: false,
         }
     }

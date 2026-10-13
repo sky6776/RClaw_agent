@@ -560,9 +560,297 @@ fn extract_title(session: &rclaw_store::session::SessionStore, chat_id: &str) ->
     String::new()
 }
 
+/// 会话分叉结果。
+#[derive(Debug, Serialize)]
+pub struct ChatForkDto {
+    pub chat_id: String,
+    /// 复制进新会话的消息条数。
+    pub copied: usize,
+}
+
+/// 从任意消息锚点分叉出新会话（ZCode forkStableConversationAtMessage 同源语义，
+/// 第十二轮）：消息下方的「分叉」按钮直达这里。原会话不动；新会话出现在会话列表。
+#[tauri::command]
+pub async fn chat_fork(
+    state: State<'_, AppState>,
+    chat_id: String,
+    anchor_message_id: i64,
+) -> Result<ChatForkDto, String> {
+    if !is_valid_chat_id(&chat_id) {
+        return Err(format!("非法会话 id: {chat_id}"));
+    }
+    let session = state.session().ok_or("agent 尚未启动")?;
+    // 新 chat_id：`<orig>-fork<hex>`（白名单字符集，基名收敛到 40 字符）；
+    // 撞名（同秒连点两次）追加计数重试。
+    let base: String = chat_id.chars().take(40).collect();
+    let mut target = format!("{base}-fork{:x}", chrono::Utc::now().timestamp());
+    for n in 1..=64 {
+        let candidate = if n == 1 {
+            target.clone()
+        } else {
+            format!("{target}-{n}")
+        };
+        let exists = run_blocking("检查分叉会话 id", {
+            let session = session.clone();
+            let chat_id = candidate.clone();
+            move || Ok(session.session_exists(CHANNEL_DESKTOP, &chat_id).unwrap_or(false))
+        })
+        .await?;
+        if !exists {
+            target = candidate;
+            break;
+        }
+        if n == 64 {
+            return Err("无法为分叉会话分配新 id，请稍后重试".to_string());
+        }
+    }
+    let fork_target = target.clone();
+    let fork = run_blocking("分叉会话", move || {
+        session
+            .fork_session(CHANNEL_DESKTOP, &chat_id, anchor_message_id, &fork_target)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    Ok(ChatForkDto {
+        chat_id: fork.new_chat_id,
+        copied: fork.copied,
+    })
+}
+
+/// 计划（PlanRun）的一个步骤状态。
+#[derive(Debug, Serialize)]
+pub struct PlanStepDto {
+    pub id: String,
+    /// pending | succeeded | failed | skipped。
+    pub status: String,
+    /// 步骤任务文本（plan_started 里截断到 80 字符）。
+    pub task: String,
+    /// 最近一次收尾摘要（截断展示）。
+    pub summary: String,
+}
+
+/// 一个计划的状态投影（供会话面板 / 消息流的流程步骤卡片轮询）。
+#[derive(Debug, Serialize)]
+pub struct PlanDto {
+    pub plan_id: String,
+    pub name: String,
+    /// 计划是否已整体收尾（plan_completed）。
+    pub completed: bool,
+    /// 用户暂停中（最后的 plan_paused/plan_resumed 事件 + kv 标志共同决定）。
+    pub paused: bool,
+    /// plan_completed 携带的成功步骤数。
+    pub succeeded: Option<u64>,
+    /// 最后一条事件的 ts（unix 毫秒），列表按它倒序。
+    pub updated_at: i64,
+    pub steps: Vec<PlanStepDto>,
+}
+
+/// 把一条 plan journal 流的事件投影进 PlanDto（纯函数，可单测）。
+///
+/// 事件语义：`plan_started` 定步骤全集与名字（兼容旧版 id 数组 / 新版 {id, task}）；
+/// `step_finished{outcome}` / `step_skipped|step_unverified` 定步骤终态；
+/// `plan_paused` / `plan_resumed` 按事件序翻转暂停态（**必须是独立分支**——合并进
+/// plan_started 的写法会吞掉 resumed，暂停投影翻不回 false，clippy unreachable_patterns
+/// 曾揪出此 bug）；`plan_completed` 定整体收尾（收尾后暂停无意义，强制清除）。
+fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) {
+    for (_seq, event) in events {
+        // journal 的 ts 是 RFC3339 字符串（plan_event_record 形态）；毫秒 int 只在
+        // 手拼事件里出现，一并兼容。解析失败保持上一条的 updated_at。
+        let ts = event
+            .get("ts")
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .and_then(|text| {
+                        chrono::DateTime::parse_from_rfc3339(text)
+                            .ok()
+                            .map(|time| time.timestamp_millis())
+                    })
+                    .or_else(|| value.as_i64())
+            })
+            .unwrap_or(0);
+        if ts > 0 {
+            plan.updated_at = ts;
+        }
+        match event.get("event").and_then(serde_json::Value::as_str) {
+            Some("plan_started") => {
+                if let Some(name) = event.get("name").and_then(serde_json::Value::as_str) {
+                    plan.name = name.to_string();
+                }
+                // 兼容两种形态：旧版 steps 为 id 数组，新版为 {id, task} 数组。
+                if let Some(steps) = event.get("steps").and_then(serde_json::Value::as_array) {
+                    plan.steps = steps
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            serde_json::Value::String(id) => Some(PlanStepDto {
+                                id: id.clone(),
+                                status: "pending".into(),
+                                task: String::new(),
+                                summary: String::new(),
+                            }),
+                            serde_json::Value::Object(_) => Some(PlanStepDto {
+                                id: entry
+                                    .get("id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                status: "pending".into(),
+                                task: entry
+                                    .get("task")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                summary: String::new(),
+                            }),
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+            // resume 事件不带 steps（步骤清单在 plan_started 里，已装载）；
+            // 事件流顺序处理：paused → resumed 按最后一条事件决定投影态。
+            Some("plan_resumed") => {
+                if let Some(name) = event.get("name").and_then(serde_json::Value::as_str) {
+                    plan.name = name.to_string();
+                }
+                plan.paused = false;
+            }
+            Some("plan_completed") => {
+                plan.completed = true;
+                plan.succeeded = event.get("succeeded").and_then(serde_json::Value::as_u64);
+            }
+            Some("plan_paused") => plan.paused = true,
+            Some("step_finished") => {
+                let id = event
+                    .get("step")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let outcome = event
+                    .get("outcome")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let summary = event
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
+                    step.status = outcome.to_string();
+                    step.summary = summary.chars().take(160).collect();
+                }
+            }
+            Some("step_skipped") | Some("step_unverified") => {
+                let id = event
+                    .get("step")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
+                    step.status = "skipped".into();
+                    step.summary = event
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    if plan.completed {
+        plan.paused = false;
+    }
+}
+
+/// 最近若干个 PlanRun 计划的状态（journal `plan/<plan_id>` 流的只读投影）。
+///
+/// 步骤状态由事件流推导：`step_finished{outcome}` / `step_skipped{reason}` 定终态，
+/// plan_started 的步骤清单定全集，`plan_completed` 定整体收尾。没有 step_started
+/// 事件，未定终态的步骤一律显示 pending（执行中的细节由任务面板的子代理列表承担）。
+#[tauri::command]
+pub async fn plan_status(state: State<'_, AppState>) -> Result<Vec<PlanDto>, String> {
+    let session = state.session().ok_or("agent 尚未启动")?;
+    run_blocking("读取计划状态", move || {
+        let journal = session.journal();
+        let streams = journal
+            .streams(rclaw_store::JOURNAL_PLAN)
+            .map_err(|e| e.to_string())?;
+        let mut plans: Vec<PlanDto> = Vec::new();
+        for stream in streams {
+            let events = journal
+                .load(rclaw_store::JOURNAL_PLAN, &stream)
+                .map_err(|e| e.to_string())?;
+            if events.is_empty() {
+                continue;
+            }
+            let mut plan = PlanDto {
+                plan_id: stream.clone(),
+                name: stream.clone(),
+                completed: false,
+                paused: false,
+                succeeded: None,
+                updated_at: 0,
+                steps: Vec::new(),
+            };
+            project_plan_events(&mut plan, &events);
+            plans.push(plan);
+        }
+        plans.sort_by_key(|plan| std::cmp::Reverse(plan.updated_at));
+        plans.truncate(6);
+        Ok(plans)
+    })
+    .await
+}
+
+/// 暂停 / 继续一个 PlanRun 计划（ZCode 任务暂停/继续，第十二轮）：写 kv 暂停标志
+/// + 追加 `plan_paused` / `plan_resumed` 事件。执行器在【波次边界】协作式读取——
+/// 当前在飞的步骤跑完、后续波次等待恢复；不影响取消语义（/cancel 照常终止）。
+#[tauri::command]
+pub async fn plan_pause(
+    state: State<'_, AppState>,
+    plan_id: String,
+    paused: bool,
+) -> Result<(), String> {
+    let session = state.session().ok_or("agent 尚未启动")?;
+    let key = format!("plan-pause/{plan_id}");
+    run_blocking("计划暂停/继续", move || {
+        let journal = session.journal();
+        // kv 里流必须已存在（暂停一个不存在的计划没有意义，明确报错）。
+        if !journal
+            .exists(rclaw_store::JOURNAL_PLAN, &plan_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!("计划 '{plan_id}' 不存在（见任务面板 / 步骤卡片里的 plan_id）"));
+        }
+        let (event, write) = if paused {
+            (
+                "plan_paused",
+                journal.kv_set(&key, &serde_json::json!({"at": chrono::Utc::now().timestamp_millis()})),
+            )
+        } else {
+            ("plan_resumed", journal.kv_delete(&key))
+        };
+        write.map_err(|e| e.to_string())?;
+        journal
+            .append(
+                rclaw_store::JOURNAL_PLAN,
+                &plan_id,
+                &serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "event": event,
+                    "plan_id": plan_id,
+                    "source": "ui",
+                }),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+}
+
 /// 历史消息条目（恢复转录用）。
 #[derive(Debug, Serialize)]
 pub struct HistoryMsgDto {
+    /// 消息行 id（state.sqlite 的 message.id；消息下方「分叉到新会话」的锚点）。
+    pub id: i64,
     /// user | assistant | status（工具调用轮）。
     pub role: String,
     pub content: String,
@@ -609,6 +897,7 @@ pub async fn chat_history(
                     continue;
                 }
                 out.push(HistoryMsgDto {
+                    id: msg.id,
                     role: "user".into(),
                     content: t.to_string(),
                 });
@@ -624,6 +913,7 @@ pub async fn chat_history(
                     .collect();
                 if !tools.is_empty() {
                     out.push(HistoryMsgDto {
+                        id: msg.id,
                         role: "status".into(),
                         content: format!("🔧 调用工具: {}", tools.join(", ")),
                     });
@@ -636,6 +926,7 @@ pub async fn chat_history(
                     .join("");
                 if !text.trim().is_empty() {
                     out.push(HistoryMsgDto {
+                        id: msg.id,
                         role: "assistant".into(),
                         content: text,
                     });
@@ -4848,5 +5139,133 @@ pub async fn whisper_transcribe(
     {
         let _ = (audio, model, lang);
         Err("whisper 转写仅 Android 应用支持".into())
+    }
+}
+
+#[cfg(test)]
+mod plan_projection_tests {
+    use super::*;
+
+    fn event(kind: &str, fields: serde_json::Value) -> (u64, serde_json::Value) {
+        let mut value = serde_json::json!({ "event": kind });
+        if let (Some(obj), Some(extra)) = (value.as_object_mut(), fields.as_object()) {
+            for (key, field) in extra {
+                obj.insert(key.clone(), field.clone());
+            }
+        }
+        (1, value)
+    }
+
+    fn blank_plan() -> PlanDto {
+        PlanDto {
+            plan_id: "p".into(),
+            name: "p".into(),
+            completed: false,
+            paused: false,
+            succeeded: None,
+            updated_at: 0,
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn projection_covers_step_lifecycle_and_legacy_step_shapes() {
+        let mut plan = blank_plan();
+        let events = vec![
+            event(
+                "plan_started",
+                serde_json::json!({
+                    "name": "巡检",
+                    "steps": [
+                        {"id": "a", "task": "收集"},
+                        {"id": "b", "task": "汇总"}
+                    ]
+                }),
+            ),
+            event(
+                "step_finished",
+                serde_json::json!({"step": "a", "outcome": "succeeded", "summary": "完成"}),
+            ),
+            event("step_skipped", serde_json::json!({"step": "b", "reason": "依赖未成功"})),
+            event("plan_completed", serde_json::json!({"succeeded": 1})),
+        ];
+        project_plan_events(&mut plan, &events);
+        assert_eq!(plan.name, "巡检");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].status, "succeeded");
+        assert_eq!(plan.steps[0].summary, "完成");
+        assert_eq!(plan.steps[1].status, "skipped");
+        assert!(plan.completed);
+        assert_eq!(plan.succeeded, Some(1));
+
+        // 旧版 journal 的 steps 为 id 数组。
+        let mut legacy = blank_plan();
+        project_plan_events(
+            &mut legacy,
+            &[event(
+                "plan_started",
+                serde_json::json!({"steps": ["x", "y"]}),
+            )],
+        );
+        assert_eq!(legacy.steps.len(), 2);
+        assert_eq!(legacy.steps[0].id, "x");
+        assert_eq!(legacy.steps[0].status, "pending");
+    }
+
+    #[test]
+    fn projection_reads_rfc3339_and_millisecond_timestamps() {
+        let mut plan = blank_plan();
+        project_plan_events(
+            &mut plan,
+            &[
+                (
+                    1,
+                    serde_json::json!({
+                        "ts": "2026-10-13T13:44:37.113778700+00:00",
+                        "event": "plan_started",
+                        "steps": [{"id": "a", "task": "t"}]
+                    }),
+                ),
+                (
+                    2,
+                    serde_json::json!({"ts": 1791899277000i64, "event": "plan_paused"}),
+                ),
+            ],
+        );
+        // RFC3339（执行器形态）与毫秒 int（手拼形态）都应推进 updated_at；
+        // 后到的毫秒值更大，排序取最新。
+        assert_eq!(plan.updated_at, 1_791_899_277_000);
+
+        // 无法解析的 ts 不清零已有值。
+        project_plan_events(
+            &mut plan,
+            &[(3, serde_json::json!({"ts": "not-a-time", "event": "plan_resumed"}))],
+        );
+        assert_eq!(plan.updated_at, 1_791_899_277_000);
+        assert!(!plan.paused);
+    }
+
+    #[test]
+    fn projection_flips_paused_and_resumed_in_event_order() {
+        // 回归：plan_resumed 曾被 plan_started 的合并分支吞掉（clippy unreachable_patterns
+        // 揪出）——暂停后恢复必须翻得回 false。
+        let mut plan = blank_plan();
+        let events = vec![
+            event("plan_started", serde_json::json!({"name": "n", "steps": [{"id": "a", "task": "t"}]})),
+            event("plan_paused", serde_json::json!({})),
+            event("plan_resumed", serde_json::json!({})),
+        ];
+        project_plan_events(&mut plan, &events);
+        assert!(!plan.paused, "恢复事件必须清除暂停态");
+
+        // 最后一条是暂停 → paused；收尾事件强制清除暂停（收尾后暂停无意义）。
+        let mut paused = blank_plan();
+        project_plan_events(&mut paused, &[event("plan_paused", serde_json::json!({}))]);
+        assert!(paused.paused);
+        project_plan_events(
+            &mut paused,
+            &[event("plan_completed", serde_json::json!({"succeeded": 0}))],
+        );
+        assert!(!paused.paused && paused.completed);
     }
 }

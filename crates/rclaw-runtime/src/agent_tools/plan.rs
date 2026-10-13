@@ -32,9 +32,10 @@ const DEP_SUMMARY_MAX_CHARS: usize = 1_500;
 /// verdict reasons 的单条 / 总量字符上限（注入 journal 与重跑任务文本前收敛）。
 const MAX_VERDICT_REASON_CHARS: usize = 300;
 const MAX_VERDICT_REASONS_TOTAL_CHARS: usize = 1_500;
-/// 默认 / 最大并行步骤数。
-const DEFAULT_MAX_PARALLEL: usize = 2;
-const MAX_PARALLEL_STEPS: usize = 4;
+/// 默认 / 最大并行步骤数（第十二轮 2/4 → 4/8：唤醒合批消除通知放大后，波次上限是
+/// 大规模并行的直接瓶颈；步骤仍共享子代理推理错峰 `subagent_request_stagger`）。
+const DEFAULT_MAX_PARALLEL: usize = 4;
+const MAX_PARALLEL_STEPS: usize = 8;
 /// 对抗环 verdict 失败轮次上限（默认 / 硬顶）。`while (!verdict.pass)` 的有界化：
 /// 每轮失败摘要注入目标重跑，超过上限即判 Failed（依赖方按既有策略传染 skipped）。
 /// 轮次按【对抗周期】计：一次 pass 收口一个周期；目标之后因编排者答案重跑（旧 pass 被
@@ -84,6 +85,12 @@ impl PlanRunTool {
     pub fn new(runtime: AgentToolRuntime) -> Self {
         PlanRunTool { runtime }
     }
+}
+
+/// 计划暂停标志的 kv 键（存在 = 暂停；`plan_pause` 命令 / 桌面按钮写入，
+/// 执行器在波次边界读取——跨进程一致的协作式暂停）。
+pub(crate) fn plan_pause_key(plan_id: &str) -> String {
+    format!("plan-pause/{plan_id}")
 }
 
 fn sanitize_step_id(raw: &str) -> Result<String, String> {
@@ -1538,7 +1545,7 @@ impl Tool for PlanRunTool {
                         "required": ["id", "task"]
                     }
                 },
-                "max_parallel": {"type": "integer", "minimum": 1, "maximum": 4},
+                "max_parallel": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Max steps running concurrently within a wave (default 4)."},
                 "max_verdict_rounds": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Allowed FAILED verdict rounds per verified pair before both steps are marked failed (default 2). Counted per adversarial cycle: a pass closes the cycle, so a target re-run forced after a pass (e.g. by an orchestrator answer) starts a fresh budget; fails within a cycle keep counting. The budget persists across resume via the journal: a pair whose budget is exhausted stays failed on resume (editing the target's task text does not reset it) unless you resume with a larger max_verdict_rounds than the recorded round, or change its verified_by."},
                 "resume_plan_id": {"type": "string", "description": "Resume a previous plan by id (the plan_id / event-log locator shown in an earlier PlanRun result): steps recorded 'succeeded' in that journal inherit their summaries and do NOT re-run; failed/skipped steps become pending again so you can retry them with (possibly edited) task text — except a verified pair whose verdict budget is exhausted, which stays failed unless max_verdict_rounds is raised above the recorded round (or its verified_by changed). Steps are matched by id."}
             },
@@ -1610,7 +1617,7 @@ impl Tool for PlanRunTool {
         if let Err(error) = try_append_plan_event(
             &plan_log,
             "plan_started",
-            json!({"plan_id": plan_id, "name": plan_name, "steps": steps.iter().map(|s| &s.id).collect::<Vec<_>>(), "max_parallel": max_parallel, "resumed": resume_request.is_some()}),
+            json!({"plan_id": plan_id, "name": plan_name, "steps": steps.iter().map(|s| json!({"id": s.id, "task": truncate_text(&s.task, 80)})).collect::<Vec<_>>(), "max_parallel": max_parallel, "resumed": resume_request.is_some()}),
         ) {
             return ToolResult::err(format!(
                 "计划未启动：{error}。journal 写不进去时无法判定提问归属，拒绝执行以免误判步骤"
@@ -1805,6 +1812,34 @@ impl Tool for PlanRunTool {
         let mut journal_failure: Option<String> = None;
 
         loop {
+            // 任务暂停 / 继续（ZCode 同款语义，第十二轮）：kv 里挂了暂停标志时，当前波
+            // 跑完、后续波不派发——在波次边界轮询（300ms），恢复后继续。进入暂停与
+            // 恢复各写一次 journal 事件（暂停态的持久事实源；plan_status 投影显示）。
+            // 工具 future 被丢弃（父 /cancel）时本循环随 future 一并终止，暂停不改
+            // 取消语义。失败传染等收口逻辑都在暂停检查之后——暂停期间不推进状态机。
+            {
+                let mut announced = false;
+                while self
+                    .runtime
+                    .journal
+                    .kv_get(&plan_pause_key(&plan_id))
+                    .map(|value| value.is_some())
+                    .unwrap_or(false)
+                {
+                    if !announced {
+                        append_plan_event(
+                            &plan_log,
+                            "plan_paused",
+                            json!({"plan_id": plan_id, "note": "当前波跑完后暂停，后续波次等待恢复"}),
+                        );
+                        announced = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                if announced {
+                    append_plan_event(&plan_log, "plan_resumed", json!({"plan_id": plan_id}));
+                }
+            }
             // 失败传染：依赖未全部成功的待执行步骤标 skipped（无重试是显式策略）。
             for step in &steps {
                 if status.get(&step.id) == Some(&StepStatus::Pending) {

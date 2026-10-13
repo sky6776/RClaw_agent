@@ -31,6 +31,11 @@ tokio-util = { workspace = true }
 rquickjs = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }     # rewind checkpoint 的文件内容 hash（持久化身份需跨 Rust 版本稳定）
+oxc_parser = "0.116.0"
+oxc_allocator = "0.116.0"
+oxc_ast = "0.116.0"
+oxc_span = "0.116.0"
+oxc_ast_visit = "0.116.0"
 
 [dev-dependencies]
 tempfile = "3"

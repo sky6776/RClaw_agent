@@ -1471,3 +1471,139 @@ fn tool_use_counts_only_counts_assistant_tool_uses() {
     let counts = tool_use_counts(&msgs);
     assert_eq!(counts.get("read_file"), Some(&2));
 }
+
+// ---------------------------------------------------------------------------
+// 会话任意锚点 fork（第十二轮）
+// ---------------------------------------------------------------------------
+
+/// 造一段 user/assistant 交替的会话，返回消息 id。
+fn chat_sequence(s: &SessionStore, n: usize) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+        ids.push(s.append("cli", "c", &Message::plain(role, format!("m{i}"))).unwrap());
+    }
+    ids
+}
+
+#[test]
+fn fork_copies_active_view_prefix_and_keeps_source_untouched() {
+    let (_g, s) = store();
+    let ids = chat_sequence(&s, 6); // m0(u) m1(a) m2(u) m3(a) m4(u) m5(a)
+
+    let fork = s
+        .fork_session("cli", "c", ids[2], "c-fork-1")
+        .expect("fork 应成功");
+    assert_eq!(fork.copied, 3, "锚点 m2 及其前共 3 条");
+    assert_eq!(fork.anchor_message_id, ids[2]);
+
+    // 源会话原样：可见历史一条不缺、不被折叠。
+    assert_eq!(
+        texts(&s.load_all("cli", "c").unwrap()),
+        vec!["m0", "m1", "m2", "m3", "m4", "m5"]
+    );
+    // 新会话可见历史 = 源活动视图前缀。
+    assert_eq!(
+        texts(&s.load_all("cli", "c-fork-1").unwrap()),
+        vec!["m0", "m1", "m2"]
+    );
+    // 血缘可查回。
+    let lineage = s.fork_parent("cli", "c-fork-1").unwrap().expect("有血缘");
+    assert_eq!(lineage.parent_chat_id, "c");
+    assert_eq!(lineage.anchor_message_id, ids[2]);
+    // 非 fork 会话无血缘。
+    assert!(s.fork_parent("cli", "c").unwrap().is_none());
+}
+
+#[test]
+fn fork_rejects_unknown_or_hidden_anchor_and_duplicate_target() {
+    let (_g, s) = store();
+    let ids = chat_sequence(&s, 8);
+    // 摘要掉 m2..m5（受保护头部 m0,m1；尾窗 m6,m7）。
+    let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
+    s.append_compaction("cli", "c", &summary, Some(ids[1]), ids[6])
+        .unwrap();
+
+    // 被折叠的消息不可作锚（不在活动视图）。
+    let err = s.fork_session("cli", "c", ids[3], "c-fork-x").unwrap_err();
+    assert!(err.to_string().contains("不在"), "{err}");
+
+    // 视图内的锚点（尾窗 m6）照常。
+    let fork = s.fork_session("cli", "c", ids[6], "c-fork-a").unwrap();
+    assert_eq!(fork.copied, 4, "m0,m1,summary,m6");
+    // 目标已存在 → 拒绝覆盖。
+    let err = s.fork_session("cli", "c", ids[6], "c-fork-a").unwrap_err();
+    assert!(err.to_string().contains("已存在"), "{err}");
+    // 源会话不存在。
+    let err = s.fork_session("cli", "nope", ids[0], "x").unwrap_err();
+    assert!(err.to_string().contains("不存在"), "{err}");
+}
+
+#[test]
+fn fork_copies_boundary_summary_as_plain_row() {
+    let (_g, s) = store();
+    let ids = chat_sequence(&s, 8);
+    let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
+    s.append_compaction("cli", "c", &summary, Some(ids[1]), ids[6])
+        .unwrap();
+    s.fork_session("cli", "c", ids[7], "c-fork-b").unwrap();
+
+    // 新会话里 boundary 是普通行（meta NULL）：可见历史是 fork 时刻的完整可见视图，
+    // 且新会话自己后续再压缩时不受旧锚点污染。
+    let meta_rows: i64 = s
+        .db()
+        .with(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM message m JOIN session s ON s.id = m.session_id \
+                 WHERE s.chat_id = 'c-fork-b' AND m.meta IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(meta_rows, 0, "fork 会话不得携带源会话的 boundary meta");
+    assert_eq!(
+        texts(&s.load_all("cli", "c-fork-b").unwrap()),
+        vec!["m0", "m1", "[CONTEXT COMPACTION] summary", "m6", "m7"]
+    );
+}
+
+#[test]
+fn recent_user_anchors_list_real_user_messages_newest_first() {
+    let (_g, s) = store();
+    let ids = chat_sequence(&s, 4);
+    // 工具结果载体（role=user 但全是 tool_result 块）与 boundary 不进列表。
+    let carrier = Message {
+        id: 0,
+        role: Role::User,
+        content: vec![rclaw_core::ContentBlock::ToolResult {
+            tool_use_id: "t".into(),
+            content: "tool output".into(),
+            is_error: false,
+        }],
+        tool_call_id: None,
+        ts: 0,
+    };
+    s.append("cli", "c", &carrier).unwrap();
+    let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
+    s.append_compaction("cli", "c", &summary, None, ids[1]).unwrap();
+
+    let anchors = s.recent_user_anchors("cli", "c", 10).unwrap();
+    let preview_ids: Vec<i64> = anchors.iter().map(|(id, _, _)| *id).collect();
+    // 只有真实 user 消息：m0、m2（boundary 与载体被排除），新在前。
+    assert_eq!(preview_ids, vec![ids[2], ids[0]], "{anchors:?}");
+    assert_eq!(anchors[0].2, "m2");
+    // 长文本截断到 120 字符。
+    let long = s
+        .append(
+            "cli",
+            "c",
+            &Message::plain(Role::User, "长".repeat(200)),
+        )
+        .unwrap();
+    let anchors = s.recent_user_anchors("cli", "c", 10).unwrap();
+    assert_eq!(anchors[0].0, long);
+    assert_eq!(anchors[0].2.chars().count(), 120);
+    // 不存在的会话 → 空列表。
+    assert!(s.recent_user_anchors("cli", "nope", 5).unwrap().is_empty());
+}

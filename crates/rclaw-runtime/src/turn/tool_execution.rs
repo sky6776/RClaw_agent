@@ -68,6 +68,9 @@ pub(crate) struct ToolExecutionContext<'a> {
     pub(crate) state: &'a mut TurnState,
     pub(crate) catalog: &'a SkillCatalog,
     pub(crate) policy: ToolExecutionPolicy<'a>,
+    /// 工具结果落盘配置（ZCode artifact 策略，第十二轮）：前台来自 turn 的 AgentOptions，
+    /// 子代理来自 AgentToolRuntime 的同一份选项。
+    pub(crate) spill: super::artifact::ToolResultSpill,
 }
 
 /// 执行一整批工具调用，并生成下一次模型请求所需的规范消息。
@@ -82,6 +85,7 @@ pub(crate) async fn execute_tool_batch(
         state,
         catalog,
         policy,
+        spill,
     } = context;
     let mut slots: Vec<Option<ContentBlock>> =
         (0..outcome.tool_calls.len()).map(|_| None).collect();
@@ -173,6 +177,14 @@ pub(crate) async fn execute_tool_batch(
             }
             media_blocks.extend(result.attachments);
             result.content = redact_sensitive_text(&result.content);
+            super::artifact::spill_if_over_budget(
+                &spill,
+                &layout.base,
+                policy.source_channel(),
+                policy.source_chat(),
+                &outcome.tool_calls[index].name,
+                &mut result.content,
+            );
             let tc = &outcome.tool_calls[index];
             slots[index] = Some(ContentBlock::ToolResult {
                 tool_use_id: tc.id.clone(),
@@ -191,6 +203,7 @@ pub(crate) async fn execute_tool_batch(
             &policy,
             &skill_manage_preflight,
             &callable_dynamic_tools,
+            &spill,
             &mut slots,
             &mut media_blocks,
             &mut package_skill_contexts,
@@ -247,6 +260,7 @@ async fn execute_tool_batch_serial(
     policy: &ToolExecutionPolicy<'_>,
     skill_manage_preflight: &HashMap<usize, String>,
     callable_dynamic_tools: &HashSet<String>,
+    spill: &super::artifact::ToolResultSpill,
     slots: &mut [Option<ContentBlock>],
     media_blocks: &mut Vec<rclaw_core::ContentBlock>,
     package_skill_contexts: &mut Vec<String>,
@@ -325,6 +339,14 @@ async fn execute_tool_batch_serial(
                             let attempted =
                                 agent_result_reports_media_publish_attempt(&result.content);
                             result.content = redact_sensitive_text(&result.content);
+                            super::artifact::spill_if_over_budget(
+                                spill,
+                                &layout.base,
+                                &source_channel,
+                                &source_chat,
+                                &tc.name,
+                                &mut result.content,
+                            );
                             (
                                 slot_index,
                                 ContentBlock::ToolResult {
@@ -541,6 +563,14 @@ async fn execute_tool_batch_serial(
         }
         media_blocks.extend(result.attachments);
         result.content = redact_sensitive_text(&result.content);
+        super::artifact::spill_if_over_budget(
+            spill,
+            &layout.base,
+            policy.source_channel(),
+            policy.source_chat(),
+            &tc.name,
+            &mut result.content,
+        );
         slots[index] = Some(ContentBlock::ToolResult {
             tool_use_id: tc.id.clone(),
             content: result.content,

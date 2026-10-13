@@ -395,6 +395,40 @@ async fn subagent_retries_retryable_llm_errors() {
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
+/// 压测 provider（第十二轮 · 并行波次上限提升）：记录同时在飞的推理数峰值。
+/// chat 内 sleep 一个小窗口，让并发可观测（瞬时完成会把峰值压成 1）。
+struct PeakConcurrencyProvider {
+    calls: std::sync::atomic::AtomicU32,
+    inflight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for PeakConcurrencyProvider {
+    fn name(&self) -> &str {
+        "peak-concurrency"
+    }
+
+    async fn chat(&self, _req: ChatRequest) -> rclaw_llm::Result<rclaw_core::ChatOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
+        Ok(NoopProvider::outcome())
+    }
+
+    async fn chat_stream(
+        &self,
+        req: ChatRequest,
+        on_text: rclaw_llm::OnText,
+    ) -> rclaw_llm::Result<rclaw_core::ChatOutcome> {
+        let outcome = self.chat(req).await?;
+        on_text(&outcome.text);
+        Ok(outcome)
+    }
+}
+
 #[tokio::test]
 async fn concurrent_subagents_stagger_model_requests() {
     let starts = Arc::new(StdMutex::new(Vec::new()));
@@ -428,6 +462,104 @@ async fn concurrent_subagents_stagger_model_requests() {
             pair[1].duration_since(pair[0])
         );
     }
+}
+
+/// 压测（第十二轮 · 并行波次上限提升）：8 路并发子代理在错峰打开（20ms）时全部完成，
+/// 相邻请求起始间隔仍不小于错峰窗口——波次上限提高不放大请求尖峰。
+#[tokio::test]
+async fn stagger_holds_at_eight_way_concurrent_fanout() {
+    let starts = Arc::new(StdMutex::new(Vec::new()));
+    let stagger = std::time::Duration::from_millis(20);
+    let opts = AgentOptions {
+        subagent_request_stagger: stagger,
+        ..AgentOptions::default()
+    };
+    let (runtime, _layout, _registry) = test_runtime_with_provider_and_options(
+        Arc::new(TimingProvider {
+            starts: starts.clone(),
+        }),
+        opts,
+    );
+    let futures = (0..8).map(|index| {
+        let runtime = runtime.clone();
+        let spec = test_spec(&format!("independent research {index}"));
+        async move { runtime.run_task_inner_for_test(&spec, None).await }
+    });
+    let results = futures::future::join_all(futures).await;
+    assert!(results.iter().all(Result::is_ok), "8 路并发不得死锁或失败");
+    let starts = starts.lock().unwrap();
+    assert_eq!(starts.len(), 8);
+    for pair in starts.windows(2) {
+        assert!(
+            pair[1].duration_since(pair[0])
+                >= stagger.saturating_sub(std::time::Duration::from_millis(10)),
+            "8 路并发下相邻请求仍未错峰: {:?}",
+            pair[1].duration_since(pair[0])
+        );
+    }
+}
+
+/// 压测（第十二轮 · 并行波次上限提升）：8 步独立计划以 max_parallel=8 单波执行，
+/// 信号量许可全部用满（峰值并发 = 8，错峰关闭以隔离信号量行为）、8 步全部成功。
+#[tokio::test]
+async fn plan_wave_of_eight_runs_concurrently_at_raised_cap() {
+    let provider = Arc::new(PeakConcurrencyProvider {
+        calls: std::sync::atomic::AtomicU32::new(0),
+        inflight: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let opts = AgentOptions {
+        subagent_request_stagger: std::time::Duration::ZERO,
+        ..AgentOptions::default()
+    };
+    let (runtime, _layout, _registry) =
+        test_runtime_with_provider_and_options(provider.clone(), opts);
+    let tool = super::PlanRunTool::new(runtime);
+    let steps: Vec<Value> = (0..8)
+        .map(|index| json!({"id": format!("s{index}"), "task": format!("独立任务 {index}")}))
+        .collect();
+    let result = tool
+        .execute(json!({"steps": steps, "max_parallel": 8}))
+        .await;
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 8);
+    assert_eq!(
+        provider.peak.load(Ordering::SeqCst),
+        8,
+        "8 许可的波次信号量应允许整波同时在飞（错峰已关闭）"
+    );
+    for index in 0..8 {
+        assert!(
+            result.content.contains(&format!("s{index} [succeeded]")),
+            "{}",
+            result.content
+        );
+    }
+}
+
+/// 压测（第十二轮 · 并行波次上限提升）：WorkflowRun 的 Promise.all 扇出在
+/// max_parallel_asks=16（新硬顶）下 16 个 ask 全部完成且聚合正确。
+#[tokio::test]
+async fn workflow_sixteen_ask_fanout_at_raised_cap() {
+    let opts = AgentOptions {
+        subagent_request_stagger: std::time::Duration::ZERO,
+        ..AgentOptions::default()
+    };
+    let (runtime, _layout, _registry) =
+        test_runtime_with_provider_and_options(Arc::new(NoopProvider), opts);
+    let tool = super::WorkflowRunTool::new(runtime);
+    let asks: Vec<String> = (0..16).map(|index| format!("a.ask(\"问题{index}\")")).collect();
+    let script = format!(
+        "const a = agent(\"worker\");\nconst rs = await Promise.all([{}]);\nresult(rs.length + \":\" + rs.join(\"|\"));\n",
+        asks.join(", ")
+    );
+    let result = tool
+        .execute(json!({"script": script, "max_parallel_asks": 16}))
+        .await;
+    assert!(!result.is_error, "{}", result.content);
+    let parsed: Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(parsed["asks_total"], 16, "{}", result.content);
+    assert_eq!(parsed["result"], format!("16:{}", vec!["ok"; 16].join("|")));
 }
 
 #[tokio::test]
@@ -3417,4 +3549,160 @@ async fn workflow_type_check_downgrades_gracefully_without_tsc() {
     assert!(!outcome.is_error, "{}", outcome.content);
     let parsed: Value = serde_json::from_str(&outcome.content).unwrap();
     assert_eq!(parsed["result"], "ok|ok:named");
+}
+
+/// `.ask<T>` 泛型编译端到端（第十二轮）：typed ask 重写为 askJson、答案按编译出的
+/// schema 校验；resume 按【原文】hash 零调用重放（重写确定性）。
+#[tokio::test]
+async fn workflow_typed_ask_compiles_validates_and_resumes() {
+    let good = StaticTextProvider {
+        text: r#"{"host": "node-1", "port": 8080}"#.to_string(),
+    };
+    let (runtime, _layout, _registry) = test_runtime_with_provider(Arc::new(good));
+    let tool = super::WorkflowRunTool::new(runtime.clone());
+    let script = concat!(
+        "const scout = agent(\"scout\");\n",
+        "const host = await scout.ask<{ host: string, port: number }>(\"找一个主机\");\n",
+        "result(host.host + \":\" + String(host.port));\n"
+    );
+    let first = tool.execute(json!({"script": script})).await;
+    assert!(!first.is_error, "{}", first.content);
+    let parsed: Value = serde_json::from_str(&first.content).unwrap();
+    assert_eq!(parsed["result"], "node-1:8080");
+    // run_started 记录 typed ask 行号。
+    let run_id = parsed["run_id"].as_str().unwrap().to_string();
+    let log = journal_text(&runtime.journal, JOURNAL_WORKFLOW, &run_id);
+    assert!(log.contains("\"typed_asks\":[2]"), "{log}");
+
+    // 同一脚本 resume：按原文 hash 校验通过，重写确定性复现，零调用重放。
+    let second = tool
+        .execute(json!({"script": script, "resume_run_id": run_id}))
+        .await;
+    assert!(!second.is_error, "{}", second.content);
+    let parsed2: Value = serde_json::from_str(&second.content).unwrap();
+    assert_eq!(parsed2["asks_replayed"], 1);
+
+    // 编译不支持的类型 → 提交期拒绝（诊断只回模型）。
+    let bad = StaticTextProvider {
+        text: "ok".to_string(),
+    };
+    let tool_bad =
+        super::WorkflowRunTool::new(test_runtime_with_provider(Arc::new(bad)).0);
+    let rejected = tool_bad
+        .execute(json!({
+            "script": "const h = agent('h');\nconst r = await h.ask<Date>('时间');\nresult('x');\n"
+        }))
+        .await;
+    assert!(rejected.is_error, "未知类型应在提交期拒绝");
+    assert!(rejected.content.contains("未知类型"), "{}", rejected.content);
+
+    // 答案不符编译出的 schema → run 失败。
+    let wrong = StaticTextProvider {
+        text: r#"{"host": "node-1", "port": "8080"}"#.to_string(),
+    };
+    let tool_wrong =
+        super::WorkflowRunTool::new(test_runtime_with_provider(Arc::new(wrong)).0);
+    let failed = tool_wrong.execute(json!({"script": script})).await;
+    assert!(failed.is_error, "schema 不符应使 run 失败: {}", failed.content);
+    assert!(
+        failed.content.contains("类型不符") || failed.content.contains("port"),
+        "{}",
+        failed.content
+    );
+}
+
+
+/// 暂停 / 继续（第十二轮 · ZCode 任务暂停同款）：暂停标志在【波次边界】生效——
+/// 当前波跑完、后续波不派发；恢复后计划继续并全部收尾；journal 记录暂停/恢复事件。
+#[tokio::test]
+async fn paused_plan_waits_at_wave_boundary_and_resumes() {
+    /// 步骤执行带固定延迟（默认错峰 2s 会把「暂停挡住派发」和「错峰等待」混在一起：
+    /// 拉长波 1 的执行时间，保证暂停标志赶在波 2 边界检查之前挂上）。
+    struct DelayedCapture {
+        calls: std::sync::atomic::AtomicU32,
+        delay_ms: u64,
+    }
+    #[async_trait]
+    impl Provider for DelayedCapture {
+        fn name(&self) -> &str {
+            "delayed-capture"
+        }
+        async fn chat(&self, _req: ChatRequest) -> rclaw_llm::Result<rclaw_core::ChatOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(NoopProvider::outcome())
+        }
+        async fn chat_stream(
+            &self,
+            req: ChatRequest,
+            on_text: rclaw_llm::OnText,
+        ) -> rclaw_llm::Result<rclaw_core::ChatOutcome> {
+            let outcome = self.chat(req).await?;
+            on_text(&outcome.text);
+            Ok(outcome)
+        }
+    }
+
+    let provider = Arc::new(DelayedCapture {
+        calls: std::sync::atomic::AtomicU32::new(0),
+        delay_ms: 600,
+    });
+    let (runtime, _layout, _registry) = test_runtime_with_provider(provider.clone());
+    let tool_runtime = runtime.clone();
+    let execute = tokio::spawn(async move {
+        super::PlanRunTool::new(tool_runtime)
+            .execute(json!({
+                "steps": [
+                    {"id": "a", "task": "第一步"},
+                    {"id": "b", "task": "第二步", "depends_on": ["a"]}
+                ],
+                "max_parallel": 1
+            }))
+            .await
+    });
+
+    // 等 plan journal 流出现后【立刻】挂暂停标志（波 1 还在跑——600ms 延迟留足窗口）。
+    let mut plan_id = String::new();
+    for _ in 0..100 {
+        if let Ok(streams) = runtime.journal.streams(JOURNAL_PLAN) {
+            if let Some(first) = streams.first() {
+                plan_id = first.clone();
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!plan_id.is_empty(), "plan 流应及时出现");
+    runtime
+        .journal
+        .kv_set(&super::plan::plan_pause_key(&plan_id), &json!({"at": 0}))
+        .unwrap();
+
+    // 波 1（a）跑完后计划停在波次边界：等超过「a 的延迟 + 默认错峰 2s」仍只有 1 次
+    // 推理（错峰窗口已过，是暂停挡住了 b 的派发）。
+    tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "暂停期间（含错峰窗口过后）步骤 b 不得派发"
+    );
+
+    // 恢复：b 在轮询间隔（300ms）+ 执行延迟内派发，整体收尾成功。
+    runtime
+        .journal
+        .kv_delete(&super::plan::plan_pause_key(&plan_id))
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), execute)
+        .await
+        .expect("恢复后计划应跑完")
+        .expect("执行任务不得 panic");
+    assert!(!result.is_error, "{}", result.content);
+    assert!(result.content.contains("a [succeeded]"), "{}", result.content);
+    assert!(result.content.contains("b [succeeded]"), "{}", result.content);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+    // journal：执行器记录了暂停与恢复事件（暂停态的持久事实源）。
+    let log = plan_journal_text(&runtime.journal, &plan_id);
+    assert!(log.contains("plan_paused"), "{log}");
+    assert!(log.contains("plan_resumed"), "{log}");
 }

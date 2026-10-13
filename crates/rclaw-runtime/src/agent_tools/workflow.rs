@@ -43,9 +43,11 @@ const DEFAULT_MAX_RUN_SECS: u64 = 60 * 60;
 const MAX_MAX_RUN_SECS: u64 = 24 * 60 * 60;
 /// 取消 / 超时后给子代理优雅收尾（经 cancel token 退出）的宽限期，到期放弃引擎。
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
-/// 并行 ask 上限（`Promise.all` 扇出的信号量许可数；default 4，硬顶 8）。
-const DEFAULT_MAX_PARALLEL_ASKS: u32 = 4;
-const MAX_MAX_PARALLEL_ASKS: u32 = 8;
+/// 并行 ask 上限（`Promise.all` 扇出的信号量许可数；default 8，硬顶 16——第十二轮
+/// 4/8 → 8/16：与 PlanRun 波次上限同一轮提升，大规模并行的直接闸门；ask 的子代理
+/// 模型请求仍由 `subagent_request_stagger` 错峰）。
+const DEFAULT_MAX_PARALLEL_ASKS: u32 = 8;
+const MAX_MAX_PARALLEL_ASKS: u32 = 16;
 /// 单次 ask 的子代理工具迭代上限（对齐计划步骤的收敛口径）。
 const WORKFLOW_ASK_MAX_TOOL_ITER: usize = 64;
 const MAX_SCRIPT_CHARS: usize = 100_000;
@@ -61,7 +63,13 @@ pub(crate) const FACADE_DTS: &str = r#"
 declare function agent(name: string): {
   /** 向子代理提问并等待回答（promise）。问题文本即输入指纹（inputHash）。 */
   ask(question: string): Promise<string>;
-  /** 同 ask，但答案按 JSON 解析并按 schema（JSON Schema 子集）校验后返回对象。 */
+  /**
+   * 类型化 ask：内联类型注解编译成 JSON Schema 校验答案（答案按 JSON 解析后返回对象）。
+   * 支持 string / number / boolean / null / 字面量 / 联合 / 数组（T[] 或 Array<T>）/
+   * 对象字面量 / 顶层 type 别名（无泛型）；any 不允许（用具体类型或 unknown）。
+   */
+  ask<T = string>(question: string): Promise<T>;
+  /** 同 ask<T>，但 schema 以 JSON Schema 子集作为第二参数显式传入。 */
   askJson<T = any>(question: string, schema: object): Promise<T>;
 };
 declare function result(text: string): void;
@@ -184,7 +192,7 @@ fn is_identifier_byte(byte: u8) -> bool {
 /// 把字符串字面量（单/双引号、模板串，含转义）与注释的内容替换成空格——字节长度与换行位置
 /// 不变，禁用模式只在代码上匹配，行/列仍对应原脚本。模板串的 `${}` 一并视作字符串（经它
 /// 拼出的动态求值由沙箱拆除的 eval / Function 兜底）。
-fn mask_strings_and_comments(script: &str) -> String {
+pub(crate) fn mask_strings_and_comments(script: &str) -> String {
     let bytes = script.as_bytes();
     let mut masked = bytes.to_vec();
     fn blank(masked: &mut [u8], from: usize, to: usize) {
@@ -462,11 +470,36 @@ fn type_check_with_tsc(script: &str) -> Option<Vec<FacadeDiagnostic>> {
 // ---------------------------------------------------------------------------
 
 /// 极简 JSON Schema 子集校验（递归）：type（string/number/integer/boolean/object/array/null，
-/// 可为 `["T", "null"]` 数组）、object.properties/required、array.items。覆盖 facade 契约场景；
+/// 可为 `["T", "null"]` 数组）、const、enum、anyOf、object.properties/required、array.items。
+/// 覆盖 facade 契约场景（含 `.ask<T>` 编译出的字面量 / 联合 schema，第十二轮）；
 /// 超出子集的字段忽略；未知类型名与超深嵌套（> 8）按错误处理。
 fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(), String> {
     if depth > 8 {
         return Err("schema 嵌套超过深度上限 8".to_string());
+    }
+    // anyOf：任一分支通过即可（先于 type 校验——联合的每个分支自带 type/const）。
+    if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
+        let mut failures = Vec::new();
+        for variant in variants {
+            match validate_json_schema(value, variant, depth + 1) {
+                Ok(()) => return Ok(()),
+                Err(error) => failures.push(error),
+            }
+        }
+        return Err(format!("不满足任一联合分支：{}", failures.join("; ")));
+    }
+    if let Some(expected_const) = schema.get("const") {
+        if value != expected_const {
+            return Err(format!("常量不符：期望 {expected_const}，实际 {value}"));
+        }
+    }
+    if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
+        if !variants.contains(value) {
+            return Err(format!(
+                "枚举不符：期望 {} 之一，实际 {value}",
+                serde_json::to_string(variants).unwrap_or_default()
+            ));
+        }
     }
     let expected: Vec<&str> = match schema.get("type") {
         Some(Value::String(name)) => vec![name.as_str()],
@@ -534,24 +567,34 @@ pub(crate) struct WorkflowInsight {
     pub(crate) dependency_graph: DependencyGraph,
 }
 
-/// 文本级静态分析：扫描 `agent("...")` 提取 actor；扫描 `.ask(` / `.askJson(` 计数；
-/// `Promise.all` / `await Promise` 判定并行。
+/// 静态洞察（第十二轮起 AST 优先，文本解析降级）：actor 清单 / ask 计数 / 并行标记 /
+/// 依赖图。AST 版（[`super::workflow_ast`]）不误报字符串与注释里的 `.ask(`、能识别变量
+/// 提升的 `Promise.all` 扇出与 inline `agent("x").ask()`；解析失败降级回文本扫描，
+/// 分析永不阻塞提交。
 pub(crate) fn analyze_workflow_script(script: &str) -> WorkflowInsight {
-    let mut actors: Vec<String> = Vec::new();
-    let mut search_from = 0usize;
-    while let Some(found) = script[search_from..].find("agent(") {
-        let rest = &script[search_from + found + "agent(".len()..];
-        let rest = rest.trim_start();
-        if let Some(rest) = rest.strip_prefix('"') {
-            if let Some(close) = rest.find('"') {
-                let name = &rest[..close];
-                if !name.is_empty() && !actors.iter().any(|existing| existing == name) {
-                    actors.push(name.to_string());
+    // AST 提取失败（None）才走文本扫描：AST 成功而零 actor 是合法结果（文本扫描反而
+    // 会把字符串里的 agent( 当真）。
+    let actors: Vec<String> = match super::workflow_ast::extract_actors(script) {
+        Some(actors) => actors,
+        None => {
+            let mut actors: Vec<String> = Vec::new();
+            let mut search_from = 0usize;
+            while let Some(found) = script[search_from..].find("agent(") {
+                let rest = &script[search_from + found + "agent(".len()..];
+                let rest = rest.trim_start();
+                if let Some(rest) = rest.strip_prefix('"') {
+                    if let Some(close) = rest.find('"') {
+                        let name = &rest[..close];
+                        if !name.is_empty() && !actors.iter().any(|existing| existing == name) {
+                            actors.push(name.to_string());
+                        }
+                    }
                 }
+                search_from += found + "agent(".len();
             }
+            actors
         }
-        search_from += found + "agent(".len();
-    }
+    };
     let ask_count = script.matches(".ask(").count() + script.matches(".askJson(").count();
     let parallel = script.contains("Promise.all");
     let dependency_graph = analyze_dependency_graph(script);
@@ -580,7 +623,7 @@ pub(crate) struct DependencyNode {
     pub(crate) parallel: bool,
     /// 所属 Promise.all 波编号（0 = 不在波内；可跨行）。
     #[serde(skip)]
-    wave: usize,
+    pub(crate) wave: usize,
 }
 
 /// 依赖图：节点 = ask 调用点，边 = 「必须后于」约束，waves = 拓扑层级。
@@ -593,15 +636,22 @@ pub(crate) struct DependencyGraph {
     pub(crate) waves: Vec<Vec<String>>,
 }
 
-/// 依赖图静态分析（语句级文本解析，QuickJS 兼容 JS 子集）：
-/// - `const <handle> = agent("<actor>")` → 句柄绑定；
-/// - `await <handle>.ask(...)` / `<handle>.ask(...)` / `.askJson(...)` → ask 节点；
-/// - `Promise.all([...])`（可跨行，按括号深度跟踪）内的多个 ask → 并行波（内部无边）；
-/// - 相邻语句的 ask → 顺序边（前一波每个节点 → 后一波每个节点）。
-///
-/// 这是文本级近似（无完整 AST）：不解析任意表达式形态，产出的是真实的
-/// 节点/边/波次 DAG，供调度参照与可观测性。
+/// 依赖图静态分析（第十二轮起 AST 优先，文本解析降级）：
+/// - AST 版（[`super::workflow_ast::build_dependency_graph`]）：ask 调用点按语法识别
+///   （字符串 / 注释里的 `.ask(` 不误报）、receiver 经句柄绑定或 inline `agent()`
+///   调用解析 actor、`Promise.all` 数组元素（直接 ask 或持有 ask promise 的标识符）
+///   合并成并行波；
+/// - oxc 解析失败（None）降级回第十一轮的语句级文本解析：不解析任意表达式形态，
+///   产出仍是真实的节点/边/波次 DAG，供调度参照与可观测性。
 pub(crate) fn analyze_dependency_graph(script: &str) -> DependencyGraph {
+    if let Some(graph) = super::workflow_ast::build_dependency_graph(script) {
+        return graph;
+    }
+    text_parse_dependency_graph(script)
+}
+
+/// 第十一轮的语句级文本解析（AST 解析失败时的降级路径）。
+fn text_parse_dependency_graph(script: &str) -> DependencyGraph {
     let mut bindings: Vec<(String, String)> = Vec::new(); // (handle, actor)
     let mut nodes: Vec<DependencyNode> = Vec::new();
     let mut wave_id = 0usize; // 当前 Promise.all 波编号
@@ -744,7 +794,7 @@ fn asks_on_line(
 }
 
 /// Kahn 分层：波次 = 拓扑层级（同层可并行）。
-fn topo_waves(nodes: &[DependencyNode], edges: &[(String, String)]) -> Vec<Vec<String>> {
+pub(crate) fn topo_waves(nodes: &[DependencyNode], edges: &[(String, String)]) -> Vec<Vec<String>> {
     let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let mut indegree: HashMap<String, usize> = ids.iter().map(|id| (id.clone(), 0)).collect();
     let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
@@ -1609,7 +1659,7 @@ impl Tool for WorkflowRunTool {
                 "script": {"type": "string", "description": "Deterministic JS orchestration script (<=100k chars), wrapped in an async IIFE (top-level await and Promise.all allowed). Globals: agent(name).ask(question) (Promise), result(text). No Date.now/Math.random/import (pinned/blocked)."},
                 "resume_run_id": {"type": "string", "description": "Resume a previous run: answered asks are replayed from the journal at zero cost; the script must be identical (hash checked)."},
                 "amend_run_id": {"type": "string", "description": "AMEND a previous run with a REVISED script: completed asks are imported from the predecessor journal by actor name + question hash (identical question text = zero-cost answer; changed/new questions run fresh). Mutually exclusive with resume_run_id; creates a new run id with lineage recorded."},
-                "max_parallel_asks": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Concurrency cap for parallel asks (default 4)."},
+                "max_parallel_asks": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Concurrency cap for parallel asks (default 8)."},
                 "max_run_secs": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "Overall wall-clock budget for the run in seconds (default 3600). Exceeding it fails the run; the journal is kept for resume."},
                 "type_check": {"type": "boolean", "description": "Run tsc type-level check against facade.d.ts when the host has node+tsc (auto-downgrades to syntax+lint when unavailable). Default true."}
             },
@@ -1629,6 +1679,30 @@ impl Tool for WorkflowRunTool {
         if script.chars().count() > MAX_SCRIPT_CHARS {
             return ToolResult::err(format!("script 超过 {MAX_SCRIPT_CHARS} 字符"));
         }
+        // Layer 3 `.ask<T>` 泛型编译（第十二轮）：内联类型注解编译成 JSON schema，调用点
+        // 重写为 askJson(question, schema)。script hash 仍按【作者原文】计算（resume 的
+        // 逐字节一致语义不变）；语法 / lint 检查与引擎执行都走重写后的 exec_script。
+        // 编译在 blocking 线程（oxc 解析是纯 CPU）。
+        let compile_input = script.clone();
+        let compiled = tokio::task::spawn_blocking(move || {
+            if super::workflow_ast::has_typed_asks(&compile_input) {
+                super::workflow_ast::compile_typed_asks(&compile_input)
+                    .map(|transform| (transform.exec_script, transform.typed_asks))
+            } else {
+                Ok((compile_input.clone(), Vec::new()))
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!("typed ask 编译线程失败，按未重写脚本继续: {error}");
+            Ok((script.clone(), Vec::new()))
+        });
+        let (exec_script, typed_asks) = match compiled {
+            Ok(compiled) => compiled,
+            Err(diagnostics) => {
+                return ToolResult::err(format_diagnostics(&diagnostics));
+            }
+        };
         // Layer 3 类型/facade 检查：带诊断的脚本拒绝提交，诊断只回给模型不落用户。
         // tsc 类型级检查耗时（秒级）且为阻塞调用：放 blocking 线程。
         // 默认启用（不可用自动降级），显式 false 才跳过。
@@ -1636,7 +1710,7 @@ impl Tool for WorkflowRunTool {
             .get("type_check")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let type_check_script = script.clone();
+        let type_check_script = exec_script.clone();
         let diagnostics = tokio::task::spawn_blocking(move || {
             check_script(&type_check_script, type_check)
         })
@@ -1696,8 +1770,9 @@ impl Tool for WorkflowRunTool {
             ));
         };
         let journal = EventLog::workflow(&self.runtime.journal, &run_id);
-        // Layer 3 静态洞察（文本级近似）：actor/ask 数/并行，入 run_started 与报告。
-        let insight = analyze_workflow_script(&script);
+        // Layer 3 静态洞察（AST 优先，文本降级）：actor/ask 数/并行/依赖图，
+        // 入 run_started 与报告；typed ask 计数一并入事件。
+        let insight = analyze_workflow_script(&exec_script);
         let mut replay: ReplayTable = HashMap::new();
         let mut amended_from: Option<String> = None;
         let mut imported_asks = 0usize;
@@ -1751,6 +1826,7 @@ impl Tool for WorkflowRunTool {
             lifecycle_event = json!({
                 "event": "run_started",
                 "script_hash": format!("{script_hash:016x}"),
+                "typed_asks": typed_asks.iter().map(|(line, _)| line).collect::<Vec<_>>(),
                 "insight": insight,
             });
         }
@@ -1799,7 +1875,7 @@ impl Tool for WorkflowRunTool {
                 .enable_all()
                 .build()
                 .map_err(|error| format!("workflow 内嵌 runtime 创建失败: {error}"))?;
-            inner.block_on(drive_engine(script, max_run, engine_runtime, engine_shared))
+            inner.block_on(drive_engine(exec_script, max_run, engine_runtime, engine_shared))
         })
         .await;
         let outcome = match executed {
@@ -2494,4 +2570,44 @@ mod schema_and_insight_tests {
         assert!(insight.parallel);
     }
 
+}
+
+#[cfg(test)]
+mod validator_tests {
+    use super::validate_json_schema;
+    use serde_json::json;
+
+    #[test]
+    fn validator_supports_const_enum_and_anyof() {
+        // const：字面量精确匹配。
+        assert!(validate_json_schema(&json!("fast"), &json!({"const": "fast"}), 0).is_ok());
+        assert!(validate_json_schema(&json!("slow"), &json!({"const": "fast"}), 0).is_err());
+        assert!(validate_json_schema(&json!(8080), &json!({"const": 8080}), 0).is_ok());
+        // enum：任一枚举值。
+        let enum_schema = json!({"enum": ["fast", "slow"]});
+        assert!(validate_json_schema(&json!("fast"), &enum_schema, 0).is_ok());
+        assert!(validate_json_schema(&json!("mid"), &enum_schema, 0).is_err());
+        // anyOf：任一分支通过。
+        let union = json!({"anyOf": [{"type": "string"}, {"type": "number"}]});
+        assert!(validate_json_schema(&json!("x"), &union, 0).is_ok());
+        assert!(validate_json_schema(&json!(1), &union, 0).is_ok());
+        assert!(validate_json_schema(&json!(true), &union, 0).is_err());
+        // 编译产物的组合形态：对象内嵌枚举 + 数组元素 const。
+        let compiled = json!({
+            "type": "object",
+            "properties": {
+                "zone": {"enum": ["a", "b"]},
+                "tags": {"type": "array", "items": {"const": "x"}}
+            },
+            "required": ["zone"]
+        });
+        assert!(validate_json_schema(
+            &json!({"zone": "a", "tags": ["x", "x"]}),
+            &compiled,
+            0
+        )
+        .is_ok());
+        assert!(validate_json_schema(&json!({"zone": "c"}), &compiled, 0).is_err());
+        assert!(validate_json_schema(&json!({"zone": "a", "tags": ["y"]}), &compiled, 0).is_err());
+    }
 }

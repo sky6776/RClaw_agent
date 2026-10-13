@@ -12,6 +12,8 @@ enum RuntimeCommand {
     Log,
     Compact,
     Rewind,
+    Fork,
+    Goal,
     Export,
 }
 
@@ -28,6 +30,8 @@ impl RuntimeCommand {
             "log" => Some(Self::Log),
             "compact" => Some(Self::Compact),
             "rewind" => Some(Self::Rewind),
+            "fork" => Some(Self::Fork),
+            "goal" => Some(Self::Goal),
             "export" => Some(Self::Export),
             _ => None,
         }
@@ -74,6 +78,23 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                     .handle_rewind(&msg.channel, &msg.chat_id, &msg.content)
                     .await
             }
+            RuntimeCommand::Fork => {
+                // fork 只读源会话 + 新建会话（不动源历史），运行中的 turn 不受影响；
+                // 但复制要读活动视图快照，放 blocking 线程，不在路由任务上等。
+                let manager = manager.clone();
+                let channel = msg.channel.clone();
+                let chat_id = msg.chat_id.clone();
+                let content = msg.content.clone();
+                tokio::spawn(async move {
+                    let response = manager.handle_fork(&channel, &chat_id, &content).await;
+                    let _ = manager
+                        .outbound_tx
+                        .send(BusMessage::new(channel, chat_id, response))
+                        .await;
+                });
+                return true;
+            }
+            RuntimeCommand::Goal => manager.handle_goal(&msg.channel, &msg.chat_id, &msg.content).await,
             RuntimeCommand::Export => {
                 // 导出要把整段 transcript（可能上千条）读出来并渲染、落盘：虽然走的是
                 // spawn_blocking，但在路由任务上 await 它同样会让别的会话排队。与 /compact

@@ -1793,6 +1793,96 @@ async fn ai_berkshire_package_skill_is_loaded_once_per_turn_on_demand() {
     assert_eq!(state.loaded_package_skills.len(), 1);
 }
 
+/// 工具结果落盘 + 引用句柄（ZCode artifact 策略，第十二轮）：read 大文件返回超预算
+/// 内容时，模型收到「预览 + 路径」句柄、全文落在 `agent/artifacts/<会话键>/` 下；
+/// 小结果原样通过。
+#[tokio::test]
+async fn oversized_tool_result_spills_to_artifact_with_reference_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let big = layout.base.join("big.log");
+    let body = format!("{}
+", "x".repeat(99)).repeat(600); // ~60KB，600 行
+    std::fs::write(&big, &body).unwrap();
+    let small = layout.base.join("small.txt");
+    std::fs::write(&small, "small content").unwrap();
+
+    let outcome = ChatOutcome {
+        text: String::new(),
+        reasoning: None,
+        tool_calls: vec![
+            ToolCall {
+                id: "big".into(),
+                name: "read".into(),
+                input: json!({"path": big}).to_string(),
+            },
+            ToolCall {
+                id: "small".into(),
+                name: "read".into(),
+                input: json!({"path": small}).to_string(),
+            },
+        ],
+        stop: Some(FinishReason::ToolCalls),
+        usage: None,
+    };
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(Read::new(layout.base.clone())));
+    let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+    let mgr = TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: "unused".into(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout.clone(),
+        Arc::new(tools),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    );
+    let msg = BusMessage::new(CHANNEL_CLI, "console", "读大文件");
+    let mut state = TurnState::new(&[]);
+    let catalog = SkillCatalog::new(&layout);
+
+    let result = mgr
+        .execute_tools(&outcome, &msg, &mut state, &catalog)
+        .await;
+    let contents = result
+        .tool_result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(contents.len(), 2);
+
+    // 大结果：句柄（路径 + 头尾预览 + 读取指引），中段不进入上下文。
+    let handle = contents[0];
+    assert!(handle.contains("超出预算已落盘"), "{handle}");
+    let artifact_line = handle
+        .lines()
+        .find(|line| line.starts_with("完整内容已存至: "))
+        .expect("句柄应包含落盘路径");
+    let artifact_path = artifact_line.trim_start_matches("完整内容已存至: ");
+    assert!(
+        artifact_path.contains("artifacts/cli-console"),
+        "artifact 应按会话键归档: {artifact_path}"
+    );
+    let disk = std::fs::read_to_string(artifact_path).expect("artifact 文件应存在");
+    assert_eq!(disk.len(), body.len(), "落盘的是工具返回的全文");
+    assert!(handle.contains("x".repeat(99).as_str()), "头尾预览保留");
+    assert!(handle.contains("已省略"), "{handle}");
+
+    // 小结果：原样通过。
+    assert_eq!(contents[1], "small content");
+}
+
 #[tokio::test]
 async fn ai_berkshire_skill_fails_closed_when_package_rules_are_missing() {
     let dir = tempfile::tempdir().unwrap();
@@ -8535,3 +8625,191 @@ async fn cancel_during_tool_execution_persists_closed_interrupted_chain() {
         .unwrap()
         .contains("已停止当前任务"));
 }
+
+// ---------------------------------------------------------------------------
+// /fork：任意消息锚点 fork 出新会话（第十二轮）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fork_command_lists_anchors_and_forks_to_new_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+    let mgr = TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: "unused".into(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout.clone(),
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    );
+    let ids = [
+        mgr.session
+            .append("cli", "console", &Message::plain(Role::User, "先做调研"))
+            .unwrap(),
+        mgr.session
+            .append("cli", "console", &Message::plain(Role::Assistant, "调研完成"))
+            .unwrap(),
+        mgr.session
+            .append("cli", "console", &Message::plain(Role::User, "再写报告"))
+            .unwrap(),
+        mgr.session
+            .append("cli", "console", &Message::plain(Role::Assistant, "报告已写"))
+            .unwrap(),
+    ];
+
+    // 无参：列出真实用户消息锚点（新在前）。
+    let listing = mgr.handle_fork("cli", "console", "/fork").await;
+    assert!(listing.contains("可分叉锚点"), "{listing}");
+    assert!(listing.contains(&format!("#{}", ids[2])), "{listing}");
+    assert!(listing.contains("再写报告"), "{listing}");
+
+    // 带参：fork 出新会话，源会话不动。
+    let report = mgr
+        .handle_fork("cli", "console", &format!("/fork {}", ids[2]))
+        .await;
+    assert!(report.contains("✅"), "{report}");
+    let new_chat_id = report
+        .split('`')
+        .nth(1)
+        .expect("报告应含反引号包裹的新会话 id")
+        .to_string();
+    let forked = mgr.session.load_all("cli", &new_chat_id).unwrap();
+    let texts: Vec<&str> = forked
+        .iter()
+        .filter_map(|m| m.content.iter().find_map(|b| b.as_text()))
+        .collect();
+    assert_eq!(texts, vec!["先做调研", "调研完成", "再写报告"], "{texts:?}");
+    assert_eq!(
+        mgr.session
+            .load_all("cli", "console")
+            .unwrap()
+            .len(),
+        4,
+        "源会话不得被 fork 改动"
+    );
+    // 血缘可查。
+    let lineage = mgr
+        .session
+        .fork_parent("cli", &new_chat_id)
+        .unwrap()
+        .expect("有血缘");
+    assert_eq!(lineage.parent_chat_id, "console");
+    assert_eq!(lineage.anchor_message_id, ids[2]);
+
+    // 非法输入明确报错。
+    let bad = mgr.handle_fork("cli", "console", "/fork abc").await;
+    assert!(bad.contains("非法锚点 id"), "{bad}");
+    let hidden = mgr.handle_fork("cli", "console", "/fork 99999").await;
+    assert!(hidden.contains("⚠️"), "{hidden}");
+}
+
+// ---------------------------------------------------------------------------
+// /goal：会话长期目标（ZCode /goal 同款，第十二轮）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn goal_command_sets_shows_and_clears_session_goal() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+    let mgr = TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: "ok".into(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout.clone(),
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    );
+
+    // 未设定：提示用法。
+    let none = mgr.handle_goal("cli", "console", "/goal").await;
+    assert!(none.contains("未设定"), "{none}");
+
+    // 设定：回执 + kv 落库，按会话隔离。
+    let set = mgr
+        .handle_goal("cli", "console", "/goal 把日志模块迁到新框架并通过全部测试")
+        .await;
+    assert!(set.contains("已设定"), "{set}");
+    let key = TurnManager::goal_key("cli", "console");
+    let stored = mgr
+        .session
+        .journal()
+        .kv_get(&key)
+        .unwrap()
+        .expect("目标应已落库");
+    assert_eq!(
+        stored["objective"], "把日志模块迁到新框架并通过全部测试"
+    );
+    assert!(mgr
+        .session
+        .journal()
+        .kv_get(&TurnManager::goal_key("cli", "other"))
+        .unwrap()
+        .is_none());
+
+    // 查看：显示当前目标。
+    let show = mgr.handle_goal("cli", "console", "/goal").await;
+    assert!(show.contains("当前会话目标"), "{show}");
+    assert!(show.contains("迁到新框架"), "{show}");
+
+    // 超长目标拒绝。
+    let too_long = mgr.handle_goal("cli", "console", &format!("/goal {}", "长".repeat(2001))).await;
+    assert!(too_long.contains("过长"), "{too_long}");
+
+    // 收尾：清除（幂等）。
+    let cleared = mgr.handle_goal("cli", "console", "/goal clear").await;
+    assert!(cleared.contains("已清除"), "{cleared}");
+    assert!(mgr.session.journal().kv_get(&key).unwrap().is_none());
+    let again = mgr.handle_goal("cli", "console", "/goal done").await;
+    assert!(again.contains("已清除"), "{again}");
+}
+
+#[test]
+fn goal_reminder_block_renders_objective_and_clears_with_goal() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    let journal = session.journal();
+
+    // 无目标 → None。
+    assert!(TurnManager::goal_reminder_block(&journal, "cli", "console").is_none());
+
+    // 设定 → 提醒块含原文 + 收尾指引；按会话隔离。
+    journal
+        .kv_set(
+            &TurnManager::goal_key("cli", "console"),
+            &serde_json::json!({"objective": "完成迁移并通过测试"}),
+        )
+        .unwrap();
+    let block = TurnManager::goal_reminder_block(&journal, "cli", "console")
+        .expect("有目标应产提醒块");
+    assert!(block.contains("[Session goal]"), "{block}");
+    assert!(block.contains("完成迁移并通过测试"), "{block}");
+    assert!(block.contains("/goal clear"), "{block}");
+    assert!(block.contains("不要把计划或部分进度"), "{block}");
+    assert!(TurnManager::goal_reminder_block(&journal, "cli", "other").is_none());
+
+    // 清除 → 回到 None。
+    journal
+        .kv_delete(&TurnManager::goal_key("cli", "console"))
+        .unwrap();
+    assert!(TurnManager::goal_reminder_block(&journal, "cli", "console").is_none());
+}
+

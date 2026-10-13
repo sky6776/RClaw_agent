@@ -49,6 +49,28 @@ pub struct SessionSummary {
     pub message_count: u32,
 }
 
+/// [`SessionStore::fork_session`] 的产物。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFork {
+    pub new_chat_id: String,
+    /// 复制进新会话的消息条数（活动视图前缀，含作为普通行保留的摘要正文）。
+    pub copied: usize,
+    /// 分叉锚点（源会话的 message id；新分支包含它及之前的全部可见消息）。
+    pub anchor_message_id: i64,
+}
+
+/// 会话血缘（kv `session-fork/<channel>/<chat_id>` 的解码形态）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkLineage {
+    pub parent_chat_id: String,
+    pub anchor_message_id: i64,
+}
+
+/// fork 血缘的 kv 键。
+fn fork_lineage_key(channel: &str, chat_id: &str) -> String {
+    format!("session-fork/{channel}/{chat_id}")
+}
+
 /// 活动 / 归档会话计数。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionStats {
@@ -489,6 +511,169 @@ impl SessionStore {
             )?;
             Ok(n > 0)
         })
+    }
+
+    /// 从任意消息锚点 fork 出【新会话】（ZCode `forkStableConversationAtMessage` 同源语义，
+    /// 第十二轮）：把源会话【活动视图】里 id ≤ 锚点的消息原样复制进一个新 chat_id 的会话，
+    /// 原会话一个字节都不动（append-only；运行中的 turn 继续往原会话追加）。
+    ///
+    /// - 锚点必须是活动视图里的消息行：被压缩摘要折叠掉的消息不可作锚（它已不在
+    ///   「用户所见历史」里，与 ZCode rewind 的 Unavailable 策略同判），明确报错。
+    /// - 视图里的 compaction boundary 行按【普通行】复制（摘要正文保留，旧 meta 锚点
+    ///   引用的是源会话的 id，带过去即坏）——新会话的可见历史 = fork 时刻源会话的
+    ///   可见历史，不再折叠。
+    /// - 血缘写进同一事务的 kv：`session-fork/<channel>/<new_chat_id>` =
+    ///   `{parent, anchor}`（查回用 [`Self::fork_parent`]）。
+    /// - `new_chat_id` 由调用方给出（桌面命令/斜杠命令负责生成与字符集校验）；已存在
+    ///   则报错——fork 是显式动作，不静默覆盖别人的历史。
+    /// - 整个复制在一个事务里：中途失败新会话一个字节都不留。
+    pub fn fork_session(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        anchor_message_id: i64,
+        new_chat_id: &str,
+    ) -> Result<SessionFork> {
+        let now = now_ms();
+        self.db.transaction(|tx| {
+            if session_id(tx, channel, new_chat_id)?.is_some() {
+                return Err(StoreError::Other(format!(
+                    "会话 {channel}/{new_chat_id} 已存在，fork 拒绝覆盖"
+                )));
+            }
+            let Some(sid) = session_id(tx, channel, chat_id)? else {
+                return Err(StoreError::Other(format!(
+                    "源会话 {channel}/{chat_id} 不存在"
+                )));
+            };
+            // 活动视图前缀（快照内一致）；锚点不在视图里 → 明确报错（见方法文档）。
+            let view = load_active_raw(tx, sid, None)?;
+            let Some(anchor_pos) = view
+                .iter()
+                .position(|(id, _)| *id == anchor_message_id)
+            else {
+                return Err(StoreError::Other(format!(
+                    "锚点消息 {anchor_message_id} 不在会话 {channel}/{chat_id} 的活动视图里\
+                     （可能已被压缩折叠进摘要）。请换一个仍可见的消息作为分叉点"
+                )));
+            };
+            // 视图顺序 = 会话顺序（head ++ [boundary] ++ kept ++ after）；按锚点在视图中的
+            // 【位置】取前缀——boundary 行的 id 最大，按 id 大小截断会把 boundary 连同它
+            // 之后的尾窗错切掉。
+            let prefix: Vec<(i64, String)> = view[..=anchor_pos].to_vec();
+            tx.execute(
+                "INSERT INTO session(channel, chat_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+                params![channel, new_chat_id, now],
+            )?;
+            let new_sid = session_id(tx, channel, new_chat_id)?.ok_or_else(|| {
+                StoreError::Other(format!("会话行创建后不可见: {channel}/{new_chat_id}"))
+            })?;
+            // role/ts 从源行随取（data 里的 ts 是序列化冗余，列值才是事实源）。
+            let mut stmt = tx.prepare_cached(
+                "SELECT role, ts FROM message WHERE session_id = ?1 AND id = ?2",
+            )?;
+            for (id, data) in &prefix {
+                let (role, ts): (String, i64) = stmt.query_row(params![sid, id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+                tx.execute(
+                    "INSERT INTO message(session_id, role, ts, data, meta) VALUES (?1, ?2, ?3, ?4, NULL)",
+                    params![new_sid, role, ts, data],
+                )?;
+            }
+            let lineage = serde_json::json!({
+                "parent": chat_id,
+                "anchor": anchor_message_id,
+            })
+            .to_string();
+            tx.execute(
+                "INSERT INTO kv(key, value, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![fork_lineage_key(channel, new_chat_id), lineage, now],
+            )?;
+            Ok(SessionFork {
+                new_chat_id: new_chat_id.to_string(),
+                copied: prefix.len(),
+                anchor_message_id,
+            })
+        })
+    }
+
+    /// fork 出的会话的父会话（非 fork 会话 / 血缘损坏 → None）。
+    pub fn fork_parent(&self, channel: &str, chat_id: &str) -> Result<Option<ForkLineage>> {
+        let raw = self.db.with(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM kv WHERE key = ?1",
+                    params![fork_lineage_key(channel, chat_id)],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?)
+        })?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            StoreError::Other(format!("fork 血缘不可解析: {channel}/{chat_id}: {e}"))
+        })?;
+        Ok(Some(ForkLineage {
+            parent_chat_id: value
+                .get("parent")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            anchor_message_id: value
+                .get("anchor")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// 最近若干条【真实用户消息】（id + 时间 + 文本预览）：`/fork` 无参列表的锚点候选。
+    ///
+    /// 与 `first_user_messages` 同一筛选（排除 boundary 行与 tool_result 载体），方向相反
+    /// （新在前）。文本块拼接后取前 120 字符做预览。
+    pub fn recent_user_anchors(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, i64, String)>> {
+        let rows = self.db.with(|conn| {
+            let Some(sid) = session_id(conn, channel, chat_id)? else {
+                return Ok(Vec::new());
+            };
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, ts, data FROM message WHERE session_id = ?1 AND role = 'user' \
+                 AND meta IS NULL \
+                 AND NOT EXISTS (SELECT 1 FROM json_each(message.data, '$.content') AS b \
+                                 WHERE json_extract(b.value, '$.type') = 'tool_result') \
+                 ORDER BY id DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![sid, limit.max(1) as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, ts, data)| {
+                let preview = parse_message(id, &data)
+                    .map(|m| {
+                        m.content
+                            .iter()
+                            .filter_map(|b| b.as_text())
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                let preview: String = preview.trim().chars().take(120).collect();
+                (id, ts, preview)
+            })
+            .collect())
     }
 
     /// `/clear`：清空全部会话级数据（会话 / 消息 / checkpoint / usage 锚点）并 `VACUUM`。

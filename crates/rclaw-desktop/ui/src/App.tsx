@@ -14,6 +14,7 @@ import {
   type AppVersions,
   type ChatMeta,
   type PermissionRequest,
+  type PlanStatus,
   type Status,
   type UsageSnapshot,
 } from "./lib/api";
@@ -548,6 +549,35 @@ export default function App() {
     });
   }, [activeId]);
 
+  // ---- PlanRun 流程步骤 / todo（第十二轮 · zcode 同款）----
+  // plan_status 轮询：有未收尾计划或任一会话忙碌时 2.5s 高频，否则 12s 低频
+  // （计划事件量小，全量投影每次都读；收尾后卡片默认收起只留标题）。
+  const [plans, setPlans] = useState<PlanStatus[]>([]);
+  const latestPlan = plans[0] ?? null;
+  // 高频条件：存在计划且最新未收尾，或任一会话忙碌（PlanRun 通常在忙碌期推进）。
+  // 从未用过 PlanRun 的部署保持 12s 低频空轮询（首次 tick 立即执行补状态）。
+  const planNeedsFresh = plans.length > 0 && !latestPlan?.completed;
+  const anyBusy = Object.values(busyByChat).some(Boolean);
+  useEffect(() => {
+    if (agentState !== "ready") return;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const next = await api.planStatus();
+        if (!stopped) setPlans(next);
+      } catch {
+        // agent 未启动等瞬时失败：静默（下次轮询再试）。
+      }
+    };
+    void tick();
+    const interval = planNeedsFresh || anyBusy ? 2500 : 12000;
+    const timer = setInterval(tick, interval);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [agentState, planNeedsFresh, anyBusy]);
+
   // 新建会话的公共部分：重置草稿/转录/占位标记并切换到对话页。是否在侧栏
   // 列表补条目由调用方决定（「＋」新建要补；删空后的裸工作会话不补）。
   const prepareChat = useCallback((id: string) => {
@@ -669,6 +699,58 @@ export default function App() {
     window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 4000);
   }, []);
+
+  // 暂停 / 继续计划（步骤卡片 ⏸/▶ 按钮）：写标志与事件后立即本地翻转投影
+  // （2.5s 轮询会带回权威状态），失败回滚并提示。
+  const handlePlanPause = useCallback(
+    (planId: string, paused: boolean) => {
+      setPlans((prev) =>
+        prev.map((p) => (p.plan_id === planId ? { ...p, paused } : p)),
+      );
+      api.planPause(planId, paused).catch((e) => {
+        setPlans((prev) =>
+          prev.map((p) => (p.plan_id === planId ? { ...p, paused: !paused } : p)),
+        );
+        setErrorToast(`暂停/继续失败: ${String(e)}`);
+      });
+    },
+    [setErrorToast],
+  );
+
+  // 消息「分叉到新会话」（ZCode fork 同款，第十二轮）：解析该消息的持久化行 id
+  // （直播条目缺省时从 chat_history 按 role+content 从尾往前匹配），fork 后切到新会话。
+  const handleFork = useCallback(
+    async (entry: Entry) => {
+      let anchorId = entry.msgId ?? null;
+      if (anchorId === null) {
+        try {
+          const history = await api.chatHistory(activeId);
+          const wantRole = entry.role === "user" ? "user" : "assistant";
+          for (let i = history.length - 1; i >= 0; i--) {
+            if (history[i].role === wantRole && history[i].content === entry.content) {
+              anchorId = history[i].id;
+              break;
+            }
+          }
+        } catch {
+          // 历史读取失败按未找到处理（下方统一报错）。
+        }
+      }
+      if (anchorId === null) {
+        setErrorToast("未找到该消息的持久化记录（可能尚未落库），请稍后重试");
+        return;
+      }
+      try {
+        const fork = await api.chatFork(activeId, anchorId);
+        await refreshChats();
+        setErrorToast(`✅ 已分叉出新会话（复制 ${fork.copied} 条历史）`);
+        void openChat(fork.chat_id);
+      } catch (e) {
+        setErrorToast(`分叉失败: ${String(e)}`);
+      }
+    },
+    [activeId, openChat, refreshChats, setErrorToast],
+  );
 
   // 工作区外访问授权（默认权限下工具触达工作区之外时后端推送）：
   // 请求排队逐个弹窗，允许 / 拒绝后回填后端，超时由后端按拒绝兜底。
@@ -1250,6 +1332,55 @@ export default function App() {
               ＋
             </button>
           </div>
+          {/* todo（zcode 会话面板同款信息位）：最近一个未收尾计划的步骤清单，
+              与消息流的「流程步骤」卡片同源数据。 */}
+          {latestPlan && !latestPlan.completed && latestPlan.steps.length > 0 && (
+            <div className="mb-2 rounded-lg border border-[#2a2f3a] bg-[#141821] px-2.5 py-2">
+              <div className="flex items-center justify-between text-[11px] text-gray-500">
+                <span className="truncate">📋 {latestPlan.name}</span>
+                <span>
+                  {latestPlan.steps.filter((s) => s.status === "pending").length} 项待办
+                </span>
+              </div>
+              <ul className="mt-1 space-y-0.5">
+                {latestPlan.steps.slice(0, 8).map((step) => (
+                  <li key={step.id} className="flex items-start gap-1.5 text-[11px] leading-snug">
+                    <span
+                      className={
+                        step.status === "succeeded"
+                          ? "text-emerald-400"
+                          : step.status === "failed"
+                            ? "text-red-400"
+                            : step.status === "skipped"
+                              ? "text-gray-600"
+                              : "text-amber-400"
+                      }
+                    >
+                      {step.status === "succeeded"
+                        ? "✓"
+                        : step.status === "failed"
+                          ? "✗"
+                          : step.status === "skipped"
+                            ? "⤼"
+                            : "☐"}
+                    </span>
+                    <span
+                      className="min-w-0 truncate text-gray-400"
+                      title={step.task || step.summary}
+                    >
+                      {step.id}
+                      {step.task ? ` · ${step.task}` : ""}
+                    </span>
+                  </li>
+                ))}
+                {latestPlan.steps.length > 8 && (
+                  <li className="pl-4 text-[10px] text-gray-600">
+                    … 共 {latestPlan.steps.length} 步
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
           <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-2 max-md:min-h-[9rem]">
             {chats.filter((c) => !c.archived).length === 0 && (
               <div className="px-2 py-1 text-xs text-gray-600">暂无会话</div>
@@ -1443,6 +1574,9 @@ export default function App() {
             onCapture={isMobile ? handleCaptureAction : undefined}
             onForwardToChat={forwardToChat}
             sessionKey={activeId}
+            onFork={handleFork}
+            plan={latestPlan}
+            onPlanPause={handlePlanPause}
             futureThinkingCollapsed={futureThinkingCollapsed[activeId] ?? false}
             onToggleThinking={(collapsed) =>
               setFutureThinkingCollapsed((prev) => ({ ...prev, [activeId]: collapsed }))

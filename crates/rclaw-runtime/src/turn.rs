@@ -90,6 +90,9 @@ mod output;
 mod review;
 pub mod rewind;
 
+/// 工具结果落盘 + 引用句柄（ZCode artifact 策略，第十二轮）：见 [`artifact`] 模块文档。
+pub(crate) mod artifact;
+
 use compression::*;
 use output::*;
 use review::*;
@@ -1297,6 +1300,177 @@ impl TurnManager {
         }
     }
 
+    /// 会话目标的 kv 键（`state.sqlite` 的 kv 表；/goal 设定，按会话隔离）。
+    fn goal_key(channel: &str, chat_id: &str) -> String {
+        format!("session-goal/{channel}/{chat_id}")
+    }
+
+    /// 活动目标的提醒块（无目标 / 读库失败 → None）。注入每次推理尾部，对齐 ZCode
+    /// goal reminder：持续工作 + 按证据核对 + 不自行宣告完成 + 提醒用户收尾。
+    fn goal_reminder_block(
+        journal: &rclaw_store::journal::JournalStore,
+        channel: &str,
+        chat_id: &str,
+    ) -> Option<String> {
+        let goal = journal.kv_get(&Self::goal_key(channel, chat_id)).ok()??;
+        let objective = goal.get("objective")?.as_str()?;
+        Some(format!(
+            "
+[Session goal] 本会话有用户设定的活动目标：
+「{objective}」
+             在目标达成前持续朝它工作；每次收尾回复前对照目标逐项核对             已交付的证据（文件 / 测试 / 命令输出），不要把计划或部分进度             当作完成；确信全部达成时，在回复里列出证据清单并提醒用户             用 /goal clear 收尾。"
+        ))
+    }
+
+    /// `/goal [目标文本|clear]`（ZCode /goal 同款语义）：设定当前会话的长期目标。
+    ///
+    /// - 无参：显示当前目标（或未设定提示）；
+    /// - `clear` / `done` / `完成` / `清除`：删除目标；
+    /// - 其它文本：设定（覆盖旧目标）。
+    ///
+    /// 目标存 `kv` 表（按 channel+chat 隔离，/clear 随会话清理之外不自动过期）；
+    /// 设定后【本会话每次推理的尾部上下文】都会注入目标提醒（原文 + 完成前持续
+    /// 工作 + 逐项核对证据 + 不自行宣告完成），对齐 ZCode 的 goal reminder 语义。
+    /// RClaw 没有运行时完成校验器：完成判定靠模型按证据自评 + 用户 `/goal clear`
+    /// 收尾（提醒文案明说「提醒用户收尾」，不擅自宣告达成）。
+    async fn handle_goal(&self, channel: &str, chat_id: &str, content: &str) -> String {
+        let journal = self.session.journal();
+        let key = Self::goal_key(channel, chat_id);
+        let rest = content.trim().strip_prefix('/').unwrap_or(content);
+        let arg = rest.trim_start_matches("goal").trim();
+        match arg {
+            "" => match journal.kv_get(&key) {
+                Ok(Some(value)) => {
+                    let objective = value
+                        .get("objective")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    format!(
+                        "🎯 当前会话目标：{objective}
+
+完成后用 /goal clear 收尾；                         /goal <新目标> 可覆盖。"
+                    )
+                }
+                _ => "当前会话未设定目标。用法：/goal <目标文本> 设定；/goal 查看现状；/goal clear 收尾。".to_string(),
+            },
+            "clear" | "done" | "完成" | "清除" => {
+                // 未设定时也按成功回执（幂等，不制造错误噪音）。
+                let _ = journal.kv_delete(&key);
+                "✅ 会话目标已清除。".to_string()
+            }
+            objective => {
+                let objective = objective.trim();
+                if objective.chars().count() > 2000 {
+                    return "目标文本过长（上限 2000 字符）；请提炼为可核对的结果性描述。".to_string();
+                }
+                let payload = serde_json::json!({
+                    "objective": objective,
+                    "created_at": chrono::Utc::now().timestamp_millis(),
+                });
+                match journal.kv_set(&key, &payload) {
+                    Ok(()) => format!(
+                        "🎯 会话目标已设定：{objective}
+
+此后本会话每次回复都会收到该目标提醒，                         在目标达成前请持续朝它工作并按证据核对；用户确认达成后会用 /goal clear 收尾。"
+                    ),
+                    Err(error) => format!("⚠️ 目标写入失败: {error}"),
+                }
+            }
+        }
+    }
+
+    /// `/fork [消息 id]`：从任意消息锚点 fork 出【新会话】（ZCode `forkStableConversationAtMessage`
+    /// 同源语义，第十二轮）。无参时列出最近的真实用户消息作锚点候选。
+    ///
+    /// 与 `/rewind` 的分界：rewind 回滚【文件】（会话历史不动）；fork 复制【会话历史前缀】
+    /// 到新 chat_id（源会话与工作区都不动）。fork 不持静默门：它只创建新会话，与运行中
+    /// turn 的追加互不干扰（活动视图在读写各自的快照里取）。
+    async fn handle_fork(&self, channel: &str, chat_id: &str, content: &str) -> String {
+        let mut parts = content.split_whitespace();
+        let _command = parts.next();
+        let session = self.session.clone();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        match parts.next() {
+            None => {
+                let anchors = tokio::task::spawn_blocking(move || {
+                    session.recent_user_anchors(&channel, &chat_id, 15)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("fork 锚点列表读取失败: {error}");
+                    Ok(Vec::new())
+                })
+                .unwrap_or_default();
+                if anchors.is_empty() {
+                    return "当前会话没有可分叉的真实用户消息。".to_string();
+                }
+                let mut out = format!("可分叉锚点（最近 {} 条用户消息，新在前）：", anchors.len());
+                for (id, ts_ms, preview) in &anchors {
+                    let time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(*ts_ms)
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "?".to_string());
+                    out.push_str(&format!("
+- #{id}（{time}）{preview}"));
+                }
+                out.push_str(
+                    "
+
+分叉：/fork <消息 id> —— 从该消息（含）复制出新会话分支；原会话与文件都不动，
+桌面端也可在消息下方的分叉按钮直接点选。",
+                );
+                out
+            }
+            Some(id_text) => {
+                let Ok(anchor_id) = id_text.trim_start_matches('#').parse::<i64>() else {
+                    return format!("非法锚点 id「{id_text}」：应为 /fork 列表里 # 后的数字。");
+                };
+                // 新 chat_id：`<orig>-fork<hex>`（字符集过 chat_id 白名单的子集，长度收敛）；
+                // 撞名（同秒连按两次）就追加计数重试。
+                let base: String = chat_id.chars().take(40).collect();
+                let mut fork_target = format!("{base}-fork{:x}", chrono::Utc::now().timestamp());
+                for n in 1..=64 {
+                    let candidate = if n == 1 {
+                        fork_target.clone()
+                    } else {
+                        format!("{fork_target}-{n}")
+                    };
+                    let session = session.clone();
+                    let (channel2, chat2) = (channel.clone(), candidate.clone());
+                    let taken = tokio::task::spawn_blocking(move || {
+                        session.session_exists(&channel2, &chat2).unwrap_or(false)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if !taken {
+                        fork_target = candidate;
+                        break;
+                    }
+                    if n == 64 {
+                        return "⚠️ 无法为分叉会话分配新 id，请稍后重试。".to_string();
+                    }
+                }
+                let forked = tokio::task::spawn_blocking(move || {
+                    session.fork_session(&channel, &chat_id, anchor_id, &fork_target)
+                })
+                .await;
+                match forked {
+                    Ok(Ok(fork)) => format!(
+                        "✅ 已从消息 #{anchor_id} 分叉出新会话 `{}`（复制了 {} 条可见历史）。
+原会话与工作区文件均未改动；在桌面端会话列表里打开新分支继续，或换到该会话上下文后直接对话。",
+                        fork.new_chat_id, fork.copied
+                    ),
+                    Ok(Err(error)) => format!("⚠️ {error}"),
+                    Err(error) => format!("⚠️ fork 任务执行异常: {error}"),
+                }
+            }
+        }
+    }
+
     /// `/export [all]`：把当前会话（或全部会话）的完整记录导出为 JSONL 文件。
     ///
     /// 导出的是 `state.sqlite` 里的完整 transcript（含被压缩进摘要的消息与 compaction
@@ -2433,6 +2607,14 @@ impl TurnManager {
                     // M1：团队邮箱有未读的后台子 Agent 完成通知时，把「存在性」提示注入
                     // 本次推理尾部（非持久化、不唤醒）——父在下一个自然迭代即可看到结果
                     // 已就绪并自行决定何时用 TaskList 查看，不再「干等 or 漏看」二选一。
+                    // 会话目标提醒（ZCode /goal reminder 同源）。
+                    if let Some(block) = Self::goal_reminder_block(
+                        &self.session.journal(),
+                        &msg.channel,
+                        &msg.chat_id,
+                    ) {
+                        tail_message.content.push(ContentBlock::text(block));
+                    }
                     let team_inbox_unread =
                         crate::agent_tools::read_team_inbox_unread(&self.session.journal());
                     if team_inbox_unread > 0 {
@@ -3143,6 +3325,7 @@ impl TurnManager {
                     outbound: &self.outbound_tx,
                     send_working_status: self.opts.send_working_status,
                 },
+                spill: crate::turn::artifact::ToolResultSpill::from_options(&self.opts),
             },
         )
         .await

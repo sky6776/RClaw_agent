@@ -60,7 +60,7 @@ pub struct Config {
 pub struct AgentSection {
     #[serde(default = "default_base_dir")]
     pub base_dir: String,
-    /// 可同时执行的顶层 turn 数量；同一普通会话仍保持串行。缺省 6，0 在运行时按 1 处理。
+    /// 可同时执行的顶层 turn 数量；同一普通会话仍保持串行。缺省 8，0 在运行时按 1 处理。
     #[serde(default = "default_max_concurrent_turns")]
     pub max_concurrent_turns: usize,
     #[serde(default = "default_true")]
@@ -158,7 +158,7 @@ fn default_base_dir() -> String {
     "agent".into()
 }
 fn default_max_concurrent_turns() -> usize {
-    6
+    8
 }
 fn default_compression_protect_first() -> usize {
     3
