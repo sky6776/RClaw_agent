@@ -1325,9 +1325,10 @@ export default function Chat({
 
         {/* 排队消息（zcode 同款，第十二轮）：agent 运行期间发送的消息在此排队，
             可删除 / 编辑 / 立即投递；会话收尾后由 App 逐条自动发出（App 级状态，
-            页面切换不丢）。props.queue 已是当前会话的队列。 */}
+            页面切换不丢）。props.queue 已是当前会话的队列。限高自滚动：页面本身
+            overflow-hidden 且只有历史区滚动，队列无界会把输入框 / 停止按钮顶出屏幕。 */}
         {queue.length > 0 && (
-          <div className="mb-2 space-y-1.5">
+          <div className="mb-2 max-h-40 space-y-1.5 overflow-y-auto">
             {queue.map((item) => (
               <div
                 key={item.id}

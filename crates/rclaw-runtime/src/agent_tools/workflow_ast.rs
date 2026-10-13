@@ -475,6 +475,22 @@ pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<
     if !walker.diagnostics.is_empty() {
         return Err(walker.diagnostics);
     }
+    // 重写生成的 `JSON.parse(...)` 依赖内置 JSON：脚本自己声明了 `JSON` 绑定时拒绝
+    //（遮蔽内置对象，TDZ 场景重写体直接 ReferenceError——原脚本能过 tsc，重写后
+    // 才炸）。
+    if !walker.replacements.is_empty() {
+        let mut bindings = BindingNameCollector { declares_json: false };
+        bindings.visit_program(&program);
+        if bindings.declares_json {
+            return Err(vec![FacadeDiagnostic {
+                line: 1,
+                col: 1,
+                message:
+                    "脚本声明了名为 `JSON` 的绑定：与 typed ask 重写依赖的内置 JSON.parse 冲突，请改名"
+                        .to_string(),
+            }]);
+        }
+    }
     // 别名声明是纯 TS：QuickJS 不认，必须从可执行脚本里抹掉（置空格保留换行，行列与
     // 偏移都不动，后按原文偏移应用 ask 替换不受影响——别名声明与 ask 调用的 span
     // 天然不相交）。
@@ -578,6 +594,22 @@ impl<'a> Visit<'a> for AliasCollector<'a> {
                 body: it.type_annotation.clone_in(self.allocator),
             },
         );
+    }
+}
+
+/// 脚本里声明过的绑定名收集：`BindingIdentifier` 只出现在声明位置（引用是另一种
+/// 节点 `IdentifierReference`），据此精确判断脚本是否声明了 `JSON`——typed ask
+/// 重写生成的 `JSON.parse(...)` 会命中用户的同名绑定（遮蔽内置对象；TDZ 场景直接
+/// ReferenceError），存在冲突时编译拒绝。
+struct BindingNameCollector {
+    declares_json: bool,
+}
+
+impl<'a> Visit<'a> for BindingNameCollector {
+    fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+        if it.name.as_str() == "JSON" {
+            self.declares_json = true;
+        }
     }
 }
 
@@ -1616,6 +1648,26 @@ mod extended_type_tests {
                 transform.typed_asks
             );
         }
+    }
+
+    #[test]
+    fn json_binding_conflicts_are_rejected() {
+        // 回归：用户声明的 `JSON` 绑定会遮蔽重写依赖的内置 JSON.parse——原脚本能过
+        // tsc，重写体在 TDZ 场景直接 ReferenceError。存在 typed ask 时明确拒绝。
+        let script = concat!(
+            "const h = agent(\"h\");\n",
+            "const JSON = await h.ask<{ v: string }>(\"问\");\n",
+            "result(JSON.v);\n"
+        );
+        let diagnostics = compile_typed_asks(script).unwrap_err();
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("JSON")),
+            "{diagnostics:?}"
+        );
+        // 没有 typed ask 时不拦（脚本不重写，用户自己的 JSON 用法与自己负责）。
+        let plain = "const JSON = { parse: () => 1 };\nresult(String(JSON.parse()));\n";
+        let transform = compile_typed_asks(plain).expect("无 typed ask 时不拒绝");
+        assert!(transform.typed_asks.is_empty());
     }
 
     #[test]

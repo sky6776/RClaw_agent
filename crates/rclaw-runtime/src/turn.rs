@@ -674,6 +674,10 @@ struct ActiveTurn {
     /// 无 job id 的 cron 消息——它的键与普通 turn 同形，不能从键上推断）既不加载也不持久化
     /// 会话历史，为 false，同 chat 上跑着的 cron 任务不该把用户的 `/compact` 挡掉。
     touches_history: bool,
+    /// 终局回复是否已经投递（outbound 已发出）：命令回复的忙碌判定据此区分「真的
+    /// 在跑」与「终局已交付、外壳尚未清理」——后者若仍按忙碌算，紧随终局之后的命令
+    /// 回复会被标成 intermediate，桌面端忙碌态翻不回来、排队消息全部卡住。
+    final_delivered: bool,
     // 注意：不存放 turn 任务的 `JoinHandle`。tokio 的 spawned 任务在句柄 drop 时自动
     // detach（继续在后台跑），而取消走 `CancellationToken`（不用 join.abort()），故无需持有句柄。
 }
@@ -833,6 +837,31 @@ impl TurnManager {
             .any(|(key, turn)| {
                 key.channel == channel && key.chat_id == chat_id && !turn.event_tx.is_closed()
             })
+    }
+
+    /// 同步：该会话是否有「终局回复尚未投递」的活动 turn。命令回复的 intermediate
+    /// 标记用它（区别于 [`Self::is_session_busy`]）：终局已投递、外壳尚未清理的 turn
+    /// 不算忙——否则紧随终局之后的命令回复被标成 intermediate，桌面端已为命令重新
+    /// 置位的忙碌态没有任何后续消息来解除，排队消息全部卡住。
+    fn turn_pending_delivery(&self, channel: &str, chat_id: &str) -> bool {
+        self.active
+            .lock()
+            .expect("active map 锁未被毒化")
+            .iter()
+            .any(|(key, turn)| {
+                key.channel == channel
+                    && key.chat_id == chat_id
+                    && !turn.event_tx.is_closed()
+                    && !turn.final_delivered
+            })
+    }
+
+    /// 同步：标记该 turn 的终局回复已投递（outbound 发出后立即调用）。
+    fn mark_final_delivered(&self, key: &TurnKey) {
+        let mut active = self.active.lock().expect("active map 锁未被毒化");
+        if let Some(turn) = active.get_mut(key) {
+            turn.final_delivered = true;
+        }
     }
 
     /// 同步：取某会话活动 turn 的插队事件发送端（克隆），不持有锁返回。
@@ -1084,6 +1113,7 @@ impl TurnManager {
                     cancel: cancel.clone(),
                     event_tx: event_tx.clone(),
                     touches_history: true,
+                    final_delivered: false,
                 },
             );
         }
@@ -1312,7 +1342,7 @@ impl TurnManager {
     /// 这条回复解除。
     async fn send_command_reply(&self, channel: &str, chat_id: &str, response: String) {
         let mut reply = BusMessage::new(channel.to_string(), chat_id.to_string(), response);
-        if self.is_session_busy(channel, chat_id) {
+        if self.turn_pending_delivery(channel, chat_id) {
             reply = reply.with_intermediate();
         }
         let _ = self.outbound_tx.send(reply).await;
@@ -2266,6 +2296,7 @@ impl TurnManager {
                     cancel,
                     event_tx,
                     touches_history,
+                    final_delivered: false,
                 },
             );
             return true;
@@ -3435,6 +3466,9 @@ impl TurnManager {
                     ))
                     .await;
             }
+            // 终局已投递：此后（外壳清理完成前）到达的命令按空闲会话回复，不标
+            // intermediate——桌面端为该命令重新置位的忙碌态需要这条普通回复来解除。
+            self.mark_final_delivered(&TurnKey::from_msg(&msg));
             // 交接回执：按 Agent 消息的关联 id 配给等待方（用户 turn 的回复
             // 不属于任何交接，跳过——否则会顶掉排队中交接的答案）。
             if let Some(router) = &self.bot_router {
@@ -3464,6 +3498,8 @@ impl TurnManager {
                     body.clone(),
                 ))
                 .await;
+            // 终局（失败形态）已投递：同成功分支——之后的命令回复不标 intermediate。
+            self.mark_final_delivered(&TurnKey::from_msg(&msg));
             if let Some(router) = &self.bot_router {
                 router.notify(
                     &msg.channel,

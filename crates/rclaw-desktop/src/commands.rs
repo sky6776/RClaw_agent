@@ -925,6 +925,15 @@ pub async fn plan_status(state: State<'_, AppState>) -> Result<Vec<PlanDto>, Str
                 steps: Vec::new(),
             };
             project_plan_events(&mut plan, &events);
+            // kv 暂停标志是执行器的唯一权威（波次边界轮询它）：快速 恢复→暂停 交错
+            // 时事件序可能与最终 kv 状态不一致（executor 在 300ms 轮询间隔内可能错过
+            // 短暂的标志删除），投影以 kv 为准——事件只负责收尾态与步骤状态。
+            if !plan.completed {
+                let pause_key = format!("plan-pause/{stream}");
+                if let Ok(Some(_)) = journal.kv_get(&pause_key) {
+                    plan.paused = true;
+                }
+            }
             plans.push(plan);
         }
         plans.sort_by_key(|plan| std::cmp::Reverse(plan.updated_at));

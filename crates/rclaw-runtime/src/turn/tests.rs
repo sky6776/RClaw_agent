@@ -1875,13 +1875,9 @@ async fn oversized_tool_result_spills_to_artifact_with_reference_handle() {
         "artifact 应按会话键归档: {artifact_path}"
     );
     let disk = std::fs::read_to_string(artifact_path).expect("artifact 文件应存在");
-    // 落盘是分行形态（按 ~2KB 补换行，便于 read 行式分页取回）：两侧对称去掉换行后
-    // 必须与原文一致（分行只插入换行，不动任何内容字节）。
-    assert_eq!(
-        disk.replace('\n', ""),
-        body.replace('\n', ""),
-        "落盘内容去掉换行后应与工具返回的全文逐字节一致"
-    );
+    // 全部原始行都在行宽内：落盘与原文逐字节一致（fold 只折叠超长行——多行内容
+    // 绝不能被拼行毁掉）。
+    assert_eq!(disk, body, "短行内容应原样落盘");
     for line in disk.lines() {
         assert!(line.len() <= 2048 + 4, "每行不超过行宽上限: {}", line.len());
     }
@@ -3564,6 +3560,7 @@ impl ReplacementDuringChatProvider {
                     cancel: CancellationToken::new(),
                     event_tx: replacement_tx.clone(),
                     touches_history: true,
+                    final_delivered: false,
                 },
             );
         *self.replacement_tx.lock().unwrap() = Some(replacement_tx);
@@ -3898,6 +3895,7 @@ async fn is_session_busy_counts_only_live_turns_of_that_session() {
             cancel: CancellationToken::new(),
             event_tx: live_tx,
             touches_history: false,
+            final_delivered: false,
         },
     );
     assert!(mgr.is_session_busy(CHANNEL_CLI, "console"), "cron 分键同样计入");
@@ -3920,6 +3918,7 @@ async fn is_session_busy_counts_only_live_turns_of_that_session() {
             cancel: CancellationToken::new(),
             event_tx: tx,
             touches_history: true,
+            final_delivered: false,
         },
     );
     let mgr = Arc::new(mgr);
@@ -3967,6 +3966,7 @@ async fn finishing_old_turn_does_not_remove_replacement_active_turn() {
             cancel: cancel.clone(),
             event_tx: old_tx.clone(),
             touches_history: true,
+            final_delivered: false,
         },
     );
 
@@ -4060,6 +4060,7 @@ async fn cancel_treats_closed_active_entry_as_no_task() {
             cancel: CancellationToken::new(),
             event_tx,
             touches_history: true,
+            final_delivered: false,
         },
     );
 
@@ -7870,6 +7871,7 @@ async fn compact_prunes_persists_boundary_and_records_refill_floor() {
             cancel: CancellationToken::new(),
             event_tx: live_tx,
             touches_history: true,
+            final_delivered: false,
         },
     );
     let refused = mgr.handle_compact(CHANNEL_CLI, "console").await;
@@ -7891,6 +7893,7 @@ async fn compact_prunes_persists_boundary_and_records_refill_floor() {
             cancel: CancellationToken::new(),
             event_tx: cron_tx,
             touches_history: false,
+            final_delivered: false,
         },
     );
     assert!(
