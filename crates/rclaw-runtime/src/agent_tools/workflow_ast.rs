@@ -398,6 +398,20 @@ pub(crate) struct TypedAskTransform {
     pub(crate) typed_asks: Vec<(usize, Value)>,
 }
 
+/// schema 展开的节点数预算。正常 facade schema 远小于此（几十到几百节点）。
+const MAX_SCHEMA_NODES: usize = 50_000;
+/// 重写后可执行脚本的长度上限：每个调用点的 schema JSON 都内联进 exec_script，
+/// 聚合体积要有自己的上限（与 [`MAX_SCHEMA_NODES`] 一起把编译期内存钉死）。
+const MAX_EXEC_SCRIPT_CHARS: usize = 200_000;
+
+/// 跨【全部 typed ask】共享的展开预算（每次编译一个）：按 ask 独立计数挡不住
+/// 「很多个中等大小的 ask」加总爆内存（1500 个 4 层宽别名调用 ≈ 200 MB schema）。
+#[derive(Default)]
+struct Budget {
+    nodes: usize,
+    over: bool,
+}
+
 /// 脚本（字符串/注释遮蔽后）是否包含 `.ask<`——typed ask 的快速预判，无则零开销跳过。
 ///
 /// **只作观测用途**（洞察 / 测试），不作编译开关：`.ask <T>`（空格）与模板串插值里的
@@ -455,6 +469,7 @@ pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<
         typed_asks: Vec::new(),
         aliases: &aliases,
         wrapped: &wrapped,
+        budget: Budget::default(),
     };
     walker.visit_program(&program);
     if !walker.diagnostics.is_empty() {
@@ -484,6 +499,19 @@ pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<
         if start <= end && end <= exec_script.len() {
             exec_script.replace_range(start..end, &text);
         }
+    }
+    // 聚合体积第二道闸：每个调用点的 schema JSON 都内联进 exec_script，节点预算挡
+    // 不住「很多个中等大小的 ask」把重写后的脚本撑大（执行期 QuickJS 内存限制在
+    // 这之前不生效）。
+    if exec_script.chars().count() > MAX_EXEC_SCRIPT_CHARS {
+        return Err(vec![FacadeDiagnostic {
+            line: 1,
+            col: 1,
+            message: format!(
+                "重写后的脚本超过 {MAX_EXEC_SCRIPT_CHARS} 字符上限：内联 schema 过大，\
+                 请缩小类型宽度、嵌套层数或 ask 数量"
+            ),
+        }]);
     }
     Ok(TypedAskTransform {
         exec_script,
@@ -560,6 +588,8 @@ struct TypedAskWalker<'a> {
     typed_asks: Vec<(usize, Value)>,
     aliases: &'a HashMap<String, AliasDef<'a>>,
     wrapped: &'a str,
+    /// 跨本次编译【全部 typed ask】共享的展开预算。
+    budget: Budget,
 }
 
 impl<'a> TypedAskWalker<'a> {
@@ -639,8 +669,7 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
             aliases: self.aliases,
             type_args: Vec::new(),
             diagnostics: Vec::new(),
-            nodes: 0,
-            over_budget: false,
+            budget: &mut self.budget,
         };
         let schema = compiler.compile(type_node, 0, 0);
         for (offset, message) in compiler.diagnostics {
@@ -699,16 +728,11 @@ struct SchemaCompiler<'a> {
     /// compile_reference 命中参数名时查这帧；查不到落到全局别名表。
     type_args: Vec<HashMap<String, Value>>,
     diagnostics: Vec<(u32, String)>,
-    /// 展开预算（近似 schema 节点数，含从帧里 clone 出来的实参子树）：深度上限 8
-    /// 挡不住「宽别名 × 嵌套实例化」的指数展开（32 字段别名嵌 6 层 ≈ 10^9 叶子），
-    /// 而编译发生在 QuickJS 的内存/执行限制之前——一条短脚本就能耗尽宿主内存，
-    /// 必须自带预算，超限报错拒绝。
-    nodes: usize,
-    over_budget: bool,
+    /// 跨全部 typed ask 共享的展开预算（近似 schema 节点数，含从帧里 clone 出来的
+    /// 实参子树）：深度上限 8 挡不住「宽别名 × 嵌套实例化」的指数展开，而编译发生
+    /// 在 QuickJS 的内存/执行限制之前——必须自带预算，超限报错拒绝。
+    budget: &'a mut Budget,
 }
-
-/// schema 展开的节点数预算。正常 facade schema 远小于此（几十到几百节点）。
-const MAX_SCHEMA_NODES: usize = 50_000;
 
 /// schema 树的近似节点数（对象 / 数组的值逐个计入）。
 fn schema_size(value: &Value) -> usize {
@@ -722,13 +746,13 @@ fn schema_size(value: &Value) -> usize {
 impl<'a> SchemaCompiler<'a> {
     /// 预算入账 + 超限判定：超限只报一次诊断，之后所有 compile 调用 O(1) 快速返回。
     fn charge(&mut self, nodes: usize, offset: u32) {
-        self.nodes = self.nodes.saturating_add(nodes);
-        if self.nodes > MAX_SCHEMA_NODES && !self.over_budget {
-            self.over_budget = true;
+        self.budget.nodes = self.budget.nodes.saturating_add(nodes);
+        if self.budget.nodes > MAX_SCHEMA_NODES && !self.budget.over {
+            self.budget.over = true;
             self.diagnostics.push((
                 offset,
                 format!(
-                    "类型展开超过 {MAX_SCHEMA_NODES} 节点上限：缩小别名宽度或实例化嵌套层数"
+                    "类型展开超过 {MAX_SCHEMA_NODES} 节点上限：缩小别名宽度、实例化层数或 ask 数量"
                 ),
             ));
         }
@@ -738,7 +762,7 @@ impl<'a> SchemaCompiler<'a> {
 impl<'a> SchemaCompiler<'a> {
     fn compile(&mut self, ty: &'a TSType<'a>, depth: usize, alias_depth: usize) -> Value {
         self.charge(1, ty.span().start);
-        if self.over_budget {
+        if self.budget.over {
             return json!({});
         }
         if depth > MAX_TYPE_DEPTH {
@@ -988,7 +1012,7 @@ impl<'a> SchemaCompiler<'a> {
             .find_map(|frame| frame.get(name).cloned());
         if let Some(schema) = hit {
             self.charge(schema_size(&schema), span_start);
-            return if self.over_budget {
+            return if self.budget.over {
                 json!({})
             } else {
                 schema
@@ -1525,6 +1549,24 @@ mod extended_type_tests {
         assert_eq!(
             small.typed_asks[0].1["properties"]["a"]["properties"]["b"]["type"],
             "number"
+        );
+    }
+
+    #[test]
+    fn expansion_budget_is_shared_across_asks() {
+        // 回归：预算曾按 ask 重置——很多个「中等大小」的 ask 加总照样爆内存
+        //（输入远在 100k 字符限内）。全部 ask 共享同一预算（或聚合脚本长度上限），
+        // 超限整体拒绝。
+        let mut script = String::from("type Pair<T> = { a: T, b: T };\nconst h = agent(\"h\");\n");
+        for index in 0..3000 {
+            script.push_str(&format!("await h.ask<Pair<Pair<number>>>(\"q{index}\");\n"));
+        }
+        let diagnostics = compile_typed_asks(&script).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("展开超过") || d.message.contains("字符上限")),
+            "{diagnostics:?}"
         );
     }
 

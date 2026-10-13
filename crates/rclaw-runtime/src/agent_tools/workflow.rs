@@ -476,12 +476,32 @@ fn type_check_with_tsc(script: &str) -> Option<Vec<FacadeDiagnostic>> {
 /// 超深嵌套（> 8）按错误处理。
 /// JSON Schema 语义的值相等：数值按数学值比较（serde_json 的 `Value` 相等区分
 /// 整数 / 浮点表示——`1` ≠ `1.0`，而 ask<1> 的答案序列化成 `1.0` / `1e0` 应放行）；
+/// 整数值跨表示比较时走【精确整数】路径——f64 在 2^53 以上会合并相邻整数
+/// （9007199254740992 与 ...993 转换后相等，const / enum 校验被静默绕过）；
 /// 其余类型退回结构相等。
 fn json_schema_equal(a: &Value, b: &Value) -> bool {
-    if let (Some(left), Some(right)) = (a.as_f64(), b.as_f64()) {
-        if a.is_number() && b.is_number() {
+    if let (Some(left), Some(right)) = (a.as_i64(), b.as_i64()) {
+        return left == right;
+    }
+    if a.is_number() && b.is_number() {
+        let (Some(left), Some(right)) = (a.as_f64(), b.as_f64()) else {
+            return a == b;
+        };
+        if left.fract() != 0.0 || right.fract() != 0.0 {
             return left == right;
         }
+        // 两个都是整数值：能用整数表示就精确比较，溢出 i64/u64 的大数才退回 f64
+        //（JSON 数值超过 2^53 时生产端本就只有浮点精度）。
+        let exact = |value: &Value| -> Option<i128> {
+            value
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| value.as_u64().map(|u| u as i128))
+        };
+        if let (Some(left), Some(right)) = (exact(a), exact(b)) {
+            return left == right;
+        }
+        return left == right;
     }
     a == b
 }
@@ -2747,6 +2767,19 @@ mod validator_tests {
         assert!(validate_json_schema(&json!(3.0), &enum_schema, 0).is_err());
         // 字符串等非数值不受影响（"1" 仍不等 1）。
         assert!(validate_json_schema(&json!("1"), &json!({"const": 1}), 0).is_err());
+        // 回归：2^53 以上的整数走精确比较——f64 转换曾把相邻大整数合并成相等，
+        // const / enum 校验被静默绕过。
+        let big_const = json!({"const": 9007199254740992i64});
+        assert!(validate_json_schema(&json!(9007199254740992i64), &big_const, 0).is_ok());
+        assert!(
+            validate_json_schema(&json!(9007199254740993i64), &big_const, 0).is_err(),
+            "相邻大整数不得被 f64 转换合并"
+        );
+        // 跨表示的同一整数值（i64 vs 浮点形态）仍按数学值相等放行。
+        assert!(
+            validate_json_schema(&json!(9007199254740992.0f64), &big_const, 0).is_ok(),
+            "整数与它的浮点形态相等"
+        );
     }
 }
 

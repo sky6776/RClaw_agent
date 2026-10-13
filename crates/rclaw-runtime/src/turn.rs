@@ -1514,8 +1514,22 @@ impl TurnManager {
     /// 到新 chat_id（源会话与工作区都不动）。fork 不持静默门：它只创建新会话，与运行中
     /// turn 的追加互不干扰（活动视图在读写各自的快照里取）。
     async fn handle_fork(&self, channel: &str, chat_id: &str, content: &str) -> String {
-        let mut parts = content.split_whitespace();
-        let _command = parts.next();
+        // 命令头消费与 [`RuntimeCommand::parse`] / [`Self::handle_goal`] 同规则
+        // （`/` 后可有空白、命令名大小写不敏感）：`/ fork 123` 按「丢第一个 token」
+        // 的旧写法会把 `fork` 当成锚点参数，命令永远失败。
+        let after_slash = content
+            .trim()
+            .strip_prefix('/')
+            .map(str::trim_start)
+            .unwrap_or_else(|| content.trim());
+        let mut head = after_slash.splitn(2, char::is_whitespace);
+        let name = head.next().unwrap_or("");
+        let args = if name.eq_ignore_ascii_case("fork") {
+            head.next().unwrap_or("").trim()
+        } else {
+            after_slash.trim()
+        };
+        let mut parts = args.split_whitespace();
         let session = self.session.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();

@@ -8710,6 +8710,15 @@ async fn fork_command_lists_anchors_and_forks_to_new_session() {
     assert!(bad.contains("非法锚点 id"), "{bad}");
     let hidden = mgr.handle_fork("cli", "console", "/fork 99999").await;
     assert!(hidden.contains("⚠️"), "{hidden}");
+
+    // 回归：命令头消费与 dispatch 同规则（`/` 后可有空白）——`/ fork <id>` 曾把
+    // `fork` 当成锚点参数，命令永远失败；`/ fork` 也应列出锚点而非报错。
+    let spaced = mgr
+        .handle_fork("cli", "console", &format!("/ fork {}", ids[2]))
+        .await;
+    assert!(spaced.contains("✅"), "{spaced}");
+    let spaced_list = mgr.handle_fork("cli", "console", "/ fork").await;
+    assert!(spaced_list.contains("可分叉锚点"), "{spaced_list}");
 }
 
 // ---------------------------------------------------------------------------
