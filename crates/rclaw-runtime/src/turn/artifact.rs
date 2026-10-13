@@ -29,9 +29,6 @@ use crate::options::AgentOptions;
 
 /// 预览预算（头 + 尾合计，中段以省略标记替代）。
 const PREVIEW_BYTES: usize = 4096;
-/// 会话键的最大长度（截断，不报错）。
-const CHAT_KEY_MAX_CHARS: usize = 64;
-
 /// 从 [`AgentOptions`] 派生的落盘配置（`Clone` 便宜，随执行上下文传递）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ToolResultSpill {
@@ -48,24 +45,10 @@ impl ToolResultSpill {
     }
 }
 
-/// 会话键：`[A-Za-z0-9._-]` 之外替换成 `_`，防 chat_id 里的路径分隔符逃出目录。
+/// 会话键：规则单一事实源在 [`rclaw_store::session::artifact_chat_key`]（store 的
+/// 会话删除级联清理用同一规则定位目录）。
 pub(crate) fn sanitize_chat_key(channel: &str, chat_id: &str) -> String {
-    let raw = if chat_id.is_empty() {
-        format!("subagent-{channel}")
-    } else {
-        format!("{channel}-{chat_id}")
-    };
-    let sanitized: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    sanitized.chars().take(CHAT_KEY_MAX_CHARS).collect()
+    rclaw_store::session::artifact_chat_key(channel, chat_id)
 }
 
 /// artifact 文件名：纳秒单调 id（复用 rewind 的分配器语义，进程内严格递增、可读时间）
@@ -152,11 +135,8 @@ mod tests {
         assert_eq!(sanitize_chat_key("a/b", "c\\d e"), "a_b-c_d_e");
         // 子代理（无源会话）按来源通道归档。
         assert_eq!(sanitize_chat_key("desktop", ""), "subagent-desktop");
-        // 超长键截断。
-        assert_eq!(
-            sanitize_chat_key("x", &"9".repeat(200)).chars().count(),
-            CHAT_KEY_MAX_CHARS
-        );
+        // 超长键截断（规则在 store::artifact_chat_key，长度 64）。
+        assert_eq!(sanitize_chat_key("x", &"9".repeat(200)).chars().count(), 64);
     }
 
     #[test]

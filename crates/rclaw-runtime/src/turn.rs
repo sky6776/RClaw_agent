@@ -1305,6 +1305,87 @@ impl TurnManager {
         format!("session-goal/{channel}/{chat_id}")
     }
 
+    /// 解析审计输出：正文里第一个平衡 JSON 对象里的 `goal_met`（布尔）与
+    /// `evidence_summary`；缺失 / 非布尔 / 不可解析 → None（目标保持，绝不误清）。
+    fn parse_goal_audit(text: &str) -> Option<(bool, String)> {
+        let start = text.find('{')?;
+        let end = text.rfind('}')?;
+        let candidate = text.get(start..=end)?;
+        let value: serde_json::Value = serde_json::from_str(candidate).ok()?;
+        let met = value.get("goal_met")?.as_bool()?;
+        let summary = value
+            .get("evidence_summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Some((met, summary))
+    }
+
+    /// 目标完成审计（无工具小推理；ZCode completion verifier 轻量对位）：
+    /// 判定「本轮汇报是否以可核对证据证实目标达成」。达成 → 清 goal + 系统回执；
+    /// 其余情况静默（失败只告警，绝不误清目标）。
+    fn spawn_goal_audit(
+        &self,
+        objective: String,
+        final_reply: String,
+        channel: String,
+        chat_id: String,
+    ) {
+        let provider = self.provider.clone();
+        let session = self.session.clone();
+        let outbound = self.outbound_tx.clone();
+        tokio::spawn(async move {
+            // 审计截断：目标 ≤2000、汇报 ≤4000 字符（设定侧已限目标长度）。
+            let reply: String = final_reply.chars().take(4000).collect();
+            let mut request = ChatRequest::new(
+                Some(
+                    "你是目标完成审计员。判断【目标】是否已由【工作汇报】证实达成。
+                     判定标准：汇报中必须包含可核对的完成证据（具体产物 / 测试结果 / 命令                     输出 / 交付物路径等）；计划、承诺、进行中、部分完成都不算达成。
+                     只输出一个 JSON 对象：{\"goal_met\": true|false, \"evidence_summary\": \"一句话依据\"}，                     不要输出其它内容。"
+                        .to_string(),
+                ),
+                vec![Message::plain(
+                    Role::User,
+                    format!("【目标】{objective}
+
+【工作汇报】{reply}").as_str(),
+                )],
+            );
+            request.max_tokens = 200;
+            let outcome = match provider.chat(request).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::debug!("目标完成审计调用失败（目标保持）：{error}");
+                    return;
+                }
+            };
+            let verdict = Self::parse_goal_audit(&outcome.text);
+            match verdict {
+                Some((true, summary)) => {
+                    let key = Self::goal_key(&channel, &chat_id);
+                    if let Err(error) = session.journal().kv_delete(&key) {
+                        tracing::warn!("目标审计通过但清除失败（目标保留）：{error}");
+                        return;
+                    }
+                    let receipt = if summary.is_empty() {
+                        "🎯 会话目标已达成（完成审计确认），goal 已自动清除。".to_string()
+                    } else {
+                        format!("🎯 会话目标已达成（完成审计确认：{summary}），goal 已自动清除。")
+                    };
+                    let _ = outbound
+                        .send(BusMessage::new(channel, chat_id, receipt))
+                        .await;
+                }
+                Some((false, _)) => {
+                    // 未达成：不动作（下轮提醒继续驱动）。
+                }
+                None => {
+                    tracing::debug!("目标完成审计输出不可解析（目标保持）：{}", outcome.text);
+                }
+            }
+        });
+    }
+
     /// 活动目标的提醒块（无目标 / 读库失败 → None）。注入每次推理尾部，对齐 ZCode
     /// goal reminder：持续工作 + 按证据核对 + 不自行宣告完成 + 提醒用户收尾。
     fn goal_reminder_block(
@@ -1371,7 +1452,7 @@ impl TurnManager {
                     Ok(()) => format!(
                         "🎯 会话目标已设定：{objective}
 
-此后本会话每次回复都会收到该目标提醒，                         在目标达成前请持续朝它工作并按证据核对；用户确认达成后会用 /goal clear 收尾。"
+此后本会话每次回复都会收到该目标提醒，                         在目标达成前请持续朝它工作并按证据核对；每次成功收尾系统会用一次小审计                         核对证据，确认达成后自动清除目标（也可随时 /goal clear 手动收尾）。"
                     ),
                     Err(error) => format!("⚠️ 目标写入失败: {error}"),
                 }
@@ -1426,6 +1507,27 @@ impl TurnManager {
                 out
             }
             Some(id_text) => {
+                let mut rest = parts.clone();
+                // /fork <id> [full] [files]：full = 完整转录分叉（含被压缩折叠的原文）；
+                // files = 同时把工作区文件回滚到锚点时刻（与 /rewind 同纪律：任何会话
+                // 有活动 turn / 后台 review 时拒绝——文件不分会话）。
+                let full_transcript = rest.clone().any(|token| token.eq_ignore_ascii_case("full"));
+                let rewind_files = rest.any(|token| token.eq_ignore_ascii_case("files"));
+                let _gate = if rewind_files {
+                    match self.gate.try_acquire() {
+                        Some(gate) => Some(gate),
+                        None => {
+                            let (turns, _reviews) = self.gate.running();
+                            return if turns > 0 {
+                                "⏳ 有任务正在运行，文件回滚已中止：请先 /cancel 或等其结束后重试。".to_string()
+                            } else {
+                                "⏳ 后台 review / 维护操作仍在运行，文件回滚已中止：请稍后重试。".to_string()
+                            };
+                        }
+                    }
+                } else {
+                    None
+                };
                 let Ok(anchor_id) = id_text.trim_start_matches('#').parse::<i64>() else {
                     return format!("非法锚点 id「{id_text}」：应为 /fork 列表里 # 后的数字。");
                 };
@@ -1454,16 +1556,60 @@ impl TurnManager {
                         return "⚠️ 无法为分叉会话分配新 id，请稍后重试。".to_string();
                     }
                 }
+                let self_channel = channel.clone();
+                let self_chat = chat_id.clone();
                 let forked = tokio::task::spawn_blocking(move || {
-                    session.fork_session(&channel, &chat_id, anchor_id, &fork_target)
+                    session.fork_session(&channel, &chat_id, anchor_id, &fork_target, full_transcript)
                 })
                 .await;
                 match forked {
-                    Ok(Ok(fork)) => format!(
-                        "✅ 已从消息 #{anchor_id} 分叉出新会话 `{}`（复制了 {} 条可见历史）。
+                    Ok(Ok(fork)) => {
+                        let mut report = format!(
+                            "✅ 已从消息 #{anchor_id} 分叉出新会话 `{}`（复制了 {} 条{}历史）。",
+                            fork.new_chat_id,
+                            fork.copied,
+                            if full_transcript { "完整转录" } else { "可见" }
+                        );
+                        if rewind_files {
+                            // 文件联动：把锚点之后的 checkpointed 写入回滚到锚点时刻。
+                            // 历史已 fork（不回退）；文件回滚失败时如实分项报告。
+                            let session = self.session.clone();
+                            let (channel2, chat2) =
+                                (self_channel.clone(), self_chat.clone());
+                            let restored = tokio::task::spawn_blocking(move || {
+                                rewind::restore_to_message(&session, &channel2, &chat2, anchor_id)
+                            })
+                            .await;
+                            match restored {
+                                Ok(Ok(file_report)) => {
+                                    report.push_str(&format!(
+                                        "
+
+📁 文件已一并回滚到锚点时刻（影响全局工作区，                                         原会话与新分支共享同一工作区）：
+{file_report}"
+                                    ));
+                                }
+                                Ok(Err(error)) => {
+                                    report.push_str(&format!(
+                                        "
+
+⚠️ 文件回滚未执行（新会话历史不受影响）：{error}"
+                                    ));
+                                }
+                                Err(error) => {
+                                    report.push_str(&format!("
+
+⚠️ 文件回滚任务异常: {error}"));
+                                }
+                            }
+                        } else {
+                            report.push_str(
+                                "
 原会话与工作区文件均未改动；在桌面端会话列表里打开新分支继续，或换到该会话上下文后直接对话。",
-                        fork.new_chat_id, fork.copied
-                    ),
+                            );
+                        }
+                        report
+                    }
                     Ok(Err(error)) => format!("⚠️ {error}"),
                     Err(error) => format!("⚠️ fork 任务执行异常: {error}"),
                 }
@@ -3171,6 +3317,32 @@ impl TurnManager {
                 messages.push(final_msg);
             }
             completed_successfully = true;
+
+            // /goal 完成审计（第十二轮后续项，ZCode completion verifier 的轻量对位）：
+            // 本会话有活动目标时，成功收尾后用一次无工具的小推理审计「本轮汇报是否以
+            // 可核对证据证实目标达成」。达成 → 清除 goal + 投一条系统回执；未达成 /
+            // 审计失败 → 不动（下轮提醒继续驱动）。异步执行，不阻塞收尾回复。
+            let goal_objective = self
+                .session
+                .journal()
+                .kv_get(&Self::goal_key(&msg.channel, &msg.chat_id))
+                .ok()
+                .flatten()
+                .and_then(|goal| {
+                    goal.get("objective")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            if self.opts.goal_audit_enabled && !text.is_empty() {
+                if let Some(objective) = goal_objective {
+                    self.spawn_goal_audit(
+                        objective,
+                        text.clone(),
+                        msg.channel.clone(),
+                        msg.chat_id.clone(),
+                    );
+                }
+            }
 
             // CLI 的 streaming provider 输出经过完成门禁缓冲；验证通过后才一次性写 stdout。
             // 非 CLI 通道仍经 outbound 投递。

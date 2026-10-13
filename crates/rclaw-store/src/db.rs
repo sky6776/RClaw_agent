@@ -17,7 +17,12 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Result;
 
 /// 当前 schema 版本（`PRAGMA user_version`）。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// v1 → v2：`file_checkpoint` 加 `anchor_message_id` 列（checkpoint 与同事务写入的
+/// tool_result 消息行的关联；「fork + 文件回滚到锚点」按它切回滚集。旧行 NULL =
+/// 迁移前的记录，归属未知，按消息锚点回滚时不参与）。
+const SCHEMA_V2_MIGRATION: &str = "ALTER TABLE file_checkpoint ADD COLUMN anchor_message_id INTEGER;";
 
 /// v1 schema。字段语义见 `docs/superpowers/specs/2026-10-12-sqlite-state-store-design.md`。
 const SCHEMA_V1: &str = r#"
@@ -245,6 +250,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         if version < 1 {
             conn.execute_batch(SCHEMA_V1)?;
         }
+        if version < 2 {
+            conn.execute_batch(SCHEMA_V2_MIGRATION)?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     })();
@@ -393,5 +401,71 @@ mod tests {
             .with(|c| Ok(c.query_row("SELECT rclaw_lower(NULL)", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(null, None);
+    }
+}
+
+#[cfg(test)]
+mod v2_migration_tests {
+    use super::*;
+
+    #[test]
+    fn v1_database_migrates_to_v2_with_checkpoint_anchor_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        // 手造 v1 库：建 v1 schema、插一行 checkpoint、盖 user_version=1。
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO session(channel, chat_id, created_at, updated_at) VALUES ('cli','c',1,1)",
+                [],
+            )
+            .unwrap();
+            let sid: i64 = conn.query_row("SELECT id FROM session", [], |r| r.get(0)).unwrap();
+            conn.execute(
+                "INSERT INTO file_checkpoint(session_id, group_id, path, before, before_hash, \
+                 after_hash, is_rewind) VALUES (?1, 100, 'a.txt', 'v1', 'h1', 'h2', 0)",
+                [sid],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1_i64).unwrap();
+        }
+        // 正常打开：迁移到 v2，旧行在、anchor 列为 NULL。
+        let db = Db::open(&path).unwrap();
+        db.with(|conn| {
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(version, SCHEMA_VERSION);
+            let (count, anchor): (i64, Option<i64>) = conn.query_row(
+                "SELECT count(*), min(anchor_message_id) FROM file_checkpoint",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(count, 1, "迁移不丢数据");
+            assert_eq!(anchor, None, "旧行 anchor 为 NULL（归属未知，不参与按消息回滚）");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn fresh_database_creates_v2_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("state.sqlite")).unwrap();
+        db.with(|conn| {
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(version, SCHEMA_VERSION);
+            // v2 列可直接写入（先建会话行满足外键）。
+            conn.execute(
+                "INSERT INTO session(channel, chat_id, created_at, updated_at) VALUES ('c','k',1,1)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO file_checkpoint(session_id, group_id, path, is_rewind, \
+                 anchor_message_id) VALUES ((SELECT id FROM session), 1, 'p', 0, 42)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     }
 }

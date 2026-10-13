@@ -720,7 +720,7 @@ export default function App() {
   // 消息「分叉到新会话」（ZCode fork 同款，第十二轮）：解析该消息的持久化行 id
   // （直播条目缺省时从 chat_history 按 role+content 从尾往前匹配），fork 后切到新会话。
   const handleFork = useCallback(
-    async (entry: Entry) => {
+    async (entry: Entry, full = false, files = false) => {
       let anchorId = entry.msgId ?? null;
       if (anchorId === null) {
         try {
@@ -740,10 +740,22 @@ export default function App() {
         setErrorToast("未找到该消息的持久化记录（可能尚未落库），请稍后重试");
         return;
       }
+      // 文件联动走斜杠命令（`/fork <id> files`）：运行时侧有与 /rewind 同款的
+      // 静默门（活动 turn / 后台 review 时拒绝），命令经完整 dispatch 语义执行；
+      // 报告以消息形式回到会话流。
+      if (files) {
+        const suffix = full ? " full files" : " files";
+        try {
+          await api.send(activeId, `/fork ${anchorId}${suffix}`);
+        } catch (e) {
+          setErrorToast(`发送分叉命令失败: ${String(e)}`);
+        }
+        return;
+      }
       try {
-        const fork = await api.chatFork(activeId, anchorId);
+        const fork = await api.chatFork(activeId, anchorId, full);
         await refreshChats();
-        setErrorToast(`✅ 已分叉出新会话（复制 ${fork.copied} 条历史）`);
+        setErrorToast(`✅ 已分叉出新会话（复制 ${fork.copied} 条${full ? "完整转录" : "可见"}历史）`);
         void openChat(fork.chat_id);
       } catch (e) {
         setErrorToast(`分叉失败: ${String(e)}`);
@@ -1353,7 +1365,9 @@ export default function App() {
                             ? "text-red-400"
                             : step.status === "skipped"
                               ? "text-gray-600"
-                              : "text-amber-400"
+                              : step.status === "running"
+                                ? "text-indigo-400"
+                                : "text-amber-400"
                       }
                     >
                       {step.status === "succeeded"
@@ -1362,7 +1376,9 @@ export default function App() {
                           ? "✗"
                           : step.status === "skipped"
                             ? "⤼"
-                            : "☐"}
+                            : step.status === "running"
+                              ? "◌"
+                              : "☐"}
                     </span>
                     <span
                       className="min-w-0 truncate text-gray-400"

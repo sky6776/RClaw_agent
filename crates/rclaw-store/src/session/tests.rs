@@ -136,6 +136,7 @@ fn tool_chain_is_one_transaction() {
         before_hash: Some("h0".into()),
         after_hash: Some("h1".into()),
         is_rewind: false,
+        anchor_message_id: None,
     };
     s.append_tool_chain_with_checkpoints("cli", "console", &asst, &tool_result, 77, &[cp])
         .unwrap();
@@ -1044,6 +1045,7 @@ fn clear_all_sessions_empties_tables_and_keeps_journal() {
             before_hash: None,
             after_hash: Some("h".into()),
             is_rewind: false,
+            anchor_message_id: None,
         }],
     )
     .unwrap();
@@ -1106,6 +1108,7 @@ fn file_checkpoints_keep_insert_order_and_group() {
         before_hash: None,
         after_hash: Some("h".into()),
         is_rewind: gid == 0,
+        anchor_message_id: None,
     };
     s.append_file_checkpoints("cli", "c", 10, &[cp("a", 0), cp("b", 0)]).unwrap();
     s.append_file_checkpoints("cli", "c", 20, &[cp("c", 0)]).unwrap();
@@ -1332,6 +1335,7 @@ fn checkpoint_meta_and_range_loaders() {
         before_hash: Some(format!("h-{before}")),
         after_hash: Some("after".into()),
         is_rewind: false,
+        anchor_message_id: None,
     };
     s.append_file_checkpoints("cli", "c", 10, &[cp("a", "A0"), cp("b", "B0")]).unwrap();
     s.append_file_checkpoints("cli", "c", 20, &[cp("a", "A1")]).unwrap();
@@ -1377,6 +1381,7 @@ fn checkpoint_only_writes_do_not_touch_session_updated_at() {
             before_hash: None,
             after_hash: Some("h".into()),
             is_rewind: false,
+            anchor_message_id: None,
         }],
     )
     .unwrap();
@@ -1395,6 +1400,7 @@ fn checkpoint_only_writes_do_not_touch_session_updated_at() {
             before_hash: None,
             after_hash: None,
             is_rewind: false,
+            anchor_message_id: None,
         }],
     )
     .unwrap();
@@ -1448,6 +1454,7 @@ fn tool_chain_failure_rolls_back_whole_transaction() {
                 before_hash: None,
                 after_hash: Some("h".into()),
                 is_rewind: false,
+                anchor_message_id: None,
             }],
         )
         .unwrap_err();
@@ -1492,7 +1499,7 @@ fn fork_copies_active_view_prefix_and_keeps_source_untouched() {
     let ids = chat_sequence(&s, 6); // m0(u) m1(a) m2(u) m3(a) m4(u) m5(a)
 
     let fork = s
-        .fork_session("cli", "c", ids[2], "c-fork-1")
+        .fork_session("cli", "c", ids[2], "c-fork-1", false)
         .expect("fork 应成功");
     assert_eq!(fork.copied, 3, "锚点 m2 及其前共 3 条");
     assert_eq!(fork.anchor_message_id, ids[2]);
@@ -1525,17 +1532,17 @@ fn fork_rejects_unknown_or_hidden_anchor_and_duplicate_target() {
         .unwrap();
 
     // 被折叠的消息不可作锚（不在活动视图）。
-    let err = s.fork_session("cli", "c", ids[3], "c-fork-x").unwrap_err();
+    let err = s.fork_session("cli", "c", ids[3], "c-fork-x", false).unwrap_err();
     assert!(err.to_string().contains("不在"), "{err}");
 
     // 视图内的锚点（尾窗 m6）照常。
-    let fork = s.fork_session("cli", "c", ids[6], "c-fork-a").unwrap();
+    let fork = s.fork_session("cli", "c", ids[6], "c-fork-a", false).unwrap();
     assert_eq!(fork.copied, 4, "m0,m1,summary,m6");
     // 目标已存在 → 拒绝覆盖。
-    let err = s.fork_session("cli", "c", ids[6], "c-fork-a").unwrap_err();
+    let err = s.fork_session("cli", "c", ids[6], "c-fork-a", false).unwrap_err();
     assert!(err.to_string().contains("已存在"), "{err}");
     // 源会话不存在。
-    let err = s.fork_session("cli", "nope", ids[0], "x").unwrap_err();
+    let err = s.fork_session("cli", "nope", ids[0], "x", false).unwrap_err();
     assert!(err.to_string().contains("不存在"), "{err}");
 }
 
@@ -1546,7 +1553,7 @@ fn fork_copies_boundary_summary_as_plain_row() {
     let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
     s.append_compaction("cli", "c", &summary, Some(ids[1]), ids[6])
         .unwrap();
-    s.fork_session("cli", "c", ids[7], "c-fork-b").unwrap();
+    s.fork_session("cli", "c", ids[7], "c-fork-b", false).unwrap();
 
     // 新会话里 boundary 是普通行（meta NULL）：可见历史是 fork 时刻的完整可见视图，
     // 且新会话自己后续再压缩时不受旧锚点污染。
@@ -1606,4 +1613,72 @@ fn recent_user_anchors_list_real_user_messages_newest_first() {
     assert_eq!(anchors[0].2.chars().count(), 120);
     // 不存在的会话 → 空列表。
     assert!(s.recent_user_anchors("cli", "nope", 5).unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// artifact 目录级联清理（第十二轮后续项）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delete_session_cascades_artifact_dir_and_clear_wipes_root() {
+    let (_g, s) = store();
+    let base = s.layout().base.clone();
+    let a_dir = base.join("artifacts").join("cli-console");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("1799-read.txt"), "big output").unwrap();
+    let other_dir = base.join("artifacts").join("cli-other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    // 无关会话的 artifact 也在（键规则与 runtime artifact.rs 同源）。
+    s.append("cli", "console", &Message::plain(Role::User, "m")).unwrap();
+
+    assert!(s.delete_session("cli", "console").unwrap());
+    assert!(!a_dir.exists(), "会话删除应级联清理其 artifact 目录");
+    assert!(other_dir.exists(), "无关会话的 artifact 不受影响");
+
+    // 会话不存在 → 幂等成功，不动目录。
+    std::fs::create_dir_all(&a_dir).unwrap();
+    assert!(!s.delete_session("cli", "console").unwrap());
+    assert!(a_dir.exists(), "删除不存在的会话不得误清目录");
+
+    // /clear：全部会话清空时 artifacts 根一并移除。
+    s.clear_all_sessions().unwrap();
+    assert!(!base.join("artifacts").exists(), "clear 应清空 artifacts 根");
+}
+
+#[test]
+fn fork_full_transcript_carries_folded_messages_and_hidden_anchor() {
+    let (_g, s) = store();
+    let ids = chat_sequence(&s, 8);
+    // 摘要掉 m2..m5（受保护头部 m0,m1；尾窗 m6,m7）。
+    let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
+    s.append_compaction("cli", "c", &summary, Some(ids[1]), ids[6])
+        .unwrap();
+
+    // 被折叠的消息（m3）作锚：视图分叉拒绝，full 分叉成功并携带被折叠原文。
+    let err = s
+        .fork_session("cli", "c", ids[3], "c-fork-view", false)
+        .unwrap_err();
+    assert!(err.to_string().contains("不在会话"), "{err}");
+    let fork = s
+        .fork_session("cli", "c", ids[3], "c-fork-full", true)
+        .expect("full 分叉应成功");
+    // 完整转录前缀 = m0..m3（含被折叠的 m2、m3 原文）。
+    assert_eq!(fork.copied, 4);
+    assert_eq!(
+        texts(&s.load_all("cli", "c-fork-full").unwrap()),
+        vec!["m0", "m1", "m2", "m3"],
+        "full 分叉应包含被压缩折叠的原文"
+    );
+    // 源会话视图不变。
+    assert_eq!(
+        texts(&s.load_all("cli", "c").unwrap()),
+        vec!["m0", "m1", "[CONTEXT COMPACTION] summary", "m6", "m7"]
+    );
+
+    // full 分叉锚点在视图内也成立（尾窗 m6）：前缀含全部行（折叠段 + boundary 摘要行）。
+    let fork_tail = s
+        .fork_session("cli", "c", ids[6], "c-fork-tail", true)
+        .unwrap();
+    // boundary 行 id 最大（> m7），id ≤ m6 的转录前缀不含它：m0..m6 共 7 行。
+    assert_eq!(fork_tail.copied, 7);
 }

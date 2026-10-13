@@ -575,6 +575,7 @@ pub async fn chat_fork(
     state: State<'_, AppState>,
     chat_id: String,
     anchor_message_id: i64,
+    full: Option<bool>,
 ) -> Result<ChatForkDto, String> {
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
@@ -605,9 +606,16 @@ pub async fn chat_fork(
         }
     }
     let fork_target = target.clone();
+    let full_transcript = full.unwrap_or(false);
     let fork = run_blocking("分叉会话", move || {
         session
-            .fork_session(CHANNEL_DESKTOP, &chat_id, anchor_message_id, &fork_target)
+            .fork_session(
+                CHANNEL_DESKTOP,
+                &chat_id,
+                anchor_message_id,
+                &fork_target,
+                full_transcript,
+            )
             .map_err(|e| e.to_string())
     })
     .await?;
@@ -621,7 +629,7 @@ pub async fn chat_fork(
 #[derive(Debug, Serialize)]
 pub struct PlanStepDto {
     pub id: String,
-    /// pending | succeeded | failed | skipped。
+    /// pending | running | succeeded | failed | skipped。
     pub status: String,
     /// 步骤任务文本（plan_started 里截断到 80 字符）。
     pub task: String,
@@ -720,6 +728,14 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
                 plan.succeeded = event.get("succeeded").and_then(serde_json::Value::as_u64);
             }
             Some("plan_paused") => plan.paused = true,
+            // step_started：步骤级「运行中」（终态事件在其后覆盖；重跑重记按序生效）。
+            Some("step_started") => {
+                if let Some(id) = event.get("step").and_then(serde_json::Value::as_str) {
+                    if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
+                        step.status = "running".into();
+                    }
+                }
+            }
             Some("step_finished") => {
                 let id = event
                     .get("step")
@@ -5210,6 +5226,39 @@ mod plan_projection_tests {
         assert_eq!(legacy.steps.len(), 2);
         assert_eq!(legacy.steps[0].id, "x");
         assert_eq!(legacy.steps[0].status, "pending");
+    }
+
+    #[test]
+    fn projection_marks_started_steps_running_until_terminal() {
+        let mut plan = blank_plan();
+        project_plan_events(
+            &mut plan,
+            &[
+                (
+                    1,
+                    serde_json::json!({
+                        "ts": 1000,
+                        "event": "plan_started",
+                        "steps": [{"id": "a", "task": "t"}, {"id": "b", "task": "u"}]
+                    }),
+                ),
+                (2, serde_json::json!({"ts": 1100, "event": "step_started", "step": "a"})),
+                (3, serde_json::json!({"ts": 1200, "event": "step_started", "step": "b"})),
+            ],
+        );
+        assert_eq!(plan.steps[0].status, "running");
+        assert_eq!(plan.steps[1].status, "running");
+        // 终态覆盖运行中；重跑（started 在 finished 后）重新置 running。
+        project_plan_events(
+            &mut plan,
+            &[(4, serde_json::json!({"ts": 1300, "event": "step_finished", "step": "a", "outcome": "succeeded"}))],
+        );
+        assert_eq!(plan.steps[0].status, "succeeded");
+        project_plan_events(
+            &mut plan,
+            &[(5, serde_json::json!({"ts": 1400, "event": "step_started", "step": "a"}))],
+        );
+        assert_eq!(plan.steps[0].status, "running");
     }
 
     #[test]

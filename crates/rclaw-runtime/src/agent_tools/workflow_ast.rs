@@ -439,17 +439,36 @@ pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<
 /// 有效，别名类型经 `CloneIn` 克隆进 arena 后跨回调保存。
 struct AliasCollector<'a> {
     allocator: &'a Allocator,
-    aliases: HashMap<String, TSType<'a>>,
+    aliases: HashMap<String, AliasDef<'a>>,
+}
+
+/// 一条类型别名定义：泛型参数名（按声明序，无泛型为空）+ 类型体（arena 克隆）。
+/// 实例化（`Box<string>`）由 SchemaCompiler 做语法层代入。
+pub(crate) struct AliasDef<'a> {
+    pub(crate) params: Vec<String>,
+    pub(crate) body: TSType<'a>,
 }
 
 impl<'a> Visit<'a> for AliasCollector<'a> {
     fn visit_ts_type_alias_declaration(&mut self, it: &TSTypeAliasDeclaration<'a>) {
-        if it.type_parameters.is_none() {
-            self.aliases.insert(
-                it.id.name.as_str().to_string(),
-                it.type_annotation.clone_in(self.allocator),
-            );
-        }
+        let params: Vec<String> = it
+            .type_parameters
+            .as_ref()
+            .map(|parameters| {
+                parameters
+                    .params
+                    .iter()
+                    .map(|parameter| parameter.name.name.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.aliases.insert(
+            it.id.name.as_str().to_string(),
+            AliasDef {
+                params,
+                body: it.type_annotation.clone_in(self.allocator),
+            },
+        );
     }
 }
 
@@ -458,7 +477,7 @@ struct TypedAskWalker<'a> {
     replacements: Vec<(usize, usize, String)>,
     diagnostics: Vec<FacadeDiagnostic>,
     typed_asks: Vec<(usize, Value)>,
-    aliases: &'a HashMap<String, TSType<'a>>,
+    aliases: &'a HashMap<String, AliasDef<'a>>,
     wrapped: &'a str,
 }
 
@@ -535,6 +554,7 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
         };
         let mut compiler = SchemaCompiler {
             aliases: self.aliases,
+            type_args: Vec::new(),
             diagnostics: Vec::new(),
         };
         let schema = compiler.compile(type_node, 0, 0);
@@ -562,12 +582,15 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
 // ---------------------------------------------------------------------------
 
 struct SchemaCompiler<'a> {
-    aliases: &'a HashMap<String, TSType<'a>>,
+    aliases: &'a HashMap<String, AliasDef<'a>>,
+    /// 泛型实例化栈（别名参数名 → 实参类型引用）：compile_reference 命中参数名时
+    /// 栈顶向下查找代入。
+    type_args: Vec<HashMap<String, &'a TSType<'a>>>,
     diagnostics: Vec<(u32, String)>,
 }
 
 impl<'a> SchemaCompiler<'a> {
-    fn compile(&mut self, ty: &TSType<'a>, depth: usize, alias_depth: usize) -> Value {
+    fn compile(&mut self, ty: &'a TSType<'a>, depth: usize, alias_depth: usize) -> Value {
         if depth > MAX_TYPE_DEPTH {
             self.diagnostics.push((
                 ty.span().start,
@@ -605,10 +628,62 @@ impl<'a> SchemaCompiler<'a> {
             TSType::TSArrayType(array) => {
                 json!({"type": "array", "items": self.compile(&array.element_type, depth + 1, alias_depth)})
             }
+            TSType::TSTupleType(tuple) => {
+                // 定长元组 → prefixItems（按位校验）+ min/maxItems；可选 / rest 元素
+                // 不支持（校验器无对应语义，报错优于近似）。
+                let mut items = Vec::new();
+                for element in &tuple.element_types {
+                    // 普通类型元素（@inherit TSType）直接编译；可选 / rest 元素
+                    // 校验器无对应语义，报错优于近似。
+                    if let Some(element_type) = element.as_ts_type() {
+                        items.push(self.compile(element_type, depth + 1, alias_depth));
+                    } else {
+                        self.diagnostics.push((
+                            element.span().start,
+                            "元组元素必须是普通类型（可选 / rest 元素不支持）".to_string(),
+                        ));
+                        return json!({});
+                    }
+                }
+                let len = items.len();
+                json!({"type": "array", "prefixItems": items, "minItems": len, "maxItems": len})
+            }
+            TSType::TSIntersectionType(intersection) => {
+                // 交叉 = 对象合并：properties 合并、required 并集；非对象分量不支持。
+                let mut properties = serde_json::Map::new();
+                let mut required: Vec<String> = Vec::new();
+                for member in &intersection.types {
+                    let schema = self.compile(member, depth + 1, alias_depth);
+                    let Some(object) = schema.get("properties").and_then(Value::as_object) else {
+                        self.diagnostics.push((
+                            member.span().start,
+                            "交叉类型的成员必须是对象类型（对象字面量 / 别名）".to_string(),
+                        ));
+                        continue;
+                    };
+                    for (key, value) in object {
+                        properties.insert(key.clone(), value.clone());
+                    }
+                    if let Some(member_required) = schema.get("required").and_then(Value::as_array)
+                    {
+                        for key in member_required.iter().filter_map(Value::as_str) {
+                            if !required.iter().any(|existing: &String| existing == key) {
+                                required.push(key.to_string());
+                            }
+                        }
+                    }
+                }
+                let mut schema = json!({"type": "object", "properties": properties});
+                if !required.is_empty() {
+                    schema["required"] = json!(required);
+                }
+                schema
+            }
             TSType::TSTypeLiteral(literal) => {
                 self.compile_type_literal(literal, depth, alias_depth)
             }
             TSType::TSTypeReference(reference) => {
+                // Box<'a, TSTypeReference<'a>> 解引用为 &'a（实例化栈要存 'a 引用）。
                 self.compile_reference(reference, ty.span().start, depth, alias_depth)
             }
             TSType::TSParenthesizedType(paren) => {
@@ -643,7 +718,7 @@ impl<'a> SchemaCompiler<'a> {
 
     fn compile_type_literal(
         &mut self,
-        literal: &TSTypeLiteral<'a>,
+        literal: &'a TSTypeLiteral<'a>,
         depth: usize,
         alias_depth: usize,
     ) -> Value {
@@ -708,7 +783,7 @@ impl<'a> SchemaCompiler<'a> {
 
     fn compile_reference(
         &mut self,
-        reference: &TSTypeReference<'a>,
+        reference: &'a TSTypeReference<'a>,
         span_start: u32,
         depth: usize,
         alias_depth: usize,
@@ -716,13 +791,13 @@ impl<'a> SchemaCompiler<'a> {
         let TSTypeName::IdentifierReference(id) = &reference.type_name else {
             self.diagnostics.push((
                 span_start,
-                "类型引用必须是简单标识符（不支持限定名 / 泛型别名）".to_string(),
+                "类型引用必须是简单标识符（不支持限定名）".to_string(),
             ));
             return json!({});
         };
         let name = id.name.as_str();
         // Array<T>。
-        if name == "Array" {
+        if name == "Array" && self.aliases.get(name).is_none() {
             let Some(params) = &reference.type_arguments else {
                 self.diagnostics.push((span_start, "Array 需要元素类型参数".to_string()));
                 return json!({});
@@ -733,11 +808,17 @@ impl<'a> SchemaCompiler<'a> {
             };
             return json!({"type": "array", "items": self.compile(element, depth + 1, alias_depth)});
         }
-        // 类型别名（脚本顶层 `type X = ...`，无泛型）。
+        // 泛型实例化栈优先：别名 body 内引用参数名（T / U…）→ 代入实参编译。
+        for frame in self.type_args.iter().rev() {
+            if let Some(argument) = frame.get(name) {
+                return self.compile(argument, depth + 1, alias_depth);
+            }
+        }
+        // 类型别名（脚本顶层 `type X = ...`，可带泛型参数，引用点实例化）。
         let Some(alias) = self.aliases.get(name) else {
             self.diagnostics.push((
                 span_start,
-                format!("未知类型 `{name}`：只支持内联类型或脚本顶层 type 别名（无泛型）"),
+                format!("未知类型 `{name}`：只支持内联类型或脚本顶层 type 别名"),
             ));
             return json!({});
         };
@@ -745,7 +826,33 @@ impl<'a> SchemaCompiler<'a> {
             self.diagnostics.push((span_start, "类型别名循环引用".to_string()));
             return json!({});
         }
-        self.compile(alias, depth + 1, alias_depth + 1)
+        // 实参个数与声明对齐：无参数别名不允许带实参引用；带参数别名必须给全。
+        let arguments: Vec<&TSType<'a>> = reference
+            .type_arguments
+            .as_ref()
+            .map(|params| params.params.iter().collect())
+            .unwrap_or_default();
+        if arguments.len() != alias.params.len() {
+            self.diagnostics.push((
+                span_start,
+                format!(
+                    "类型 `{name}` 需要 {} 个类型参数，实给 {} 个",
+                    alias.params.len(),
+                    arguments.len()
+                ),
+            ));
+            return json!({});
+        }
+        // 语法层代入：参数名 → 实参引用 入栈，编译 body 后弹栈（body 里引用参数名
+        // 的 TSTypeReference 在上方栈查找命中）。生命周期：实参引用来自同一 arena。
+        let mut frame: HashMap<String, &TSType<'a>> = HashMap::new();
+        for (param, argument) in alias.params.iter().zip(arguments) {
+            frame.insert(param.clone(), argument);
+        }
+        self.type_args.push(frame);
+        let compiled = self.compile(&alias.body, depth + 1, alias_depth + 1);
+        self.type_args.pop();
+        compiled
     }
 }
 
@@ -922,5 +1029,93 @@ mod tests {
         assert!(transform.exec_script.contains("h.ask(\"普通\")"));
         assert!(transform.exec_script.contains("h.ask(\"再来\")"));
         assert!(transform.exec_script.contains("h.askJson(\"类型\""));
+    }
+}
+
+#[cfg(test)]
+mod extended_type_tests {
+    use super::*;
+
+    #[test]
+    fn tuple_compiles_to_prefix_items() {
+        let script = "const h = agent(\"h\");\n\
+                      const r = await h.ask<[string, number, boolean]>(\"三元组\");\n\
+                      result(String(r.length));\n";
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        let (_, schema) = &transform.typed_asks[0];
+        assert_eq!(schema["type"], "array");
+        let prefix = schema["prefixItems"].as_array().unwrap();
+        assert_eq!(prefix.len(), 3);
+        assert_eq!(prefix[0]["type"], "string");
+        assert_eq!(prefix[1]["type"], "number");
+        assert_eq!(prefix[2]["type"], "boolean");
+        assert_eq!(schema["minItems"], 3);
+        assert_eq!(schema["maxItems"], 3);
+        // 可选 / rest 元素拒绝。
+        let bad = compile_typed_asks(
+            "const h = agent(\"h\");\nawait h.ask<[string, number?]>(\"q\");\n",
+        )
+        .unwrap_err();
+        assert!(bad.iter().any(|d| d.message.contains("可选")), "{bad:?}");
+    }
+
+    #[test]
+    fn intersection_merges_object_schemas() {
+        let script = concat!(
+            "type Base = { id: string, note?: string };\n",
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<Base & { score: number }>(\"交叉\");\n",
+            "result(r.id);\n"
+        );
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        let (_, schema) = &transform.typed_asks[0];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["id"]["type"], "string");
+        assert_eq!(schema["properties"]["score"]["type"], "number");
+        assert_eq!(schema["properties"]["note"]["type"], "string");
+        // required = 并集（可选字段不进）。
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "id"));
+        assert!(required.iter().any(|v| v == "score"));
+        assert!(!required.iter().any(|v| v == "note"));
+        // 非对象分量拒绝。
+        let bad = compile_typed_asks(
+            "const h = agent(\"h\");\nawait h.ask<{ a: string } & string[]>(\"q\");\n",
+        )
+        .unwrap_err();
+        assert!(bad.iter().any(|d| d.message.contains("交叉")), "{bad:?}");
+    }
+
+    #[test]
+    fn generic_alias_instantiates_type_arguments() {
+        let script = concat!(
+            "type Box<T> = { value: T };\n",
+            "type Pair<A, B> = { first: A, second: B };\n",
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<Box<number>>(\"单参\");\n",
+            "const p = await h.ask<Pair<string, boolean>>(\"双参\");\n",
+            "result(String(r.value) + String(p.first));\n"
+        );
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        assert_eq!(transform.typed_asks.len(), 2);
+        let (_, box_schema) = &transform.typed_asks[0];
+        assert_eq!(box_schema["properties"]["value"]["type"], "number");
+        let (_, pair_schema) = &transform.typed_asks[1];
+        assert_eq!(pair_schema["properties"]["first"]["type"], "string");
+        assert_eq!(pair_schema["properties"]["second"]["type"], "boolean");
+
+        // 实参个数不匹配 → 诊断。
+        let bad = compile_typed_asks(
+            "type Box<T> = { value: T };\nconst h = agent(\"h\");\nawait h.ask<Box>(\"q\");\n",
+        )
+        .unwrap_err();
+        assert!(bad.iter().any(|d| d.message.contains("1 个类型参数")), "{bad:?}");
+        // 嵌套实例化：Box<Box<string>>。
+        let nested = compile_typed_asks(
+            "type Box<T> = { value: T };\nconst h = agent(\"h\");\nawait h.ask<Box<Box<string>>>(\"q\");\n",
+        )
+        .expect("嵌套实例化应成功");
+        let (_, schema) = &nested.typed_asks[0];
+        assert_eq!(schema["properties"]["value"]["properties"]["value"]["type"], "string");
     }
 }

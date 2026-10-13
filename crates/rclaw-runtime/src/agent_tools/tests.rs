@@ -3701,8 +3701,9 @@ async fn paused_plan_waits_at_wave_boundary_and_resumes() {
     assert!(result.content.contains("b [succeeded]"), "{}", result.content);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 
-    // journal：执行器记录了暂停与恢复事件（暂停态的持久事实源）。
+    // journal：执行器记录了暂停/恢复与 step_started（运行中状态的持久事实源）。
     let log = plan_journal_text(&runtime.journal, &plan_id);
     assert!(log.contains("plan_paused"), "{log}");
     assert!(log.contains("plan_resumed"), "{log}");
+    assert!(log.contains("step_started"), "{log}");
 }

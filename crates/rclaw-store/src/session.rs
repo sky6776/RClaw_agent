@@ -71,6 +71,45 @@ fn fork_lineage_key(channel: &str, chat_id: &str) -> String {
     format!("session-fork/{channel}/{chat_id}")
 }
 
+/// artifact 目录的会话键（与 runtime `turn::artifact` 同一规则，单一事实源在此）：
+/// `[A-Za-z0-9._-]` 之外替换成 `_`（防 chat_id 里的路径分隔符逃出目录），截断 64 字符；
+/// 子代理等无源会话场景由调用方传 `chat_id = ""`（归档为 `subagent-<channel>`）。
+pub fn artifact_chat_key(channel: &str, chat_id: &str) -> String {
+    let raw = if chat_id.is_empty() {
+        format!("subagent-{channel}")
+    } else {
+        format!("{channel}-{chat_id}")
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    sanitized.chars().take(64).collect()
+}
+
+/// 删除某会话的 artifact 目录（工具结果落盘句柄的实体；会话删除时级联清理）。
+/// best-effort：目录不存在视为成功，删除失败只告警（artifact 只是上下文优化产物，
+/// 不能让会话删除因此失败）。
+fn remove_artifact_dir(layout: &crate::fs::Layout, channel: &str, chat_id: &str) {
+    let dir = layout
+        .base
+        .join("artifacts")
+        .join(artifact_chat_key(channel, chat_id));
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!("artifact 目录清理失败（{}）: {error}", dir.display());
+        }
+    }
+}
+
 /// 活动 / 归档会话计数。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionStats {
@@ -90,6 +129,8 @@ pub struct FileCheckpointMeta {
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
     pub is_rewind: bool,
+    /// 同事务 tool_result 消息行 id（v2；旧行 / 重锚标记为 None）。
+    pub anchor_message_id: Option<i64>,
 }
 
 /// rewind 文件 checkpoint 记录（一条 = 某次工具写入前后的单个文件快照）。
@@ -108,6 +149,10 @@ pub struct FileCheckpointRecord {
     pub after_hash: Option<String>,
     /// `/rewind` 自身写下的「重锚」标记（不参与回滚集，只刷新最新 hash）。
     pub is_rewind: bool,
+    /// 与本 checkpoint 同事务写入的 tool_result 消息行 id（v2 起）；`None` = 旧数据
+    /// （迁移前行）或独立落库路径（cron / 取消清理的 flush、rewind 重锚标记）。
+    /// 「fork + 文件回滚到锚点」按它判定 checkpoint 属于哪条消息之后。
+    pub anchor_message_id: Option<i64>,
 }
 
 /// usage 锚点：某条消息（`anchor_message_id`）处 provider 回报的真实 prompt token 总数。
@@ -223,7 +268,9 @@ impl SessionStore {
             let sid = ensure_session(tx, channel, chat_id)?;
             let a = insert_message(tx, sid, asst, None)?;
             let t = insert_message(tx, sid, tool_result, None)?;
-            insert_checkpoints(tx, sid, group_id, checkpoints)?;
+            // checkpoint 锚定同事务的 tool_result 消息行（v2）——按消息锚点回滚文件
+            // 的事实源。
+            insert_checkpoints(tx, sid, group_id, checkpoints, Some(t))?;
             Ok((a, t))
         })
     }
@@ -498,9 +545,10 @@ impl SessionStore {
         })
     }
 
-    /// 删除会话（消息 / checkpoint 级联；usage 锚点一并删除）。返回会话是否存在。
+    /// 删除会话（消息 / checkpoint 级联；usage 锚点一并删除，artifact 目录级联清理）。
+    /// 返回会话是否存在。
     pub fn delete_session(&self, channel: &str, chat_id: &str) -> Result<bool> {
-        self.db.transaction(|tx| {
+        let existed = self.db.transaction(|tx| {
             tx.execute(
                 "DELETE FROM usage_anchor WHERE channel = ?1 AND chat_id = ?2",
                 params![channel, chat_id],
@@ -510,15 +558,22 @@ impl SessionStore {
                 params![channel, chat_id],
             )?;
             Ok(n > 0)
-        })
+        })?;
+        if existed {
+            remove_artifact_dir(&self.layout, channel, chat_id);
+        }
+        Ok(existed)
     }
 
     /// 从任意消息锚点 fork 出【新会话】（ZCode `forkStableConversationAtMessage` 同源语义，
     /// 第十二轮）：把源会话【活动视图】里 id ≤ 锚点的消息原样复制进一个新 chat_id 的会话，
     /// 原会话一个字节都不动（append-only；运行中的 turn 继续往原会话追加）。
     ///
-    /// - 锚点必须是活动视图里的消息行：被压缩摘要折叠掉的消息不可作锚（它已不在
-    ///   「用户所见历史」里，与 ZCode rewind 的 Unavailable 策略同判），明确报错。
+    /// - `full_transcript = false`（默认）：锚点必须是活动视图里的消息行——被压缩摘要
+    ///   折叠掉的消息不可作锚（它已不在「用户所见历史」里，与 ZCode rewind 的
+    ///   Unavailable 策略同判），明确报错；子会话轻（不带被折叠的中段）。
+    /// - `full_transcript = true`：复制完整转录前缀（id ≤ 锚点的全部行，含被折叠原文与
+    ///   旧 boundary，boundary 同样降级为普通行）——存档式分叉，锚点在转录里即可。
     /// - 视图里的 compaction boundary 行按【普通行】复制（摘要正文保留，旧 meta 锚点
     ///   引用的是源会话的 id，带过去即坏）——新会话的可见历史 = fork 时刻源会话的
     ///   可见历史，不再折叠。
@@ -533,6 +588,7 @@ impl SessionStore {
         chat_id: &str,
         anchor_message_id: i64,
         new_chat_id: &str,
+        full_transcript: bool,
     ) -> Result<SessionFork> {
         let now = now_ms();
         self.db.transaction(|tx| {
@@ -546,21 +602,38 @@ impl SessionStore {
                     "源会话 {channel}/{chat_id} 不存在"
                 )));
             };
-            // 活动视图前缀（快照内一致）；锚点不在视图里 → 明确报错（见方法文档）。
-            let view = load_active_raw(tx, sid, None)?;
-            let Some(anchor_pos) = view
-                .iter()
-                .position(|(id, _)| *id == anchor_message_id)
-            else {
-                return Err(StoreError::Other(format!(
-                    "锚点消息 {anchor_message_id} 不在会话 {channel}/{chat_id} 的活动视图里\
-                     （可能已被压缩折叠进摘要）。请换一个仍可见的消息作为分叉点"
-                )));
+            // 复制源二选一（第十二轮后续项）：
+            // - 活动视图前缀（默认）：锚点必须在视图里，被压缩折叠的消息不带走；
+            // - 完整转录前缀（full_transcript）：id ≤ 锚点的全部行——含被折叠的原文与
+            //   旧 boundary（boundary 降级为普通行，与视图分支同规则）。ZCode「fork
+            //   复制源必须是 UI transcript 语义」的对位能力；锚点在转录里即可。
+            let prefix: Vec<(i64, String)> = if full_transcript {
+                query_raw(
+                    tx,
+                    "SELECT id, data FROM message WHERE session_id = ?1 AND id <= ?2 ORDER BY id",
+                    params![sid, anchor_message_id],
+                )?
+            } else {
+                let view = load_active_raw(tx, sid, None)?;
+                let Some(anchor_pos) = view
+                    .iter()
+                    .position(|(id, _)| *id == anchor_message_id)
+                else {
+                    return Err(StoreError::Other(format!(
+                        "锚点消息 {anchor_message_id} 不在会话 {channel}/{chat_id} 的活动视图里                         （可能已被压缩折叠进摘要）。请换一个仍可见的消息，或用完整转录分叉"
+                    )));
+                };
+                // 视图顺序 = 会话顺序（head ++ [boundary] ++ kept ++ after）；按锚点在视图
+                // 中的【位置】取前缀——boundary 行的 id 最大，按 id 大小截断会把 boundary
+                // 连同它之后的尾窗错切掉。
+                view[..=anchor_pos].to_vec()
             };
-            // 视图顺序 = 会话顺序（head ++ [boundary] ++ kept ++ after）；按锚点在视图中的
-            // 【位置】取前缀——boundary 行的 id 最大，按 id 大小截断会把 boundary 连同它
-            // 之后的尾窗错切掉。
-            let prefix: Vec<(i64, String)> = view[..=anchor_pos].to_vec();
+            // full 分支的锚点存在性（视图分支已在定位时报错）：前缀末行必须是锚点本身。
+            if prefix.last().is_none_or(|(id, _)| *id != anchor_message_id) {
+                return Err(StoreError::Other(format!(
+                    "锚点消息 {anchor_message_id} 不在会话 {channel}/{chat_id} 的转录里"
+                )));
+            }
             tx.execute(
                 "INSERT INTO session(channel, chat_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
                 params![channel, new_chat_id, now],
@@ -694,6 +767,18 @@ impl SessionStore {
         })?;
         if let Err(e) = self.db.vacuum() {
             tracing::warn!("state.sqlite VACUUM 失败（数据已删除，仅文件体积未回收）: {e}");
+        }
+        // 会话全清，工具结果落盘的 artifact 根目录一并清空（best-effort）。
+        let artifacts_root = self.layout.base.join("artifacts");
+        match std::fs::remove_dir_all(&artifacts_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    "artifacts 根目录清理失败（{}）: {error}",
+                    artifacts_root.display()
+                );
+            }
         }
         Ok(())
     }
@@ -838,7 +923,8 @@ impl SessionStore {
         }
         self.db.transaction(|tx| {
             let sid = ensure_session_untouched(tx, channel, chat_id)?;
-            insert_checkpoints(tx, sid, group_id, checkpoints)
+            // 独立落库路径（cron / 取消清理的 flush）：无同事务消息可锚，anchor 为 None。
+            insert_checkpoints(tx, sid, group_id, checkpoints, None)
         })
     }
 
@@ -864,8 +950,9 @@ impl SessionStore {
                 return Ok(Vec::new());
             };
             let mut stmt = conn.prepare(
-                "SELECT id, group_id, path, before, before_hash, after_hash, is_rewind \
-                 FROM file_checkpoint WHERE session_id = ?1 AND id >= ?2 ORDER BY id",
+                "SELECT id, group_id, path, before, before_hash, after_hash, is_rewind, \
+                 anchor_message_id FROM file_checkpoint WHERE session_id = ?1 AND id >= ?2 \
+                 ORDER BY id",
             )?;
             let rows = stmt.query_map(params![sid, min_id], |row| {
                 Ok(FileCheckpointRecord {
@@ -876,6 +963,7 @@ impl SessionStore {
                     before_hash: row.get(4)?,
                     after_hash: row.get(5)?,
                     is_rewind: row.get::<_, i64>(6)? != 0,
+                    anchor_message_id: row.get(7)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -897,8 +985,8 @@ impl SessionStore {
                 return Ok(Vec::new());
             };
             let mut stmt = conn.prepare(
-                "SELECT id, group_id, path, before_hash, after_hash, is_rewind \
-                 FROM file_checkpoint WHERE session_id = ?1 ORDER BY id",
+                "SELECT id, group_id, path, before_hash, after_hash, is_rewind, \
+                 anchor_message_id FROM file_checkpoint WHERE session_id = ?1 ORDER BY id",
             )?;
             let rows = stmt.query_map(params![sid], |row| {
                 Ok(FileCheckpointMeta {
@@ -908,6 +996,7 @@ impl SessionStore {
                     before_hash: row.get(3)?,
                     after_hash: row.get(4)?,
                     is_rewind: row.get::<_, i64>(5)? != 0,
+                    anchor_message_id: row.get(6)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -1144,13 +1233,14 @@ fn insert_checkpoints(
     session_id: i64,
     group_id: i64,
     checkpoints: &[FileCheckpointRecord],
+    anchor_message_id: Option<i64>,
 ) -> Result<()> {
     if checkpoints.is_empty() {
         return Ok(());
     }
     let mut stmt = conn.prepare_cached(
         "INSERT INTO file_checkpoint(session_id, group_id, path, before, before_hash, \
-         after_hash, is_rewind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         after_hash, is_rewind, anchor_message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for cp in checkpoints {
         // 单条记录可自带 group_id（`/rewind` 的重锚标记用独立分组）；0 则跟随参数。
@@ -1159,6 +1249,9 @@ fn insert_checkpoints(
         } else {
             group_id
         };
+        // 记录级 anchor 优先（重锚标记显式 None）；缺省继承事务级（工具链同事务的
+        // tool_result 消息 id）。
+        let anchor = cp.anchor_message_id.or(anchor_message_id);
         stmt.execute(params![
             session_id,
             gid,
@@ -1166,7 +1259,8 @@ fn insert_checkpoints(
             cp.before,
             cp.before_hash,
             cp.after_hash,
-            cp.is_rewind as i64
+            cp.is_rewind as i64,
+            anchor
         ])?;
     }
     Ok(())

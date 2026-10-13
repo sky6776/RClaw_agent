@@ -914,13 +914,42 @@ plan_status 是 journal 的只读投影，不与执行器写路径竞争。
 合并分支吞掉（clippy unreachable_patterns 揪出）——暂停后恢复的投影态翻不回 false，
 已拆分为独立分支。
 
-## 后续工作（第十二轮后）
+## 第十三轮：后续项清账（除 7 CLI 会话切换 / 9 全仓 fmt 外全部完成）
 
-1. **artifact 清理策略**：`agent/artifacts/` 只增不减（与 exports 同纪律）；按会话
-   归档 + 会话删除级联清理是下一步。
-2. **fork 的文件系统联动**：当前 fork 只复制会话历史（工作区文件父分支与子分支共享，
-   ZCode stable fork 同款）；「fork + 文件回滚到锚点」的组合入口待做。
-3. **`.ask<T>` 的类型面扩展**：泛型别名 / tuple / 交叉类型 / JSDoc 约束（ZCode
-   SchemaEmitter 对位能力）；tsc 可用时可考虑把类型检查切到原文（当前查 exec script）。
-4. **PlanRun 事件的 step_started**：步骤级「运行中」状态目前由「未定终态」近似；
-   补 step_started 事件后 todo 卡片可显示真正在跑的步骤。
+1. **artifact 清理策略 ✅**：会话键规则单一事实源下沉到 `store::session::
+   artifact_chat_key`（runtime 落盘与 store 清理共用）；`delete_session` 级联删除该会话
+   的 `artifacts/<会话键>/`（best-effort，失败只告警），`/clear`（clear_all_sessions）
+   清空 artifacts 根。测试：`delete_session_cascades_artifact_dir_and_clear_wipes_root`。
+2. **fork 文件联动 ✅**：schema v2（`file_checkpoint.anchor_message_id`，迁移
+   v1→v2 保数据旧行 NULL）；工具链同事务写入的 checkpoint 锚定 tool_result 消息行；
+   `rewind::restore_to_message`（回滚集 = 锚点之后的写入，锚点自身 checkpoint 作
+   校验链起点、其写入保留——漏掉链起点会让锚点与其后写入之间的未记录改动漏检，
+   测试曾以此失败形态验证）；入口 `/fork <id> files`（与 full 可组合；与 /rewind 同
+   纪律持静默门）、桌面长按菜单「分叉并回滚文件」走命令文本。旧行（迁移前）归属
+   未知不参与，报告注明。
+3. **`.ask<T>` 类型面扩展 ✅**：tuple（prefixItems + min/maxItems，校验器同步支持
+   按位与混合变长尾）、交叉类型（对象合并 properties/required 并集）、泛型别名
+   （`type Box<T> = …` 单/多参实例化，语法层代入栈，嵌套 `Box<Box<string>>` 支持）；
+   tsc 类型检查切换到【作者原文】（facade.d.ts 已声明 ask<T>，原文直接暴露类型错误；
+   语法探针与 lint 仍查重写后的 exec script）。JSDoc 约束不做（oxc 需保留注释做
+   span 关联，成本高于收益——ZCode jsdoc.ts 对位能力暂缺，在此声明）。
+4. **step_started 事件 ✅**：执行器派发处写入；投影把「有 started 无终态」标
+   running（重跑重记按序生效）；卡片与侧栏 todo 加运行中图标。
+5. **/goal 完成审计 ✅**：`goal_audit_enabled`（默认开）；有活动目标的会话每次成功
+   收尾后异步跑一次无工具小推理（max_tokens 200），按「可核对证据」标准判定
+   `{goal_met, evidence_summary}`；达成 → 清 goal + 系统回执；未达成 / 解析失败 /
+   调用失败 → 目标保持（`parse_goal_audit` fail-closed，绝不误清）。
+6. **fork 完整转录开关 ✅**：`fork_session(full_transcript)`——true 复制 id ≤ 锚点的
+   全部转录行（含被压缩折叠的原文与旧 boundary，ZCode transcript 语义对位；锚点
+   在转录里即可）；false 保持活动视图前缀。入口 `/fork <id> full`、桌面长按菜单
+   「分叉（含完整历史）」、chat_fork 命令 full 参数。
+7. ~~CLI fork 会话切换~~ / 8. ~~insights ts 解析~~（核对为 false alarm：ts 本就按
+   字符串直传显示）/ 9. ~~全仓 fmt~~——按用户指示跳过。
+
+## 后续工作（第十三轮后）
+
+1. **typed ask 的 JSDoc 约束**（@minimum/@maximum 等）：需 oxc 注释保留 + span 关联。
+2. **/goal 审计的证据上下文扩展**：当前审计只看本轮最终回复；可带入目标设定以来的
+   会话尾部或产物清单（成本换召回）。
+3. **按消息锚点的 /rewind by message**：v2 的 anchor 列让 /rewind 也能按消息选点
+   （当前只有 fork files 用到）。

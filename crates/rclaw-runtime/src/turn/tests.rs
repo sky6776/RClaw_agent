@@ -8813,3 +8813,104 @@ fn goal_reminder_block_renders_objective_and_clears_with_goal() {
     assert!(TurnManager::goal_reminder_block(&journal, "cli", "console").is_none());
 }
 
+
+#[test]
+fn parse_goal_audit_accepts_json_and_fails_closed() {
+    // 纯 JSON / 带前置散文的 JSON 都能提取；goal_met 非布尔 / 缺失 / 不可解析 → None
+    //（目标保持，绝不误清）。
+    assert_eq!(
+        TurnManager::parse_goal_audit(r#"{"goal_met": true, "evidence_summary": "测试全绿"}"#),
+        Some((true, "测试全绿".to_string()))
+    );
+    assert_eq!(
+        TurnManager::parse_goal_audit("审计结论如下：\n{\"goal_met\": false, \"evidence_summary\": \"仍在进行\"}"),
+        Some((false, "仍在进行".to_string()))
+    );
+    assert_eq!(TurnManager::parse_goal_audit(r#"{"goal_met": "yes"}"#), None);
+    assert_eq!(TurnManager::parse_goal_audit(r#"{"evidence_summary": "x"}"#), None);
+    assert_eq!(TurnManager::parse_goal_audit("不是 JSON"), None);
+    assert_eq!(
+        TurnManager::parse_goal_audit(r#"{"goal_met": true}"#),
+        Some((true, String::new()))
+    );
+}
+
+#[tokio::test]
+async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: r#"{"goal_met": true, "evidence_summary": "全部测试通过"}"#.to_string(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout.clone(),
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+    mgr.handle_goal("cli", "console", "/goal 完成迁移").await;
+    let key = TurnManager::goal_key("cli", "console");
+    assert!(mgr.session.journal().kv_get(&key).unwrap().is_some());
+
+    // 审计确认 → goal 清除 + 系统回执。
+    mgr.spawn_goal_audit(
+        "完成迁移".to_string(),
+        "迁移完成：cargo test 1144 全部通过".to_string(),
+        "cli".to_string(),
+        "console".to_string(),
+    );
+    let mut receipt = None;
+    for _ in 0..100 {
+        if let Ok(msg) = outbound_rx.try_recv() {
+            receipt = Some(msg.content);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(receipt.is_some(), "审计通过应投系统回执");
+    assert!(mgr.session.journal().kv_get(&key).unwrap().is_none(), "目标应被清除");
+
+    // 审计不确认 → 目标保持。
+    mgr.handle_goal("cli", "console", "/goal 另一个目标").await;
+    let deny = Arc::new(TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: r#"{"goal_met": false, "evidence_summary": "仅部分完成"}"#.to_string(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout.clone(),
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        // 第二个实例共享同一 state.sqlite（目录相同）——目标键相同。
+        {
+            let (tx, _rx) = mpsc::channel(1);
+            tx
+        },
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+    // 直接在原 mgr 上测（provider 是确认版）——换 deny provider 需另一个实例；
+    // 用 deny 实例（同库）跑审计。
+    deny.spawn_goal_audit(
+        "另一个目标".to_string(),
+        "还在进行中".to_string(),
+        "cli".to_string(),
+        "console".to_string(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        mgr.session.journal().kv_get(&key).unwrap().is_some(),
+        "审计不确认时目标必须保持"
+    );
+}

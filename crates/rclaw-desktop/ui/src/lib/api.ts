@@ -351,9 +351,9 @@ export const api = {
 
   chatHistory: (chatId: string) => invoke<HistoryMsg[]>("chat_history", { chatId }),
 
-  /** 从任意消息锚点分叉出新会话（原会话不动）。 */
-  chatFork: (chatId: string, anchorMessageId: number) =>
-    invoke<ChatForkResult>("chat_fork", { chatId, anchorMessageId }),
+  /** 从任意消息锚点分叉出新会话（原会话不动）；full = 携带完整转录（含被压缩折叠的原文）。 */
+  chatFork: (chatId: string, anchorMessageId: number, full?: boolean) =>
+    invoke<ChatForkResult>("chat_fork", { chatId, anchorMessageId, full }),
 
   /** 最近若干个 PlanRun 计划的状态（流程步骤 / todo 轮询）。 */
   planStatus: () => invoke<PlanStatus[]>("plan_status"),

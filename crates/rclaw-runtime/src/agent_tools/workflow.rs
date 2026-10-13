@@ -545,11 +545,41 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
             }
         }
     }
+    if let Some(prefix_items) = schema.get("prefixItems").and_then(Value::as_array) {
+        if let Some(array) = value.as_array() {
+            // 定长元组：前缀按位校验；min/maxItems 约束长度。
+            for (index, (item, subschema)) in
+                array.iter().zip(prefix_items.iter()).enumerate()
+            {
+                validate_json_schema(item, subschema, depth + 1)
+                    .map_err(|error| format!("[{index}]: {error}"))?;
+            }
+        }
+    }
     if let Some(items) = schema.get("items") {
         if let Some(array) = value.as_array() {
-            for (index, item) in array.iter().enumerate() {
+            let prefix = schema
+                .get("prefixItems")
+                .and_then(Value::as_array)
+                .map(|prefix| prefix.len())
+                .unwrap_or(0);
+            for (index, item) in array.iter().enumerate().skip(prefix) {
                 validate_json_schema(item, items, depth + 1)
                     .map_err(|error| format!("[{index}]: {error}"))?;
+            }
+        }
+    }
+    if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64) {
+        if let Some(array) = value.as_array() {
+            if array.len() < min_items as usize {
+                return Err(format!("数组长度不足：期望 ≥ {min_items}，实际 {}", array.len()));
+            }
+        }
+    }
+    if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64) {
+        if let Some(array) = value.as_array() {
+            if array.len() > max_items as usize {
+                return Err(format!("数组超长：期望 ≤ {max_items}，实际 {}", array.len()));
             }
         }
     }
@@ -1710,9 +1740,24 @@ impl Tool for WorkflowRunTool {
             .get("type_check")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let type_check_script = exec_script.clone();
+        // tsc 类型级检查优先对【作者原文】跑（facade.d.ts 已声明 ask<T> 泛型，原文可
+        // 直接检查出类型错误；重写后的 exec script 只剩 askJson，丢掉 ask<T> 的类型
+        // 语境）。无 typed ask 时两者一致，仍用 exec script。语法探针与 lint 始终跑
+        // exec script（QuickJS 只认重写后的纯 JS）。
+        let tsc_input = if typed_asks.is_empty() {
+            exec_script.clone()
+        } else {
+            script.clone()
+        };
+        let lint_script = exec_script.clone();
         let diagnostics = tokio::task::spawn_blocking(move || {
-            check_script(&type_check_script, type_check)
+            let mut diagnostics = check_script(&lint_script, false);
+            if type_check && diagnostics.is_empty() {
+                if let Some(mut tsc_diagnostics) = type_check_with_tsc(&tsc_input) {
+                    diagnostics.append(&mut tsc_diagnostics);
+                }
+            }
+            diagnostics
         })
         .await
         .unwrap_or_default();
@@ -2609,5 +2654,35 @@ mod validator_tests {
         .is_ok());
         assert!(validate_json_schema(&json!({"zone": "c"}), &compiled, 0).is_err());
         assert!(validate_json_schema(&json!({"zone": "a", "tags": ["y"]}), &compiled, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tuple_validator_tests {
+    use super::validate_json_schema;
+    use serde_json::json;
+
+    #[test]
+    fn validator_checks_tuple_positions_and_bounds() {
+        let tuple = json!({
+            "type": "array",
+            "prefixItems": [{"type": "string"}, {"type": "number"}],
+            "minItems": 2,
+            "maxItems": 2
+        });
+        assert!(validate_json_schema(&json!(["a", 1]), &tuple, 0).is_ok());
+        // 位置类型错。
+        assert!(validate_json_schema(&json!([1, "a"]), &tuple, 0).is_err());
+        // 长度不足 / 超长。
+        assert!(validate_json_schema(&json!(["a"]), &tuple, 0).is_err());
+        assert!(validate_json_schema(&json!(["a", 1, true]), &tuple, 0).is_err());
+        // prefixItems 之后的元素由 items 接管（混合元组 + 变长尾）。
+        let hybrid = json!({
+            "type": "array",
+            "prefixItems": [{"type": "string"}],
+            "items": {"type": "number"}
+        });
+        assert!(validate_json_schema(&json!(["a", 1, 2]), &hybrid, 0).is_ok());
+        assert!(validate_json_schema(&json!(["a", 1, "b"]), &hybrid, 0).is_err());
     }
 }

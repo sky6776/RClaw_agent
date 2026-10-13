@@ -57,8 +57,8 @@ interface Props {
   onForwardToChat?: (text: string) => void;
   /** 当前会话 id：变化时重置滚动跟随并直达新会话底部（Chat 不随会话重挂载）。 */
   sessionKey: string;
-  /** 从该消息锚点分叉出新会话（ZCode 式 fork；桌面按钮 / 移动端菜单项共用）。 */
-  onFork?: (entry: Entry) => void;
+  /** 从该消息锚点分叉出新会话（full = 携带完整转录；files = 同时回滚工作区文件）。 */
+  onFork?: (entry: Entry, full?: boolean, files?: boolean) => void;
   /** 最近的 PlanRun 计划状态（流程步骤卡片；null = 无计划数据）。 */
   plan: PlanStatus | null;
   /** 暂停 / 继续计划（步骤卡片展开时的 ⏸/▶ 按钮）。 */
@@ -345,6 +345,8 @@ function PlanStepsCard({
     if (status === "succeeded") return <span className="text-emerald-400">✓</span>;
     if (status === "failed") return <span className="text-red-400">✗</span>;
     if (status === "skipped") return <span className="text-gray-600">⤼</span>;
+    if (status === "running")
+      return <span className="inline-block animate-spin text-indigo-400">◌</span>;
     return <span className="text-amber-400">⏳</span>;
   };
   return (
@@ -1867,15 +1869,30 @@ export default function Chat({
             >
               多选
             </button>
-            {/* 分叉到新会话（用户/助手消息；从该消息复制出新会话分支，原会话不动）。 */}
+            {/* 分叉到新会话（用户/助手消息；从该消息复制出新会话分支，原会话不动）。
+                full 变体携带被压缩折叠前的完整原文（存档式分叉）。 */}
             {onFork &&
               (msgMenu.entry.role === "user" || msgMenu.entry.role === "assistant") && (
-                <button
-                  className={MENU_ITEM}
-                  onClick={closeMenuAnd((m) => onFork(m.entry))}
-                >
-                  ⑂ 从这里分叉到新会话
-                </button>
+                <>
+                  <button
+                    className={MENU_ITEM}
+                    onClick={closeMenuAnd((m) => onFork(m.entry))}
+                  >
+                    ⑂ 从这里分叉到新会话
+                  </button>
+                  <button
+                    className={MENU_ITEM}
+                    onClick={closeMenuAnd((m) => onFork(m.entry, true))}
+                  >
+                    ⑂ 分叉（含完整历史）
+                  </button>
+                  <button
+                    className={MENU_ITEM}
+                    onClick={closeMenuAnd((m) => onFork(m.entry, false, true))}
+                  >
+                    ⑂ 分叉并回滚文件
+                  </button>
+                </>
               )}
           </div>
         </div>

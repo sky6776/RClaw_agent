@@ -158,6 +158,11 @@ pub struct AgentOptions {
     pub skill_curator_interval_hours: u64,
     pub skill_stale_after_days: u64,
     pub skill_archive_after_days: u64,
+    /// 是否启用【/goal 完成审计】（第十二轮后续项）：有活动目标的会话在每次成功
+    /// 收尾后，用一次无工具的小推理审计本轮汇报是否以可核对证据证实目标达成——
+    /// 达成则自动清除目标并投系统回执；未达成 / 审计失败保持目标不动（绝不误清）。
+    /// 关闭后退回纯模型自评（提醒文案驱动 + 用户 /goal clear 收尾）。
+    pub goal_audit_enabled: bool,
     /// 是否启用【工具结果落盘 + 引用句柄】（ZCode artifact 策略，第十二轮）。
     ///
     /// 工具结果超过 [`Self::tool_result_artifact_bytes`] 时，全文写入
@@ -225,6 +230,7 @@ impl Default for AgentOptions {
             // 2026-09 由 30/90 收紧——闲置技能更快让位）。
             skill_stale_after_days: 14,
             skill_archive_after_days: 30,
+            goal_audit_enabled: true,
             tool_result_artifact_enabled: true,
             tool_result_artifact_bytes: 32 * 1024,
             verify_candidate_patches: false,
