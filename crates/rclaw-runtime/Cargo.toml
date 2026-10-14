@@ -37,6 +37,14 @@ oxc_ast = "0.116.0"
 oxc_span = "0.116.0"
 oxc_ast_visit = "0.116.0"
 
+# rquickjs-sys 0.9 不内置 aarch64-linux-android 的预生成 bindings（查至最新 0.14 也没有，
+# 报错「couldn't find file …/bindings/aarch64-linux-android.rs」）：安卓目标必须开 bindgen
+# 特性在构建期现场生成——宿主需 libclang，交叉编译还需 BINDGEN_EXTRA_CLANG_ARGS 指向
+# NDK sysroot（release.yml 的 termux/apk job 已配置）。非安卓目标不进本节，继续走内置
+# bindings，不受影响。
+[target.'cfg(target_os = "android")'.dependencies]
+rquickjs = { workspace = true, features = ["bindgen"] }
+
 [dev-dependencies]
 tempfile = "3"
 secrecy = { workspace = true }

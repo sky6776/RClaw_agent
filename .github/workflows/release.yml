@@ -150,6 +150,15 @@ jobs:
           sdkmanager --install "ndk;29.0.14206865" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
 
+      # rquickjs-sys 的安卓 bindings 需构建期现场生成（runtime 对 android 目标开了
+      # rquickjs/bindgen）：bindgen 跑在宿主上要 libclang，解析 quickjs.h 的系统头
+      # （stdio/stdint…）还得指到 NDK sysroot，否则 --target=aarch64-linux-android
+      # 找不到 libc 头文件。
+      - name: Configure bindgen for android bindings (rquickjs-sys)
+        run: |
+          sudo apt-get install -y libclang-dev
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> "$GITHUB_ENV"
+
       - name: Build rclaw (release-termux profile)
         run: cargo ndk -t arm64-v8a build --profile release-termux -p rclaw-cli
 
@@ -237,6 +246,13 @@ jobs:
           # wry 的 build.rs 会对 WRY_ANDROID_KOTLIN_FILES_OUT_DIR 做 canonicalize，
           # 目录不存在直接 panic；该目录由构建生成、不入库，新克隆需预建。
           mkdir -p crates/rclaw-desktop/gen/android/app/src/main/java/ai/rclaw/app/generated
+
+      # 同 termux job：runtime 对 android 目标开 rquickjs/bindgen，宿主要 libclang、
+      # bindgen 解析系统头要指到 NDK sysroot。
+      - name: Configure bindgen for android bindings (rquickjs-sys)
+        run: |
+          sudo apt-get install -y libclang-dev
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> "$GITHUB_ENV"
 
       - name: Build frontend (ui/dist)
         working-directory: crates/rclaw-desktop/ui
