@@ -2271,7 +2271,7 @@ function ArchivedSection({
 /** 检查更新卡片（关于页）：GitHub releases 比对当前版本；有新版可一键下载并
  *  触发安装——Windows 换单文件 exe 后自动重启，安卓拉起系统安装器。进度经
  *  update_progress 事件推送。 */
-function UpdateCard() {
+function UpdateCard({ currentVersion }: { currentVersion?: string | null }) {
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2333,7 +2333,7 @@ function UpdateCard() {
     <div className="rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">
       <h2 className="mb-1 text-sm font-medium text-gray-200">检查更新</h2>
       <p className="mb-2 text-[10px] text-gray-600">
-        当前版本 {info?.current ?? "…"}；对照 GitHub 发布页的最新 Release。发现新版后
+        当前版本 {currentVersion ?? info?.current ?? "…"}；对照 GitHub 发布页的最新 Release。发现新版后
         {isAndroidDevice() ? "下载 APK 并拉起系统安装器" : "下载新程序并自动替换重启"}。
       </p>
       <div className="flex flex-wrap items-center gap-2">
@@ -2452,7 +2452,7 @@ function About({ home }: { home: string }) {
           )}
         </div>
         {/* 检查更新（原在配置页）：版本信息紧跟着给更新入口。 */}
-        <UpdateCard />
+        <UpdateCard currentVersion={versions?.app} />
         <div className="rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">
           <h2 className="mb-2 text-sm font-medium text-gray-200">在对话里直接用命令</h2>
           <ul className="space-y-1 text-xs leading-relaxed">
