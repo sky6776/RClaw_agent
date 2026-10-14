@@ -378,9 +378,12 @@ function PlanStepsCard({
           <span className="min-w-0 truncate text-[11px] text-gray-500">
             {plan.name}
             {plan.paused && " · ⏸ 已暂停"}
-            {plan.completed
-              ? ` · 完成 ${plan.succeeded ?? "?"}/${plan.steps.length}`
-              : ` · 待办 ${pending}/${plan.steps.length}`}
+            {/* 已中止（取消 / 崩溃 / 进程被杀）没有 succeeded 计数，标成「已中止」而不是「完成 ?/N」。 */}
+            {plan.aborted
+              ? " · ⏹ 已中止"
+              : plan.completed
+                ? ` · 完成 ${plan.succeeded ?? "?"}/${plan.steps.length}`
+                : ` · 待办 ${pending}/${plan.steps.length}`}
           </span>
         </span>
         <span className="shrink-0 text-[10px] text-gray-600">{open ? "▾" : "▸"}</span>

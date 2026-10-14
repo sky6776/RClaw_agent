@@ -183,6 +183,7 @@ pub(crate) async fn execute_tool_batch(
                 policy.source_channel(),
                 policy.source_chat(),
                 &outcome.tool_calls[index].name,
+                &outcome.tool_calls[index].input,
                 &mut result.content,
             );
             let tc = &outcome.tool_calls[index];
@@ -345,6 +346,7 @@ async fn execute_tool_batch_serial(
                                 &source_channel,
                                 &source_chat,
                                 &tc.name,
+                                &tc.input,
                                 &mut result.content,
                             );
                             (
@@ -569,6 +571,7 @@ async fn execute_tool_batch_serial(
             policy.source_channel(),
             policy.source_chat(),
             &tc.name,
+            &tc.input,
             &mut result.content,
         );
         slots[index] = Some(ContentBlock::ToolResult {

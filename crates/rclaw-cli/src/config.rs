@@ -124,6 +124,17 @@ pub struct AgentSection {
     /// USER.md 总字符上限。缺省 1375（≈500 token）。
     #[serde(default = "default_user_char_limit")]
     pub user_char_limit: usize,
+    /// `/goal` 目标的完成审计：有活动目标的会话成功收尾后，用一次无工具的小推理核对
+    /// 汇报证据，确认达成即自动清除目标。缺省开启；关闭后只剩提醒 + 手动 `/goal clear`。
+    #[serde(default = "default_true")]
+    pub goal_audit_enabled: bool,
+    /// 超长工具结果落盘为 artifact（`agent/artifacts/<会话键>/`），模型只看首尾预览 +
+    /// 文件路径。缺省开启；关闭后工具结果按原有截断口径进上下文。
+    #[serde(default = "default_true")]
+    pub tool_result_artifact_enabled: bool,
+    /// 工具结果落盘阈值（字节）：超过即落盘。缺省 32768（32 KiB）。
+    #[serde(default = "default_tool_result_artifact_bytes")]
+    pub tool_result_artifact_bytes: usize,
 }
 impl Default for AgentSection {
     fn default() -> Self {
@@ -151,6 +162,9 @@ impl Default for AgentSection {
             verify_candidate_patches: false,
             memory_char_limit: default_memory_char_limit(),
             user_char_limit: default_user_char_limit(),
+            goal_audit_enabled: true,
+            tool_result_artifact_enabled: true,
+            tool_result_artifact_bytes: default_tool_result_artifact_bytes(),
         }
     }
 }
@@ -159,6 +173,9 @@ fn default_base_dir() -> String {
 }
 fn default_max_concurrent_turns() -> usize {
     8
+}
+fn default_tool_result_artifact_bytes() -> usize {
+    32 * 1024
 }
 fn default_compression_protect_first() -> usize {
     3

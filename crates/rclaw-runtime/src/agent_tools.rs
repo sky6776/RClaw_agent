@@ -68,7 +68,14 @@ impl RunAdapter for SubagentRunAdapter<'_> {
 mod escalate;
 pub use escalate::{EscalateTool, ResolveWorkflowQuestionTool};
 pub use workflow::WorkflowRunTool;
-pub use plan::PlanRunTool;
+pub use plan::{plan_pause_key, PlanRunTool};
+
+/// 某 PlanRun 计划是否正在【本进程】执行（宿主 UI 的 plan_status / plan_pause 用：
+/// journal 停在进行中但执行者已不在的计划投影成已中止，不在执行的计划拒绝落暂停）。
+/// 不覆盖别的进程（CLI 与桌面端共用 state.sqlite 时无跨进程租约）。
+pub fn plan_is_active(plan_id: &str) -> bool {
+    workflow::ActiveRunGuard::is_plan_active(plan_id)
+}
 use subagent::*;
 pub(crate) use team::sanitize_agent_name;
 use team::*;

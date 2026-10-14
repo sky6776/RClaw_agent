@@ -88,8 +88,9 @@ impl PlanRunTool {
 }
 
 /// 计划暂停标志的 kv 键（存在 = 暂停；`plan_pause` 命令 / 桌面按钮写入，
-/// 执行器在波次边界读取——跨进程一致的协作式暂停）。
-pub(crate) fn plan_pause_key(plan_id: &str) -> String {
+/// 执行器在波次边界读取——跨进程一致的协作式暂停）。宿主 UI 经
+/// `rclaw_runtime::plan_pause_key` 复用，不再手写键格式。
+pub fn plan_pause_key(plan_id: &str) -> String {
     format!("plan-pause/{plan_id}")
 }
 
@@ -307,6 +308,58 @@ fn parse_steps(input: &Value) -> Result<Vec<PlanStep>, String> {
 pub(super) fn append_plan_event(plan_log: &EventLog, event: &str, payload: Value) {
     if let Err(error) = try_append_plan_event(plan_log, event, payload) {
         tracing::warn!("{error}");
+    }
+}
+
+/// 计划执行的收尾守卫：`plan_started` 落下后创建，正常写完 `plan_completed` 再 `disarm`；
+/// 其余任何退出路径——锚点后的早退（plan_resumed / 装载失败）、turn 取消把工具 future
+/// 丢弃、执行体 panic——Drop 时补一条 `plan_aborted` 终态事件并清掉暂停标志。否则 journal
+/// 停在「进行中」：桌面端 plan_status 把它当成活计划永远转圈、暂停按钮还可用，resume 也
+/// 分不清是崩溃还是仍在跑。声明顺序放在 ActiveRunGuard 之后：先于它 Drop，终态事件写入
+/// 时计划仍在「执行中」集合里，不留「不活跃又没终态」的窗口。
+struct PlanAbortGuard {
+    plan_log: EventLog,
+    pause_key: String,
+    journal: rclaw_store::journal::JournalStore,
+    armed: bool,
+}
+
+impl PlanAbortGuard {
+    fn new(plan_log: &EventLog, journal: &rclaw_store::journal::JournalStore, plan_id: &str) -> Self {
+        PlanAbortGuard {
+            plan_log: plan_log.clone(),
+            pause_key: plan_pause_key(plan_id),
+            journal: journal.clone(),
+            armed: true,
+        }
+    }
+
+    /// 正常收尾（`plan_completed` 已写）：不再补终态；暂停标志一并清掉——计划已结束，
+    /// 残留的 kv 会让同 id 的下一次 resume 一开跑就停在第一个波次边界。
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.clear_pause_flag();
+    }
+
+    fn clear_pause_flag(&self) {
+        if let Err(error) = self.journal.kv_delete(&self.pause_key) {
+            tracing::warn!("计划暂停标志清理失败（{}）: {error}", self.pause_key);
+        }
+    }
+}
+
+impl Drop for PlanAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let reason = if std::thread::panicking() {
+            "执行器 panic"
+        } else {
+            "执行器在收尾前退出（取消 / 早退）"
+        };
+        append_plan_event(&self.plan_log, "plan_aborted", json!({"reason": reason}));
+        self.clear_pause_flag();
     }
 }
 
@@ -1594,7 +1647,15 @@ impl Tool for PlanRunTool {
         // 会凭空造出一条只有锚点的 journal（错误重定向比静默从零开始危险）。
         if resume_request.is_some() {
             match plan_log.exists() {
-                Ok(true) => {}
+                Ok(true) => {
+                    // 上一代留下的暂停标志必然是残留（暂停只对正在执行的计划开放、守卫在
+                    // 任何退出路径都会清；剩下的只有进程被杀 / 暂停与收尾撞上的窗口），
+                    // 在锚点可见之前清掉——否则本代会在第一个波次边界就无故停下。锚点之后
+                    // 再落的标志是针对本代的真实暂停，照常生效。
+                    if let Err(error) = self.runtime.journal.kv_delete(&plan_pause_key(&plan_id)) {
+                        tracing::warn!("resume 前清理残留暂停标志失败（{plan_id}）: {error}");
+                    }
+                }
                 Ok(false) => {
                     return ToolResult::err(format!(
                         "计划事件日志（{}）不存在。resume 需要一个已存在 plan 的 id（见先前 PlanRun 结果里的事件日志标识）。",
@@ -1623,6 +1684,9 @@ impl Tool for PlanRunTool {
                 "计划未启动：{error}。journal 写不进去时无法判定提问归属，拒绝执行以免误判步骤"
             ));
         }
+        // 锚点已落：从这里起任何未写 plan_completed 的退出都由守卫补 plan_aborted 终态
+        // （见 [`PlanAbortGuard`]）。
+        let mut abort_guard = PlanAbortGuard::new(&plan_log, &self.runtime.journal, &plan_id);
         if resume_request.is_some() {
             if let Err(error) = try_append_plan_event(
                 &plan_log,
@@ -2381,6 +2445,7 @@ impl Tool for PlanRunTool {
             "plan_completed",
             json!({"succeeded": succeeded, "failed": failed, "skipped": skipped, "stalled": stalled.len()}),
         );
+        abort_guard.disarm();
         let inherited_now = inherited_steps.len();
         let mut report = format!(
             "计划 '{plan_name}'（{plan_id}）执行完毕：{succeeded} 成功 / {failed} 失败 / {skipped} 跳过{}。\n事件日志：{}\n",

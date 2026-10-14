@@ -388,20 +388,10 @@ pub(crate) fn finish_capture(checkpoint: &mut FileCheckpoint) -> bool {
     true
 }
 
-/// 把本迭代捕获的文件 checkpoint 以分组 id 单独落库（cron turn / 取消清理等不与工具链
-/// 同事务的路径；尽力而为，失败只告警）。前台路径用
+/// 把本迭代捕获的文件 checkpoint（已经 [`into_records`] 转换）以分组 id 单独落库：
+/// cron turn、工具链同事务写入失败后的补落库、取消清理时没有可挂靠工具链等不与工具链
+/// 同事务的路径；尽力而为，失败只告警。前台路径用
 /// [`SessionStore::append_tool_chain_with_checkpoints`] 与工具链同事务提交。
-pub(crate) fn flush(
-    session: &SessionStore,
-    channel: &str,
-    chat_id: &str,
-    group_id: i64,
-    checkpoints: Vec<FileCheckpoint>,
-) {
-    flush_records(session, channel, chat_id, group_id, &into_records(checkpoints));
-}
-
-/// [`flush`] 的记录形态：工具链同事务写入失败后的补落库路径复用（记录已转换）。
 pub(crate) fn flush_records(
     session: &SessionStore,
     channel: &str,
@@ -415,6 +405,19 @@ pub(crate) fn flush_records(
     if let Err(error) = session.append_file_checkpoints(channel, chat_id, group_id, checkpoints) {
         tracing::warn!("rewind checkpoint 写入失败: {error}");
     }
+}
+
+/// 测试便利：未转换的 checkpoint 直接落库（生产路径都先经 [`into_records`]，以便工具链
+/// 同事务写入失败后复用同一批记录补落库）。
+#[cfg(test)]
+fn flush(
+    session: &SessionStore,
+    channel: &str,
+    chat_id: &str,
+    group_id: i64,
+    checkpoints: Vec<FileCheckpoint>,
+) {
+    flush_records(session, channel, chat_id, group_id, &into_records(checkpoints));
 }
 
 /// `rewind_files` 工具：按回滚点 id 选点恢复文件（无 `rewind_id` 时列出最近分组）。
@@ -615,11 +618,13 @@ pub(crate) fn restore_to_point(
         ));
     };
     // 选点行起的全量窗口（含其后的 rewind 重锚标记），重锚分组沿用回滚点 id。
+    let rows_from = all_meta[start].id;
     restore_meta_window(
         session,
         channel,
         chat_id,
         all_meta[start..].to_vec(),
+        rows_from,
         rewind_id,
         &format!("回滚点 {rewind_id}"),
         all_meta,
@@ -642,10 +647,6 @@ pub(crate) fn restore_to_message(
     anchor_message_id: i64,
 ) -> Result<String, String> {
     let all_meta = load_meta(session, channel, chat_id);
-    let unanchored = all_meta
-        .iter()
-        .filter(|record| !record.is_rewind && record.anchor_message_id.is_none())
-        .count();
     // 窗口起点 = 锚点消息自身的第一行 checkpoint（链起点，其写入保留）；其后全部
     // 写入（> 锚点，回滚目标）+ 不早于起点的重锚标记与独立 checkpoint 参与校验链。
     // 漏掉锚点自身的 checkpoint 会让链起点悬空——锚点与其后写入之间的未记录改动
@@ -688,9 +689,21 @@ pub(crate) fn restore_to_message(
     });
     if !has_rollbackable {
         return Err(format!(
-            "锚点消息 {anchor_message_id} 之后没有可回滚的文件写入（仅 write/edit/delete 被              checkpoint，且迁移前的旧记录不参与按消息回滚）"
+            "锚点消息 {anchor_message_id} 之后没有可回滚的文件写入（仅 write/edit/delete 被 \
+             checkpoint，且无法归属消息的记录——cron / 落库失败补写 / 迁移前——不参与按消息回滚）"
         ));
     }
+    // 窗口内无锚的真实 checkpoint（cron 任务、工具链落库失败后的补写、迁移前的旧行）
+    // 归属未知：参与校验链但不作回滚目标，报告里点明数量——只数窗口内的，窗口外的
+    // 旧行与本次回滚无关，一并报出来会误导用户以为有东西漏撤。
+    let unanchored = all_meta
+        .iter()
+        .filter(|record| {
+            !record.is_rewind
+                && record.anchor_message_id.is_none()
+                && window_start.is_none_or(|start| record.id >= start)
+        })
+        .count();
     // 链校验补前驱：锚点消息自身可能没有 checkpoint（它没做文件写入）——此时窗口
     // 起点之前的【最后一条同文件记录】是该文件链的真实前驱，必须参与校验（不作
     // 回滚目标）：否则「锚点前 shell 改动 + 锚点后 checkpointed 写入」的未记录编辑
@@ -701,10 +714,11 @@ pub(crate) fn restore_to_message(
         let mut predecessors: Vec<FileCheckpointMeta> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in all_meta.iter().rev() {
-            // 跳过窗口内的行；重锚标记（is_rewind）反映的是更早一次回滚的状态，
-            // 不是链前驱——真前驱是最后一条【checkpoint】（跳过标记才能与既有
-            // 「窗口外历史标记不参与」的口径一致）。
-            if record.id >= first_id || record.is_rewind {
+            // 跳过窗口内的行。前驱 = 该文件在窗口前的【最后一行】，重锚标记也算：
+            // 标记的 after_hash 就是上次回滚后文件的真实状态，其后第一次写入的
+            // before_hash 接的正是它——跳过标记去接更早的 checkpoint 会把「/rewind
+            // 之后再写同一文件、再按消息回滚」的合法链误判成未记录的改动。
+            if record.id >= first_id {
                 continue;
             }
             let key = path_key(&record.path);
@@ -721,15 +735,18 @@ pub(crate) fn restore_to_message(
     let mut note = String::new();
     if unanchored > 0 {
         note = format!(
-            "
-注意：{unanchored} 条迁移前的旧 checkpoint 无法归到消息，未参与本次回滚。"
+            "\n注意：锚点之后有 {unanchored} 条无法归属消息的 checkpoint（cron / 落库失败补写 / \
+             迁移前），其写入未被撤销，请人工核对。"
         );
     }
+    // 正文读取从锚定窗口起点开始（补进来的前驱只参与链校验，不读正文）。
+    let rows_from = window_start.unwrap_or_else(|| window.first().map_or(0, |record| record.id));
     let report = restore_meta_window(
         session,
         channel,
         chat_id,
         window,
+        rows_from,
         anchor_message_id,
         &format!("锚点消息 {anchor_message_id}"),
         all_meta,
@@ -744,19 +761,25 @@ pub(crate) fn restore_to_message(
     Ok(format!("{report}{note}"))
 }
 
-/// 回滚内核：给定窗口元数据（回滚集 + 参与校验的重锚标记）执行校验链 → 目标状态 →
+/// 回滚内核：给定窗口元数据（回滚集 + 参与校验的重锚标记 / 前驱）执行校验链 → 目标状态 →
 /// 安全校验 → 应用（中途逆序撤回）→ 完成后重锚（分组 id 用 marker_group_id）。
+/// `rows_from`：回滚集正文的读取起点行 id（窗口里补进来的链前驱只参与校验，不该把
+/// 它们之后、起点之前的全部正文都读进内存）。
 #[allow(clippy::too_many_arguments)]
 fn restore_meta_window(
     session: &SessionStore,
     channel: &str,
     chat_id: &str,
     window: Vec<FileCheckpointMeta>,
+    rows_from: i64,
     marker_group_id: i64,
     describe: &str,
     all_meta: Vec<FileCheckpointMeta>,
     in_targets: &dyn Fn(&FileCheckpointRecord) -> bool,
 ) -> Result<String, String> {
+    if window.is_empty() {
+        return Err(format!("{describe} 没有可回滚的文件写入"));
+    }
     let broken = broken_chains(&window);
     if !broken.is_empty() {
         return Err(format!(
@@ -766,9 +789,9 @@ fn restore_meta_window(
         ));
     }
 
-    // 回滚集的正文：只读选点行起的记录（行 id >= 选点行）。
+    // 回滚集的正文：只读起点行起的记录（行 id >= rows_from）。
     let rollback_rows = session
-        .load_file_checkpoints_from(channel, chat_id, window[0].id)
+        .load_file_checkpoints_from(channel, chat_id, rows_from)
         .map_err(|error| format!("读取 rewind checkpoint 正文失败: {error}"))?;
     let rollback: Vec<&FileCheckpointRecord> = rollback_rows
         .iter()
@@ -1480,5 +1503,40 @@ mod message_rollback_tests {
         //（独立行无锚），直接验证 m2 自身：没有 > m2 的写入 → 明确报错。
         let err = restore_to_message(&session, "cli", "console", m2).unwrap_err();
         assert!(err.contains("没有可回滚"), "{err}");
+        // 报告点明窗口内无法归属消息的行（独立 flush 行），提示人工核对。
+        assert!(report.contains("1 条无法归属消息的 checkpoint"), "{report}");
+    }
+
+    #[test]
+    fn restore_to_message_uses_rewind_marker_as_chain_predecessor() {
+        // 回归：锚点前最后一行是 /rewind 的重锚标记时，前驱搜索曾跳过标记去接更早的
+        // checkpoint（after = 被回滚掉的内容），与锚点后第一次写入的 before（= 回滚后
+        // 的内容）对不上——「/rewind 之后再写同一文件、再按消息回滚」被误判成未记录的
+        // 改动。标记的 after_hash 才是文件的真实状态。
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_store(dir.path());
+        let base = session.layout().base.clone();
+        let file_a = base.join("a.txt");
+        write_file(&file_a, "v1");
+
+        let (_m1, _) = toolchain_write(&session, &base, "a.txt", Some("v2"), 0);
+        // /rewind 回到 m1 之前：a = v1，落重锚标记（after = v1）。
+        let group = load_meta(&session, "cli", "console").last().unwrap().group_id;
+        restore_to_point(&session, "cli", "console", group).expect("/rewind 应成功");
+        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v1");
+
+        let anchor = session
+            .append("cli", "console", &Message::plain(Role::User, "回滚后的新消息"))
+            .unwrap();
+        let (_m2, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
+
+        let report = restore_to_message(&session, "cli", "console", anchor)
+            .expect("重锚标记是真实前驱，不得误判断链");
+        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v1", "{report}");
+        // 标记之前没有外部改动的事实不变：真有未记录改动仍能检出。
+        write_file(&file_a, "shell edit");
+        let (_m3, _) = toolchain_write(&session, &base, "a.txt", Some("v4"), 2);
+        let err = restore_to_message(&session, "cli", "console", anchor).unwrap_err();
+        assert!(err.contains("未记录的改动"), "{err}");
     }
 }

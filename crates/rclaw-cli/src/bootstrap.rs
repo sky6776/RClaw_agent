@@ -285,13 +285,16 @@ pub async fn assemble_core_with(
     customize(&mut tools);
 
     // 精简 opts：与原 main.rs 一致，传给 AgentToolRuntime（见函数注释）——
-    // stream/daemon 之外只多一个 verify_candidate_patches：它是子代理行为开关
-    //（交叉验证在 run_task_inner 里跑），必须随配置传入，否则永远停在默认 false。
-    // 子代理专属选项（唤醒 / 自动转后台 / 升级等待等）当前无配置项，取默认值。
+    // stream/daemon 之外带上子代理也会读的行为开关：verify_candidate_patches（交叉验证
+    // 在 run_task_inner 里跑）与工具结果落盘阈值（子代理工具循环同样走 spill）；不随
+    // 配置传入就永远停在默认值。子代理专属选项（唤醒 / 自动转后台 / 升级等待等）
+    // 当前无配置项，取默认值。
     let runtime_opts = AgentOptions {
         stream_enabled: cfg.llm.stream,
         daemon,
         verify_candidate_patches: cfg.agent.verify_candidate_patches,
+        tool_result_artifact_enabled: cfg.agent.tool_result_artifact_enabled,
+        tool_result_artifact_bytes: cfg.agent.tool_result_artifact_bytes,
         ..AgentOptions::default()
     };
 
@@ -433,6 +436,9 @@ pub async fn assemble_core_with(
         skill_stale_after_days: cfg.agent.skill_stale_after_days,
         skill_archive_after_days: cfg.agent.skill_archive_after_days,
         verify_candidate_patches: cfg.agent.verify_candidate_patches,
+        goal_audit_enabled: cfg.agent.goal_audit_enabled,
+        tool_result_artifact_enabled: cfg.agent.tool_result_artifact_enabled,
+        tool_result_artifact_bytes: cfg.agent.tool_result_artifact_bytes,
         daemon,
         ..AgentOptions::default()
     };

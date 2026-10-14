@@ -37,7 +37,7 @@
 | 会话历史任意锚点 fork | `SessionStore::fork_session`：把活动视图前缀（≤ 锚点，按视图序）单事务复制进新会话，boundary 摘要降级为普通行，血缘入 kv；`/fork [消息 id]` 命令（无参列锚点）；桌面/安卓 UI 消息下方「⑂ 分叉」按钮（chat_fork 命令 + 切换新会话） | ✅ 第十二轮 |
 | 工作流 AST 级分析 + `.ask<T>` 编译 | `agent_tools/workflow_ast.rs`（oxc 0.116，纯 Rust）：AST 依赖图（字符串/注释不误报、hoisted Promise.all 扇出、inline agent() 调用；失败降级文本解析）；`.ask<T>` 内联类型编译为 JSON schema 并重写为 `askJson(question, schema)`（script hash 仍按原文；类型别名/字面量/联合/数组，Rust 校验器扩展 const/enum/anyOf） | ✅ 第十二轮 |
 | 会话长期目标 /goal（ZCode /goal reminder） | `/goal <目标>` 写 kv（按会话隔离，2000 字上限）；无参查看、clear/done 收尾；活动目标时【每次推理的尾部上下文】注入提醒块（原文 + 持续工作 + 按证据核对 + 不自行宣告完成 + 提醒用户 /goal clear），Rust 侧 `goal_reminder_block` 可单测 | ✅ 第十二轮 |
-| PlanRun 任务暂停 / 继续（ZCode 任务暂停） | kv `plan-pause/<plan_id>` 协作式暂停：执行器在【波次边界】轮询（300ms）——当前波跑完、后续波不派发，父 /cancel 语义不变；`plan_paused` / `plan_resumed` 事件入 journal（持久事实源）；桌面 `plan_pause` 命令 + 步骤卡片展开时的 ⏸/▶ 按钮（plan_status 投影 paused 字段） | ✅ 第十二轮 |
+| PlanRun 任务暂停 / 继续（ZCode 任务暂停） | kv `plan-pause/<plan_id>` 协作式暂停：执行器在【波次边界】轮询（300ms）——当前波跑完、后续波不派发，父 /cancel 语义不变；`plan_paused` / `plan_unpaused` 事件入 journal（kv 标志为权威，`plan_resumed` 是 resume 代际锚点、不混用）；执行器收尾守卫在取消 / 早退 / panic 时补 `plan_aborted` 终态；桌面 `plan_pause` 命令（只对执行中的计划接受暂停）+ 步骤卡片展开时的 ⏸/▶ 按钮（plan_status 投影 paused / aborted 字段，执行者不在本进程的进行中计划投影成已中止） | ✅ 第十二轮 |
 | 桌面/安卓 UI：流程步骤 + todo + 排队消息 + 分叉 | `plan_status` 命令投影 PlanRun journal（plan_started 补步骤任务文本）；消息流「📋 流程步骤」可折叠卡片 + 会话面板 todo 区；agent 运行期间输入入队（删除/编辑/「立即」插队投递，turn 收尾自动按序发出）；消息下方「分叉」入口（桌面内联 + 移动端长按菜单） | ✅ 第十二轮 |
 
 ## Layer 1：轮内上下文管理（本次移植的核心）
@@ -875,8 +875,10 @@ anchor_message_id}`（请求里最后一条已持久化消息的 `Message.id`）
    用户 `/goal clear`（提醒文案明说）。
 7. **PlanRun 暂停 / 继续**：kv `plan-pause/<plan_id>` 标志 + 执行器波次边界协作轮询
    （300ms）。暂停语义 = 当前在飞步骤跑完、后续波次不派发（不是硬中断——与
-   `/cancel` 的「终止」正交）；`plan_paused` / `plan_resumed` journal 事件是暂停态的
-   持久事实源；桌面 `plan_pause(plan_id, paused)` 命令 + 流程步骤卡片展开时的
+   `/cancel` 的「终止」正交）；`plan_paused` / `plan_unpaused` journal 事件记录暂停态
+   的翻转（**不是** `plan_resumed`——那是 resume 新一代执行的代际锚点，二者不可混用），
+   kv 标志才是执行器与 `plan_status` 投影共同的权威；桌面 `plan_pause(plan_id, paused)`
+   命令（只对正在执行的计划接受暂停）+ 流程步骤卡片展开时的
    ⏸/▶ 按钮（乐观翻转 + 失败回滚）。测试 `paused_plan_waits_at_wave_boundary_and_
    resumes`：延迟 provider 拉开时序，证明暂停（而非错峰）挡住了后续波次，恢复后
    全部收尾、事件齐备。

@@ -1644,9 +1644,57 @@ fn delete_session_cascades_artifact_dir_and_clear_wipes_root() {
     assert!(!s.delete_session("cli", "console").unwrap());
     assert!(a_dir.exists(), "删除不存在的会话不得误清目录");
 
-    // /clear：全部会话清空时 artifacts 根一并移除。
+    // /clear：全部会话的 artifact 目录一并移除；只删形如 `<会话键>-<16 hex>` 的目录，
+    // 用户放进 artifacts/ 的别的东西不碰（根目录在用户可配置的 agent 根下）。
+    let foreign_dir = base.join("artifacts").join("my-notes");
+    std::fs::create_dir_all(&foreign_dir).unwrap();
+    std::fs::write(foreign_dir.join("keep.md"), "user data").unwrap();
+    std::fs::write(base.join("artifacts").join("loose.txt"), "user file").unwrap();
     s.clear_all_sessions().unwrap();
-    assert!(!base.join("artifacts").exists(), "clear 应清空 artifacts 根");
+    assert!(!a_dir.exists(), "clear 应清空会话 artifact 目录");
+    assert!(!other_dir.exists(), "clear 应清空全部会话 artifact 目录");
+    assert!(foreign_dir.join("keep.md").exists(), "非会话目录不得被 clear 抹掉");
+    assert!(base.join("artifacts").join("loose.txt").exists(), "根下散文件不得被 clear 抹掉");
+}
+
+#[test]
+fn fork_copy_skips_atomic_write_sidecars() {
+    // 并发写入中的 `.<名>.<nonce>.tmp` sidecar / 崩溃残留的孤儿 tmp 不是 artifact 实体，
+    // fork 复制目录时跳过（半截内容不该成为新分支的句柄实体）。
+    let (_g, s) = store();
+    let base = s.layout().base.clone();
+    let anchor = s.append("cli", "c", &Message::plain(Role::User, "m")).unwrap();
+    let src_dir = base
+        .join("artifacts")
+        .join(crate::session::artifact_chat_key("cli", "c"));
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("7-shell.txt"), "done").unwrap();
+    std::fs::write(src_dir.join(".8-shell.txt.0123456789abcdef.tmp"), "half").unwrap();
+    s.fork_session("cli", "c", anchor, "c-fork", false).unwrap();
+    let fork_dir = base
+        .join("artifacts")
+        .join(crate::session::artifact_chat_key("cli", "c-fork"));
+    assert!(fork_dir.join("7-shell.txt").exists());
+    assert!(!fork_dir.join(".8-shell.txt.0123456789abcdef.tmp").exists(), "tmp sidecar 不复制");
+}
+
+#[test]
+fn fork_lineage_kv_is_cascaded_on_delete_and_clear() {
+    // 血缘 kv 随会话删除 / 全清：留着会让复用 chat_id 的新会话被当成旧分叉。
+    let (_g, s) = store();
+    let anchor = s.append("cli", "c", &Message::plain(Role::User, "m")).unwrap();
+    s.fork_session("cli", "c", anchor, "c-fork", false).unwrap();
+    assert!(s.fork_parent("cli", "c-fork").unwrap().is_some());
+    assert!(s.delete_session("cli", "c-fork").unwrap());
+    assert!(s.fork_parent("cli", "c-fork").unwrap().is_none(), "会话删除应级联血缘 kv");
+
+    s.fork_session("cli", "c", anchor, "c-fork-2", false).unwrap();
+    s.journal()
+        .kv_set("plan-pause/plan-1", &serde_json::json!({"at": 0}))
+        .unwrap();
+    s.clear_all_sessions().unwrap();
+    assert!(s.fork_parent("cli", "c-fork-2").unwrap().is_none(), "/clear 应清空全部血缘 kv");
+    assert!(s.journal().kv_get("plan-pause/plan-1").unwrap().is_some(), "运行时 kv 不受牵连");
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,7 +1773,10 @@ fn fork_rewrites_and_copies_artifact_handles() {
         text.contains(&format!("/artifacts/{}/42-grep.txt", crate::session::artifact_chat_key("cli", "c-fork"))),
         "句柄应重写到新目录: {text}"
     );
-    assert!(!text.contains("/artifacts/cli-c-") || text.contains(&crate::session::artifact_chat_key("cli", "c-fork")), "不得残留源目录句柄: {text}");
+    assert!(
+        !text.contains(&format!("/artifacts/{}/", crate::session::artifact_chat_key("cli", "c"))),
+        "不得残留源目录句柄: {text}"
+    );
 
     // 父会话删除不再牵连 fork 的副本。
     assert!(s.delete_session("cli", "c").unwrap());

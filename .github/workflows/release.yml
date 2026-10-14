@@ -34,9 +34,41 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # 版本一致性门禁：tag `vX.Y.Z` 必须同时等于两处应用版本——
+  #   · crates/rclaw-desktop/tauri.conf.json 的 version（桌面 package_info / 更新检查）；
+  #   · crates/rclaw-desktop/gen/android/app/tauri.properties 的 tauri.androidName
+  #     （已入库；gradle 的 APK versionName 与 build.rs 注入的 RCLAW_APP_VERSION
+  #     「关于」版本都读它）。
+  # 只改其中一处打 tag 会出现 Release 页写着 v1.2.3、装上去「关于」显示 1.2.2，升级安装
+  # 还可能因 versionCode 不增而被拒。手动 dispatch（nightly）不受此门禁。
+  # ---------------------------------------------------------------------------
+  version-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match app versions (tauri.conf.json + tauri.properties)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          APP_VERSION="$(jq -r .version crates/rclaw-desktop/tauri.conf.json)"
+          ANDROID_VERSION="$(sed -n 's/^tauri\.androidName=//p' crates/rclaw-desktop/gen/android/app/tauri.properties | tr -d '[:space:]')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$TAG_VERSION" != "$APP_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 crates/rclaw-desktop/tauri.conf.json 的 version=${APP_VERSION} 不一致：先把 version 改成 ${TAG_VERSION}（或重新打 v${APP_VERSION} 的 tag）再发布"
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$ANDROID_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 crates/rclaw-desktop/gen/android/app/tauri.properties 的 tauri.androidName=${ANDROID_VERSION} 不一致：APK versionName / 「关于」版本读的是它，改成 ${TAG_VERSION} 后再发布"
+            exit 1
+          fi
+          echo "版本一致：${GITHUB_REF_NAME} == tauri.conf.json ${APP_VERSION} == tauri.properties ${ANDROID_VERSION}"
+
+  # ---------------------------------------------------------------------------
   # 桌面免安装版（Windows）：前端 → cargo release → exe 打 zip
   # ---------------------------------------------------------------------------
   desktop:
+    needs: [version-check]
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -87,6 +119,7 @@ jobs:
   # 用 cargo-ndk：除 linker 外还需它导出的目标 C 编译器环境变量（ring 等 C 依赖）
   # ---------------------------------------------------------------------------
   termux:
+    needs: [version-check]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -147,6 +180,7 @@ jobs:
   # 安卓 APK（ubuntu）：前端 → cargo ndk .so → whisper JNI 库 → gradle release
   # ---------------------------------------------------------------------------
   apk:
+    needs: [version-check]
     runs-on: ubuntu-latest
     timeout-minutes: 100
     env:

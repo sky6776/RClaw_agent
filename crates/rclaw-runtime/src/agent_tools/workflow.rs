@@ -64,9 +64,11 @@ declare function agent(name: string): {
   /** 向子代理提问并等待回答（promise）。问题文本即输入指纹（inputHash）。 */
   ask(question: string): Promise<string>;
   /**
-   * 类型化 ask：内联类型注解编译成 JSON Schema 校验答案（答案按 JSON 解析后返回对象）。
+   * 类型化 ask：内联类型注解编译成 JSON Schema 校验答案（答案按 JSON 解析后返回对象；
+   * ask<string> 与 ask(question) 同义，答案原文返回）。
    * 支持 string / number / boolean / null / 字面量 / 联合 / 数组（T[] 或 Array<T>）/
-   * 对象字面量 / 顶层 type 别名（无泛型）；any 不允许（用具体类型或 unknown）。
+   * 对象字面量 / 脚本顶层 type 别名（可带泛型参数，引用处实例化）；恰好一个类型参数；
+   * any 不允许（用具体类型或 unknown）。
    */
   ask<T = string>(question: string): Promise<T>;
   /** 同 ask<T>，但 schema 以 JSON Schema 子集作为第二参数显式传入。 */
@@ -1643,6 +1645,17 @@ impl ActiveRunGuard {
     /// 计划执行（`PlanRun`，按 plan_id）。
     pub(super) fn acquire_plan(plan_id: &str) -> Option<Self> {
         Self::acquire_key(format!("plan:{plan_id}"))
+    }
+
+    /// 某计划当前是否正在本进程执行（守卫在握）。桌面端 plan_status 用它把「日志停在
+    /// 进行中但执行者已不在」的计划（进程崩溃 / 工具 future 被丢弃且未落 plan_aborted）
+    /// 投影成已中止，而不是永远转圈；plan_pause 对不在执行的计划拒绝落暂停。
+    pub(super) fn is_plan_active(plan_id: &str) -> bool {
+        ACTIVE_RUNS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .is_some_and(|active| active.contains(&format!("plan:{plan_id}")))
     }
 
     fn acquire_key(key: String) -> Option<Self> {

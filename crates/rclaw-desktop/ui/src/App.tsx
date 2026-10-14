@@ -313,6 +313,13 @@ export default function App() {
   const [activeId, setActiveId] = useState<string>(DEFAULT_CHAT);
   const [entriesByChat, setEntriesByChat] = useState<Record<string, Entry[]>>({});
   const [busyByChat, setBusyByChat] = useState<Record<string, boolean>>({});
+  // 事件回调（分叉等）只在点击时才需要最新的转录 / 忙碌态：经 ref 读取，不把这两个
+  // 随每个流式 token 变化的对象放进 useCallback 依赖——否则回调身份每个 token 变一次，
+  // Chat 里依赖它的 listItems useMemo 跟着整段重算。
+  const entriesByChatRef = useRef(entriesByChat);
+  entriesByChatRef.current = entriesByChat;
+  const busyByChatRef = useRef(busyByChat);
+  busyByChatRef.current = busyByChat;
   // 之后新到的思考块是否默认收起（按会话）：由用户最近一次手动折叠（true）/
   // 展开（false）决定，只作为新块的初始状态，不改动已在屏上的块。
   const [futureThinkingCollapsed, setFutureThinkingCollapsed] = useState<Record<string, boolean>>({});
@@ -785,19 +792,21 @@ export default function App() {
         // 文本反查只在会话空闲时可靠：直播条目落库要等 turn 启动（运行时按会话串行，
         // 排队中的消息还没写进库），忙碌期按「从尾数第 N 个匹配」会把尚未落库的这条
         // 配到前面同文本的旧消息上，fork 到错误锚点（文件联动跟着回滚错）。
-        if (busyByChat[activeId]) {
+        if (busyByChatRef.current[activeId]) {
           setErrorToast(
             "会话运行中，该消息可能尚未落库：请等任务收尾后再分叉，或用 /fork 查看已落库的锚点",
           );
           return;
         }
-        const transcript = entriesByChat[activeId] ?? [];
+        const transcript = entriesByChatRef.current[activeId] ?? [];
         // 该条目之后还有几条同 (role, content) 条目（碰到自身即清零重计）。发送
         // 失败的条目没有落库，不得计入——它们在库里没有对应行，计入会把 skip 数
-        // 抬高、fork 到更早的同文消息上。
+        // 抬高、fork 到更早的同文消息上。按 id 认自身而不是对象同一性：菜单里持有的
+        // 是打开菜单时的对象，条目被替换（流式更新 / sendFailed 标记）后同一性失效，
+        // 会把自己也算进 skip、锚到更早的同文消息。
         let laterMatches = 0;
         for (const existing of transcript) {
-          if (existing === entry) {
+          if (existing.id === entry.id) {
             laterMatches = 0;
           } else if (
             !existing.sendFailed &&
@@ -856,7 +865,7 @@ export default function App() {
         setErrorToast(`分叉失败: ${String(e)}`);
       }
     },
-    [activeId, busyByChat, entriesByChat, openChat, refreshChats, setErrorToast],
+    [activeId, openChat, refreshChats, setErrorToast],
   );
 
   // 工作区外访问授权（默认权限下工具触达工作区之外时后端推送）：

@@ -652,8 +652,11 @@ pub struct PlanStepDto {
 pub struct PlanDto {
     pub plan_id: String,
     pub name: String,
-    /// 计划是否已整体收尾（plan_completed）。
+    /// 计划是否已整体收尾（plan_completed / plan_aborted，或执行者已不在）。
     pub completed: bool,
+    /// 执行器未正常收尾：journal 里有 plan_aborted（取消 / 早退 / panic 由守卫补写），
+    /// 或流停在进行中但本进程已没有它的执行者（崩溃后重启）。`completed` 同时为 true。
+    pub aborted: bool,
     /// 用户暂停中（最后的 plan_paused / plan_resumed|plan_unpaused 事件决定）。
     pub paused: bool,
     /// plan_completed 携带的成功步骤数。
@@ -703,6 +706,7 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
                 }
                 // resume 复用同一 journal 流：新一代执行开始必须复位上一代的整体收尾态。
                 plan.completed = false;
+                plan.aborted = false;
                 plan.succeeded = None;
                 plan.paused = false;
                 // 兼容两种形态：旧版 steps 为 id 数组，新版为 {id, task} 数组。
@@ -778,6 +782,16 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
             Some("plan_completed") => {
                 plan.completed = true;
                 plan.succeeded = event.get("succeeded").and_then(serde_json::Value::as_u64);
+                // 收尾后不该再有「运行中」：执行器个别路径（波次收尾读 journal 失败）只在
+                // 内存里把整波判 skipped、不补步骤事件，投影若保留 running 会永远转圈。
+                mark_running_steps_pending(plan);
+            }
+            // 执行器未正常收尾（取消 / 早退 / panic，由执行器的收尾守卫补写）：整体按
+            // 已结束投影，运行中的步骤没有终态——回 pending（resume 会重跑它们）。
+            Some("plan_aborted") => {
+                plan.completed = true;
+                plan.aborted = true;
+                mark_running_steps_pending(plan);
             }
             Some("plan_paused") => plan.paused = true,
             // step_started：步骤级「运行中」（终态事件在其后覆盖；重跑重记按序生效）。
@@ -886,6 +900,29 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
     }
 }
 
+/// 执行者已不在：`running` 的步骤没有终态，回 pending（不再转圈；resume 会重跑）。
+fn mark_running_steps_pending(plan: &mut PlanDto) {
+    for step in &mut plan.steps {
+        if step.status == "running" {
+            step.status = "pending".into();
+        }
+    }
+}
+
+/// 把「journal 停在进行中、但本进程已没有执行者」的计划投影成已中止：执行器守卫在
+/// 取消 / 早退 / panic 时会补 plan_aborted，但进程被杀 / 断电什么都写不了——重启后这些
+/// 流若不收口，会永远显示运行中、暂停按钮也还可点。只看本进程（桌面端的 agent 就在
+/// 本进程里；CLI 与桌面端共用一个 state.sqlite 本就不支持并发执行）。
+fn reconcile_with_executor(plan: &mut PlanDto, active: bool) {
+    if plan.completed || active {
+        return;
+    }
+    plan.completed = true;
+    plan.aborted = true;
+    plan.paused = false;
+    mark_running_steps_pending(plan);
+}
+
 /// 计划列表的可见性收口：截断只用于【已收尾】的历史（6 条），未收尾（运行中 /
 /// 暂停中）的计划全量保留——暂停中的执行器在等恢复标志，一旦被更新的计划挤出
 /// 返回窗口，GUI 就再也没有它的「继续」按钮，任务永远挂起。
@@ -919,6 +956,10 @@ pub async fn plan_status(state: State<'_, AppState>) -> Result<Vec<PlanDto>, Str
             .map_err(|e| e.to_string())?;
         let mut plans: Vec<PlanDto> = Vec::new();
         for stream in streams {
+            // 执行者存活性在读事件【前后】各看一次、取或：只在读后看，计划恰好在两次调用之间
+            // 正常收尾（plan_completed 落盘 → 守卫释放）时，已读到的事件还没有终态而执行者
+            // 已不在，这一轮会被误投影成已中止（步骤回 pending），下一轮才自愈。
+            let active_before = rclaw_runtime::plan_is_active(&stream);
             let events = journal
                 .load(rclaw_store::JOURNAL_PLAN, &stream)
                 .map_err(|e| e.to_string())?;
@@ -929,18 +970,21 @@ pub async fn plan_status(state: State<'_, AppState>) -> Result<Vec<PlanDto>, Str
                 plan_id: stream.clone(),
                 name: stream.clone(),
                 completed: false,
+                aborted: false,
                 paused: false,
                 succeeded: None,
                 updated_at: 0,
                 steps: Vec::new(),
             };
             project_plan_events(&mut plan, &events);
+            let active = active_before || rclaw_runtime::plan_is_active(&stream);
+            reconcile_with_executor(&mut plan, active);
             // kv 暂停标志是执行器的唯一权威（波次边界轮询它），【双向】覆盖事件推导：
             // 快速 恢复→暂停 / 暂停→恢复 交错时事件序可能与最终 kv 状态不一致，且
             // executor 可能在 300ms 轮询间隔里错过短暂的标志变化而不补发事件——标志
             // 在=暂停、不在=运行，事件只负责收尾态与步骤状态。
             if !plan.completed {
-                let pause_key = format!("plan-pause/{stream}");
+                let pause_key = rclaw_runtime::plan_pause_key(&stream);
                 plan.paused = journal
                     .kv_get(&pause_key)
                     .map(|value| value.is_some())
@@ -964,7 +1008,7 @@ pub async fn plan_pause(
     paused: bool,
 ) -> Result<(), String> {
     let session = state.session().ok_or("agent 尚未启动")?;
-    let key = format!("plan-pause/{plan_id}");
+    let key = rclaw_runtime::plan_pause_key(&plan_id);
     run_blocking("计划暂停/继续", move || {
         let journal = session.journal();
         // kv 里流必须已存在（暂停一个不存在的计划没有意义，明确报错）。
@@ -973,6 +1017,14 @@ pub async fn plan_pause(
             .map_err(|e| e.to_string())?
         {
             return Err(format!("计划 '{plan_id}' 不存在（见任务面板 / 步骤卡片里的 plan_id）"));
+        }
+        // 暂停只对正在执行的计划有意义：已结束 / 已中止的流落了标志没人消费，反而让同
+        // id 的下一次 resume 一开跑就停在第一个波次边界。恢复（清标志）不设此门——
+        // 清掉残留标志总是安全的。
+        if paused && !rclaw_runtime::plan_is_active(&plan_id) {
+            return Err(format!(
+                "计划 '{plan_id}' 当前没有在执行（已结束或已中止），不能暂停；需要续跑请让 agent 以该 id resume"
+            ));
         }
         let (event, write) = if paused {
             (
@@ -5363,11 +5415,84 @@ mod plan_projection_tests {
             plan_id: "p".into(),
             name: "p".into(),
             completed: false,
+            aborted: false,
             paused: false,
             succeeded: None,
             updated_at: 0,
             steps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn aborted_plans_project_as_finished_and_stop_spinning() {
+        // 执行器守卫补写的 plan_aborted：整体收尾 + 运行中的步骤回 pending；下一代
+        // plan_started 复位中止态。
+        let mut plan = blank_plan();
+        project_plan_events(
+            &mut plan,
+            &[
+                event(
+                    "plan_started",
+                    serde_json::json!({"steps": [{"id": "a", "task": "跑"}, {"id": "b", "task": "等"}]}),
+                ),
+                event("step_started", serde_json::json!({"step": "a"})),
+                event("plan_paused", serde_json::json!({})),
+                event("plan_aborted", serde_json::json!({"reason": "取消"})),
+            ],
+        );
+        assert!(plan.completed && plan.aborted);
+        assert!(!plan.paused, "已结束的计划不再显示暂停");
+        assert_eq!(plan.steps[0].status, "pending");
+        assert_eq!(plan.steps[1].status, "pending");
+        project_plan_events(
+            &mut plan,
+            &[event("plan_started", serde_json::json!({"steps": ["a", "b"], "resumed": true}))],
+        );
+        assert!(!plan.completed && !plan.aborted);
+
+        // 没有终态事件、执行者也不在本进程：按已中止收口；执行者在则原样保留。
+        let mut orphan = blank_plan();
+        project_plan_events(
+            &mut orphan,
+            &[
+                event("plan_started", serde_json::json!({"steps": ["a"]})),
+                event("step_started", serde_json::json!({"step": "a"})),
+            ],
+        );
+        let mut live = orphan.clone();
+        reconcile_with_executor(&mut live, true);
+        assert!(!live.completed);
+        assert_eq!(live.steps[0].status, "running");
+        reconcile_with_executor(&mut orphan, false);
+        assert!(orphan.completed && orphan.aborted);
+        assert_eq!(orphan.steps[0].status, "pending");
+        // 已正常收尾的计划不受影响（不被改成 aborted）。
+        let mut done = blank_plan();
+        project_plan_events(
+            &mut done,
+            &[
+                event("plan_started", serde_json::json!({"steps": ["a"]})),
+                event("plan_completed", serde_json::json!({"succeeded": 0})),
+            ],
+        );
+        reconcile_with_executor(&mut done, false);
+        assert!(done.completed && !done.aborted);
+        // plan_completed 落下时仍 running 的步骤（执行器只在内存里判 skipped、没补步骤
+        // 事件的路径）不得继续转圈。
+        let mut unsettled = blank_plan();
+        project_plan_events(
+            &mut unsettled,
+            &[
+                event("plan_started", serde_json::json!({"steps": ["a", "b"]})),
+                event("step_started", serde_json::json!({"step": "a"})),
+                event("step_finished", serde_json::json!({"step": "a", "outcome": "succeeded"})),
+                event("step_started", serde_json::json!({"step": "b"})),
+                event("plan_completed", serde_json::json!({"succeeded": 1})),
+            ],
+        );
+        assert!(unsettled.completed && !unsettled.aborted);
+        assert_eq!(unsettled.steps[0].status, "succeeded");
+        assert_eq!(unsettled.steps[1].status, "pending");
     }
 
     #[test]

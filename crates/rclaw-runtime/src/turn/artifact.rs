@@ -117,8 +117,44 @@ fn artifacts_dir(base: &Path, chat_key: &str) -> PathBuf {
     base.join("artifacts").join(chat_key)
 }
 
-/// 超预算时把 `content` 替换为「预览 + 路径」引用句柄；未超限 / 关闭 / 落盘失败则原样保留。
+/// 这次调用是不是在【取回 artifact】（`read` 工具、path 落在本 agent 根的 artifacts/ 下）。
+/// 取回结果不再二次落盘：否则模型按句柄分页读中段，一页超过预算就又生成一个 artifact
+/// 套一个句柄——取回永远到不了内容本身。`read` 自身的 256KB 输出上限兜住单页体积。
+fn reads_artifact(base: &Path, tool: &str, tool_input: &str) -> bool {
+    if tool != "read" {
+        return false;
+    }
+    let Ok(input) = serde_json::from_str::<serde_json::Value>(tool_input) else {
+        return false;
+    };
+    let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/");
+    let mut root = absolute_base(base)
+        .join("artifacts")
+        .to_string_lossy()
+        .replace('\\', "/");
+    if !root.ends_with('/') {
+        root.push('/');
+    }
+    // 句柄里的路径由本模块生成，模型照抄；Windows 路径大小写不敏感，宽松比较。模型也可能
+    // 写成相对 agent 根的 `artifacts/<key>/…`（`read` 同样接受，拼到 base 下）。
+    has_dir_prefix(&normalized, &root) || has_dir_prefix(&normalized, "artifacts/")
+}
+
+/// `path` 是否以目录前缀 `prefix`（以 `/` 结尾）开头、且其后还有内容。按【字节】比较：
+/// `prefix.len()` 不一定落在 `path` 的字符边界上（前缀之外的中文路径分量），按字符串
+/// 切片会 panic，而这里跑在 turn 任务里——一次 `read` 大文件就能把整条 turn 打崩。
+fn has_dir_prefix(path: &str, prefix: &str) -> bool {
+    let (path, prefix) = (path.as_bytes(), prefix.as_bytes());
+    path.len() > prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// 超预算时把 `content` 替换为「预览 + 路径」引用句柄；未超限 / 关闭 / 落盘失败 /
+/// 本身就是在取回 artifact（见 [`reads_artifact`]）则原样保留。
 ///
+/// `tool_input` 为该次调用的入参 JSON（只用于识别 artifact 取回，解析失败按普通调用）。
 /// 返回落盘路径（仅在成功落盘并替换时为 `Some`，供测试与日志断言）。
 pub(crate) fn spill_if_over_budget(
     spill: &ToolResultSpill,
@@ -126,9 +162,13 @@ pub(crate) fn spill_if_over_budget(
     channel: &str,
     chat_id: &str,
     tool: &str,
+    tool_input: &str,
     content: &mut String,
 ) -> Option<PathBuf> {
     if !spill.enabled || content.len() <= spill.threshold_bytes {
+        return None;
+    }
+    if reads_artifact(base, tool, tool_input) {
         return None;
     }
     let dir = artifacts_dir(&absolute_base(base), &sanitize_chat_key(channel, chat_id));
@@ -149,13 +189,16 @@ pub(crate) fn spill_if_over_budget(
     // 路径统一正斜杠：跨平台一致（Windows 侧 API 与 read 工具都接受），
     // 句柄进 transcript 后也不因平台不同而形态漂移。
     let display_path = path.to_string_lossy().replace('\\', "/");
+    // 每页行数建议：按行宽上限估算一页不超过预算（短行内容可以更多；取回 artifact 的
+    // read 结果不会再次落盘，页取大了只是多占上下文）。
+    let page_lines = (spill.threshold_bytes / SPILL_LINE_BYTES).max(1);
     *content = format!(
         "[工具输出超出预算已落盘：原始 {total} 字节（预算 {} 字节）]\n\
          完整内容已存至: {display_path}\n\
          （多行内容与原文逐字节一致；仅超过 ~2KB 的超长行被折行——若原文是单行长\n\
          内容，拼接各行即原文）\n\
-         取回中段：用 read 工具按 offset/limit 分页读取该文件（超长行已折行，\n\
-         任意段都能按行取回，不会越读越超预算）。\n\n\
+         取回中段：用 read 工具按 offset/limit 分页读取该文件（建议每页 limit ≤ {page_lines} 行，\n\
+         超长行已折行，任意段都能按行取回；读取该文件的结果不会再次落盘）。\n\n\
          预览（头尾合计 {} 字节，中段已省略）：\n{}",
         spill.threshold_bytes,
         PREVIEW_BYTES,
@@ -216,7 +259,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spill = spill_on(1024);
         let mut content = "short".to_string();
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &mut content).is_none());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", "{}", &mut content).is_none()
+        );
         assert_eq!(content, "short");
         // 关闭时超预算也不动。
         let off = ToolResultSpill {
@@ -224,8 +269,54 @@ mod tests {
             threshold_bytes: 4,
         };
         let mut big = "x".repeat(100);
-        assert!(spill_if_over_budget(&off, dir.path(), "cli", "c", "read", &mut big).is_none());
+        assert!(spill_if_over_budget(&off, dir.path(), "cli", "c", "read", "{}", &mut big).is_none());
         assert_eq!(big.len(), 100);
+    }
+
+    #[test]
+    fn reading_an_artifact_back_is_not_spilled_again() {
+        // 回归：按句柄分页读 artifact，一页超过预算曾被再次落盘成新 artifact + 新句柄，
+        // 取回永远到不了内容本身。
+        let dir = tempfile::tempdir().unwrap();
+        let spill = spill_on(64);
+        let mut first = "line\n".repeat(100);
+        let path = spill_if_over_budget(&spill, dir.path(), "cli", "c", "grep", "{}", &mut first)
+            .expect("首次超预算应落盘");
+        assert!(first.contains("建议每页 limit"), "{first}");
+        // 模型照抄句柄路径（正斜杠形态）去 read：结果原样保留。
+        let display_path = path.to_string_lossy().replace('\\', "/");
+        let input = serde_json::json!({"path": display_path, "offset": 0, "limit": 50}).to_string();
+        let mut page = "line\n".repeat(50);
+        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &input, &mut page).is_none());
+        assert_eq!(page, "line\n".repeat(50));
+        // 反斜杠形态 / 大小写差异同样识别。
+        let windows_style = display_path.replace('/', "\\").to_ascii_uppercase();
+        let input = serde_json::json!({"path": windows_style}).to_string();
+        let mut page = "line\n".repeat(50);
+        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &input, &mut page).is_none());
+        // 读别的大文件照常落盘；非 read 工具带 artifacts 路径也照常落盘。
+        let other = serde_json::json!({"path": dir.path().join("src/big.rs").to_string_lossy()}).to_string();
+        let mut big = "x".repeat(500);
+        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &other, &mut big).is_some());
+        let shell = serde_json::json!({"command": format!("cat {display_path}")}).to_string();
+        let mut out = "x".repeat(500);
+        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "shell", &shell, &mut out).is_some());
+        // 入参不是 JSON（或缺 path）按普通调用处理。
+        let mut odd = "x".repeat(500);
+        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", "not json", &mut odd).is_some());
+        // 回归：前缀长度落在中文分量内部时字符串切片会 panic（整条 turn 被打崩）——
+        // 非 artifact 的中文路径大文件照常落盘、不 panic。agent 根 + "docs/" 恰好与
+        // 根 + "artifacts/" 同长，让 prefix.len() 切进「说明.md」的多字节字符里。
+        let cjk = serde_json::json!({"path": dir.path().join("docs/说明说明说明说明.md").to_string_lossy()}).to_string();
+        let mut big = "x".repeat(500);
+        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &cjk, &mut big).is_some());
+        let short = serde_json::json!({"path": "说明"}).to_string();
+        let mut big = "x".repeat(500);
+        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &short, &mut big).is_some());
+        // 相对 agent 根的句柄写法（read 同样拼到 base 下）也认作取回。
+        let relative = serde_json::json!({"path": format!("artifacts/{}", path.file_name().unwrap().to_string_lossy())}).to_string();
+        let mut page = "line\n".repeat(50);
+        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &relative, &mut page).is_none());
     }
 
     #[test]
@@ -257,7 +348,7 @@ mod tests {
         let mut content = format!("{head}{middle}{tail}");
         let original = content.clone();
         let path =
-            spill_if_over_budget(&spill, dir.path(), "cli", "console", "grep", &mut content)
+            spill_if_over_budget(&spill, dir.path(), "cli", "console", "grep", "{}", &mut content)
                 .expect("超预算应落盘");
         // 落盘的是【全文】（折叠形态：原始行结构保留，仅超长行折行）。
         let disk = std::fs::read_to_string(&path).unwrap();
@@ -301,8 +392,8 @@ mod tests {
         let spill = spill_on(16);
         let mut a = "a".repeat(100);
         let mut b = "b".repeat(100);
-        let pa = spill_if_over_budget(&spill, dir.path(), "cli", "chat-a", "read", &mut a).unwrap();
-        let pb = spill_if_over_budget(&spill, dir.path(), "cli", "chat-b", "read", &mut b).unwrap();
+        let pa = spill_if_over_budget(&spill, dir.path(), "cli", "chat-a", "read", "{}", &mut a).unwrap();
+        let pb = spill_if_over_budget(&spill, dir.path(), "cli", "chat-b", "read", "{}", &mut b).unwrap();
         let key_a = dir
             .path()
             .join("artifacts")

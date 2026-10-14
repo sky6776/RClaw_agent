@@ -112,6 +112,21 @@ pub fn artifact_chat_key(channel: &str, chat_id: &str) -> String {
     key
 }
 
+/// 目录名是否形如 [`artifact_chat_key`] 的产物（`<1..=46 个 [A-Za-z0-9._-]>-<16 hex>`）。
+/// 全清时只删这种目录，用户放进 `artifacts/` 的别的东西不碰。
+fn is_artifact_chat_dir_name(name: &str) -> bool {
+    let Some((head, hash)) = name.rsplit_once('-') else {
+        return false;
+    };
+    let head_len = head.chars().count();
+    (1..=46).contains(&head_len)
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && hash.len() == 16
+        && hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 /// 删除某会话的 artifact 目录（工具结果落盘句柄的实体；会话删除时级联清理）。
 /// best-effort：目录不存在视为成功，删除失败只告警（artifact 只是上下文优化产物，
 /// 不能让会话删除因此失败）。
@@ -564,18 +579,22 @@ impl SessionStore {
         })
     }
 
-    /// 删除会话（消息 / checkpoint 级联；usage 锚点与会话目标 kv 一并删除，artifact
-    /// 目录级联清理）。返回会话是否存在。
+    /// 删除会话（消息 / checkpoint 级联；usage 锚点、会话目标与 fork 血缘 kv 一并删除，
+    /// artifact 目录级联清理）。返回会话是否存在。
     pub fn delete_session(&self, channel: &str, chat_id: &str) -> Result<bool> {
         let existed = self.db.transaction(|tx| {
             tx.execute(
                 "DELETE FROM usage_anchor WHERE channel = ?1 AND chat_id = ?2",
                 params![channel, chat_id],
             )?;
-            // 会话级 kv（/goal 目标）随会话删除：目标活不过它的会话。
+            // 会话级 kv（/goal 目标、fork 血缘）随会话删除：目标活不过它的会话；血缘
+            // 行留着会让 chat_id 复用时「新会话被当成旧分叉」。
             tx.execute(
-                "DELETE FROM kv WHERE key = ?1",
-                params![session_goal_key(channel, chat_id)],
+                "DELETE FROM kv WHERE key IN (?1, ?2)",
+                params![
+                    session_goal_key(channel, chat_id),
+                    fork_lineage_key(channel, chat_id)
+                ],
             )?;
             let n = tx.execute(
                 "DELETE FROM session WHERE channel = ?1 AND chat_id = ?2",
@@ -653,7 +672,8 @@ impl SessionStore {
                     .position(|(id, _)| *id == anchor_message_id)
                 else {
                     return Err(StoreError::Other(format!(
-                        "锚点消息 {anchor_message_id} 不在会话 {channel}/{chat_id} 的活动视图里                         （可能已被压缩折叠进摘要）。请换一个仍可见的消息，或用完整转录分叉"
+                        "锚点消息 {anchor_message_id} 不在会话 {channel}/{chat_id} 的活动视图里\
+                         （可能已被压缩折叠进摘要）。请换一个仍可见的消息，或用完整转录分叉"
                     )));
                 };
                 // 视图顺序 = 会话顺序（head ++ [boundary] ++ kept ++ after）；按锚点在视图
@@ -748,6 +768,12 @@ impl SessionStore {
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
+            // 只复制 artifact 实体（`<id>-<tool>.txt`）：atomic_write 并发写入中的
+            // `.<名>.<nonce>.tmp` sidecar / 崩溃残留的孤儿 tmp 以 `.` 开头，半截内容
+            // 不该被当成新分支的句柄实体带走。
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             if let Err(error) = std::fs::copy(entry.path(), target.join(entry.file_name())) {
                 tracing::warn!("artifact 文件复制失败（{}）: {error}", entry.path().display());
             }
@@ -819,11 +845,17 @@ impl SessionStore {
             let Some(sid) = session_id(conn, channel, chat_id)? else {
                 return Ok(Vec::new());
             };
+            // 与 `recent_window` 同一套 JSON 防护：手改坏的行用 json_valid 挡在 SQL 层
+            // （否则 json_each 对非法 JSON 直接让整条查询报错，/fork 列表整体失效）；
+            // content 不是数组时 json_each 给出标量行，CASE 不去 json_extract。
             let mut stmt = conn.prepare_cached(
                 "SELECT id, ts, data FROM message WHERE session_id = ?1 AND role = 'user' \
                  AND meta IS NULL \
-                 AND NOT EXISTS (SELECT 1 FROM json_each(message.data, '$.content') AS b \
-                                 WHERE json_extract(b.value, '$.type') = 'tool_result') \
+                 AND CASE WHEN json_valid(message.data) \
+                          THEN NOT EXISTS (SELECT 1 FROM json_each(message.data, '$.content') AS b \
+                                           WHERE CASE WHEN b.type = 'object' \
+                                                      THEN json_extract(b.value, '$.type') END = 'tool_result') \
+                          ELSE 0 END \
                  ORDER BY id DESC LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![sid, limit.max(1) as i64], |row| {
@@ -866,25 +898,43 @@ impl SessionStore {
                 "DELETE FROM file_checkpoint; DELETE FROM message; DELETE FROM session; \
                  DELETE FROM usage_anchor;",
             )?;
-            // 会话全清，会话级 kv（/goal 目标）一并删除——否则 /clear 后旧目标还挂在
-            // kv 里，goal reminder 会把它注进「全新」的会话。plan / workflow 等
-            // 运行时 journal 与其 kv 不属会话，保留。
-            tx.execute("DELETE FROM kv WHERE key LIKE 'session-goal/%'", [])?;
+            // 会话全清，会话级 kv（/goal 目标、fork 血缘）一并删除——否则 /clear 后旧
+            // 目标还挂在 kv 里，goal reminder 会把它注进「全新」的会话；血缘行会让复用
+            // chat_id 的新会话被当成旧分叉。plan / workflow 等运行时 journal 与其 kv
+            // 不属会话，保留。
+            tx.execute(
+                "DELETE FROM kv WHERE key LIKE 'session-goal/%' OR key LIKE 'session-fork/%'",
+                [],
+            )?;
             Ok(())
         })?;
         if let Err(e) = self.db.vacuum() {
             tracing::warn!("state.sqlite VACUUM 失败（数据已删除，仅文件体积未回收）: {e}");
         }
-        // 会话全清，工具结果落盘的 artifact 根目录一并清空（best-effort）。
+        // 会话全清，工具结果落盘的 artifact 目录一并清空（best-effort）。只删形如
+        // `<会话键>-<16 hex>` 的会话目录（[`artifact_chat_key`] 的产物）：根目录是用户可
+        // 配置的 agent 根下的子目录，整棵 remove_dir_all 会把用户放进去的别的东西也抹掉。
         let artifacts_root = self.layout.base.join("artifacts");
-        match std::fs::remove_dir_all(&artifacts_root) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        let entries = match std::fs::read_dir(&artifacts_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 tracing::warn!(
-                    "artifacts 根目录清理失败（{}）: {error}",
+                    "artifacts 根目录读取失败（{}）: {error}",
                     artifacts_root.display()
                 );
+                return Ok(());
+            }
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if !is_artifact_chat_dir_name(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                tracing::warn!("artifact 目录清理失败（{}）: {error}", entry.path().display());
             }
         }
         Ok(())
@@ -1356,8 +1406,8 @@ fn insert_checkpoints(
         } else {
             group_id
         };
-        // 记录级 anchor 优先（重锚标记显式 None）；缺省继承事务级（工具链同事务的
-        // tool_result 消息 id）。
+        // 记录自带 anchor 时用它，否则继承事务级（工具链同事务的 tool_result 消息 id）。
+        // 重锚标记本身无锚：它走 `append_file_checkpoints`，事务级也是 None。
         let anchor = cp.anchor_message_id.or(anchor_message_id);
         stmt.execute(params![
             session_id,

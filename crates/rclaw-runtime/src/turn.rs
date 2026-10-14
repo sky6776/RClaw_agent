@@ -480,7 +480,8 @@ fn clear_agent_state(
         }
     })?;
     Ok(format!(
-        "• state.sqlite：删除 {sessions} 个会话（含当前会话）及其文件 checkpoint、用量锚点\n\
+        "• state.sqlite：删除 {sessions} 个会话（含当前会话）及其文件 checkpoint、用量锚点、会话目标与分叉血缘\n\
+         • artifacts/：删除各会话的工具结果落盘目录（转录里的落盘句柄随之失效）\n\
          • memory/：删除 {memory} 个顶层条目（MEMORY.md、daily/、session_summaries/）\n\
          \n记忆与历史已重置；下一次写入会自动重建所需记录与文件。"
     ))
@@ -1400,16 +1401,16 @@ impl TurnManager {
             let reply: String = final_reply.chars().take(4000).collect();
             let mut request = ChatRequest::new(
                 Some(
-                    "你是目标完成审计员。判断【目标】是否已由【工作汇报】证实达成。
-                     判定标准：汇报中必须包含可核对的完成证据（具体产物 / 测试结果 / 命令                     输出 / 交付物路径等）；计划、承诺、进行中、部分完成都不算达成。
-                     只输出一个 JSON 对象：{\"goal_met\": true|false, \"evidence_summary\": \"一句话依据\"}，                     不要输出其它内容。"
+                    "你是目标完成审计员。判断【目标】是否已由【工作汇报】证实达成。\n\
+                     判定标准：汇报中必须包含可核对的完成证据（具体产物 / 测试结果 / 命令输出 / \
+                     交付物路径等）；计划、承诺、进行中、部分完成都不算达成。\n\
+                     只输出一个 JSON 对象：{\"goal_met\": true|false, \"evidence_summary\": \"一句话依据\"}，\
+                     不要输出其它内容。"
                         .to_string(),
                 ),
                 vec![Message::plain(
                     Role::User,
-                    format!("【目标】{objective}
-
-【工作汇报】{reply}").as_str(),
+                    format!("【目标】{objective}\n\n【工作汇报】{reply}").as_str(),
                 )],
             );
             request.max_tokens = 200;
@@ -1473,10 +1474,10 @@ impl TurnManager {
         let goal = journal.kv_get(&Self::goal_key(channel, chat_id)).ok()??;
         let objective = goal.get("objective")?.as_str()?;
         Some(format!(
-            "
-[Session goal] 本会话有用户设定的活动目标：
-「{objective}」
-             在目标达成前持续朝它工作；每次收尾回复前对照目标逐项核对             已交付的证据（文件 / 测试 / 命令输出），不要把计划或部分进度             当作完成；确信全部达成时，在回复里列出证据清单并提醒用户             用 /goal clear 收尾。"
+            "\n[Session goal] 本会话有用户设定的活动目标：\n「{objective}」\n\
+             在目标达成前持续朝它工作；每次收尾回复前对照目标逐项核对已交付的证据（文件 / 测试 / \
+             命令输出），不要把计划或部分进度当作完成；确信全部达成时，在回复里列出证据清单并提醒\
+             用户用 /goal clear 收尾。"
         ))
     }
 
@@ -1517,9 +1518,7 @@ impl TurnManager {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
                     format!(
-                        "🎯 当前会话目标：{objective}
-
-完成后用 /goal clear 收尾；                         /goal <新目标> 可覆盖。"
+                        "🎯 当前会话目标：{objective}\n\n完成后用 /goal clear 收尾；/goal <新目标> 可覆盖。"
                     )
                 }
                 _ => "当前会话未设定目标。用法：/goal <目标文本> 设定；/goal 查看现状；/goal clear 收尾。".to_string(),
@@ -1540,9 +1539,9 @@ impl TurnManager {
                 });
                 match journal.kv_set(&key, &payload) {
                     Ok(()) => format!(
-                        "🎯 会话目标已设定：{objective}
-
-此后本会话每次回复都会收到该目标提醒，                         在目标达成前请持续朝它工作并按证据核对；每次成功收尾系统会用一次小审计                         核对证据，确认达成后自动清除目标（也可随时 /goal clear 手动收尾）。"
+                        "🎯 会话目标已设定：{objective}\n\n此后本会话每次回复都会收到该目标提醒，\
+                         在目标达成前请持续朝它工作并按证据核对；每次成功收尾系统会用一次小审计\
+                         核对证据，确认达成后自动清除目标（也可随时 /goal clear 手动收尾）。"
                     ),
                     Err(error) => format!("⚠️ 目标写入失败: {error}"),
                 }
@@ -1597,22 +1596,22 @@ impl TurnManager {
                     return "当前会话没有可分叉的真实用户消息。".to_string();
                 }
                 let mut out = format!("可分叉锚点（最近 {} 条用户消息，新在前）：", anchors.len());
-                for (id, ts_ms, preview) in &anchors {
-                    let time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(*ts_ms)
+                // message.ts 是 Unix【秒】（Message.ts 落库原样写入；SessionSummary.updated_at
+                // 才是毫秒），按毫秒解释会把所有锚点显示成 1970-01-21。
+                for (id, ts_secs, preview) in &anchors {
+                    let time = chrono::DateTime::<chrono::Utc>::from_timestamp(*ts_secs, 0)
                         .map(|t| {
                             t.with_timezone(&chrono::Local)
                                 .format("%Y-%m-%d %H:%M")
                                 .to_string()
                         })
                         .unwrap_or_else(|| "?".to_string());
-                    out.push_str(&format!("
-- #{id}（{time}）{preview}"));
+                    out.push_str(&format!("\n- #{id}（{time}）{preview}"));
                 }
                 out.push_str(
-                    "
-
-分叉：/fork <消息 id> —— 从该消息（含）复制出新会话分支；原会话与文件都不动，
-桌面端也可在消息下方的分叉按钮直接点选。",
+                    "\n\n分叉：/fork <消息 id> [full] [files] —— 从该消息（含）复制出新会话分支；\
+                     原会话不动；files 同时把工作区文件回滚到该消息时刻，full 复制完整转录\
+                     （含被压缩折叠的原文）。桌面端也可在消息下方的分叉按钮直接点选。",
                 );
                 out
             }
@@ -1693,29 +1692,23 @@ impl TurnManager {
                             match restored {
                                 Ok(Ok(file_report)) => {
                                     report.push_str(&format!(
-                                        "
-
-📁 文件已一并回滚到锚点时刻（影响全局工作区，                                         原会话与新分支共享同一工作区）：
-{file_report}"
+                                        "\n\n📁 文件已一并回滚到锚点时刻（影响全局工作区，\
+                                         原会话与新分支共享同一工作区）：\n{file_report}"
                                     ));
                                 }
                                 Ok(Err(error)) => {
                                     report.push_str(&format!(
-                                        "
-
-⚠️ 文件回滚未执行（新会话历史不受影响）：{error}"
+                                        "\n\n⚠️ 文件回滚未执行（新会话历史不受影响）：{error}"
                                     ));
                                 }
                                 Err(error) => {
-                                    report.push_str(&format!("
-
-⚠️ 文件回滚任务异常: {error}"));
+                                    report.push_str(&format!("\n\n⚠️ 文件回滚任务异常: {error}"));
                                 }
                             }
                         } else {
                             report.push_str(
-                                "
-原会话与工作区文件均未改动；在桌面端会话列表里打开新分支继续，或换到该会话上下文后直接对话。",
+                                "\n原会话与工作区文件均未改动；在桌面端会话列表里打开新分支继续，\
+                                 或换到该会话上下文后直接对话。",
                             );
                         }
                         report
@@ -3360,14 +3353,12 @@ impl TurnManager {
             // ——模型下轮知道哪些调用没有结果、不会重复已做的工作；
             // 其余情况不留任何未闭合链。
             // Layer 5：被打断前已完成的文件写入照样落 checkpoint（文件已改，回滚点不能
-            // 因取消丢失；cron turn 同理）。
-            rewind::flush(
-                &self.session,
-                &msg.channel,
-                &msg.chat_id,
-                checkpoint_group_id,
-                std::mem::take(&mut state.pending_file_checkpoints),
-            );
+            // 因取消丢失；cron turn 同理）。前台路径优先与中断工具链同事务落库、锚到
+            // aborted 占位结果——否则这批写入 anchor 为 NULL，`/fork <id> files` 按消息回滚
+            // 时无法归属、不会被撤销；只有没有可闭合的链（模型纯文本阶段被取消但工具已写
+            // 过文件的边角）或事务失败才退回独立落库。
+            let mut checkpoints =
+                rewind::into_records(std::mem::take(&mut state.pending_file_checkpoints));
             if !is_cron {
                 if let Some(assistant_msg) = interrupted_chain.take() {
                     let ids = assistant_msg
@@ -3380,16 +3371,28 @@ impl TurnManager {
                         .collect::<Vec<_>>();
                     if !ids.is_empty() {
                         let carrier = rclaw_store::synthesize_aborted_tool_results(&ids);
-                        if let Err(e) = self.session.append_tool_chain(
+                        match self.session.append_tool_chain_with_checkpoints(
                             &msg.channel,
                             &msg.chat_id,
                             &assistant_msg,
                             &carrier,
+                            checkpoint_group_id,
+                            &checkpoints,
                         ) {
-                            tracing::warn!("中断工具链持久化失败: {e}");
+                            Ok(_) => checkpoints.clear(),
+                            Err(e) => tracing::warn!("中断工具链持久化失败: {e}"),
                         }
                     }
                 }
+            }
+            rewind::flush_records(
+                &self.session,
+                &msg.channel,
+                &msg.chat_id,
+                checkpoint_group_id,
+                &checkpoints,
+            );
+            if !is_cron {
                 // 写一条简短 assistant 确认，保证会话历史可回放、合法（user 之后有 assistant）。
                 let confirm = Message::plain(Role::Assistant, "（已停止当前任务）");
                 if let Err(e) = self.session.append(&msg.channel, &msg.chat_id, &confirm) {
@@ -3444,31 +3447,38 @@ impl TurnManager {
             // 可核对证据证实目标达成」。达成 → 清除 goal + 投一条系统回执；未达成 /
             // 审计失败 → 不动（下轮提醒继续驱动）。异步执行，不阻塞收尾回复。
             // created_at 随目标一并带进审计：异步窗口里 /goal 换目标时审计不得误清新目标。
-            let active_goal = self
-                .session
-                .journal()
-                .kv_get(&Self::goal_key(&msg.channel, &msg.chat_id))
-                .ok()
-                .flatten()
-                .and_then(|goal| {
-                    Some((
-                        goal.get("objective")
-                            .and_then(serde_json::Value::as_str)?
-                            .to_string(),
-                        goal.get("created_at").and_then(serde_json::Value::as_i64)?,
-                    ))
-                });
-            if self.opts.goal_audit_enabled && !text.is_empty() {
-                if let Some((objective, created_at)) = active_goal {
-                    self.spawn_goal_audit(
-                        turn_provider.clone(),
-                        objective,
-                        created_at,
-                        text.clone(),
-                        msg.channel.clone(),
-                        msg.chat_id.clone(),
-                    );
-                }
+            // 只审计用户 turn 的汇报：cron 任务 / Agent 交接等非用户来源的 turn 不是在
+            // 回应目标，它们的回复里偶然出现的「已完成」会把目标误清。
+            let audit_this_turn = self.opts.goal_audit_enabled
+                && msg.source() == MessageSource::User
+                && !is_cron
+                && !text.is_empty();
+            let active_goal = if audit_this_turn {
+                self.session
+                    .journal()
+                    .kv_get(&Self::goal_key(&msg.channel, &msg.chat_id))
+                    .ok()
+                    .flatten()
+                    .and_then(|goal| {
+                        Some((
+                            goal.get("objective")
+                                .and_then(serde_json::Value::as_str)?
+                                .to_string(),
+                            goal.get("created_at").and_then(serde_json::Value::as_i64)?,
+                        ))
+                    })
+            } else {
+                None
+            };
+            if let Some((objective, created_at)) = active_goal {
+                self.spawn_goal_audit(
+                    turn_provider.clone(),
+                    objective,
+                    created_at,
+                    text.clone(),
+                    msg.channel.clone(),
+                    msg.chat_id.clone(),
+                );
             }
 
             // CLI 的 streaming provider 输出经过完成门禁缓冲；验证通过后才一次性写 stdout。

@@ -78,11 +78,21 @@ export interface ChatForkResult {
   copied: number;
 }
 
+/** PlanRun 步骤状态（与后端 PlanStepDto.status 同集合）。 */
+export type PlanStepStatus =
+  | "pending"
+  | "running"
+  | "verifying"
+  | "succeeded"
+  | "failed"
+  | "skipped";
+
 /** PlanRun 计划的一个步骤状态（plan_status 轮询）。 */
 export interface PlanStep {
   id: string;
-  /** pending | succeeded | failed | skipped。 */
-  status: string;
+  /** 后端投影的状态；未知值（更新的后端）按 pending 渲染。`string & {}` 让联合不被
+   *  坍缩成 string，已知字面量仍参与补全与穷举检查。 */
+  status: PlanStepStatus | (string & {});
   task: string;
   summary: string;
 }
@@ -91,7 +101,10 @@ export interface PlanStep {
 export interface PlanStatus {
   plan_id: string;
   name: string;
+  /** 已整体收尾（plan_completed / plan_aborted，或执行者已不在）。 */
   completed: boolean;
+  /** 执行器未正常收尾（取消 / 早退 / 进程重启）；completed 同时为 true。 */
+  aborted: boolean;
   /** 用户暂停中（波次边界协作式暂停：当前波跑完后等待恢复）。 */
   paused: boolean;
   succeeded: number | null;

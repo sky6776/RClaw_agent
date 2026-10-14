@@ -79,6 +79,19 @@ skill_curator_interval_hours = 168
 skill_stale_after_days = 30
 skill_archive_after_days = 90
 
+# 可同时执行的顶层 turn 数（不同会话 / cron / 子代理并行）；同一普通会话仍串行。缺省 8。
+# max_concurrent_turns = 8
+
+# /goal 会话目标的完成审计：有活动目标的会话成功收尾后，用一次无工具小推理核对汇报里的
+# 完成证据，确认达成即自动清除目标并回执。关闭后只保留每轮提醒，靠手动 /goal clear 收尾。
+# goal_audit_enabled = true
+
+# 超长工具结果落盘：超过阈值（字节）的工具输出全文写到 agent/artifacts/<会话键>/，
+# 模型只收到首尾预览 + 文件路径（用 read 工具按 offset/limit 取中段）。会话删除 / /clear
+# 时级联清理。关闭后按原有截断口径直接进上下文。
+# tool_result_artifact_enabled = true
+# tool_result_artifact_bytes = 32768
+
 
 [llm]
 provider = "zhipu"

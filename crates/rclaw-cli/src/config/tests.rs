@@ -92,6 +92,23 @@ fn max_concurrent_turns_defaults_to_eight_and_parses_override() {
 }
 
 #[test]
+fn goal_audit_and_artifact_keys_default_and_parse() {
+    // 第十二轮新增的运行时开关必须能从配置改（AgentOptions 有字段但配置没键 = 永远默认）。
+    let default_cfg: Config = toml::from_str("").unwrap();
+    assert!(default_cfg.agent.goal_audit_enabled);
+    assert!(default_cfg.agent.tool_result_artifact_enabled);
+    assert_eq!(default_cfg.agent.tool_result_artifact_bytes, 32 * 1024);
+
+    let configured: Config = toml::from_str(
+        "[agent]\ngoal_audit_enabled = false\ntool_result_artifact_enabled = false\ntool_result_artifact_bytes = 4096\n",
+    )
+    .unwrap();
+    assert!(!configured.agent.goal_audit_enabled);
+    assert!(!configured.agent.tool_result_artifact_enabled);
+    assert_eq!(configured.agent.tool_result_artifact_bytes, 4096);
+}
+
+#[test]
 fn compression_token_budgets_default_to_derived_sentinels() {
     // 0 在 CLI 配置层表示「未显式配置」，main.rs 会用 provider context_length
     // 派生 threshold/tail 预算。

@@ -35,14 +35,117 @@ use super::workflow::{DependencyGraph, DependencyNode, FacadeDiagnostic};
 /// 包裹头：与执行引擎的 async IIFE 语义一致（顶层 await / return 合法）。
 const WRAPPER_HEAD: &str = "(async function __wf__(){\n";
 const WRAPPER_TAIL: &str = "\n})";
-/// 类型嵌套深度上限（与 Rust 侧 schema 校验器的深度上限同源：8）。
+/// 类型嵌套深度上限（与 Rust 侧 schema 校验器的深度上限同源：8）。编译完成后按
+/// 校验器口径核对展开后的 schema（[`schema_depth`]），这是唯一与校验器对齐的判定。
 const MAX_TYPE_DEPTH: usize = 8;
 /// 类型别名解析深度上限（防 `type A = B; type B = A;` 循环）。
 const MAX_ALIAS_DEPTH: usize = 8;
+/// schema 编译的语法递归护栏：每条 compile 递归边 +1（别名实例化的实参、体、括号、
+/// 联合成员各占一层，并非 JSON 递归边）。只防失控递归，不承担「与校验器同口径」的
+/// 职责——按 MAX_TYPE_DEPTH 直接卡语法层曾把 Box×8 这种校验器放行的嵌套多拒掉
+///（8 层实参 + 体 + 属性 = 10 层语法递归）。取 4 倍留足别名 / 括号 / 联合的开销，
+/// 展开后仍超 8 层的由 [`schema_depth`] 复核拒绝。
+const MAX_COMPILE_RECURSION: usize = MAX_TYPE_DEPTH * 4;
+/// 脚本嵌套深度上限（`([{` 一组、泛型 `<>` 一组）。oxc 是纯递归下降解析器，没有递归
+/// 护栏；脚本来自模型（可被用户诱导），几 KB 的 `[[[[…]]]]` 就能在默认 2 MiB 的线程栈
+/// 上溢出——Rust 栈溢出是 abort 不是 panic，整个进程退出。解析前线性预检拒绝超限脚本，
+/// 解析本身再放到大栈专用线程（[`PARSE_STACK_BYTES`]）上，两道一起把递归深度钉死。
+/// 正常脚本的嵌套远低于此（几层到十几层）。
+const MAX_NESTING_DEPTH: usize = 256;
+/// oxc 解析 + AST 遍历专用线程的栈大小（虚拟地址预留，按需提交物理页）。
+const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// 嵌套深度预检：字符串 / 注释遮蔽后，`([{` 与泛型 `<>` 的嵌套任一超过
+/// [`MAX_NESTING_DEPTH`] 即返回带作者脚本行列的诊断。
+///
+/// `<>` 的计数是启发式（`<` 也是比较运算符）：`<=` / `>=` / `=>` 不计；`;` 把 `<>`
+/// 计数清零——类型实参列表里不会出现 `;`（对象类型字面量的 `;` 伴随 `{}`，由括号计数
+/// 兜住），而比较表达式总在语句结束前被清零，不会跨语句累加。`script` 必须是作者原文
+///（不含包裹头尾），行列对应原脚本。
+fn check_nesting_depth(script: &str) -> Result<(), FacadeDiagnostic> {
+    let masked = super::workflow::mask_strings_and_comments(script);
+    let bytes = masked.as_bytes();
+    let (mut bracket, mut angle) = (0usize, 0usize);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let exceeded = match bytes[i] {
+            b'(' | b'[' | b'{' => {
+                bracket += 1;
+                bracket > MAX_NESTING_DEPTH
+            }
+            b')' | b']' | b'}' => {
+                bracket = bracket.saturating_sub(1);
+                false
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'=') => {
+                i += 1;
+                false
+            }
+            b'<' => {
+                angle += 1;
+                angle > MAX_NESTING_DEPTH
+            }
+            b'>' if bytes.get(i + 1) == Some(&b'=') => {
+                i += 1;
+                false
+            }
+            b'>' => {
+                if i == 0 || bytes[i - 1] != b'=' {
+                    angle = angle.saturating_sub(1);
+                }
+                false
+            }
+            b';' => {
+                angle = 0;
+                false
+            }
+            _ => false,
+        };
+        if exceeded {
+            let (line, col) = line_col(script, (i + WRAPPER_HEAD.len()) as u32);
+            return Err(FacadeDiagnostic {
+                line,
+                col,
+                message: format!(
+                    "脚本嵌套过深：此处括号 / 泛型嵌套超过 {MAX_NESTING_DEPTH} 层，拆分表达式或类型后重新提交"
+                ),
+            });
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// 在大栈专用线程上执行 oxc 解析 + 遍历（见 [`PARSE_STACK_BYTES`]），结果带回当前线程。
+/// 线程起不来（资源耗尽）返回 `None`，调用方按「无法分析」降级；闭包 panic 原样在当前
+/// 线程重新抛出（与直接调用同语义）。
+fn on_parse_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Option<T> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("rclaw-workflow-ast".into())
+            .stack_size(PARSE_STACK_BYTES)
+            .spawn_scoped(scope, f)
+            .ok()?;
+        match handle.join() {
+            Ok(value) => Some(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
 
 /// 解析包裹后的脚本（`wrapped` 由调用方持有，AST 与之同生命周期）。解析失败（含可恢复
-/// 语法错误）返回 `None`：调用方降级（依赖图）或诊断（typed ask 编译）。
+/// 语法错误）与嵌套超限（[`check_nesting_depth`]）都返回 `None`：调用方降级（依赖图）
+/// 或诊断（typed ask 编译在调用前已单独预检并给出带行列的诊断）。
 fn parse<'a>(allocator: &'a Allocator, wrapped: &'a str) -> Option<Program<'a>> {
+    // 预检只看作者原文：包裹头尾自带的 `(` `{` 会让恰在上限附近的脚本过了作者级预检
+    //（compile_typed_asks 入口）却在这里被拒，两处口径不一致、诊断也丢了行列。
+    let author = wrapped
+        .strip_prefix(WRAPPER_HEAD)
+        .and_then(|rest| rest.strip_suffix(WRAPPER_TAIL))
+        .unwrap_or(wrapped);
+    if check_nesting_depth(author).is_err() {
+        return None;
+    }
     let source_type = SourceType::mjs().with_typescript(true);
     let ret = Parser::new(allocator, wrapped, source_type).parse();
     if ret.panicked || !ret.errors.is_empty() {
@@ -68,8 +171,13 @@ fn line_col(script: &str, offset_in_wrapped: u32) -> (usize, usize) {
 // AST 依赖图
 // ---------------------------------------------------------------------------
 
-/// AST 版依赖图（第十一轮文本版的升级）。解析失败返回 `None`（调用方降级文本解析）。
+/// AST 版依赖图（第十一轮文本版的升级）。解析失败 / 嵌套超限 / 解析线程不可用都返回
+/// `None`（调用方降级文本解析）。解析与遍历在大栈专用线程上执行（见 [`on_parse_stack`]）。
 pub(crate) fn build_dependency_graph(script: &str) -> Option<DependencyGraph> {
+    on_parse_stack(|| build_dependency_graph_inner(script)).flatten()
+}
+
+fn build_dependency_graph_inner(script: &str) -> Option<DependencyGraph> {
     let allocator = Allocator::default();
     let wrapped = format!("{WRAPPER_HEAD}{script}{WRAPPER_TAIL}");
     let program = parse(&allocator, &wrapped)?;
@@ -162,7 +270,12 @@ pub(crate) fn build_dependency_graph(script: &str) -> Option<DependencyGraph> {
 }
 
 /// AST 版 actor 提取：任意位置的 `agent("name")` 调用，按首现序去重。失败返回 `None`。
+/// 解析与遍历在大栈专用线程上执行（见 [`on_parse_stack`]）。
 pub(crate) fn extract_actors(script: &str) -> Option<Vec<String>> {
+    on_parse_stack(|| extract_actors_inner(script)).flatten()
+}
+
+fn extract_actors_inner(script: &str) -> Option<Vec<String>> {
     let allocator = Allocator::default();
     let wrapped = format!("{WRAPPER_HEAD}{script}{WRAPPER_TAIL}");
     let program = parse(&allocator, &wrapped)?;
@@ -426,7 +539,26 @@ pub(crate) fn has_typed_asks(script: &str) -> bool {
 /// 不支持的类型 / 非法形状 / 嵌套 typed ask 返回诊断列表（提交期拒绝，只回模型）。
 /// oxc 拒绝的脚本（极端语法 / 语法错误）原样返回——重写层不设第二道语法门禁，
 /// 语法由 `check_script` 的探针把关（typed ask 只会出现在 oxc 能解析的脚本里）。
+/// 嵌套超限（[`check_nesting_depth`]）直接给带行列的诊断；解析与遍历在大栈专用线程上
+/// 执行（见 [`on_parse_stack`]），线程起不来按「无 typed ask」原样放行（QuickJS 探针
+/// 仍会把 TS 语法当语法错误拒绝，不会把未编译的 `ask<T>` 放进执行）。
 pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<FacadeDiagnostic>> {
+    if let Err(diagnostic) = check_nesting_depth(script) {
+        return Err(vec![diagnostic]);
+    }
+    match on_parse_stack(|| compile_typed_asks_inner(script)) {
+        Some(result) => result,
+        None => {
+            tracing::warn!("workflow typed ask 编译线程无法启动，按无 typed ask 放行");
+            Ok(TypedAskTransform {
+                exec_script: script.to_string(),
+                typed_asks: Vec::new(),
+            })
+        }
+    }
+}
+
+fn compile_typed_asks_inner(script: &str) -> Result<TypedAskTransform, Vec<FacadeDiagnostic>> {
     let allocator = Allocator::default();
     let wrapped = format!("{WRAPPER_HEAD}{script}{WRAPPER_TAIL}");
     let Some(program) = parse(&allocator, &wrapped) else {
@@ -713,10 +845,23 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
                 return;
             }
         };
-        let Some(type_node) = type_arguments.params.first() else {
-            self.diag(it.span.start, "ask<> 的类型参数列表为空".to_string());
-            walk_call_expression(self, it);
-            return;
+        // 恰好一个类型实参：多余的实参（`ask<A, B>`）曾被静默丢弃——作者以为 B 参与
+        // 了校验，实际只按 A 校验。
+        let type_node = match type_arguments.params.as_slice() {
+            [only] => only,
+            [] => {
+                self.diag(it.span.start, "ask<> 的类型参数列表为空".to_string());
+                walk_call_expression(self, it);
+                return;
+            }
+            _ => {
+                self.diag(
+                    it.span.start,
+                    "ask<T> 只接受一个类型参数：多余的类型参数不参与校验，请删掉".to_string(),
+                );
+                walk_call_expression(self, it);
+                return;
+            }
         };
         let mut compiler = SchemaCompiler {
             aliases: self.aliases,
@@ -729,22 +874,37 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
             self.diag(offset, message);
         }
         if self.diagnostics.is_empty() {
-            let schema_json = schema.to_string();
             let receiver = self.slice(object.span()).trim();
             let question_src = self.slice(question.span());
-            // schema 以 JSON 文本 → JS 字符串字面量 → JSON.parse 嵌入：直接内联对象
-            // 字面量会把 `__proto__` 键变成原型设置而非自有属性（JSON.stringify 随即
-            // 丢掉该约束，校验被静默放宽）；parse 路径的键语义与 JSON 完全一致。
-            let schema_literal = serde_json::to_string(&schema_json).unwrap_or_default();
             // 可选链（h?.ask<T>(..)）重写后必须保留：`?.` 与 `.` 混用会改变语义——
             // h 为空时合法跳过的调用变成 TypeError，且问题参数的副作用不再被短路。
             // 调用本身的可选标记（`ask?.<T>(..)`，flag 在 CallExpression 上）放在
             // 参数括号之前（`askJson?.(...)` 是 JS 的可选调用语法；`(...)?` 不是）。
             let chain = if member_optional { "?." } else { "." };
             let call_mark = if it.optional { "?." } else { "" };
-            let replacement = format!(
-                "{receiver}{chain}askJson{call_mark}({question_src}, JSON.parse({schema_literal}))"
-            );
+            // `ask<string>` 与 facade 默认的 `ask(question): Promise<string>` 同义：答案本来
+            // 就是整段文本，不该再要求子代理回 JSON 字符串字面量（`"..."`）——走 askJson
+            // 会把朴素回答判成「不是合法 JSON」。只抹掉类型实参，保留普通 ask。
+            let plain_string_ask = schema == json!({"type": "string"});
+            let mut replacement = if plain_string_ask {
+                format!("{receiver}{chain}ask{call_mark}({question_src}")
+            } else {
+                // schema 以 JSON 文本 → JS 字符串字面量 → JSON.parse 嵌入：直接内联对象
+                // 字面量会把 `__proto__` 键变成原型设置而非自有属性（JSON.stringify 随即
+                // 丢掉该约束，校验被静默放宽）；parse 路径的键语义与 JSON 完全一致。
+                let schema_literal =
+                    serde_json::to_string(&schema.to_string()).unwrap_or_default();
+                format!("{receiver}{chain}askJson{call_mark}({question_src}, JSON.parse({schema_literal})")
+            };
+            // 原调用跨多行（类型实参 / 参数各占一行）时替换文本会变短：补回被吃掉的换行，
+            // 后续语句的行号与作者脚本一致——否则 QuickJS 运行期报错 / run_failed 的
+            // 行号指到错误位置，模型按行号修改时改错地方。
+            let original_newlines = self.slice(it.span).matches('\n').count();
+            let replacement_newlines = replacement.matches('\n').count();
+            for _ in replacement_newlines..original_newlines {
+                replacement.push('\n');
+            }
+            replacement.push(')');
             if let Some((start, end)) = self.script_span(it.span) {
                 // 嵌套 typed ask（`ask<T>(await ask<U>(...))` 的参数里又有一层）拒绝：
                 // 外层替换的文本取自原文，内层重写无法嵌进外层的固定 span 里——支持它
@@ -804,8 +964,11 @@ fn schema_size(value: &Value) -> usize {
 /// additionalProperties、prefixItems、allOf、anyOf 会消耗校验器的 depth+1；
 /// `type` / `required` / `const` 等标量字段与 JSON 表示容器（properties 键本身）
 /// 不算——按 JSON 容器层计会把合法嵌套在编译期提前拒掉（校验器其实只看到一半深度）。
+/// 叶子记 0：校验器从 depth 0 校验根 schema，每条递归边 +1，`depth > 8` 才拒绝——
+/// 返回值即「最深叶子被校验时的 depth」，与 `MAX_TYPE_DEPTH` 直接比较口径一致
+/// （叶子记 1 曾把校验器放行的 8 层嵌套在编译期多拒掉一层）。
 fn schema_depth(value: &Value) -> usize {
-    let mut depth = 1;
+    let mut depth = 0;
     if let Some(properties) = value.get("properties").and_then(Value::as_object) {
         for child in properties.values() {
             depth = depth.max(1 + schema_depth(child));
@@ -866,10 +1029,12 @@ impl<'a> SchemaCompiler<'a> {
         if self.budget.over {
             return json!({});
         }
-        if depth > MAX_TYPE_DEPTH {
+        if depth > MAX_COMPILE_RECURSION {
             self.diagnostics.push((
                 ty.span().start,
-                format!("类型嵌套超过 {MAX_TYPE_DEPTH} 层上限"),
+                format!(
+                    "类型语法嵌套超过 {MAX_COMPILE_RECURSION} 层上限：拆分别名或减少实例化层数"
+                ),
             ));
             return json!({});
         }
@@ -988,7 +1153,7 @@ impl<'a> SchemaCompiler<'a> {
                 self.diagnostics.push((
                     other.span().start,
                     "类型不受支持：可用 string / number / boolean / null / 字面量 / 联合 / \
-                     数组（T[] 或 Array<T>）/ 对象字面量 / 顶层 type 别名（无泛型）"
+                     数组（T[] 或 Array<T>）/ 对象字面量 / 脚本顶层 type 别名（可带泛型参数）"
                         .to_string(),
                 ));
                 json!({})
@@ -1719,16 +1884,20 @@ mod extended_type_tests {
                       result(String(r));\n";
         let transform = compile_typed_asks(script).expect("负数字面量应编译");
         assert_eq!(transform.typed_asks[0].1["enum"], json!([-1, 0]));
-        // 负号作用在非数字上（`-'x'`）：oxc 无法解析该类型 → 编译按「原样返回」降级
-        //（不产出任何 typed ask，语法交给 check_script 的探针把关），绝不静默编出
-        // 错误的 schema。
-        let bad = compile_typed_asks("const h = agent(\"h\");\nconst r = await h.ask<-'x'>(\"q\");\n");
-        if let Ok(transform) = bad {
-            assert!(
+        // 负号作用在非数字上（`-'x'`）只允许两种结果：oxc 解析失败 → 编译按「原样返回」
+        // 降级（不产出任何 typed ask，语法交给 check_script 的探针把关）；或 oxc 解析成
+        // UnaryExpression → 明确的「负号仅限数字字面量」诊断。绝不静默编出错误的 schema，
+        // 也不得因别的原因报错。
+        match compile_typed_asks("const h = agent(\"h\");\nconst r = await h.ask<-'x'>(\"q\");\n") {
+            Ok(transform) => assert!(
                 transform.typed_asks.is_empty(),
                 "解析失败的类型不得编出 schema: {:?}",
                 transform.typed_asks
-            );
+            ),
+            Err(diagnostics) => assert!(
+                diagnostics.iter().any(|d| d.message.contains("负号")),
+                "非数字负号应给出字面量诊断: {diagnostics:?}"
+            ),
         }
     }
 
@@ -1792,8 +1961,10 @@ mod extended_type_tests {
             diagnostics.iter().any(|d| d.message.contains("超过") && d.message.contains("层")),
             "{diagnostics:?}"
         );
-        // 校验器口径内的嵌套不受影响（Box9 层 = 9 个 properties 边 + string ≤ 8 才放行；
-        // 4 层 = 4 边 + string = 5 层，合法）。
+        // 校验器口径内的嵌套不受影响（Box9 展开 = 9 条 properties 递归边，string 叶在
+        // depth 9 被校验，> 8 拒绝；Box8 的叶在 depth 8，校验器放行，编译期也必须放行——
+        // 叶子记 1 的旧算法曾在这里多拒一层；语法递归护栏按 MAX_TYPE_DEPTH 直接卡
+        // 也会多拒：Box8 是 8 层实参 + 体 + 属性 = 10 层语法递归）。
         let ok = compile_typed_asks(
             "type Box<T> = { value: T };\nconst h = agent(\"h\");\nconst r = await h.ask<Box<Box<Box<Box<string>>>>>(\"内\");\n",
         )
@@ -1803,6 +1974,102 @@ mod extended_type_tests {
             cursor = &cursor["properties"]["value"];
         }
         assert_eq!(cursor["type"], "string");
+        let opens = "Box<".repeat(8);
+        let closes = ">".repeat(8);
+        let boundary = format!(
+            "type Box<T> = {{ value: T }};\nconst h = agent(\"h\");\nconst r = await h.ask<{opens}string{closes}>(\"界\");\n"
+        );
+        let ok = compile_typed_asks(&boundary).expect("8 层嵌套与校验器同口径放行");
+        assert_eq!(schema_depth(&ok.typed_asks[0].1), MAX_TYPE_DEPTH);
+    }
+
+    #[test]
+    fn deeply_nested_scripts_are_rejected_before_parsing() {
+        // 回归：oxc 递归下降无护栏，几 KB 的 `[[[[…]]]]` 曾把解析线程的栈打穿（Rust 栈
+        // 溢出是 abort，整个进程退出）。预检在解析前拒绝，三处入口都不进 oxc。
+        let depth = MAX_NESTING_DEPTH + 10;
+        let bracket_bomb = format!(
+            "const h = agent(\"h\");\nconst x = {}1{};\nresult(String(x));\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        let diagnostics = compile_typed_asks(&bracket_bomb).unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 2, "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("嵌套过深"), "{diagnostics:?}");
+        assert!(build_dependency_graph(&bracket_bomb).is_none());
+        assert!(extract_actors(&bracket_bomb).is_none());
+        // 泛型嵌套同样受限（`<>` 不进括号计数）。
+        let generic_bomb = format!(
+            "type Box<T> = {{ value: T }};\nconst h = agent(\"h\");\nconst r = await h.ask<{}string{}>(\"深\");\n",
+            "Box<".repeat(depth),
+            ">".repeat(depth)
+        );
+        let diagnostics = compile_typed_asks(&generic_bomb).unwrap_err();
+        assert!(diagnostics[0].message.contains("嵌套过深"), "{diagnostics:?}");
+        // 字符串 / 注释里的括号不计；比较运算符与箭头函数不触发泛型计数。
+        let benign = format!(
+            "const h = agent(\"h\");\n// {}\nconst s = \"{}\";\nconst f = (a, b) => a < b && a <= b && b >= a && b > a;\nfor (let i = 0; i < 3; i++) {{ h.ask(`x${{i}}`); }}\nresult(s);\n",
+            "(".repeat(depth),
+            "{".repeat(depth)
+        );
+        compile_typed_asks(&benign).expect("遮蔽后的括号与运算符不触发深度预检");
+        assert!(build_dependency_graph(&benign).is_some());
+        // 上限之内的真实嵌套照常解析（大栈线程兜住 oxc 的递归）。
+        let within = format!(
+            "const h = agent(\"h\");\nconst x = {}1{};\nresult(String(x));\n",
+            "[".repeat(MAX_NESTING_DEPTH - 4),
+            "]".repeat(MAX_NESTING_DEPTH - 4)
+        );
+        compile_typed_asks(&within).expect("上限内的嵌套应解析");
+        assert!(build_dependency_graph(&within).is_some());
+    }
+
+    #[test]
+    fn multiline_typed_asks_keep_following_line_numbers() {
+        // 回归：跨多行的 `ask<T>(…)` 重写成单行后，后续语句整体上移——运行期错误行号
+        // 与作者脚本对不上。替换体补回被吃掉的换行。
+        let script = "const h = agent(\"h\");\n\
+                      const r = await h.ask<{\n  name: string;\n  age: number;\n}>(\n  \"多行\"\n);\n\
+                      result(r.name);\n";
+        let transform = compile_typed_asks(script).expect("多行 typed ask 应编译");
+        assert_eq!(
+            transform.exec_script.lines().count(),
+            script.lines().count(),
+            "{}",
+            transform.exec_script
+        );
+        let original_line = script
+            .lines()
+            .position(|line| line.contains("result(r.name);"))
+            .expect("原行存在");
+        let rewritten_line = transform
+            .exec_script
+            .lines()
+            .position(|line| line.contains("result(r.name);"))
+            .expect("重写后仍在");
+        assert_eq!(rewritten_line, original_line);
+    }
+
+    #[test]
+    fn extra_type_arguments_are_rejected() {
+        // 回归：`ask<A, B>` 曾只取 A、静默丢掉 B——作者以为 B 参与了校验。
+        let script = "const h = agent(\"h\");\nconst r = await h.ask<string, number>(\"多参\");\n";
+        let diagnostics = compile_typed_asks(script).unwrap_err();
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("只接受一个类型参数")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn string_typed_ask_stays_plain_ask() {
+        // `ask<string>` 与默认的 ask(question): Promise<string> 同义：不该要求子代理回
+        // JSON 字符串字面量，只抹掉类型实参。
+        let script = "const h = agent(\"h\");\nconst r = await h?.ask<string>(\"文本\");\nresult(r);\n";
+        let transform = compile_typed_asks(script).expect("ask<string> 应编译");
+        assert!(transform.exec_script.contains("h?.ask(\"文本\")"), "{}", transform.exec_script);
+        assert!(!transform.exec_script.contains("askJson"), "{}", transform.exec_script);
     }
 
 
