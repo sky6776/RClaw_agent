@@ -155,7 +155,8 @@ final class BrowserSession {
         }
     }
 
-    /** 离屏截图：View.draw 到 ARGB 位图 → PNG。阻塞至绘制完成（至多 20s）。 */
+    /** 离屏截图：主线程 View.draw 到 ARGB 位图（至多等 15s），PNG 压缩与写盘
+     *  留在调用方工作线程——压缩可达秒级，上主线程会 ANR。 */
     static boolean screenshot(String absPath) {
         synchronized (LOCK) {
             if (webView == null || absPath == null || absPath.isEmpty()) {
@@ -163,29 +164,38 @@ final class BrowserSession {
             }
             final java.util.concurrent.CountDownLatch done =
                     new java.util.concurrent.CountDownLatch(1);
-            final boolean[] ok = {false};
+            final android.graphics.Bitmap[] drawn = {null};
             UI.post(() -> {
                 try {
                     android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(
                             webView.getWidth(), webView.getHeight(),
                             android.graphics.Bitmap.Config.ARGB_8888);
                     webView.draw(new android.graphics.Canvas(bmp));
-                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(absPath)) {
-                        bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos);
-                    }
-                    bmp.recycle();
-                    ok[0] = true;
+                    drawn[0] = bmp;
                 } catch (Throwable error) {
-                    android.util.Log.e("BrowserSession", "screenshot failed", error);
+                    android.util.Log.e("BrowserSession", "screenshot draw failed", error);
                 } finally {
                     done.countDown();
                 }
             });
             try {
-                return done.await(20, java.util.concurrent.TimeUnit.SECONDS) && ok[0];
+                if (!done.await(15, java.util.concurrent.TimeUnit.SECONDS)
+                        || drawn[0] == null) {
+                    return false;
+                }
             } catch (InterruptedException error) {
                 Thread.currentThread().interrupt();
                 return false;
+            }
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(absPath)) {
+                boolean ok = drawn[0].compress(
+                        android.graphics.Bitmap.CompressFormat.PNG, 100, fos);
+                return ok;
+            } catch (Throwable error) {
+                android.util.Log.e("BrowserSession", "screenshot save failed", error);
+                return false;
+            } finally {
+                drawn[0].recycle();
             }
         }
     }
