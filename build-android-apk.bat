@@ -55,7 +55,9 @@ REM cargo-ndk overwrites with a sysroot-only value. Values are shell-lexed by
 REM bindgen, so use forward slashes (backslashes get eaten as escapes).
 if defined BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android goto :bindgen_env_done
 for /d %%v in ("%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64\lib\clang\*") do set "CLANG_RESOURCE_DIR=%%v"
-set "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=%ANDROID_NDK_HOME:\=/%/toolchains/llvm/prebuilt/windows-x86_64/sysroot -resource-dir=%CLANG_RESOURCE_DIR:\=/%"
+REM Paths quoted inside the value: bindgen shell-lexes the variable, so a
+REM toolchain path containing spaces must arrive as single quoted tokens.
+set BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot="%ANDROID_NDK_HOME:\=/%/toolchains/llvm/prebuilt/windows-x86_64/sysroot" -resource-dir="%CLANG_RESOURCE_DIR:\=/%"
 :bindgen_env_done
 REM NDK toolchain bin on PATH: bindgen's in-process clang driver fails to
 REM locate its own installation without it (empty InstalledDir, builtin

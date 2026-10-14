@@ -248,7 +248,11 @@ fn handle_tray_event(app: &tauri::AppHandle, id: &str) {
                 let _ = window.set_focus();
             }
         }
-        "quit" => app.exit(0),
+        // 与 app_exit 命令同一清理：无头 Chromium 不随父进程退出，先回收。
+        "quit" => {
+            rclaw_tools::cdp_browser::kill_headless_processes();
+            app.exit(0)
+        }
         _ => {}
     }
 }

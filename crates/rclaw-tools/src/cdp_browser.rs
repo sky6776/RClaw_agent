@@ -514,7 +514,9 @@ impl HeadlessChromiumTransport {
         HeadlessChromiumTransport {
             inner: AsyncMutex::new(None),
             screenshot_dir: screenshot_dir.into(),
-            profile_dir: std::env::temp_dir().join("rclaw-browser-profile"),
+            // 按进程隔离：两个应用实例各用各的 profile，不互相抢锁（崩溃残留的
+            // 孤儿由 kill_orphans_holding_profile 按各自目录特征清杀）。
+            profile_dir: std::env::temp_dir().join(format!("rclaw-browser-profile-{}", std::process::id())),
         }
     }
 
@@ -968,6 +970,12 @@ impl CdpBrowser {
             .as_millis();
         let name = format!("screenshot_{stamp}.png");
         let dest = self.transport.screenshot_dir().join(&name);
+        // 全新工作区还没有 browser/ 目录，先建（幂等）。
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("创建截图目录失败: {e}"))?;
+        }
         self.transport.capture_screenshot(&session, &dest).await
     }
 
@@ -1167,10 +1175,17 @@ const EXTRACT_JS: &str = r##"(function () {
 // 工具面
 // ---------------------------------------------------------------------------
 
+/// 进程级共享内核：注册可能发生多次（安卓服务重启重建注册表、桌面重装配），
+/// 而底层会话是进程单例（安卓 BrowserSession 静态字段 / 桌面 HEADLESS_CHILD），
+/// 两个内核实例驱动同一会话会互相串页、互相关闭——首个 transport 定格复用。
+static SHARED_BROWSER: std::sync::OnceLock<Arc<CdpBrowser>> = std::sync::OnceLock::new();
+
 /// web_browser 换 CDP 会话后端，并挂 browser_* 交互工具（全部共享同一内核）。
 pub fn register(tools: &mut crate::ToolRegistry, transport: Arc<dyn DevtoolsTransport>) {
     tools.remove("web_browser");
-    let browser = Arc::new(CdpBrowser::new(transport));
+    let browser = SHARED_BROWSER
+        .get_or_init(|| Arc::new(CdpBrowser::new(transport)))
+        .clone();
     tools.register(Box::new(WebBrowserTool::new(Arc::new(CdpPageLoader {
         browser: browser.clone(),
     }))));
