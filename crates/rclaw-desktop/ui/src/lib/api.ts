@@ -349,6 +349,13 @@ export interface UpdateInfo {
   error: string | null;
 }
 
+/** 应用内更新进度（update_progress 事件载荷）。 */
+export interface UpdateProgress {
+  phase: "download" | "install";
+  received: number;
+  total: number;
+}
+
 export const api = {
   getStatus: () => invoke<Status>("get_status"),
 
@@ -553,6 +560,14 @@ export const api = {
     invoke<PendingShare | null>("consume_pending_share"),
 
   updateCheck: () => invoke<UpdateInfo>("update_check"),
+
+  /** 下载平台对应的最新版并触发安装（Windows 换文件后自动重启；安卓拉起系统
+   *  安装器）。进度经 onUpdateProgress 推送。 */
+  updateDownloadInstall: () => invoke<void>("update_download_install"),
+
+  /** 应用内更新下载进度（字节）。 */
+  onUpdateProgress: (cb: (p: UpdateProgress) => void): Promise<UnlistenFn> =>
+    listen<UpdateProgress>("update_progress", (event) => cb(event.payload)),
 
   /** 用系统方式打开外部链接（Android 浏览器 / 桌面默认浏览器）。 */
   openUrl: (url: string) => invoke<void>("open_url", { url }),

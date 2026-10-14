@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 应用内更新：拉起系统安装器安装自更新的 APK（用户在系统弹窗确认）。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- 会话采集：拍照/录视频（系统相机）+ 录音（whisper 转写输入）。 -->
     <uses-permission android:name="android.permission.CAMERA" />

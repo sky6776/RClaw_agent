@@ -28,6 +28,33 @@ public final class NativeBridge {
         }
     }
 
+    /** 应用内更新：拉起系统安装器安装已下载的 APK（Rust install_update 的 JNI 入口）。
+     *  absPath 必须位于 FileProvider 暴露的 files/ 之下（下载命令落在 files/update/）。
+     *  Android 8+ 首次会先引导到「未知来源安装」授权页，授权后重新点更新即可。 */
+    static boolean installUpdate(String absPath) {
+        android.content.Context context = appContext;
+        if (context == null || absPath == null || absPath.isEmpty()) {
+            return false;
+        }
+        try {
+            java.io.File apk = new java.io.File(absPath);
+            if (!apk.isFile() || apk.length() == 0) {
+                return false;
+            }
+            android.net.Uri uri = androidx.core.content.FileProvider.getUriForFile(
+                    context, context.getPackageName() + ".fileprovider", apk);
+            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, "application/vnd.android.package-archive");
+            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(intent);
+            return true;
+        } catch (RuntimeException error) {
+            android.util.Log.e("NativeBridge", "installUpdate failed", error);
+            return false;
+        }
+    }
+
     /** 会话内点开工作区媒体（视频/图片）：经 FileProvider 授只读 URI，
      *  拉起系统播放器/查看器（Rust open_media 的 JNI 入口）。
      *  relativePath 是相对 agent/ 的路径（如 media/skilltest_fish.mp4）。 */

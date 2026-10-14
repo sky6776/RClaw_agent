@@ -134,6 +134,21 @@ pub fn open_url(url: &str) -> Result<()> {
     }
 }
 
+/// 应用内更新：拉起系统安装器安装已下载的 APK。`apk_abs` 必须位于 FileProvider
+/// 暴露的 files/ 之下（file_paths.xml 的 `<files-path path="."/>`；下载命令落在
+/// files/update/）。Android 8+ 首次会先引导到「未知来源安装」授权页。
+pub fn install_update(apk_abs: &str) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::install_update(apk_abs)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = apk_abs;
+        Err(anyhow!("install_update 仅在 Android 宿主可用（桌面走自替换脚本）"))
+    }
+}
+
 /// 会话内点开工作区媒体（相对 agent/ 的路径，如 media/skilltest_fish.mp4）：
 /// 经 FileProvider 只读 URI 拉起系统播放器/查看器。
 pub fn open_media(relative_path: &str) -> Result<()> {
@@ -1342,6 +1357,35 @@ pub mod jni_bridge {
         // 否则 GUI 表现为"点了没反应且无报错"。
         if !result.z().unwrap_or(false) {
             return Err(anyhow!("系统未受理打开链接请求（无可用浏览器或链接非法）"));
+        }
+        Ok(())
+    }
+
+    /// 应用内更新：调 NativeBridge.installUpdate 拉起系统安装器（FileProvider
+    /// content URI + ACTION_VIEW，FLAG_NEW_TASK——从非 Activity 上下文启动必需）。
+    pub(super) fn install_update(apk_abs: &str) -> Result<()> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加安装更新线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let jpath = env.new_string(apk_abs)?;
+        let result = env
+            .call_static_method(
+                class,
+                "installUpdate",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&JObject::from(jpath))],
+            )
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.installUpdate 失败: {error}")
+            })?;
+        if !result.z().unwrap_or(false) {
+            return Err(anyhow!(
+                "系统未受理安装请求（文件缺失或需先授予「安装未知应用」权限）"
+            ));
         }
         Ok(())
     }

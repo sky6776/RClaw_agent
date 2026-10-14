@@ -7,7 +7,7 @@
 
 use rclaw_tools::files::is_dos_device_name;
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::agent::{self, is_valid_chat_id, CHANNEL_DESKTOP};
 use crate::home;
@@ -16,8 +16,8 @@ use crate::wizard::{self, WizardParams};
 
 
 // ---------------------------------------------------------------------------
-// 检查更新：GitHub releases（桌面与 Android 同一逻辑——提示用户去下载页，
-// 不做自动下载安装；Android 侧载分发 = 重装 APK，桌面 = 下载安装包）。
+// 检查更新：GitHub releases（安卓装 APK、Windows 换单文件 exe，应用内直接
+// 下载并触发安装；进度经 update_progress 事件推给前端）。
 // ---------------------------------------------------------------------------
 
 /// 仓库 coordinates：releases 以 GitHub Release 发布（tag 形如 v2.5.7）。
@@ -135,6 +135,196 @@ pub async fn update_check(app: AppHandle) -> Result<UpdateInfo, String> {
         notes,
         error: None,
     })
+}
+
+/// 应用内更新对应的发布资产名（release.yml 的产物名）：安卓装 APK，
+/// Windows 换单文件 exe。
+#[cfg(all(target_os = "android", feature = "apk-host"))]
+const UPDATE_ASSET_NAME: &str = "RClaw-android-arm64.apk";
+#[cfg(not(all(target_os = "android", feature = "apk-host")))]
+const UPDATE_ASSET_NAME: &str = "RClaw-desktop-win64.exe";
+
+/// 下载平台对应的最新版资产并触发安装。安卓把 APK 落到 FileProvider 暴露的
+/// files/update/ 下再拉起系统安装器（系统弹窗确认，REQUEST_INSTALL_PACKAGES）；
+/// Windows 把 exe 落到临时目录后写自替换脚本（等本进程退出 → 覆盖 → 重启 →
+/// 自删）并脱离启动，随后本进程退出。进度经 `update_progress` 事件推送
+/// （`{phase:"download"|"install", received, total}`）。
+#[tauri::command]
+pub async fn update_download_install(app: AppHandle) -> Result<(), String> {
+    let current = app.package_info().version.to_string();
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("RClaw/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30 * 60))
+        .build()
+        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+    let response = client
+        .get(UPDATE_REPO_API)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("网络请求失败: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GitHub 返回 {}", response.status()));
+    }
+    #[derive(serde::Deserialize)]
+    struct Asset {
+        name: String,
+        browser_download_url: String,
+        #[serde(default)]
+        size: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct Release {
+        tag_name: String,
+        assets: Vec<Asset>,
+    }
+    let release: Release = response
+        .json()
+        .await
+        .map_err(|e| format!("解析 release JSON 失败: {e}"))?;
+    let latest = release.tag_name.trim_start_matches('v').to_string();
+    if version_cmp(&parse_version(&latest), &parse_version(&current)) != std::cmp::Ordering::Greater
+    {
+        return Err(format!("当前已是最新版本 v{current}"));
+    }
+    let found = release
+        .assets
+        .iter()
+        .find(|a| a.name == UPDATE_ASSET_NAME)
+        .ok_or_else(|| {
+            format!(
+                "最新版 v{latest} 未发布 {UPDATE_ASSET_NAME}（旧版打包格式），请前往发布页手动下载"
+            )
+        })?;
+    let asset_url = found.browser_download_url.clone();
+    let asset_size = found.size;
+
+    #[cfg(all(target_os = "android", feature = "apk-host"))]
+    let dest = {
+        let ctx = rclaw_android::host_context()
+            .ok_or_else(|| "应用未就绪（宿主上下文未初始化，稍后重试）".to_string())?;
+        let dir = ctx.files_dir.join("update");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("创建更新目录失败: {e}"))?;
+        dir.join(UPDATE_ASSET_NAME)
+    };
+    #[cfg(not(all(target_os = "android", feature = "apk-host")))]
+    let dest = {
+        let dir = std::env::temp_dir().join(format!(
+            "rclaw-update-{}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("创建更新目录失败: {e}"))?;
+        dir.join(UPDATE_ASSET_NAME)
+    };
+
+    download_update_asset(&app, &client, &asset_url, asset_size, &dest).await?;
+
+    let _ = app.emit(
+        "update_progress",
+        serde_json::json!({ "phase": "install", "received": asset_size, "total": asset_size }),
+    );
+    #[cfg(all(target_os = "android", feature = "apk-host"))]
+    {
+        rclaw_android::install_update(dest.to_string_lossy().as_ref())
+            .map_err(|e| format!("拉起系统安装器失败: {e}"))?;
+    }
+    #[cfg(not(all(target_os = "android", feature = "apk-host")))]
+    {
+        spawn_windows_self_update(&dest)?;
+        // 脚本已脱离启动，本进程退出后由它完成换文件 + 重启。
+        app.exit(0);
+    }
+    Ok(())
+}
+
+/// 流式下载资产到 `dest` 并推下载进度（每 ≥1% 或收尾各推一次，避免事件刷屏）。
+async fn download_update_asset(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    url: &str,
+    total: u64,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("下载请求失败: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载请求返回 {}", response.status()));
+    }
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| format!("创建下载文件失败: {e}"))?;
+    let mut received: u64 = 0;
+    let step = total / 100 + 1;
+    let mut next_emit = step;
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|e| format!("下载中断: {e}"))?;
+        let Some(chunk) = chunk else { break };
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入下载文件失败: {e}"))?;
+        received += chunk.len() as u64;
+        if received >= next_emit {
+            let _ = app.emit(
+                "update_progress",
+                serde_json::json!({
+                    "phase": "download", "received": received, "total": total,
+                }),
+            );
+            next_emit = received.saturating_add(step);
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("刷写下载文件失败: {e}"))?;
+    if total != 0 && received != total {
+        return Err(format!("下载不完整：{received}/{total} 字节"));
+    }
+    Ok(())
+}
+
+/// Windows 自替换：写 cmd 脚本（ASCII 指令 + `chcp 65001` 兼容非 ASCII 路径；
+/// 等待用 ping——脚本以 DETACHED 启动无控制台，`timeout /t` 会因无 stdin 失败），
+/// 脱离启动后由它等本进程退出 → move 覆盖 → 重启 → 自删。
+#[cfg(not(all(target_os = "android", feature = "apk-host")))]
+fn spawn_windows_self_update(new_exe: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let current = std::env::current_exe().map_err(|e| format!("定位当前程序失败: {e}"))?;
+    let image = current
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("rclaw-desktop.exe");
+    let script_path = new_exe.with_extension("update.cmd");
+    let script = format!(
+        "@echo off\r\nchcp 65001 >nul\r\n:waitpid\r\ntasklist /FI \"PID eq {pid}\" | find /I \"{image}\" >nul\r\nif not errorlevel 1 (\r\n  ping -n 2 127.0.0.1 >nul\r\n  goto waitpid\r\n)\r\nmove /Y \"{new}\" \"{current}\"\r\nif errorlevel 1 goto done\r\nstart \"\" \"{current}\"\r\n:done\r\ndel \"%~f0\"\r\n",
+        pid = std::process::id(),
+        image = image,
+        new = new_exe.display(),
+        current = current.display(),
+    );
+    std::fs::write(&script_path, script).map_err(|e| format!("写自更新脚本失败: {e}"))?;
+    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP：脱离本进程存活，不弹控制台窗口。
+    std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "start",
+            "",
+            &script_path.as_os_str().to_string_lossy(),
+        ])
+        .creation_flags(0x0000_0008 | 0x0000_0200)
+        .spawn()
+        .map_err(|e| format!("启动自更新脚本失败: {e}"))?;
+    Ok(())
 }
 
 /// 用系统方式打开外部链接：Android 经 JNI intent（应用内注册的 context），
@@ -5837,6 +6027,7 @@ mod plan_projection_tests {
 }
 
 /// `history_entries`（快照 / 增量共用的行→条目映射）的口径测试。
+#[cfg(test)]
 mod history_entries_tests {
     use super::*;
     use rclaw_core::{ContentBlock, Message, Role};

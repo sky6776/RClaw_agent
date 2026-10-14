@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type ConfigEdit,
-  type UpdateInfo,
   type ConfigItem,
   type ConfigSection,
   type ConfigStateDto,
@@ -174,67 +173,6 @@ function SectionCard({
 /** 配置面板：rclaw.toml 全量项可视化编辑（文档来自 rclaw.toml.example，保存为
  * 注释/键序保真的 toml_edit 手术，保存前做结构校验）。另含标题栏循环标语及其
  * 轮播周期的编辑——标语属界面偏好（desktop_prefs.json），不写入 rclaw.toml。 */
-/** 检查更新卡片：GitHub releases 比对当前版本；有新版给出下载入口。 */
-function UpdateCard() {
-  const [info, setInfo] = useState<UpdateInfo | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const check = useCallback(async () => {
-    setChecking(true);
-    setError(null);
-    try {
-      setInfo(await api.updateCheck());
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setChecking(false);
-    }
-  }, []);
-
-  const hasNewer = info?.latest != null;
-
-  return (
-    <div className="mb-4 rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">
-      <h2 className="mb-1 text-sm font-medium text-gray-200">检查更新</h2>
-      <p className="mb-2 text-[10px] text-gray-600">
-        当前版本 {info?.current ?? "…"}；对照 GitHub 发布页的最新 Release。
-        应用本身不自动下载安装——有新版时前往发布页下载（Android 安装 APK，
-        桌面运行安装包）。
-      </p>
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          onClick={() => void check()}
-          disabled={checking}
-          className="rounded-lg border border-[#2a2f3a] px-3 py-1.5 text-xs text-gray-300 transition enabled:hover:border-indigo-500/50 enabled:hover:text-indigo-300 disabled:opacity-50"
-        >
-          {checking ? "检查中…" : "检查更新"}
-        </button>
-        {hasNewer && info?.url && (
-          <button
-            onClick={() => void api.openUrl(info.url!)}
-            className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-indigo-500"
-          >
-            前往下载 v{info.latest}
-          </button>
-        )}
-        {!checking && info && !hasNewer && !info.error && (
-          <span className="text-xs text-emerald-400">已是最新版本 ✓</span>
-        )}
-      </div>
-      {info?.error && (
-        <p className="mt-2 text-xs text-amber-400">{info.error}（稍后重试）</p>
-      )}
-      {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
-      {hasNewer && info?.notes && (
-        <pre className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-lg bg-[#0f131b] p-2 text-[10px] leading-relaxed text-gray-400">
-          {info.notes}
-        </pre>
-      )}
-    </div>
-  );
-}
-
 export default function ConfigPanel({
   agentReady,
   slogans,
@@ -445,9 +383,7 @@ export default function ConfigPanel({
           </p>
         )}
 
-        {/* 检查更新：GitHub releases 对照 */}
         <SkillOpsCard />
-        <UpdateCard />
 
         {/* 标题栏循环标语：界面偏好，不写 rclaw.toml */}
         <div className="mb-4 rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">

@@ -91,22 +91,20 @@ jobs:
       - name: Build desktop binary
         run: cargo build --release -p rclaw-desktop
 
-      - name: Package portable zip
+      - name: Package portable exe
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\rclaw-desktop.exe dist\
+          Copy-Item target\release\rclaw-desktop.exe dist\RClaw-desktop-win64.exe
           @'
-          RClaw 桌面版（免安装版）
+          RClaw 桌面版（Windows 单文件，免安装）
 
-          使用：解压到任意目录，双击 rclaw-desktop.exe 运行。
+          使用：下载 RClaw-desktop-win64.exe 后直接双击运行（应用内「关于 → 检查更新」
+          可自动下载替换升级）。
             - 需要 WebView2 Runtime（Windows 10/11 通常已内置）。
             - 用户数据目录：%USERPROFILE%\.rclaw（rclaw.toml 与 agent/ 工作区）。
             - 关闭窗口 = 隐藏到托盘；托盘菜单「退出」才结束进程。
-          '@ | Set-Content -Path dist\README.txt -Encoding utf8
-          Compress-Archive -Path dist\rclaw-desktop.exe, dist\README.txt `
-            -DestinationPath dist\RClaw-desktop-portable-win64.zip -Force
-          Remove-Item dist\rclaw-desktop.exe, dist\README.txt
+          '@ | Set-Content -Path dist\README-win64.txt -Encoding utf8
 
       - uses: actions/upload-artifact@v4
         with:
@@ -385,7 +383,7 @@ jobs:
           | 产物 | 说明 |
           |---|---|
           | \`RClaw-android-arm64.apk\` | 安卓 arm64 安装包（Chaquopy Python + whisper 内置） |
-          | \`RClaw-desktop-portable-win64.zip\` | Windows 桌面免安装版（解压即用，需 WebView2 Runtime） |
+          | \`RClaw-desktop-win64.exe\` | Windows 桌面单文件（免安装，双击运行；应用内可自动更新） |
           | \`RClaw-termux-aarch64.zip\` | Termux aarch64 二进制（release-termux profile 构建） |
 
           APK 签名：仓库配置了 \`RCLAW_KEYSTORE_BASE64\` + \`RCLAW_KEYSTORE_PASSWORD\`

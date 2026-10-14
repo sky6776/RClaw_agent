@@ -19,6 +19,7 @@ import {
   type PermissionRequest,
   type PlanStatus,
   type Status,
+  type UpdateInfo,
   type UsageSnapshot,
 } from "./lib/api";
 import Wizard from "./components/Wizard";
@@ -2242,6 +2243,132 @@ function ArchivedSection({
   );
 }
 
+/** 检查更新卡片（关于页）：GitHub releases 比对当前版本；有新版可一键下载并
+ *  触发安装——Windows 换单文件 exe 后自动重启，安卓拉起系统安装器。进度经
+ *  update_progress 事件推送。 */
+function UpdateCard() {
+  const [info, setInfo] = useState<UpdateInfo | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [phase, setPhase] = useState<"idle" | "download" | "install">("idle");
+  const [progress, setProgress] = useState<{ received: number; total: number } | null>(null);
+
+  useEffect(() => {
+    const un = api.onUpdateProgress((p) => {
+      if (p.phase === "install") {
+        setPhase("install");
+        return;
+      }
+      setPhase("download");
+      setProgress({ received: p.received, total: p.total });
+    });
+    return () => {
+      un.then((fn) => fn());
+    };
+  }, []);
+
+  const check = useCallback(async () => {
+    setChecking(true);
+    setError(null);
+    try {
+      setInfo(await api.updateCheck());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setChecking(false);
+    }
+  }, []);
+
+  const install = useCallback(async () => {
+    setPhase("download");
+    setProgress(null);
+    setError(null);
+    try {
+      await api.updateDownloadInstall();
+      // 不重置 phase：Windows 此刻进程即将退出；安卓停在「安装中」直到系统
+      // 安装器接管（用户取消安装则界面保持，重新点更新即可重下）。
+    } catch (e) {
+      setError(String(e));
+      setPhase("idle");
+    }
+  }, []);
+
+  const hasNewer = info?.latest != null;
+  const busy = phase !== "idle";
+  const pct =
+    progress && progress.total > 0
+      ? Math.min(100, Math.round((progress.received / progress.total) * 100))
+      : null;
+
+  return (
+    <div className="rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">
+      <h2 className="mb-1 text-sm font-medium text-gray-200">检查更新</h2>
+      <p className="mb-2 text-[10px] text-gray-600">
+        当前版本 {info?.current ?? "…"}；对照 GitHub 发布页的最新 Release。发现新版后
+        {isAndroidDevice() ? "下载 APK 并拉起系统安装器" : "下载新程序并自动替换重启"}。
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          onClick={() => void check()}
+          disabled={checking || busy}
+          className="rounded-lg border border-[#2a2f3a] px-3 py-1.5 text-xs text-gray-300 transition enabled:hover:border-indigo-500/50 enabled:hover:text-indigo-300 disabled:opacity-50"
+        >
+          {checking ? "检查中…" : "检查更新"}
+        </button>
+        {hasNewer && !busy && (
+          <button
+            onClick={() => void install()}
+            className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-indigo-500"
+          >
+            更新到 v{info!.latest}
+          </button>
+        )}
+        {!checking && info && !hasNewer && !info.error && (
+          <span className="text-xs text-emerald-400">已是最新版本 ✓</span>
+        )}
+        {hasNewer && info?.url && !busy && (
+          <button
+            onClick={() => void api.openUrl(info.url!)}
+            className="text-xs text-gray-500 underline decoration-dotted hover:text-gray-300"
+          >
+            前往发布页
+          </button>
+        )}
+      </div>
+      {phase === "download" && (
+        <div className="mt-2">
+          <div className="mb-1 text-[10px] text-gray-400">
+            下载中…{pct != null ? ` ${pct}%` : ""}
+            {progress ? `（${(progress.received / 1048576).toFixed(1)} MB）` : ""}
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-[#0f131b]">
+            <div
+              className="h-full bg-indigo-500 transition-all"
+              style={{ width: `${pct ?? 5}%` }}
+            />
+          </div>
+        </div>
+      )}
+      {phase === "install" && (
+        <p className="mt-2 text-xs text-indigo-300">
+          {isAndroidDevice()
+            ? "下载完成，已拉起系统安装器——请在弹窗中确认安装。"
+            : "下载完成，正在准备替换重启…"}
+        </p>
+      )}
+      {info?.error && (
+        <p className="mt-2 text-xs text-amber-400">{info.error}（稍后重试）</p>
+      )}
+      {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
+      {hasNewer && info?.notes && (
+        <pre className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-lg bg-[#0f131b] p-2 text-[10px] leading-relaxed text-gray-400">
+          {info.notes}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 /** 关于页：斜杠命令与配置说明（设置类操作复用既有 slash 管道）。 */
 function About({ home }: { home: string }) {
   const [versions, setVersions] = useState<AppVersions | null>(null);
@@ -2295,6 +2422,8 @@ function About({ home }: { home: string }) {
             <div className="text-xs text-gray-500">读取中…</div>
           )}
         </div>
+        {/* 检查更新（原在配置页）：版本信息紧跟着给更新入口。 */}
+        <UpdateCard />
         <div className="rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">
           <h2 className="mb-2 text-sm font-medium text-gray-200">在对话里直接用命令</h2>
           <ul className="space-y-1 text-xs leading-relaxed">

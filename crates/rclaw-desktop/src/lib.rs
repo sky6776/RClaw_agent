@@ -94,6 +94,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
             commands::update_check,
+            commands::update_download_install,
             commands::open_url,
             commands::media_base64,
             commands::media_preview,
