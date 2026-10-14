@@ -671,11 +671,22 @@ fn windows_kill_and_remove(entries: &[serde_json::Value], own_pid: u32) {
          Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }} }}",
         own = own_pid
     );
-    // CREATE_NO_WINDOW：不闪控制台。
-    let _ = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
+    // CREATE_NO_WINDOW：不闪控制台。脚本经 stdin 传入（`-Command -`）：
+    // -Command 参数受 32767 字符进程命令行上限约束，目录积累多了会被截断
+    // 静默失效；stdin 无此限制。
+    let Ok(mut child) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "-"])
+        .stdin(std::process::Stdio::piped())
         .creation_flags(0x0800_0000)
-        .output();
+        .spawn()
+    else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(script.as_bytes());
+    }
+    let _ = child.wait_with_output();
 }
 
 /// 清扫只跑一次（进程生命周期内一次即可）。
