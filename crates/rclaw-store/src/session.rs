@@ -618,16 +618,12 @@ impl SessionStore {
         full_transcript: bool,
     ) -> Result<SessionFork> {
         let now = now_ms();
-        // 句柄重写前缀：与落盘侧同一正斜杠形态（artifact 句柄进转录前已统一）。
-        let base_display = self.layout.base.to_string_lossy().replace('\\', "/");
-        let source_prefix = format!(
-            "{base_display}/artifacts/{}/",
-            artifact_chat_key(channel, chat_id)
-        );
-        let target_prefix = format!(
-            "{base_display}/artifacts/{}/",
-            artifact_chat_key(channel, new_chat_id)
-        );
+        // 句柄重写前缀：与落盘侧（runtime spill）同构造——Path::join 归一尾部分隔符
+        // （base = "agent/" 时手拼字符串会出现 `agent//artifacts`，与落盘路径
+        // `agent/artifacts` 对不上，重写永远不命中）+ 正斜杠 + 相对 base 按进程
+        // CWD 展开（spill 的 absolute_base 同一假设）+ 尾斜杠（消息里路径必带文件名）。
+        let source_prefix = self.artifacts_dir_prefix(channel, chat_id);
+        let target_prefix = self.artifacts_dir_prefix(channel, new_chat_id);
         let fork = self.db.transaction(|tx| {
             if session_id(tx, channel, new_chat_id)?.is_some() {
                 return Err(StoreError::Other(format!(
@@ -756,6 +752,27 @@ impl SessionStore {
                 tracing::warn!("artifact 文件复制失败（{}）: {error}", entry.path().display());
             }
         }
+    }
+
+    /// 消息体里 artifact 句柄的目录前缀（带尾斜杠、正斜杠形态）：与 runtime spill 的
+    /// display 路径同构造——Path::join 归一 base 尾部分隔符（手拼字符串会出现
+    /// `agent//artifacts`，与落盘路径对不上、重写永不命中），相对 base 按进程 CWD 展开。
+    fn artifacts_dir_prefix(&self, channel: &str, chat_id: &str) -> String {
+        let base = &self.layout.base;
+        let base = if base.is_absolute() {
+            base.clone()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(base))
+                .unwrap_or_else(|_| base.clone())
+        };
+        format!(
+            "{}/",
+            base.join("artifacts")
+                .join(artifact_chat_key(channel, chat_id))
+                .to_string_lossy()
+                .replace('\\', "/")
+        )
     }
 
     /// fork 出的会话的父会话（非 fork 会话 / 血缘损坏 → None）。

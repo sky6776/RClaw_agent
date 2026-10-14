@@ -664,7 +664,7 @@ pub(crate) fn restore_to_message(
                     .is_some_and(|anchor| anchor >= anchor_message_id)
         })
         .map(|record| record.id);
-    let window: Vec<FileCheckpointMeta> = all_meta
+    let mut window: Vec<FileCheckpointMeta> = all_meta
         .iter()
         .filter(|record| {
             let in_range = window_start.is_none_or(|start| record.id >= start);
@@ -690,6 +690,33 @@ pub(crate) fn restore_to_message(
         return Err(format!(
             "锚点消息 {anchor_message_id} 之后没有可回滚的文件写入（仅 write/edit/delete 被              checkpoint，且迁移前的旧记录不参与按消息回滚）"
         ));
+    }
+    // 链校验补前驱：锚点消息自身可能没有 checkpoint（它没做文件写入）——此时窗口
+    // 起点之前的【最后一条同文件记录】是该文件链的真实前驱，必须参与校验（不作
+    // 回滚目标）：否则「锚点前 shell 改动 + 锚点后 checkpointed 写入」的未记录编辑
+    // 无法被 broken_chains 检出，回滚会把 shell 改过的中间状态静默恢复成成功。
+    if let Some(first_id) = window.first().map(|record| record.id) {
+        let window_files: std::collections::HashSet<String> =
+            window.iter().map(|record| path_key(&record.path)).collect();
+        let mut predecessors: Vec<FileCheckpointMeta> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for record in all_meta.iter().rev() {
+            // 跳过窗口内的行；重锚标记（is_rewind）反映的是更早一次回滚的状态，
+            // 不是链前驱——真前驱是最后一条【checkpoint】（跳过标记才能与既有
+            // 「窗口外历史标记不参与」的口径一致）。
+            if record.id >= first_id || record.is_rewind {
+                continue;
+            }
+            let key = path_key(&record.path);
+            if window_files.contains(&key) && seen.insert(key) {
+                predecessors.push(record.clone());
+                if seen.len() == window_files.len() {
+                    break;
+                }
+            }
+        }
+        predecessors.reverse();
+        window.splice(0..0, predecessors);
     }
     let mut note = String::new();
     if unanchored > 0 {
@@ -1338,6 +1365,47 @@ mod message_rollback_tests {
         // 无锚点后的写入：明确报错（不是静默成功）。
         let err = restore_to_message(&session, "cli", "console", 999_999).unwrap_err();
         assert!(err.contains("没有可回滚"), "{err}");
+    }
+
+    #[test]
+    fn restore_to_message_detects_unrecorded_edits_before_anchor_without_own_checkpoint() {
+        // 回归：锚点消息自身没有 checkpoint（它没做文件写入）时，窗口曾不含各文件
+        // 的链前驱——「锚点前 shell 改动 + 锚点后 checkpointed 写入」的未记录编辑
+        // 检不出来，回滚把 shell 改过的中间状态静默恢复成成功。前驱参与校验后
+        // 必须拒绝。
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_store(dir.path());
+        let base = session.layout().base.clone();
+        let file_a = base.join("a.txt");
+        write_file(&file_a, "v1");
+
+        let (_m1, _) = toolchain_write(&session, &base, "a.txt", Some("v2"), 0);
+        // 锚点消息：无任何文件写入（没有自己的 checkpoint）。
+        let anchor = session
+            .append("cli", "console", &Message::plain(Role::User, "纯文字锚点"))
+            .unwrap();
+        // 锚点之后的 shell 改动（未记录）+ checkpointed 写入。
+        write_file(&file_a, "v2.5");
+        let (_m2, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
+
+        let err = restore_to_message(&session, "cli", "console", anchor).unwrap_err();
+        assert!(err.contains("未记录的改动"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&file_a).unwrap(),
+            "v3",
+            "拒绝时不动文件"
+        );
+        assert!(!err.contains("没有可回滚"), "{err}");
+
+        // 没有未记录改动时，同一形态正常回滚（前驱只参与校验，不影响目标）。
+        write_file(&file_a, "v3");
+        let (_m3, _) = toolchain_write(&session, &base, "a.txt", Some("v4"), 2);
+        let anchor2 = session
+            .append("cli", "console", &Message::plain(Role::User, "第二个锚点"))
+            .unwrap();
+        let (_m4, _) = toolchain_write(&session, &base, "a.txt", Some("v5"), 3);
+        let report = restore_to_message(&session, "cli", "console", anchor2).expect("应成功");
+        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v4", "{report}");
     }
 
     #[test]

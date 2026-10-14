@@ -1744,9 +1744,10 @@ export default function Chat({
               className="hidden"
               onChange={(e) => void onFilesPicked(e.target.files)}
             />
-            {/* 运行中且有草稿：排队发送按钮（桌面也可 Enter 入队；移动端无 Enter
-                发送语义，这是唯一入队入口）。 */}
-            {busy && draft.trim() && (
+            {/* 运行中且有可发送内容：排队发送按钮（桌面也可 Enter 入队；移动端无
+                Enter 发送语义，这是唯一入队入口）。准入条件与 send() 一致——纯附件 /
+                纯引用（无正文）同样可排队，不必凑一句说明文字。 */}
+            {busy && !uploading && (draft.trim() || attachments.length > 0 || quote) && (
               <button
                 onClick={send}
                 title="排队发送（任务结束后自动发出，可点「立即」插队）"

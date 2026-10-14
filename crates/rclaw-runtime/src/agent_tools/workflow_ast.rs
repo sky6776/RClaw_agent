@@ -475,6 +475,21 @@ pub(crate) fn compile_typed_asks(script: &str) -> Result<TypedAskTransform, Vec<
     if !walker.diagnostics.is_empty() {
         return Err(walker.diagnostics);
     }
+    // 展开后的 schema 深度按【校验器口径】统一核对（泛型代入会把实参子树插进别名
+    // 体——源类型嵌套浅 + 实参子树深的组合曾编译通过，子代理执行完之后所有答案才
+    // 被校验器的深度上限打回）。schema_depth 与 validate_json_schema 的递归边同口径。
+    for (line, schema) in &walker.typed_asks {
+        let depth = schema_depth(schema);
+        if depth > MAX_TYPE_DEPTH {
+            return Err(vec![FacadeDiagnostic {
+                line: *line,
+                col: 1,
+                message: format!(
+                    "类型展开后嵌套 {depth} 层，超过 {MAX_TYPE_DEPTH} 层上限：减少实例化嵌套层数"
+                ),
+            }]);
+        }
+    }
     // 重写生成的 `JSON.parse(...)` 依赖内置 JSON：脚本自己声明了 `JSON` 绑定时拒绝
     //（遮蔽内置对象，TDZ 场景重写体直接 ReferenceError——原脚本能过 tsc，重写后
     // 才炸）。
@@ -785,13 +800,32 @@ fn schema_size(value: &Value) -> usize {
     }
 }
 
-/// schema 树的嵌套深度（对象 / 数组每层计 1，与校验器的深度口径一致）。
+/// schema 树的嵌套深度，按【校验器递归边】计：只有 properties 的值、items、
+/// additionalProperties、prefixItems、allOf、anyOf 会消耗校验器的 depth+1；
+/// `type` / `required` / `const` 等标量字段与 JSON 表示容器（properties 键本身）
+/// 不算——按 JSON 容器层计会把合法嵌套在编译期提前拒掉（校验器其实只看到一半深度）。
 fn schema_depth(value: &Value) -> usize {
-    match value {
-        Value::Object(map) => 1 + map.values().map(schema_depth).max().unwrap_or(0),
-        Value::Array(items) => 1 + items.iter().map(schema_depth).max().unwrap_or(0),
-        _ => 1,
+    let mut depth = 1;
+    if let Some(properties) = value.get("properties").and_then(Value::as_object) {
+        for child in properties.values() {
+            depth = depth.max(1 + schema_depth(child));
+        }
     }
+    for edge in ["items", "additionalProperties"] {
+        if let Some(child) = value.get(edge) {
+            if child.is_object() || child.is_array() {
+                depth = depth.max(1 + schema_depth(child));
+            }
+        }
+    }
+    for edge in ["prefixItems", "allOf", "anyOf"] {
+        if let Some(children) = value.get(edge).and_then(Value::as_array) {
+            for child in children {
+                depth = depth.max(1 + schema_depth(child));
+            }
+        }
+    }
+    depth
 }
 
 impl<'a> SchemaCompiler<'a> {
@@ -1085,9 +1119,8 @@ impl<'a> SchemaCompiler<'a> {
         }
         // 泛型实例化帧优先：别名 body 内引用参数名（T / U…）→ 返回调用方环境里
         // 已解析的实参 schema。clone 的是整棵子树，其尺寸计入展开预算——否则
-        // 「body 里 N 处引用 × 实参子树大小」的乘法绕过构造期计数。插入点还要核对
-        // 展开后的总深度（源类型嵌套浅 + 实参子树深 = 校验器拒收的深 schema——
-        // 拒绝必须发生在子代理执行之前，而不是答案全部被深度上限打回）。
+        // 「body 里 N 处引用 × 实参子树大小」的乘法绕过构造期计数。展开后的总深度
+        // 在编译完成后按校验器口径统一核对（见 compile_typed_asks）。
         let hit = self
             .type_args
             .iter()
@@ -1095,17 +1128,11 @@ impl<'a> SchemaCompiler<'a> {
             .find_map(|frame| frame.get(name).cloned());
         if let Some(schema) = hit {
             self.charge(schema_size(&schema), span_start);
-            if self.budget.over {
-                return json!({});
-            }
-            if depth + schema_depth(&schema) > MAX_TYPE_DEPTH {
-                self.diagnostics.push((
-                    span_start,
-                    format!("类型展开后嵌套超过 {MAX_TYPE_DEPTH} 层上限：减少实例化嵌套层数"),
-                ));
-                return json!({});
-            }
-            return schema;
+            return if self.budget.over {
+                json!({})
+            } else {
+                schema
+            };
         }
         // 类型别名（脚本顶层 `type X = ...`，可带泛型参数，引用点实例化）。
         let Some(alias) = self.aliases.get(name) else {
@@ -1752,27 +1779,32 @@ mod extended_type_tests {
 
     #[test]
     fn expanded_schema_depth_is_checked_before_execution() {
-        // 回归：实参子树在插入点的深度曾不核对——源类型嵌套浅 + 实参子树深，编译
-        // 通过但展开 schema 超过校验器深度上限，所有合规答案都在子代理执行完之后
-        // 才被拒。编译期按插入点核对总深度并拒绝。
-        let script = concat!(
-            "type Box<T> = { x: { y: { z: T } } };\n",
-            "const h = agent(\"h\");\n",
-            "const r = await h.ask<Box<Box<Box<string>>>>(\"深\");\n",
-            "result(r.x);\n"
+        // 回归：泛型代入会把实参子树插进别名体——源类型嵌套浅 + 实参子树深的组合
+        // 曾编译通过，子代理执行完之后所有答案才被校验器的深度上限打回。编译完成后
+        // 按【校验器口径】（properties 递归边，别名层不再 +1）核对总深度并拒绝。
+        let opens = "Box<".repeat(9);
+        let closes = ">".repeat(9);
+        let script = format!(
+            "type Box<T> = {{ value: T }};\nconst h = agent(\"h\");\nconst r = await h.ask<{opens}string{closes}>(\"深\");\nresult(r.value);\n"
         );
-        let diagnostics = compile_typed_asks(script).unwrap_err();
+        let diagnostics = compile_typed_asks(&script).unwrap_err();
         assert!(
-            diagnostics.iter().any(|d| d.message.contains("展开后嵌套超过")),
+            diagnostics.iter().any(|d| d.message.contains("超过") && d.message.contains("层")),
             "{diagnostics:?}"
         );
-        // 深度预算内的组合不受影响（3 层别名体 × string = 4 层 < 8）。
+        // 校验器口径内的嵌套不受影响（Box9 层 = 9 个 properties 边 + string ≤ 8 才放行；
+        // 4 层 = 4 边 + string = 5 层，合法）。
         let ok = compile_typed_asks(
-            "type Box<T> = { x: { y: { z: T } } };\nconst h = agent(\"h\");\nconst r = await h.ask<Box<string>>(\"内\");\n",
+            "type Box<T> = { value: T };\nconst h = agent(\"h\");\nconst r = await h.ask<Box<Box<Box<Box<string>>>>>(\"内\");\n",
         )
         .expect("深度预算内应编译");
-        assert_eq!(ok.typed_asks[0].1["properties"]["x"]["properties"]["y"]["type"], "object");
+        let mut cursor = &ok.typed_asks[0].1;
+        for _ in 0..4 {
+            cursor = &cursor["properties"]["value"];
+        }
+        assert_eq!(cursor["type"], "string");
     }
+
 
     #[test]
     fn duplicate_alias_declarations_are_rejected() {
