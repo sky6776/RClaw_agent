@@ -89,7 +89,22 @@ public final class NativeBridge {
     /** CDP 浏览器会话：启动（或复用）长驻调试 WebView，返回 {"ok":true,"pid":N}
      *  （Rust cdp_browser 据此拼 DevTools socket 名；BrowserSession.start 的桥）。 */
     static String browserSessionStart() {
-        return BrowserSession.start(appContext);
+        // BrowserSession.start 只捕获 InterruptedException——其余 RuntimeException
+        // /Error 会穿透成 JNI "Java exception was thrown"，堆栈被 exception_clear
+        // 丢弃、真因无从查起。这里全量捕获，把类名+堆栈带回工具错误串。
+        try {
+            return BrowserSession.start(appContext);
+        } catch (Throwable t) {
+            java.io.StringWriter stack = new java.io.StringWriter();
+            t.printStackTrace(new java.io.PrintWriter(stack));
+            android.util.Log.e("NativeBridge", "browserSessionStart failed", t);
+            try {
+                return "{\"ok\":false,\"error\":" + org.json.JSONObject.quote(
+                        t.getClass().getName() + ": " + t.getMessage() + "\n" + stack) + "}";
+            } catch (Throwable ignored) {
+                return "{\"ok\":false,\"error\":\"browserSessionStart Throwable（堆栈序列化失败）\"}";
+            }
+        }
     }
 
     /** CDP 浏览器会话：销毁长驻 WebView（browser_close 工具的桥）。 */
