@@ -79,9 +79,7 @@ fn pick_page_target(body: &str) -> anyhow::Result<String> {
             fallback = target.get("id").and_then(Value::as_str).map(str::to_string);
         }
     }
-    fallback
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("DevTools 没有可用的 page target（应用界面除外）"))
+    fallback.ok_or_else(|| anyhow!("DevTools 没有可用的 page target（应用界面除外）"))
 }
 
 // ---------------------------------------------------------------------------

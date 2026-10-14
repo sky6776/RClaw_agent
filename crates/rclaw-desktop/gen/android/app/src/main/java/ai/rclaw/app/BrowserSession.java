@@ -64,9 +64,15 @@ final class BrowserSession {
                         wv.setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null);
                         // 不装 WebViewClient 时链接点击会甩给系统浏览器——CDP 会话
                         // 还停在旧页面，后续操作/截图全部错位。http(s) 一律会话内
-                        // 导航；非 http(s)（tel:/mailto:/intent:…）显式转交系统
-                        // 处理后消费掉导航（返回 true 只代表「应用已处理」，系统
-                        // 不会自动代发）。
+                        // 导航；非 http(s)（tel:/mailto:/intent:…）复刻 WebView 默认
+                        // 派发器的安全语义后显式转交系统：
+                        //   · 仅用户手势（点击）或重定向才派发——页面 JS 静默跳
+                        //     tel:/mailto: 不得拉起拨号器/邮件；
+                        //   · intent:// 先 parseUri 解出目标动作/组件（字面 intent
+                        //     scheme 无法被 ACTION_VIEW 处理）；
+                        //   · 加 CATEGORY_BROWSABLE：只派发给声明接受浏览器来源的
+                        //     目标（浏览器→应用边界）。
+                        // 返回 true 表示本应用已处理（系统不会自动代发）。
                         wv.setWebViewClient(new android.webkit.WebViewClient() {
                             @Override
                             public boolean shouldOverrideUrlLoading(
@@ -77,16 +83,29 @@ final class BrowserSession {
                                 if ("http".equals(scheme) || "https".equals(scheme)) {
                                     return false;
                                 }
-                                try {
-                                    android.content.Context ctx = view.getContext()
-                                            .getApplicationContext();
-                                    android.content.Intent intent = new android.content.Intent(
-                                            android.content.Intent.ACTION_VIEW, uri);
-                                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-                                    ctx.startActivity(intent);
-                                } catch (RuntimeException error) {
-                                    android.util.Log.w("BrowserSession",
-                                            "external scheme dispatch failed: " + uri, error);
+                                if (request.hasGesture() || request.isRedirect()) {
+                                    try {
+                                        android.content.Context ctx = view.getContext()
+                                                .getApplicationContext();
+                                        android.content.Intent intent;
+                                        if ("intent".equals(scheme)) {
+                                            intent = android.content.Intent.parseUri(
+                                                    uri.toString(),
+                                                    android.content.Intent.URI_INTENT_SCHEME);
+                                        } else {
+                                            intent = new android.content.Intent(
+                                                    android.content.Intent.ACTION_VIEW, uri);
+                                        }
+                                        intent.addCategory(
+                                                android.content.Intent.CATEGORY_BROWSABLE);
+                                        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                                        ctx.startActivity(intent);
+                                    } catch (Exception error) {
+                                        // parseUri 抛受检 URISyntaxException；目标缺失等
+                                        // 运行时异常一并按「派发失败」处理（页面留在原处）。
+                                        android.util.Log.w("BrowserSession",
+                                                "external scheme dispatch failed: " + uri, error);
+                                    }
                                 }
                                 return true;
                             }
