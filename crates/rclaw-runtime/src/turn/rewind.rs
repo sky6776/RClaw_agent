@@ -701,10 +701,12 @@ pub(crate) fn restore_to_message(
         let mut predecessors: Vec<FileCheckpointMeta> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in all_meta.iter().rev() {
-            // 跳过窗口内的行；重锚标记（is_rewind）反映的是更早一次回滚的状态，
-            // 不是链前驱——真前驱是最后一条【checkpoint】（跳过标记才能与既有
-            // 「窗口外历史标记不参与」的口径一致）。
-            if record.id >= first_id || record.is_rewind {
+            // 跳过窗口内的行。重锚标记（is_rewind）同样是合法前驱：真回滚后该文件
+            // 的链状态由标记的 after_hash 权威记录，其后第一条 checkpoint 的 before
+            // 指向它——跳过标记会选中回滚前的旧 checkpoint，把「回滚 + 纯文字锚点 +
+            // 正常写入」的合法链误判成未记录改动（broken_chains 对标记本就只取
+            // after_hash 作新起点）。
+            if record.id >= first_id {
                 continue;
             }
             let key = path_key(&record.path);
@@ -1409,9 +1411,10 @@ mod message_rollback_tests {
     }
 
     #[test]
-    fn restore_to_message_ignores_pre_anchor_rewind_markers() {
-        // 回归：锚点【之前】的历史重锚标记若全量进校验窗口，会与被排除的锚点前
-        // checkpoint 断链，把合法回滚误判成「未记录的改动」。
+    fn restore_to_message_uses_pre_anchor_rewind_marker_as_predecessor() {
+        // 回归：锚点【之前】的历史重锚标记是该文件链的合法前驱（after_hash 即链的
+        // 当前状态）——既不能全量进校验窗口（与被排除的锚点前 checkpoint 断链），
+        // 也不能在前驱挑选时被跳过（选中更旧的 checkpoint 一样误报断链）。
         let dir = tempfile::tempdir().unwrap();
         let session = test_store(dir.path());
         let base = session.layout().base.clone();
@@ -1437,7 +1440,8 @@ mod message_rollback_tests {
         let (m1, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
         let (m2, _) = toolchain_write(&session, &base, "a.txt", Some("v4"), 2);
 
-        // 回滚到 m1：窗口只含 m1 起的记录（锚点前的标记不参与），合法回滚必须放行。
+        // 回滚到 m1：锚点前的标记作为前驱参与校验（after=v2 接上 m1 的 before=v2），
+        // 合法回滚必须放行。
         let report = restore_to_message(&session, "cli", "console", m1).expect("不得被历史标记误断链");
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v3");
         assert!(report.contains("1 个文件恢复原内容"), "{report}");
@@ -1445,6 +1449,49 @@ mod message_rollback_tests {
         // m2 之后无写入：仍明确报错。
         let err = restore_to_message(&session, "cli", "console", m2).unwrap_err();
         assert!(err.contains("没有可回滚"), "{err}");
+    }
+
+    #[test]
+    fn restore_to_message_after_real_rewind_uses_marker_as_predecessor() {
+        // 回归：真回滚（文件内容真的变回旧版）之后，重锚标记的 after_hash 才是该
+        // 文件链的当前状态——其后纯文字锚点 + checkpointed 写入的 before 指向标记
+        // 而不是回滚前的旧 checkpoint；前驱挑选跳过标记曾选中旧状态，把合法回滚
+        // 误判成「未记录的改动」并拒绝。
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_store(dir.path());
+        let base = session.layout().base.clone();
+        let file_a = base.join("a.txt");
+        write_file(&file_a, "v1");
+
+        let (_m0, _) = toolchain_write(&session, &base, "a.txt", Some("v2"), 0);
+        // /rewind 回到 v1：文件内容真的变回旧版，落重锚标记（after = v1 ≠ 旧 checkpoint 的 v2）。
+        // path 与生产一致用 display_path 归一（path_key 按记录 path 匹配，相对/绝对不一致
+        // 会让标记在前驱挑选里对不上号——生产标记的 path 来自 targets，本就是归一后的）。
+        write_file(&file_a, "v1");
+        let marker = FileCheckpointRecord {
+            id: 0,
+            group_id: next_rewind_id(),
+            path: display_path(&base.join("a.txt")),
+            before: None,
+            before_hash: None,
+            after_hash: Some(hash_bytes(b"v1")),
+            is_rewind: true,
+            anchor_message_id: None,
+        };
+        session
+            .append_file_checkpoints("cli", "console", next_rewind_id(), &[marker])
+            .unwrap();
+
+        // 回滚之后的纯文字锚点 + checkpointed 写入（before = v1，指向标记）。
+        let anchor = session
+            .append("cli", "console", &Message::plain(Role::User, "回滚后的锚点"))
+            .unwrap();
+        let (_m1, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
+
+        let report =
+            restore_to_message(&session, "cli", "console", anchor).expect("标记是合法链前驱");
+        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v1", "{report}");
+        assert!(report.contains("1 个文件恢复原内容"), "{report}");
     }
 
     #[test]

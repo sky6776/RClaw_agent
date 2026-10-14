@@ -1105,22 +1105,10 @@ impl<'a> SchemaCompiler<'a> {
             return json!({});
         };
         let name = id.name.as_str();
-        // Array<T>。
-        if name == "Array" && self.aliases.get(name).is_none() {
-            let Some(params) = &reference.type_arguments else {
-                self.diagnostics.push((span_start, "Array 需要元素类型参数".to_string()));
-                return json!({});
-            };
-            let Some(element) = params.params.first() else {
-                self.diagnostics.push((span_start, "Array<> 的类型参数列表为空".to_string()));
-                return json!({});
-            };
-            return json!({"type": "array", "items": self.compile(element, depth + 1, alias_depth)});
-        }
-        // 泛型实例化帧优先：别名 body 内引用参数名（T / U…）→ 返回调用方环境里
-        // 已解析的实参 schema。clone 的是整棵子树，其尺寸计入展开预算——否则
-        // 「body 里 N 处引用 × 实参子树大小」的乘法绕过构造期计数。展开后的总深度
-        // 在编译完成后按校验器口径统一核对（见 compile_typed_asks）。
+        // 泛型实例化帧最优先：别名 body 内引用参数名（T / U…，含遮蔽内置 Array 的
+        // 参数名）→ 返回调用方环境里已解析的实参 schema。clone 的是整棵子树，其尺寸
+        // 计入展开预算——否则「body 里 N 处引用 × 实参子树大小」的乘法绕过构造期
+        // 计数。展开后的总深度在编译完成后按校验器口径统一核对（见 compile_typed_asks）。
         let hit = self
             .type_args
             .iter()
@@ -1133,6 +1121,18 @@ impl<'a> SchemaCompiler<'a> {
             } else {
                 schema
             };
+        }
+        // Array<T>（内置特判在参数帧之后——参数名可以遮蔽内置名）。
+        if name == "Array" && self.aliases.get(name).is_none() {
+            let Some(params) = &reference.type_arguments else {
+                self.diagnostics.push((span_start, "Array 需要元素类型参数".to_string()));
+                return json!({});
+            };
+            let Some(element) = params.params.first() else {
+                self.diagnostics.push((span_start, "Array<> 的类型参数列表为空".to_string()));
+                return json!({});
+            };
+            return json!({"type": "array", "items": self.compile(element, depth + 1, alias_depth)});
         }
         // 类型别名（脚本顶层 `type X = ...`，可带泛型参数，引用点实例化）。
         let Some(alias) = self.aliases.get(name) else {
@@ -1775,6 +1775,27 @@ mod extended_type_tests {
         )
         .expect("编译应成功");
         assert_eq!(inside.typed_asks[0].1["const"], json!(9007199254740992i64));
+    }
+
+    #[test]
+    fn alias_parameter_shadows_builtin_array() {
+        // 回归：参数名可以遮蔽内置 Array——`type Box<Array> = { value: Array }` 的
+        // body 里 Array 是本别名的参数，指向调用方实参；内置特判曾先于参数帧查找
+        // 执行，把这个合法工作流误拒成「Array 需要元素类型参数」。
+        let shadowed = compile_typed_asks(
+            "type Box<Array> = { value: Array };\nconst h = agent(\"h\");\nconst r = await h.ask<Box<string>>(\"q\");\n",
+        )
+        .expect("参数遮蔽内置名应按实参解析");
+        assert_eq!(shadowed.typed_asks[0].1["properties"]["value"]["type"], "string");
+        // 泛型代入仍要过展开预算：深实参经遮蔽内置名的参数名展开时同样受深度上限
+        // 约束（编译完成后统一核对）。尖括号用 format! 构造，避免手写失衡被解析器
+        // 吃成比较运算后静默降级。
+        let opens = "Array<".repeat(8);
+        let closes = ">".repeat(9);
+        let deep = compile_typed_asks(&format!(
+            "type Box<Array> = {{ value: Array }};\nconst h = agent(\"h\");\nconst r = await h.ask<Box<{opens}string{closes}>(\"深\");\n"
+        ));
+        assert!(deep.is_err(), "超展开深度应被拒绝");
     }
 
     #[test]
