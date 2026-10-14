@@ -6,6 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
+import { flushSync } from "react-dom";
 import {
   api,
   isStatusLine,
@@ -327,6 +328,9 @@ export default function App() {
   const [futureThinkingCollapsed, setFutureThinkingCollapsed] = useState<Record<string, boolean>>({});
   // 已从持久化历史恢复过转录的会话（避免重复拉取）。
   const restoredChats = useRef<Set<string>>(new Set());
+  // 快照拉取进行中的会话：游标尚未落定，增量拉取必须等它完成（否则从 0 起步会把
+  // 尾窗之外的历史整段拉进视图，破坏首屏有界加载）。
+  const snapshotLoading = useRef<Set<string>>(new Set());
   // 行级游标（每会话）：已消费到哪条持久化消息行。快照落定 / 增量入账时推进；
   // turn 收尾与窗口恢复可见时按它续读增量（重连不重拉全量）。
   const cursorByChat = useRef<Record<string, number>>({});
@@ -398,17 +402,24 @@ export default function App() {
     [],
   );
 
-  // 已落库条目并入会话视图（行级增量的装配步）：同角色同文的直播条目原位盖上持久化
-  // 行 id——顺序与对象身份都不动，fork 菜单持有的条目引用因此拿到锚点；没有直播孪生的
-  // （错过事件 / 重连补洞）按序追加在尾部。发送失败条目与思考块永远匹配不上：前者
-  // 没落库，后者不产生持久化行。
+  // 已落库条目并入会话视图（行级增量的装配步），两阶段保证幂等与顺序：
+  // 1) 按行 id 去重（已在视图里的行直接跳过——重叠/重放的增量不产生双份，也不会把
+  //    新到的同文消息误盖上一轮的行 id）；再把同角色同文的【未盖章】直播条目一对一
+  //    原位盖上行 id——顺序与对象身份都不动，fork 菜单持有的条目引用因此拿到锚点；
+  //    发送失败条目与思考块永远匹配不上：前者没落库，后者不产生持久化行。
+  // 2) 没有直播孪生的行（错过事件 / 重连补洞）按行 id 插到第一个更大行 id 的条目
+  //    之前、否则追加尾部——乱序到达的中插行不会落到最终回复之后。
   const applyCommitted = useCallback((chatId: string, items: HistoryMsg[]) => {
     if (items.length === 0) return;
     setEntriesByChat((prev) => {
       const existing = prev[chatId] ?? [];
       const next = existing.slice();
+      const have = new Set(
+        existing.flatMap((e) => (e.msgId === undefined ? [] : [e.msgId])),
+      );
       const appended: Entry[] = [];
       for (const m of items) {
+        if (have.has(m.id)) continue;
         const idx = next.findIndex(
           (e) =>
             e.msgId === undefined &&
@@ -427,30 +438,50 @@ export default function App() {
             msgId: m.id,
           });
         }
+        have.add(m.id);
       }
-      return { ...prev, [chatId]: [...next, ...appended] };
+      // 乱序行插到第一个更大持久化 id 之前；未盖章直播条目（msgId 缺省）不参与
+      // 定位——它们的位置在增量入账前本来就是临时序。
+      for (const item of appended) {
+        const pos = next.findIndex((e) => e.msgId !== undefined && e.msgId > item.msgId!);
+        if (pos >= 0) next.splice(pos, 0, item);
+        else next.push(item);
+      }
+      return { ...prev, [chatId]: next };
     });
   }, []);
 
   // 行级增量拉取：把游标之后落库的行补进视图并回填锚点。turn 收尾 / 窗口恢复可见 /
-  // fork 前兜底共用。快照都没拉过的会话直接跳过（后台会话的条目全是直播，打开时走
-  // 快照路径）。more 分页循环有硬上限，防御后端异常导致的无限续拉。
+  // fork 前兜底共用。快照还没就绪（初始化中 / 从未拉过）的会话直接跳过——前者等
+  // openChat 落定游标，后者等首次打开走快照路径。同一会话的并发拉取合并为一次在飞
+  // 请求：重叠触发（收尾 + 切回可见 + fork 兜底）共用同一游标起点，重复请求会各自
+  // 从同一 cursor 取到同一批行，靠幂等兜底不如干脆不重入。
+  const resyncInflight = useRef<Record<string, Promise<void>>>({});
   const resyncChat = useCallback(
-    async (chatId: string) => {
-      if (!restoredChats.current.has(chatId)) return;
-      let after = cursorByChat.current[chatId] ?? 0;
-      for (let page = 0; page < 20; page++) {
-        let delta: ChatHistoryDelta;
-        try {
-          delta = await api.chatHistorySince(chatId, after);
-        } catch {
-          return; // agent 未启动等瞬时失败：下次收尾再补。
+    (chatId: string): Promise<void> => {
+      const inflight = resyncInflight.current[chatId];
+      if (inflight) return inflight;
+      const run = (async () => {
+        if (snapshotLoading.current.has(chatId) || !restoredChats.current.has(chatId)) return;
+        let after = cursorByChat.current[chatId] ?? 0;
+        for (let page = 0; page < 20; page++) {
+          let delta: ChatHistoryDelta;
+          try {
+            delta = await api.chatHistorySince(chatId, after);
+          } catch {
+            return; // agent 未启动等瞬时失败：下次收尾再补。
+          }
+          cursorByChat.current[chatId] = Math.max(after, delta.cursor);
+          if (delta.entries.length > 0) applyCommitted(chatId, delta.entries);
+          if (!delta.more) return;
+          after = delta.cursor;
         }
-        cursorByChat.current[chatId] = delta.cursor;
-        if (delta.entries.length > 0) applyCommitted(chatId, delta.entries);
-        if (!delta.more) return;
-        after = delta.cursor;
-      }
+      })();
+      resyncInflight.current[chatId] = run;
+      void run.finally(() => {
+        delete resyncInflight.current[chatId];
+      });
+      return run;
     },
     [applyCommitted],
   );
@@ -541,14 +572,16 @@ export default function App() {
       // 会话边界清草稿（入口同步清，不依赖 Chat 挂载后的 effect 时序——
       // 分享确认等"先切会话再并入草稿"的路径会被后跑的清空 effect 抵消）。
       setChatDraft("");
-      if (restoredChats.current.has(chatId)) return;
-      restoredChats.current.add(chatId);
+      if (restoredChats.current.has(chatId) || snapshotLoading.current.has(chatId)) return;
+      snapshotLoading.current.add(chatId);
       setEntriesByChat((prev) => ({ ...prev, [chatId]: prev[chatId] ?? [] }));
       try {
         // 快照装配：已落库条目是权威投影，整体重建；此后视图 = 快照 + 按游标续读
         // 的增量（resyncChat），不存在「数第 N 次出现」式的文本对位。
         const history = await api.chatHistory(chatId);
         cursorByChat.current[chatId] = history.cursor;
+        snapshotLoading.current.delete(chatId);
+        restoredChats.current.add(chatId);
         setEntriesByChat((prev) => {
           const committed: Entry[] = history.entries.map((m) => ({
             id: next_entry_id++,
@@ -556,23 +589,26 @@ export default function App() {
             content: m.content,
             msgId: m.id,
           }));
-          // 事件可能先于快照返回：直播条目里与快照同角色同文的丢弃（已在投影里），
-          // 没落库的（本轮直播 / 发送失败）与思考块保留在尾部。
-          const live = prev[chatId] ?? [];
-          const pending = live.filter(
-            (e) =>
-              e.role === "thinking" ||
-              !committed.some(
-                (c) => c.role === e.role && c.content.trim() === e.content.trim(),
-              ),
-          );
-          return { ...prev, [chatId]: [...committed, ...pending] };
+          // 事件可能先于快照返回：每条快照条目一对一消费一条同角色同文的直播孪生
+          // （成员资格判断会误伤重复文本——快照之后新发的乐观「继续」、永远无法从
+          // 库里恢复的发送失败条目都会被整批错杀）。没被消费的直播条目与思考块
+          // 保留在尾部，等增量入账盖章。
+          const live = [...(prev[chatId] ?? [])];
+          for (const c of committed) {
+            const idx = live.findIndex(
+              (e) =>
+                !e.sendFailed &&
+                e.role === c.role &&
+                e.content.trim() === c.content.trim(),
+            );
+            if (idx >= 0) live.splice(idx, 1);
+          }
+          return { ...prev, [chatId]: [...committed, ...live] };
         });
       } catch {
-        // agent 未启动等瞬时失败：回滚已恢复标记与游标，下次打开还能重试；
+        // agent 未启动等瞬时失败：回滚加载标记，下次打开还能重试；
         // 否则该会话永远保持空转录。
-        restoredChats.current.delete(chatId);
-        delete cursorByChat.current[chatId];
+        snapshotLoading.current.delete(chatId);
       }
     },
     [],
@@ -585,8 +621,9 @@ export default function App() {
       setChats((list) => {
         if (!list.some((c) => c.chat_id === activeId) && list.length > 0) {
           void openChat(list[0].chat_id);
-        } else if (list.length > 0 && !restoredChats.current.has(activeId)) {
-          // 初始定位到最近会话（默认 main 也在列表里）。
+        } else if (!restoredChats.current.has(activeId)) {
+          // 初始定位到最近会话；列表为空（全新库）也要初始化默认会话——
+          // 否则它的首批消息永远拿不到游标与 fork 锚点。
           void openChat(activeId);
         }
         return list;
@@ -796,6 +833,7 @@ export default function App() {
         return;
       }
       restoredChats.current.delete(chatId);
+      snapshotLoading.current.delete(chatId);
       delete cursorByChat.current[chatId];
       localChatIds.current.delete(chatId);
       setEntriesByChat((prev) => {
@@ -879,6 +917,10 @@ export default function App() {
           return;
         }
         await resyncChat(activeId);
+        // applyCommitted 只是把盖章排进了 state 队列；并发渲染下 await 返回不代表
+        // 已提交。强制冲刷一轮再读 ref，否则第一次 fork 会拿到旧的未盖章条目、
+        // 误报「没有持久化记录」。
+        flushSync(() => {});
         anchorId =
           entriesByChatRef.current[activeId]?.find((e) => e.id === entry.id)?.msgId ?? null;
       }

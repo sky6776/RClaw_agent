@@ -497,7 +497,8 @@ impl SessionStore {
     /// 下一次续读自然覆盖，不重不漏。
     ///
     /// 与快照窗口不同，这里【不做字节裁剪】——被裁掉的行游标已声明消费，丢了就永远
-    /// 补不回来；截断只按条数（`more`），由调用方续拉。
+    /// 补不回来；截断只按条数（`more`），由调用方续拉。页满与否按【原始 SQL 行】计
+    /// （坏 JSON 行被跳过也占页额度），否则一页坏行会让游标越页推进、跳过其后全部好行。
     pub fn load_chat_delta(
         &self,
         channel: &str,
@@ -513,20 +514,30 @@ impl SessionStore {
                     more: false,
                 });
             };
-            let messages = query_messages(
-                conn,
-                &format!(
-                    "SELECT id, data FROM message \
-                     WHERE session_id = ?1 AND id > ?2 AND {REPLAYABLE_FILTER_SQL} \
-                     ORDER BY id LIMIT ?3"
-                ),
-                params![sid, after_id, limit.max(1) as i64],
-            )?;
-            let full = messages.len() >= limit.max(1);
-            let cursor = match messages.last() {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id, data FROM message \
+                 WHERE session_id = ?1 AND id > ?2 AND {REPLAYABLE_FILTER_SQL} \
+                 ORDER BY id LIMIT ?3"
+            ))?;
+            let mut rows = stmt.query(params![sid, after_id, limit.max(1) as i64])?;
+            let mut messages = Vec::new();
+            let mut raw_count = 0usize;
+            let mut last_raw_id = after_id;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let data: String = row.get(1)?;
+                raw_count += 1;
+                last_raw_id = id;
+                if let Some(m) = parse_message(id, &data) {
+                    messages.push(m);
+                }
+            }
+            let full = raw_count >= limit.max(1);
+            let cursor = match raw_count {
                 // 批满：游标只能推进到本批最后一行（之后可能还有，`more` 让调用方续拉）；
                 // 不满：一次消费到头（含被过滤器筛掉的行），游标直达当前最大行 id。
-                Some(last) if full => last.id,
+                0 => max_message_id(conn, sid)?,
+                _ if full => last_raw_id,
                 _ => max_message_id(conn, sid)?,
             };
             Ok(ChatDelta {

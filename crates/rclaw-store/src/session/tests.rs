@@ -2012,3 +2012,30 @@ fn delta_skips_compaction_boundary_but_cursor_passes_it() {
     let d2 = s.load_chat_delta("cli", "c", d.cursor, 100).unwrap();
     assert!(d2.messages.is_empty());
 }
+
+#[test]
+fn delta_page_fullness_counts_raw_rows_not_parsed_messages() {
+    let (_g, s) = store();
+    let v1 = s.append("cli", "c", &Message::plain(Role::User, "v1")).unwrap();
+    // 一行合法 JSON 但反序列化不成 Message：query 层面占页额度，只是映射不出条目。
+    let bad = raw_insert(&s, "cli", "c", "user", r#"{"not":"a message"}"#);
+    let v2 = s.append("cli", "c", &Message::plain(Role::User, "v2")).unwrap();
+    let v3 = s.append("cli", "c", &Message::plain(Role::User, "v3")).unwrap();
+    assert!(bad > v1 && v2 > bad && v3 > v2);
+
+    // limit=2 的第一页吃到 (v1, bad)：映射出 1 条，但页是【满】的——more=true 且
+    // 游标只推到坏行（绝不能越页直捣最大 id，把 v2/v3 永久跳过）。
+    let first = s.load_chat_delta("cli", "c", 0, 2).unwrap();
+    assert_eq!(texts(&first.messages), vec!["v1"]);
+    assert!(first.more, "页满按原始行计，坏行占额度");
+    assert_eq!(first.cursor, bad);
+
+    // 第二页恰好装下剩余两行（满页）；第三页见底。
+    let second = s.load_chat_delta("cli", "c", first.cursor, 2).unwrap();
+    assert_eq!(texts(&second.messages), vec!["v2", "v3"]);
+    assert!(second.more);
+    assert_eq!(second.cursor, v3);
+    let third = s.load_chat_delta("cli", "c", second.cursor, 2).unwrap();
+    assert!(third.messages.is_empty() && !third.more);
+    assert_eq!(third.cursor, v3);
+}
