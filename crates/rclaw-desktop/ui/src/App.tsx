@@ -2310,8 +2310,12 @@ function UpdateCard() {
     setError(null);
     try {
       await api.updateDownloadInstall();
-      // 不重置 phase：Windows 此刻进程即将退出；安卓停在「安装中」直到系统
-      // 安装器接管（用户取消安装则界面保持，重新点更新即可重下）。
+      // 命令返回 = 交付完成，不等于安装完成：Windows 进程即将退出（保持
+      // install 态无所谓）；安卓只是拉起了系统安装器——用户取消安装/先去授权
+      // 「未知来源」都会回到本界面，15s 后复位状态让「更新到 vX」可重试。
+      if (isAndroidDevice()) {
+        window.setTimeout(() => setPhase((cur) => (cur === "install" ? "idle" : cur)), 15000);
+      }
     } catch (e) {
       setError(String(e));
       setPhase("idle");

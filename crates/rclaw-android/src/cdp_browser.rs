@@ -45,21 +45,43 @@ pub fn shared() -> &'static CdpBrowser {
     BROWSER.get_or_init(CdpBrowser::new)
 }
 
-/// `/json/list` 应答里挑 page target（跳过 service_worker 等）。
+/// `/json/list` 应答里挑 page target。调试开关会暴露进程内【所有】WebView：
+/// Tauri 主界面（MainActivity）本身就是 page target，不能靠列表顺序——按 URL
+/// 排除应用界面（tauri/file/data/devtools），优先 about:blank（会话初始态）。
 #[cfg(any(unix, test))]
 fn pick_page_target(body: &str) -> anyhow::Result<String> {
     let targets: Vec<Value> =
         serde_json::from_str(body).map_err(|e| anyhow!("解析 /json/list 失败: {e}"))?;
+    let mut fallback: Option<&str> = None;
     for target in targets {
-        if target.get("type").and_then(Value::as_str) == Some("page") {
+        if target.get("type").and_then(Value::as_str) != Some("page") {
+            continue;
+        }
+        let url = target.get("url").and_then(Value::as_str).unwrap_or("");
+        let is_app_ui = url.starts_with("tauri://")
+            || url.starts_with("http://tauri.localhost")
+            || url.starts_with("https://tauri.localhost")
+            || url.starts_with("file://")
+            || url.starts_with("data:")
+            || url.starts_with("devtools://")
+            || url.starts_with("about:tauri");
+        if is_app_ui {
+            continue;
+        }
+        if url == "about:blank" {
             return target
                 .get("id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .ok_or_else(|| anyhow!("page target 缺少 id"));
         }
+        if fallback.is_none() {
+            fallback = target.get("id").and_then(Value::as_str);
+        }
     }
-    Err(anyhow!("DevTools 没有可用的 page target"))
+    fallback
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("DevTools 没有可用的 page target（应用界面除外）"))
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +104,11 @@ mod socket_layer {
         #[cfg(target_os = "android")]
         use std::os::android::net::SocketAddrExt as _;
         let addr = StdSocketAddr::from_abstract_name(socket_name.as_bytes())?;
-        Ok(tokio::net::UnixStream::connect_addr(&addr).await?)
+        // tokio 的 UnixStream 没有暴露 connect_addr：std 连接（阻塞、本就在
+        // spawn_blocking 之外但连接是毫秒级本地套接字）后转 tokio。
+        let stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
+        stream.set_nonblocking(true)?;
+        Ok(UnixStream::from_std(stream)?)
     }
 
     /// 探测 page target id：HTTP 探测走完即断（Connection: close）。WebView
@@ -173,7 +199,7 @@ impl Session {
         Ok(reply)
     }
 
-    /// 等待一次新的页面加载完成（`Page.loadEventFenced` 计数超过 `after`）。
+    /// 等待一次新的页面加载完成（`Page.loadEventFired` 计数超过 `after`）。
     async fn wait_load(&self, after: u64, timeout: Duration) -> Result<(), String> {
         let mut rx = self.load_rx.clone();
         let deadline = tokio::time::Instant::now() + timeout;
@@ -241,7 +267,7 @@ struct FetchRetry {
 }
 
 /// manager：持有 WebSocket 写半边，串行发命令、按 id 回应答、处理事件。
-/// `Page.loadEventFenced` 驱动 load 计数（wait_load 等它）；Fetch 拦截的
+/// `Page.loadEventFired` 驱动 load 计数（wait_load 等它）；Fetch 拦截的
 /// 放行命令失败时按 attempts 降级，最终以无头放行兜底——宁可带上指纹也不让
 /// 页面卡死在拦截器里。
 #[cfg(unix)]
@@ -291,30 +317,37 @@ async fn run_connection(
                 if let Some(id) = value.get("id").and_then(Value::as_u64) {
                     let resp = pending.remove(&id);
                     let failed = value.get("error").is_some();
-                    // 放行命令降级：失败且有剩余尝试 → 发下一种形态；形态全部
-                    // 失败 → 原样放行兜底（不带改写头）。
-                    if failed {
-                        if let Some(FetchRetry {
-                            request_id,
-                            mut attempts,
-                        }) = fetch_retry.remove(&id)
-                        {
+                    // 放行应答（无论成败）都先清跟踪记录——成功即完事；失败按
+                    // 剩余形态降级：数组形态 → object 形态 → 原样放行兜底
+                    // （兜底本身不再跟踪，它是终态）。
+                    if let Some(FetchRetry {
+                        request_id,
+                        mut attempts,
+                    }) = fetch_retry.remove(&id)
+                    {
+                        if failed {
                             if let Some(params) = attempts.next() {
                                 send_fire_and_forget(
                                     &mut sink, &mut next_id, &mut fetch_retry,
                                     &request_id, attempts, params,
                                 )
                                 .await;
-                            } else {
-                                send_fire_and_forget(
-                                    &mut sink, &mut next_id, &mut fetch_retry,
-                                    &request_id, std::vec::IntoIter::new(Vec::new()),
-                                    json!({ "requestId": request_id }),
-                                )
-                                .await;
+                                continue;
+                            }
+                            next_id += 1;
+                            let frame = json!({
+                                "id": next_id,
+                                "method": "Fetch.continueRequest",
+                                "params": { "requestId": request_id },
+                            });
+                            if let Err(error) = sink.send(Message::Text(frame.to_string())).await {
+                                tracing::warn!("CDP WebSocket 写失败（放行兜底）: {error}");
+                                break;
                             }
                             continue;
                         }
+                        // 放行成功：记录已清，无事可做。
+                        continue;
                     }
                     if let Some(resp) = resp {
                         let result = match value.get("error") {
@@ -341,7 +374,7 @@ async fn run_connection(
                         )
                         .await;
                     }
-                    "Page.loadEventFenced" => {
+                    "Page.loadEventFired" => {
                         load_tx.send_modify(|count| *count += 1);
                     }
                     _ => {}
@@ -370,15 +403,15 @@ async fn send_fire_and_forget(
 ) {
     *next_id += 1;
     let id = *next_id;
-    if !remaining.as_slice().is_empty() {
-        fetch_retry.insert(
-            id,
-            FetchRetry {
-                request_id: request_id.to_string(),
-                attempts: remaining,
-            },
-        );
-    }
+    // 无论有无剩余形态都登记：应答（成功或失败）都要清记录，长期页面高频
+    // XHR 不清理就是无界增长。
+    fetch_retry.insert(
+        id,
+        FetchRetry {
+            request_id: request_id.to_string(),
+            attempts: remaining,
+        },
+    );
     let frame = json!({ "id": id, "method": "Fetch.continueRequest", "params": params });
     if let Err(error) = sink.send(Message::Text(frame.to_string())).await {
         tracing::warn!("CDP WebSocket 写失败（Fetch 放行）: {error}");
@@ -387,7 +420,6 @@ async fn send_fire_and_forget(
 
 /// Fetch.requestPaused：改写头后放行。形态序列：HeaderEntry[]（CDP ≥ 126）→
 /// object（旧版）→ 无头原样放行。
-#[cfg(unix)]
 #[cfg(unix)]
 async fn handle_fetch_paused(
     sink: &mut futures::stream::SplitSink<WebSocketStream<tokio::net::UnixStream>, Message>,
@@ -483,6 +515,10 @@ async fn connect_session() -> Result<Session, String> {
 /// CDP 浏览器共享内核（web_browser 与 browser_* 工具共用）。
 pub struct CdpBrowser {
     session: AsyncMutex<Option<Session>>,
+    /// 操作互斥：浏览器是进程级单例（对话 turn / cron turn 可能并发调工具），
+    /// 「导航→等加载→提取」这类多步事务必须整体串行，否则两个并发取页会互相
+    /// 覆盖页面、各自提取到对方的 URL。
+    op: AsyncMutex<()>,
 }
 
 impl Default for CdpBrowser {
@@ -495,6 +531,7 @@ impl CdpBrowser {
     pub fn new() -> Self {
         CdpBrowser {
             session: AsyncMutex::new(None),
+            op: AsyncMutex::new(()),
         }
     }
 
@@ -530,6 +567,7 @@ impl CdpBrowser {
 
     /// 打开 URL 并等加载完成，返回人读报告（含 Google 风控页/同意页检测）。
     pub async fn navigate(&self, url: &str) -> Result<String, String> {
+        let _op = self.op.lock().await;
         let session = self.navigate_wait(url, Duration::from_secs(45)).await?;
         let info = self.page_info(&session).await?;
         Ok(format_report(&info))
@@ -540,6 +578,7 @@ impl CdpBrowser {
         &self,
         url: &str,
     ) -> Result<rclaw_tools::web_browser::PagePayload, String> {
+        let _op = self.op.lock().await;
         let session = self.navigate_wait(url, Duration::from_secs(40)).await?;
         let reply = session
             .call(
@@ -554,6 +593,7 @@ impl CdpBrowser {
 
     /// 紧凑可交互元素清单（每项带 ref，供 browser_click / browser_type 定位）。
     pub async fn snapshot(&self) -> Result<String, String> {
+        let _op = self.op.lock().await;
         let session = self.session().await?;
         let reply = session
             .call(
@@ -580,6 +620,7 @@ impl CdpBrowser {
 
     /// 点按 ref 元素（CDP 真实鼠标事件，非 JS 合成点击）。
     pub async fn click(&self, r: u32) -> Result<String, String> {
+        let _op = self.op.lock().await;
         let session = self.session().await?;
         let (x, y) = self.element_center(&session, r).await?;
         for kind in ["mousePressed", "mouseReleased"] {
@@ -604,6 +645,7 @@ impl CdpBrowser {
 
     /// 聚焦 ref 输入框并输入文本（先清空；InsertText 走 IME 通路，事件完整）。
     pub async fn type_text(&self, r: u32, text: &str) -> Result<String, String> {
+        let _op = self.op.lock().await;
         let session = self.session().await?;
         let (x, y) = self.element_center(&session, r).await?;
         for kind in ["mousePressed", "mouseReleased"] {
@@ -645,6 +687,7 @@ impl CdpBrowser {
 
     /// 离屏截图（Java View.draw 软件位图）到工作区 browser/ 下，返回相对路径。
     pub async fn screenshot(&self) -> Result<String, String> {
+        let _op = self.op.lock().await;
         let ctx = crate::host_context()
             .ok_or_else(|| "应用未就绪（宿主上下文未初始化）".to_string())?;
         // 确保会话活着（截图前没导航过也要有 WebView）。
@@ -672,6 +715,7 @@ impl CdpBrowser {
     /// 销毁会话（下次任何 browser 工具使用时自动重建）。
     pub async fn close(&self) -> Result<String, String> {
         {
+        let _op = self.op.lock().await;
             let mut guard = self.session.lock().await;
             *guard = None;
         }
@@ -734,7 +778,6 @@ fn evaluate_string(reply: &Value) -> Result<String, String> {
     }
     reply
         .get("result")
-        .and_then(|r| r.get("result"))
         .and_then(|r| r.get("value"))
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -1115,8 +1158,8 @@ impl BrowserCloseTool {
 mod tests {
     use super::*;
 
+    #[cfg(all(test, unix))]
     #[test]
-#[cfg(all(test, unix))]
     fn strip_removes_requested_with_case_insensitively_and_keeps_rest() {
         let headers = json!({
             "User-Agent": "Mozilla/5.0",
@@ -1133,14 +1176,14 @@ mod tests {
             .all(|k| !k.eq_ignore_ascii_case("X-Requested-With")));
     }
 
+    #[cfg(all(test, unix))]
     #[test]
-#[cfg(all(test, unix))]
     fn strip_passes_through_missing_headers_object() {
         assert_eq!(strip_x_requested_with(&Value::Null), json!({}));
     }
 
+    #[cfg(all(test, unix))]
     #[test]
-#[cfg(all(test, unix))]
     fn header_entries_map_to_name_value_pairs() {
         let entries = header_entries(&json!({ "A": "1", "B": "2" }));
         let list = entries.as_array().unwrap();
@@ -1150,8 +1193,8 @@ mod tests {
             .all(|e| e.get("name").is_some() && e.get("value").is_some()));
     }
 
+    #[cfg(all(test, unix))]
     #[test]
-#[cfg(all(test, unix))]
     fn pick_page_target_skips_non_page_entries() {
         let body = r#"[
             {"description":"","devtoolsFrontendUrl":"x","id":"SW1","type":"service_worker","url":"https://sw"},
@@ -1161,12 +1204,39 @@ mod tests {
         assert_eq!(super::pick_page_target(body).unwrap(), "PAGE1");
     }
 
+    #[cfg(all(test, unix))]
     #[test]
-#[cfg(all(test, unix))]
     fn pick_page_target_errors_when_no_page() {
         let body = r#"[{"id":"SW1","type":"service_worker","url":"https://sw"}]"#;
         assert!(super::pick_page_target(body).is_err());
         assert!(super::pick_page_target("not json").is_err());
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn pick_page_target_skips_tauri_ui_and_prefers_about_blank() {
+        // 调试开关暴露进程内所有 WebView：Tauri 主界面（排在最前）必须跳过，
+        // 会话 WebView 初始态是 about:blank，优先选中。
+        let body = r#"[
+            {"id":"UI","type":"page","title":"RClaw","url":"http://tauri.localhost/"},
+            {"id":"BLANK","type":"page","title":"","url":"about:blank"}
+        ]"#;
+        assert_eq!(super::pick_page_target(body).unwrap(), "BLANK");
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn pick_page_target_falls_back_to_non_app_ui_page() {
+        // 会话已在导航后：没有 about:blank，取剩下的非应用界面 page。
+        let body = r#"[
+            {"id":"UI","type":"page","title":"RClaw","url":"https://tauri.localhost/"},
+            {"id":"PAGE","type":"page","title":"Google","url":"https://www.google.com/search?q=1"}
+        ]"#;
+        assert_eq!(super::pick_page_target(body).unwrap(), "PAGE");
+
+        // 只剩应用界面 = 找不到会话 target。
+        let only_ui = r#"[{"id":"UI","type":"page","title":"RClaw","url":"tauri://localhost"}]"#;
+        assert!(super::pick_page_target(only_ui).is_err());
     }
 
     #[test]

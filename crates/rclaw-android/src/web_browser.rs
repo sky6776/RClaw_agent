@@ -19,7 +19,7 @@ use crate::cdp_browser;
 /// 交互工具（navigate / snapshot / click / type / screenshot / close）。
 pub fn register(tools: &mut rclaw_tools::ToolRegistry) {
     tools.remove("web_browser");
-    let browser = Arc::new(cdp_browser::shared());
+    let browser = cdp_browser::shared();
     tools.register(Box::new(rclaw_tools::web_browser::WebBrowserTool::new(
         Arc::new(CdpPageLoader { browser }),
     )));
