@@ -894,13 +894,17 @@ impl TurnManager {
 
         let mut matched = 0usize;
         let mut all_already_cancelled = true;
-        for (key, turn) in active.iter() {
+        for (key, turn) in active.iter_mut() {
             if key.channel == channel && key.chat_id == chat_id {
                 matched += 1;
                 if !turn.cancel.is_cancelled() {
                     all_already_cancelled = false;
                     turn.cancel.cancel();
                 }
+                // 取消确认即标记「不再有终局投递」：取消清理刻意不发收尾回复，而
+                // turn 还要跑到下一个取消点才真正退出——这中间到达的命令回复若按
+                // intermediate 投，桌面端忙碌态会永久卡住。
+                turn.final_delivered = true;
             }
         }
         (matched, matched > 0 && all_already_cancelled)

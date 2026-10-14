@@ -723,11 +723,12 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
             let schema_literal = serde_json::to_string(&schema_json).unwrap_or_default();
             // 可选链（h?.ask<T>(..)）重写后必须保留：`?.` 与 `.` 混用会改变语义——
             // h 为空时合法跳过的调用变成 TypeError，且问题参数的副作用不再被短路。
-            // 调用本身的可选标记（`ask?.<T>(..)`，flag 在 CallExpression 上）同样保留。
+            // 调用本身的可选标记（`ask?.<T>(..)`，flag 在 CallExpression 上）放在
+            // 参数括号之前（`askJson?.(...)` 是 JS 的可选调用语法；`(...)?` 不是）。
             let chain = if member_optional { "?." } else { "." };
-            let call_mark = if it.optional { "?" } else { "" };
+            let call_mark = if it.optional { "?." } else { "" };
             let replacement = format!(
-                "{receiver}{chain}askJson({question_src}, JSON.parse({schema_literal})){call_mark}"
+                "{receiver}{chain}askJson{call_mark}({question_src}, JSON.parse({schema_literal}))"
             );
             if let Some((start, end)) = self.script_span(it.span) {
                 // 嵌套 typed ask（`ask<T>(await ask<U>(...))` 的参数里又有一层）拒绝：
@@ -1590,19 +1591,15 @@ mod extended_type_tests {
         let plain = compile_typed_asks("const h = agent(\"h\");\nconst r = await h.ask<number>(\"普通\");\n")
             .expect("编译应成功");
         assert!(plain.exec_script.contains("h.askJson("), "{}", plain.exec_script);
-        // 调用本身的可选标记（`ask?.<T>(..)`，flag 在 CallExpression 上）同样保留。
+        // 调用本身的可选标记（`ask?.<T>(..)`，flag 在 CallExpression 上）同样保留——
+        // 位置在参数括号前（`askJson?.(...)` 是 JS 可选调用语法；`(...)?` 不是 JS）。
         let optional_call = compile_typed_asks(
             "const h = agent(\"h\");\nconst r = await h.ask?.<number>(\"可省\");\nresult(String(r));\n",
         )
         .expect("编译应成功");
         assert!(
-            optional_call.exec_script.contains("askJson(\"可省\", JSON.parse("),
-            "{}",
-            optional_call.exec_script
-        );
-        assert!(
-            optional_call.exec_script.contains("))?"),
-            "调用级 `?` 必须保留: {}",
+            optional_call.exec_script.contains("askJson?.("),
+            "调用级可选标记应放在参数括号前: {}",
             optional_call.exec_script
         );
     }

@@ -512,7 +512,8 @@ export default function App() {
   /** 向指定会话发送消息（排队投递也走它——收尾时用户可能在别的会话/页面）。 */
   const sendTo = useCallback(
     (chatId: string, content: string) => {
-      appendEntries(chatId, [{ role: "user", content }]);
+      const userEntry: Entry = { id: next_entry_id++, role: "user", content };
+      appendEntries(chatId, [userEntry]);
       setBusyByChat((prev) => ({ ...prev, [chatId]: true }));
       // 首条消息发出时后端会话记录尚未落库，chat_list 扫不到：先本地补一个
       // 会话条目让侧栏立即显示（否则整个 turn 期间是「暂无会话」，直到收尾
@@ -543,6 +544,14 @@ export default function App() {
       });
       void api.send(chatId, content).catch((e) => {
         appendEntries(chatId, [{ role: "assistant", content: `发送失败：${String(e)}` }]);
+        // 标记这条用户消息发送失败（未落库）：fork 锚点解析不得把它配到前面同文
+        // 的旧消息上——空闲也不证明它已持久化。
+        setEntriesByChat((prev) => ({
+          ...prev,
+          [chatId]: (prev[chatId] ?? []).map((existing) =>
+            existing.id === userEntry.id ? { ...existing, sendFailed: true } : existing,
+          ),
+        }));
         setBusyByChat((prev) => ({ ...prev, [chatId]: false }));
       });
       void refreshChats();
@@ -765,6 +774,12 @@ export default function App() {
   // 窗口内），"继续"这类重复文本也能命中点选的那一条。
   const handleFork = useCallback(
     async (entry: Entry, full = false, files = false) => {
+      // 发送失败的条目没有落库，文本反查会把它配到前面同文的旧消息上（fork /
+      // 文件回滚都错位）——直接拒绝。
+      if (entry.sendFailed) {
+        setErrorToast("该消息发送失败、未落库，无法作为分叉锚点");
+        return;
+      }
       let anchorId = entry.msgId ?? null;
       if (anchorId === null) {
         // 文本反查只在会话空闲时可靠：直播条目落库要等 turn 启动（运行时按会话串行，

@@ -498,7 +498,11 @@ fn json_schema_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// 标量的 JSON Schema 数值相等（非数值退回结构相等）。
+/// 标量的 JSON Schema 数值相等（非数值退回结构相等）。整数值一律转 i128 精确比较
+/// ——整数值的浮点（如 9007199254740992.0）同样精确转换，混合表示的比较绝不先做
+/// f64 舍入（const 9007199254740993 曾接受答案 9007199254740992.0：常量转 f64 被
+/// 舍入成 ...992，两个不同的数学值被判相等）。超出 i128 表示范围的大数（如 1e100）
+/// 退回 f64 比较——生产端只有浮点精度可言。
 fn scalar_numeric_equal(a: &Value, b: &Value) -> bool {
     if let (Some(left), Some(right)) = (a.as_i64(), b.as_i64()) {
         return left == right;
@@ -510,13 +514,21 @@ fn scalar_numeric_equal(a: &Value, b: &Value) -> bool {
         if left.fract() != 0.0 || right.fract() != 0.0 {
             return left == right;
         }
-        // 两个都是整数值：能用整数表示就精确比较，溢出 i64/u64 的大数才退回 f64
-        //（JSON 数值超过 2^53 时生产端本就只有浮点精度）。
+        // 两个都是整数值：精确整数比较（f64 整数值在 |f| < 2^126 内 as i128 精确；
+        // 饱和转换会被上界检查挡住 → None）。
         let exact = |value: &Value| -> Option<i128> {
-            value
-                .as_i64()
-                .map(i128::from)
-                .or_else(|| value.as_u64().map(|u| u as i128))
+            if let Some(i) = value.as_i64() {
+                return Some(i128::from(i));
+            }
+            if let Some(u) = value.as_u64() {
+                return Some(i128::from(u));
+            }
+            if let Some(f) = value.as_f64() {
+                if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.0e36 {
+                    return Some(f as i128);
+                }
+            }
+            None
         };
         if let (Some(left), Some(right)) = (exact(a), exact(b)) {
             return left == right;
@@ -2799,6 +2811,13 @@ mod validator_tests {
         assert!(
             validate_json_schema(&json!(9007199254740992.0f64), &big_const, 0).is_ok(),
             "整数与它的浮点形态相等"
+        );
+        // 回归：混合表示（精确整数常量 vs 整数值浮点答案）同样精确——常量转 f64 曾
+        // 被舍入，两个不同的数学值被判相等。
+        let bigger_const = json!({"const": 9007199254740993i64});
+        assert!(
+            validate_json_schema(&json!(9007199254740992.0f64), &bigger_const, 0).is_err(),
+            "常量 ...993 不得接受答案 ...992.0（常量侧转 f64 曾被舍入成 ...992）"
         );
     }
 

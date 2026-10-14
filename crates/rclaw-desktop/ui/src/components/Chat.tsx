@@ -25,6 +25,9 @@ export interface Entry {
   ts?: number;
   /** 持久化消息行 id（历史恢复路径携带；「分叉到新会话」的锚点，直播条目缺省）。 */
   msgId?: number;
+  /** 发送失败标记：这条消息没有落库，不得作为「分叉到新会话」的锚点（文本反查
+   *  会把它配到前面同文的旧消息上，fork / 文件回滚都错位）。 */
+  sendFailed?: boolean;
 }
 
 /** 待随消息发送的上传附件（已落入 agent 工作区 uploads/）。 */
