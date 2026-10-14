@@ -62,6 +62,35 @@ final class BrowserSession {
                         settings.setSaveFormData(false);
                         // 软件层：离屏 draw() 截图必须（硬件层的离屏视图画不出内容）。
                         wv.setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null);
+                        // 不装 WebViewClient 时链接点击会甩给系统浏览器——CDP 会话
+                        // 还停在旧页面，后续操作/截图全部错位。http(s) 一律会话内
+                        // 导航；非 http(s)（tel:/mailto:/intent:…）显式转交系统
+                        // 处理后消费掉导航（返回 true 只代表「应用已处理」，系统
+                        // 不会自动代发）。
+                        wv.setWebViewClient(new android.webkit.WebViewClient() {
+                            @Override
+                            public boolean shouldOverrideUrlLoading(
+                                    android.webkit.WebView view,
+                                    android.webkit.WebResourceRequest request) {
+                                android.net.Uri uri = request.getUrl();
+                                String scheme = uri.getScheme() == null ? "" : uri.getScheme();
+                                if ("http".equals(scheme) || "https".equals(scheme)) {
+                                    return false;
+                                }
+                                try {
+                                    android.content.Context ctx = view.getContext()
+                                            .getApplicationContext();
+                                    android.content.Intent intent = new android.content.Intent(
+                                            android.content.Intent.ACTION_VIEW, uri);
+                                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                                    ctx.startActivity(intent);
+                                } catch (RuntimeException error) {
+                                    android.util.Log.w("BrowserSession",
+                                            "external scheme dispatch failed: " + uri, error);
+                                }
+                                return true;
+                            }
+                        });
                         wv.measure(
                                 android.view.View.MeasureSpec.makeMeasureSpec(VIEW_W,
                                         android.view.View.MeasureSpec.EXACTLY),

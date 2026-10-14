@@ -52,8 +52,8 @@ pub fn shared() -> &'static CdpBrowser {
 fn pick_page_target(body: &str) -> anyhow::Result<String> {
     let targets: Vec<Value> =
         serde_json::from_str(body).map_err(|e| anyhow!("解析 /json/list 失败: {e}"))?;
-    let mut fallback: Option<&str> = None;
-    for target in targets {
+    let mut fallback: Option<String> = None;
+    for target in &targets {
         if target.get("type").and_then(Value::as_str) != Some("page") {
             continue;
         }
@@ -76,7 +76,7 @@ fn pick_page_target(body: &str) -> anyhow::Result<String> {
                 .ok_or_else(|| anyhow!("page target 缺少 id"));
         }
         if fallback.is_none() {
-            fallback = target.get("id").and_then(Value::as_str);
+            fallback = target.get("id").and_then(Value::as_str).map(str::to_string);
         }
     }
     fallback
