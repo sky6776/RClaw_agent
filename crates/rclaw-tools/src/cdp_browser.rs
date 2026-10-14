@@ -481,57 +481,85 @@ pub fn kill_headless_processes() {
     }
 }
 
+/// 目录名 → 属主：非本产品前缀 → `None`（不碰）；无后缀旧版共享目录 →
+/// `Some(None)`（必无主）；`-<pid>` 后缀 → `Some(Some(pid))`；其余怪异命名
+/// （`-backup` 之类）不是我们的产物 → `None`。
+fn classify_profile_dir(name: &str) -> Option<Option<u32>> {
+    let rest = name.strip_prefix("rclaw-browser-profile")?;
+    if rest.is_empty() {
+        return Some(None);
+    }
+    let pid = rest.strip_prefix('-')?.parse::<u32>().ok()?;
+    Some(Some(pid))
+}
+
 /// 清扫历史崩溃残留的无头浏览器与 profile 目录：profile 按进程 id 隔离后，
 /// 崩溃实例的孤儿锁的是「死 pid」的目录，正常启动不会再撞锁，孤儿会无限
-/// 积累。目录枚举与属主判活全在 Rust 里做（扫描目录与 [`std::env::temp_dir`]
-/// 同源，不存在 $TEMP/$TMPDIR 分歧；怪异命名的目录一律不动）；仅「按命令
-/// 行找持有进程」借平台机制，匹配用字面量+边界（不用 -like/pkill 通配或正
-/// 则，无注入面、无 -120 误中 -1200 的前缀问题）。后台线程执行，静默失败
-/// （清扫只是卫生问题，不阻塞启动）。
+/// 积累。只清属主已死的目录（含无后缀旧版共享目录）；运行中实例的 profile
+/// 属主存活，不受影响。目录枚举与 [`std::env::temp_dir`] 同源（不存在
+/// $TEMP/$TMPDIR 分歧）；仅「按命令行找持有进程」借平台机制，匹配一律字面
+/// 量+边界（无通配/正则，无注入面、无 -120 误中 -1200）。后台线程执行，
+/// 静默失败（清扫只是卫生问题，不阻塞启动）。
 fn sweep_stale_orphans() {
     let own_pid = std::process::id();
-    let mut stale: Vec<std::path::PathBuf> = Vec::new();
+    let mut candidates: Vec<(std::path::PathBuf, Option<u32>)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
     for entry in entries.flatten() {
+        // 只认目录：同名普通文件不是浏览器 profile，绝不能进查杀/删除流程。
+        let Ok(is_dir) = entry.file_type().map(|t| t.is_dir()) else {
+            continue;
+        };
+        if !is_dir {
+            continue;
+        }
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        let Some(rest) = name.strip_prefix("rclaw-browser-profile") else {
-            continue;
-        };
-        let is_stale = match rest.strip_prefix('-') {
-            // 无后缀 = 旧版共享 profile，必然无主，必清。
-            None => true,
-            Some(pid) => match pid.parse::<u32>() {
-                Ok(pid) => pid != own_pid && !pid_alive(pid),
-                // 非数字后缀不是我们的产物，不碰。
-                Err(_) => false,
-            },
-        };
-        if is_stale {
-            stale.push(entry.path());
+        if let Some(owner) = classify_profile_dir(&name) {
+            candidates.push((entry.path(), owner));
         }
     }
-    if stale.is_empty() {
+    if candidates.is_empty() {
         return;
     }
-    kill_profile_holders(&stale);
-    for dir in &stale {
-        let _ = std::fs::remove_dir_all(dir);
+    #[cfg(windows)]
+    {
+        // 判活下沉进 PowerShell（Get-Process）；force=true 的条目跳过判活。
+        let list: Vec<serde_json::Value> = candidates
+            .iter()
+            .map(|(path, owner)| {
+                json!({"path": path.to_string_lossy(), "owner": owner, "force": false})
+            })
+            .collect();
+        windows_kill_and_remove(&list, own_pid);
+    }
+    #[cfg(not(windows))]
+    {
+        let stale: Vec<std::path::PathBuf> = candidates
+            .into_iter()
+            .filter(|(_, owner)| match owner {
+                None => true,
+                Some(pid) => *pid != own_pid && !pid_alive(*pid),
+            })
+            .map(|(path, _)| path)
+            .collect();
+        if !stale.is_empty() {
+            kill_profile_holders(&stale);
+            for dir in &stale {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
     }
 }
 
-/// 平台判活：拿不到可靠判活就一律视为存活（宁漏勿杀）。
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// 平台判活（unix）：kill -0 只探测信号权限，不实际发送；EPERM 同样证明
+/// 进程存在（他人归属）。
+#[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn pid_alive(_pid: u32) -> bool {
-    true
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// 命令行是否把 dir 作为完整参数边界引用（引用点后随空白/引号/结尾）——
@@ -557,7 +585,12 @@ fn kill_profile_holders(dirs: &[std::path::PathBuf]) {
         return;
     };
     for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().into_string().and_then(|s| s.parse::<u32>()) else {
+        let Some(pid) = entry
+            .file_name()
+            .into_string()
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
             continue;
         };
         if pid == std::process::id() {
@@ -609,30 +642,34 @@ fn kill_profile_holders(dirs: &[std::path::PathBuf]) {
     }
 }
 
-/// Windows：目录清单经 base64+JSON 传入（无引号注入面）；IndexOf 字面量
-/// 匹配 + 边界检查；删除用 -LiteralPath（不展开通配）。
+/// Windows 查杀/删除执行器：条目清单经 base64+JSON 传入（无引号注入面）。
+/// 每条 `{path, owner, force}`：owner 为 null 或 force，或属主进程已死
+/// （Get-Process 判活）时——按字面量 IndexOf+边界匹配杀持有者，
+/// `Remove-Item -LiteralPath` 删目录（不展开通配）。
 #[cfg(windows)]
-fn kill_profile_holders(dirs: &[std::path::PathBuf]) {
+fn windows_kill_and_remove(entries: &[serde_json::Value], own_pid: u32) {
     use std::os::windows::process::CommandExt as _;
     use base64::Engine as _;
-    let list: Vec<String> = dirs
-        .iter()
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
     let b64 = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_string(&list).unwrap_or_default().as_bytes());
+        .encode(serde_json::to_string(entries).unwrap_or_default().as_bytes());
     let script = format!(
-        "$dirs = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')) | \
-         ConvertFrom-Json; foreach ($d in $dirs) {{ \
+        "$own = {own}; \
+         $entries = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')) | \
+         ConvertFrom-Json; foreach ($e in $entries) {{ \
+         $stale = $false; \
+         if ($null -eq $e.owner -or $e.force) {{ $stale = $true }} \
+         elseif (([int]$e.owner -ne $own) -and (-not (Get-Process -Id ([int]$e.owner) -ErrorAction SilentlyContinue))) {{ $stale = $true }} \
+         if ($stale) {{ $d = $e.path; \
          Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' or Name='chrome.exe'\" | \
          ForEach-Object {{ $cl = $_.CommandLine; if ($cl) {{ \
          $i = $cl.IndexOf($d, [System.StringComparison]::Ordinal); \
-         while ($i -ge 0) {{ $e = $i + $d.Length; \
-         $after = if ($e -lt $cl.Length) {{ $cl[$e] }} else {{ [char]0 }}; \
+         while ($i -ge 0) {{ $e2 = $i + $d.Length; \
+         $after = if ($e2 -lt $cl.Length) {{ $cl[$e2] }} else {{ [char]0 }}; \
          if ($after -eq [char]0 -or $after -eq ' ' -or $after -eq '\"' -or $after -eq \"'\") {{ \
          Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; break }} \
-         $i = $cl.IndexOf($d, $e, [System.StringComparison]::Ordinal) }} }} }}; \
-         Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }}"
+         $i = $cl.IndexOf($d, $e2, [System.StringComparison]::Ordinal) }} }} }}; \
+         Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }} }}",
+        own = own_pid
     );
     // CREATE_NO_WINDOW：不闪控制台。
     let _ = std::process::Command::new("powershell")
@@ -645,10 +682,22 @@ fn kill_profile_holders(dirs: &[std::path::PathBuf]) {
 static SWEEP_ONCE: std::sync::Once = std::sync::Once::new();
 
 /// 杀掉命令行里引用了本 profile 目录的【无头】浏览器实例：启动失败的清场
-/// 路径用（重置 profile 前先清占用者），与清扫共用同一套字面量查杀。
+/// 路径用（重置 profile 前先清占用者）。目录归本进程所有，无需判活，
+/// force 直杀。
 fn kill_orphans_holding_profile(profile_dir: &std::path::Path) {
-    let owned = profile_dir.to_path_buf();
-    kill_profile_holders(std::slice::from_ref(&owned));
+    #[cfg(windows)]
+    {
+        let list = vec![json!({
+            "path": profile_dir.to_string_lossy(),
+            "owner": null,
+            "force": true,
+        })];
+        windows_kill_and_remove(&list, std::process::id());
+    }
+    #[cfg(not(windows))]
+    {
+        kill_profile_holders(std::slice::from_ref(&profile_dir.to_path_buf()));
+    }
 }
 
 impl HeadlessChromiumTransport {
@@ -1585,6 +1634,17 @@ impl BrowserCloseTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_profile_dir_distinguishes_legacy_pid_and_foreign_names() {
+        assert_eq!(classify_profile_dir("rclaw-browser-profile"), Some(None));
+        assert_eq!(classify_profile_dir("rclaw-browser-profile-120"), Some(Some(120)));
+        // 非本产品命名：不碰。
+        assert_eq!(classify_profile_dir("rclaw-browser-profiles"), None);
+        assert_eq!(classify_profile_dir("rclaw-browser-profile-backup"), None);
+        assert_eq!(classify_profile_dir("rclaw-browser-profile-[12]000"), None);
+        assert_eq!(classify_profile_dir("other"), None);
+    }
 
     #[test]
     fn cmdline_holds_dir_requires_argument_boundary() {
