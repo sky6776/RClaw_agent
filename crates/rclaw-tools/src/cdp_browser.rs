@@ -481,6 +481,63 @@ pub fn kill_headless_processes() {
     }
 }
 
+/// 清扫历史崩溃残留的无头浏览器与 profile 目录：profile 按进程 id 隔离后，
+/// 崩溃实例的孤儿锁的是「死 pid」的目录，正常启动不会再撞锁，孤儿会无限
+/// 积累。这里按目录名里的属主 pid 判活，只清属主已死的（含无后缀的旧版
+/// 共享目录）；运行中实例的 profile 属主存活，不受影响。后台线程执行，
+/// 静默失败（清扫只是卫生问题，不阻塞启动）。
+fn sweep_stale_orphans() {
+    let own_pid = std::process::id();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NO_WINDOW：不闪控制台。无后缀目录是旧版共享 profile——
+        // 必然无主，直接清；带 -<pid> 后缀的只在属主进程已死时清。
+        let script = "\
+$owner = OWN; \
+Get-ChildItem $env:TEMP -Directory -Filter 'rclaw-browser-profile-*' | ForEach-Object { \
+  if ($_.Name -match '-(\\d+)$') { \
+    $p = [int]$Matches[1]; \
+    $stale = ($p -ne $owner) -and (-not (Get-Process -Id $p -ErrorAction SilentlyContinue)); \
+  } else { $stale = $true } \
+  if ($stale) { \
+    $dir = $_.FullName; \
+    Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' or Name='chrome.exe'\" | \
+      Where-Object { $_.CommandLine -like ('*' + $dir + '*') } | \
+      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; \
+    Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue; \
+  } \
+}".replace("OWN", &own_pid.to_string());
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .creation_flags(0x0800_0000)
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        // 无后缀目录（旧版共享 profile）按必清处理；带 -<pid> 后缀的只在
+        // 属主进程已死时清。pkill 模式是具体路径，非用户可控输入。
+        let script = format!(
+            "for d in \"${{TMPDIR:-/tmp}}\"/rclaw-browser-profile-*; do \
+             [ -d \"$d\" ] || continue; \
+             p=${{d##*-}}; \
+             case $p in *[!0-9]*|'') ;; \
+             *) [ \"$p\" = \"{own}\" ] && continue; kill -0 \"$p\" 2>/dev/null && continue ;; \
+             esac; \
+             pkill -f \"$d\" 2>/dev/null; rm -rf \"$d\"; \
+             done",
+            own = own_pid
+        );
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output();
+    }
+}
+
+/// 清扫只跑一次（进程生命周期内一次即可）。
+static SWEEP_ONCE: std::sync::Once = std::sync::Once::new();
+
 /// 杀掉命令行里引用了本 profile 目录的【无头】浏览器实例：上一次进程崩溃
 /// 留下的孤儿会锁住 profile，让下一次启动秒退（exit 21）。只按命令行特征
 /// 匹配，不碰用户自己的浏览器窗口。
@@ -568,6 +625,10 @@ impl HeadlessChromiumTransport {
     /// 拉起无头实例：stderr 上等 `DevTools listening on ws://127.0.0.1:<port>/…`
     /// 行拿调试端口（--remote-debugging-port=0 由内核自选）。
     async fn launch(&self) -> Result<RunningChromium, String> {
+        // 首次拉起前顺手清一次历史崩溃孤儿（后台线程，不阻塞启动）。
+        SWEEP_ONCE.call_once(|| {
+            std::thread::spawn(sweep_stale_orphans);
+        });
         fn launch_blocking(
             exe: std::path::PathBuf,
             profile: std::path::PathBuf,
