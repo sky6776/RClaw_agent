@@ -72,6 +72,20 @@ export interface HistoryMsg {
   content: string;
 }
 
+/** 行级快照：尾部条目 + 消费游标（之后用 chatHistorySince 按游标续读）。 */
+export interface ChatHistorySnapshot {
+  entries: HistoryMsg[];
+  /** 读取时会话的最大消息行 id（含被过滤行——它们被游标消费、不再投递）。 */
+  cursor: number;
+}
+
+/** 行级增量：游标之后新落库的条目 + 新游标；more = 按条数截断，应立即续拉。 */
+export interface ChatHistoryDelta {
+  entries: HistoryMsg[];
+  cursor: number;
+  more: boolean;
+}
+
 /** chat_fork 结果：新会话 id 与复制的消息条数。 */
 export interface ChatForkResult {
   chat_id: string;
@@ -362,16 +376,18 @@ export const api = {
 
   chatList: () => invoke<ChatMeta[]>("chat_list"),
 
-  chatHistory: (chatId: string) => invoke<HistoryMsg[]>("chat_history", { chatId }),
+  /** 历史快照（尾部窗口条目 + 行级游标）：会话首开 / 重建视图用。 */
+  chatHistory: (chatId: string) =>
+    invoke<ChatHistorySnapshot>("chat_history", { chatId }),
+
+  /** 行级增量：返回 last_seen_row_id 之后新落库的条目 + 新游标（turn 收尾 / 窗口
+   *  恢复可见时续读，重连不重拉全量）。 */
+  chatHistorySince: (chatId: string, after: number) =>
+    invoke<ChatHistoryDelta>("chat_history_since", { chatId, after }),
 
   /** 从任意消息锚点分叉出新会话（原会话不动）；full = 携带完整转录（含被压缩折叠的原文）。 */
   chatFork: (chatId: string, anchorMessageId: number, full?: boolean) =>
     invoke<ChatForkResult>("chat_fork", { chatId, anchorMessageId, full }),
-
-  /** 全量转录按内容定位消息行 id（从尾数第 skip+1 个匹配）：fork 锚点解析的
-   *  全量兜底——chat_history 只回尾部窗口，长会话里更早的 live 条目靠它定位。 */
-  chatMessageId: (chatId: string, role: string, content: string, laterMatches: number) =>
-    invoke<number | null>("chat_message_id", { chatId, role, content, laterMatches }),
 
   /** 最近若干个 PlanRun 计划的状态（流程步骤 / todo 轮询）。 */
   planStatus: () => invoke<PlanStatus[]>("plan_status"),

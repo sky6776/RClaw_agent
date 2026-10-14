@@ -1055,53 +1055,8 @@ pub async fn plan_pause(
     .await
 }
 
-/// 全量转录里按内容定位消息行 id（「从尾数第 skip+1 个匹配」）：直播条目没有
-/// 持久化 id，chat_history 的尾部窗口在长会话里够不到更早的 live 消息——fork
-/// 锚点解析的全量兜底在这里做（DB 完整扫描，不受窗口限制）。
-#[tauri::command]
-pub async fn chat_message_id(
-    state: State<'_, AppState>,
-    chat_id: String,
-    role: String,
-    content: String,
-    later_matches: usize,
-) -> Result<Option<i64>, String> {
-    if !is_valid_chat_id(&chat_id) {
-        return Err(format!("非法会话 id: {chat_id}"));
-    }
-    let session = state.session().ok_or("agent 尚未启动")?;
-    run_blocking("定位消息锚点", move || {
-        let msgs = session
-            .load_transcript(CHANNEL_DESKTOP, &chat_id)
-            .map_err(|e| e.to_string())?;
-        let want_role = match role.as_str() {
-            "user" => rclaw_core::Role::User,
-            _ => rclaw_core::Role::Assistant,
-        };
-        let matches: Vec<i64> = msgs
-            .iter()
-            .filter(|m| {
-                m.role == want_role
-                    && m.content
-                        .iter()
-                        .filter_map(|block| block.as_text())
-                        .collect::<String>()
-                        == content
-            })
-            .map(|m| m.id)
-            .collect();
-        // 从尾数第 later_matches+1 个匹配（与 UI 侧「该条目之后还有几条同文」对齐；
-        // 之后的条目一定更新、一定已落库，从全量尾部倒数即对应 clicked 这条）。
-        Ok(matches
-            .len()
-            .checked_sub(1 + later_matches)
-            .and_then(|index| matches.get(index).copied()))
-    })
-    .await
-}
-
 /// 历史消息条目（恢复转录用）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct HistoryMsgDto {
     /// 消息行 id（state.sqlite 的 message.id；消息下方「分叉到新会话」的锚点）。
     pub id: i64,
@@ -1110,29 +1065,28 @@ pub struct HistoryMsgDto {
     pub content: String,
 }
 
-/// 读取指定会话的持久化历史（完整 transcript 里最近 200 条可回放行 / 4 MB），映射为转录条目。
+/// 行级快照：尾部条目 + 消费游标（前端增量续读的 `last_seen_row_id`）。
+#[derive(Debug, Serialize)]
+pub struct ChatHistorySnapshot {
+    pub entries: Vec<HistoryMsgDto>,
+    /// 读取时会话的最大消息行 id（含被过滤行——它们被游标消费、不再投递）。
+    pub cursor: i64,
+}
+
+/// 行级增量：游标之后新落库的条目 + 新游标。`more` = 本批按条数截断，调用方应立即续拉。
+#[derive(Debug, Serialize)]
+pub struct ChatHistoryDelta {
+    pub entries: Vec<HistoryMsgDto>,
+    pub cursor: i64,
+    pub more: bool,
+}
+
+/// transcript 行 → 面板条目（快照与增量共用同一映射，两边口径才不会走散）。
 ///
-/// 与 `chat_export` 同源读 transcript，而不是 provider 可见的压缩视图：压缩是非破坏性的，
-/// 回放若按压缩视图渲染，压缩点处会无提示地缺一段中间对话（boundary 行只是摘要，还被
-/// 过滤掉）。boundary 行与工具结果载体由 store 在 SQL 层筛掉、不占 200 条的额度（否则
-/// 工具密集的会话首屏只剩几条对话）；下面的过滤只是兜底。
-#[tauri::command]
-pub async fn chat_history(
-    state: State<'_, AppState>,
-    chat_id: String,
-) -> Result<Vec<HistoryMsgDto>, String> {
-    if !is_valid_chat_id(&chat_id) {
-        return Err(format!("非法会话 id: {chat_id}"));
-    }
-    let session = state.session().ok_or("agent 尚未启动")?;
-    // 只读，不改库（目标会话可能正有 turn 在追加：进程内共用一条连接、按互斥锁串行，
-    // 这里只是排在写事务之后读到一致快照，不与之交错）。
-    let msgs = run_blocking("读取会话历史", move || {
-        session
-            .load_transcript_tail(CHANNEL_DESKTOP, &chat_id, 200, 4 * 1024 * 1024)
-            .map_err(|e| e.to_string())
-    })
-    .await?;
+/// status 条目（工具调用轮）只在快照路径生成（调用方传 `with_status`）：直播视图里
+/// 同一工具轮已有运行时的「正在调用工具(N):…」进度行，增量再合成一份「🔧 调用工具」
+/// 就会双份；重载后的快照没有直播进度行，仍需要它充当工具轮占位。
+fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<HistoryMsgDto> {
     let mut out = Vec::new();
     for msg in msgs {
         if msg.is_tool_result_carrier() {
@@ -1165,7 +1119,7 @@ pub async fn chat_history(
                         _ => None,
                     })
                     .collect();
-                if !tools.is_empty() {
+                if with_status && !tools.is_empty() {
                     out.push(HistoryMsgDto {
                         id: msg.id,
                         role: "status".into(),
@@ -1189,11 +1143,75 @@ pub async fn chat_history(
             _ => {}
         }
     }
-    // 只保留最近 80 条，避免长会话首屏过载。
-    if out.len() > 80 {
-        out.drain(..out.len() - 80);
+    out
+}
+
+/// 历史快照：完整 transcript 里最近 200 条可回放行 / 4 MB 映射为条目，附带行级游标。
+///
+/// 与 `chat_export` 同源读 transcript，而不是 provider 可见的压缩视图：压缩是非破坏性的，
+/// 回放若按压缩视图渲染，压缩点处会无提示地缺一段中间对话（boundary 行只是摘要，还被
+/// 过滤掉）。boundary 行与工具结果载体由 store 在 SQL 层筛掉、不占 200 条的额度（否则
+/// 工具密集的会话首屏只剩几条对话）；下面的过滤只是兜底。
+///
+/// 游标语义见 `rclaw_store::session::ChatSnapshot`：前端存下它，turn 收尾 / 窗口重新
+/// 可见时用 [`chat_history_since`] 按游标续读，重连不重拉全量。
+#[tauri::command]
+pub async fn chat_history(
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<ChatHistorySnapshot, String> {
+    if !is_valid_chat_id(&chat_id) {
+        return Err(format!("非法会话 id: {chat_id}"));
     }
-    Ok(out)
+    let session = state.session().ok_or("agent 尚未启动")?;
+    // 只读，不改库（目标会话可能正有 turn 在追加：进程内共用一条连接、按互斥锁串行，
+    // 这里只是排在写事务之后读到一致快照，不与之交错）。
+    let snap = run_blocking("读取会话历史", move || {
+        session
+            .load_chat_snapshot(CHANNEL_DESKTOP, &chat_id, 200, 4 * 1024 * 1024)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    let mut entries = history_entries(&snap.messages, true);
+    // 只保留最近 80 条，避免长会话首屏过载（游标不受影响：窗口外的旧行已消费）。
+    if entries.len() > 80 {
+        entries.drain(..entries.len() - 80);
+    }
+    Ok(ChatHistorySnapshot {
+        entries,
+        cursor: snap.cursor,
+    })
+}
+
+/// 行级增量：返回 `after`（前端持有的 `last_seen_row_id`）之后新落库的条目 + 新游标。
+///
+/// 与快照同一套「可回放行 → 条目」映射；不做字节裁剪也不做首屏截断——游标已声明
+/// 消费的行不会二次投递，这里丢了就永远丢了（截断只按条数，`more` 提示续拉）。
+/// 不生成 status 条目：直播进度行已在屏上，增量再合成一份就是双份。
+#[tauri::command]
+pub async fn chat_history_since(
+    state: State<'_, AppState>,
+    chat_id: String,
+    after: i64,
+) -> Result<ChatHistoryDelta, String> {
+    if !is_valid_chat_id(&chat_id) {
+        return Err(format!("非法会话 id: {chat_id}"));
+    }
+    if after < 0 {
+        return Err(format!("非法游标: {after}"));
+    }
+    let session = state.session().ok_or("agent 尚未启动")?;
+    let delta = run_blocking("读取会话增量", move || {
+        session
+            .load_chat_delta(CHANNEL_DESKTOP, &chat_id, after, 200)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    Ok(ChatHistoryDelta {
+        entries: history_entries(&delta.messages, false),
+        cursor: delta.cursor,
+        more: delta.more,
+    })
 }
 
 /// 归档会话：打 `archived_at` 标记（恢复 = 清除标记）；消息、chat_id 都不动。
@@ -5815,5 +5833,83 @@ mod plan_projection_tests {
             "验证对耗尽保持 failed（权威状态表覆盖启发式）"
         );
         assert_eq!(plan.steps[1].status, "failed");
+    }
+}
+
+/// `history_entries`（快照 / 增量共用的行→条目映射）的口径测试。
+mod history_entries_tests {
+    use super::*;
+    use rclaw_core::{ContentBlock, Message, Role};
+
+    fn text_msg(id: i64, role: Role, text: &str) -> Message {
+        Message {
+            id,
+            role,
+            content: vec![ContentBlock::text(text)],
+            tool_call_id: None,
+            ts: 0,
+        }
+    }
+
+    fn tool_use_msg(id: i64) -> Message {
+        Message {
+            id,
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "shell".into(),
+                input: serde_json::json!({"command": "ls"}),
+            }],
+            tool_call_id: None,
+            ts: 0,
+        }
+    }
+
+    fn tool_result_carrier(id: i64) -> Message {
+        Message {
+            id,
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".into(),
+                content: "ok".into(),
+                is_error: false,
+            }],
+            tool_call_id: None,
+            ts: 0,
+        }
+    }
+
+    #[test]
+    fn snapshot_path_maps_status_and_skips_carriers_and_compaction() {
+        let msgs = vec![
+            text_msg(1, Role::User, "  hello  "),
+            text_msg(2, Role::User, "[CONTEXT COMPACTION] 摘要"),
+            tool_use_msg(3),
+            tool_result_carrier(4),
+            text_msg(5, Role::Assistant, "done"),
+        ];
+        let entries = history_entries(&msgs, true);
+        assert_eq!(
+            entries,
+            vec![
+                HistoryMsgDto { id: 1, role: "user".into(), content: "hello".into() },
+                HistoryMsgDto {
+                    id: 3,
+                    role: "status".into(),
+                    content: "🔧 调用工具: shell".into(),
+                },
+                HistoryMsgDto { id: 5, role: "assistant".into(), content: "done".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn delta_path_omits_status_entries_but_keeps_assistant_text() {
+        let msgs = vec![tool_use_msg(3), text_msg(5, Role::Assistant, "done")];
+        let entries = history_entries(&msgs, false);
+        assert_eq!(
+            entries,
+            vec![HistoryMsgDto { id: 5, role: "assistant".into(), content: "done".into() }]
+        );
     }
 }

@@ -205,6 +205,30 @@ pub struct SearchRow {
     pub message: Message,
 }
 
+/// 会话历史快照：尾部可回放窗口 + 行级游标（前端增量续读的起点）。
+///
+/// 游标 = 读取时该会话的最大消息行 id（与窗口同一读快照，不含窗口裁掉的更早行——
+/// 那些行 id < 游标，永远不会被增量重放，视为已消费的「窗口外历史」）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatSnapshot {
+    pub messages: Vec<Message>,
+    pub cursor: i64,
+}
+
+/// 会话历史行级增量：`after_id` 之后新落库的可回放行 + 消费游标。
+///
+/// 游标语义保证「id ≤ cursor 的行要么在本批、要么被过滤器明确消费、要么在更早的
+/// 批次里」：批满 `limit` 条时游标 = 本批最后一行的 id（后面可能还有，`more` 提示
+/// 调用方续拉）；不满时游标 = 该会话当时的最大行 id（一次性消费到头，含被过滤器
+/// 筛掉的行）。rclaw 的消息行只追加不更新，增量天然只有 appended 一种，无需
+/// upsert / tombstone（zcode 协议层的三事件在这里塌缩成一个「按游标续读」）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatDelta {
+    pub messages: Vec<Message>,
+    pub cursor: i64,
+    pub more: bool,
+}
+
 /// compaction boundary 元数据（`message.meta` 列的 JSON 形态）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompactionMeta {
@@ -435,41 +459,82 @@ impl SessionStore {
         max_msgs: usize,
         max_bytes: usize,
     ) -> Result<Vec<Message>> {
-        let mut msgs = self.db.with(|conn| {
+        let msgs = self.db.with(|conn| {
             let Some(sid) = session_id(conn, channel, chat_id)? else {
                 return Ok(Vec::new());
             };
-            query_messages(
-                conn,
-                "SELECT id, data FROM (
-                     SELECT id, data FROM message WHERE session_id = ?1 AND meta IS NULL \
-                       AND role IN ('user', 'assistant') \
-                       AND CASE WHEN json_valid(message.data) \
-                                THEN NOT EXISTS (SELECT 1 FROM json_each(message.data, '$.content') AS b \
-                                                 WHERE CASE WHEN b.type = 'object' \
-                                                            THEN json_extract(b.value, '$.type') END = 'tool_result') \
-                                ELSE 0 END \
-                     ORDER BY id DESC LIMIT ?2
-                 ) ORDER BY id",
-                params![sid, max_msgs.max(1) as i64],
-            )
+            transcript_tail_on(conn, sid, max_msgs)
         })?;
-        // 体积从最新一端往回累计、一次扫过：每条只序列化一次（旧写法每删一条就把整段重新
-        // 序列化，面板每次打开都是 O(n²) 的 4 MB 级工作量）。`serialized_size` 失败时返回
-        // `usize::MAX` 当「装不下」，饱和加法让它不溢出。
-        let mut keep_from = msgs.len();
-        let mut used = 0usize;
-        while keep_from > 0 {
-            let size = serialized_size(std::slice::from_ref(&msgs[keep_from - 1]));
-            let total = used.saturating_add(size);
-            if total > max_bytes && keep_from < msgs.len() {
-                break;
-            }
-            used = total;
-            keep_from -= 1;
-        }
-        msgs.drain(..keep_from);
-        Ok(msgs)
+        Ok(trim_tail_by_bytes(msgs, max_bytes))
+    }
+
+    /// 历史快照 + 行级游标：尾部窗口（与 [`Self::load_transcript_tail`] 同口径）与
+    /// 「该会话当前最大消息行 id」取自同一读快照。给桌面端首开 / 重建视图用：
+    /// 拿 `cursor` 作 `last_seen_row_id`，之后用 [`Self::load_chat_delta`] 按游标续读，
+    /// 视图 = 窗口投影 + 其后增量，重连不重拉全量。
+    pub fn load_chat_snapshot(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        max_msgs: usize,
+        max_bytes: usize,
+    ) -> Result<ChatSnapshot> {
+        self.db.read_snapshot(|conn| {
+            let Some(sid) = session_id(conn, channel, chat_id)? else {
+                return Ok(ChatSnapshot {
+                    messages: Vec::new(),
+                    cursor: 0,
+                });
+            };
+            let messages = trim_tail_by_bytes(transcript_tail_on(conn, sid, max_msgs)?, max_bytes);
+            let cursor = max_message_id(conn, sid)?;
+            Ok(ChatSnapshot { messages, cursor })
+        })
+    }
+
+    /// 行级增量：`after_id` 之后落库的可回放行（id 升序，最多 `limit` 条）+ 消费游标
+    /// （语义见 [`ChatDelta`]）。行集与游标取自同一读快照：并发写入的行 id 更大，
+    /// 下一次续读自然覆盖，不重不漏。
+    ///
+    /// 与快照窗口不同，这里【不做字节裁剪】——被裁掉的行游标已声明消费，丢了就永远
+    /// 补不回来；截断只按条数（`more`），由调用方续拉。
+    pub fn load_chat_delta(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<ChatDelta> {
+        self.db.read_snapshot(|conn| {
+            let Some(sid) = session_id(conn, channel, chat_id)? else {
+                return Ok(ChatDelta {
+                    messages: Vec::new(),
+                    cursor: 0,
+                    more: false,
+                });
+            };
+            let messages = query_messages(
+                conn,
+                &format!(
+                    "SELECT id, data FROM message \
+                     WHERE session_id = ?1 AND id > ?2 AND {REPLAYABLE_FILTER_SQL} \
+                     ORDER BY id LIMIT ?3"
+                ),
+                params![sid, after_id, limit.max(1) as i64],
+            )?;
+            let full = messages.len() >= limit.max(1);
+            let cursor = match messages.last() {
+                // 批满：游标只能推进到本批最后一行（之后可能还有，`more` 让调用方续拉）；
+                // 不满：一次消费到头（含被过滤器筛掉的行），游标直达当前最大行 id。
+                Some(last) if full => last.id,
+                _ => max_message_id(conn, sid)?,
+            };
+            Ok(ChatDelta {
+                messages,
+                cursor,
+                more: full,
+            })
+        })
     }
 
     /// 完整 transcript 连同每行的 `meta`（compaction boundary 行为 `Some`）。
@@ -1434,6 +1499,59 @@ fn parse_message(id: i64, data: &str) -> Option<Message> {
             None
         }
     }
+}
+
+/// 「可回放行」筛选（SQL 片段）：排除 compaction boundary（`meta IS NOT NULL`）、
+/// `role=tool` 与 tool_result 载体。回放 / 面板历史 / 快照 / 增量共用同一口径，
+/// 消费游标才成立——被它筛掉的行视为已消费，不进任何批次。
+const REPLAYABLE_FILTER_SQL: &str = "meta IS NULL \
+   AND role IN ('user', 'assistant') \
+   AND CASE WHEN json_valid(message.data) \
+            THEN NOT EXISTS (SELECT 1 FROM json_each(message.data, '$.content') AS b \
+                             WHERE CASE WHEN b.type = 'object' \
+                                        THEN json_extract(b.value, '$.type') END = 'tool_result') \
+            ELSE 0 END";
+
+/// 尾部窗口查询（连接上执行，不含字节裁剪）：最近 `max_msgs` 条可回放行，id 升序。
+fn transcript_tail_on(conn: &Connection, session_id: i64, max_msgs: usize) -> Result<Vec<Message>> {
+    query_messages(
+        conn,
+        &format!(
+            "SELECT id, data FROM ( \
+                 SELECT id, data FROM message WHERE session_id = ?1 AND {REPLAYABLE_FILTER_SQL} \
+                 ORDER BY id DESC LIMIT ?2 \
+             ) ORDER BY id"
+        ),
+        params![session_id, max_msgs.max(1) as i64],
+    )
+}
+
+/// 该会话当前最大消息行 id（无行返回 0）。
+fn max_message_id(conn: &Connection, session_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM message WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// 体积从最新一端往回累计、一次扫过：每条只序列化一次（旧写法每删一条就把整段重新
+/// 序列化，面板每次打开都是 O(n²) 的 4 MB 级工作量）。`serialized_size` 失败时返回
+/// `usize::MAX` 当「装不下」，饱和加法让它不溢出。至少保留一条。
+fn trim_tail_by_bytes(mut msgs: Vec<Message>, max_bytes: usize) -> Vec<Message> {
+    let mut keep_from = msgs.len();
+    let mut used = 0usize;
+    while keep_from > 0 {
+        let size = serialized_size(std::slice::from_ref(&msgs[keep_from - 1]));
+        let total = used.saturating_add(size);
+        if total > max_bytes && keep_from < msgs.len() {
+            break;
+        }
+        used = total;
+        keep_from -= 1;
+    }
+    msgs.drain(..keep_from);
+    msgs
 }
 
 fn row_to_message(row: &Row<'_>) -> rusqlite::Result<Option<Message>> {

@@ -1858,3 +1858,157 @@ fn fork_full_transcript_carries_folded_messages_and_hidden_anchor() {
     // boundary 行 id 最大（> m7），id ≤ m6 的转录前缀不含它：m0..m6 共 7 行。
     assert_eq!(fork_tail.copied, 7);
 }
+
+// ---------------------------------------------------------------------------
+// 行级 delta + 快照装配（load_chat_snapshot / load_chat_delta）
+// ---------------------------------------------------------------------------
+
+fn assistant_tool_use(name: &str, call_id: &str) -> Message {
+    Message {
+        id: 0,
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: call_id.into(),
+            name: name.into(),
+            input: serde_json::json!({"path": "agent/x"}),
+        }],
+        tool_call_id: None,
+        ts: 0,
+    }
+}
+
+fn tool_result_carrier(call_id: &str) -> Message {
+    Message {
+        id: 0,
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: call_id.into(),
+            content: "ok".into(),
+            is_error: false,
+        }],
+        tool_call_id: None,
+        ts: 0,
+    }
+}
+
+#[test]
+fn delta_from_snapshot_cursor_consumes_exactly_once() {
+    let (_g, s) = store();
+    s.append("cli", "c", &Message::plain(Role::User, "q1")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::Assistant, "a1"))
+        .unwrap();
+
+    // 快照：cursor = 当时最大行 id（含工具链等被过滤行）。
+    let snap = s.load_chat_snapshot("cli", "c", 200, 4 * 1024 * 1024).unwrap();
+    assert_eq!(texts(&snap.messages), vec!["q1", "a1"]);
+    let max_after_two = s.load_transcript("cli", "c").unwrap().last().unwrap().id;
+    assert_eq!(snap.cursor, max_after_two);
+
+    // 游标处再拉增量：空、不 more。
+    let d = s.load_chat_delta("cli", "c", snap.cursor, 200).unwrap();
+    assert!(d.messages.is_empty() && !d.more && d.cursor >= snap.cursor);
+
+    // 新一轮落库（含被过滤的 tool 链与 boundary），增量只回可回放行、游标越过被过滤行。
+    let (ta, _tr) = s
+        .append_tool_chain("cli", "c", &assistant_tool_use("read", "c1"), &tool_result_carrier("c1"))
+        .unwrap();
+    s.append("cli", "c", &Message::plain(Role::Assistant, "a2"))
+        .unwrap();
+    let d2 = s.load_chat_delta("cli", "c", snap.cursor, 200).unwrap();
+    // 工具链两行只回 assistant tool_use 行（可回放，同尾窗口径）；tool_result 载体被过滤。
+    assert_eq!(d2.messages.len(), 2);
+    assert!(d2.messages[0].has_tool_calls());
+    assert_eq!(d2.messages[1].content[0].as_text().unwrap(), "a2");
+    let max_now = s.load_transcript("cli", "c").unwrap().last().unwrap().id;
+    assert_eq!(d2.cursor, max_now, "不满批：游标直达当前最大行 id（越过被过滤行）");
+    assert!(!d2.more);
+    assert!(ta > max_after_two);
+
+    // 从新游标再拉：空。任何一行不会被投递两次。
+    let d3 = s.load_chat_delta("cli", "c", d2.cursor, 200).unwrap();
+    assert!(d3.messages.is_empty());
+}
+
+#[test]
+fn delta_pages_with_more_and_row_cursor_when_full() {
+    let (_g, s) = store();
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        ids.push(
+            s.append("cli", "c", &Message::plain(Role::User, format!("m{i}")))
+                .unwrap(),
+        );
+    }
+    // 批满：more=true，游标 = 本批最后一行（不是全局最大）。
+    let first = s.load_chat_delta("cli", "c", 0, 2).unwrap();
+    assert_eq!(texts(&first.messages), vec!["m0", "m1"]);
+    assert!(first.more);
+    assert_eq!(first.cursor, ids[1]);
+
+    let second = s.load_chat_delta("cli", "c", first.cursor, 2).unwrap();
+    assert_eq!(texts(&second.messages), vec!["m2", "m3"]);
+    assert!(second.more);
+
+    // 不满批：到头，游标 = 全局最大行 id。
+    let third = s.load_chat_delta("cli", "c", second.cursor, 2).unwrap();
+    assert_eq!(texts(&third.messages), vec!["m4"]);
+    assert!(!third.more);
+    assert_eq!(third.cursor, ids[4]);
+
+    let rest = s.load_chat_delta("cli", "c", third.cursor, 2).unwrap();
+    assert!(rest.messages.is_empty() && !rest.more);
+}
+
+#[test]
+fn snapshot_tail_window_keeps_global_cursor_over_filtered_rows() {
+    let (_g, s) = store();
+    // 3 条可回放 + 尾部一条 tool 载体（turn 以工具调用收尾时真实存在）。
+    s.append("cli", "c", &Message::plain(Role::User, "q")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::Assistant, "a")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "q2")).unwrap();
+    s.append("cli", "c", &tool_result_carrier("cx")).unwrap();
+
+    // 窗口只装 2 条：最旧的可回放行被裁掉，但游标仍是全局最大（含被裁行与载体行）。
+    let snap = s.load_chat_snapshot("cli", "c", 2, 1024 * 1024).unwrap();
+    assert_eq!(texts(&snap.messages), vec!["a", "q2"]);
+    let max_all = s.load_transcript("cli", "c").unwrap().last().unwrap().id;
+    assert_eq!(snap.cursor, max_all);
+
+    // 窗口外历史不会被增量重放（id < cursor 视为已消费的窗口外历史）。
+    let d = s.load_chat_delta("cli", "c", snap.cursor, 10).unwrap();
+    assert!(d.messages.is_empty());
+}
+
+#[test]
+fn snapshot_and_delta_on_missing_session_are_empty() {
+    let (_g, s) = store();
+    let snap = s.load_chat_snapshot("cli", "ghost", 10, 1024).unwrap();
+    assert!(snap.messages.is_empty() && snap.cursor == 0);
+    let d = s.load_chat_delta("cli", "ghost", 0, 10).unwrap();
+    assert!(d.messages.is_empty() && d.cursor == 0 && !d.more);
+}
+
+#[test]
+fn delta_skips_compaction_boundary_but_cursor_passes_it() {
+    let (_g, s) = store();
+    s.append("cli", "c", &Message::plain(Role::User, "m0")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::Assistant, "m1"))
+        .unwrap();
+    let boundary = s
+        .append_compaction(
+            "cli",
+            "c",
+            &Message::plain(Role::User, "[CONTEXT COMPACTION] 摘要"),
+            None,
+            1,
+        )
+        .unwrap();
+    let after = s
+        .append("cli", "c", &Message::plain(Role::User, "m2"))
+        .unwrap();
+    let d = s.load_chat_delta("cli", "c", 0, 100).unwrap();
+    assert_eq!(texts(&d.messages), vec!["m0", "m1", "m2"]);
+    assert_eq!(d.cursor, after, "boundary 行 id({boundary}) 被游标越过");
+    let d2 = s.load_chat_delta("cli", "c", d.cursor, 100).unwrap();
+    assert!(d2.messages.is_empty());
+}
