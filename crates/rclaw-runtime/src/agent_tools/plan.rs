@@ -2085,11 +2085,14 @@ impl Tool for PlanRunTool {
                 }
                 // 真要派发了：继承的产出（若有）从此被重跑取代。
                 inherited_steps.remove(&step.id);
-                // step_started（第十二轮后续项）：步骤级「运行中」状态的持久事实源——
-                // 投影端「有 started 无终态」= running（重跑也重记，事件流按序覆盖）。
-                append_plan_event(&plan_log, "step_started", json!({"step": step.id}));
+                let plan_log = plan_log.clone();
                 futures.push(async move {
                     let _permit = semaphore.acquire().await.expect("plan semaphore 不会关闭");
+                    // step_started（第十二轮后续项）在真正拿到并发许可后落盘：波内
+                    // 步数超过 max_parallel 时，等许可的步骤并没有在跑——提前落盘
+                    // 会让投影把它们画成 running。步骤级「运行中」状态的持久事实源：
+                    // 投影端「有 started 无终态」= running（重跑也重记，事件流按序覆盖）。
+                    append_plan_event(&plan_log, "step_started", json!({"step": step.id}));
                     let result = runtime.run_task(spec, None, None).await;
                     (step.id.clone(), result, verifier_inputs)
                 });

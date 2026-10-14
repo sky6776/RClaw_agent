@@ -792,12 +792,18 @@ export default function App() {
           return;
         }
         const transcript = entriesByChat[activeId] ?? [];
-        // 该条目之后还有几条同 (role, content) 条目（碰到自身即清零重计）。
+        // 该条目之后还有几条同 (role, content) 条目（碰到自身即清零重计）。发送
+        // 失败的条目没有落库，不得计入——它们在库里没有对应行，计入会把 skip 数
+        // 抬高、fork 到更早的同文消息上。
         let laterMatches = 0;
         for (const existing of transcript) {
           if (existing === entry) {
             laterMatches = 0;
-          } else if (existing.role === entry.role && existing.content === entry.content) {
+          } else if (
+            !existing.sendFailed &&
+            existing.role === entry.role &&
+            existing.content === entry.content
+          ) {
             laterMatches += 1;
           }
         }

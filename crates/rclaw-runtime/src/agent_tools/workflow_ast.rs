@@ -785,14 +785,25 @@ fn schema_size(value: &Value) -> usize {
     }
 }
 
+/// schema 树的嵌套深度（对象 / 数组每层计 1，与校验器的深度口径一致）。
+fn schema_depth(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => 1 + map.values().map(schema_depth).max().unwrap_or(0),
+        Value::Array(items) => 1 + items.iter().map(schema_depth).max().unwrap_or(0),
+        _ => 1,
+    }
+}
+
 impl<'a> SchemaCompiler<'a> {
-    /// 数字常量的 schema 形态：整数值归一成整数表示（json!(f64) 会产出 `1.0`，
-    /// 而类型注解 `<1>` 的自然预期是 `1`；校验端两种表示都按数值相等接受）。
+    /// 数字常量的 schema 形态：整数值且能在 i64 里【精确】表示才落整数（json!(f64)
+    /// 会产出 `1.0`，而类型注解 `<1>` 的自然预期是 `1`；校验端两种表示都按数值相等
+    /// 接受）。上界用 2^63 严格比较——`i64::MAX as f64` 会舍入成 2^63，包含性比较
+    /// 加饱和转换曾把 9223372036854775808 错写成 9223372036854775807。
     fn number_const(value: f64) -> Value {
         if value.is_finite()
             && value.fract() == 0.0
             && value >= i64::MIN as f64
-            && value <= i64::MAX as f64
+            && value < 9_223_372_036_854_775_808.0
         {
             json!(value as i64)
         } else {
@@ -1074,7 +1085,9 @@ impl<'a> SchemaCompiler<'a> {
         }
         // 泛型实例化帧优先：别名 body 内引用参数名（T / U…）→ 返回调用方环境里
         // 已解析的实参 schema。clone 的是整棵子树，其尺寸计入展开预算——否则
-        // 「body 里 N 处引用 × 实参子树大小」的乘法绕过构造期计数。
+        // 「body 里 N 处引用 × 实参子树大小」的乘法绕过构造期计数。插入点还要核对
+        // 展开后的总深度（源类型嵌套浅 + 实参子树深 = 校验器拒收的深 schema——
+        // 拒绝必须发生在子代理执行之前，而不是答案全部被深度上限打回）。
         let hit = self
             .type_args
             .iter()
@@ -1082,11 +1095,17 @@ impl<'a> SchemaCompiler<'a> {
             .find_map(|frame| frame.get(name).cloned());
         if let Some(schema) = hit {
             self.charge(schema_size(&schema), span_start);
-            return if self.budget.over {
-                json!({})
-            } else {
-                schema
-            };
+            if self.budget.over {
+                return json!({});
+            }
+            if depth + schema_depth(&schema) > MAX_TYPE_DEPTH {
+                self.diagnostics.push((
+                    span_start,
+                    format!("类型展开后嵌套超过 {MAX_TYPE_DEPTH} 层上限：减少实例化嵌套层数"),
+                ));
+                return json!({});
+            }
+            return schema;
         }
         // 类型别名（脚本顶层 `type X = ...`，可带泛型参数，引用点实例化）。
         let Some(alias) = self.aliases.get(name) else {
@@ -1704,6 +1723,55 @@ mod extended_type_tests {
         let plain = "const JSON = { parse: () => 1 };\nresult(String(JSON.parse()));\n";
         let transform = compile_typed_asks(plain).expect("无 typed ask 时不拒绝");
         assert!(transform.typed_asks.is_empty());
+    }
+
+    #[test]
+    fn numeric_boundaries_keep_exact_values() {
+        // 回归：i64 边界上的常量曾走饱和转换——ask<9223372036854775808>（2^63，
+        // i64::MAX as f64 恰好舍入到它）被错写成 i64::MAX（...997），正确的 JSON
+        // 答案被拒、不同的答案被放行。超出 i64 的保留浮点表示。
+        let script = concat!(
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<9223372036854775808>(\"边界\");\n",
+            "result(String(r));\n"
+        );
+        let transform = compile_typed_asks(script).expect("编译应成功");
+        let (_, schema) = &transform.typed_asks[0];
+        assert_eq!(
+            schema["const"],
+            json!(9223372036854775808.0f64),
+            "2^63 保留浮点形态（不是饱和成 i64::MAX）: {schema}"
+        );
+        // i64 范围内的整数值仍落整数表示。
+        let inside = compile_typed_asks(
+            "const h = agent(\"h\");\nconst r = await h.ask<9007199254740992>(\"内\");\n",
+        )
+        .expect("编译应成功");
+        assert_eq!(inside.typed_asks[0].1["const"], json!(9007199254740992i64));
+    }
+
+    #[test]
+    fn expanded_schema_depth_is_checked_before_execution() {
+        // 回归：实参子树在插入点的深度曾不核对——源类型嵌套浅 + 实参子树深，编译
+        // 通过但展开 schema 超过校验器深度上限，所有合规答案都在子代理执行完之后
+        // 才被拒。编译期按插入点核对总深度并拒绝。
+        let script = concat!(
+            "type Box<T> = { x: { y: { z: T } } };\n",
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<Box<Box<Box<string>>>>(\"深\");\n",
+            "result(r.x);\n"
+        );
+        let diagnostics = compile_typed_asks(script).unwrap_err();
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("展开后嵌套超过")),
+            "{diagnostics:?}"
+        );
+        // 深度预算内的组合不受影响（3 层别名体 × string = 4 层 < 8）。
+        let ok = compile_typed_asks(
+            "type Box<T> = { x: { y: { z: T } } };\nconst h = agent(\"h\");\nconst r = await h.ask<Box<string>>(\"内\");\n",
+        )
+        .expect("深度预算内应编译");
+        assert_eq!(ok.typed_asks[0].1["properties"]["x"]["properties"]["y"]["type"], "object");
     }
 
     #[test]
