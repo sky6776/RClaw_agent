@@ -119,6 +119,15 @@ impl AppState {
             .map(|a| a.session_lifecycle.clone())
     }
 
+    /// Bot 注册表克隆（bot 会话的身份判定：分叉会话无法继承 persona）。
+    pub fn bots(&self) -> Option<Arc<BotRegistry>> {
+        self.agent
+            .read()
+            .expect("AppState.agent 锁未被毒化")
+            .as_ref()
+            .map(|a| a.bots.clone())
+    }
+
     /// 多 agent 运行时句柄克隆。
     pub fn agent_runtime(&self) -> Option<AgentToolRuntime> {
         self.agent

@@ -1560,6 +1560,12 @@ impl TurnManager {
             after_slash.trim()
         };
         let mut parts = args.split_whitespace();
+        // bot 会话拒绝分叉：分叉 id（<bot 名>-fork…）无法命中 BotRegistry 的同名
+        // persona，后续消息会静默落到主 persona（换 provider / 记忆、丢
+        // denied_tools 工具限制）——显式报错优于悄悄换身份。
+        if self.bots.persona_for_chat(channel, chat_id).is_some() {
+            return "🤖 bot 会话不支持分叉：分叉会话无法继承 bot 的 persona（模型 / 记忆 / 工具限制）。请直接新建会话。".to_string();
+        }
         let session = self.session.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();
@@ -2414,6 +2420,11 @@ impl TurnManager {
                 Vec::new()
             }
         };
+
+        // turn 主体已结束：无论正常收尾、/cancel 还是 panic，都不再有终局回复投递
+        //（取消清理刻意不发收尾回复）。标记后，本条目在清理完成前不再把命令回复判成
+        // intermediate——否则 /cancel 后立即发送的命令会把忙碌态永久卡住。
+        self.mark_final_delivered(&key);
 
         // 从 active 移除自己（turn 已结束）。若旧 active 已被路由层清理并替换成新 turn，
         // 这里不能按 key 无条件删除，否则会误删新 turn，破坏 per-session 单写者约束。

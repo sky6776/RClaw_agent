@@ -1307,21 +1307,26 @@ export default function Chat({
             ——只展示最新的会把被顶到后面的暂停计划藏没：暂停中的执行器在等恢复
             标志，Resume 按钮必须任何时候都够得着（暂停中的计划【全部渲染】，不受
             卡片上限约束）；没有未收尾计划时保留最新已收尾计划当摘要卡。非暂停的
-            未收尾计划按 updated_at 序最多补 4 张。计划无会话归属（journal 全局），
-            在哪个会话都能操作。 */}
-        {(() => {
-          const visible = plans.filter((p) => !p.completed && p.steps.length > 0);
-          if (visible.length === 0 && plans[0]?.steps.length) {
-            visible.push(plans[0]);
-          }
-          const pausedPlans = visible.filter((p) => p.paused);
-          const others = visible
-            .filter((p) => !p.paused)
-            .slice(0, Math.max(0, 4 - pausedPlans.length));
-          return [...pausedPlans, ...others].map((p) => (
-            <PlanStepsCard key={p.plan_id} plan={p} onPlanPause={onPlanPause} />
-          ));
-        })()}
+            未收尾计划按 updated_at 序最多补 4 张。整块限高自滚动（页面 overflow-hidden
+            且只有历史区滚动，多计划展开会把输入框 / 停止按钮顶出可视区）。计划无
+            会话归属（journal 全局），在哪个会话都能操作。 */}
+        {plans.length > 0 && (
+          <div className="mb-2 max-h-60 space-y-1.5 overflow-y-auto">
+            {(() => {
+              const visible = plans.filter((p) => !p.completed && p.steps.length > 0);
+              if (visible.length === 0 && plans[0]?.steps.length) {
+                visible.push(plans[0]);
+              }
+              const pausedPlans = visible.filter((p) => p.paused);
+              const others = visible
+                .filter((p) => !p.paused)
+                .slice(0, Math.max(0, 4 - pausedPlans.length));
+              return [...pausedPlans, ...others].map((p) => (
+                <PlanStepsCard key={p.plan_id} plan={p} onPlanPause={onPlanPause} />
+              ));
+            })()}
+          </div>
+        )}
 
         {/* 排队消息（zcode 同款，第十二轮）：agent 运行期间发送的消息在此排队，
             可删除 / 编辑 / 立即投递；会话收尾后由 App 逐条自动发出（App 级状态，

@@ -581,6 +581,16 @@ pub async fn chat_fork(
         return Err(format!("非法会话 id: {chat_id}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
+    // bot 会话拒绝分叉：分叉会话（<bot 名>-fork…）无法命中 BotRegistry 的同名
+    // persona，后续消息会静默落到主 persona（换 provider / 记忆、丢 denied_tools）。
+    if let Some(bots) = state.bots() {
+        if bots.persona_for_chat(CHANNEL_DESKTOP, &chat_id).is_some() {
+            return Err(
+                "🤖 bot 会话不支持分叉：分叉会话无法继承 bot 的 persona（模型 / 记忆 / 工具限制）。请直接新建会话。"
+                    .to_string(),
+            );
+        }
+    }
     // 新 chat_id：`<orig>-fork<hex>`（白名单字符集，基名收敛到 40 字符）；
     // 撞名（同秒连点两次）追加计数重试。
     let base: String = chat_id.chars().take(40).collect();

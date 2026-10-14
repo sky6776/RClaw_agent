@@ -8733,6 +8733,56 @@ async fn fork_command_lists_anchors_and_forks_to_new_session() {
     assert!(spaced_list.contains("可分叉锚点"), "{spaced_list}");
 }
 
+#[tokio::test]
+async fn fork_rejects_bot_sessions() {
+    // 回归：bot 会话分叉出的 id（<bot 名>-fork…）无法命中 BotRegistry 的同名
+    // persona——后续消息会静默落到主 persona（换 provider / 记忆、丢工具限制）。
+    // 显式报错优于悄悄换身份。
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    // 预置一个 bot 定义，让注册表 reload 时装载 persona "alpha"。
+    let store = rclaw_store::bots::BotStore::new(&layout.base);
+    store
+        .save(
+            "alpha",
+            rclaw_store::bots::BotDef {
+                title: "Alpha".into(),
+                description: String::new(),
+                persona: "测试".into(),
+                provider: None,
+                denied_tools: vec!["shell".into()],
+            },
+        )
+        .unwrap();
+    let bots = Arc::new(crate::bots::BotRegistry::new(
+        &layout,
+        Arc::new(|_: &str| -> Option<Arc<dyn rclaw_llm::Provider>> { None }),
+        None,
+        2200,
+        1375,
+    ));
+    let (outbound_tx, _outbound_rx) = mpsc::channel(8);
+    let mgr = TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: "unused".into(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout.clone(),
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        bots,
+        None,
+    );
+    let report = mgr.handle_fork("desktop", "bot-alpha", "/fork 1").await;
+    assert!(report.contains("不支持分叉"), "{report}");
+    assert!(!report.contains("✅"), "{report}");
+}
+
 // ---------------------------------------------------------------------------
 // /goal：会话长期目标（ZCode /goal 同款，第十二轮）
 // ---------------------------------------------------------------------------
