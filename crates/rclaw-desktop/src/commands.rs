@@ -1001,6 +1001,51 @@ pub async fn plan_pause(
     .await
 }
 
+/// 全量转录里按内容定位消息行 id（「从尾数第 skip+1 个匹配」）：直播条目没有
+/// 持久化 id，chat_history 的尾部窗口在长会话里够不到更早的 live 消息——fork
+/// 锚点解析的全量兜底在这里做（DB 完整扫描，不受窗口限制）。
+#[tauri::command]
+pub async fn chat_message_id(
+    state: State<'_, AppState>,
+    chat_id: String,
+    role: String,
+    content: String,
+    later_matches: usize,
+) -> Result<Option<i64>, String> {
+    if !is_valid_chat_id(&chat_id) {
+        return Err(format!("非法会话 id: {chat_id}"));
+    }
+    let session = state.session().ok_or("agent 尚未启动")?;
+    run_blocking("定位消息锚点", move || {
+        let msgs = session
+            .load_transcript(CHANNEL_DESKTOP, &chat_id)
+            .map_err(|e| e.to_string())?;
+        let want_role = match role.as_str() {
+            "user" => rclaw_core::Role::User,
+            _ => rclaw_core::Role::Assistant,
+        };
+        let matches: Vec<i64> = msgs
+            .iter()
+            .filter(|m| {
+                m.role == want_role
+                    && m.content
+                        .iter()
+                        .filter_map(|block| block.as_text())
+                        .collect::<String>()
+                        == content
+            })
+            .map(|m| m.id)
+            .collect();
+        // 从尾数第 later_matches+1 个匹配（与 UI 侧「该条目之后还有几条同文」对齐；
+        // 之后的条目一定更新、一定已落库，从全量尾部倒数即对应 clicked 这条）。
+        Ok(matches
+            .len()
+            .checked_sub(1 + later_matches)
+            .and_then(|index| matches.get(index).copied()))
+    })
+    .await
+}
+
 /// 历史消息条目（恢复转录用）。
 #[derive(Debug, Serialize)]
 pub struct HistoryMsgDto {

@@ -611,6 +611,12 @@ impl<'a> Visit<'a> for BindingNameCollector {
             self.declares_json = true;
         }
     }
+
+    // 纯类型声明不产生运行时绑定：`type JSON = ...`（别名在执行前被抹除，遮蔽不到
+    // 内置 JSON.parse）与 interface 不构成冲突——别把它们算进来，合法的类型别名
+    // 名得继续可用。
+    fn visit_ts_type_alias_declaration(&mut self, _it: &TSTypeAliasDeclaration<'a>) {}
+    fn visit_ts_interface_declaration(&mut self, _it: &TSInterfaceDeclaration<'a>) {}
 }
 
 struct TypedAskWalker<'a> {
@@ -717,9 +723,12 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
             let schema_literal = serde_json::to_string(&schema_json).unwrap_or_default();
             // 可选链（h?.ask<T>(..)）重写后必须保留：`?.` 与 `.` 混用会改变语义——
             // h 为空时合法跳过的调用变成 TypeError，且问题参数的副作用不再被短路。
+            // 调用本身的可选标记（`ask?.<T>(..)`，flag 在 CallExpression 上）同样保留。
             let chain = if member_optional { "?." } else { "." };
-            let replacement =
-                format!("{receiver}{chain}askJson({question_src}, JSON.parse({schema_literal}))");
+            let call_mark = if it.optional { "?" } else { "" };
+            let replacement = format!(
+                "{receiver}{chain}askJson({question_src}, JSON.parse({schema_literal})){call_mark}"
+            );
             if let Some((start, end)) = self.script_span(it.span) {
                 // 嵌套 typed ask（`ask<T>(await ask<U>(...))` 的参数里又有一层）拒绝：
                 // 外层替换的文本取自原文，内层重写无法嵌进外层的固定 span 里——支持它
@@ -1581,6 +1590,36 @@ mod extended_type_tests {
         let plain = compile_typed_asks("const h = agent(\"h\");\nconst r = await h.ask<number>(\"普通\");\n")
             .expect("编译应成功");
         assert!(plain.exec_script.contains("h.askJson("), "{}", plain.exec_script);
+        // 调用本身的可选标记（`ask?.<T>(..)`，flag 在 CallExpression 上）同样保留。
+        let optional_call = compile_typed_asks(
+            "const h = agent(\"h\");\nconst r = await h.ask?.<number>(\"可省\");\nresult(String(r));\n",
+        )
+        .expect("编译应成功");
+        assert!(
+            optional_call.exec_script.contains("askJson(\"可省\", JSON.parse("),
+            "{}",
+            optional_call.exec_script
+        );
+        assert!(
+            optional_call.exec_script.contains("))?"),
+            "调用级 `?` 必须保留: {}",
+            optional_call.exec_script
+        );
+    }
+
+    #[test]
+    fn type_alias_named_json_does_not_conflict() {
+        // 回归：`type JSON = ...` 是纯类型声明（别名执行前被抹除，遮蔽不到运行时的
+        // 内置 JSON.parse）——曾把类型别名标识符也当值绑定误拒。
+        let script = concat!(
+            "type JSON = { ok: boolean };\n",
+            "const h = agent(\"h\");\n",
+            "const r = await h.ask<JSON>(\"别名\");\n",
+            "result(String(r.ok));\n"
+        );
+        let transform = compile_typed_asks(script).expect("类型别名 JSON 不构成冲突");
+        assert_eq!(transform.typed_asks[0].1["properties"]["ok"]["type"], "boolean");
+        assert!(transform.exec_script.contains("JSON.parse("));
     }
 
     #[test]

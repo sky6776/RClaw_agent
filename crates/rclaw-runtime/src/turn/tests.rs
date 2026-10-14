@@ -8941,6 +8941,9 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
 
     // 审计确认 → goal 清除 + 系统回执（intermediate：不得解除忙碌态）。
     mgr.spawn_goal_audit(
+        Arc::new(ScriptedProvider {
+            reply: r#"{"goal_met": true, "evidence_summary": "全部测试通过"}"#.to_string(),
+        }),
         "完成迁移".to_string(),
         created_at,
         "迁移完成：cargo test 1144 全部通过".to_string(),
@@ -8994,6 +8997,9 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
     // 直接在原 mgr 上测（provider 是确认版）——换 deny provider 需另一个实例；
     // 用 deny 实例（同库）跑审计。
     deny.spawn_goal_audit(
+        Arc::new(ScriptedProvider {
+            reply: r#"{"goal_met": false, "evidence_summary": "仅部分完成"}"#.to_string(),
+        }),
         "另一个目标".to_string(),
         created_at2,
         "还在进行中".to_string(),
@@ -9027,6 +9033,9 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
         None,
     ));
     stale.spawn_goal_audit(
+        Arc::new(ScriptedProvider {
+            reply: r#"{"goal_met": true, "evidence_summary": "旧目标的证据"}"#.to_string(),
+        }),
         "另一个目标".to_string(),
         created_at.saturating_sub(1_000),
         "旧目标的汇报".to_string(),

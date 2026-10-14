@@ -129,6 +129,7 @@ pub fn run() {
             commands::chat_list,
             commands::chat_history,
             commands::chat_fork,
+            commands::chat_message_id,
             commands::plan_status,
             commands::plan_pause,
             commands::chat_archive,

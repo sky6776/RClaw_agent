@@ -355,6 +355,11 @@ export const api = {
   chatFork: (chatId: string, anchorMessageId: number, full?: boolean) =>
     invoke<ChatForkResult>("chat_fork", { chatId, anchorMessageId, full }),
 
+  /** 全量转录按内容定位消息行 id（从尾数第 skip+1 个匹配）：fork 锚点解析的
+   *  全量兜底——chat_history 只回尾部窗口，长会话里更早的 live 条目靠它定位。 */
+  chatMessageId: (chatId: string, role: string, content: string, laterMatches: number) =>
+    invoke<number | null>("chat_message_id", { chatId, role, content, laterMatches }),
+
   /** 最近若干个 PlanRun 计划的状态（流程步骤 / todo 轮询）。 */
   planStatus: () => invoke<PlanStatus[]>("plan_status"),
 

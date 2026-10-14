@@ -856,11 +856,20 @@ impl TurnManager {
             })
     }
 
-    /// 同步：标记该 turn 的终局回复已投递（outbound 发出后立即调用）。
-    fn mark_final_delivered(&self, key: &TurnKey) {
+    /// 同步：标记该 turn 的终局回复已投递（outbound 发出后立即调用）。按事件通道
+    /// 身份校验条目——旧 turn 主体结束到外壳清理之间，路由层可能已用同 key 换上
+    /// 新 turn，无条件按 key 标记会把新 turn 误标成「已投递」（其命令回复会提前
+    /// 解除忙碌态、放行排队消息）。
+    fn mark_final_delivered_if_same(
+        &self,
+        key: &TurnKey,
+        event_tx: &mpsc::Sender<Interjection>,
+    ) {
         let mut active = self.active.lock().expect("active map 锁未被毒化");
         if let Some(turn) = active.get_mut(key) {
-            turn.final_delivered = true;
+            if turn.event_tx.same_channel(event_tx) {
+                turn.final_delivered = true;
+            }
         }
     }
 
@@ -1373,13 +1382,13 @@ impl TurnManager {
     /// 新目标一并端掉。清除前重读 kv，只清自己审计的那一份。
     fn spawn_goal_audit(
         &self,
+        provider: Arc<dyn Provider>,
         objective: String,
         goal_created_at: i64,
         final_reply: String,
         channel: String,
         chat_id: String,
     ) {
-        let provider = self.provider.clone();
         let session = self.session.clone();
         let outbound = self.outbound_tx.clone();
         tokio::spawn(async move {
@@ -2376,6 +2385,9 @@ impl TurnManager {
         // 自动转后台建立「父取消 → 子取消」联动（detach 后由调用方解除）。
         let cancel_for_scope = cancel.clone();
         let chat_scope = Some((panic_report_target.channel.clone(), panic_report_target.chat_id.clone()));
+        // 内层也要事件通道发送端：终局投递标记按它校验 active 条目身份（防误标换代
+        // 后的新 turn）；外壳自身在清理时还要用，克隆一份随闭包 move。
+        let event_tx_for_inner = event_tx.clone();
         let inner: JoinHandle<Vec<BusMessage>> = tokio::spawn(async move {
             let fut = rewind::CURRENT_CHAT.scope(
                 chat_scope,
@@ -2384,7 +2396,7 @@ impl TurnManager {
                     Some(cancel_for_scope),
                     rclaw_tools::access::scope_access(
                         access,
-                        mgr.run_turn_inner(msg, cancel, event_rx, persona),
+                        mgr.run_turn_inner(msg, cancel, event_rx, event_tx_for_inner, persona),
                     ),
                 ),
             );
@@ -2423,8 +2435,9 @@ impl TurnManager {
 
         // turn 主体已结束：无论正常收尾、/cancel 还是 panic，都不再有终局回复投递
         //（取消清理刻意不发收尾回复）。标记后，本条目在清理完成前不再把命令回复判成
-        // intermediate——否则 /cancel 后立即发送的命令会把忙碌态永久卡住。
-        self.mark_final_delivered(&key);
+        // intermediate——否则 /cancel 后立即发送的命令会把忙碌态永久卡住。按事件通道
+        // 身份校验：等待清理的间隙里路由层可能已用同 key 换上新一代 turn。
+        self.mark_final_delivered_if_same(&key, &event_tx);
 
         // 从 active 移除自己（turn 已结束）。若旧 active 已被路由层清理并替换成新 turn，
         // 这里不能按 key 无条件删除，否则会误删新 turn，破坏 per-session 单写者约束。
@@ -2492,6 +2505,7 @@ impl TurnManager {
         msg: BusMessage,
         cancel: CancellationToken,
         mut event_rx: mpsc::Receiver<Interjection>,
+        event_tx: mpsc::Sender<Interjection>,
         persona: Option<Arc<crate::bots::BotPersona>>,
     ) -> Vec<BusMessage> {
         let is_cron = msg.is_cron_task();
@@ -3443,6 +3457,7 @@ impl TurnManager {
             if self.opts.goal_audit_enabled && !text.is_empty() {
                 if let Some((objective, created_at)) = active_goal {
                     self.spawn_goal_audit(
+                        turn_provider.clone(),
                         objective,
                         created_at,
                         text.clone(),
@@ -3479,7 +3494,7 @@ impl TurnManager {
             }
             // 终局已投递：此后（外壳清理完成前）到达的命令按空闲会话回复，不标
             // intermediate——桌面端为该命令重新置位的忙碌态需要这条普通回复来解除。
-            self.mark_final_delivered(&TurnKey::from_msg(&msg));
+            self.mark_final_delivered_if_same(&TurnKey::from_msg(&msg), &event_tx);
             // 交接回执：按 Agent 消息的关联 id 配给等待方（用户 turn 的回复
             // 不属于任何交接，跳过——否则会顶掉排队中交接的答案）。
             if let Some(router) = &self.bot_router {
@@ -3510,7 +3525,7 @@ impl TurnManager {
                 ))
                 .await;
             // 终局（失败形态）已投递：同成功分支——之后的命令回复不标 intermediate。
-            self.mark_final_delivered(&TurnKey::from_msg(&msg));
+            self.mark_final_delivered_if_same(&TurnKey::from_msg(&msg), &event_tx);
             if let Some(router) = &self.bot_router {
                 router.notify(
                     &msg.channel,

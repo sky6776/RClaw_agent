@@ -801,6 +801,11 @@ export default function App() {
               break;
             }
           }
+          // 尾窗没找到：长会话里更早的 live 条目超出 chat_history 的窗口——走全量
+          // 转录的 DB 扫描兜底（同一套「从尾数第 N+1 个匹配」语义，不受窗口限制）。
+          if (anchorId === null) {
+            anchorId = await api.chatMessageId(activeId, wantRole, entry.content, laterMatches);
+          }
         } catch {
           // 历史读取失败按未找到处理（下方统一报错）。
         }
