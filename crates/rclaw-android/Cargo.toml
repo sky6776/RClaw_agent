@@ -28,6 +28,10 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 jni = "0.21"
 sha2 = "0.10"
+# CDP 浏览器：WebView DevTools socket 上的 HTTP 探测 + WebSocket（CDP 协议通道）。
+# 抽象套接字连接用 std 的 SocketAddrExt::from_abstract_name（1.70+，linux/android）。
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

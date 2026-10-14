@@ -86,6 +86,23 @@ public final class NativeBridge {
         }
     }
 
+    /** CDP 浏览器会话：启动（或复用）长驻调试 WebView，返回 {"ok":true,"pid":N}
+     *  （Rust cdp_browser 据此拼 DevTools socket 名；BrowserSession.start 的桥）。 */
+    static String browserSessionStart() {
+        return BrowserSession.start(appContext);
+    }
+
+    /** CDP 浏览器会话：销毁长驻 WebView（browser_close 工具的桥）。 */
+    static boolean browserSessionStop() {
+        return BrowserSession.stop();
+    }
+
+    /** CDP 浏览器会话：离屏截图到 PNG（View.draw 软件位图；不走 CDP——离屏
+     *  WebView 无合成器帧）。 */
+    static boolean browserSessionScreenshot(String absPath) {
+        return BrowserSession.screenshot(absPath);
+    }
+
     /** 转发工作区媒体到其它应用（微信/QQ 等）：ACTION_SEND + FileProvider 只读
      *  URI，拉起系统分享面板（Rust share_media 的 JNI 入口）。 */
     static boolean shareFile(String relativePath) {

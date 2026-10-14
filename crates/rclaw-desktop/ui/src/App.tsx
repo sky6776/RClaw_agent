@@ -1488,14 +1488,17 @@ export default function App() {
 
         <nav className={`space-y-1 ${sidebarCollapsed ? "px-2" : "px-3"}`}>
           {/* 任务概览仅移动端抽屉展示（桌面由右侧 TaskPanel 承担）：
-              与其他栏目同级，点击进入专门的概览详情页。 */}
-          {(isMobile
-            ? ([
-                ...NAV.slice(0, 7),
-                ["taskview", "任务概览", () => <TasksIcon />],
-                ...NAV.slice(7),
-              ] as Array<[Page, string, () => ReactNode]>)
-            : NAV
+              与其他栏目同级，点击进入专门的概览详情页。
+              「关于」固定置底：先渲染除它以外的栏目，安卓的主题入口垫在
+              「配置」之后，最后渲染「关于」（NAV 末项）。 */}
+          {(
+            isMobile
+              ? ([
+                  ...NAV.slice(0, 7),
+                  ["taskview", "任务概览", () => <TasksIcon />],
+                  ...NAV.slice(7, -1),
+                ] as Array<[Page, string, () => ReactNode]>)
+              : NAV.slice(0, -1)
           ).map(([key, label, Icon]) => (
             <button
               key={key}
@@ -1534,6 +1537,28 @@ export default function App() {
               主题
             </button>
           )}
+          {NAV.slice(-1).map(([key, label, Icon]) => (
+            <button
+              key={key}
+              onClick={() => {
+                setPage(key);
+                setDrawerOpen(false);
+              }}
+              title={label}
+              className={`flex w-full items-center rounded-lg text-sm transition max-md:text-[15px] ${
+                sidebarCollapsed ? "justify-center py-2" : "gap-2.5 px-3 py-2 text-left max-md:py-2"
+              } ${
+                page === key
+                  ? "bg-indigo-500/10 text-indigo-300"
+                  : "text-gray-400 hover:bg-[#1a1f29] hover:text-gray-200"
+              }`}
+            >
+              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                <Icon />
+              </span>
+              {!sidebarCollapsed && label}
+            </button>
+          ))}
         </nav>
 
         {/* 会话列表（收起为图标栏时隐藏）；移动端保证最小可见高度，

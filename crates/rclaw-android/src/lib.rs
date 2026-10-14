@@ -8,6 +8,8 @@
 
 mod bridge_executor;
 mod host_glue;
+#[cfg(unix)]
+pub mod cdp_browser;
 #[cfg(target_os = "android")]
 pub mod web_browser;
 
@@ -146,6 +148,45 @@ pub fn install_update(apk_abs: &str) -> Result<()> {
     {
         let _ = apk_abs;
         Err(anyhow!("install_update 仅在 Android 宿主可用（桌面走自替换脚本）"))
+    }
+}
+
+/// CDP 浏览器会话：确保长驻调试 WebView 在跑，返回进程 pid（cdp_browser 拼上
+/// `webview_devtools_remote_<pid>` 连 DevTools）。阻塞至 WebView 就绪（至多 10s）。
+pub fn browser_session_start() -> Result<u32> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::browser_session_start()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err(anyhow!("CDP 浏览器仅在 Android 宿主可用"))
+    }
+}
+
+/// CDP 浏览器会话：销毁长驻 WebView（下次使用自动重建）。
+pub fn browser_session_stop() -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::browser_session_stop()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err(anyhow!("CDP 浏览器仅在 Android 宿主可用"))
+    }
+}
+
+/// CDP 浏览器会话：离屏截图到 PNG（View.draw 软件位图，不走 CDP——离屏 WebView
+/// 无合成器帧）。阻塞至绘制完成（至多 20s）。
+pub fn browser_session_screenshot(abs_path: &str) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::browser_session_screenshot(abs_path)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = abs_path;
+        Err(anyhow!("CDP 浏览器仅在 Android 宿主可用"))
     }
 }
 
@@ -1216,6 +1257,7 @@ pub mod jni_bridge {
     use anyhow::{anyhow, Context, Result};
     use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
     use jni::{JNIEnv, JavaVM};
+    use serde_json::Value;
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
@@ -1467,6 +1509,89 @@ pub mod jni_bridge {
         let value = JString::from(result);
         let payload = env.get_string(&value)?.to_string_lossy().into_owned();
         Ok(payload)
+    }
+
+    /// CDP 浏览器会话：确保长驻调试 WebView 在跑，返回进程 pid（拼 DevTools
+    /// socket 名 webview_devtools_remote_<pid>）。阻塞至 WebView 就绪（至多 10s）。
+    pub(super) fn browser_session_start() -> Result<u32> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加 CDP 浏览器线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let result = env
+            .call_static_method(
+                class,
+                "browserSessionStart",
+                "()Ljava/lang/String;",
+                &[],
+            )
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.browserSessionStart 失败: {error}")
+            })?
+            .l()?;
+        let value = JString::from(result);
+        let payload = env.get_string(&value)?.to_string_lossy().into_owned();
+        let reply: serde_json::Value =
+            serde_json::from_str(&payload).map_err(|e| anyhow!("解析会话应答失败: {e}"))?;
+        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(anyhow!(
+                "CDP 浏览器会话启动失败: {}",
+                reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知原因")
+            ));
+        }
+        Ok(reply
+            .get("pid")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("会话应答缺少 pid"))? as u32)
+    }
+
+    /// CDP 浏览器会话：销毁长驻 WebView（browser_close 工具）。
+    pub(super) fn browser_session_stop() -> Result<()> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加 CDP 浏览器线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        env.call_static_method(class, "browserSessionStop", "()Z", &[])
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.browserSessionStop 失败: {error}")
+            })?;
+        Ok(())
+    }
+
+    /// CDP 浏览器会话：离屏截图到 PNG（View.draw 软件位图，不走 CDP——离屏
+    /// WebView 无合成器帧）。阻塞至绘制完成（至多 20s）。
+    pub(super) fn browser_session_screenshot(abs_path: &str) -> Result<()> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加 CDP 浏览器线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let jpath = env.new_string(abs_path)?;
+        let result = env
+            .call_static_method(
+                class,
+                "browserSessionScreenshot",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&JObject::from(jpath))],
+            )
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.browserSessionScreenshot 失败: {error}")
+            })?;
+        if !result.z().unwrap_or(false) {
+            return Err(anyhow!("截图失败（会话未启动或文件不可写）"));
+        }
+        Ok(())
     }
 
     /// 应用 GUI 是否在前台（MainActivity onResume/onPause 维护的标志）。
