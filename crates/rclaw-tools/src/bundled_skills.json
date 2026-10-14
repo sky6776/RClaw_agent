@@ -4,6 +4,7 @@
     "ai-berkshire",
     "analyze-gold-market",
     "cron-task-patterns",
+    "docx",
     "evaluate-fund",
     "extract-archive",
     "glm-image-gen",
@@ -25,10 +26,13 @@
     "happyhorse-i2v",
     "happyhorse-r2v",
     "happyhorse-t2v",
+    "pdf",
+    "pptx",
     "screen-funds",
     "sd25-pe",
     "seedance-video",
     "seedream-image",
-    "seedream-prompt-gen"
+    "seedream-prompt-gen",
+    "xlsx"
   ]
 }

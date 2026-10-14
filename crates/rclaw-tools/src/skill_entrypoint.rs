@@ -2584,7 +2584,18 @@ max_items = 2
         // 「文档教模型经 shell 直跑 scripts/*.py」设计，是 termux 侧实测可用的机制，
         // 尚未迁移为 Manifest 工具（迁移需逐子命令建入口并在手机端回归）。迁移前
         // 它们的文档豁免本守卫；其余包出现脚本路径引用仍然直接失败。
-        const PENDING_MANIFEST_MIGRATION: &[&str] = &["pick-funds", "read-macro", "watch-positions"];
+        const PENDING_MANIFEST_MIGRATION: &[&str] = &[
+            "pick-funds",
+            "read-macro",
+            "watch-positions",
+            // zcode 生产力包（docx/xlsx/pptx/pdf，2026-10 移植）：按「文档教模型经
+            // shell 直跑 scripts/*」设计（QA/校验脚本十几个、含 Node 运行时），
+            // Manifest 迁移待办；迁移前豁免本守卫。
+            "docx",
+            "pdf",
+            "pptx",
+            "xlsx",
+        ];
         let executable_path =
             regex::Regex::new(r#"(?i)(?:scripts|tools)[/\\][^`"']+\.(?:py|js|mjs|sh|ps1)"#)
                 .unwrap();

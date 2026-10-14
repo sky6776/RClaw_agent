@@ -32,6 +32,9 @@ tokio-util = { workspace = true }
 # MCP stdio 客户端需要：oneshot/timeout/spawn_blocking（异步同步原语与时间）、sync::Mutex。
 # 工作区已开启 "full"，故直接复用 workspace 依赖（与 rclaw-runtime 一致）。
 tokio = { workspace = true }
+# CDP 浏览器：无头 Chromium（桌面）/ WebView（安卓）的 DevTools WebSocket。
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
 reqwest = { workspace = true }
 # grep 工具：进程内正则搜索（ripgrep 同源 regex 引擎）+ 目录遍历，跨平台无 C 依赖。
 regex = "1"

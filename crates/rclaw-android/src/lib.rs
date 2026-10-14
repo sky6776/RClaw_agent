@@ -2009,7 +2009,10 @@ mod tests {
         assert!(!heartbeat_is_fresh(999, 1_000));
     }
 
+    // 断言依赖 POSIX 绝对路径语义（/data/user/0/... 判定与 join 分隔符），
+    // Windows 宿主跑不了——私有路径切换在真机（unix）上验证。
     #[test]
+    #[cfg(unix)]
     fn complete_app_toml_maps_all_sections_and_switches_to_private_paths() {
         let toml = r#"
 [agent]

@@ -131,12 +131,23 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     };
 
     // 核心组件与 CLI 同一装配路径；/llmodel 持久化写回数据目录的 rclaw.toml。
-    let core = rclaw_cli::bootstrap::assemble_core(
+    // CDP 浏览器（桌面）：web_browser 换无头 Chromium 后端 + browser_* 交互
+    // 工具（协议与安卓共用，见 rclaw_tools::cdp_browser）。截图落工作区 browser/。
+    let browser_screenshot_dir = layout.base.join("browser");
+    let core = rclaw_cli::bootstrap::assemble_core_with(
         &cfg,
         &layout,
         &channel_info,
         false,
         home::config_path(&home),
+        |tools| {
+            rclaw_tools::cdp_browser::register(
+                tools,
+                Arc::new(rclaw_tools::cdp_browser::HeadlessChromiumTransport::new(
+                    browser_screenshot_dir,
+                )),
+            );
+        },
     )
     .await
     .map_err(|e| {

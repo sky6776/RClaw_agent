@@ -11,6 +11,7 @@
 //! 工具描述内部沿用 Anthropic 风格 `input_schema`，由 LLM 协议层翻译为具体 wire。
 
 pub mod access;
+pub mod cdp_browser;
 pub mod cron_controller;
 pub mod cron_tools;
 pub mod files;

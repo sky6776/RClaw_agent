@@ -2124,6 +2124,9 @@ pub fn window_close(app: AppHandle) -> Result<(), String> {
 pub fn app_exit(app: AppHandle) -> Result<(), String> {
     #[cfg(not(target_os = "android"))]
     {
+        // 无头 Chromium 子进程不随父进程退出：显式回收（正常退出路径；崩溃
+        // 场景残留的无头进程由用户手动结束，影响有限）。
+        rclaw_tools::cdp_browser::kill_headless_processes();
         app.cleanup_before_exit();
         app.exit(0);
         Ok(())

@@ -80,7 +80,10 @@ final class BrowserSession {
                                     android.webkit.WebResourceRequest request) {
                                 android.net.Uri uri = request.getUrl();
                                 String scheme = uri.getScheme() == null ? "" : uri.getScheme();
-                                if ("http".equals(scheme) || "https".equals(scheme)) {
+                                if ("http".equals(scheme) || "https".equals(scheme)
+                                        || "about".equals(scheme)) {
+                                    // about:（含 about:blank）是会话内部导航，外派会
+                                    // 取消导航且 CDP 停在旧文档。
                                     return false;
                                 }
                                 if (request.hasGesture() || request.isRedirect()) {
@@ -92,6 +95,13 @@ final class BrowserSession {
                                             intent = android.content.Intent.parseUri(
                                                     uri.toString(),
                                                     android.content.Intent.URI_INTENT_SCHEME);
+                                            // 复刻 WebView 默认派发器的净化：parseUri
+                                            // 会保留 URL 里的显式 component/selector，
+                                            // 网页可借此调起未对浏览器开放的本应用内部
+                                            // 组件（如非 BROWSABLE 的 MainActivity）——
+                                            // 一律清掉，只按动作+数据派发。
+                                            intent.setComponent(null);
+                                            intent.setSelector(null);
                                         } else {
                                             intent = new android.content.Intent(
                                                     android.content.Intent.ACTION_VIEW, uri);

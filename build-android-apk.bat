@@ -46,6 +46,21 @@ set "ANDROID_NDK_HOME=%ANDROID_HOME%\ndk\29.0.14206865"
 set "NDK_HOME=%ANDROID_NDK_HOME%"
 set "NDK_ROOT=%ANDROID_NDK_HOME%"
 set "GRADLE_USER_HOME=%ANDROID_TOOLCHAIN%\gradle-user-home"
+REM rquickjs/bindgen (aarch64 target) runs on the host and needs libclang.
+if not defined LIBCLANG_PATH set "LIBCLANG_PATH=%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64\bin"
+REM The NDK's libclang auto resource-dir detection fails under bindgen on
+REM Windows (stdbool.h not found), so pass the clang resource dir explicitly.
+REM Use the target-suffixed var: bindgen prefers it over the plain one, which
+REM cargo-ndk overwrites with a sysroot-only value. Values are shell-lexed by
+REM bindgen, so use forward slashes (backslashes get eaten as escapes).
+if defined BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android goto :bindgen_env_done
+for /d %%v in ("%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64\lib\clang\*") do set "CLANG_RESOURCE_DIR=%%v"
+set "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=%ANDROID_NDK_HOME:\=/%/toolchains/llvm/prebuilt/windows-x86_64/sysroot -resource-dir=%CLANG_RESOURCE_DIR:\=/%"
+:bindgen_env_done
+REM NDK toolchain bin on PATH: bindgen's in-process clang driver fails to
+REM locate its own installation without it (empty InstalledDir, builtin
+REM headers like stdbool.h unresolvable), and cc needs the cross wrappers.
+set "PATH=%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64\bin;%PATH%"
 if "%RCLAW_BUILD_PYTHON%"=="" (
     set "RCLAW_BUILD_PYTHON=%ANDROID_TOOLCHAIN%\python312\python.exe"
     if not exist "!RCLAW_BUILD_PYTHON!" set "RCLAW_BUILD_PYTHON="
@@ -69,6 +84,9 @@ REM wry kotlin templates go into the generated\ subdir: the same files were
 REM placed there by the tauri CLI era - writing to the old path makes duplicate
 REM class declarations (redeclaration compile failure).
 set "WRY_ANDROID_KOTLIN_FILES_OUT_DIR=%REPO%\crates\rclaw-desktop\gen\android\app\src\main\java\ai\rclaw\app\generated"
+REM wry canonicalizes the dir before writing into it; fresh checkouts lack it
+REM (the dir is gitignored), so create it up front.
+if not exist "%WRY_ANDROID_KOTLIN_FILES_OUT_DIR%" mkdir "%WRY_ANDROID_KOTLIN_FILES_OUT_DIR%"
 
 echo [1/5] frontend build - ui/dist
 pushd "%REPO%\crates\rclaw-desktop\ui"
