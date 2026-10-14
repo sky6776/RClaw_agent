@@ -452,34 +452,46 @@ export default function App() {
   }, []);
 
   // 行级增量拉取：把游标之后落库的行补进视图并回填锚点。turn 收尾 / 窗口恢复可见 /
-  // fork 前兜底共用。快照还没就绪（初始化中 / 从未拉过）的会话直接跳过——前者等
-  // openChat 落定游标，后者等首次打开走快照路径。同一会话的并发拉取合并为一次在飞
-  // 请求：重叠触发（收尾 + 切回可见 + fork 兜底）共用同一游标起点，重复请求会各自
-  // 从同一 cursor 取到同一批行，靠幂等兜底不如干脆不重入。
+  // fork 前兜底共用。两个竞态都在这里收口：
+  // - 快照还在装（snapshotLoading）：不是丢弃触发——快照读库之后落库的行要等它落定
+  //   后靠这里的增量补上（snapshotReady 在 openChat 成功/失败时都会解除）。
+  // - 同会话在飞期间再触发 ≠ 已覆盖：那次请求可能已读过库，新提交的行不在其响应里。
+  //   记一笔尾随重跑，作业收尾前从最新游标再读一轮，直到没有尾随触发为止。
   const resyncInflight = useRef<Record<string, Promise<void>>>({});
+  const resyncPending = useRef<Record<string, boolean>>({});
+  const snapshotReady = useRef<Record<string, Promise<void>>>({});
   const resyncChat = useCallback(
     (chatId: string): Promise<void> => {
       const inflight = resyncInflight.current[chatId];
-      if (inflight) return inflight;
+      if (inflight) {
+        resyncPending.current[chatId] = true;
+        return inflight;
+      }
       const run = (async () => {
-        if (snapshotLoading.current.has(chatId) || !restoredChats.current.has(chatId)) return;
-        let after = cursorByChat.current[chatId] ?? 0;
-        for (let page = 0; page < 20; page++) {
-          let delta: ChatHistoryDelta;
-          try {
-            delta = await api.chatHistorySince(chatId, after);
-          } catch {
-            return; // agent 未启动等瞬时失败：下次收尾再补。
+        for (;;) {
+          resyncPending.current[chatId] = false;
+          await snapshotReady.current[chatId];
+          if (!restoredChats.current.has(chatId)) return;
+          let after = cursorByChat.current[chatId] ?? 0;
+          for (let page = 0; page < 20; page++) {
+            let delta: ChatHistoryDelta;
+            try {
+              delta = await api.chatHistorySince(chatId, after);
+            } catch {
+              return; // agent 未启动等瞬时失败：下次收尾再补。
+            }
+            cursorByChat.current[chatId] = Math.max(after, delta.cursor);
+            if (delta.entries.length > 0) applyCommitted(chatId, delta.entries);
+            if (!delta.more) break;
+            after = delta.cursor;
           }
-          cursorByChat.current[chatId] = Math.max(after, delta.cursor);
-          if (delta.entries.length > 0) applyCommitted(chatId, delta.entries);
-          if (!delta.more) return;
-          after = delta.cursor;
+          if (!resyncPending.current[chatId]) return;
         }
       })();
       resyncInflight.current[chatId] = run;
       void run.finally(() => {
         delete resyncInflight.current[chatId];
+        resyncPending.current[chatId] = false;
       });
       return run;
     },
@@ -574,6 +586,12 @@ export default function App() {
       setChatDraft("");
       if (restoredChats.current.has(chatId) || snapshotLoading.current.has(chatId)) return;
       snapshotLoading.current.add(chatId);
+      // 快照就绪闸门：装完（成功或失败都算解除）前到达的增量拉取在这里等，
+      // 落定后从最新游标补读快照读库与安装之间落库的行。
+      let resolveReady!: () => void;
+      snapshotReady.current[chatId] = new Promise((resolve) => {
+        resolveReady = resolve;
+      });
       setEntriesByChat((prev) => ({ ...prev, [chatId]: prev[chatId] ?? [] }));
       try {
         // 快照装配：已落库条目是权威投影，整体重建；此后视图 = 快照 + 按游标续读
@@ -582,6 +600,7 @@ export default function App() {
         cursorByChat.current[chatId] = history.cursor;
         snapshotLoading.current.delete(chatId);
         restoredChats.current.add(chatId);
+        resolveReady();
         setEntriesByChat((prev) => {
           const committed: Entry[] = history.entries.map((m) => ({
             id: next_entry_id++,
@@ -609,6 +628,7 @@ export default function App() {
         // agent 未启动等瞬时失败：回滚加载标记，下次打开还能重试；
         // 否则该会话永远保持空转录。
         snapshotLoading.current.delete(chatId);
+        resolveReady();
       }
     },
     [],
