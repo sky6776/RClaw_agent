@@ -75,9 +75,10 @@ final class BrowserOverlay {
 
     /** Activity 登记（onCreate；重建时刷新并丢弃旧视图树上的面板引用）。 */
     static void setActivity(androidx.activity.ComponentActivity host) {
-        // WebView 摘回离屏布局 + attached 复位（否则 attach 因 attached=true
-        // 短路、面板复用旧 Activity 的视图树）。
-        BrowserSession.resetAttachmentForActivityChange();
+        // 先作废旧面板引用（webviewHost=null 等），【再】投递复位：复位任务在
+        // NAV 线程异步执行，若在引用作废前运行，会看到「attached=true 且父容器
+        // == 旧 webviewHost」而错误跳过，WebView 滞留旧 Activity 的视图树。
+        // 作废后投递则复位必然执行（摘旧树 + 恢复软件层 + 清 attached）。
         synchronized (BrowserOverlay.class) {
             activity = host;
             // 旧 Activity 的视图树不可再用：面板/回调引用作废，下次展开重建。
@@ -88,6 +89,7 @@ final class BrowserOverlay {
             backCallback = null;
             panelShown = false;
         }
+        BrowserSession.resetAttachmentForActivityChange();
     }
 
     // ------------------------------------------------------------------
