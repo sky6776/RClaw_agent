@@ -314,9 +314,14 @@ final class BrowserSession {
                         attached = false;
                         return;
                     }
-                    if (attached) {
-                        return; // 已挂在当前面板：状态正确，无需复位
+                    // 仅当 WebView 真实挂在【当前面板】容器里才跳过：attached
+                    // 标志可能是旧 Activity 面板的遗留（面板引用已随 setActivity
+                    // 作废），此时必须复位（摘旧树 + 恢复软件层 + 清标志）。
+                    if (attached && BrowserOverlay.webviewHost() != null
+                            && webView.getParent() == BrowserOverlay.webviewHost()) {
+                        return;
                     }
+                    attached = false;
                     wv = webView;
                 }
                 final java.util.concurrent.CountDownLatch done =
