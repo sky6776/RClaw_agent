@@ -62,7 +62,17 @@ export default function TitleBar({
   onToggleTheme: () => void;
 }) {
   const [maximized, setMaximized] = useState(false);
+  const [browserOpen, setBrowserOpen] = useState(false);
   const lastPress = useRef(0);
+
+  // 浏览器快捷按钮：切到可见模式立即拉起真实浏览器窗口（与助手共用会话，
+  // 手动上网 + agent 驱动同一实例）；再点切回无头（窗口关闭）。
+  const toggleBrowser = useCallback(() => {
+    void api
+      .browserToggleVisible()
+      .then(setBrowserOpen)
+      .catch(() => {});
+  }, []);
 
   // 最大化状态：启动查一次；窗口尺寸变化（含贴边分屏 / 双击标题栏）后重查。
   useEffect(() => {
@@ -122,6 +132,17 @@ export default function TitleBar({
               <path d="M13.5 9.7A5.6 5.6 0 0 1 6.3 2.5a5.6 5.6 0 1 0 7.2 7.2z" />
             </svg>
           )}
+        </BarButton>
+        {/* 浏览器快捷入口：窗控按钮左侧（最大/最小化左边）。地球图标点亮 =
+            可见浏览器窗口已开启（用户可像 Firefox 一样上网，与助手共享会话）。 */}
+        <BarButton
+          title={browserOpen ? "关闭浏览器窗口（切回无头）" : "打开浏览器窗口（与助手共用）"}
+          onClick={toggleBrowser}
+        >
+          <svg {...icon} strokeWidth={browserOpen ? 1.9 : 1.3}>
+            <circle cx="8" cy="8" r="6.2" />
+            <path d="M1.8 8h12.4M8 1.8c1.9 1.7 2.9 3.8 2.9 6.2S9.9 12.5 8 14.2C6.1 12.5 5.1 10.4 5.1 8S6.1 3.5 8 1.8z" />
+          </svg>
         </BarButton>
         <BarButton title="最小化" onClick={() => void api.windowMinimize().catch(() => {})}>
           <svg {...icon}>

@@ -151,9 +151,18 @@ pub fn install_update(apk_abs: &str) -> Result<()> {
     }
 }
 
-/// CDP 浏览器会话：确保长驻调试 WebView 在跑，返回进程 pid（cdp_browser 拼上
-/// `webview_devtools_remote_<pid>` 连 DevTools）。阻塞至 WebView 就绪（至多 10s）。
-pub fn browser_session_start() -> Result<u32> {
+/// CDP 浏览器会话就绪信息（Java start JSON 带回；pid 供拼 DevTools socket 名，
+/// 尺寸为 WebView 离屏布局的真实 Display CSS 视口，指纹一致性记录用）。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BrowserSessionInfo {
+    pub pid: u32,
+    pub width: i64,
+    pub height: i64,
+    pub dpr: f64,
+}
+
+/// CDP 浏览器会话：确保长驻调试 WebView 在跑（阻塞至就绪，至多 15s）。
+pub fn browser_session_start() -> Result<BrowserSessionInfo> {
     #[cfg(target_os = "android")]
     {
         jni_bridge::browser_session_start()
@@ -187,6 +196,70 @@ pub fn browser_session_screenshot(abs_path: &str) -> Result<()> {
     {
         let _ = abs_path;
         Err(anyhow!("CDP 浏览器仅在 Android 宿主可用"))
+    }
+}
+
+/// CDP 浏览器悬浮窗：展开面板并挂载 WebView（Google 风控页人工过码入口）。
+/// 无悬浮窗权限时发引导通知并返回错误（park 不阻断）。
+pub fn browser_overlay_expand() -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::browser_overlay_expand()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err(anyhow!("CDP 浏览器仅在 Android 宿主可用"))
+    }
+}
+
+/// CDP 浏览器悬浮窗：收起为气泡（WebView 摘回离屏，agent 不受影响）。
+pub fn browser_overlay_collapse() -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::browser_overlay_collapse()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err(anyhow!("CDP 浏览器仅在 Android 宿主可用"))
+    }
+}
+
+/// CDP 浏览器悬浮窗：摘窗（WebView 回离屏，不销毁会话）。
+pub fn browser_overlay_dismiss() -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::browser_overlay_dismiss()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Err(anyhow!("CDP 浏览器仅在 Android 宿主可用"))
+    }
+}
+
+/// WebView 当前是否挂在悬浮窗面板里（截图分流：attached 走 CDP 截图）。
+/// 查询失败按离屏处理。
+pub fn browser_overlay_attached() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::browser_overlay_attached().unwrap_or(false)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        false
+    }
+}
+
+/// Google 风控页命中：高优通知 + 尽力自动展开悬浮窗。失败仅记日志不阻断
+/// （park 照常等待；桌面无此能力为 no-op）。
+pub fn notify_captcha_detected(url: &str) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::notify_captcha_detected(url)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = url;
+        Ok(())
     }
 }
 
@@ -1503,9 +1576,9 @@ pub mod jni_bridge {
         Ok(())
     }
 
-    /// CDP 浏览器会话：确保长驻调试 WebView 在跑，返回进程 pid（拼 DevTools
-    /// socket 名 webview_devtools_remote_<pid>）。阻塞至 WebView 就绪（至多 10s）。
-    pub(super) fn browser_session_start() -> Result<u32> {
+    /// CDP 浏览器会话：确保长驻调试 WebView 在跑，返回 pid + 真实视口（拼
+    /// DevTools socket 名 webview_devtools_remote_<pid>）。阻塞至就绪（至多 15s）。
+    pub(super) fn browser_session_start() -> Result<super::BrowserSessionInfo> {
         let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
         let mut env = vm
             .attach_current_thread()
@@ -1526,21 +1599,164 @@ pub mod jni_bridge {
             .l()?;
         let value = JString::from(result);
         let payload = env.get_string(&value)?.to_string_lossy().into_owned();
-        let reply: serde_json::Value =
-            serde_json::from_str(&payload).map_err(|e| anyhow!("解析会话应答失败: {e}"))?;
+        parse_session_reply(&payload)
+    }
+
+    /// start/attach/detach 共用的 JSON 应答解析：ok=false 带错误串。
+    fn parse_session_reply(payload: &str) -> Result<super::BrowserSessionInfo> {
+        let reply: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|e| anyhow!("解析会话应答失败: {e}（原文: {payload}）"))?;
         if reply.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(anyhow!(
-                "CDP 浏览器会话启动失败: {}",
+                "CDP 浏览器会话操作失败: {}",
                 reply
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("未知原因")
             ));
         }
-        Ok(reply
-            .get("pid")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("会话应答缺少 pid"))? as u32)
+        Ok(super::BrowserSessionInfo {
+            pid: reply
+                .get("pid")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("会话应答缺少 pid"))? as u32,
+            width: reply.get("width").and_then(Value::as_i64).unwrap_or(0),
+            height: reply.get("height").and_then(Value::as_i64).unwrap_or(0),
+            dpr: reply.get("dpr").and_then(Value::as_f64).unwrap_or(1.0),
+        })
+    }
+
+    /// CDP 浏览器悬浮窗：展开面板并挂载 WebView（风控页人工过码入口）。
+    pub(super) fn browser_overlay_expand() -> Result<()> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加悬浮窗线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let result = env
+            .call_static_method(class, "browserOverlayExpand", "()Ljava/lang/String;", &[])
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.browserOverlayExpand 失败: {error}")
+            })?
+            .l()?;
+        let value = JString::from(result);
+        let payload = env.get_string(&value)?.to_string_lossy().into_owned();
+        let reply: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|e| anyhow!("解析悬浮窗应答失败: {e}（原文: {payload}）"))?;
+        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(anyhow!(
+                "悬浮窗展开失败: {}",
+                reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知原因")
+            ));
+        }
+        Ok(())
+    }
+
+    /// CDP 浏览器悬浮窗：收起为气泡（WebView 摘回离屏）。
+    pub(super) fn browser_overlay_collapse() -> Result<()> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加悬浮窗线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let result = env
+            .call_static_method(class, "browserOverlayCollapse", "()Ljava/lang/String;", &[])
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.browserOverlayCollapse 失败: {error}")
+            })?
+            .l()?;
+        let value = JString::from(result);
+        let payload = env.get_string(&value)?.to_string_lossy().into_owned();
+        let reply: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|e| anyhow!("解析悬浮窗应答失败: {e}（原文: {payload}）"))?;
+        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(anyhow!(
+                "悬浮窗收起失败: {}",
+                reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知原因")
+            ));
+        }
+        Ok(())
+    }
+
+    /// CDP 浏览器悬浮窗：摘窗（WebView 回离屏，不销毁会话）。
+    pub(super) fn browser_overlay_dismiss() -> Result<()> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加悬浮窗线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let result = env
+            .call_static_method(class, "browserOverlayDismiss", "()Ljava/lang/String;", &[])
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.browserOverlayDismiss 失败: {error}")
+            })?
+            .l()?;
+        let value = JString::from(result);
+        let payload = env.get_string(&value)?.to_string_lossy().into_owned();
+        let reply: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|e| anyhow!("解析悬浮窗应答失败: {e}（原文: {payload}）"))?;
+        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(anyhow!(
+                "悬浮窗关闭失败: {}",
+                reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知原因")
+            ));
+        }
+        Ok(())
+    }
+
+    /// WebView 当前是否挂在悬浮窗面板里（截图分流查询）。
+    pub(super) fn browser_overlay_attached() -> Result<bool> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加悬浮窗查询线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let result = env
+            .call_static_method(class, "browserOverlayAttached", "()Z", &[])
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.browserOverlayAttached 失败: {error}")
+            })?;
+        Ok(result.z().unwrap_or(false))
+    }
+
+    /// Google 风控页命中：高优通知 + 尽力自动展开悬浮窗（失败由 Java 侧吞掉记
+    /// 日志，不阻断 park 等待）。
+    pub(super) fn notify_captcha_detected(url: &str) -> Result<()> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加过码通知线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let jurl = env.new_string(url)?;
+        env.call_static_method(
+            class,
+            "notifyCaptchaDetected",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&JObject::from(jurl))],
+        )
+        .map_err(|error| {
+            let _ = env.exception_clear();
+            anyhow!("调用 NativeBridge.notifyCaptchaDetected 失败: {error}")
+        })?;
+        Ok(())
     }
 
     /// CDP 浏览器会话：销毁长驻 WebView（browser_close 工具）。

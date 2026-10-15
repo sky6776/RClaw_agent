@@ -133,7 +133,10 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     // 核心组件与 CLI 同一装配路径；/llmodel 持久化写回数据目录的 rclaw.toml。
     // CDP 浏览器（桌面）：拟人化 browser_* 工具面（协议与安卓共用，见
     // rclaw_tools::cdp_browser；CLI/Termux 不注册，无浏览器工具）。截图落工作区 browser/。
-    let browser_screenshot_dir = layout.base.join("browser");
+    // transport 经 commands::browser_transport_or_init 单源获取：装配重试时
+    // 命令层（「打开浏览器」）与工具注册始终同一实例。
+    let browser_transport =
+        crate::commands::browser_transport_or_init(layout.base.join("browser"));
     let core = rclaw_cli::bootstrap::assemble_core_with(
         &cfg,
         &layout,
@@ -141,12 +144,7 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
         false,
         home::config_path(&home),
         |tools| {
-            rclaw_tools::cdp_browser::register(
-                tools,
-                Arc::new(rclaw_tools::cdp_browser::HeadlessChromiumTransport::new(
-                    browser_screenshot_dir,
-                )),
-            );
+            rclaw_tools::cdp_browser::register(tools, browser_transport);
         },
     )
     .await

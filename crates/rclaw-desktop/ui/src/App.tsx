@@ -59,6 +59,7 @@ import {
 
 type Page =
   | "chat"
+  | "chats"
   | "bots"
   | "tools"
   | "skills"
@@ -70,9 +71,20 @@ type Page =
   | "config"
   | "about";
 
+/** 会话列表页的图标（对话气泡叠层）。 */
+function SessionsIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 3.5h8.5v5H5L2 11V3.5z" />
+      <path d="M6 12.5h7.5L16 15V8.2c0-.7-.4-1.2-1-1.2H14" />
+    </svg>
+  );
+}
+
 /** 导航项：页面 / 标签 / 图标。「对话」列在首位（收起后的图标栏也需要回到对话的入口）。 */
 const NAV: Array<[Page, string, () => ReactNode]> = [
   ["chat", "对话", () => <ChatIcon />],
+  ["chats", "会话", () => <SessionsIcon />],
   ["bots", "智能体", () => <BotsIcon />],
   ["tools", "工具", () => <ToolsIcon />],
   ["skills", "技能", () => <SkillsIcon />],
@@ -1449,10 +1461,10 @@ export default function App() {
       {isMobile && drawerOpen && <DrawerScrim onClose={() => setDrawerOpen(false)} />}
       {/* 侧边栏：展开 = 图标+文字（宽度可拖拽调整）；收起 = 图标栏（悬浮 title 提示）。 */}
       <div
-        className={`sidebar-bg flex shrink-0 flex-col border-r border-[#2a2f3a] bg-[#12151d] ${
+        className={`sidebar-bg flex shrink-0 flex-col overflow-hidden border-r border-[#2a2f3a] bg-[#12151d] ${
           isMobile
             ? drawerOpen
-              ? "fixed inset-y-0 left-0 z-50 w-[17rem] max-w-[85vw] overflow-y-auto shadow-2xl"
+              ? "fixed inset-y-0 left-0 z-50 w-[17rem] max-w-[85vw] shadow-2xl"
               : "hidden"
             : sidebarCollapsed
               ? "w-14"
@@ -1477,6 +1489,18 @@ export default function App() {
           {!sidebarCollapsed && (
             <span className="min-w-0 flex-1 truncate font-semibold text-gray-100">RClaw</span>
           )}
+          {/* 新建对话快捷按钮（RClaw 右侧；新建即回到对话页）。 */}
+          <button
+            onClick={() => {
+              newChat();
+              setPage("chat");
+              setDrawerOpen(false);
+            }}
+            title="新建对话"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-base leading-none text-gray-400 transition hover:bg-[#1a1f29] hover:text-indigo-300"
+          >
+            ＋
+          </button>
           <button
             onClick={toggleSidebar}
             title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
@@ -1486,7 +1510,30 @@ export default function App() {
           </button>
         </div>
 
-        <nav className={`space-y-1 ${sidebarCollapsed ? "px-2" : "px-3"}`}>
+        {/* 侧边栏顶部常驻入口：浏览器（应用内面板，手动上网/人工过码）。
+            桌面版入口在标题栏右上角（地球图标），此处仅移动端抽屉展示。 */}
+        {isMobile && (
+          <div className="px-3 pb-1">
+            <button
+              onClick={() => {
+                void api.browserToggleVisible().catch(() => {});
+                setDrawerOpen(false);
+              }}
+              className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm text-gray-300 transition hover:bg-[#1a1f29] hover:text-gray-100 max-md:py-2"
+            >
+              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="8" cy="8" r="6.2" />
+                  <path d="M1.8 8h12.4M8 1.8c1.9 1.7 2.9 3.8 2.9 6.2S9.9 12.5 8 14.2C6.1 12.5 5.1 10.4 5.1 8S6.1 3.5 8 1.8z" />
+                </svg>
+              </span>
+              浏览器
+            </button>
+          </div>
+        )}
+
+        {/* 导航区自滚（条目多时上下滑动，不再把底部会话区挤走）。 */}
+        <nav className={`min-h-0 flex-1 space-y-1 overflow-y-auto ${sidebarCollapsed ? "px-2" : "px-3"}`}>
           {/* 任务概览仅移动端抽屉展示（桌面由右侧 TaskPanel 承担）：
               与其他栏目同级，点击进入专门的概览详情页。
               「关于」固定置底：先渲染除它以外的栏目，安卓的主题入口垫在
@@ -1561,193 +1608,6 @@ export default function App() {
           ))}
         </nav>
 
-        {/* 会话列表（收起为图标栏时隐藏）；移动端保证最小可见高度，
-            超出部分由侧栏整体滚动承接（导航/状态块不再挤占会话区）。 */}
-        {!sidebarCollapsed && (
-        <div className="mt-5 flex min-h-0 flex-1 flex-col px-3 max-md:mt-2">
-          <div className="mb-1 flex items-center justify-between px-1">
-            <span className="text-xs font-medium text-gray-500">会话</span>
-            <button
-              onClick={() => {
-                newChat();
-                setDrawerOpen(false);
-              }}
-              title="新建对话"
-              className="rounded-md px-1.5 text-sm text-gray-400 transition hover:bg-[#1a1f29] hover:text-indigo-300"
-            >
-              ＋
-            </button>
-          </div>
-          {/* todo（zcode 会话面板同款信息位）：最近一个未收尾计划的步骤清单，
-              与消息流的「流程步骤」卡片同源数据。 */}
-          {latestPlan && !latestPlan.completed && latestPlan.steps.length > 0 && (
-            <div className="mb-2 rounded-lg border border-[#2a2f3a] bg-[#141821] px-2.5 py-2">
-              <div className="flex items-center justify-between text-[11px] text-gray-500">
-                <span className="truncate">📋 {latestPlan.name}</span>
-                <span>
-                  {latestPlan.steps.filter((s) => s.status === "pending").length} 项待办
-                </span>
-              </div>
-              <ul className="mt-1 space-y-0.5">
-                {latestPlan.steps.slice(0, 8).map((step) => (
-                  <li key={step.id} className="flex items-start gap-1.5 text-[11px] leading-snug">
-                    <span
-                      className={
-                        step.status === "succeeded"
-                          ? "text-emerald-400"
-                          : step.status === "failed"
-                            ? "text-red-400"
-                            : step.status === "skipped"
-                              ? "text-gray-600"
-                              : step.status === "running"
-                                ? "text-indigo-400"
-                                : step.status === "verifying"
-                                  ? "text-amber-300"
-                                  : "text-amber-400"
-                      }
-                    >
-                      {step.status === "succeeded"
-                        ? "✓"
-                        : step.status === "failed"
-                          ? "✗"
-                          : step.status === "skipped"
-                            ? "⤼"
-                            : step.status === "running"
-                              ? "◌"
-                              : step.status === "verifying"
-                                ? "🔍"
-                                : "☐"}
-                    </span>
-                    <span
-                      className="min-w-0 truncate text-gray-400"
-                      title={step.task || step.summary}
-                    >
-                      {step.id}
-                      {step.task ? ` · ${step.task}` : ""}
-                    </span>
-                  </li>
-                ))}
-                {latestPlan.steps.length > 8 && (
-                  <li className="pl-4 text-[10px] text-gray-600">
-                    … 共 {latestPlan.steps.length} 步
-                  </li>
-                )}
-              </ul>
-            </div>
-          )}
-          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-2 max-md:min-h-[9rem]">
-            {chats.filter((c) => !c.archived).length === 0 && (
-              <div className="px-2 py-1 text-xs text-gray-600">暂无会话</div>
-            )}
-            {chats
-              .filter((c) => !c.archived)
-              .map((c) => (
-                <div
-                  key={c.chat_id}
-                  data-chat-row
-                  className={`group flex items-center rounded-lg transition ${
-                    activeId === c.chat_id && page === "chat"
-                      ? "bg-[#1a2030] text-indigo-200"
-                      : "text-gray-400 hover:bg-[#1a1f29]"
-                  }`}
-                >
-                  {/* 会话工作状态：agent 工作中 = 转圈，turn 结束 = 绿点。 */}
-                  {renamingId !== c.chat_id &&
-                    (busyByChat[c.chat_id] ? (
-                      <span
-                        title="Agent 工作中"
-                        className="ml-2.5 h-2.5 w-2.5 shrink-0 animate-spin rounded-full border-[1.5px] border-indigo-400 border-t-transparent"
-                      />
-                    ) : (
-                      <span
-                        title="空闲"
-                        className="ml-3 h-2 w-2 shrink-0 rounded-full bg-emerald-500"
-                      />
-                    ))}
-                  {renamingId === c.chat_id ? (
-                    <input
-                      autoFocus
-                      value={renameDraft}
-                      onChange={(e) => setRenameDraft(e.target.value)}
-                      onClick={(e) => e.stopPropagation()}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          void commitRename();
-                        } else if (e.key === "Escape") {
-                          renameCancelled.current = true;
-                          setRenamingId(null);
-                        }
-                      }}
-                      onBlur={() => void commitRename()}
-                      maxLength={120}
-                      placeholder={c.chat_id}
-                      className="min-w-0 flex-1 rounded-md border border-indigo-500/50 bg-[#161a22] px-2 py-1 text-xs text-gray-200 outline-none"
-                    />
-                  ) : (
-                    <button
-                      onClick={() => void openChat(c.chat_id)}
-                      onDoubleClick={() => startRename(c.chat_id, c.title || c.chat_id)}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        setChatMenu({
-                          chatId: c.chat_id,
-                          title: c.title || c.chat_id,
-                          x: e.clientX,
-                          // 靠底行向上弹，避免菜单溢出窗口。
-                          y: Math.min(e.clientY, window.innerHeight - 170),
-                        });
-                      }}
-                      className="min-w-0 flex-1 px-2 py-1.5 text-left max-md:py-2.5"
-                      title={`${c.title || c.chat_id}（双击重命名，右键更多操作）`}
-                    >
-                      <div className="truncate text-xs max-md:text-[13px]">
-                        {c.chat_id.startsWith("bot-") ? "🤖 " : ""}
-                        {c.title || c.chat_id}
-                      </div>
-                    </button>
-                  )}
-                  {!busyByChat[c.chat_id] && renamingId !== c.chat_id && (
-                    <>
-                      {/* 移动端操作入口（触屏无右键/hover）：弹出重命名/导出/归档菜单 */}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const r = e.currentTarget.getBoundingClientRect();
-                          setChatMenu({
-                            chatId: c.chat_id,
-                            title: c.title || c.chat_id,
-                            x: Math.min(r.left, window.innerWidth - 176),
-                            y: Math.min(r.bottom + 4, window.innerHeight - 170),
-                          });
-                        }}
-                        title="会话操作"
-                        className="mr-0.5 hidden shrink-0 rounded px-1.5 py-0.5 text-xs leading-none text-gray-500 transition hover:text-gray-200 max-md:block"
-                      >
-                        ⋯
-                      </button>
-                      <button
-                        onClick={() => void archiveChat(c.chat_id)}
-                        title="归档此会话"
-                        className="mr-1 hidden rounded px-1 text-[10px] text-gray-500 transition hover:text-amber-300 group-hover:block"
-                      >
-                        归档
-                      </button>
-                    </>
-                  )}
-                </div>
-              ))}
-            {/* 已归档（折叠展示，可恢复/删除） */}
-            {chats.some((c) => c.archived) && (
-              <ArchivedSection
-                items={chats.filter((c) => c.archived)}
-                onRestore={(id) => void restoreChat(id)}
-                onDelete={(id, title) => setDeleteConfirm({ chatId: id, title })}
-              />
-            )}
-          </div>
-        </div>
-        )}
-
         {/* 移动端：上下文窗口 / 内存占用（数据路径上方；桌面在 TaskPanel）。
             单行紧凑卡：小圆点颜色表达上下文压力（>80% 变红，替代桌面进度条）。 */}
         {isMobile && (
@@ -1816,6 +1676,195 @@ export default function App() {
             </div>
           </div>
         )}
+        {agentState === "ready" && page === "chats" && (
+          <div className="h-full overflow-y-auto bg-[#0f131b] px-5 py-4 max-md:px-3">
+        {/* 会话列表（收起为图标栏时隐藏）；移动端保证最小可见高度，
+            超出部分由侧栏整体滚动承接（导航/状态块不再挤占会话区）。 */}
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-base font-semibold text-gray-100">会话</h2>
+          <button
+            onClick={() => {
+              newChat();
+              setPage("chat");
+            }}
+            className="rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300"
+          >
+            ＋ 新建对话
+          </button>
+        </div>
+          {/* todo（zcode 会话面板同款信息位）：最近一个未收尾计划的步骤清单，
+              与消息流的「流程步骤」卡片同源数据。 */}
+          {latestPlan && !latestPlan.completed && latestPlan.steps.length > 0 && (
+            <div className="mb-2 rounded-lg border border-[#2a2f3a] bg-[#141821] px-2.5 py-2">
+              <div className="flex items-center justify-between text-[11px] text-gray-500">
+                <span className="truncate">📋 {latestPlan.name}</span>
+                <span>
+                  {latestPlan.steps.filter((s) => s.status === "pending").length} 项待办
+                </span>
+              </div>
+              <ul className="mt-1 space-y-0.5">
+                {latestPlan.steps.slice(0, 8).map((step) => (
+                  <li key={step.id} className="flex items-start gap-1.5 text-[11px] leading-snug">
+                    <span
+                      className={
+                        step.status === "succeeded"
+                          ? "text-emerald-400"
+                          : step.status === "failed"
+                            ? "text-red-400"
+                            : step.status === "skipped"
+                              ? "text-gray-600"
+                              : step.status === "running"
+                                ? "text-indigo-400"
+                                : step.status === "verifying"
+                                  ? "text-amber-300"
+                                  : "text-amber-400"
+                      }
+                    >
+                      {step.status === "succeeded"
+                        ? "✓"
+                        : step.status === "failed"
+                          ? "✗"
+                          : step.status === "skipped"
+                            ? "⤼"
+                            : step.status === "running"
+                              ? "◌"
+                              : step.status === "verifying"
+                                ? "🔍"
+                                : "☐"}
+                    </span>
+                    <span
+                      className="min-w-0 truncate text-gray-400"
+                      title={step.task || step.summary}
+                    >
+                      {step.id}
+                      {step.task ? ` · ${step.task}` : ""}
+                    </span>
+                  </li>
+                ))}
+                {latestPlan.steps.length > 8 && (
+                  <li className="pl-4 text-[10px] text-gray-600">
+                    … 共 {latestPlan.steps.length} 步
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
+          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-2">
+            {chats.filter((c) => !c.archived).length === 0 && (
+              <div className="px-2 py-1 text-xs text-gray-600">暂无会话</div>
+            )}
+            {chats
+              .filter((c) => !c.archived)
+              .map((c) => (
+                <div
+                  key={c.chat_id}
+                  data-chat-row
+                  className={`group flex items-center rounded-lg transition ${
+                    activeId === c.chat_id
+                      ? "bg-[#1a2030] text-indigo-200"
+                      : "text-gray-400 hover:bg-[#1a1f29]"
+                  }`}
+                >
+                  {/* 会话工作状态：agent 工作中 = 转圈，turn 结束 = 绿点。 */}
+                  {renamingId !== c.chat_id &&
+                    (busyByChat[c.chat_id] ? (
+                      <span
+                        title="Agent 工作中"
+                        className="ml-2.5 h-2.5 w-2.5 shrink-0 animate-spin rounded-full border-[1.5px] border-indigo-400 border-t-transparent"
+                      />
+                    ) : (
+                      <span
+                        title="空闲"
+                        className="ml-3 h-2 w-2 shrink-0 rounded-full bg-emerald-500"
+                      />
+                    ))}
+                  {renamingId === c.chat_id ? (
+                    <input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={(e) => setRenameDraft(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          void commitRename();
+                        } else if (e.key === "Escape") {
+                          renameCancelled.current = true;
+                          setRenamingId(null);
+                        }
+                      }}
+                      onBlur={() => void commitRename()}
+                      maxLength={120}
+                      placeholder={c.chat_id}
+                      className="min-w-0 flex-1 rounded-md border border-indigo-500/50 bg-[#161a22] px-2 py-1 text-xs text-gray-200 outline-none"
+                    />
+                  ) : (
+                    <button
+                      onClick={() => {
+                        void openChat(c.chat_id);
+                        setPage("chat");
+                      }}
+                      onDoubleClick={() => startRename(c.chat_id, c.title || c.chat_id)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setChatMenu({
+                          chatId: c.chat_id,
+                          title: c.title || c.chat_id,
+                          x: e.clientX,
+                          // 靠底行向上弹，避免菜单溢出窗口。
+                          y: Math.min(e.clientY, window.innerHeight - 170),
+                        });
+                      }}
+                      className="min-w-0 flex-1 px-2 py-1.5 text-left max-md:py-2.5"
+                      title={`${c.title || c.chat_id}（双击重命名，右键更多操作）`}
+                    >
+                      <div className="truncate text-xs max-md:text-[13px]">
+                        {c.chat_id.startsWith("bot-") ? "🤖 " : ""}
+                        {c.title || c.chat_id}
+                      </div>
+                    </button>
+                  )}
+                  {!busyByChat[c.chat_id] && renamingId !== c.chat_id && (
+                    <>
+                      {/* 移动端操作入口（触屏无右键/hover）：弹出重命名/导出/归档菜单 */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const r = e.currentTarget.getBoundingClientRect();
+                          setChatMenu({
+                            chatId: c.chat_id,
+                            title: c.title || c.chat_id,
+                            x: Math.min(r.left, window.innerWidth - 176),
+                            y: Math.min(r.bottom + 4, window.innerHeight - 170),
+                          });
+                        }}
+                        title="会话操作"
+                        className="mr-0.5 hidden shrink-0 rounded px-1.5 py-0.5 text-xs leading-none text-gray-500 transition hover:text-gray-200 max-md:block"
+                      >
+                        ⋯
+                      </button>
+                      <button
+                        onClick={() => void archiveChat(c.chat_id)}
+                        title="归档此会话"
+                        className="mr-1 hidden rounded px-1 text-[10px] text-gray-500 transition hover:text-amber-300 group-hover:block"
+                      >
+                        归档
+                      </button>
+                    </>
+                  )}
+                </div>
+              ))}
+            {/* 已归档（折叠展示，可恢复/删除） */}
+            {chats.some((c) => c.archived) && (
+              <ArchivedSection
+                items={chats.filter((c) => c.archived)}
+                onRestore={(id) => void restoreChat(id)}
+                onDelete={(id, title) => setDeleteConfirm({ chatId: id, title })}
+              />
+            )}
+          </div>
+          </div>
+        )}
+
         {agentState === "ready" && page === "chat" && (
           <Chat
             entries={activeEntries}

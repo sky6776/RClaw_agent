@@ -7,19 +7,33 @@
 //! - 安卓（rclaw-android::cdp_browser::AndroidTransport）：长驻调试 WebView，
 //!   经 abstract unix socket 直连。
 //!
-//! Google 拒绝的根因治理 + 拟人化（反爬优先策略）：`Fetch` 拦截摘掉 WebView
-//! 网络栈强加的 `X-Requested-With`（应用包名指纹）；会话建立时 UA 清洗覆写
-//! （桌面去 `HeadlessChrome` 标记、安卓去 WebView `; wv` 标记，并带一致性
-//! Client Hints 元数据），`navigator.webdriver` 掩蔽；交互全部走真实输入
-//! 事件——鼠标移动轨迹 + 按抬起随机节奏的点击、逐格抖动的滚轮滑动、IME
-//! 通路输入；Cookie 由真实网络栈跨调用保持；navigate 结果带 `/sorry/`
-//! （CAPTCHA）与 consent 同意页检测，如实上报并给出建议。
+//! Google 拒绝的根因治理 + 拟人化（反爬优先策略）：
+//! - 会话建立：UA 清洗覆写（桌面去 `HeadlessChrome`、安卓去 WebView `; wv`，
+//!   带一致性 Client Hints 元数据）；`Emulation.setFocusEmulationEnabled` +
+//!   stealth 注入（`navigator.webdriver` 掩蔽、`document.hasFocus()` 前台化、
+//!   `window.chrome` shim、PDF Viewer 三件套 plugins/mimeTypes——均为真机
+//!   bot.sannysoft 实测暴露项；WebGL 渲染器实测已是真 GPU【Adreno 616，
+//!   离屏 + LAYER_TYPE_SOFTWARE 不影响 WebGL 的 GL 上下文】，不做 hook，
+//!   canvas 噪声/字体/AudioContext 指纹破坏正常页面或性价比低，明确不做）；
+//! - `Fetch` 拦截摘掉 WebView 网络栈强加的 `X-Requested-With`（应用包名指纹）；
+//! - 交互事件词汇随 UA 判定：移动端（Android UA）走 `Input.dispatchTouchEvent`
+//!   触摸事件 + 逐字符键盘事件（手机不发鼠标事件，`insertText` 不产生键盘
+//!   事件流——事件词汇与 UA 矛盾是行为检测的直接证据），桌面保持鼠标/滚轮；
+//! - Cookie 由真实网络栈跨调用保持（Java 侧 teardown 时 `CookieManager.flush`
+//!   落盘，进程被杀不丢已养的风控信誉）。
+//!
+//! Google 风控页（CAPTCHA）park/long-poll：browser_navigate 命中风控页时本次
+//! 调用不返回——外呼 transport 通知用户（安卓：高优通知 + 悬浮窗展开人工过码；
+//! 桌面：无外呼），然后 select 三臂等待：1.5s 轮询页面恢复（用户过完码 Google
+//! 自动跳回，无需 Java→Rust 信号）/ 180s 超时标注返回 / 连接断开（悬浮窗「关闭
+//! 会话」）报取消。恢复后重新提取，agent 同回合无缝继续。
 //!
 //! 检索不设专用工具：模型直接 navigate 到任意搜索引擎的结果页 URL
 //! （EXTRACT_JS 按主机名解析 SERP 并过滤广告），引擎自由选择。
 //!
-//! 截图是例外：安卓离屏 WebView 没有合成器帧（`Page.captureScreenshot` 出
-//! 空白），走 `View.draw` 软件位图；桌面无头实例可直接 CDP 截图。
+//! 截图：安卓按悬浮窗挂载状态分流——attached 有真实合成器帧走
+//! `Page.captureScreenshot`，离屏走 `View.draw` 软件位图（CDP 截图空白）；
+//! 桌面无头实例直接 CDP 截图。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,6 +66,9 @@ pub struct PagePayload {
     /// 风控/同意页标注（提取 JS 填写；页面正常时为空串）。
     #[serde(default)]
     pub blocked: String,
+    /// park 过码等待的结果说明（Rust 侧填写；非提取 JS 产出，未 park 为空）。
+    #[serde(default)]
+    pub park_note: String,
 }
 
 /// SERP 单条结果（提取 JS 解析并过滤广告后产出）。
@@ -499,22 +516,61 @@ pub trait DevtoolsTransport: Send + Sync {
     async fn shutdown(&self) -> Result<(), String>;
     /// 截图落点目录（工作区内，如 <agent>/browser）。
     fn screenshot_dir(&self) -> std::path::PathBuf;
-    /// 离屏截图到 dest（PNG）。安卓走 View.draw 软件位图（离屏无合成器帧），
-    /// 桌面走 Page.captureScreenshot。返回人读结果文案。
+    /// 截图到 dest（PNG）。安卓按悬浮窗挂载状态分流（attached→CDP capture /
+    /// 离屏→View.draw），桌面走 Page.captureScreenshot。返回人读结果文案。
     async fn capture_screenshot(
         &self,
         session: &Session,
         dest: &std::path::Path,
     ) -> Result<String, String>;
+    /// Google 风控页命中时的宿主外呼（安卓：高优通知 + 自动展开悬浮窗供人工
+    /// 过码；桌面无悬浮窗能力，空实现——park 仍等待 reCAPTCHA 自动放行/超时）。
+    async fn notify_captcha(&self, _url: &str) {}
+    /// 宿主设备的真实 CSS 视口（宽, 高, dpr）：会话建立时用
+    /// Emulation.setDeviceMetricsOverride 钉住渲染视口，使 innerWidth/innerHeight
+    /// 与真机 Chrome Mobile 一致。桌面无头实例窗口自洽，返回 None 跳过。
+    fn device_metrics(&self) -> Option<(i64, i64, f64)> {
+        None
+    }
 }
 
-/// 桌面端传输：拉起本机 Chrome/Edge 无头实例，经 TCP DevTools 端口驱动。
+/// CDP `Page.captureScreenshot` → PNG 落盘（传输双轨的 CDP 轨：桌面无头实例
+/// 与安卓悬浮窗 attached 态都有真实合成器帧）。返回 base64 解码字节数。
+pub async fn capture_screenshot_via_cdp(
+    session: &Session,
+    dest: &std::path::Path,
+) -> Result<usize, String> {
+    let reply = session
+        .call(
+            "Page.captureScreenshot",
+            json!({ "format": "png" }),
+            Duration::from_secs(20),
+        )
+        .await?;
+    let data = reply
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "截图无数据（离屏渲染未就绪？）".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| format!("解码截图失败: {e}"))?;
+    tokio::fs::write(dest, &bytes)
+        .await
+        .map_err(|e| format!("写入截图失败: {e}"))?;
+    Ok(bytes.len())
+}
+
+/// 桌面端传输：拉起本机 Chrome/Edge 实例，经 TCP DevTools 端口驱动。
 /// 浏览器可执行文件按 zcode cdp 后端同款的候选路径表解析，可用
-/// `RCLAW_BROWSER_EXE` 覆盖。
+/// `RCLAW_BROWSER_EXE` 覆盖。两种形态：无头（默认，agent 专用）与可见
+/// （`set_visible(true)`：真实浏览器窗口，用户手动上网与 agent 共用同一
+/// 实例/会话——「像 Firefox 一样上网」的桌面形态；切换经 close + 重连生效）。
 pub struct HeadlessChromiumTransport {
     inner: AsyncMutex<Option<RunningChromium>>,
     screenshot_dir: std::path::PathBuf,
     profile_dir: std::path::PathBuf,
+    /// 可见模式：true = 下次拉起带窗口的真实浏览器（共享给人用）。
+    visible: std::sync::atomic::AtomicBool,
 }
 
 struct RunningChromium {
@@ -523,15 +579,22 @@ struct RunningChromium {
 }
 
 /// 进程级登记的子进程：app 退出钩子（[`kill_headless_processes`]）唯一所有者，
-/// 实例侧只留 endpoint（重连复用）。
-static HEADLESS_CHILD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+/// 实例侧只留 endpoint（重连复用）。Edge 155 起「启动器进程」会立即退出并
+/// 把真浏览器拉成分离进程——child 句柄随之失效，故连 profile 目录一起登记，
+/// 关闭时按命令行引用兜底查杀分离进程。
+static HEADLESS_CHILD: std::sync::Mutex<Option<(std::process::Child, std::path::PathBuf)>> =
+    std::sync::Mutex::new(None);
 
 /// 杀掉登记的无头 Chromium（app 退出钩子 / 会话关闭共用）。
 pub fn kill_headless_processes() {
     if let Ok(mut guard) = HEADLESS_CHILD.lock() {
-        if let Some(mut child) = guard.take() {
+        if let Some((mut child, profile)) = guard.take() {
             let _ = child.kill();
             let _ = child.wait();
+            // 启动器交接后真浏览器是分离进程，child 杀不到：按命令行引用
+            // profile 目录兜底查杀（启动清扫同款机制；同步执行，关闭路径
+            // 多花 ~1s 可接受）。只杀不删——profile 留着养 Cookie 信誉。
+            kill_orphans_holding_profile(&profile, false);
         }
     }
 }
@@ -582,10 +645,11 @@ fn sweep_stale_orphans() {
     #[cfg(windows)]
     {
         // 判活下沉进 PowerShell（Get-Process）；force=true 的条目跳过判活。
+        // 清扫=连目录一起删（属主已死的残留）。
         let list: Vec<serde_json::Value> = candidates
             .iter()
             .map(|(path, owner)| {
-                json!({"path": path.to_string_lossy(), "owner": owner, "force": false})
+                json!({"path": path.to_string_lossy(), "owner": owner, "force": false, "remove": true})
             })
             .collect();
         windows_kill_and_remove(&list, own_pid);
@@ -723,7 +787,7 @@ fn windows_kill_and_remove(entries: &[serde_json::Value], own_pid: u32) {
          if ($after -eq [char]0 -or $after -eq ' ' -or $after -eq '\"' -or $after -eq \"'\") {{ \
          Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; break }} \
          $i = $cl.IndexOf($d, $e2, [System.StringComparison]::Ordinal) }} }} }}; \
-         Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }} }}",
+         if ($e.remove) {{ Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }} }} }}",
         own = own_pid
     );
     // CREATE_NO_WINDOW：不闪控制台。脚本经 stdin 传入（`-Command -`）：
@@ -747,21 +811,24 @@ fn windows_kill_and_remove(entries: &[serde_json::Value], own_pid: u32) {
 /// 清扫只跑一次（进程生命周期内一次即可）。
 static SWEEP_ONCE: std::sync::Once = std::sync::Once::new();
 
-/// 杀掉命令行里引用了本 profile 目录的【无头】浏览器实例：启动失败的清场
-/// 路径用（重置 profile 前先清占用者）。目录归本进程所有，无需判活，
-/// force 直杀。
-fn kill_orphans_holding_profile(profile_dir: &std::path::Path) {
+/// 杀掉命令行里引用了本 profile 目录的【无头】浏览器实例。`remove` 决定是否
+/// 连目录一起删：profile 重置前的清场 = true；正常关闭/重连 = false——关闭
+/// 路径删 profile 会把养好的 Cookie/登录态一起抹掉（风控信誉清零）。
+fn kill_orphans_holding_profile(profile_dir: &std::path::Path, remove: bool) {
     #[cfg(windows)]
     {
         let list = vec![json!({
             "path": profile_dir.to_string_lossy(),
             "owner": null,
             "force": true,
+            "remove": remove,
         })];
         windows_kill_and_remove(&list, std::process::id());
     }
     #[cfg(not(windows))]
     {
+        // 非 Windows 的查杀只杀不删；需要删目录由调用方自行 remove_dir_all。
+        let _ = remove;
         kill_profile_holders(std::slice::from_ref(&profile_dir.to_path_buf()));
     }
 }
@@ -774,7 +841,19 @@ impl HeadlessChromiumTransport {
             // 按进程隔离：两个应用实例各用各的 profile，不互相抢锁（崩溃残留的
             // 孤儿由 kill_orphans_holding_profile 按各自目录特征清杀）。
             profile_dir: std::env::temp_dir().join(format!("rclaw-browser-profile-{}", std::process::id())),
+            visible: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 切换可见模式（true = 用户共享的真实浏览器窗口）。已在跑的实例不受影响：
+    /// 调用方随后 close + 重连即以新形态拉起（profile 延续，cookie 信誉保留）。
+    pub fn set_visible(&self, visible: bool) {
+        self.visible
+            .store(visible, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 候选可执行文件：环境覆盖 → Windows 常规安装位 → Linux/macOS 常规位。
@@ -832,23 +911,37 @@ impl HeadlessChromiumTransport {
         fn launch_blocking(
             exe: std::path::PathBuf,
             profile: std::path::PathBuf,
+            visible: bool,
         ) -> Result<(std::process::Child, u16), String> {
             use std::io::BufRead as _;
+            // 上次崩溃实例可能遗留旧端口文件：启动前先清（spawn 之后再清会
+            // 竞态删除本次的就绪信号——Edge 写文件早于我们的删除）。NotFound
+            // 属正常；删除失败也只是退回 stderr 行信号，不阻断。
+            let port_file = profile.join("DevToolsActivePort");
+            match std::fs::remove_file(&port_file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::debug!("清理旧 DevToolsActivePort 失败: {error}"),
+            }
             let mut command = std::process::Command::new(&exe);
+            if visible {
+                // 可见模式 = 真实浏览器窗口（用户手动上网共享）：无头/禁 GPU/
+                // 隐藏滚动条一律不设（真实渲染与滚动条），窗口拉起即最大化。
+                command.arg("--start-maximized");
+            } else {
+                command.arg("--headless=new");
+            }
             command
-                .arg("--headless=new")
                 .arg("--remote-debugging-port=0")
                 // Chromium 开关值必须同参数（= 连接）：拆成两个参数时路径会被当
                 // 成位置参数（URL），profile 落回默认目录——撞上已运行的实例
                 // 就立即退出，stderr 随之关闭。
                 .arg(format!("--user-data-dir={}", profile.display()))
-                .args([
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-gpu",
-                    "--hide-scrollbars",
-                    "about:blank",
-                ])
+                .args(["--no-first-run", "--no-default-browser-check", "about:blank"]);
+            if !visible {
+                command.args(["--disable-gpu", "--hide-scrollbars"]);
+            }
+            command
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped());
             let mut child = command
@@ -859,9 +952,12 @@ impl HeadlessChromiumTransport {
                 .take()
                 .ok_or_else(|| "无头浏览器 stderr 不可读".to_string())?;
             // stderr 必须持续排空——管道写满（64KB）会反过来阻塞浏览器进程本身
-            // （Playwright 同款后台泵）。泵线程读到 DevTools 行即经通道通知本路径
-            // 立刻返回，之后继续排到 EOF（随浏览器关闭自然结束）。
+            // （Playwright 同款后台泵）。DevTools 端口的就绪信号有 两 路（先到
+            // 先得）：stderr 的 "DevTools listening on ws://…" 行（老内核），
+            // 以及 profile 目录下 DevToolsActivePort 文件首行（Chromium 标准
+            // 行为；实测 Edge 155 起 stderr 行不再输出，只剩文件信号）。
             let (tx, rx) = std::sync::mpsc::channel::<(Option<u16>, Vec<String>)>();
+            let mut sent = false;
             std::thread::spawn(move || {
                 let mut seen: Vec<String> = Vec::new();
                 let mut port: Option<u16> = None;
@@ -879,6 +975,7 @@ impl HeadlessChromiumTransport {
                             authority.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
                         {
                             port = Some(found);
+                            sent = true;
                             let _ = tx.send((port, std::mem::take(&mut seen)));
                             continue;
                         }
@@ -887,25 +984,58 @@ impl HeadlessChromiumTransport {
                         seen.push(line);
                     }
                 }
-                // EOF = 进程已退出（或从未报端口）：把结局带回主路径。
-                let _ = tx.send((port, seen));
-            });
-            match rx.recv_timeout(Duration::from_secs(20)) {
-                Ok((Some(port), _)) => Ok((child, port)),
-                Ok((None, seen)) => {
-                    // EOF = 进程已退出：带上退出状态便于定位（策略拦截 / 参数
-                    // 不识别 / profile 锁等都会秒退）。
-                    let status = child.wait().map_err(|e| format!("wait 失败: {e}"))?;
-                    Err(format!(
-                        "无头浏览器未报 DevTools 端口即退出（前几行: {seen:?}，退出状态: {status}）"
-                    ))
+                // EOF = 进程已退出（或从未报端口）：把结局带回主路径（端口已
+                // 发过则不重发——主路径可能已消费）。
+                if !sent {
+                    let _ = tx.send((port, seen));
                 }
-                Err(_) => {
-                    // 超时：显式杀掉，防孤儿实例锁住 profile 卡死下次启动。
+            });
+            let port_file = profile.join("DevToolsActivePort");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok((Some(port), _)) = rx.try_recv() {
+                    return Ok((child, port));
+                }
+                if let Ok(content) = std::fs::read_to_string(&port_file) {
+                    if let Some(port) = content
+                        .lines()
+                        .next()
+                        .and_then(|line| line.trim().parse::<u16>().ok())
+                    {
+                        return Ok((child, port));
+                    }
+                }
+                match child.try_wait() {
+                    // 非零退出 = 真失败（策略拦截 / profile 锁 / 参数不识别），
+                    // 快速报错带回 stderr 前几行。
+                    Ok(Some(status)) if !status.success() => {
+                        let mut seen = Vec::new();
+                        while let Ok((_, lines)) = rx.try_recv() {
+                            if seen.is_empty() {
+                                seen = lines;
+                            }
+                        }
+                        return Err(format!(
+                            "无头浏览器未报调试端口即退出（前几行: {seen:?}，退出状态: {status}）"
+                        ));
+                    }
+                    // 退出码 0 = Edge 155+ 启动器交接：真浏览器是分离进程，
+                    // 端口文件随后出现——继续等文件到 deadline，不判失败。
+                    Ok(Some(_)) => {}
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Err(format!("探测无头浏览器状态失败: {error}"));
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    Err("等待无头浏览器调试端口超时".to_string())
+                    return Err(
+                        "等待无头浏览器调试端口超时（20s 内未读到 DevToolsActivePort / stderr 端口行）"
+                            .to_string(),
+                    );
                 }
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
 
@@ -920,7 +1050,8 @@ impl HeadlessChromiumTransport {
         tokio::fs::create_dir_all(&profile)
             .await
             .map_err(|e| format!("创建浏览器 profile 目录失败: {e}"))?;
-        let job = tokio::task::spawn_blocking(move || launch_blocking(exe, profile));
+        let visible = self.is_visible();
+        let job = tokio::task::spawn_blocking(move || launch_blocking(exe, profile, visible));
         // stderr 行读取是阻塞循环：外层限时兜底（内核异常时不无限等）。
         let (child, port) = tokio::time::timeout(Duration::from_secs(20), job)
             .await
@@ -928,7 +1059,7 @@ impl HeadlessChromiumTransport {
             .map_err(|e| format!("调度无头浏览器启动失败: {e}"))??;
         tracing::info!(port, "CDP 无头浏览器已拉起");
         if let Ok(mut guard) = HEADLESS_CHILD.lock() {
-            *guard = Some(child);
+            *guard = Some((child, self.profile_dir.clone()));
         }
         Ok(RunningChromium {
             endpoint: format!("http://127.0.0.1:{port}"),
@@ -982,7 +1113,7 @@ impl DevtoolsTransport for HeadlessChromiumTransport {
                 // profile 半删除损坏时则静默卡死。清孤儿 → 重置 → 重试一次。
                 tracing::warn!("无头浏览器启动失败（{error}），清孤儿并重置 profile 后重试");
                 kill_headless_processes();
-                kill_orphans_holding_profile(&self.profile_dir);
+                kill_orphans_holding_profile(&self.profile_dir, false);
                 let _ = tokio::fs::remove_dir_all(&self.profile_dir).await;
                 self.launch().await?
             }
@@ -1010,23 +1141,7 @@ impl DevtoolsTransport for HeadlessChromiumTransport {
         session: &Session,
         dest: &std::path::Path,
     ) -> Result<String, String> {
-        let reply = session
-            .call(
-                "Page.captureScreenshot",
-                json!({ "format": "png" }),
-                Duration::from_secs(20),
-            )
-            .await?;
-        let data = reply
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "截图无数据（离屏渲染未就绪？）".to_string())?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|e| format!("解码截图失败: {e}"))?;
-        tokio::fs::write(dest, &bytes)
-            .await
-            .map_err(|e| format!("写入截图失败: {e}"))?;
+        capture_screenshot_via_cdp(session, dest).await?;
         let name = dest
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1047,6 +1162,26 @@ pub struct CdpBrowser {
     /// 「导航→等加载→提取」这类多步事务必须整体串行，否则两个并发取页会互相
     /// 覆盖页面、各自提取到对方的 URL。
     op: AsyncMutex<()>,
+    /// 会话 UA 的事件词汇判定：true = 移动端（Android UA → touch 事件 +
+    /// 逐字符键盘事件），false = 桌面（鼠标/滚轮）。会话建立时由
+    /// humanize 的 UA 读取更新（UA 是会话级覆写，词汇必须同源）。
+    mobile_input: std::sync::atomic::AtomicBool,
+}
+
+/// park 过码等待：页面恢复轮询间隔。
+const PARK_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+/// park 过码等待总超时（到点标注返回，agent 指引报告用户并停止重试）。
+const PARK_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// park 等待的结局。
+enum ParkOutcome {
+    /// 页面已离开风控页（用户过码或 reCAPTCHA 自动放行），携带等待秒数与
+    /// 恢复页的重新提取结果。
+    Recovered(u64, PagePayload),
+    /// 超时未恢复：带当前（风控）页的提取结果。
+    Timeout(PagePayload),
+    /// 连接断开：悬浮窗「关闭会话」销毁了 WebView。
+    Cancelled,
 }
 
 impl CdpBrowser {
@@ -1055,6 +1190,7 @@ impl CdpBrowser {
             transport,
             session: AsyncMutex::new(None),
             op: AsyncMutex::new(()),
+            mobile_input: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1083,9 +1219,38 @@ impl CdpBrowser {
                 Duration::from_secs(10),
             )
             .await?;
-        humanize_session(&session).await;
+        let mobile = humanize_session(&session).await;
+        self.mobile_input
+            .store(mobile, std::sync::atomic::Ordering::Relaxed);
+        // 视口一致性：老 WebView 的 app-context 度量把 CSS 视口折成非标准值
+        // （真机实测 480/1440，真手机上不可能出现）。用设备真实 Display 的
+        // CSS 视口钉住渲染器（mobile=true 同时启用移动视口语义），Playwright
+        // 同款机制；失败仅记日志（总比 1702×3189 的矛盾视口好）。
+        if let Some((w, h, dpr)) = self.transport.device_metrics() {
+            if let Err(error) = session
+                .call(
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({
+                        "width": w, "height": h,
+                        "deviceScaleFactor": dpr, "mobile": true,
+                    }),
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                tracing::warn!("CDP 拟人化：视口覆写失败（沿用内核视口）: {error}");
+            } else {
+                tracing::info!(w, h, dpr, "CDP 拟人化：渲染视口已钉住（设备真实值）");
+            }
+        }
         *guard = Some(session.clone());
         Ok(session)
+    }
+
+    /// 建立（或复用）共享会话：连接 + 拟人化 + 视口钉住。桌面「打开浏览器」
+    /// 立即拉起可见窗口用；失败原样上抛。
+    pub async fn ensure_session(&self) -> Result<(), String> {
+        self.session().await.map(|_| ())
     }
 
     /// 导航公共段：Page.navigate → 等 loadEventFired → 静置 800ms。
@@ -1104,11 +1269,8 @@ impl CdpBrowser {
         Ok(session)
     }
 
-    /// 打开 URL 并等加载完成，返回页面提取结果（正文 + SERP 结果 +
-    /// Google 风控页/同意页检测标注）。
-    pub async fn navigate_and_extract(&self, url: &str) -> Result<PagePayload, String> {
-        let _op = self.op.lock().await;
-        let session = self.navigate_wait(url, Duration::from_secs(40)).await?;
+    /// EXTRACT_JS 提取当前页面（正文 + SERP 结果 + 风控/同意页检测标注）。
+    async fn extract_page(&self, session: &Session) -> Result<PagePayload, String> {
         let reply = session
             .call(
                 "Runtime.evaluate",
@@ -1118,6 +1280,107 @@ impl CdpBrowser {
             .await?;
         let value = evaluate_string(&reply)?;
         serde_json::from_str(&value).map_err(|e| format!("解析页面提取结果失败: {e}"))
+    }
+
+    /// 打开 URL 并等加载完成，返回页面提取结果（正文 + SERP 结果 +
+    /// Google 风控页/同意页检测标注）。命中风控页进入 park 等待（见模块注释）。
+    pub async fn navigate_and_extract(&self, url: &str) -> Result<PagePayload, String> {
+        let _op = self.op.lock().await;
+        let session = self.navigate_wait(url, Duration::from_secs(40)).await?;
+        let mut payload = self.extract_page(&session).await?;
+        if payload.blocked.contains("CAPTCHA") {
+            // 单点通知（通知+悬浮窗展开失败只记日志，park 照常等待）。
+            self.transport.notify_captcha(&payload.url).await;
+            match self.park_until_recovered(&session).await {
+                ParkOutcome::Recovered(waited, recovered) => {
+                    payload = recovered;
+                    payload.park_note = format!("已通过人工过码（等待 {waited} 秒），页面已恢复。");
+                }
+                ParkOutcome::Timeout(captcha_page) => {
+                    payload = captcha_page;
+                    payload.park_note = format!(
+                        "已通知用户人工过码，但等待 {} 秒仍未通过——向用户报告，不要立刻重试（重复触发会加重出口 IP 封锁）。",
+                        PARK_TIMEOUT.as_secs()
+                    );
+                }
+                ParkOutcome::Cancelled => {
+                    return Err(
+                        "用户在悬浮窗关闭了浏览器会话（过码取消）；下次任一 browser_* 调用会自动重建会话。"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        Ok(payload)
+    }
+
+    /// park/long-poll：风控页命中后的等待循环。三臂竞争——1.5s 轮询探针
+    /// （页面恢复即重新提取返回）/ 180s 总超时 / 连接断开（悬浮窗「关闭会话」
+    /// → WebView 销毁 → DevTools socket 失效 → manager 退出）。轮询是只读
+    /// evaluate，与用户在悬浮窗里的手动操作互不冲突。
+    async fn park_until_recovered(&self, session: &Session) -> ParkOutcome {
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + PARK_TIMEOUT;
+        loop {
+            let tick = tokio::time::sleep(PARK_POLL_INTERVAL);
+            tokio::select! {
+                _ = tick => {
+                    if session.tx.is_closed() {
+                        return ParkOutcome::Cancelled;
+                    }
+                    match self.captcha_probe(session).await {
+                        Ok(still_captcha) if !still_captcha => {
+                            let waited = started.elapsed().as_secs();
+                            // 恢复确认：重新提取成功才算恢复——探针与提取之间
+                            // 页面可能再跳转；暂态失败继续轮询下一拍，断连报取消，
+                            // 绝不把提取失败伪装成「已通过人工过码」的空结果。
+                            match self.extract_page(session).await {
+                                Ok(recovered) => {
+                                    return ParkOutcome::Recovered(waited, recovered);
+                                }
+                                Err(error) => {
+                                    if session.tx.is_closed() || error.contains("已断开") {
+                                        return ParkOutcome::Cancelled;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            // 连接已断（关闭会话）→ 取消；页面跳转瞬间的单次
+                            // evaluate 失败不构成取消，继续等下一拍。
+                            if session.tx.is_closed() || error.contains("已断开") {
+                                return ParkOutcome::Cancelled;
+                            }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let payload = self.extract_page(session).await.unwrap_or_default();
+                    return ParkOutcome::Timeout(payload);
+                }
+                _ = session.tx.closed() => {
+                    return ParkOutcome::Cancelled;
+                }
+            }
+        }
+    }
+
+    /// 风控探针（PAGE_INFO_JS 轻量读取；true = 仍在风控/同意页）。
+    async fn captcha_probe(&self, session: &Session) -> Result<bool, String> {
+        let reply = session
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": PAGE_INFO_JS, "returnByValue": true }),
+                Duration::from_secs(3),
+            )
+            .await?;
+        let value = evaluate_string(&reply)?;
+        let parsed: Value = serde_json::from_str(&value).map_err(|e| format!("{e}"))?;
+        Ok(parsed
+            .get("blocked")
+            .and_then(Value::as_str)
+            .is_some_and(|blocked| blocked.contains("CAPTCHA")))
     }
 
     /// 紧凑可交互元素清单（每项带 ref，供 browser_click / browser_type 定位）。
@@ -1147,36 +1410,67 @@ impl CdpBrowser {
             .to_string())
     }
 
-    /// 点按 ref 元素（CDP 真实鼠标事件，非 JS 合成点击）。
+    /// 点按 ref 元素（CDP 真实输入事件，非 JS 合成点击）。
     ///
-    /// 拟人节奏：点按前先落两步鼠标移动（目标附近小偏移 → 目标中心），
+    /// 事件词汇随会话 UA：移动端派发 touchStart/Move/End（手指按下微移 +
+    /// 按抬起随机节奏；UA 声称 Android 手机却发鼠标事件是行为检测的直接矛盾）；
+    /// 桌面保持鼠标词汇——点按前先落两步鼠标移动（目标附近小偏移 → 目标中心），
     /// 按下与抬起之间随机静置——反爬会查“零轨迹瞬移 + 恒定间隔”的点按。
     pub async fn click(&self, r: u32) -> Result<String, String> {
         let _op = self.op.lock().await;
         let session = self.session().await?;
         let (x, y) = self.element_center(&session, r).await?;
-        for (mx, my) in [(x + jitter(-24, 24), y + jitter(-18, 18)), (x, y)] {
+        if self.mobile_input.load(std::sync::atomic::Ordering::Relaxed) {
             session
                 .call(
-                    "Input.dispatchMouseEvent",
-                    json!({ "type": "mouseMoved", "x": mx, "y": my }),
+                    "Input.dispatchTouchEvent",
+                    json!({ "type": "touchStart", "touchPoints": [{ "x": x, "y": y }] }),
                     Duration::from_secs(10),
                 )
                 .await?;
-        }
-        for kind in ["mousePressed", "mouseReleased"] {
+            // 手指按下后的按压微动（1-2 帧小偏移），随后静置再抬起。
             session
                 .call(
-                    "Input.dispatchMouseEvent",
+                    "Input.dispatchTouchEvent",
                     json!({
-                        "type": kind, "x": x, "y": y,
-                        "button": "left", "buttons": 1, "clickCount": 1,
+                        "type": "touchMove",
+                        "touchPoints": [{ "x": x + jitter(-4, 4), "y": y + jitter(-4, 4) }]
                     }),
                     Duration::from_secs(10),
                 )
                 .await?;
-            if kind == "mousePressed" {
-                tokio::time::sleep(Duration::from_millis(jitter(50, 140) as u64)).await;
+            tokio::time::sleep(Duration::from_millis(jitter(50, 140) as u64)).await;
+            session
+                .call(
+                    "Input.dispatchTouchEvent",
+                    json!({ "type": "touchEnd", "touchPoints": [] }),
+                    Duration::from_secs(10),
+                )
+                .await?;
+        } else {
+            for (mx, my) in [(x + jitter(-24, 24), y + jitter(-18, 18)), (x, y)] {
+                session
+                    .call(
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": "mouseMoved", "x": mx, "y": my }),
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+            }
+            for kind in ["mousePressed", "mouseReleased"] {
+                session
+                    .call(
+                        "Input.dispatchMouseEvent",
+                        json!({
+                            "type": kind, "x": x, "y": y,
+                            "button": "left", "buttons": 1, "clickCount": 1,
+                        }),
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                if kind == "mousePressed" {
+                    tokio::time::sleep(Duration::from_millis(jitter(50, 140) as u64)).await;
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -1187,22 +1481,39 @@ impl CdpBrowser {
         ))
     }
 
-    /// 聚焦 ref 输入框并输入文本（先清空；InsertText 走 IME 通路，事件完整）。
+    /// 聚焦 ref 输入框并输入文本（先清空）。事件词汇随会话 UA：移动端逐字符
+    /// `Input.dispatchKeyEvent`（keyDown 带 text → Chromium 合成 keypress +
+    /// input + keyUp 完整键盘事件流；`insertText` 只有 input 事件，是已知
+    /// 自动化特征），单字符派发失败回退 `insertText`；桌面保持 IME 通路
+    /// `insertText`（桌面真人键盘场景反爬不查 key 流，且 IME 通路对中文最稳）。
     pub async fn type_text(&self, r: u32, text: &str) -> Result<String, String> {
         let _op = self.op.lock().await;
         let session = self.session().await?;
         let (x, y) = self.element_center(&session, r).await?;
-        for kind in ["mousePressed", "mouseReleased"] {
-            session
-                .call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": kind, "x": x, "y": y,
-                        "button": "left", "buttons": 1, "clickCount": 1,
-                    }),
-                    Duration::from_secs(10),
-                )
-                .await?;
+        if self.mobile_input.load(std::sync::atomic::Ordering::Relaxed) {
+            for kind in ["touchStart", "touchEnd"] {
+                let params = if kind == "touchStart" {
+                    json!({ "type": kind, "touchPoints": [{ "x": x, "y": y }] })
+                } else {
+                    json!({ "type": kind, "touchPoints": [] })
+                };
+                session
+                    .call("Input.dispatchTouchEvent", params, Duration::from_secs(10))
+                    .await?;
+            }
+        } else {
+            for kind in ["mousePressed", "mouseReleased"] {
+                session
+                    .call(
+                        "Input.dispatchMouseEvent",
+                        json!({
+                            "type": kind, "x": x, "y": y,
+                            "button": "left", "buttons": 1, "clickCount": 1,
+                        }),
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+            }
         }
         let clear = format!(
             "(function(ref){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');if(!el)return JSON.stringify({{ok:false,error:'引用不存在'}});el.focus();el.value='';el.dispatchEvent(new Event('input',{{bubbles:true}}));return JSON.stringify({{ok:true}});}})({r})"
@@ -1215,13 +1526,55 @@ impl CdpBrowser {
             )
             .await?;
         check_eval_ok(&reply)?;
-        session
-            .call(
-                "Input.insertText",
-                json!({ "text": text }),
-                Duration::from_secs(10),
-            )
-            .await?;
+        let mut typed = 0usize;
+        if self.mobile_input.load(std::sync::atomic::Ordering::Relaxed) {
+            for ch in text.chars() {
+                let unit = ch.to_string();
+                // keyDown 带 text：Chromium 侧合成 char 事件（keypress/input）。
+                let down = json!({
+                    "type": "keyDown", "key": unit,
+                    "text": unit, "unmodifiedText": unit,
+                });
+                match session
+                    .call(
+                        "Input.dispatchKeyEvent",
+                        down,
+                        Duration::from_secs(10),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        // 内核拒收（老版本对非 ASCII text 有限制等）：整段回退
+                        // insertText，保住输入能力。
+                        tracing::debug!("逐字符键盘事件失败（回退 insertText）: {error}");
+                        break;
+                    }
+                }
+                session
+                    .call(
+                        "Input.dispatchKeyEvent",
+                        json!({ "type": "keyUp", "key": unit }),
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                typed += 1;
+                // 真人击键节奏（0.03-0.12s 随机间隔）。
+                tokio::time::sleep(Duration::from_millis(jitter(30, 120) as u64)).await;
+            }
+        }
+        if typed < text.chars().count() {
+            // 逐字符通路失败（首字符即拒或中途拒）：只补未入场的剩余部分，
+            // 已派发的字符不重复。
+            let remaining: String = text.chars().skip(typed).collect();
+            session
+                .call(
+                    "Input.insertText",
+                    json!({ "text": remaining }),
+                    Duration::from_secs(10),
+                )
+                .await?;
+        }
         tokio::time::sleep(Duration::from_millis(400)).await;
         Ok(format!(
             "已在 [ref {r}] 输入 {} 个字符。",
@@ -1229,30 +1582,37 @@ impl CdpBrowser {
         ))
     }
 
-    /// 滚轮滑动页面（`Input.dispatchMouseEvent` 的 mouseWheel，真实滚轮事件）。
-    /// `notches` 格数，正=向下负=向上；逐格派发、坐标与间隔带抖动——匀速
-    /// 瞬时大位移是机器滚动的典型特征，也是触发懒加载的自然方式。
+    /// 滑动页面。事件词汇随会话 UA：移动端走 `Input.dispatchTouchEvent` 拖拽链
+    /// （手指按下 → 8-14 步缓动位移 → 抬起，Chromium 按末速自然施加惯性——
+    /// 手机没有滚轮）；桌面保持真实滚轮事件（`mouseWheel`，逐格带拟人抖动）。
+    /// 匀速瞬时大位移是机器滚动的典型特征，也是触发懒加载的自然方式。
     pub async fn scroll(&self, notches: i32) -> Result<String, String> {
         let _op = self.op.lock().await;
         let session = self.session().await?;
-        let (w, h) = self.viewport_size(&session).await?;
-        // 滚轮坐标取视口中部：可见区域内的坐标都作用于悬停内容，中部最接近真人。
+        let (inner, visual) = self.viewports(&session).await?;
+        // 事件坐标必须落在可见区域内；起点取视口中部最接近真人。
+        let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
+        let (w, h) = if mobile { visual } else { inner };
         let (x, y) = (w / 2, h / 2);
-        for _ in 0..notches.unsigned_abs() {
-            session
-                .call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mouseWheel",
-                        "x": x + jitter(-8, 8),
-                        "y": y + jitter(-8, 8),
-                        "deltaX": 0,
-                        "deltaY": 120 * notches.signum(),
-                    }),
-                    Duration::from_secs(10),
-                )
-                .await?;
-            tokio::time::sleep(Duration::from_millis(jitter(60, 160) as u64)).await;
+        if self.mobile_input.load(std::sync::atomic::Ordering::Relaxed) {
+            self.touch_drag(&session, x, y, notches).await?;
+        } else {
+            for _ in 0..notches.unsigned_abs() {
+                session
+                    .call(
+                        "Input.dispatchMouseEvent",
+                        json!({
+                            "type": "mouseWheel",
+                            "x": x + jitter(-8, 8),
+                            "y": y + jitter(-8, 8),
+                            "deltaX": 0,
+                            "deltaY": 120 * notches.signum(),
+                        }),
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(jitter(60, 160) as u64)).await;
+            }
         }
         // 静置一拍让滚动/懒加载稳定，再回页面信息。
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1265,14 +1625,73 @@ impl CdpBrowser {
         ))
     }
 
-    /// 视口尺寸（滚轮事件坐标要在可见区域内；取不到时按常见桌面视口兜底）。
-    async fn viewport_size(&self, session: &Session) -> Result<(i64, i64), String> {
+    /// 移动端触摸拖拽链：手指从视口中部按下，按「起步加速 → 匀速 → 收尾减速」
+    /// 缓动走完 120px×格数 的反向位移（手指上滑 = 页面下滚），每步坐标带抖动、
+    /// 间隔 16-48ms；抬起瞬间 Chromium 按末段速度施加惯性滚动。`steps` 随
+    /// 格数增减（长滑更慢更自然），上限 24 步防超长拖拽。
+    async fn touch_drag(
+        &self,
+        session: &Session,
+        x: i64,
+        y: i64,
+        notches: i32,
+    ) -> Result<(), String> {
+        let total = -120.0 * notches as f64; // 手指位移（页面向下滚 → 手指向上）
+        let steps = (notches.unsigned_abs().clamp(4, 12) * 2) as i64;
+        let start_y = y as f64 + jitter(-6, 6) as f64;
+        session
+            .call(
+                "Input.dispatchTouchEvent",
+                json!({
+                    "type": "touchStart",
+                    "touchPoints": [{ "x": x + jitter(-4, 4), "y": start_y as i64 }]
+                }),
+                Duration::from_secs(10),
+            )
+            .await?;
+        for step in 1..=steps {
+            let t = step as f64 / steps as f64;
+            // smoothstep 缓动：起步/收尾慢，中段快（真人拖拽的速度轮廓）。
+            let eased = t * t * (3.0 - 2.0 * t);
+            let py = start_y + total * eased + jitter(-2, 2) as f64;
+            session
+                .call(
+                    "Input.dispatchTouchEvent",
+                    json!({
+                        "type": "touchMove",
+                        "touchPoints": [{ "x": x + jitter(-3, 3), "y": py as i64 }]
+                    }),
+                    Duration::from_secs(10),
+                )
+                .await?;
+            tokio::time::sleep(Duration::from_millis(jitter(16, 48) as u64)).await;
+        }
+        session
+            .call(
+                "Input.dispatchTouchEvent",
+                json!({ "type": "touchEnd", "touchPoints": [] }),
+                Duration::from_secs(10),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 事件坐标基准视口（双口径）：桌面滚轮用窗口 innerWidth/innerHeight
+    /// （滚轮坐标必须落在窗口视口内，screen 是整个显示器）；移动触摸用可视
+    /// 视口——页面被缩小适配时（无 viewport meta 的桌面页，Chrome 手机版按
+    /// 980 布局回退再缩小）innerWidth 是布局宽度而非可视宽度，可视宽度恒等
+    /// 于 screen.width，可视高度 = visualViewport.height × scale（未缩放时
+    /// ≈ innerHeight）。
+    async fn viewports(
+        &self,
+        session: &Session,
+    ) -> Result<((i64, i64), (i64, i64)), String> {
         let reply = session
             .call(
                 "Runtime.evaluate",
                 json!({
                     "expression":
-                        "JSON.stringify({w:window.innerWidth||800,h:window.innerHeight||600})",
+                        "JSON.stringify({iw:window.innerWidth||800,ih:window.innerHeight||600,sw:(screen&&screen.width)||0,vh:(function(){var vv=window.visualViewport;return vv?Math.round(vv.height*(vv.scale||1)):0;})()})",
                     "returnByValue": true
                 }),
                 Duration::from_secs(10),
@@ -1281,10 +1700,17 @@ impl CdpBrowser {
         let value = evaluate_string(&reply)?;
         let parsed: Value =
             serde_json::from_str(&value).map_err(|e| format!("解析视口尺寸失败: {e}"))?;
-        Ok((
-            parsed.get("w").and_then(Value::as_i64).unwrap_or(800),
-            parsed.get("h").and_then(Value::as_i64).unwrap_or(600),
-        ))
+        let inner = (
+            parsed.get("iw").and_then(Value::as_i64).unwrap_or(800),
+            parsed.get("ih").and_then(Value::as_i64).unwrap_or(600),
+        );
+        let screen_w = parsed.get("sw").and_then(Value::as_i64).unwrap_or(0);
+        let visual_h = parsed.get("vh").and_then(Value::as_i64).unwrap_or(0);
+        let visual = (
+            if screen_w > 0 { screen_w } else { inner.0 },
+            if visual_h > 0 { visual_h } else { inner.1 },
+        );
+        Ok((inner, visual))
     }
 
     /// 截图到工作区 browser/ 下（内核相关实现见
@@ -1400,9 +1826,107 @@ fn check_eval_ok(reply: &Value) -> Result<(), String> {
 const WEBDRIVER_MASK_JS: &str =
     "Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => undefined });";
 
+/// stealth 注入（真机 bot.sannysoft.com + Runtime.evaluate 探针实测的暴露项，
+/// 每项对应基线证据；新文档生效）：
+/// - `document.hasFocus()`：离屏 WebView / 无焦点悬浮窗实测 false，前台浏览器
+///   恒 true——CDP 焦点模拟（Emulation.setFocusEmulationEnabled）是主修，此
+///   覆写兜底内核不支持模拟时的老版本 WebView；
+/// - `window.chrome`：Chrome Mobile 有、WebView 无（最经典的 WebView 判据，
+///   sannysoft「Chrome (New)」红），注入只读最小 shim（app/runtime/csi/loadTimes）；
+/// - `navigator.plugins/mimeTypes`：WebView 空数组（sannysoft 两项红），补齐
+///   Chrome Mobile 标准 PDF Viewer 三件套（PluginArray/MimeTypeArray 原型链
+///   保真，instanceof 检测过）。
+/// 明确不做（实测无需或有意放弃，防后人补）：WebGL UNMASKED_RENDERER hook——
+/// 真机实测已是真 GPU（Adreno 616，离屏 + 软件层不影响 WebGL 的 GL 上下文，
+/// sannysoft 该项绿）；canvas 噪声注入破坏正常页面渲染；字体/AudioContext
+/// 指纹性价比低；Runtime.enable 深层检测对抗无干净解法。
+const STEALTH_JS: &str = r#"(function(){
+  try { Object.defineProperty(document, 'hasFocus', { value: function(){ return true; }, configurable: true }); } catch (e) {}
+  try {
+    if (typeof window.chrome === 'undefined') {
+      var noop = function(){};
+      var chrome = {
+        app: { isInstalled: false,
+               InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+               RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+               getDetails: function(){ return null; }, getIsInstalled: function(){ return false; },
+               installState: function(){ return 'disabled'; } },
+        runtime: { PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+                   PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                   PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                   OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                   OnRestartReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', SESSION_UPDATE: 'session_update' },
+                   RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+                   connect: noop, sendMessage: noop },
+        csi: function(){ return { startE: Date.now(), onloadT: Date.now(), pageT: 0, tran: 0 }; },
+        loadTimes: function(){ return { requestTime: Date.now() / 1000, startLoadTime: Date.now() / 1000, commitLoadTime: Date.now() / 1000, finishDocumentLoadTime: Date.now() / 1000, finishLoadTime: Date.now() / 1000, firstPaintTime: Date.now() / 1000, firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: false, wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' }; }
+      };
+      Object.defineProperty(window, 'chrome', { value: chrome, writable: false, configurable: false });
+    }
+  } catch (e) {}
+  try {
+    if (navigator.plugins && navigator.plugins.length === 0) {
+      var makeMime = function(type){
+        var m = Object.create(window.MimeType ? MimeType.prototype : Object.prototype);
+        Object.defineProperties(m, {
+          type: { value: type }, suffixes: { value: 'pdf' },
+          description: { value: 'Portable Document Format' }
+        });
+        return m;
+      };
+      var pdf = makeMime('application/pdf');
+      var textPdf = makeMime('text/pdf');
+      var makePlugin = function(name){
+        var p = Object.create(window.Plugin ? Plugin.prototype : Object.prototype);
+        Object.defineProperties(p, {
+          name: { value: name }, filename: { value: 'internal-pdf-viewer' },
+          description: { value: 'Portable Document Format' }, length: { value: 2 },
+          0: { value: pdf }, 1: { value: textPdf }
+        });
+        return p;
+      };
+      var list = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer'].map(makePlugin);
+      // MimeType.enabledPlugin 反向引用：不给自有值的话，页面读它会命中原生
+      // getter 并因接收者无内部槽抛 TypeError（PDF 探测页常见路径）。
+      try {
+        Object.defineProperty(pdf, 'enabledPlugin', { value: list[0] });
+        Object.defineProperty(textPdf, 'enabledPlugin', { value: list[0] });
+      } catch (e) {}
+      var plugins = Object.create(window.PluginArray ? PluginArray.prototype : Object.prototype);
+      Object.defineProperty(plugins, 'length', { value: list.length });
+      for (var i = 0; i < list.length; i++) {
+        (function(idx){
+          Object.defineProperty(plugins, idx, { value: list[idx], enumerable: true });
+          Object.defineProperty(plugins, list[idx].name, { value: list[idx] });
+        })(i);
+      }
+      Object.defineProperty(plugins, 'item', { value: function(i){ return list[i] || null; } });
+      Object.defineProperty(plugins, 'namedItem', { value: function(n){
+        for (var j = 0; j < list.length; j++) { if (list[j].name === n) return list[j]; }
+        return null;
+      } });
+      Object.defineProperty(navigator, 'plugins', { value: plugins, configurable: true });
+      var mimes = Object.create(window.MimeTypeArray ? MimeTypeArray.prototype : Object.prototype);
+      var mList = [pdf, textPdf];
+      Object.defineProperty(mimes, 'length', { value: mList.length });
+      for (var k = 0; k < mList.length; k++) {
+        (function(idx){ Object.defineProperty(mimes, idx, { value: mList[idx], enumerable: true }); })(k);
+      }
+      Object.defineProperty(mimes, 'item', { value: function(i){ return mList[i] || null; } });
+      Object.defineProperty(mimes, 'namedItem', { value: function(n){
+        for (var l = 0; l < mList.length; l++) { if (mList[l].type === n) return mList[l]; }
+        return null;
+      } });
+      Object.defineProperty(navigator, 'mimeTypes', { value: mimes, configurable: true });
+    }
+  } catch (e) {}
+})()"#;
+
 /// 会话建立后的拟人化注入（各步骤失败仅记日志不阻断——内核/版本能力有差异）：
-/// UA 清洗覆写（带一致性的 Client Hints 元数据）+ webdriver 掩蔽。
-async fn humanize_session(session: &Session) {
+/// UA 清洗覆写（带一致性的 Client Hints 元数据）+ 焦点模拟 + webdriver 掩蔽 +
+/// stealth 注入。返回移动端判定（Android UA → touch/键盘事件词汇），与 UA
+/// 覆写同源（同一份 UA 判定词汇才自洽）。
+async fn humanize_session(session: &Session) -> bool {
     let ua = match session
         .call(
             "Runtime.evaluate",
@@ -1414,13 +1938,14 @@ async fn humanize_session(session: &Session) {
         Ok(reply) => evaluate_string(&reply).unwrap_or_default(),
         Err(error) => {
             tracing::warn!("CDP 拟人化：读取 UA 失败（跳过 UA 覆写）: {error}");
-            return;
+            return false;
         }
     };
     if ua.trim().is_empty() {
         tracing::warn!("CDP 拟人化：UA 为空（跳过 UA 覆写）");
-        return;
+        return false;
     }
+    let mobile = ua_is_mobile(&ua);
     let cleaned = humanize_ua(&ua);
     let mut params = json!({ "userAgent": cleaned });
     // Client Hints 元数据优先沿用内核真实值（UA 只摘了 Headless/wv 标记，版本/
@@ -1471,6 +1996,29 @@ async fn humanize_session(session: &Session) {
     {
         tracing::warn!("CDP 拟人化：webdriver 掩蔽注入失败: {error}");
     }
+    // 焦点模拟：离屏 WebView / 无焦点悬浮窗的 document.hasFocus() 实测 false，
+    // 前台浏览器恒 true。CDP 焦点模拟开启后内核还会派发真实 focus 事件。
+    if let Err(error) = session
+        .call(
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+            Duration::from_secs(10),
+        )
+        .await
+    {
+        tracing::warn!("CDP 拟人化：焦点模拟开启失败（hasFocus 覆写兜底）: {error}");
+    }
+    if let Err(error) = session
+        .call(
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": STEALTH_JS }),
+            Duration::from_secs(10),
+        )
+        .await
+    {
+        tracing::warn!("CDP 拟人化：stealth 注入失败: {error}");
+    }
+    mobile
 }
 
 /// UA 拟人化清洗：桌面无头实例自报 `HeadlessChrome/…`、安卓 WebView 自报
@@ -1482,6 +2030,13 @@ fn humanize_ua(ua: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// 交互事件词汇判定：Android UA（手机/平板）→ touch 拖拽 + 逐字符键盘
+/// （真机没有滚轮，也不发鼠标事件——事件词汇与 UA 矛盾是行为检测证据）；
+/// 其余（桌面无头实例）→ 鼠标/滚轮/IME 通路。
+fn ua_is_mobile(ua: &str) -> bool {
+    ua.contains("Android")
 }
 
 /// 读取内核真实的 Client Hints 元数据：getHighEntropyValues 只回高熵部分，
@@ -1806,6 +2361,30 @@ pub fn register(tools: &mut crate::ToolRegistry, transport: Arc<dyn DevtoolsTran
     tools.register(Box::new(BrowserCloseTool { browser }));
 }
 
+/// 关闭共享浏览器会话（桌面可见形态切换用：先 set_visible 再关，下次任一
+/// browser_* 调用/打开浏览器即以新形态重建；profile 延续，cookie 信誉保留）。
+pub async fn close_shared_browser() -> Result<(), String> {
+    match SHARED_BROWSER.get() {
+        Some(browser) => browser.close().await.map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// 共享内核句柄（命令层立即拉起浏览器窗口用；未注册返回 None）。
+pub fn shared_browser() -> Option<Arc<CdpBrowser>> {
+    SHARED_BROWSER.get().cloned()
+}
+
+impl CdpBrowser {
+    /// 仅作废缓存的 CDP 会话连接（不关内核、不抢 op 锁）。可见形态切换用：
+    /// transport.shutdown 后 manager 可能尚未退出，直接 ensure_session 会复用
+    /// 已死通道——先作废，下次 session() 必以新形态重连。
+    pub async fn invalidate_session(&self) {
+        let mut guard = self.session.lock().await;
+        *guard = None;
+    }
+}
+
 /// URL 归一：无 scheme 补 https://；只收 http(s)。
 fn normalize_url(url: &str) -> Result<String, String> {
     let url = url.trim();
@@ -1852,7 +2431,7 @@ pub struct BrowserNavigateTool {
 browser_tool_impl!(
     BrowserNavigateTool,
     "browser_navigate",
-    "CDP 浏览器：打开 URL 并读取页面（真实 Chromium 内核，UA 与交互已拟人化，可正常访问 Google 等风控站点）。普通页返回页面标题、最终 URL 与正文文本；搜索引擎结果页 URL（引擎自由选择，如 https://www.bing.com/search?q=检索词 或 google/baidu 的搜索 URL）返回解析后的结果列表（标题/链接/摘要，广告已过滤）。检测到 Google 风控页（CAPTCHA）/同意页时明确标注。需要交互（点击/输入/滚动/截图）用 browser_snapshot / browser_click / browser_type / browser_scroll / browser_screenshot。",
+    "CDP 浏览器：打开 URL 并读取页面（真实 Chromium 内核，UA 与交互已拟人化，可正常访问 Google 等风控站点）。普通页返回页面标题、最终 URL 与正文文本；搜索引擎结果页 URL（引擎自由选择，如 https://www.bing.com/search?q=检索词 或 google/baidu 的搜索 URL）返回解析后的结果列表（标题/链接/摘要，广告已过滤）。命中 Google 风控页（CAPTCHA）时本调用会挂起等待人工过码（已自动通知用户并展开悬浮窗），恢复后返回结果并标注；最多等 180 秒，超时返回风控页标注——超时后不要立即重试，向用户报告即可。同意页（consent）仅标注，可用 browser_snapshot 后点按勾选框继续。需要交互（点击/输入/滚动/截图）用 browser_snapshot / browser_click / browser_type / browser_scroll / browser_screenshot。",
     async fn execute(&self, input: Value) -> ToolResult {
         let url = match input.get("url").and_then(Value::as_str) {
             Some(url) => url,
@@ -1883,14 +2462,20 @@ impl BrowserNavigateTool {
 /// browser_navigate 输出：搜索引擎结果页走结构化结果列表（EXTRACT_JS 按主机名
 /// 分派解析并过滤广告；SERP 的全文 dump 是噪音，不输出）；普通页走导航报告
 /// （标题/最终 URL/风控标注）+ 截断正文。正文为空不报错（可能是交互页/纯媒体页），
-/// 引导走 browser_snapshot。风控/同意页标注在两种形态下都保留。
+/// 引导走 browser_snapshot。风控/同意页标注在两种形态下都保留；park 过码等待
+/// 的结果说明置顶。
 fn format_navigated_page(page: &PagePayload) -> String {
+    let mut prefix = String::new();
+    if !page.park_note.is_empty() {
+        prefix.push_str(&page.park_note);
+        prefix.push_str("\n\n");
+    }
     if !page.results.is_empty() && looks_like_serp(&page.url) {
         let mut out = format_serp_page(page);
         if !page.blocked.is_empty() {
             push_blocked_note(&mut out, &page.blocked);
         }
-        return out;
+        return format!("{prefix}{out}");
     }
     let mut out = format!("已打开：{}\n标题：{}", page.url, single_line(&page.title));
     if !page.blocked.is_empty() {
@@ -1903,7 +2488,7 @@ fn format_navigated_page(page: &PagePayload) -> String {
         out.push('\n');
         out.push_str(&truncate_chars(&page.text, PAGE_TEXT_MAX_CHARS));
     }
-    out
+    format!("{prefix}{out}")
 }
 
 /// URL 是否为搜索引擎结果页（google.com /search、bing.com /search、
@@ -2417,6 +3002,49 @@ mod tests {
         assert!(!looks_like_serp("https://www.bing.com/searching/x"));
     }
 
+    #[test]
+    fn ua_is_mobile_selects_event_vocabulary() {
+        // Android（手机/平板 UA 一律触屏词汇）；桌面无头/普通桌面 UA 鼠标词汇。
+        assert!(ua_is_mobile(
+            "Mozilla/5.0 (Linux; Android 10; V1911A) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/83.0.4103.106 Mobile Safari/537.36"
+        ));
+        assert!(ua_is_mobile(
+            "Mozilla/5.0 (Linux; Android 13; SM-X710) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ));
+        assert!(!ua_is_mobile(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ));
+        assert!(!ua_is_mobile(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) HeadlessChrome/120.0.0.0 Safari/537.36"
+        ));
+    }
+
+    #[test]
+    fn navigated_page_prefixes_park_note() {
+        // park 过码等待的结果说明置顶（恢复/超时两种），后续形态不被破坏。
+        let mut page = serp_payload("https://www.bing.com/search?q=x");
+        page.park_note = "已通过人工过码（等待 12 秒），页面已恢复。".into();
+        let out = format_navigated_page(&page);
+        assert!(out.starts_with("已通过人工过码"), "{out}");
+        assert!(out.contains("检索结果 1 条"), "{out}");
+
+        let mut timeout = serp_payload("https://www.google.com/sorry/index");
+        timeout.results.clear();
+        timeout.blocked = "Google CAPTCHA 风控页（/sorry/）".into();
+        timeout.park_note = "已通知用户人工过码，但等待 180 秒仍未通过".into();
+        let out = format_navigated_page(&timeout);
+        assert!(out.starts_with("已通知用户人工过码"), "{out}");
+        assert!(out.contains("检测到Google CAPTCHA"), "{out}");
+
+        // 未 park（空标注）不引入多余前缀。
+        let page = serp_payload("https://www.bing.com/search?q=x");
+        assert!(format_navigated_page(&page).starts_with("已打开："));
+    }
+
     fn serp_payload(url: &str) -> PagePayload {
         PagePayload {
             title: "search - 搜索".into(),
@@ -2428,6 +3056,7 @@ mod tests {
                 snippet: "摘要".into(),
             }],
             blocked: String::new(),
+            park_note: String::new(),
         }
     }
 
@@ -2458,6 +3087,7 @@ mod tests {
             text: String::new(),
             results: vec![],
             blocked: String::new(),
+            park_note: String::new(),
         };
         let out = format_navigated_page(&empty);
         assert!(out.contains("browser_snapshot"), "{out}");

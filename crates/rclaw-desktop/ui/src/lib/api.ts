@@ -487,6 +487,10 @@ export const api = {
 
   openMedia: (path: string) => invoke<void>("open_media", { path }),
 
+  /** 浏览器快捷入口：桌面 = 无头 ↔ 可见浏览器窗口切换（与助手共用会话）；
+   *  安卓 = 展开应用内浏览器面板（手动上网/过码）。返回可见模式状态。 */
+  browserToggleVisible: () => invoke<boolean>("browser_toggle_visible"),
+
   /** 会话媒体保存到本地：图片/视频/音频进相册（桌面 Pictures/RClaw），
    *  文档进下载目录（安卓 MediaStore.Downloads / 桌面「下载/RClaw」）。 */
   saveMedia: (path: string) => invoke<string>("save_media", { path }),

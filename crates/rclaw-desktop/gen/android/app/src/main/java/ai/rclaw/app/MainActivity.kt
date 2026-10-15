@@ -19,7 +19,12 @@ class MainActivity : TauriActivity() {
     NativeBridge.setContext(application)
     NativeBridge.init(filesDir)
     CaptureBridge.activity = this
+    // 浏览器面板（应用内原生视图，盖在聊天 UI 上）的宿主窗口：panel 加进本
+    // Activity 的视图树，无需悬浮窗权限。setActivity 会复位 attached 并把
+    // WebView 从旧窗口摘回离屏（面板展开期间 Activity 重建的场景）。
+    BrowserOverlay.setActivity(this)
     ShareReceiver.handle(this, intent)
+    openBrowserPanelIfRequested(intent)
     val service = Intent(this, RClawService::class.java).setAction(RClawService.ACTION_START)
     if (Build.VERSION.SDK_INT >= 26) {
       startForegroundService(service)
@@ -51,14 +56,34 @@ class MainActivity : TauriActivity() {
         }
       }
     })
+    // 通知点击进入（open_browser extra）：UI 已就绪，展开浏览器面板
+    //（过码/手动上网入口）。
+    if (pendingOpenBrowser) {
+      pendingOpenBrowser = false
+      NativeBridge.browserOverlayExpandAsync()
+    }
   }
 
   /** 系统分享（应用已在前台时经 onNewIntent 送达，singleTask 不会重建 Activity）。 */
   override fun onNewIntent(intent: Intent) {
     AppConfig.trace(this, "activity-onNewIntent action=${intent.action}")
     ShareReceiver.handle(this, intent)
+    // Activity 存活路径：webview 必已就绪，直接展开。
+    if (intent?.getBooleanExtra("open_browser", false) == true) {
+      NativeBridge.browserOverlayExpandAsync()
+    }
     super.onNewIntent(intent)
   }
+
+  /** 冷启动路径：记下请求，onWebViewCreate（UI 就绪）时展开。 */
+  private fun openBrowserPanelIfRequested(intent: Intent?) {
+    if (intent?.getBooleanExtra("open_browser", false) == true) {
+      pendingOpenBrowser = true
+      AppConfig.trace(this, "browser-panel open requested (pending)")
+    }
+  }
+
+  private var pendingOpenBrowser = false
 
   /** 相机/录音权限结果：交给 CaptureBridge（录音授权后自动开录）。 */
   override fun onRequestPermissionsResult(
@@ -94,6 +119,9 @@ class MainActivity : TauriActivity() {
     // 新实例刚登记的引用抹掉，之后拍照/录音永远拿不到 Activity。只清自己的。
     if (CaptureBridge.activity === this) {
       CaptureBridge.activity = null
+    }
+    if (BrowserOverlay.activity === this) {
+      BrowserOverlay.activity = null
     }
     super.onDestroy()
   }

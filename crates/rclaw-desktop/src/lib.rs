@@ -100,6 +100,7 @@ pub fn run() {
             commands::media_preview,
             commands::media_stream_url,
             commands::open_media,
+            commands::browser_toggle_visible,
             commands::save_media,
             commands::share_media,
             commands::share_text,

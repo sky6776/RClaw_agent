@@ -3927,11 +3927,73 @@ fn media_kind_of(path: &str) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 浏览器快捷入口（桌面：无头 ↔ 可见窗口切换；安卓：展开应用内浏览器面板）
+// ---------------------------------------------------------------------------
+
+/// 桌面 transport 句柄（agent.rs 装配时登记；「打开浏览器」命令切换形态用）。
+/// get_or_init 单源：装配重试（首次启动失败→修配置再来）时命令侧与工具注册
+/// 拿到的是同一个实例，不会出现按钮改 A 实例、内核持有 B 实例的分叉。
+static BROWSER_TRANSPORT: std::sync::OnceLock<
+    std::sync::Arc<rclaw_tools::cdp_browser::HeadlessChromiumTransport>,
+> = std::sync::OnceLock::new();
+
+/// 取（或首次创建）桌面浏览器 transport——命令层与 agent 装配共用唯一实例。
+pub fn browser_transport_or_init(
+    screenshot_dir: impl Into<std::path::PathBuf>,
+) -> std::sync::Arc<rclaw_tools::cdp_browser::HeadlessChromiumTransport> {
+    BROWSER_TRANSPORT.get_or_init(|| {
+        std::sync::Arc::new(rclaw_tools::cdp_browser::HeadlessChromiumTransport::new(
+            screenshot_dir,
+        ))
+    })
+    .clone()
+}
+
+/// 「打开浏览器」按钮（桌面）：切到可见模式并重建会话——拉起真实浏览器窗口，
+/// 用户手动上网与 agent 驱动共用同一实例/profile（cookie 信誉延续）。再点一次
+/// 切回无头（窗口关闭，agent 侧照常）。安卓上改走 browser_overlay_expand。
+#[tauri::command]
+pub async fn browser_toggle_visible() -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        rclaw_android::browser_overlay_expand()
+            .map(|_| true)
+            .map_err(|e| format!("展开浏览器面板失败: {e}"))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        use rclaw_tools::cdp_browser::DevtoolsTransport as _;
+        let transport = BROWSER_TRANSPORT
+            .get()
+            .ok_or_else(|| "浏览器尚未装配（运行时未就绪）".to_string())?;
+        let next = !transport.is_visible();
+        transport.set_visible(next);
+        // 切形态必须重建实例：直接关 transport（不经 CdpBrowser.close 的 op
+        // 锁——agent 的 park 过码会占锁 180s，按钮不能陪等）。关停会让在途
+        // CDP 会话断开：park 走取消臂、普通工具下次调用自动重连；profile
+        // 目录保留，cookie 信誉不丢。
+        transport
+            .shutdown()
+            .await
+            .map_err(|e| format!("切换浏览器形态失败: {e}"))?;
+        if next {
+            // 立即拉起可见窗口（不等 agent 的下一次工具调用）。先作废缓存的
+            // CDP 会话（transport 已关停，manager 退出有延迟），再连接——确保
+            // 窗口真的以可见形态拉起。
+            let browser = rclaw_tools::cdp_browser::shared_browser()
+                .ok_or_else(|| "浏览器尚未装配".to_string())?;
+            browser.invalidate_session().await;
+            browser.ensure_session().await?;
+        }
+        Ok(next)
+    }
+}
+
 /// 会话内点开工作区媒体：安卓经 FileProvider 拉起系统播放器/查看器，
 /// 桌面用系统默认程序打开（路径校验同 media_base64）。
 #[tauri::command]
-pub async fn open_media(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let full = resolve_media_file(&state.home, &path)?;
+pub async fn open_media(state: State<'_, AppState>, path: String) -> Result<(), String> {    let full = resolve_media_file(&state.home, &path)?;
 
     #[cfg(target_os = "android")]
     {

@@ -10,5 +10,9 @@
     <string name="stop">停止</string>
     <string name="done_channel">任务完成</string>
     <string name="turn_done_title">RClaw 任务完成</string>
+    <string name="browser_channel">浏览器</string>
+    <string name="browser_overlay_title">RClaw 浏览器</string>
+    <string name="browser_captcha_title">网页需要人工过码</string>
+    <string name="browser_captcha_hint">检测到人机验证页，点开回到应用完成验证（最多等待 180 秒）</string>
     <string name="fgs_subtype">Runs the user-configured local RClaw assistant and its embedded knowledge tools.</string>
 </resources>

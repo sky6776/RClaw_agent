@@ -107,15 +107,140 @@ public final class NativeBridge {
         }
     }
 
-    /** CDP 浏览器会话：销毁长驻 WebView（browser_close 工具的桥）。 */
+    /** CDP 浏览器会话：销毁长驻 WebView（browser_close 工具的桥）。面板一并
+     *  摘除——只销毁 WebView 会留下挡住聊天的空面板。stop 与 dismiss 全段入
+     *  OVERLAY_SERIAL：两步之间若有线程展开并挂载新会话，收尾的 dismiss 会把
+     *  新面板藏掉、留下 attached=true 的孤儿 WebView。 */
     static boolean browserSessionStop() {
-        return BrowserSession.stop();
+        synchronized (OVERLAY_SERIAL) {
+            boolean stopped = BrowserSession.stop();
+            BrowserOverlay.dismiss(appContext);
+            return stopped;
+        }
     }
 
     /** CDP 浏览器会话：离屏截图到 PNG（View.draw 软件位图；不走 CDP——离屏
      *  WebView 无合成器帧）。 */
     static boolean browserSessionScreenshot(String absPath) {
         return BrowserSession.screenshot(absPath);
+    }
+
+    // ------------------------------------------------------------------
+    // CDP 浏览器面板（应用内原生视图：Google 风控页人工过码 + 手动上网）。
+    // 返回值约定：String 为 {"ok":bool,...} JSON；attached 为 boolean。
+    // ------------------------------------------------------------------
+
+    /**
+     * 浏览器面板形态切换与 WebView reparent 的串行锁：expand/collapse/dismiss/
+     * 自动展开（通知路径、工具路径、用户按钮路径）全部经它整体互斥——「已显示
+     * 面板但还没 attach」的窗口期被收起穿插，会让 WebView 挂进已移除的面板并
+     * 误置 attached=true（截图错轨）。锁序固定为 OVERLAY_SERIAL →
+     * BrowserSession.LOCK，各处一致，无死锁面。
+     */
+    static final Object OVERLAY_SERIAL = new Object();
+
+    /** 展开前的会话懒启动（panel 点击时可能尚无会话）。持锁调用。 */
+    private static String ensureSessionStarted() {
+        if (BrowserSession.isStarted()) {
+            return "{\"ok\":true}";
+        }
+        return BrowserSession.start(appContext);
+    }
+
+    /** 展开浏览器面板并把 WebView 挂进容器（会话懒启动）。MainActivity 通知
+     *  路径与 UI 侧边栏入口共用。 */
+    static String browserOverlayExpand() {
+        synchronized (OVERLAY_SERIAL) {
+            try {
+                String started = ensureSessionStarted();
+                if (!started.contains("\"ok\":true")) {
+                    return started;
+                }
+                if (!BrowserOverlay.ensureExpanded(appContext)) {
+                    return "{\"ok\":false,\"error\":\"应用窗口未就绪，稍后重试\"}";
+                }
+                return BrowserSession.attach(BrowserOverlay.webviewHost());
+            } catch (Throwable t) {
+                return bridgeError("browserOverlayExpand", t);
+            }
+        }
+    }
+
+    /** 异步展开（MainActivity 通知路径：无需回执，结果进日志）。 */
+    static void browserOverlayExpandAsync() {
+        java.util.concurrent.Executors.newSingleThreadExecutor().execute(() -> {
+            String reply = browserOverlayExpand();
+            android.util.Log.i("NativeBridge", "browser overlay expand: " + reply);
+        });
+    }
+
+    /** 收起面板：WebView 摘回离屏（agent 不受影响），聊天 UI 重新可见。 */
+    static String browserOverlayCollapse() {
+        synchronized (OVERLAY_SERIAL) {
+            try {
+                String detach = BrowserSession.detach();
+                BrowserOverlay.collapse(appContext);
+                return detach;
+            } catch (Throwable t) {
+                return bridgeError("browserOverlayCollapse", t);
+            }
+        }
+    }
+
+    /** 关闭面板（WebView 回离屏，不销毁会话）。 */
+    static String browserOverlayDismiss() {
+        synchronized (OVERLAY_SERIAL) {
+            try {
+                BrowserOverlay.dismiss(appContext);
+                return BrowserSession.detach();
+            } catch (Throwable t) {
+                return bridgeError("browserOverlayDismiss", t);
+            }
+        }
+    }
+
+    /** WebView 当前是否挂在可见面板里（Rust 截图分流：attached 走 CDP 截图）。 */
+    static boolean browserOverlayAttached() {
+        return BrowserSession.isAttached() && BrowserOverlay.isExpanded();
+    }
+
+    /** Google 风控页命中：高优通知（点开进应用并展开面板）+ 前台时直接展开。 */
+    static void notifyCaptchaDetected(String url) {
+        try {
+            BrowserOverlay.notifyCaptcha(appContext, url);
+        } catch (Throwable t) {
+            android.util.Log.e("NativeBridge", "notifyCaptchaDetected failed", t);
+        }
+        // 前台场景直接全屏展开，用户无需再点通知（应用在后台时面板也会挂好，
+        // 点通知回来即见）。
+        java.util.concurrent.Executors.newSingleThreadExecutor().execute(() -> {
+            synchronized (OVERLAY_SERIAL) {
+                try {
+                    String started = ensureSessionStarted();
+                    if (!started.contains("\"ok\":true")) {
+                        return;
+                    }
+                    if (BrowserOverlay.ensureExpandedFullscreen(appContext)) {
+                        BrowserSession.attach(BrowserOverlay.webviewHost());
+                    }
+                } catch (Throwable error) {
+                    android.util.Log.e("NativeBridge", "auto expand failed", error);
+                }
+            }
+        });
+    }
+
+    /** 悬浮窗/通知动作的统一 Throwable 序列化（类名 + 堆栈进 JSON 错误串）。 */
+    private static String bridgeError(String entry, Throwable t) {
+        java.io.StringWriter stack = new java.io.StringWriter();
+        t.printStackTrace(new java.io.PrintWriter(stack));
+        android.util.Log.e("NativeBridge", entry + " failed", t);
+        try {
+            return "{\"ok\":false,\"error\":" + org.json.JSONObject.quote(
+                    t.getClass().getName() + ": " + t.getMessage() + "\n" + stack) + "}";
+        } catch (Throwable ignored) {
+            return "{\"ok\":false,\"error\":\"" + entry + " Throwable（堆栈序列化失败）\"}";
+        }
     }
 
     /** 转发工作区媒体到其它应用（微信/QQ 等）：ACTION_SEND + FileProvider 只读

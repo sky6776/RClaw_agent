@@ -1013,9 +1013,12 @@ impl Config {
     pub fn load_from_dir(dir: &std::path::Path) -> Result<Self> {
         let path = dir.join("rclaw.toml");
         let cfg = if let Ok(text) = std::fs::read_to_string(&path) {
-            // 遗留节物理删除：剥离后写回原文件（toml_edit 保真，注释与格式
-            // 不动）；写回失败仅告警——本次仍按剥离结果加载，下次启动再试。
-            let (stripped, removed) = strip_removed_legacy_sections(&text);
+            // 与 parse_config_text 同序：先归一化 Windows 路径字面量（`\U` 等
+            // 反斜杠序列会让 toml_edit 解析失败，导致遗留节剥不掉、带病解析），
+            // 再物理删除遗留节并写回原文件（toml_edit 保真，注释与格式不动）；
+            // 写回失败仅告警——本次仍按剥离结果加载，下次启动再试。
+            let normalized = normalize_windows_path_basic_strings(&text);
+            let (stripped, removed) = strip_removed_legacy_sections(&normalized);
             if !removed.is_empty() {
                 match std::fs::write(&path, &stripped) {
                     Ok(()) => tracing::info!(
@@ -1030,8 +1033,7 @@ impl Config {
                     ),
                 }
             }
-            let normalized = normalize_windows_path_basic_strings(&stripped);
-            toml::from_str(&normalized).with_context(|| format!("解析 {} 失败", path.display()))?
+            toml::from_str(&stripped).with_context(|| format!("解析 {} 失败", path.display()))?
         } else {
             Config::default()
         };
