@@ -45,10 +45,6 @@ pub struct Config {
     /// 可扩展的 web_search provider pool。缺省关闭。
     #[serde(default)]
     pub web_search: WebSearchSection,
-    /// `[web_browser]` 段：无头浏览器检索（web_browser 工具）的搜索引擎偏好。
-    /// 整段可选，缺省首选引擎 bing（与历史行为一致）。
-    #[serde(default)]
-    pub web_browser: WebBrowserSection,
     /// `[skills]` 段：技能入口执行参数。缺省（无该段）时全部取默认值，
     /// 行为与历史版本一致。
     #[serde(default)]
@@ -726,33 +722,6 @@ fn default_heartbeat_interval() -> u64 {
 // 技能执行
 // ---------------------------------------------------------------------------
 
-/// `[web_browser]` 段：无头浏览器检索（web_browser 工具 action=search）的
-/// 搜索引擎偏好。整段可选；缺省首选引擎 bing，与历史行为一致。
-///
-/// 首选引擎搜不到时自动依次换备用引擎（备选顺序：必应 → 百度）；google 只作
-/// 首选（网络不可达的环境里插进降级链中段只会白等超时）。对话里模型显式指定
-/// engine 参数时不降级。会话内可用 `/webbrowser <引擎>` 热切换（同步写回
-/// rclaw.toml）；本段的改动重启生效。
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebBrowserSection {
-    /// 首选搜索引擎：google / bing / baidu（大小写不敏感，缺省 bing）。
-    #[serde(default = "default_web_browser_engine")]
-    pub engine: String,
-}
-
-impl Default for WebBrowserSection {
-    fn default() -> Self {
-        WebBrowserSection {
-            engine: default_web_browser_engine(),
-        }
-    }
-}
-
-fn default_web_browser_engine() -> String {
-    "bing".into()
-}
-
 /// `[skills]` 段：skill 入口（skill.toml 声明式动态工具）执行参数。
 ///
 /// 缺省（无 `[skills]` 段）时 `max_output_bytes = None`，运行期取
@@ -1045,27 +1014,8 @@ impl Config {
         }
 
         cfg.validate_skill_curator()?;
-        cfg.validate_web_browser_engine()?;
 
         Ok(cfg)
-    }
-
-    /// `[web_browser].engine` 启动期校验：fail-fast 拒绝不识别的引擎名，
-    /// 避免配置 typo（如 "googel"）静默回落默认 bing。
-    fn validate_web_browser_engine(&self) -> Result<()> {
-        let engine = self.web_browser.engine.trim();
-        if engine.is_empty() {
-            anyhow::bail!(
-                "[web_browser] engine 不能为空（支持 google / bing / baidu，缺省 bing）"
-            );
-        }
-        if rclaw_tools::web_browser::SearchEngine::parse(engine).is_none() {
-            anyhow::bail!(
-                "[web_browser] engine 值 '{}' 不识别（支持 google / bing / baidu）",
-                self.web_browser.engine
-            );
-        }
-        Ok(())
     }
 
     /// 当前选中 provider 的上下文窗口大小（token）。0 = 该 provider 未声明 `context_length`。

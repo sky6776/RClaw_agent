@@ -4,8 +4,8 @@
 //! - [`Tool`] trait：统一工具接口（名字、描述、JSON Schema、async execute）。
 //! - [`ToolRegistry`]：注册表，产出工具描述（供 LLM）、按名执行。
 //! - 内置工具：read/write/edit/list/grep/shell + health-aware web_search /
-//!   provider-specific search tools / tavily_extract + web_browser（无头浏览器
-//!   检索/读页，后端可插拔）+ cron_add/list/remove。
+//!   provider-specific search tools / tavily_extract + 拟人化 CDP 浏览器
+//!   browser_* 工具面（cdp_browser）+ cron_add/list/remove。
 //!
 //! 用 `Box<dyn Tool>` 而非静态数组 + 函数指针，便于扩展。
 //! 工具描述内部沿用 Anthropic 风格 `input_schema`，由 LLM 协议层翻译为具体 wire。
@@ -27,7 +27,6 @@ pub mod skill_signals;
 pub mod skill_usage;
 pub mod truncate;
 pub mod turn_state;
-pub mod web_browser;
 pub mod web_search;
 
 pub use cron_controller::CronController;
@@ -57,10 +56,6 @@ pub use skill_usage::{
     SkillLifecycleRecord, SkillOwner, SkillState, SkillUsageStore,
 };
 pub use truncate::{head_tail_truncate, HeadTailBuffer, HeadTailOutput};
-pub use web_browser::{
-    preferred_engine, set_preferred_engine, HeadlessBrowserLoader, PageLoader, PagePayload,
-    SearchEngine, SearchEntry, WebBrowserTool,
-};
 pub use web_search::{
     BackendError, BackendErrorKind, BackendId, BackendStatus, DoubaoBackend, DoubaoSearchConfig,
     DoubaoVariant, HealthStatus, ProviderSearchTool, ReadResponse, ReaderBackend, SearchBackend,

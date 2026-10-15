@@ -105,13 +105,39 @@ struct PromptHost<'a> {
     /// `None` = 不按工具裁剪（桌面 / Termux 恒为 None；APK 宿主在拿不到注册表时也为 None，
     /// 此时按 APK 平台事实推断：没有 shell，其余工具视为存在）。
     tools: Option<&'a [ToolSchema]>,
+    /// 未过滤的原始注册集（裁剪约定不影响它）：浏览器工具面只有桌面 GUI / APK
+    /// 宿主注册（CDP browser_*），CLI/Termux 没有——这一行的文案必须跟着实际
+    /// 注册走，是唯一按注册差异选择的行。
+    raw_tools: Option<&'a [ToolSchema]>,
 }
 
 impl PromptHost<'_> {
     fn new(kind: HostKind, tools: Option<&[ToolSchema]>) -> PromptHost<'_> {
         // 桌面与 Termux 的提示与注册表无关（零回归 D7）；只有 APK 宿主按工具裁剪。
-        let tools = if kind.is_apk_host() { tools } else { None };
-        PromptHost { kind, tools }
+        // raw_tools 保留未过滤的原始注册集，仅供浏览器工具行按真实注册选择。
+        let pruned = if kind.is_apk_host() { tools } else { None };
+        PromptHost {
+            kind,
+            tools: pruned,
+            raw_tools: tools,
+        }
+    }
+
+    /// 浏览器工具行：按真实注册选择。桌面 / APK 宿主注册 CDP browser_* 面；
+    /// CLI/Termux 无浏览器工具，不留行（不宣称未注册的能力）。拿不到注册表时
+    /// 按宿主平台事实推断（Termux 无，其余视为有）。
+    fn browser_tool_line<'a>(&self, cdp_line: &'a str) -> &'a str {
+        match self.raw_tools {
+            Some(tools) => {
+                if tools.iter().any(|tool| tool.name == "browser_navigate") {
+                    cdp_line
+                } else {
+                    ""
+                }
+            }
+            None if self.kind == HostKind::Termux => "",
+            None => cdp_line,
+        }
     }
 
     fn has_tool(&self, name: &str) -> bool {
@@ -151,7 +177,9 @@ pub fn build_system_prompt(
 /// 按宿主实际注册的工具构建 system prompt。
 ///
 /// 只有 APK 宿主会依据 `tools` 裁剪工具说明（不宣称未注册的 shell/CLI 能力）；桌面与 Termux
-/// 忽略 `tools`，输出与 [`build_system_prompt`] 逐字节一致。
+/// 忽略 `tools`，其余输出与 [`build_system_prompt`] 逐字节一致。唯一例外是浏览器
+/// 工具行：它按未过滤的原始注册集选择（桌面 GUI/APK 有 CDP `browser_*` 面、
+/// CLI/Termux 没有），因此该行随实际注册变化。
 pub fn build_system_prompt_for_tools(
     layout: &Layout,
     memory: &MemoryStore,
@@ -330,9 +358,8 @@ fn append_shared_body(
             s.push('\n');
         }
     }
-    if host.has_tool("web_browser") {
-        s.push_str("- web_browser: 用内置无头浏览器（真实浏览器引擎）检索或打开网页：action=search 给检索词返回结果列表（默认用配置的首选引擎，无结果时自动依次换备用引擎，备选顺序 必应→百度；engine 可显式指定 google/bing/baidu，显式指定时只用该家不降级——用户说「用 web_browser 搜 bing」就传 engine=bing；广告条目已过滤），action=open 给 URL 返回页面主文正文。适合联网搜索工具不可用、页面依赖 JS 渲染、或要读取具体链接内容的场景；每次调用较慢（数秒），常规检索仍优先联网搜索工具。\n");
-    }
+    let cdp_browser_line = "- browser_*: 内置 CDP 浏览器（真实 Chromium 内核，UA 与交互已拟人化，可正常访问 Google 等风控站点）。browser_navigate 打开 URL：普通页返回标题+最终 URL+正文；搜索引擎结果页 URL 返回解析后的结果列表（标题/链接/摘要，广告已过滤）——联网检索直接 navigate 到任意引擎的搜索 URL（引擎自由选择，如 https://www.bing.com/search?q=检索词、https://www.google.com/search?q=…、https://www.baidu.com/s?wd=…）；检测到风控页/同意页会明确标注。browser_snapshot 列出可交互元素（[ref] 编号，页面跳转后需重照）；browser_click 真实鼠标点按 [ref]；browser_type 往 [ref] 输入框输入；browser_scroll 滚轮滑动（可触发懒加载）；browser_screenshot 截图存工作区 browser/；browser_close 关闭会话。适合联网搜索工具不可用、页面依赖 JS 渲染、需要点击/登录/翻页/截图的场景；每次调用较慢（数秒），常规检索仍优先联网搜索工具。\n";
+    s.push_str(host.browser_tool_line(cdp_browser_line));
     s.push_str("- 审计/交叉验证完整性：来源原始值、单位、摘录、URL 和定位必须忠实来自所列证据；归一化复核值只能由审计工具计算。两个来源槽位在首次判决时锁定；判决不通过后只能修正被审计产物并重新提取，或如实保持失败并交由人工复核。禁止改写或更换既有来源、删除证据账本、反复挑选来源直到碰到有利数值，或为了让检查通过而把第二来源改成与被审计值一致。\n");
     if host.has_tool("cron_add") {
         s.push_str("- cron_add: 安排定时/一次性任务。每天/每日固定钟点用 'daily'（at_clock=\"11:00\"，本地时区）；每周固定星期/钟点用 'weekly'（weekday=1..7 表示周一..周日，at_clock=\"09:00\"）；每月固定阳历日期/钟点用 'monthly'（day_of_month=1..31，at_clock=\"09:00\"；用户没说几点时先追问）；每月固定农历日/钟点用 'lunar_monthly'（day_of_month=1..30，at_clock=\"09:00\"，仅用户显式说农历时使用）；每年固定阳历日期/钟点用 'yearly'（month/day/at_clock）；用户显式说农历才用 'lunar_yearly'（month/day/at_clock，只有说“闰某月”时 leap_month=true，否则 false）；一次性农历日期用 'lunar_clock'（year/month/day/at_clock，只有说“闰某月”时 leap_month=true）；每年从某月某日开始每天提醒、持续若干天或直到某月某日，用 'yearly_range'（month/day + duration_days 或 end_month/end_day + at_clock），显式说农历则用 'lunar_yearly_range'；只说“每年6月份”“每月12号”“生日”但没说具体日或几点时，先追问缺失的日期/时间，不要猜。一次性具体阳历钟点用 'clock'（at_clock=\"22:00\" 或 \"2026-06-28 22:00\"，本地时区，由代码换算 epoch，不要手算；用户说“今天/明天/某日”时传完整日期时间，避免裸钟点滚到下一天）；相对延时用 'after'；'every' 仅表示从创建时刻起算的固定秒间隔，不用于日历固定钟点。\n");
@@ -838,24 +865,27 @@ mod tests {
     }
 
     /// 桌面全工具注册集：与运行时注册表一致的名字（提示对桌面不裁剪，这里用于证明
-    /// 传入 tools 也不改变输出）。
+    /// 传入 tools 也不改变输出）。含 CDP 浏览器工具面（桌面 GUI 独有）。
     fn desktop_tool_names() -> Vec<&'static str> {
         vec![
             "read", "write", "edit", "list", "delete", "grep", "shell", "memory", "cron_add",
             "cron_list", "cron_remove", "skill_manage", "web_search", "zhipu_search",
-            "tavily_search", "tavily_extract", "web_browser", "TeamCreate", "TeamDelete",
-            "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "SendMessage", "Agent", "Task",
+            "tavily_search", "tavily_extract", "browser_navigate", "browser_snapshot",
+            "browser_click", "browser_type", "browser_scroll", "browser_screenshot",
+            "browser_close", "TeamCreate", "TeamDelete", "TaskCreate", "TaskUpdate", "TaskList",
+            "TaskGet", "SendMessage", "Agent", "Task",
         ]
     }
 
-    /// APK 宿主工具集：没有 shell，多出进程内 gbrain 工具。
+    /// APK 宿主工具集：没有 shell，多出进程内 gbrain 工具。浏览器工具面与桌面一致。
     fn apk_tool_names() -> Vec<&'static str> {
         vec![
             "read", "write", "edit", "list", "delete", "grep", "memory", "cron_add", "cron_list",
             "cron_remove", "skill_manage", "web_search", "zhipu_search", "tavily_search",
-            "tavily_extract", "web_browser", "TeamCreate", "TeamDelete", "TaskCreate",
-            "TaskUpdate", "TaskList", "TaskGet", "SendMessage", "Agent", "Task", "gbrain__search",
-            "gbrain__artifact_put",
+            "tavily_extract", "browser_navigate", "browser_snapshot", "browser_click",
+            "browser_type", "browser_scroll", "browser_screenshot", "browser_close",
+            "TeamCreate", "TeamDelete", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+            "SendMessage", "Agent", "Task", "gbrain__search", "gbrain__artifact_put",
         ]
     }
 
@@ -891,16 +921,33 @@ mod tests {
         let tools = schemas(&desktop_tool_names());
         let with_tools = build_system_prompt_for_tools(&layout, &memory, 0, Some(&control), &tools);
         assert_golden(&with_tools, "desktop");
-        // 桌面即便注册表缺少 shell/cron，也不裁剪（提示与注册情况无关，零回归）。
+        // 桌面即便注册表缺少 shell/cron，也不裁剪（提示与注册情况无关，零回归）；
+        // 浏览器工具行是唯一例外（按真实注册选择），故 fixture 带上 browser_navigate。
         let partial = build_system_prompt_with(
             &layout,
             &memory,
             0,
             Some(&control),
             HostKind::Desktop,
-            Some(&schemas(&["read", "grep"])),
+            Some(&schemas(&["read", "grep", "browser_navigate"])),
         );
         assert_golden(&partial, "desktop");
+    }
+
+    #[test]
+    fn cli_no_browser_registry_leaves_no_browser_line() {
+        // CLI/Termux 无浏览器工具：提示词不宣称任何浏览器能力（不区分宿主，
+        // 注册表里没有 browser_navigate 就不留行）。
+        for base in ["/srv/rclaw-cli/agent", "/data/data/com.termux/files/home/.rclaw/agent"] {
+            let layout = Layout::new(base);
+            let memory = MemoryStore::new(layout.clone());
+            let mut names = desktop_tool_names();
+            names.retain(|name| !name.starts_with("browser_"));
+            let prompt =
+                build_system_prompt_for_tools(&layout, &memory, 0, None, &schemas(&names));
+            assert!(!prompt.contains("- browser_*:"), "{base}: {prompt}");
+            assert!(!prompt.contains("web_browser"), "{base}: {prompt}");
+        }
     }
 
     #[test]
@@ -911,9 +958,10 @@ mod tests {
         assert_eq!(HostKind::detect(&layout.base), HostKind::Termux);
         let plain = build_system_prompt(&layout, &memory, 0, None);
         assert_golden(&plain, "termux");
-        // Termux 同样不按工具裁剪。
-        let tools = schemas(&desktop_tool_names());
-        let with_tools = build_system_prompt_for_tools(&layout, &memory, 0, None, &tools);
+        // Termux 同样不按工具裁剪；fixture 用 CLI 真实注册集（无浏览器工具）。
+        let mut names = desktop_tool_names();
+        names.retain(|name| !name.starts_with("browser_"));
+        let with_tools = build_system_prompt_for_tools(&layout, &memory, 0, None, &schemas(&names));
         assert_golden(&with_tools, "termux");
     }
 

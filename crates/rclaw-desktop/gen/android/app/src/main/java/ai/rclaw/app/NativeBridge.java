@@ -401,11 +401,6 @@ public final class NativeBridge {
         RClawService.applyRuntimeStatus(text, busy);
     }
 
-    /** 无头浏览器取页（Rust web_browser 工具的 JNI 入口；调用方须在工作线程）。 */
-    static String browse(String url, int timeoutMs) {
-        return HeadlessBrowser.browse(appContext, url, timeoutMs);
-    }
-
     /** turn 收尾提醒（独立「任务完成」通道，有声/横幅；autoCancel 点开进应用）。
      *  调用方（Rust）已按前台门闸过滤。 */
     static void notifyTurnDone(String text) {

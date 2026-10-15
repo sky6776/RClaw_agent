@@ -280,7 +280,8 @@ pub type ModelFactory = Arc<dyn Fn(&str) -> Option<Arc<dyn Provider>> + Send + S
 #[derive(Clone)]
 pub struct AgentToolRuntime {
     provider: Arc<dyn Provider>,
-    base_system_prompt: Arc<String>,
+    /// web_search 控制面：子代理基础提示的搜索段文案需要它（惰性构建时用）。
+    search: Option<Arc<WebSearchControl>>,
     /// 接线期采集的通道能力与共享媒体沙箱（C3）。
     channels: rclaw_core::RuntimeChannelInfo,
     registry: RegistryLink,
@@ -321,18 +322,15 @@ impl AgentToolRuntime {
         channels: rclaw_core::RuntimeChannelInfo,
         search: Option<Arc<WebSearchControl>>,
     ) -> Self {
-        let base_system_prompt = Arc::new(context::build_system_prompt(
-            &layout,
-            &memory,
-            opts.recent_days,
-            search.as_deref(),
-        ));
+        // 子代理基础提示不再在此构建：装配期 registry 还是空的 OnceLock，
+        // 按注册差异裁剪的文案（如浏览器工具行）会失真。改为子代理执行时
+        // 惰性构建（见 [`Self::base_system_prompt`]），届时注册表已终态。
         let collaboration = CollaborationState::open(journal.clone());
         let (wake_enabled, wake_debounce) =
             (opts.background_wake_enabled, opts.background_wake_debounce);
         AgentToolRuntime {
             provider,
-            base_system_prompt,
+            search,
             channels,
             registry,
             next_inference_start: Arc::new(Mutex::new(tokio::time::Instant::now())),
@@ -350,6 +348,19 @@ impl AgentToolRuntime {
             model_cache: Arc::new(StdMutex::new(HashMap::new())),
             pending_escalations: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// 子代理基础 system prompt：按当前真实注册集构建（浏览器工具行等按注册
+    /// 差异裁剪的文案因此与宿主实际能力一致）。
+    fn base_system_prompt(&self) -> Result<String, String> {
+        let registry = self.registry()?;
+        Ok(context::build_system_prompt_for_tools(
+            &self.layout,
+            &self.memory,
+            self.opts.recent_days,
+            self.search.as_deref(),
+            registry.schemas(),
+        ))
     }
 
     /// 登记待应答的 escalate 问题（Layer 3 实时通道）；返回阻塞等待的接收端。
@@ -1295,7 +1306,20 @@ impl AgentToolRuntime {
         };
         // skills 目录扫描每任务一次：动态上下文与激活失效共享该缓存。
         let catalog = SkillCatalog::new(&self.layout);
-        let mut system = (*self.base_system_prompt).clone();
+        let mut system = match self.base_system_prompt() {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                // 注册表尚未回填（理论上到不了这里：子代理只在装配完成后执行），
+                // 回退无裁剪版保底。
+                tracing::warn!("子代理基础提示按注册集构建失败（回退无裁剪版）: {error}");
+                context::build_system_prompt(
+                    &self.layout,
+                    &self.memory,
+                    self.opts.recent_days,
+                    self.search.as_deref(),
+                )
+            }
+        };
         system.push_str(
             "\n## Sub-agent Mode\n\
              You are running as a focused RClaw sub-agent. Complete only the delegated task. \

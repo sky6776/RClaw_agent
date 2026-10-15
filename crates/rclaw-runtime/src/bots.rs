@@ -227,10 +227,16 @@ pub struct BotRegistry {
     provider_factory: ProviderFactory,
     memory_char_limit: usize,
     user_char_limit: usize,
+    /// 装配终态的工具注册快照（bot 提示按注册差异裁剪的依据）。装配期分两段：
+    /// BotRegistry 先于 Agent/Task 等多 agent 工具创建，快照由 bootstrap 在全部
+    /// 注册完成后经 [`Self::set_tool_schemas`] 回填并触发 persona 重建。
+    tool_schemas: std::sync::Mutex<Vec<rclaw_core::ToolSchema>>,
 }
 
 impl BotRegistry {
     /// `provider_factory` 把 provider 名解析为可用 provider（bootstrap 传入，读配置构建）。
+    /// 工具注册快照此刻还没有终态（Agent/Task 等多 agent 工具在本构造之后注册），
+    /// bootstrap 须在全部注册完成后调 [`Self::set_tool_schemas`] 回填。
     pub fn new(
         base_layout: &Layout,
         provider_factory: ProviderFactory,
@@ -246,9 +252,19 @@ impl BotRegistry {
             provider_factory,
             memory_char_limit,
             user_char_limit,
+            tool_schemas: std::sync::Mutex::new(Vec::new()),
         };
         registry.reload(search);
         registry
+    }
+
+    /// 回填装配终态的工具注册快照并重建全部 persona：注册差异裁剪（浏览器工具
+    /// 行、团队工具行等）从此以完整注册面为准。
+    pub fn set_tool_schemas(&self, schemas: Vec<rclaw_core::ToolSchema>) {
+        *self
+            .tool_schemas
+            .lock()
+            .expect("BotRegistry.tool_schemas 锁未被毒化") = schemas;
     }
 
     /// 重读 bot 定义并重建全部 persona（提示 / 记忆 / provider 一并刷新）。
@@ -284,12 +300,19 @@ impl BotRegistry {
                     "bot 固定的 provider 不存在，回退主 provider"
                 );
             }
-            let base_prompt = Arc::new(context::build_bot_system_prompt(
+            let tool_schemas = self
+                .tool_schemas
+                .lock()
+                .expect("BotRegistry.tool_schemas 锁未被毒化")
+                .clone();
+            let base_prompt = Arc::new(context::build_bot_system_prompt_with(
                 &self.base_layout,
                 &name,
                 &def,
                 &roster,
                 search,
+                context::HostKind::detect(&self.base_layout.base),
+                Some(&tool_schemas),
             ));
             map.insert(
                 name.clone(),
@@ -758,6 +781,7 @@ mod tests {
             provider_factory: Arc::new(|_| None),
             memory_char_limit: 2200,
             user_char_limit: 1375,
+            tool_schemas: std::sync::Mutex::new(Vec::new()),
         })
     }
 

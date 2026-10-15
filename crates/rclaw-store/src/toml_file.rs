@@ -98,22 +98,6 @@ impl RclawToml {
         self.save(&doc)
     }
 
-    /// 改写 `[web_browser].engine`（段缺失时创建——该段整体可选，用户没写过
-    /// 也能直接用 /webbrowser 设首选引擎；已存在但非表值时报错）。
-    pub fn set_web_browser_engine(&self, engine: &str) -> Result<(), String> {
-        let mut doc = self.load()?;
-        {
-            let web_browser = doc
-                .entry("web_browser")
-                .or_insert(toml_edit::Item::Table(explicit_table()));
-            let table = web_browser
-                .as_table_mut()
-                .ok_or_else(|| "rclaw.toml 中 [web_browser] 已是非表值，无法写入".to_string())?;
-            set_table_item_preserving_decor(table, "engine", toml_edit::value(engine));
-        }
-        self.save(&doc)
-    }
-
     /// 面板保存的类型化赋值动作（见 [`Self::apply_edits_preview`]）。
     pub fn apply_edits_preview(&self, edits: &[(String, EditValue)]) -> Result<String, String> {
         let mut doc = self.load()?;
@@ -374,35 +358,6 @@ mod tests {
         let toml = write_config(dir.path(), "[llm]\nprovider = \"x\"\n");
         assert!(toml.set_search_order(&["zhipu"]).is_err());
         assert!(toml.set_search_fallback(true).is_err());
-    }
-
-    /// [web_browser] 段整体可选：缺失时直接创建写入；已有段更新引擎且邻居保真。
-    #[test]
-    fn set_web_browser_engine_creates_missing_section_and_updates_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml = write_config(dir.path(), "# 顶部\n[napcat]\nenabled = false\n");
-        toml.set_web_browser_engine("google").unwrap();
-        let text = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
-        assert!(text.contains("# 顶部"), "注释必须保真");
-        assert!(text.contains("[web_browser]"), "{text}");
-        assert!(text.contains("engine = \"google\""), "{text}");
-        assert!(text.contains("enabled = false"), "邻居段必须保真");
-
-        // 已有段：覆盖引擎，段内其它键保留。
-        let dir2 = tempfile::tempdir().unwrap();
-        let toml2 = write_config(
-            dir2.path(),
-            "[web_browser]\nengine = \"bing\" # 注释\n",
-        );
-        toml2.set_web_browser_engine("baidu").unwrap();
-        let text2 = std::fs::read_to_string(dir2.path().join("rclaw.toml")).unwrap();
-        assert!(text2.contains("engine = \"baidu\" # 注释"), "{text2}");
-        assert_eq!(text2.matches("engine =").count(), 1);
-
-        // 非表值：报错不写入。
-        let dir3 = tempfile::tempdir().unwrap();
-        let toml3 = write_config(dir3.path(), "web_browser = \"oops\"\n");
-        assert!(toml3.set_web_browser_engine("bing").is_err());
     }
 
     /// CRLF 文件改写后必须保持纯 CRLF（拆分前的手写编辑器明确承诺逐字节保留换行风格）。

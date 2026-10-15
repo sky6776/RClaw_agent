@@ -271,7 +271,7 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 | `session_search` | 跨会话（含归档会话）关键词检索，AND 语义 + 词频计分，召回"上次那个问题怎么解决的" |
 | `session_handoff` | 把另一段会话（含归档）的脉络带进当前会话：query 相关的更早消息 + 最近消息原文，按 4K–48K 字符预算填充，结果标注为历史素材而非指令 |
 | `web_search` | 多来源高可用搜索池（豆包 Custom / Tavily 多 Key / 智谱 MCP / 豆包 Global），额度与熔断自动切换，可补读正文 |
-| `web_browser` | 浏览器式网页抓取与阅读；检索引擎可配置（`[web_browser].engine` 或 `/webbrowser`，google/bing/baidu，搜不到自动依次换备用引擎，备选顺序 必应→百度） |
+| `browser_*` | 拟人化 CDP 浏览器（真实 Chromium 内核；navigate/snapshot/click/type/scroll/screenshot/close，仅桌面 GUI 与安卓 APK 注册）：打开 URL 返回正文，搜索引擎结果页 URL 返回解析后的结果列表（引擎自由选择，广告已过滤） |
 | `tavily_extract` | Tavily 正文抽取 |
 
 ### 技能管理
@@ -313,7 +313,7 @@ agent 每轮可用的工具面（技能动态工具与 MCP 工具之外）：
 | 命令 | 说明 |
 |---|---|
 | `/llmodel <模型名>` | 热切换 LLM 模型，同步写回 `rclaw.toml` |
-| `/search` / `/searchfallback` / `/webbrowser` | 搜索源顺序、fallback 开关与无头浏览器引擎管理 |
+| `/search` / `/searchfallback` | 搜索源顺序与 fallback 开关管理 |
 | `/skills` / `/tools` | 列出当前技能与工具 |
 | `/context` | 当前会话上下文用量（窗口 / 已用 / 剩余 / 使用率） |
 | `/compact` | 立即压缩当前会话历史（忽略阈值与防抖；有任务运行时拒绝） |

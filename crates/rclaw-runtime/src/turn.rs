@@ -341,7 +341,7 @@ fn tool_call_brief(name: &str, input: &str) -> String {
                 format!("{name} → {first_line}")
             }
         }
-        "web_browser" => {
+        "browser_navigate" => {
             let brief = str_field("query");
             let brief = if brief.is_empty() {
                 str_field("url")

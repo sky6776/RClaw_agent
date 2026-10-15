@@ -92,7 +92,13 @@ const TOOL_LABELS: Record<string, string> = {
   list: "列出",
   shell: "命令",
   web_search: "联网搜索",
-  web_browser: "网页浏览",
+  browser_navigate: "打开网页",
+  browser_snapshot: "页面快照",
+  browser_click: "点击",
+  browser_type: "输入",
+  browser_scroll: "滑动",
+  browser_screenshot: "页面截图",
+  browser_close: "关闭页面",
   memory: "记忆",
 };
 
@@ -115,7 +121,7 @@ function toolIcon(tool: string) {
   if (tool === "shell") return <TerminalIcon />;
   if (tool === "edit" || tool === "write" || tool === "delete")
     return <PencilIcon />;
-  if (tool === "read" || tool === "grep" || tool === "list" || tool === "web_search" || tool === "web_browser")
+  if (tool === "read" || tool === "grep" || tool === "list" || tool === "web_search" || tool === "browser_navigate")
     return <SearchIcon />;
   return <GearIcon />;
 }

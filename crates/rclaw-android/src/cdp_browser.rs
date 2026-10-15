@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use rclaw_tools::cdp_browser::{probe_page_target, DevtoolsTransport, RawStream};
 
-/// Android 传输实现 + web_browser / browser_* 工具注册。
+/// Android 传输实现 + 拟人化 browser_* 工具面注册。
 pub fn register(tools: &mut rclaw_tools::ToolRegistry) {
     let screenshot_dir = crate::host_context()
         .map(|ctx| ctx.files_dir.join("agent").join("browser"))

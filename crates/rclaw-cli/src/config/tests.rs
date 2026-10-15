@@ -21,8 +21,6 @@ fn example_config_parses() {
     );
     // 示例显式给出的压缩摘要上限必须是 12_000（不是旧的 2048）。
     assert_eq!(cfg.agent.compression_summary_max_tokens, 12_000);
-    // [web_browser] 段：示例显式给出首选引擎 bing（历史缺省）。
-    assert_eq!(cfg.web_browser.engine, "bing");
 }
 
 #[test]

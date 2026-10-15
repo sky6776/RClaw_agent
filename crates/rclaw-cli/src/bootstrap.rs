@@ -142,15 +142,6 @@ pub async fn assemble_core_with(
         None => rclaw_tools::clear_skill_output_limit(),
     }
 
-    // [web_browser] 检索引擎偏好：注入进程级槽位（web_browser 工具与 /webbrowser
-    // 斜杠命令分属不同 crate，槽位模式对齐上面的 set_skill_output_limit）。
-    // 配置已在 finish_load 校验过；解析失败时保留槽位现值（bing），不阻断装配。
-    if let Some(engine) =
-        rclaw_tools::web_browser::SearchEngine::parse(cfg.web_browser.engine.trim())
-    {
-        rclaw_tools::web_browser::set_preferred_engine(engine);
-    }
-
     // Provider（DeepSeek / 智谱等 OpenAI 兼容）。SwappableProvider 支持 /llmodel 热切换。
     let pcfg = cfg.build_provider_config()?;
     let hot = Arc::new(SwappableProvider::new(pcfg)?);
@@ -194,13 +185,9 @@ pub async fn assemble_core_with(
         rclaw_runtime::session_handoff::SessionHandoffTool::new(session.clone()),
     ));
 
-    // web_browser 工具：真实浏览器引擎（无头 Chrome/Edge/Chromium）检索/读页，
-    // 与 web_search API 互补；Android APK 宿主在 customize 里换成 WebView 后端。
-    tools.register(Box::new(rclaw_tools::WebBrowserTool::new(std::sync::Arc::new(
-        rclaw_tools::HeadlessBrowserLoader,
-    ))));
-
-    // Web 搜索工具：router 统一负责顺序、启禁、fallback、总时间预算和熔断。
+    // 浏览器能力统一为 CDP browser_* 工具面，由宿主装配钩子注册（桌面/APK 的
+    // customize 调 rclaw_tools::cdp_browser::register）；CLI/Termux 无浏览器工具。
+    // web_search 工具：router 统一负责顺序、启禁、fallback、总时间预算和熔断。
     let web_search_control = if let Some(web_cfg) = cfg.web_search_runtime_config()? {
         let control = Arc::new(
             WebSearchControl::new(
@@ -357,8 +344,9 @@ pub async fn assemble_core_with(
         agent_runtime.clone(),
     )));
     // Bot Mode（ADR-0006）：bot 注册表 + message_agent 交接工具。registry 在
-    // web_search_control 之后构建（bot 提示需要搜索工具面状态）；router 由二进制
-    // 建 inbound 总线后经 bot_router_slot 回填。
+    // web_search_control 之后构建（bot 提示需要搜索工具面状态）；此时 Agent/Task
+    // 等多 agent 工具还没注册，装配完成后由 set_tool_schemas 回填终态注册快照并
+    // 重建 persona；router 由二进制建 inbound 总线后经 bot_router_slot 回填。
     let bots = Arc::new(BotRegistry::new(
         layout,
         provider_factory,
@@ -378,6 +366,11 @@ pub async fn assemble_core_with(
         "Agent",
     )));
     tools.register(Box::new(ClaudeAgentTool::new(agent_runtime, "Task")));
+
+    // 全部工具注册完毕：回填终态注册快照并重建 bot persona（按注册差异裁剪的
+    // 提示文案从此与实际工具面一致）。
+    bots.set_tool_schemas(tools.schemas().to_vec());
+    bots.reload(web_search_control.as_deref());
 
     let tools = Arc::new(tools);
     let _ = agent_tools_registry.set(tools.clone());

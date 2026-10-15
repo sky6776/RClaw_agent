@@ -131,8 +131,8 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     };
 
     // 核心组件与 CLI 同一装配路径；/llmodel 持久化写回数据目录的 rclaw.toml。
-    // CDP 浏览器（桌面）：web_browser 换无头 Chromium 后端 + browser_* 交互
-    // 工具（协议与安卓共用，见 rclaw_tools::cdp_browser）。截图落工作区 browser/。
+    // CDP 浏览器（桌面）：拟人化 browser_* 工具面（协议与安卓共用，见
+    // rclaw_tools::cdp_browser；CLI/Termux 不注册，无浏览器工具）。截图落工作区 browser/。
     let browser_screenshot_dir = layout.base.join("browser");
     let core = rclaw_cli::bootstrap::assemble_core_with(
         &cfg,
@@ -685,9 +685,9 @@ pub(crate) async fn assemble_apk_agent(
                 let added = gbrain.extend_registry_with_timeout(tools, gbrain_call_timeout);
                 tracing::info!(added, "APK host 已注册进程内 gbrain 工具");
             }
-            // web_browser 取页后端换成系统 WebView 离屏渲染（装配默认后端是
-            // spawn 无头浏览器，Android 上不存在）。
-            rclaw_android::web_browser::register(tools);
+            // 注册拟人化 CDP browser_* 工具面（AndroidTransport 长驻调试
+            // WebView；桌面同款协议，见 rclaw_tools::cdp_browser）。
+            rclaw_android::browser::register(tools);
         },
     )
     .await

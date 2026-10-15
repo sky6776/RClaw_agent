@@ -11,7 +11,7 @@ mod host_glue;
 #[cfg(unix)]
 pub mod cdp_browser;
 #[cfg(target_os = "android")]
-pub mod web_browser;
+pub mod browser;
 
 pub use bridge_executor::{BridgePythonExecutor, PendingApproval, SkillApprovalStore};
 pub use host_glue::{
@@ -1478,37 +1478,6 @@ pub mod jni_bridge {
             anyhow!("调用 NativeBridge.notifyTurnDone 失败: {error}")
         })?;
         Ok(())
-    }
-
-    /// 无头浏览器取页（web_browser 工具 → NativeBridge.browse →
-    /// HeadlessBrowser 离屏 WebView）。调用方须在阻塞线程（主线程调用会死锁）。
-    /// 返回 JSON 文本 `{"ok":true,"page":{...}}` / `{"ok":false,"error":...}`。
-    pub(super) fn browse(url: &str, timeout_ms: u64) -> Result<String> {
-        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
-        let mut env = vm
-            .attach_current_thread()
-            .context("附加无头浏览器线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
-        let jurl = env.new_string(url)?;
-        let result = env
-            .call_static_method(
-                class,
-                "browse",
-                "(Ljava/lang/String;I)Ljava/lang/String;",
-                &[
-                    JValue::Object(&JObject::from(jurl)),
-                    JValue::Int(timeout_ms as i32),
-                ],
-            )
-            .map_err(|error| {
-                let _ = env.exception_clear();
-                anyhow!("调用 NativeBridge.browse 失败: {error}")
-            })?
-            .l()?;
-        let value = JString::from(result);
-        let payload = env.get_string(&value)?.to_string_lossy().into_owned();
-        Ok(payload)
     }
 
     /// CDP 浏览器会话：确保长驻调试 WebView 在跑，返回进程 pid（拼 DevTools

@@ -1,7 +1,7 @@
 package ai.rclaw.app;
 
 /**
- * CDP 浏览器会话（web_browser / browser_* 工具的共享内核）。
+ * CDP 浏览器会话（browser_* 工具面的共享内核）。
  *
  * 专用长驻 WebView（不随单次调用销毁）：Rust 侧经 DevTools abstract socket
  * （webview_devtools_remote_<pid>）直连 CDP 驱动它——真实网络栈、真实 WebView
@@ -57,9 +57,9 @@ final class BrowserSession {
                     android.webkit.WebSettings settings = wv.getSettings();
                     settings.setJavaScriptEnabled(true);
                     settings.setDomStorageEnabled(true);
-                    // UA 保持 WebView 真实身份（「; wv」+ 真实 Chromium 版本）——
-                    // 假桌面 UA 与引擎/网络栈指纹不一致，对 Google 是更糟的签名；
-                    // 干净的请求头由 Rust 侧 CDP Fetch 拦截负责。
+                    // UA 基线保持 WebView 真实身份（真实 Chromium 版本）；
+                    // Rust 侧会话建立时清洗覆写（摘「; wv」标记 + Client Hints
+                    // 元数据），请求头由 CDP Fetch 拦截摘 X-Requested-With。
                     settings.setGeolocationEnabled(false);
                     settings.setSaveFormData(false);
                     // 软件层：离屏 draw() 截图必须（硬件层的离屏视图画不出内容）。

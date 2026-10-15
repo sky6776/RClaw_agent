@@ -389,7 +389,7 @@ mod tests {
             "顶部说明应进 preamble: {:?}",
             doc.preamble
         );
-        // 顶层段齐备（含新增的 [web_browser] 检索引擎偏好段）。
+        // 顶层段齐备。
         for p in [
             "agent",
             "llm",
@@ -397,7 +397,6 @@ mod tests {
             "web_search",
             "web_search.tavily",
             "web_search.zhipu",
-            "web_browser",
             "napcat",
             "weixin",
             "log",
@@ -489,24 +488,23 @@ mod tests {
             mcp.items.iter().map(|i| i.key.as_str()).collect::<Vec<_>>()
         );
         assert!(mcp.items.iter().any(|i| i.key == "startup_timeout_secs"));
-        // web_browser 段的 engine 键可寻址、非注释、str。
-        let web_browser = doc
+        // web_search 段的 read_top 键可寻址、非注释、带行内注释（抽一个标量键验证文档化）。
+        let web_search = doc
             .sections
             .iter()
-            .find(|s| s.path == "web_browser")
-            .expect("[web_browser] 段");
-        let engine = web_browser
+            .find(|s| s.path == "web_search")
+            .expect("[web_search] 段");
+        let read_top = web_search
             .items
             .iter()
-            .find(|i| i.key == "engine")
-            .expect("web_browser.engine 应被收录");
-        assert!(!engine.commented);
-        assert_eq!(engine.kind, "str");
-        assert_eq!(engine.default_raw, "\"bing\"");
+            .find(|i| i.key == "read_top")
+            .expect("web_search.read_top 应被收录");
+        assert!(!read_top.commented);
+        assert_eq!(read_top.kind, "int");
         assert!(
-            engine.doc.iter().any(|l| l.contains("google")),
-            "engine 行内注释应进文档: {:?}",
-            engine.doc
+            read_top.doc.iter().any(|l| l.contains("补读")),
+            "read_top 行内注释应进文档: {:?}",
+            read_top.doc
         );
     }
 
