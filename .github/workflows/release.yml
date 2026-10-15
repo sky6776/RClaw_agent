@@ -338,6 +338,22 @@ jobs:
             -x rustBuildArm64Release -Dkotlin.compiler.execution.strategy=in-process \
             -PabiList=arm64-v8a -ParchList=arm64 -PtargetList=aarch64
 
+      # R8 看不到 Rust 侧的 JNI 调用点：proguard-rules.pro 的 keep 规则一旦缺失/
+      # 失效，NativeBridge/PythonRuntime 的方法会被剥离或改名，运行期统一表现为
+      # 「调用 NativeBridge.xxx 失败: Java exception was thrown」（v2.7.1 实证：
+      # 应用内更新拉起安装器失败即此，runScript 同样被改名致 skill 脚本全坏）。
+      # 方法名字符串只来自定义侧（dex 内无调用点），grep 命中即证明未被剥离。
+      - name: Verify JNI bridge survived R8
+        run: |
+          APK=crates/rclaw-desktop/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk
+          for method in installUpdate runScript openUrl updateRuntimeStatus; do
+            unzip -p "$APK" classes.dex | grep -aq "$method" || {
+              echo "::error::R8 剥离/改了 JNI 桥方法 $method（proguard-rules.pro 的 keep 规则失效？）"
+              exit 1
+            }
+          done
+          echo "JNI 桥方法校验通过（NativeBridge/PythonRuntime 未被 R8 破坏）"
+
       - name: Collect APK
         run: |
           mkdir -p dist

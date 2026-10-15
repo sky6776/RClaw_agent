@@ -35,6 +35,9 @@ chrono = { workspace = true }   # 文件日志按本地日期轮转命名（已�
 tokio = { workspace = true }
 secrecy = { workspace = true }
 toml = "0.8"
+# 遗留配置节剥离：解析前无损移除已从 schema 删除的顶层键（不重排其余内容，
+# 严格解析的报错行号保持指向原文）。
+toml_edit = { workspace = true }
 # url：用于 build_provider_config 的 base_url 启动期可解析性校验。
 # （reqwest 已传递依赖 url，故新增直接依赖不增加实际编译开销。）
 url = "2"

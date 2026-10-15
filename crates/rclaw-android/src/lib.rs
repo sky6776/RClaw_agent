@@ -514,6 +514,29 @@ fn heartbeat_is_fresh(now_ms: u64, last_ms: u64) -> bool {
     last_ms != 0 && now_ms >= last_ms && now_ms - last_ms <= RUNTIME_HEARTBEAT_STALE_AFTER_MS
 }
 
+/// 解析启动 TOML 并物理删除已退役的遗留配置节：内存剥离的同时写回
+/// `files_dir/rclaw.toml`（AppConfig.toJson 从该文件读全文传给 Rust，文件是
+/// 唯一真源；toml_edit 保真，注释与格式不动）。写回失败只落 boot 日志，
+/// 本次仍按剥离结果加载，下次启动再试。deny_unknown_fields 会把遗留键当
+/// 「拼错的键」拒绝（实例：v2.8.0 删除 [web_browser]，v2.7.x 配置在其上
+/// 启动即「解析 rclaw.toml 失败」），所以解析前必须剥离。
+fn from_toml_purging_legacy(toml: &str, files_dir: &Path) -> Result<RClawConfig> {
+    let (stripped, removed) = rclaw_cli::config::strip_removed_legacy_sections(toml);
+    if !removed.is_empty() {
+        let path = files_dir.join("rclaw.toml");
+        match std::fs::write(&path, &stripped) {
+            Ok(()) => log_boot(&format!(
+                "已从 rclaw.toml 物理移除已退役配置节: {}",
+                removed.join(", ")
+            )),
+            Err(error) => log_boot(&format!(
+                "rclaw.toml 遗留节写回失败: {error}（本次按剥离结果加载）"
+            )),
+        }
+    }
+    RClawConfig::from_toml(&stripped)
+}
+
 /// Resolve the effective app-private agent directory without requiring an LLM key.
 /// The APK file editor uses this before the runtime has necessarily started.
 pub fn resolve_agent_root(config_json: &str) -> Result<PathBuf> {
@@ -531,7 +554,7 @@ pub fn resolve_agent_root(config_json: &str) -> Result<PathBuf> {
         .as_deref()
         .filter(|text| !text.trim().is_empty())
         .ok_or_else(|| anyhow!("APK 完整 TOML 配置不能为空"))?;
-    let config = RClawConfig::from_toml(toml)?;
+    let config = from_toml_purging_legacy(toml, &files_dir)?;
     Ok(resolve_private_path(
         &files_dir,
         &files_dir,
@@ -571,7 +594,7 @@ pub fn resolve_android_config(launch: AndroidConfig) -> Result<ResolvedAndroidCo
             toml_from_file.as_str()
         }
     };
-    let mut config = RClawConfig::from_toml(toml).map_err(|error| {
+    let mut config = from_toml_purging_legacy(toml, &files_dir).map_err(|error| {
         // 真机取证（vivo logcat 被裁剪）：把输入指纹与完整错误链落到 boot log。
         let head: String = toml.chars().take(40).collect();
         let boot = format!(

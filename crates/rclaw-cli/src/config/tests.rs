@@ -489,3 +489,37 @@ fn skills_section_is_optional_and_parses() {
     let res = parse_config_text("[skills]\nmax_output = 131072\n");
     assert!(res.is_err(), "deny_unknown_fields 应拒绝未声明的 [skills] 字段");
 }
+
+#[test]
+fn removed_legacy_web_browser_section_is_ignored() {
+    // v2.8.0 删除了 [web_browser] 节（web_browser 工具退役）。旧版本写出的
+    // 配置（如 /webbrowser 热切换回写的 engine）升级后必须仍可加载，
+    // 否则应用启动即「解析 rclaw.toml 失败」。
+    let cfg = parse_config_text(
+        "[web_browser]\nengine = \"baidu\"\n\n[llm]\nrequest_timeout_secs = 60\n",
+    )
+    .unwrap();
+    assert_eq!(cfg.llm.request_timeout_secs, 60);
+}
+
+#[test]
+fn unknown_top_level_keys_are_still_rejected() {
+    // 遗留节剥离不得放宽 deny_unknown_fields：拼错的现存/未知键仍要在启动期暴露。
+    let res = parse_config_text("[no_such_section]\nkey = 1\n");
+    assert!(res.is_err(), "deny_unknown_fields 应拒绝未声明的顶层键");
+}
+
+#[test]
+fn strip_removed_legacy_sections_reports_and_preserves_rest() {
+    let text = "# 顶部注释\n[llm]\nprovider = \"deepseek\"\n\n[web_browser]\nengine = \"baidu\"\n";
+    let (stripped, removed) = strip_removed_legacy_sections(text);
+    assert_eq!(removed, vec!["web_browser"]);
+    // 其余内容（含注释与格式）逐字节保留。
+    assert_eq!(stripped, "# 顶部注释\n[llm]\nprovider = \"deepseek\"\n");
+    // 清理后的文本必须可解析。
+    parse_config_text(&stripped).unwrap();
+    // 无遗留节时原样返回。
+    let (same, none) = strip_removed_legacy_sections("[llm]\nprovider = \"x\"\n");
+    assert!(none.is_empty());
+    assert_eq!(same, "[llm]\nprovider = \"x\"\n");
+}

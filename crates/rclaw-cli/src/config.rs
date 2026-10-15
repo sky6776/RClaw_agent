@@ -804,9 +804,44 @@ fn default_log_file_name() -> String {
 // 加载
 // ---------------------------------------------------------------------------
 
+/// 已从 schema 整节删除、但旧版本可能写进 `rclaw.toml` 的顶层配置键。
+/// 顶层 [`Config`] 启用 `deny_unknown_fields`：这些键若不剥离，旧配置在升级后
+/// 会被当「拼错的键」拒绝，应用启动即「解析 rclaw.toml 失败」（实例：v2.8.0
+/// 删除 `[web_browser]`，v2.7.x 的配置在其上无法启动）。只收录确认退役的键，
+/// 现存键的拼写错误防护不受影响。
+pub const REMOVED_LEGACY_TOP_LEVEL_KEYS: &[&str] = &["web_browser"];
+
+/// 剥离 [`REMOVED_LEGACY_TOP_LEVEL_KEYS`] 中的遗留顶层键，返回 (清理后文本,
+/// 被移除的键)。经 toml_edit 保真往返：其余内容的注释与格式逐字节不动，
+/// 后续严格解析的报错行号仍指向原文。文本本身有语法错误时原样返回——
+/// 让严格解析报出原始错误。
+pub fn strip_removed_legacy_sections(text: &str) -> (String, Vec<&'static str>) {
+    let mut doc = match text.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => doc,
+        Err(_) => return (text.to_string(), Vec::new()),
+    };
+    let mut removed = Vec::new();
+    for key in REMOVED_LEGACY_TOP_LEVEL_KEYS.iter().copied() {
+        if doc.remove(key).is_some() {
+            removed.push(key);
+        }
+    }
+    if removed.is_empty() {
+        return (text.to_string(), removed);
+    }
+    (doc.to_string(), removed)
+}
+
 fn parse_config_text(text: &str) -> std::result::Result<Config, toml::de::Error> {
     let normalized = normalize_windows_path_basic_strings(text);
-    toml::from_str(&normalized)
+    let (stripped, removed) = strip_removed_legacy_sections(&normalized);
+    if !removed.is_empty() {
+        tracing::warn!(
+            keys = %removed.join(", "),
+            "rclaw.toml 含已退役的配置节，解析时忽略（现存键的拼写错误防护不受影响）"
+        );
+    }
+    toml::from_str(&stripped)
 }
 
 fn normalize_windows_path_basic_strings(text: &str) -> String {
@@ -978,7 +1013,25 @@ impl Config {
     pub fn load_from_dir(dir: &std::path::Path) -> Result<Self> {
         let path = dir.join("rclaw.toml");
         let cfg = if let Ok(text) = std::fs::read_to_string(&path) {
-            parse_config_text(&text).with_context(|| format!("解析 {} 失败", path.display()))?
+            // 遗留节物理删除：剥离后写回原文件（toml_edit 保真，注释与格式
+            // 不动）；写回失败仅告警——本次仍按剥离结果加载，下次启动再试。
+            let (stripped, removed) = strip_removed_legacy_sections(&text);
+            if !removed.is_empty() {
+                match std::fs::write(&path, &stripped) {
+                    Ok(()) => tracing::info!(
+                        keys = %removed.join(", "),
+                        path = %path.display(),
+                        "已从 rclaw.toml 物理移除已退役配置节"
+                    ),
+                    Err(error) => tracing::warn!(
+                        keys = %removed.join(", "),
+                        %error,
+                        "rclaw.toml 遗留节写回失败（本次按剥离结果加载）"
+                    ),
+                }
+            }
+            let normalized = normalize_windows_path_basic_strings(&stripped);
+            toml::from_str(&normalized).with_context(|| format!("解析 {} 失败", path.display()))?
         } else {
             Config::default()
         };
