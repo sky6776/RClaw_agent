@@ -3977,13 +3977,13 @@ pub async fn browser_toggle_visible() -> Result<bool, String> {
             .shutdown()
             .await
             .map_err(|e| format!("切换浏览器形态失败: {e}"))?;
+        // 无条件作废缓存的 CDP 会话（manager 退出有延迟，tx 短暂仍 open——
+        // 不作废的话切回无头后的第一次工具调用会复用死通道而失败）。
+        let browser = rclaw_tools::cdp_browser::shared_browser()
+            .ok_or_else(|| "浏览器尚未装配".to_string())?;
+        browser.invalidate_session().await;
         if next {
-            // 立即拉起可见窗口（不等 agent 的下一次工具调用）。先作废缓存的
-            // CDP 会话（transport 已关停，manager 退出有延迟），再连接——确保
-            // 窗口真的以可见形态拉起。
-            let browser = rclaw_tools::cdp_browser::shared_browser()
-                .ok_or_else(|| "浏览器尚未装配".to_string())?;
-            browser.invalidate_session().await;
+            // 立即拉起可见窗口（不等 agent 的下一次工具调用）。
             browser.ensure_session().await?;
         }
         Ok(next)

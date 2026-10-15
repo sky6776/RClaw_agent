@@ -293,26 +293,41 @@ final class BrowserSession {
     /** Activity 重建（新 decorView）：旧面板树作废——attached 标志复位、WebView
      *  从旧视图树摘回离屏布局。经 NAV 线程取引用（不在主线程抢 LOCK）。 */
     static void resetAttachmentForActivityChange() {
+        // OVERLAY_SERIAL 与展开/挂载同一把锁串行：复位必须先于任何新 attach
+        // 完成（否则 attach 因旧 attached=true 短路、或复位摘掉刚挂入新面板
+        // 的 WebView）。锁序 OVERLAY_SERIAL → LOCK 与全链路一致。
         NAV.execute(() -> {
-            final android.webkit.WebView wv;
-            synchronized (LOCK) {
-                attached = false;
-                wv = webView;
-            }
-            if (wv == null) {
-                return;
-            }
-            UI.post(() -> {
-                try {
-                    android.view.ViewParent p = wv.getParent();
-                    if (p instanceof android.view.ViewGroup) {
-                        ((android.view.ViewGroup) p).removeView(wv);
-                    }
-                    wv.setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null);
-                    layoutOffscreen(wv);
-                } catch (Throwable ignored) {
+            synchronized (NativeBridge.OVERLAY_SERIAL) {
+                final android.webkit.WebView wv;
+                synchronized (LOCK) {
+                    attached = false;
+                    wv = webView;
                 }
-            });
+                if (wv == null) {
+                    return;
+                }
+                final java.util.concurrent.CountDownLatch done =
+                        new java.util.concurrent.CountDownLatch(1);
+                UI.post(() -> {
+                    try {
+                        android.view.ViewParent p = wv.getParent();
+                        if (p instanceof android.view.ViewGroup) {
+                            ((android.view.ViewGroup) p).removeView(wv);
+                        }
+                        wv.setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null);
+                        layoutOffscreen(wv);
+                    } catch (Throwable ignored) {
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                try {
+                    // 等 UI 摘离完成再放行 OVERLAY_SERIAL：后续 attach 才能挂。
+                    done.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         });
     }
 
