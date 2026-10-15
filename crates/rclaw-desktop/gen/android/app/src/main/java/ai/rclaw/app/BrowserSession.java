@@ -211,18 +211,26 @@ final class BrowserSession {
             if (webView == null) {
                 return errorJson("会话未启动");
             }
-            if (attached) {
-                return okStateJson();
-            }
             if (container == null) {
                 return errorJson("悬浮窗容器不存在");
             }
+            // 不信任 attached 标志：Activity 重建等场景下标志可能与真实挂载
+            // 状态脱节（挂在旧窗口树里却 attached=true）。以「真实父容器 ==
+            // 请求容器」判定；不符则强制走完整挂载（UI 块内先摘旧父再挂入）。
+            if (attached && webView.getParent() == container) {
+                return okStateJson();
+            }
+            attached = false;
             final android.view.ViewGroup host = container;
             final java.util.concurrent.CountDownLatch done =
                     new java.util.concurrent.CountDownLatch(1);
             final String[] out = {null};
             UI.post(() -> {
                 try {
+                    android.view.ViewParent stale = webView.getParent();
+                    if (stale instanceof android.view.ViewGroup) {
+                        ((android.view.ViewGroup) stale).removeView(webView);
+                    }
                     try {
                         webView.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null);
                     } catch (Throwable ignored) {
@@ -293,18 +301,23 @@ final class BrowserSession {
     /** Activity 重建（新 decorView）：旧面板树作废——attached 标志复位、WebView
      *  从旧视图树摘回离屏布局。经 NAV 线程取引用（不在主线程抢 LOCK）。 */
     static void resetAttachmentForActivityChange() {
-        // OVERLAY_SERIAL 与展开/挂载同一把锁串行：复位必须先于任何新 attach
-        // 完成（否则 attach 因旧 attached=true 短路、或复位摘掉刚挂入新面板
-        // 的 WebView）。锁序 OVERLAY_SERIAL → LOCK 与全链路一致。
+        // OVERLAY_SERIAL 与展开/挂载同一把锁串行。语义：仅在 WebView「未挂进
+        // 当前面板」时才复位（attached=true 且真实父容器是面板 = 已被新面板
+        // 正确挂载，跳过复位——否则会把刚挂好的 WebView 摘掉留空面板）。
+        // 挂载端（attach）不信任 attached 标志、按真实父容器自愈，两端任一
+        // 时序交错都收敛到正确状态。锁序 OVERLAY_SERIAL → LOCK 全链路一致。
         NAV.execute(() -> {
             synchronized (NativeBridge.OVERLAY_SERIAL) {
                 final android.webkit.WebView wv;
                 synchronized (LOCK) {
-                    attached = false;
+                    if (webView == null) {
+                        attached = false;
+                        return;
+                    }
+                    if (attached) {
+                        return; // 已挂在当前面板：状态正确，无需复位
+                    }
                     wv = webView;
-                }
-                if (wv == null) {
-                    return;
                 }
                 final java.util.concurrent.CountDownLatch done =
                         new java.util.concurrent.CountDownLatch(1);
