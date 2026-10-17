@@ -98,6 +98,14 @@ body,
   overflow: hidden;
 }
 
+/* 消息流禁用浏览器 scroll anchoring：流式重排（思考块收起/展开等）会让
+   anchoring 自行调整 scrollTop 并派发 scroll 事件，被跟随逻辑当成「用户
+   滚离底部」误判成脱离跟随（真机上按钮无故出现）。滚动位置只由跟随滚动、
+   用户手势与程序化滚动写入。 */
+.chat-msg-list {
+  overflow-anchor: none;
+}
+
 /* 细滚动条（聊天流 / 面板） */
 *::-webkit-scrollbar {
   width: 8px;

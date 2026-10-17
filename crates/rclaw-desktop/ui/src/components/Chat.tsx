@@ -597,31 +597,363 @@ export default function Chat({
   // 自动跟随滚动：仅当用户停在底部附近（含初始未滚动）时才跟随；用户向上翻阅
   // 历史时不再强制拉回底部，LLM 照常输出，重新滚回底部即恢复跟随。
   const stickToBottomRef = useRef(true);
+  // 手指按在消息流上的手势状态。按住期间程序化跟随滚动必须让位：流式期间
+  // 每个 chunk 都 scrollTo 底部，会把用户正在进行的上滑拖动原样压回去——
+  // 位置被拉回底部、跟随标志又被滚动事件置真，表现为「和 agent 抢屏幕，
+  // 要滑好几次才滑得动」。ids 按触点 identifier 跟踪：其它区域（输入框等）
+  // 的手指会出现在 touches 里但事件不在列表上派发，手势是否结束只能凭 id 判。
+  // start* 供松手时判定手势意图，多指按下时不覆写；moved 区分轻点与拖动。
+  // zombie：手势已结算但场上还有未归属触点（e.touches.length>0）——可能是
+  // 别的区域（输入框）也可能仍按在本列表上未移动的手指。抑制跟随滚动继续
+  // 生效，直到该触点 move 到来被重新接管、ghost finish 落地或看门狗兜底，
+  // 避免「标志已结算、effect 却跟残留手指抢屏」。
+  const touchStateRef = useRef({
+    active: false,
+    zombie: false,
+    ids: new Set<number>(),
+    startX: 0,
+    startY: 0,
+    startScrollTop: 0,
+    moved: false,
+  });
+  // 最近一次滚动事件里的 scrollTop：只有朝底部方向（scrollTop 严格增大）的
+  // 滚动才允许恢复跟随——「向上翻」手势自己产生的滚动事件不能把刚脱离的跟随
+  // 又打开（滚轮一格不足 80px 容差时尤其如此，否则慢速翻阅永远逃不出拉底）。
+  // 程序化拉底后也要同步刷新它：scroll 通知是异步的，带着旧基线时，任何小于
+  // 新位置的 scrollTop（如用户随即上滚）都会被误判成「朝底」。
+  const lastScrollTopRef = useRef(0);
+  // 最近一次触摸事件的时刻 + 手势看门狗。流式重渲染可能替换触摸目标（如
+  // <p>→<h2> 换节点），后续 touchend 派发到已从文档摘除的节点、列表 capture
+  // 收不到，ids 残留会把跟随压制卡死；而 follow effect 靠内容变化驱动，输出
+  // 结束后不再重跑，兜不住这种「静默卡死」——必须用真定时器：长时间无触摸
+  // 事件即强制复位（手指还活着则续期）。
+  const lastTouchAtRef = useRef(0);
+  // 松手 / 手势终止后的跟随重判（handleListTouchFinish 与看门狗共用）：
+  // 无溢出、恰钉正底部、或贴近底部且无净上翻位移 → 恢复跟随并补拉底（按住
+  // 期间内容可能已增长，跟随 effect 被按住跳过不会补跑）；否则保持脱离。
+  // allowScroll=false 跳过补拉底（仅定标志）：用于场上还有未知归属触点时，
+  // 避免跟仍按在本列表上的手指抢屏。
+  const settleFollowAfterGesture = (
+    st: { startScrollTop: number },
+    el: HTMLDivElement,
+    allowScroll = true,
+  ) => {
+    const noOverflow = el.scrollHeight - el.clientHeight <= 0;
+    const atExactBottom = el.scrollTop === el.scrollHeight - el.clientHeight;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (noOverflow || atExactBottom || (nearBottom && el.scrollTop >= st.startScrollTop)) {
+      stickToBottomRef.current = true;
+      setShowJumpDown(false);
+      if (allowScroll) {
+        el.scrollTo({ top: el.scrollHeight });
+        lastScrollTopRef.current = el.scrollTop;
+      }
+    } else {
+      stickToBottomRef.current = false;
+      setShowJumpDown(true);
+    }
+  };
+  const touchWatchdogRef = useRef<number | null>(null);
+  const clearTouchWatchdog = () => {
+    if (touchWatchdogRef.current !== null) {
+      window.clearTimeout(touchWatchdogRef.current);
+      touchWatchdogRef.current = null;
+    }
+  };
+  const armTouchWatchdog = () => {
+    clearTouchWatchdog();
+    touchWatchdogRef.current = window.setTimeout(() => {
+      touchWatchdogRef.current = null;
+      const st = touchStateRef.current;
+      if (!st.active && !st.zombie) return;
+      if (performance.now() - lastTouchAtRef.current <= 10000) {
+        armTouchWatchdog(); // 手指还在（10s 内有过触摸事件），继续等
+        return;
+      }
+      st.active = false;
+      st.zombie = false;
+      st.ids.clear();
+      clearZombieObserver();
+      // 手势被丢失（目标节点被替换、finish 没送到）：按当前位置做一次与
+      // 正常松手相同的结算，输出可能已结束、不会再有 chunk 触发 effect。
+      const el = listRef.current;
+      if (el) settleFollowAfterGesture(st, el);
+    }, 12000);
+  };
+  // zombie 的外区触点观察：zombie 期间按在别处（输入框等）的手指抬起时，
+  // touchend 发往其起始元素、不经过列表 capture，zombie 只能等看门狗超时
+  // 解除（跟随被白抑制 ~12s，且期间内容增长会让兜底结算误判成脱离）。
+  // zombie 期间挂 window capture 触摸监听（capture 自 window 下行，任何
+  // 连接目标的 touchend 都能看到）：全部手指抬起即解除抑制，跟随标志维持
+  // 手势结算时的结果。
+  const zombieObserverRef = useRef<((e: TouchEvent) => void) | null>(null);
+  const clearZombieObserver = () => {
+    if (zombieObserverRef.current) {
+      window.removeEventListener("touchend", zombieObserverRef.current, true);
+      window.removeEventListener("touchcancel", zombieObserverRef.current, true);
+      zombieObserverRef.current = null;
+    }
+  };
+  const armZombieObserver = () => {
+    clearZombieObserver();
+    const onZombieTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length > 0) return; // 还有触点按着（不管在哪个区域）
+      touchStateRef.current.zombie = false;
+      clearTouchWatchdog();
+      clearZombieObserver();
+      // 解除抑制后按已结算的跟随标志补拉底：zombie 期间输出可能增长且已
+      // 结束（follow effect 被抑制跳过、busy 翻转也已消费，不会再重跑），
+      // 只清标志会把最后一段内容留在视口下方且无时机触发。
+      const el = listRef.current;
+      if (el && stickToBottomRef.current) {
+        el.scrollTo({ top: el.scrollHeight });
+        lastScrollTopRef.current = el.scrollTop;
+      }
+    };
+    zombieObserverRef.current = onZombieTouchEnd;
+    window.addEventListener("touchend", onZombieTouchEnd, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener("touchcancel", onZombieTouchEnd, {
+      capture: true,
+      passive: true,
+    });
+  };
   const [showJumpDown, setShowJumpDown] = useState(false);
   // 流式思考会让最后一条的 content 持续增长：把它加进依赖，流式期间跟随滚动。
   const lastContentLength = entries[entries.length - 1]?.content.length ?? 0;
   useEffect(() => {
-    if (!stickToBottomRef.current) return;
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+    if (!stickToBottomRef.current || touchStateRef.current.active || touchStateRef.current.zombie)
+      return;
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight });
+    lastScrollTopRef.current = el.scrollTop;
   }, [entries.length, lastContentLength, busy]);
 
   // 滚动时判定是否贴近底部（80px 容差）：决定后续输出是否继续跟随。
   const handleListScroll = () => {
     const el = listRef.current;
     if (!el) return;
+    if (touchStateRef.current.active) {
+      lastScrollTopRef.current = el.scrollTop;
+      return; // 拖动中的位置混着流式拉底，不据它改判跟随
+    }
+    // 内容全部可见（无溢出，scrollTop 被钳在 0）等价于停在底部：必须恢复
+    // 跟随——否则放大窗口甩下的脱离态会卡死（严格增大条件不再满足，wheel
+    // 又因无溢出提前返回，后续再溢出也不会跟随）。
+    if (el.scrollHeight - el.clientHeight <= 0) {
+      stickToBottomRef.current = true;
+      lastScrollTopRef.current = el.scrollTop;
+      setShowJumpDown(false);
+      return;
+    }
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    stickToBottomRef.current = nearBottom;
-    setShowJumpDown(!nearBottom);
+    if (nearBottom) {
+      // 严格增大才恢复：滚轮平滑动画首帧 scrollTop 可能尚未变化（相等），
+      // 用 >= 会把同一格向上滚的滚动事件当成「朝底」把刚脱离的跟随接回去。
+      // 例外：恰好钉在正底部（内容收缩/窗口放大把位置钳回底部，scrollTop
+      // 是减小的）也算恢复——向上翻的滚动不可能停在正底部。
+      const atExactBottom = el.scrollTop === el.scrollHeight - el.clientHeight;
+      if (el.scrollTop > lastScrollTopRef.current || atExactBottom) {
+        stickToBottomRef.current = true;
+      }
+    } else if (!isAndroidDevice()) {
+      // 远离底部即脱离：让滚动条拖动 / PageUp / Home 这些不经 touch/wheel
+      // 的路径也能脱离跟随。安卓 App 不走这条：触摸滚动全部经手势意图判定
+      // （touchmove/松手结算），纯位置判定会被流式重排期的非输入滚动事件
+      // （anchoring/软键盘重排等）误触发，把跟随无声甩掉（真机复现：流式
+      // 中悬浮钮无故出现）。必须调用时求值：模块常量会在 main.tsx 挂上
+      // android-app 类之前求值（静态 import 先行），把安卓错判成桌面。
+      stickToBottomRef.current = false;
+    }
+    lastScrollTopRef.current = el.scrollTop;
+    // 脱离跟随后可以仍停在容差内（如触控板在底部上滚 10px）：按钮此时
+    // 承担「恢复跟随」入口，不能只按 !nearBottom 显示。
+    setShowJumpDown(!nearBottom || !stickToBottomRef.current);
   };
+
+  // 用户手势即时接管：触摸下滑超过 touch slop（12px，与长按菜单同值）即脱离
+  // 跟随，不等 80px 容差——流式 chunk 间隙内根本拖不出容差（抢屏根因）；
+  // 滚轮向上同理。列表完全无溢出时跳过：无可翻内容，脱离只会让悬浮钮常驻。
+  // 触摸四事件挂 capture：媒体卡等子元素的 onTouchStart 会 stopPropagation
+  // （防两套长按计时器叠加），bubble 阶段列表收不到起始事件，从卡片上开始的
+  // 拖动会漏判；capture 从祖先往下先于目标元素执行，不受其影响。
+  const handleListTouchStart = (e: React.TouchEvent) => {
+    const st = touchStateRef.current;
+    const first = e.changedTouches[0];
+    const el = listRef.current;
+    lastTouchAtRef.current = performance.now();
+    if (!first || !el) return;
+    if (!st.active) {
+      st.active = true;
+      st.zombie = false;
+      clearZombieObserver();
+      st.startX = first.clientX;
+      st.startY = first.clientY;
+      st.startScrollTop = el.scrollTop;
+      st.moved = false;
+    }
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      st.ids.add(e.changedTouches[i].identifier);
+    }
+    armTouchWatchdog();
+  };
+  const handleListTouchMove = (e: React.TouchEvent) => {
+    const st = touchStateRef.current;
+    if (!st.active || st.zombie) {
+      // 两种「无主手指」都会继续来 move：看门狗把仍按住的手指误清了（静止
+      // 超时），或上一个手势结算时场上还有未归属触点（zombie）。在这里重新
+      // 接管——touch 事件始终以触摸起始元素为目标，能到本列表 capture 的
+      // move 必然起始自列表内。不接管的话后续拖动失去压制，流式 chunk 又会
+      // 跟手指抢屏。
+      const t = e.changedTouches[0];
+      const el = listRef.current;
+      if (!t || !el) return;
+      st.active = true;
+      st.zombie = false;
+      clearZombieObserver();
+      st.ids.clear();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        st.ids.add(e.changedTouches[i].identifier);
+      }
+      st.startX = t.clientX;
+      st.startY = t.clientY;
+      st.startScrollTop = el.scrollTop;
+      st.moved = true; // 中途接管：松手按「拖动过」处理，不做轻点让位
+      lastTouchAtRef.current = performance.now();
+      armTouchWatchdog();
+      return; // 起点刚重置，本事件不做脱离判定
+    }
+    lastTouchAtRef.current = performance.now();
+    const el = listRef.current;
+    if (!el || el.scrollHeight - el.clientHeight <= 0) return;
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      const t = e.changedTouches[i];
+      if (!st.ids.has(t.identifier)) continue;
+      if (Math.hypot(t.clientX - st.startX, t.clientY - st.startY) > 12) {
+        st.moved = true;
+      }
+      if (t.clientY - st.startY > 12 && stickToBottomRef.current) {
+        stickToBottomRef.current = false;
+        setShowJumpDown(true);
+        break;
+      }
+    }
+  };
+  // touchend / touchcancel 共用：id 全部抬起才算手势结束，并按松手位置
+  // 重判一次跟随——按住期间内容增长可能已把位置顶离底部（此时跟随效果
+  // 被按住跳过，不会补跑），留在原地的「假跟随」必须在这里显式摘掉。
+  const handleListTouchFinish = (e: React.TouchEvent) => {
+    const st = touchStateRef.current;
+    lastTouchAtRef.current = performance.now();
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      st.ids.delete(e.changedTouches[i].identifier);
+    }
+    if (st.ids.size > 0) return; // 还有手指按在消息流上，手势未结束
+    clearTouchWatchdog();
+    const el = listRef.current;
+    // 「安全结算」先行（无溢出 / 恰钉正底部）：不依赖手势起点、位置已在底部
+    // 无拉底动作，任何路径（残余触点直接松开、切会话后迟到的 finish）在此
+    // 恢复跟随都不会误伤。依赖起点的完整结算仍在下面按各路径 gate 执行。
+    if (el) {
+      const noOverflow = el.scrollHeight - el.clientHeight <= 0;
+      const atExactBottom = el.scrollTop === el.scrollHeight - el.clientHeight;
+      if (noOverflow || atExactBottom) {
+        stickToBottomRef.current = true;
+        setShowJumpDown(false);
+      }
+    }
+    // zombie 期间的 ghost finish：未登记的列表触点直接抬起（没有 move、没
+    // 经过重新接管）。位置分支照常结算；起点相关判定沿用现存 startScrollTop
+    // （最可信的现存值）。仍有残余触点则继续 zombie。
+    if (st.zombie) {
+      st.zombie = false;
+      clearZombieObserver();
+      if (el) settleFollowAfterGesture(st, el, e.touches.length === 0);
+      if (e.touches.length > 0) {
+        st.zombie = true;
+        armTouchWatchdog();
+        armZombieObserver();
+      }
+      return;
+    }
+    // 切会话等场景已把手势复位：迟到的 finish 不许用旧起点改判新状态。
+    if (!st.active) return;
+    st.active = false;
+    if (!el) return;
+    // 点在「回到底部」钮上的轻点（未拖动）：不在此按位置重判——近底轻点会
+    // 先恢复跟随并隐藏按钮，随后的合成 click 落在已卸载节点上落空，滚动不会
+    // 发生，交给按钮自己的 click（scrollListToBottom）。拖动过（moved）视为
+    // 普通手势，正常重判。
+    if (!st.moved && e.target instanceof Element && e.target.closest("[data-jump-down]")) {
+      return;
+    }
+    // 依赖起点的完整结算：有残留触点（e.touches.length>0，可能在别的区域，
+    // 也可能是 watchdog 误清后仍按在本列表上未移动的手指）也要执行——外部
+    // 触点不能吞掉本次手势的结论，否则松开列表手指后标志停留在过期值（无
+    // 按钮却脱离 / 贴底却继续拉底）。但此时跳过补拉底：跟仍按在列表上的
+    // 未知手指抢屏比晚一步拉底更伤。它随后的 move 会重新接管，松手时按它
+    // 的起点再做带拉底的完整结算。
+    settleFollowAfterGesture(st, el, e.touches.length === 0);
+    if (e.touches.length > 0) {
+      // 残留触点抑制跟随滚动继续生效，直到重新接管 / ghost finish / 外区
+      // 触点全部抬起 / 看门狗兜底。
+      st.zombie = true;
+      armTouchWatchdog();
+      armZombieObserver();
+    }
+  };
+  const handleListWheel = (e: React.WheelEvent) => {
+    const el = listRef.current;
+    if (!el || el.scrollHeight - el.clientHeight <= 0) return;
+    if (e.deltaY < 0) {
+      stickToBottomRef.current = false;
+      setShowJumpDown(true);
+    }
+  };
+  // 窗口尺寸变化会改变溢出状态：放大到内容全部可见时 scrollTop 被钳回 0、
+  // 不再派发 scroll 事件；放大到仍溢出时位置也会被钳到新底部（scrollTop
+  // 减小着到达底部，被 handleListScroll 的严格增大条件拒绝）——两种都等价
+  // 停在底部，须恢复跟随。只认「位置被钳动过」（scrollTop 与最近一次滚动
+  // 事件记录不同）：用户停在半空的自由位置不因缩放窗口而被拉底。窄化放大
+  // 溢出的场景交给后续滚动判定。
+  useEffect(() => {
+    const onResize = () => {
+      const el = listRef.current;
+      if (!el || touchStateRef.current.active) return;
+      const noOverflow = el.scrollHeight - el.clientHeight <= 0;
+      // 只认「位置被钳动过」（scrollTop 与最近一次滚动事件记录不同）：用户
+      // 停在半空的自由位置不因缩放窗口而被拉底。无溢出例外——短列表贴顶时
+      // scrollTop 恒为 0，放大窗口不产生位移，但「全部可见」本身等价于贴底。
+      const clamped = el.scrollTop !== lastScrollTopRef.current;
+      const atBottom = noOverflow || el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      if (atBottom && (noOverflow || clamped)) {
+        stickToBottomRef.current = true;
+        setShowJumpDown(false);
+        lastScrollTopRef.current = el.scrollTop;
+      }
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   // 回到底部并恢复跟随（发送消息 / 点击悬浮钮时调用）。
   const scrollListToBottom = (smooth = false) => {
     stickToBottomRef.current = true;
     setShowJumpDown(false);
-    listRef.current?.scrollTo({
-      top: listRef.current.scrollHeight,
+    // 用户显式回底：zombie 的滚动抑制随即解除（抑制是为「未知手指还在列表
+    // 上」，显式操作以用户意志优先）。
+    touchStateRef.current.zombie = false;
+    clearZombieObserver();
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTo({
+      top: el.scrollHeight,
       behavior: smooth ? "smooth" : "auto",
     });
+    lastScrollTopRef.current = el.scrollTop;
   };
 
   // 切换会话：恢复跟随并把视图直达新会话最新消息（DOM 已随 props 更新完再滚）。
@@ -641,8 +973,17 @@ export default function Chat({
     setSelectIds(null);
     setExportResult(null);
     draftRef.current = "";
+    // 手势态一并复位：残留的 active/zombie/ids 会把跟随压制带到新会话。
+    touchStateRef.current.active = false;
+    touchStateRef.current.zombie = false;
+    touchStateRef.current.ids.clear();
+    clearTouchWatchdog();
+    clearZombieObserver();
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      lastScrollTopRef.current = el.scrollTop;
+    }
   }, [sessionKey]);
 
   // 排队消息（第十二轮 · zcode 同款）：agent 运行期间发送的消息进入队列，显示在
@@ -817,17 +1158,18 @@ export default function Chat({
   // 消息行的长按 / 右键 → 统一操作菜单（用户/助手/思考/工具行通用；媒体卡有
   // 独立入口且已 stopPropagation，不会同时触发）。touchmove 只在位移超过 12px
   // （touch slop）时取消计时：系统同坐标长按与手指微抖都会持续派发 move，
-  // 无条件取消会让长按永远不触发。
+  // 无条件取消会让长按永远不触发。起点坐标放组件级 ref：流式更新会重建行
+  // handler，闭包局部变量每次渲染归零，按住期间一次流式重渲染 + 微抖就会
+  // 被误判成「移动了 12px+」掐掉计时器。同一时刻只有一个长按手势在途，
+  // 多行共享一个坐标 ref 是安全的。
   // 挂在整行（而非气泡内层）上：行内任意位置长按都可触发，包括气泡外空白。
+  const selectPressPosRef = useRef({ x: 0, y: 0 });
   const bubblePressHandlers = (entry: Entry) => {
-    let sx = 0;
-    let sy = 0;
     return {
       onTouchStart: (e: React.TouchEvent) => {
         if (!isMobile || e.touches.length !== 1) return;
         const { clientX, clientY } = e.touches[0];
-        sx = clientX;
-        sy = clientY;
+        selectPressPosRef.current = { x: clientX, y: clientY };
         clearSelectPress();
         selectPressTimer.current = window.setTimeout(() => {
           selectPressTimer.current = null;
@@ -838,7 +1180,14 @@ export default function Chat({
       onTouchEnd: clearSelectPress,
       onTouchMove: (e: React.TouchEvent) => {
         const t = e.touches[0];
-        if (t && Math.hypot(t.clientX - sx, t.clientY - sy) > 12) clearSelectPress();
+        if (
+          t &&
+          Math.hypot(
+            t.clientX - selectPressPosRef.current.x,
+            t.clientY - selectPressPosRef.current.y,
+          ) > 12
+        )
+          clearSelectPress();
       },
       onTouchCancel: clearSelectPress,
       onContextMenu: (e: React.MouseEvent) => {
@@ -1264,6 +1613,11 @@ export default function Chat({
       <div
         ref={listRef}
         onScroll={handleListScroll}
+        onTouchStartCapture={handleListTouchStart}
+        onTouchMoveCapture={handleListTouchMove}
+        onTouchEndCapture={handleListTouchFinish}
+        onTouchCancelCapture={handleListTouchFinish}
+        onWheel={handleListWheel}
         className="chat-msg-list flex-1 space-y-3 overflow-y-auto px-6 py-4 max-md:space-y-2.5 max-md:px-3 max-md:py-3"
       >
         {entries.length === 0 && (
@@ -1286,9 +1640,10 @@ export default function Chat({
             </div>
           </div>
         )}
-        {/* 向上翻阅历史时的「回到底部」钮：sticky 钉在滚动口底部，点击恢复跟随 */}
+        {/* 向上翻阅历史时的「回到底部」钮：sticky 钉在滚动口底部，点击恢复跟随。
+            data-jump-down：列表触摸结束重判按它让位，见 handleListTouchFinish。 */}
         {showJumpDown && (
-          <div className="sticky bottom-2 z-20 flex justify-center">
+          <div className="sticky bottom-2 z-20 flex justify-center" data-jump-down>
             <button
               onClick={() => scrollListToBottom(true)}
               title="回到底部"
