@@ -26,6 +26,7 @@
     "happyhorse-i2v",
     "happyhorse-r2v",
     "happyhorse-t2v",
+    "jd-scrape",
     "pdf",
     "pptx",
     "screen-funds",
@@ -33,6 +34,7 @@
     "seedance-video",
     "seedream-image",
     "seedream-prompt-gen",
+    "taobao-scrape",
     "xlsx"
   ]
 }
