@@ -932,7 +932,7 @@ export default function App() {
   // fork 后切到新会话。锚点一律是权威行 id：恢复条目自带，直播条目由 turn 收尾的
   // 增量回填原位盖章——没有行 id 就说明它还没落库，不做任何按内容反查的猜测。
   const handleFork = useCallback(
-    async (entry: Entry, full = false, files = false) => {
+    async (entry: Entry) => {
       // 发送失败的条目没有落库，永远拿不到行 id——直接拒绝。
       if (entry.sendFailed) {
         setErrorToast("该消息发送失败、未落库，无法作为分叉锚点");
@@ -961,22 +961,20 @@ export default function App() {
         setErrorToast("未找到该消息的持久化记录（可能尚未落库），请稍后重试");
         return;
       }
-      // 文件联动走斜杠命令（`/fork <id> files`）：运行时侧有与 /rewind 同款的
-      // 静默门（活动 turn / 后台 review 时拒绝），命令经完整 dispatch 语义执行；
-      // 报告以消息形式回到会话流。
-      if (files) {
-        const suffix = full ? " full files" : " files";
-        try {
-          await api.send(activeId, `/fork ${anchorId}${suffix}`);
-        } catch (e) {
-          setErrorToast(`发送分叉命令失败: ${String(e)}`);
-        }
-        return;
-      }
       try {
-        const fork = await api.chatFork(activeId, anchorId, full);
+        // 统一分叉语义：复制可见历史 + 自动回滚锚点之后的文件改动（runtime 侧持
+        // 静默门，任务运行中会拒绝；无文件改动是正常路径）。
+        const fork = await api.chatFork(activeId, anchorId);
         await refreshChats();
-        setErrorToast(`✅ 已分叉出新会话（复制 ${fork.copied} 条${full ? "完整转录" : "可见"}历史）`);
+        setErrorToast(
+          `✅ 已分叉出新会话（复制 ${fork.copied} 条历史${
+            fork.restore_failed
+              ? "，⚠️ 文件回滚未成功"
+              : fork.restored_files > 0
+                ? `，回滚 ${fork.restored_files} 个文件`
+                : "，无可回滚的文件改动"
+          }）`,
+        );
         void openChat(fork.chat_id);
       } catch (e) {
         setErrorToast(`分叉失败: ${String(e)}`);

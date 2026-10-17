@@ -20,7 +20,7 @@ pub mod session_handoff;
 pub mod slash;
 pub mod turn;
 
-pub use agent_loop::{AgentLoop, SessionLifecycle};
+pub use agent_loop::{AgentLoop, ForkHandle, SessionLifecycle};
 pub use agent_tools::{
     plan_is_active, plan_pause_key, AgentCancelTool, AgentResumeTool, AgentStatusTool, AgentToolRuntime,
     AgentWaitTool, ClaudeAgentTool, PlanRunTool, SendMessageTool, TaskCreateTool, TaskGetTool,
@@ -40,7 +40,9 @@ pub use cron::CronService;
 pub use heartbeat::Heartbeat;
 pub use options::AgentOptions;
 pub use slash::{CommandOutcome, SlashRegistry};
-pub use turn::{estimate_context_usage, ContextUsageSnapshot, TurnKey, TurnManager};
+pub use turn::{
+    estimate_context_usage, ContextUsageSnapshot, ForkChatOutcome, TurnKey, TurnManager,
+};
 
 pub use background_wake::BackgroundWaker;
 

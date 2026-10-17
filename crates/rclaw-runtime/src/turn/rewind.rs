@@ -632,7 +632,7 @@ pub(crate) fn restore_to_point(
     )
 }
 
-/// 按消息锚点回滚文件（「fork + 文件联动」，第十二轮后续项）：撤销锚点消息【之后】
+/// 按消息锚点宽松回滚文件（「分叉 + 自动文件回滚」专用）：撤销锚点消息【之后】
 /// 全部 checkpointed 写入，恢复到锚点时刻的文件状态。
 ///
 /// - 回滚集 = `anchor_message_id > 锚点` 的 checkpoint（v2 起工具链事务锚定）+
@@ -640,13 +640,21 @@ pub(crate) fn restore_to_point(
 /// - 迁移前的旧行（anchor 为 NULL）归属未知，保守不参与（报告里说明）；
 /// - 校验 / 应用 / 逆序撤回 / 完成后重锚与 [`restore_to_point`] 同一套（重锚分组用
 ///   锚点消息 id——is_rewind 行不进 /rewind 列表，不会与回滚点 id 混淆）。
-pub(crate) fn restore_to_message(
+/// - 返回 `(是否执行了回滚, 撤销文件数, 报告)`：「锚点之后没有可回滚写入」返回
+///   `Ok((false, 0, 说明))` 而非报错——无文件改动是分叉的正常路径（`/rewind` 按
+///   回滚点 id 走 [`restore_to_point`]，空回滚的严格报错在那里）。
+pub(crate) fn restore_to_message_lenient(
     session: &SessionStore,
     channel: &str,
     chat_id: &str,
     anchor_message_id: i64,
-) -> Result<String, String> {
-    let all_meta = load_meta(session, channel, chat_id);
+) -> Result<(bool, usize, String), String> {
+    // 回滚路径必须区分「确实没有 checkpoint」与「读取失败」：沿用列表路径的
+    // load_meta 容错语义会把库错误吞成空表、误报成「锚点之后没有可回滚写入」
+    // （list_groups 等只读展示路径维持 load_meta 的容错不变）。
+    let all_meta = session
+        .load_file_checkpoint_meta(channel, chat_id)
+        .map_err(|error| format!("读取 rewind checkpoint 失败: {error}"))?;
     // 窗口起点 = 锚点消息自身的第一行 checkpoint（链起点，其写入保留）；其后全部
     // 写入（> 锚点，回滚目标）+ 不早于起点的重锚标记与独立 checkpoint 参与校验链。
     // 漏掉锚点自身的 checkpoint 会让链起点悬空——锚点与其后写入之间的未记录改动
@@ -688,9 +696,13 @@ pub(crate) fn restore_to_message(
                 .is_some_and(|anchor| anchor > anchor_message_id)
     });
     if !has_rollbackable {
-        return Err(format!(
-            "锚点消息 {anchor_message_id} 之后没有可回滚的文件写入（仅 write/edit/delete 被 \
-             checkpoint，且无法归属消息的记录——cron / 落库失败补写 / 迁移前——不参与按消息回滚）"
+        return Ok((
+            false,
+            0,
+            format!(
+                "锚点消息 {anchor_message_id} 之后没有可回滚的文件写入（仅 write/edit/delete 被 \
+                 checkpoint，且无法归属消息的记录——cron / 落库失败补写 / 迁移前——不参与按消息回滚）"
+            ),
         ));
     }
     // 窗口内无锚的真实 checkpoint（cron 任务、工具链落库失败后的补写、迁移前的旧行）
@@ -741,6 +753,19 @@ pub(crate) fn restore_to_message(
     }
     // 正文读取从锚定窗口起点开始（补进来的前驱只参与链校验，不读正文）。
     let rows_from = window_start.unwrap_or_else(|| window.first().map_or(0, |record| record.id));
+    // 目标集覆盖的去重文件数（撤销文件数——宽松变体的结构化计数，报告是给人看的
+    // 散文，别去解析它；同一文件的多条写入记录只算一个文件）。
+    let target_count = window
+        .iter()
+        .filter(|record| {
+            !record.is_rewind
+                && record
+                    .anchor_message_id
+                    .is_some_and(|anchor| anchor > anchor_message_id)
+        })
+        .map(|record| path_key(&record.path))
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let report = restore_meta_window(
         session,
         channel,
@@ -758,7 +783,7 @@ pub(crate) fn restore_to_message(
                     .is_some_and(|anchor| anchor > anchor_message_id)
         },
     )?;
-    Ok(format!("{report}{note}"))
+    Ok((true, target_count, format!("{report}{note}")))
 }
 
 /// 回滚内核：给定窗口元数据（回滚集 + 参与校验的重锚标记 / 前驱）执行校验链 → 目标状态 →
@@ -1358,14 +1383,19 @@ mod message_rollback_tests {
         // 语义：anchor 之后（> anchor）的写入被撤销 = 恢复到「anchor 消息完成后」。
         // anchor = m2：a = v3（m2 的产物保留，m3 的 v4 撤销）；b 是 m2+1 新建（> m2）
         // → 删除。
-        let report =
-            restore_to_message(&session, "cli", "console", m2).expect("按消息回滚应成功");
+        let (changed, count, report) =
+            restore_to_message_lenient(&session, "cli", "console", m2).expect("按消息回滚应成功");
+        assert!(changed);
+        assert_eq!(count, 2, "目标是 m3 的 a.txt 写入与新建的 b.txt");
         assert!(report.contains("1 个文件恢复原内容"), "{report}");
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v3", "m3 的 v4 被撤销");
         assert!(!file_b.exists(), "锚点之后新建的 b 随回滚删除");
 
         // 回滚到 m1（撤销 > m1 全部）：a 目标 = m2 的 before = v2。
-        let report = restore_to_message(&session, "cli", "console", m1).unwrap();
+        let (changed, count, report) =
+            restore_to_message_lenient(&session, "cli", "console", m1).unwrap();
+        assert!(changed, "{report}");
+        assert_eq!(count, 2, "目标覆盖 a.txt 与新建的 b.txt 两个文件");
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v2");
         assert!(report.contains("锚点消息"), "{report}");
     }
@@ -1381,13 +1411,16 @@ mod message_rollback_tests {
         // 两次 checkpoint 之间的外部改动：断链。
         write_file(&file_a, "shell edit");
         toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
-        let err = restore_to_message(&session, "cli", "console", m1).unwrap_err();
+        let err = restore_to_message_lenient(&session, "cli", "console", m1).unwrap_err();
         assert!(err.contains("未记录的改动"), "{err}");
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v3", "拒绝时不动文件");
 
-        // 无锚点后的写入：明确报错（不是静默成功）。
-        let err = restore_to_message(&session, "cli", "console", 999_999).unwrap_err();
-        assert!(err.contains("没有可回滚"), "{err}");
+        // 无锚点后的写入：宽松语义不算错（changed=false + 说明，不是静默成功）。
+        let (changed, count, note) =
+            restore_to_message_lenient(&session, "cli", "console", 999_999).unwrap();
+        assert!(!changed);
+        assert_eq!(count, 0);
+        assert!(note.contains("没有可回滚"), "{note}");
     }
 
     #[test]
@@ -1411,7 +1444,7 @@ mod message_rollback_tests {
         write_file(&file_a, "v2.5");
         let (_m2, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
 
-        let err = restore_to_message(&session, "cli", "console", anchor).unwrap_err();
+        let err = restore_to_message_lenient(&session, "cli", "console", anchor).unwrap_err();
         assert!(err.contains("未记录的改动"), "{err}");
         assert_eq!(
             std::fs::read_to_string(&file_a).unwrap(),
@@ -1427,7 +1460,9 @@ mod message_rollback_tests {
             .append("cli", "console", &Message::plain(Role::User, "第二个锚点"))
             .unwrap();
         let (_m4, _) = toolchain_write(&session, &base, "a.txt", Some("v5"), 3);
-        let report = restore_to_message(&session, "cli", "console", anchor2).expect("应成功");
+        let (changed, _count, report) =
+            restore_to_message_lenient(&session, "cli", "console", anchor2).expect("应成功");
+        assert!(changed);
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v4", "{report}");
     }
 
@@ -1461,13 +1496,18 @@ mod message_rollback_tests {
         let (m2, _) = toolchain_write(&session, &base, "a.txt", Some("v4"), 2);
 
         // 回滚到 m1：窗口只含 m1 起的记录（锚点前的标记不参与），合法回滚必须放行。
-        let report = restore_to_message(&session, "cli", "console", m1).expect("不得被历史标记误断链");
+        let (changed, _count, report) = restore_to_message_lenient(&session, "cli", "console", m1)
+            .expect("不得被历史标记误断链");
+        assert!(changed);
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v3");
         assert!(report.contains("1 个文件恢复原内容"), "{report}");
 
-        // m2 之后无写入：仍明确报错。
-        let err = restore_to_message(&session, "cli", "console", m2).unwrap_err();
-        assert!(err.contains("没有可回滚"), "{err}");
+        // m2 之后无写入：宽松语义不算错（changed=false + 说明）。
+        let (changed, count, note) =
+            restore_to_message_lenient(&session, "cli", "console", m2).unwrap();
+        assert!(!changed);
+        assert_eq!(count, 0);
+        assert!(note.contains("没有可回滚"), "{note}");
     }
 
     #[test]
@@ -1494,15 +1534,19 @@ mod message_rollback_tests {
         let (m2, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
 
         // 回滚到 m1：目标 = m2 的 before = v2.5；独立 checkpoint 在链中衔接 m1→m2。
-        let report =
-            restore_to_message(&session, "cli", "console", m1).expect("独立 checkpoint 不得造成误断链");
+        let (changed, _count, report) = restore_to_message_lenient(&session, "cli", "console", m1)
+            .expect("独立 checkpoint 不得造成误断链");
+        assert!(changed);
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v2.5");
         assert!(report.contains("1 个文件恢复原内容"), "{report}");
 
         // 独立行不成为回滚目标：回滚到它之后、m2 之前的消息……此场景没有这样的消息
-        //（独立行无锚），直接验证 m2 自身：没有 > m2 的写入 → 明确报错。
-        let err = restore_to_message(&session, "cli", "console", m2).unwrap_err();
-        assert!(err.contains("没有可回滚"), "{err}");
+        //（独立行无锚），直接验证 m2 自身：没有 > m2 的写入 → 宽松语义不算错。
+        let (changed2, count2, note2) =
+            restore_to_message_lenient(&session, "cli", "console", m2).unwrap();
+        assert!(!changed2);
+        assert_eq!(count2, 0);
+        assert!(note2.contains("没有可回滚"), "{note2}");
         // 报告点明窗口内无法归属消息的行（独立 flush 行），提示人工核对。
         assert!(report.contains("1 条无法归属消息的 checkpoint"), "{report}");
     }
@@ -1530,13 +1574,14 @@ mod message_rollback_tests {
             .unwrap();
         let (_m2, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
 
-        let report = restore_to_message(&session, "cli", "console", anchor)
+        let (changed, _count, report) = restore_to_message_lenient(&session, "cli", "console", anchor)
             .expect("重锚标记是真实前驱，不得误判断链");
+        assert!(changed);
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v1", "{report}");
         // 标记之前没有外部改动的事实不变：真有未记录改动仍能检出。
         write_file(&file_a, "shell edit");
         let (_m3, _) = toolchain_write(&session, &base, "a.txt", Some("v4"), 2);
-        let err = restore_to_message(&session, "cli", "console", anchor).unwrap_err();
+        let err = restore_to_message_lenient(&session, "cli", "console", anchor).unwrap_err();
         assert!(err.contains("未记录的改动"), "{err}");
     }
 }

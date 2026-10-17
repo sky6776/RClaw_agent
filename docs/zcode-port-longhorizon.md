@@ -34,7 +34,7 @@
 | Layer 5 按回滚点 id 选点回滚（rewind + hash 校验） | `turn/rewind.rs`：write/edit/delete 前后 checkpoint（before/after hash，按回滚分组 id 归档到 `file_checkpoint` 表，与工具链消息同一事务写入）+ `rewind_files` 工具与 `/rewind` 命令；恢复前 hash 校验，外部改动整组拒绝（all-or-nothing） | ✅ 第五轮 |
 | 并行波次上限提升（`max_concurrent_turns` / PlanRun 波次） | 缺省 6→8、PlanRun `DEFAULT_MAX_PARALLEL`/`MAX_PARALLEL_STEPS` 2/4→4/8、WorkflowRun asks 4/8→8/16（schema 同步）；压测三件套：8 路并发错峰保持（TimingProvider）、8 步单波峰值并发 = 8（PeakConcurrencyProvider）、16 ask Promise.all 扇出聚合 | ✅ 第十二轮 |
 | 工具结果落盘 + 引用句柄（artifact 策略） | `turn/artifact.rs`：工具结果超预算（默认 32KB）时全文写 `agent/artifacts/<会话键>/<回滚点id>-<工具>.txt`（脱敏后），模型收 4KB 头尾预览 + 路径句柄（read 分页取回）；落盘失败静默回退；前台 / 子代理 / Agent 并发三路径同层接入 | ✅ 第十二轮 |
-| 会话历史任意锚点 fork | `SessionStore::fork_session`：把活动视图前缀（≤ 锚点，按视图序）单事务复制进新会话，boundary 摘要降级为普通行，血缘入 kv；`/fork [消息 id]` 命令（无参列锚点）；桌面/安卓 UI 消息下方「⑂ 分叉」按钮（chat_fork 命令 + 切换新会话） | ✅ 第十二轮 |
+| 会话历史任意锚点 fork（第十三轮归一为单一语义） | `SessionStore::fork_session`：把活动视图前缀（≤ 锚点，按视图序）单事务复制进新会话，boundary 摘要降级为普通行，血缘入 kv；runtime `TurnManager::fork_chat` 统一入口（桌面 chat_fork 命令与 `/fork <id>` 斜杠命令同一实现）：持静默门（任务运行 / 后台 review 时拒绝）+ 自动回滚锚点之后的 checkpointed 文件写入（`rewind::restore_to_message_lenient`，无文件改动不算错）+ 子会话「分叉告知」行（role=user + meta，模型可见、前端回放排除，ZCode persistSyntheticUserNotice 对位）；`/fork [消息 id]` 无参列锚点保留；UI 只剩一个「⑂ 分叉」入口（full / files 变体移除） | ✅ 第十三轮 |
 | 工作流 AST 级分析 + `.ask<T>` 编译 | `agent_tools/workflow_ast.rs`（oxc 0.116，纯 Rust）：AST 依赖图（字符串/注释不误报、hoisted Promise.all 扇出、inline agent() 调用；失败降级文本解析）；`.ask<T>` 内联类型编译为 JSON schema 并重写为 `askJson(question, schema)`（script hash 仍按原文；类型别名/字面量/联合/数组，Rust 校验器扩展 const/enum/anyOf） | ✅ 第十二轮 |
 | 会话长期目标 /goal（ZCode /goal reminder） | `/goal <目标>` 写 kv（按会话隔离，2000 字上限）；无参查看、clear/done 收尾；活动目标时【每次推理的尾部上下文】注入提醒块（原文 + 持续工作 + 按证据核对 + 不自行宣告完成 + 提醒用户 /goal clear），Rust 侧 `goal_reminder_block` 可单测 | ✅ 第十二轮 |
 | PlanRun 任务暂停 / 继续（ZCode 任务暂停） | kv `plan-pause/<plan_id>` 协作式暂停：执行器在【波次边界】轮询（300ms）——当前波跑完、后续波不派发，父 /cancel 语义不变；`plan_paused` / `plan_unpaused` 事件入 journal（kv 标志为权威，`plan_resumed` 是 resume 代际锚点、不混用）；执行器收尾守卫在取消 / 早退 / panic 时补 `plan_aborted` 终态；桌面 `plan_pause` 命令（只对执行中的计划接受暂停）+ 步骤卡片展开时的 ⏸/▶ 按钮（plan_status 投影 paused / aborted 字段，执行者不在本进程的进行中计划投影成已中止） | ✅ 第十二轮 |
@@ -846,8 +846,8 @@ anchor_message_id}`（请求里最后一条已持久化消息的 `Message.id`）
      即坏）；血缘（父会话 + 锚点）写同一事务的 kv（`session-fork/<channel>/<id>`）。
      锚点不在活动视图（被压缩折叠）→ 明确报错（ZCode Unavailable 策略同判）。
    - 运行时：`/fork [消息 id]` 斜杠命令（无参列最近 15 条真实用户消息锚点；新
-     chat_id `<orig>-fork<hex>` 撞名加计数）。fork 不持静默门：只读源 + 新建，
-     与运行中 turn 互不干扰。
+     chat_id `<orig>-fork<hex>` 撞名加计数）。第十二轮 fork 不持静默门；第十三轮起
+     统一入口 `TurnManager::fork_chat` 持静默门并自动回滚文件（见上表第十三轮行）。
    - UI（桌面 + 安卓 APK 同一 Tauri 前端）：`chat_history` 带消息行 id；消息下方
      「⑂ 分叉」按钮（桌面内联）/ 长按菜单「从这里分叉到新会话」（移动端）→
      `chat_fork` 命令 → 切到新会话。直播条目无行 id 时按 role+content 从历史回查。
@@ -905,7 +905,7 @@ plan_status 是 journal 的只读投影，不与执行器写路径竞争。
 | 功能 | ZCode 源码位置 | 核对结论 |
 |---|---|---|
 | artifact 落盘 | `core/tool/executor/result-serialization.ts`（>maxModelBytes 触发、写失败回退截断、2KB 预览 + Read 读回指引） | RClaw 同构：> 阈值触发、失败静默回退原内容、4KB 头尾预览 + read 分页指引；落盘在脱敏【后】（ZCode 的 redact 在 handler 内，RClaw 磁盘副本同样无敏感明文，更保守）；预览用头尾截断而非纯头部是自家 shell 截断哲学的延续（诊断在尾部） |
-| fork 复制源 | `methods/session-fork.ts:938`「复制源必须是 UI transcript 语义，activeSessionMessages 会按 compact boundary 截掉旧 worklog」 | **已声明差异**：ZCode 保留 compact 折叠前的完整可见转录；RClaw 复制【活动视图前缀】（boundary 摘要降级为普通行）——子会话更轻，完整原文仍在源会话 transcript（append-only 不丢）。锚点校验（不在视图 → 拒绝）与 ZCode `evaluateRewindTarget` 的 Unavailable 策略同判；ZCode 有命令级幂等（同 command 返回同一 child），RClaw 每次显式分叉生成新分支（多次点击 = 多分支，符合按钮语义） |
+| fork 复制源 | `methods/session-fork.ts:938`「复制源必须是 UI transcript 语义，activeSessionMessages 会按 compact boundary 截掉旧 worklog」 | **已声明差异**：两边都复制【活动视图前缀】（boundary 摘要降级为普通行，完整原文仍在源会话 transcript——append-only 不丢）。锚点校验（不在视图 → 拒绝）与 ZCode `evaluateRewindTarget` 的 Unavailable 策略同判。ZCode 有「父提问抢救」（findCompactedForkParentUserMessage 把被折叠的原始用户消息 prepend 回子会话）与命令级幂等（同 command 返回同一 child）——RClaw 均暂缺（被折叠锚点直接拒绝；每次显式分叉生成新分支，符合按钮语义），父提问抢救列为后续项；ZCode 文件回滚自动融合（forkWorkspaceAtMessage 按 post-anchor checkpoint 按需恢复）已对位（fork_chat 同款，第十三轮） |
 | typed ask | `dynamic-workflow/src/schema/{synthesize,emit}.ts`（any 拒绝、unknown 不校验、字面量→const/enum） | 语义一致；ZCode 有 checker 级解析（别名/泛型实例化/递归 $defs/`additionalProperties:false`），RClaw 为语法层子集 + 深度上限（差异已在「后续工作」声明为类型面扩展项）。untyped `ask()` 不校验（ZCode `askResultType` 对纯 string 返回 undefined 同判） |
 | 依赖图 | `dynamic-workflow/src/analysis/{sites,taint,graph}.ts` | RClaw 无 checker/taint（语法形状 + 绑定解析），边语义（相邻波全连 + join 内无边 + Kahn 分层）与 ZCode 站点/上下文边的保守近似一致；ZCode 的同 actor FIFO 保序边被串行链边蕴含 |
 | /goal | ZCode 每 turn 的 goal reminder（objective + budget + completion audit + 不自行宣告完成） | RClaw 尾注注入对齐全部关键要素；ZCode 有运行时 completion verifier，RClaw 靠模型按证据自评 + 用户 `/goal clear`（文档已声明） |
@@ -924,11 +924,11 @@ plan_status 是 journal 的只读投影，不与执行器写路径竞争。
    清空 artifacts 根。测试：`delete_session_cascades_artifact_dir_and_clear_wipes_root`。
 2. **fork 文件联动 ✅**：schema v2（`file_checkpoint.anchor_message_id`，迁移
    v1→v2 保数据旧行 NULL）；工具链同事务写入的 checkpoint 锚定 tool_result 消息行；
-   `rewind::restore_to_message`（回滚集 = 锚点之后的写入，锚点自身 checkpoint 作
+   `rewind::restore_to_message_lenient`（回滚集 = 锚点之后的写入，锚点自身 checkpoint 作
    校验链起点、其写入保留——漏掉链起点会让锚点与其后写入之间的未记录改动漏检，
-   测试曾以此失败形态验证）；入口 `/fork <id> files`（与 full 可组合；与 /rewind 同
-   纪律持静默门）、桌面长按菜单「分叉并回滚文件」走命令文本。旧行（迁移前）归属
-   未知不参与，报告注明。
+   测试曾以此失败形态验证；返回 (是否回滚, 撤销文件数, 报告)，无改动不算错）。第十三轮
+   起入口收敛为统一分叉（`fork_chat` 自动联动文件回滚；`/fork` 不再有 full/files 旗标，
+   `/rewind` 仍按回滚点 id 走 `restore_to_point`）。旧行（迁移前）归属未知不参与，报告注明。
 3. **`.ask<T>` 类型面扩展 ✅**：tuple（prefixItems + min/maxItems，校验器同步支持
    按位与混合变长尾）、交叉类型（对象合并 properties/required 并集）、泛型别名
    （`type Box<T> = …` 单/多参实例化，语法层代入栈，嵌套 `Box<Box<string>>` 支持）；
@@ -941,10 +941,9 @@ plan_status 是 journal 的只读投影，不与执行器写路径竞争。
    收尾后异步跑一次无工具小推理（max_tokens 200），按「可核对证据」标准判定
    `{goal_met, evidence_summary}`；达成 → 清 goal + 系统回执；未达成 / 解析失败 /
    调用失败 → 目标保持（`parse_goal_audit` fail-closed，绝不误清）。
-6. **fork 完整转录开关 ✅**：`fork_session(full_transcript)`——true 复制 id ≤ 锚点的
-   全部转录行（含被压缩折叠的原文与旧 boundary，ZCode transcript 语义对位；锚点
-   在转录里即可）；false 保持活动视图前缀。入口 `/fork <id> full`、桌面长按菜单
-   「分叉（含完整历史）」、chat_fork 命令 full 参数。
+6. ~~fork 完整转录开关~~（第十二轮引入；第十三轮随分叉归一移除——full/files 变体
+   删除，UI 只剩一个「⑂ 分叉」入口；被折叠锚点维持拒绝，ZCode 的「父提问抢救」
+   列为后续项）。
 7. ~~CLI fork 会话切换~~ / 8. ~~insights ts 解析~~（核对为 false alarm：ts 本就按
    字符串直传显示）/ 9. ~~全仓 fmt~~——按用户指示跳过。
 

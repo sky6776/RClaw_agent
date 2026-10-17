@@ -200,6 +200,8 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     );
     // 删会话时清运行期状态用的句柄：必须在 agent 被 move 进任务前取走。
     let session_lifecycle = agent.session_lifecycle();
+    // 统一分叉入口句柄：同样必须在 agent 被 move 进任务前取走。
+    let fork_handle = agent.fork_handle();
     tauri::async_runtime::spawn(agent.run());
 
     // cron + heartbeat 后台服务（与 CLI 相同语义）。
@@ -230,6 +232,7 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
         cron: core.cron,
         session: session_for_state,
         session_lifecycle,
+        fork: fork_handle,
         agent_runtime: core.agent_runtime,
         tools: tools_for_state,
         layout: layout_for_state,
@@ -603,6 +606,7 @@ fn clone_running_agent(running: &RunningAgent) -> RunningAgent {
         cron: running.cron.clone(),
         session: running.session.clone(),
         session_lifecycle: running.session_lifecycle.clone(),
+        fork: running.fork.clone(),
         agent_runtime: running.agent_runtime.clone(),
         tools: running.tools.clone(),
         layout: running.layout.clone(),
@@ -792,6 +796,7 @@ pub(crate) async fn assemble_apk_agent(
         Some(bot_router.clone()),
     );
     let session_lifecycle = agent.session_lifecycle();
+    let fork_handle = agent.fork_handle();
     tokio::spawn(agent.run());
     tokio::spawn(
         CronService::new(
@@ -848,6 +853,7 @@ pub(crate) async fn assemble_apk_agent(
             cron: core.cron,
             session: session_for_state,
             session_lifecycle,
+            fork: fork_handle,
             agent_runtime: core.agent_runtime,
             tools: tools_for_state,
             layout: layout_for_state,

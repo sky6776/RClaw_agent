@@ -714,6 +714,21 @@ impl Drop for CompactRegistration<'_> {
 ///
 /// 全局只有一个实例（由 `AgentLoop` 持有 `Arc<TurnManager>`）。所有依赖（provider /
 /// 存储 / 工具 / 选项 / outbound / 斜杠）都是可共享 / 可克隆的，方便克隆进每个 turn 任务。
+/// [`TurnManager::fork_chat`] 的产物（桌面 chat_fork 命令与 `/fork` 报告共用的事实源）。
+#[derive(Debug, Clone)]
+pub struct ForkChatOutcome {
+    pub new_chat_id: String,
+    /// 复制进子会话的历史条数（活动视图前缀，含作为普通行保留的摘要正文）。
+    pub copied: usize,
+    /// 撤销的文件写入条数（0 = 锚点之后没有 checkpointed 写入）。
+    pub restored_files: usize,
+    /// 执行了文件回滚时 = 明细报告（每文件一行）；回滚失败时 = ⚠️ 警告文案；
+    /// `None` = 锚点之后没有 checkpointed 写入，未执行回滚。
+    pub restore_report: Option<String>,
+    /// 文件回滚是否失败（分叉本身已成功，历史不回退）。
+    pub restore_failed: bool,
+}
+
 pub struct TurnManager {
     /// `(channel, chat_id, cron_job_id) → 活动 turn`。普通消息同一会话至多一个活动 turn；
     /// 不同 Cron job 即使回复目标相同，也使用独立活动 turn。
@@ -1549,12 +1564,144 @@ impl TurnManager {
         }
     }
 
+    /// 统一的分叉入口（桌面 `chat_fork` 命令与 `/fork <id>` 斜杠命令共用）：复制可见
+    /// 历史前缀到新会话 + 自动回滚锚点之后的 checkpointed 文件写入 + 往子会话写
+    /// 「分叉告知」行（模型可见、前端不回放；ZCode `persistSyntheticUserNotice` 对位）。
+    ///
+    /// 持静默门：文件回滚与任意会话的 turn / 后台 review 互斥（文件不分会话）——
+    /// 任务运行中分叉会被拒绝（与 ZCode「任务结束后可分叉」同纪律）。bot 会话拒绝
+    /// 分叉：分叉 id（`<bot 名>-fork…`）无法命中 BotRegistry 的同名 persona，后续
+    /// 消息会静默落到主 persona（换 provider / 记忆、丢 denied_tools 工具限制）——
+    /// 显式报错优于悄悄换身份。
+    pub async fn fork_chat(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        anchor_message_id: i64,
+    ) -> Result<ForkChatOutcome, String> {
+        if self.bots.persona_for_chat(channel, chat_id).is_some() {
+            return Err("🤖 bot 会话不支持分叉：分叉会话无法继承 bot 的 persona（模型 / 记忆 / 工具限制）。请直接新建会话。".to_string());
+        }
+        let Some(_quiescent) = self.gate.try_acquire() else {
+            let (turns, _reviews) = self.gate.running();
+            return Err(if turns > 0 {
+                "⏳ 有任务正在运行，分叉已中止：请先 /cancel 或等其结束后重试。".to_string()
+            } else {
+                "⏳ 后台 review / 维护操作仍在运行，分叉已中止：请稍后重试。".to_string()
+            });
+        };
+        // 新 chat_id：`<orig>-fork<hex>`（字符集过 chat_id 白名单的子集，长度收敛）；
+        // 撞名（同秒连按两次）就追加计数重试。
+        let base: String = chat_id.chars().take(40).collect();
+        let fork_base = format!("{base}-fork{:x}", chrono::Utc::now().timestamp());
+        let mut fork_target = fork_base.clone();
+        for n in 1..=64 {
+            let candidate = if n == 1 {
+                fork_base.clone()
+            } else {
+                format!("{fork_base}-{n}")
+            };
+            let session = self.session.clone();
+            let (channel2, chat2) = (channel.to_string(), candidate.clone());
+            let taken = tokio::task::spawn_blocking(move || {
+                session.session_exists(&channel2, &chat2).unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if !taken {
+                fork_target = candidate;
+                break;
+            }
+            if n == 64 {
+                return Err("无法为分叉会话分配新 id，请稍后重试。".to_string());
+            }
+        }
+        let fork = {
+            let session = self.session.clone();
+            let (channel2, chat2, target) =
+                (channel.to_string(), chat_id.to_string(), fork_target.clone());
+            tokio::task::spawn_blocking(move || {
+                session
+                    .fork_session(&channel2, &chat2, anchor_message_id, &target)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("分叉任务执行异常: {e}"))??
+        };
+        // 文件联动：锚点之后的 checkpointed 写入回滚到锚点时刻。历史已分叉（不回退）；
+        // 无文件改动是正常路径，回滚失败如实报告。
+        let (restored_files, restore_report, restore_failed) = {
+            let session = self.session.clone();
+            let (channel2, chat2) = (channel.to_string(), chat_id.to_string());
+            match tokio::task::spawn_blocking(move || {
+                rewind::restore_to_message_lenient(&session, &channel2, &chat2, anchor_message_id)
+            })
+            .await
+            {
+                Ok(Ok((true, count, report))) => (count, Some(report), false),
+                // 未回滚：说明原文带出去（真无写入 / 只有 cron 等无法归属消息的
+                // checkpoint 不参与按消息回滚——两种情况如实告知，别一律说成
+                // 「没有文件改动」）。
+                Ok(Ok((false, _, note))) => (0, Some(note), false),
+                Ok(Err(error)) => (
+                    0,
+                    Some(format!(
+                        "⚠️ 文件回滚未执行（新会话历史不受影响）：{error}"
+                    )),
+                    true,
+                ),
+                Err(error) => (0, Some(format!("⚠️ 文件回滚任务异常: {error}")), true),
+            }
+        };
+        let restore_note = if restore_failed {
+            "⚠️ 工作区文件回滚未成功（不影响本会话历史）。".to_string()
+        } else if restored_files > 0 {
+            format!("工作区文件已回滚到分叉点时刻（{restored_files} 个文件）。")
+        } else {
+            // lenient 的说明：真无写入，或只有无法归属消息的 checkpoint（不参与
+            // 按消息回滚）——原文带进子会话告知行。
+            restore_report
+                .clone()
+                .unwrap_or_else(|| "锚点之后没有文件改动，工作区无需回滚。".to_string())
+        };
+        // 子会话告知行：best-effort，写入失败不影响分叉产物。
+        {
+            let session = self.session.clone();
+            let (channel2, target, parent) = (
+                channel.to_string(),
+                fork_target.clone(),
+                chat_id.to_string(),
+            );
+            let note = restore_note.clone();
+            match tokio::task::spawn_blocking(move || {
+                session.append_fork_notice(&channel2, &target, &parent, anchor_message_id, &note)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!("分叉告知行写入失败（分叉产物不受影响）: {error}");
+                }
+                Err(error) => {
+                    tracing::warn!("分叉告知行任务异常（分叉产物不受影响）: {error}");
+                }
+            }
+        }
+        Ok(ForkChatOutcome {
+            new_chat_id: fork_target,
+            copied: fork.copied,
+            restored_files,
+            restore_report,
+            restore_failed,
+        })
+    }
+
     /// `/fork [消息 id]`：从任意消息锚点 fork 出【新会话】（ZCode `forkStableConversationAtMessage`
     /// 同源语义，第十二轮）。无参时列出最近的真实用户消息作锚点候选。
     ///
-    /// 与 `/rewind` 的分界：rewind 回滚【文件】（会话历史不动）；fork 复制【会话历史前缀】
-    /// 到新 chat_id（源会话与工作区都不动）。fork 不持静默门：它只创建新会话，与运行中
-    /// turn 的追加互不干扰（活动视图在读写各自的快照里取）。
+    /// 与 `/rewind` 的分界：rewind 只回滚【文件】（会话历史不动、原地继续）；fork =
+    /// 复制【会话历史前缀】到新 chat_id + 自动回滚锚点之后的文件写入（开分支重来）。
+    /// 两者同持静默门，见 [`Self::fork_chat`]。
     async fn handle_fork(&self, channel: &str, chat_id: &str, content: &str) -> String {
         // 命令头消费与 [`RuntimeCommand::parse`] / [`Self::handle_goal`] 同规则
         // （`/` 后可有空白、命令名大小写不敏感）：`/ fork 123` 按「丢第一个 token」
@@ -1572,12 +1719,6 @@ impl TurnManager {
             after_slash.trim()
         };
         let mut parts = args.split_whitespace();
-        // bot 会话拒绝分叉：分叉 id（<bot 名>-fork…）无法命中 BotRegistry 的同名
-        // persona，后续消息会静默落到主 persona（换 provider / 记忆、丢
-        // denied_tools 工具限制）——显式报错优于悄悄换身份。
-        if self.bots.persona_for_chat(channel, chat_id).is_some() {
-            return "🤖 bot 会话不支持分叉：分叉会话无法继承 bot 的 persona（模型 / 记忆 / 工具限制）。请直接新建会话。".to_string();
-        }
         let session = self.session.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();
@@ -1609,112 +1750,47 @@ impl TurnManager {
                     out.push_str(&format!("\n- #{id}（{time}）{preview}"));
                 }
                 out.push_str(
-                    "\n\n分叉：/fork <消息 id> [full] [files] —— 从该消息（含）复制出新会话分支；\
-                     原会话不动；files 同时把工作区文件回滚到该消息时刻，full 复制完整转录\
-                     （含被压缩折叠的原文）。桌面端也可在消息下方的分叉按钮直接点选。",
+                    "\n\n分叉：/fork <消息 id> —— 从该消息（含）复制出新会话分支，并把之后的\
+                     工作区文件改动一并回滚（原会话不动）。桌面端也可在消息下方直接点「分叉」。",
                 );
                 out
             }
             Some(id_text) => {
-                let mut rest = parts.clone();
-                // /fork <id> [full] [files]：full = 完整转录分叉（含被压缩折叠的原文）；
-                // files = 同时把工作区文件回滚到锚点时刻（与 /rewind 同纪律：任何会话
-                // 有活动 turn / 后台 review 时拒绝——文件不分会话）。
-                let full_transcript = rest.clone().any(|token| token.eq_ignore_ascii_case("full"));
-                let rewind_files = rest.any(|token| token.eq_ignore_ascii_case("files"));
-                let _gate = if rewind_files {
-                    match self.gate.try_acquire() {
-                        Some(gate) => Some(gate),
-                        None => {
-                            let (turns, _reviews) = self.gate.running();
-                            return if turns > 0 {
-                                "⏳ 有任务正在运行，文件回滚已中止：请先 /cancel 或等其结束后重试。".to_string()
-                            } else {
-                                "⏳ 后台 review / 维护操作仍在运行，文件回滚已中止：请稍后重试。".to_string()
-                            };
-                        }
-                    }
-                } else {
-                    None
-                };
                 let Ok(anchor_id) = id_text.trim_start_matches('#').parse::<i64>() else {
                     return format!("非法锚点 id「{id_text}」：应为 /fork 列表里 # 后的数字。");
                 };
-                // 新 chat_id：`<orig>-fork<hex>`（字符集过 chat_id 白名单的子集，长度收敛）；
-                // 撞名（同秒连按两次）就追加计数重试。
-                let base: String = chat_id.chars().take(40).collect();
-                let mut fork_target = format!("{base}-fork{:x}", chrono::Utc::now().timestamp());
-                for n in 1..=64 {
-                    let candidate = if n == 1 {
-                        fork_target.clone()
-                    } else {
-                        format!("{fork_target}-{n}")
-                    };
-                    let session = session.clone();
-                    let (channel2, chat2) = (channel.clone(), candidate.clone());
-                    let taken = tokio::task::spawn_blocking(move || {
-                        session.session_exists(&channel2, &chat2).unwrap_or(false)
-                    })
-                    .await
-                    .unwrap_or(false);
-                    if !taken {
-                        fork_target = candidate;
-                        break;
-                    }
-                    if n == 64 {
-                        return "⚠️ 无法为分叉会话分配新 id，请稍后重试。".to_string();
-                    }
+                // full / files 旗标已随统一分叉移除：显式拒绝而非静默忽略，避免老
+                // 输入（`/fork <id> files`）被无声变义。
+                if let Some(extra) = parts.next() {
+                    return format!(
+                        "未知参数「{extra}」：full / files 旗标已移除——分叉现在总是自动把\
+                         锚点之后的文件改动回滚到该时刻。"
+                    );
                 }
-                let self_channel = channel.clone();
-                let self_chat = chat_id.clone();
-                let forked = tokio::task::spawn_blocking(move || {
-                    session.fork_session(&channel, &chat_id, anchor_id, &fork_target, full_transcript)
-                })
-                .await;
-                match forked {
-                    Ok(Ok(fork)) => {
+                match self.fork_chat(&channel, &chat_id, anchor_id).await {
+                    Ok(outcome) => {
                         let mut report = format!(
-                            "✅ 已从消息 #{anchor_id} 分叉出新会话 `{}`（复制了 {} 条{}历史）。",
-                            fork.new_chat_id,
-                            fork.copied,
-                            if full_transcript { "完整转录" } else { "可见" }
+                            "✅ 已从消息 #{anchor_id} 分叉出新会话 `{}`（复制了 {} 条可见历史）。",
+                            outcome.new_chat_id, outcome.copied
                         );
-                        if rewind_files {
-                            // 文件联动：把锚点之后的 checkpointed 写入回滚到锚点时刻。
-                            // 历史已 fork（不回退）；文件回滚失败时如实分项报告。
-                            let session = self.session.clone();
-                            let (channel2, chat2) =
-                                (self_channel.clone(), self_chat.clone());
-                            let restored = tokio::task::spawn_blocking(move || {
-                                rewind::restore_to_message(&session, &channel2, &chat2, anchor_id)
-                            })
-                            .await;
-                            match restored {
-                                Ok(Ok(file_report)) => {
-                                    report.push_str(&format!(
-                                        "\n\n📁 文件已一并回滚到锚点时刻（影响全局工作区，\
-                                         原会话与新分支共享同一工作区）：\n{file_report}"
-                                    ));
-                                }
-                                Ok(Err(error)) => {
-                                    report.push_str(&format!(
-                                        "\n\n⚠️ 文件回滚未执行（新会话历史不受影响）：{error}"
-                                    ));
-                                }
-                                Err(error) => {
-                                    report.push_str(&format!("\n\n⚠️ 文件回滚任务异常: {error}"));
-                                }
+                        match outcome.restore_report {
+                            Some(detail) if outcome.restore_failed => {
+                                report.push_str(&format!("\n\n{detail}"));
                             }
-                        } else {
-                            report.push_str(
-                                "\n原会话与工作区文件均未改动；在桌面端会话列表里打开新分支继续，\
-                                 或换到该会话上下文后直接对话。",
-                            );
+                            Some(detail) if outcome.restored_files == 0 => {
+                                report.push_str(&format!("\n\nℹ️ {detail}"));
+                            }
+                            Some(detail) => report.push_str(&format!(
+                                "\n\n📁 文件已一并回滚到锚点时刻（影响全局工作区，\
+                                 原会话与新分支共享同一工作区）：\n{detail}"
+                            )),
+                            None => report.push_str(
+                                "\n锚点之后没有文件改动，工作区未动；在桌面端会话列表里打开新分支继续。",
+                            ),
                         }
                         report
                     }
-                    Ok(Err(error)) => format!("⚠️ {error}"),
-                    Err(error) => format!("⚠️ fork 任务执行异常: {error}"),
+                    Err(error) => format!("⚠️ {error}"),
                 }
             }
         }

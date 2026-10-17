@@ -1499,7 +1499,7 @@ fn fork_copies_active_view_prefix_and_keeps_source_untouched() {
     let ids = chat_sequence(&s, 6); // m0(u) m1(a) m2(u) m3(a) m4(u) m5(a)
 
     let fork = s
-        .fork_session("cli", "c", ids[2], "c-fork-1", false)
+        .fork_session("cli", "c", ids[2], "c-fork-1")
         .expect("fork 应成功");
     assert_eq!(fork.copied, 3, "锚点 m2 及其前共 3 条");
     assert_eq!(fork.anchor_message_id, ids[2]);
@@ -1532,17 +1532,17 @@ fn fork_rejects_unknown_or_hidden_anchor_and_duplicate_target() {
         .unwrap();
 
     // 被折叠的消息不可作锚（不在活动视图）。
-    let err = s.fork_session("cli", "c", ids[3], "c-fork-x", false).unwrap_err();
+    let err = s.fork_session("cli", "c", ids[3], "c-fork-x").unwrap_err();
     assert!(err.to_string().contains("不在"), "{err}");
 
     // 视图内的锚点（尾窗 m6）照常。
-    let fork = s.fork_session("cli", "c", ids[6], "c-fork-a", false).unwrap();
+    let fork = s.fork_session("cli", "c", ids[6], "c-fork-a").unwrap();
     assert_eq!(fork.copied, 4, "m0,m1,summary,m6");
     // 目标已存在 → 拒绝覆盖。
-    let err = s.fork_session("cli", "c", ids[6], "c-fork-a", false).unwrap_err();
+    let err = s.fork_session("cli", "c", ids[6], "c-fork-a").unwrap_err();
     assert!(err.to_string().contains("已存在"), "{err}");
     // 源会话不存在。
-    let err = s.fork_session("cli", "nope", ids[0], "x", false).unwrap_err();
+    let err = s.fork_session("cli", "nope", ids[0], "x").unwrap_err();
     assert!(err.to_string().contains("不存在"), "{err}");
 }
 
@@ -1553,7 +1553,7 @@ fn fork_copies_boundary_summary_as_plain_row() {
     let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
     s.append_compaction("cli", "c", &summary, Some(ids[1]), ids[6])
         .unwrap();
-    s.fork_session("cli", "c", ids[7], "c-fork-b", false).unwrap();
+    s.fork_session("cli", "c", ids[7], "c-fork-b").unwrap();
 
     // 新会话里 boundary 是普通行（meta NULL）：可见历史是 fork 时刻的完整可见视图，
     // 且新会话自己后续再压缩时不受旧锚点污染。
@@ -1670,7 +1670,7 @@ fn fork_copy_skips_atomic_write_sidecars() {
     std::fs::create_dir_all(&src_dir).unwrap();
     std::fs::write(src_dir.join("7-shell.txt"), "done").unwrap();
     std::fs::write(src_dir.join(".8-shell.txt.0123456789abcdef.tmp"), "half").unwrap();
-    s.fork_session("cli", "c", anchor, "c-fork", false).unwrap();
+    s.fork_session("cli", "c", anchor, "c-fork").unwrap();
     let fork_dir = base
         .join("artifacts")
         .join(crate::session::artifact_chat_key("cli", "c-fork"));
@@ -1683,12 +1683,12 @@ fn fork_lineage_kv_is_cascaded_on_delete_and_clear() {
     // 血缘 kv 随会话删除 / 全清：留着会让复用 chat_id 的新会话被当成旧分叉。
     let (_g, s) = store();
     let anchor = s.append("cli", "c", &Message::plain(Role::User, "m")).unwrap();
-    s.fork_session("cli", "c", anchor, "c-fork", false).unwrap();
+    s.fork_session("cli", "c", anchor, "c-fork").unwrap();
     assert!(s.fork_parent("cli", "c-fork").unwrap().is_some());
     assert!(s.delete_session("cli", "c-fork").unwrap());
     assert!(s.fork_parent("cli", "c-fork").unwrap().is_none(), "会话删除应级联血缘 kv");
 
-    s.fork_session("cli", "c", anchor, "c-fork-2", false).unwrap();
+    s.fork_session("cli", "c", anchor, "c-fork-2").unwrap();
     s.journal()
         .kv_set("plan-pause/plan-1", &serde_json::json!({"at": 0}))
         .unwrap();
@@ -1748,7 +1748,7 @@ fn fork_rewrites_and_copies_artifact_handles() {
         .append("cli", "c", &Message::plain(Role::Assistant, handle))
         .unwrap();
 
-    let fork = s.fork_session("cli", "c", handle_msg, "c-fork", false).unwrap();
+    let fork = s.fork_session("cli", "c", handle_msg, "c-fork").unwrap();
     assert_eq!(fork.copied, 2, "前缀含锚点（句柄消息）与其前的锚点消息");
 
     // 新会话的消息句柄已改指自己的目录，且实体文件在那里。
@@ -1788,7 +1788,7 @@ fn fork_without_artifacts_stays_clean() {
     let (_g, s) = store();
     let anchor = s.append("cli", "c", &Message::plain(Role::User, "m")).unwrap();
     // 源会话没有 artifact 目录：fork 照常成功（best-effort 跳过）。
-    let fork = s.fork_session("cli", "c", anchor, "c-fork", false).unwrap();
+    let fork = s.fork_session("cli", "c", anchor, "c-fork").unwrap();
     assert_eq!(fork.copied, 1);
 }
 
@@ -1822,41 +1822,50 @@ fn session_goal_kv_is_cascaded_on_delete_and_clear() {
 }
 
 #[test]
-fn fork_full_transcript_carries_folded_messages_and_hidden_anchor() {
+fn fork_notice_reaches_model_context_but_stays_out_of_replay() {
     let (_g, s) = store();
-    let ids = chat_sequence(&s, 8);
-    // 摘要掉 m2..m5（受保护头部 m0,m1；尾窗 m6,m7）。
+    let ids = chat_sequence(&s, 4);
+    s.fork_session("cli", "c", ids[2], "c-fork").unwrap();
+    s.append_fork_notice("cli", "c-fork", "c", ids[2], "已回滚 2 个文件到分叉点时刻。")
+        .unwrap();
+
+    // 模型上下文（活动视图）读得到告知行：继承说明 + 文件回滚结果 + 继续指令。
+    let model_view = texts(&s.load_all("cli", "c-fork").unwrap());
+    assert_eq!(model_view.len(), 4, "m0,m1,m2 + 告知行");
+    assert!(model_view[3].contains("【会话分叉】"), "{model_view:?}");
+    assert!(model_view[3].contains("已回滚 2 个文件"), "{model_view:?}");
+    assert!(model_view[3].contains("不要假设分叉点之后的消息"), "{model_view:?}");
+
+    // 前端回放（尾部窗口，REPLAYABLE_FILTER 的 meta IS NULL）不显示告知行。
+    let tail = s
+        .load_transcript_tail("cli", "c-fork", 100, 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        texts(&tail),
+        vec!["m0", "m1", "m2"],
+        "告知行不得进前端回放 / 快照 / 增量"
+    );
+
+    // 告知行（非 compaction 形态的 meta 行）不干扰 boundary 识别与锚点校验：
+    // 压缩的默认受保护头部（protect_first=3）会落在告知行上——非 compaction meta
+    // 行是普通行，必须能作压缩锚点（回归：meta IS NULL 硬校验会让分叉后的会话
+    // 永远无法落压缩 boundary）。
+    s.append("cli", "c-fork", &Message::plain(Role::User, "m4")).unwrap();
+    let child = s.load_all("cli", "c-fork").unwrap();
     let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
-    s.append_compaction("cli", "c", &summary, Some(ids[1]), ids[6])
+    // 受保护头部 = 告知行（child[3]）；尾窗 m4（child[4]）。
+    s.append_compaction("cli", "c-fork", &summary, Some(child[3].id), child[4].id)
         .unwrap();
-
-    // 被折叠的消息（m3）作锚：视图分叉拒绝，full 分叉成功并携带被折叠原文。
+    // 告知行随压缩退出视图（meta 行不进保留窗口）。
+    assert_eq!(
+        texts(&s.load_all("cli", "c-fork").unwrap()),
+        vec!["m0", "m1", "m2", "[CONTEXT COMPACTION] summary", "m4"]
+    );
+    // tail_from 回退到上一 boundary 尾窗之前 → 被拒（告知行不得让校验被静默跳过）。
     let err = s
-        .fork_session("cli", "c", ids[3], "c-fork-view", false)
+        .append_compaction("cli", "c-fork", &summary, Some(child[0].id), child[1].id)
         .unwrap_err();
-    assert!(err.to_string().contains("不在会话"), "{err}");
-    let fork = s
-        .fork_session("cli", "c", ids[3], "c-fork-full", true)
-        .expect("full 分叉应成功");
-    // 完整转录前缀 = m0..m3（含被折叠的 m2、m3 原文）。
-    assert_eq!(fork.copied, 4);
-    assert_eq!(
-        texts(&s.load_all("cli", "c-fork-full").unwrap()),
-        vec!["m0", "m1", "m2", "m3"],
-        "full 分叉应包含被压缩折叠的原文"
-    );
-    // 源会话视图不变。
-    assert_eq!(
-        texts(&s.load_all("cli", "c").unwrap()),
-        vec!["m0", "m1", "[CONTEXT COMPACTION] summary", "m6", "m7"]
-    );
-
-    // full 分叉锚点在视图内也成立（尾窗 m6）：前缀含全部行（折叠段 + boundary 摘要行）。
-    let fork_tail = s
-        .fork_session("cli", "c", ids[6], "c-fork-tail", true)
-        .unwrap();
-    // boundary 行 id 最大（> m7），id ≤ m6 的转录前缀不含它：m0..m6 共 7 行。
-    assert_eq!(fork_tail.copied, 7);
+    assert!(err.to_string().contains("回退到上一 boundary"), "{err}");
 }
 
 // ---------------------------------------------------------------------------

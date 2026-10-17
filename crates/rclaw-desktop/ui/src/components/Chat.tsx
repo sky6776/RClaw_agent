@@ -61,8 +61,8 @@ interface Props {
   onForwardToChat?: (text: string) => void;
   /** 当前会话 id：变化时重置滚动跟随并直达新会话底部（Chat 不随会话重挂载）。 */
   sessionKey: string;
-  /** 从该消息锚点分叉出新会话（full = 携带完整转录；files = 同时回滚工作区文件）。 */
-  onFork?: (entry: Entry, full?: boolean, files?: boolean) => void;
+  /** 从该消息锚点分叉出新会话（复制可见历史 + 自动回滚之后的文件改动，原会话不动）。 */
+  onFork?: (entry: Entry) => void;
   /** 最近的 PlanRun 计划状态（流程步骤卡片；完整列表，最多 6 条）。 */
   plans: PlanStatus[];
   /** 暂停 / 继续计划（步骤卡片展开时的 ⏸/▶ 按钮）。 */
@@ -329,7 +329,8 @@ function CopyButton({
 }
 
 /** 消息「分叉到新会话」小按钮（桌面内联形态）：从该消息（含）复制出一条新会话
- *  分支，原会话不动（ZCode fork 同款语义，第十二轮）。移动端走长按菜单项。 */
+ *  分支，并自动回滚锚点之后的文件改动，原会话不动（ZCode fork 同款语义）。
+ *  移动端走长按菜单项。 */
 function ForkButton({ onFork }: { onFork: () => void }) {
   return (
     <button
@@ -2265,30 +2266,16 @@ export default function Chat({
             >
               多选
             </button>
-            {/* 分叉到新会话（用户/助手消息；从该消息复制出新会话分支，原会话不动）。
-                full 变体携带被压缩折叠前的完整原文（存档式分叉）。 */}
+            {/* 分叉到新会话（用户/助手消息；一次做完：复制可见历史到新会话分支 +
+                自动回滚锚点之后的文件改动，原会话不动）。 */}
             {onFork &&
               (msgMenu.entry.role === "user" || msgMenu.entry.role === "assistant") && (
-                <>
-                  <button
-                    className={MENU_ITEM}
-                    onClick={closeMenuAnd((m) => onFork(m.entry))}
-                  >
-                    ⑂ 从这里分叉到新会话
-                  </button>
-                  <button
-                    className={MENU_ITEM}
-                    onClick={closeMenuAnd((m) => onFork(m.entry, true))}
-                  >
-                    ⑂ 分叉（含完整历史）
-                  </button>
-                  <button
-                    className={MENU_ITEM}
-                    onClick={closeMenuAnd((m) => onFork(m.entry, false, true))}
-                  >
-                    ⑂ 分叉并回滚文件
-                  </button>
-                </>
+                <button
+                  className={MENU_ITEM}
+                  onClick={closeMenuAnd((m) => onFork(m.entry))}
+                >
+                  ⑂ 从这里分叉到新会话
+                </button>
               )}
           </div>
         </div>

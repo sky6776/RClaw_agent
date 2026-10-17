@@ -754,74 +754,39 @@ fn extract_title(session: &rclaw_store::session::SessionStore, chat_id: &str) ->
 #[derive(Debug, Serialize)]
 pub struct ChatForkDto {
     pub chat_id: String,
-    /// 复制进新会话的消息条数。
+    /// 复制进新会话的消息条数（活动视图前缀，含作为普通行保留的摘要正文）。
     pub copied: usize,
+    /// 撤销的文件写入条数（0 = 锚点之后没有 checkpointed 写入）。
+    pub restored_files: usize,
+    /// 执行了文件回滚时 = 明细报告（每文件一行）；回滚失败时 = ⚠️ 警告文案；
+    /// `None` = 未执行回滚。
+    pub restore_report: Option<String>,
+    /// 文件回滚是否失败（分叉本身已成功，历史不回退）。
+    pub restore_failed: bool,
 }
 
-/// 从任意消息锚点分叉出新会话（ZCode forkStableConversationAtMessage 同源语义，
-/// 第十二轮）：消息下方的「分叉」按钮直达这里。原会话不动；新会话出现在会话列表。
+/// 从任意消息锚点分叉出新会话（ZCode `forkWorkspaceAtMessage` 同源语义）：消息下方的
+/// 「分叉」按钮直达这里。一次做完：复制可见历史前缀到新会话 + 自动回滚锚点之后的
+/// checkpointed 文件写入 + 子会话「分叉告知」行，全部委托 runtime 的
+/// [`rclaw_runtime::ForkHandle::fork_chat`]（与 `/fork` 斜杠命令同一实现，静默门 /
+/// bot 拒绝 / 目标 id 生成都收敛在那边）。原会话不动；新会话出现在会话列表。
 #[tauri::command]
 pub async fn chat_fork(
     state: State<'_, AppState>,
     chat_id: String,
     anchor_message_id: i64,
-    full: Option<bool>,
 ) -> Result<ChatForkDto, String> {
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
     }
-    let session = state.session().ok_or("agent 尚未启动")?;
-    // bot 会话拒绝分叉：分叉会话（<bot 名>-fork…）无法命中 BotRegistry 的同名
-    // persona，后续消息会静默落到主 persona（换 provider / 记忆、丢 denied_tools）。
-    if let Some(bots) = state.bots() {
-        if bots.persona_for_chat(CHANNEL_DESKTOP, &chat_id).is_some() {
-            return Err(
-                "🤖 bot 会话不支持分叉：分叉会话无法继承 bot 的 persona（模型 / 记忆 / 工具限制）。请直接新建会话。"
-                    .to_string(),
-            );
-        }
-    }
-    // 新 chat_id：`<orig>-fork<hex>`（白名单字符集，基名收敛到 40 字符）；
-    // 撞名（同秒连点两次）追加计数重试。
-    let base: String = chat_id.chars().take(40).collect();
-    let mut target = format!("{base}-fork{:x}", chrono::Utc::now().timestamp());
-    for n in 1..=64 {
-        let candidate = if n == 1 {
-            target.clone()
-        } else {
-            format!("{target}-{n}")
-        };
-        let exists = run_blocking("检查分叉会话 id", {
-            let session = session.clone();
-            let chat_id = candidate.clone();
-            move || Ok(session.session_exists(CHANNEL_DESKTOP, &chat_id).unwrap_or(false))
-        })
-        .await?;
-        if !exists {
-            target = candidate;
-            break;
-        }
-        if n == 64 {
-            return Err("无法为分叉会话分配新 id，请稍后重试".to_string());
-        }
-    }
-    let fork_target = target.clone();
-    let full_transcript = full.unwrap_or(false);
-    let fork = run_blocking("分叉会话", move || {
-        session
-            .fork_session(
-                CHANNEL_DESKTOP,
-                &chat_id,
-                anchor_message_id,
-                &fork_target,
-                full_transcript,
-            )
-            .map_err(|e| e.to_string())
-    })
-    .await?;
+    let fork = state.fork().ok_or("agent 尚未启动")?;
+    let outcome = fork.fork_chat(CHANNEL_DESKTOP, &chat_id, anchor_message_id).await?;
     Ok(ChatForkDto {
-        chat_id: fork.new_chat_id,
-        copied: fork.copied,
+        chat_id: outcome.new_chat_id,
+        copied: outcome.copied,
+        restored_files: outcome.restored_files,
+        restore_report: outcome.restore_report,
+        restore_failed: outcome.restore_failed,
     })
 }
 

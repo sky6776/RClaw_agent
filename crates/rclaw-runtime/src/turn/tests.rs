@@ -8699,7 +8699,13 @@ async fn fork_command_lists_anchors_and_forks_to_new_session() {
         .iter()
         .filter_map(|m| m.content.iter().find_map(|b| b.as_text()))
         .collect();
-    assert_eq!(texts, vec!["先做调研", "调研完成", "再写报告"], "{texts:?}");
+    // 复制的历史 + 尾部多一条「分叉告知」行（模型可见；本锚点之后无文件改动，
+    // 告知行如实说明无需回滚）。
+    assert_eq!(texts.len(), 4, "{texts:?}");
+    assert_eq!(&texts[..3], &["先做调研", "调研完成", "再写报告"], "{texts:?}");
+    assert!(texts[3].starts_with("【会话分叉】"), "{texts:?}");
+    assert!(texts[3].contains("不要假设分叉点之后的消息"), "{texts:?}");
+    assert!(texts[3].contains("没有可回滚的文件写入"), "{texts:?}");
     assert_eq!(
         mgr.session
             .load_all("cli", "console")

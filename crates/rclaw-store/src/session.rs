@@ -375,6 +375,40 @@ impl SessionStore {
         })
     }
 
+    /// 往分叉出的子会话追加一条「分叉告知」行（模型可见，前端不回放）。
+    ///
+    /// `role=user` + `meta={"fork_notice":…}`：`load_history`（模型上下文）不按 role/meta
+    /// 过滤，模型读得到；回放过滤（`REPLAYABLE_FILTER_SQL`，meta IS NULL）把它排除——
+    /// 前端历史 / 快照 / 增量都不显示，也不参与首条消息派生标题。仿 ZCode
+    /// `persistSyntheticUserNotice`：告诉模型这是分叉出的新分支，别把父会话后续的
+    /// 事当成自己经历过。`files_note` 是文件回滚结果的一句话描述（运行时按实情拼）。
+    pub fn append_fork_notice(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        parent_chat_id: &str,
+        anchor_message_id: i64,
+        files_note: &str,
+    ) -> Result<i64> {
+        let meta = serde_json::json!({
+            "fork_notice": { "parent": parent_chat_id, "anchor": anchor_message_id }
+        })
+        .to_string();
+        let text = format!(
+            "【会话分叉】本会话自父会话 `{parent_chat_id}` 的消息 #{anchor_message_id} 分叉而来，\
+             上面的历史继承自父会话。{files_note}\n\
+             请从本分叉继续：不要假设分叉点之后的消息在本会话发生过。"
+        );
+        self.db.transaction(|tx| {
+            let Some(sid) = session_id(tx, channel, chat_id)? else {
+                return Err(StoreError::Other(format!(
+                    "分叉告知写入失败：会话 {channel}/{chat_id} 不存在"
+                )));
+            };
+            insert_message(tx, sid, &Message::plain(Role::User, text), Some(&meta))
+        })
+    }
+
     // ---------------------------------------------------------------------
     // 读取
     // ---------------------------------------------------------------------
@@ -688,14 +722,11 @@ impl SessionStore {
     /// 第十二轮）：把源会话【活动视图】里 id ≤ 锚点的消息原样复制进一个新 chat_id 的会话，
     /// 原会话一个字节都不动（append-only；运行中的 turn 继续往原会话追加）。
     ///
-    /// - `full_transcript = false`（默认）：锚点必须是活动视图里的消息行——被压缩摘要
-    ///   折叠掉的消息不可作锚（它已不在「用户所见历史」里，与 ZCode rewind 的
-    ///   Unavailable 策略同判），明确报错；子会话轻（不带被折叠的中段）。
-    /// - `full_transcript = true`：复制完整转录前缀（id ≤ 锚点的全部行，含被折叠原文与
-    ///   旧 boundary，boundary 同样降级为普通行）——存档式分叉，锚点在转录里即可。
+    /// - 锚点必须是活动视图里的消息行——被压缩摘要折叠掉的消息不可作锚（它已不在
+    ///   「用户所见历史」里，与 ZCode rewind 的 Unavailable 策略同判），明确报错。
     /// - 视图里的 compaction boundary 行按【普通行】复制（摘要正文保留，旧 meta 锚点
-    ///   引用的是源会话的 id，带过去即坏）——新会话的可见历史 = fork 时刻源会话的
-    ///   可见历史，不再折叠。
+    ///   引用的是源会话的 id，带过去即坏；其余 meta 行——如 fork 告知行——原样保留）——
+    ///   新会话的可见历史 = fork 时刻源会话的可见历史，不再折叠。
     /// - 血缘写进同一事务的 kv：`session-fork/<channel>/<new_chat_id>` =
     ///   `{parent, anchor}`（查回用 [`Self::fork_parent`]）。
     /// - `new_chat_id` 由调用方给出（桌面命令/斜杠命令负责生成与字符集校验）；已存在
@@ -710,7 +741,6 @@ impl SessionStore {
         chat_id: &str,
         anchor_message_id: i64,
         new_chat_id: &str,
-        full_transcript: bool,
     ) -> Result<SessionFork> {
         let now = now_ms();
         // 句柄重写前缀：与落盘侧（runtime spill）同构造——Path::join 归一尾部分隔符
@@ -730,18 +760,8 @@ impl SessionStore {
                     "源会话 {channel}/{chat_id} 不存在"
                 )));
             };
-            // 复制源二选一（第十二轮后续项）：
-            // - 活动视图前缀（默认）：锚点必须在视图里，被压缩折叠的消息不带走；
-            // - 完整转录前缀（full_transcript）：id ≤ 锚点的全部行——含被折叠的原文与
-            //   旧 boundary（boundary 降级为普通行，与视图分支同规则）。ZCode「fork
-            //   复制源必须是 UI transcript 语义」的对位能力；锚点在转录里即可。
-            let prefix: Vec<(i64, String)> = if full_transcript {
-                query_raw(
-                    tx,
-                    "SELECT id, data FROM message WHERE session_id = ?1 AND id <= ?2 ORDER BY id",
-                    params![sid, anchor_message_id],
-                )?
-            } else {
+            // 复制源 = 活动视图前缀：锚点必须在视图里，被压缩折叠的消息不带走。
+            let prefix: Vec<(i64, String)> = {
                 let view = load_active_raw(tx, sid, None)?;
                 let Some(anchor_pos) = view
                     .iter()
@@ -749,7 +769,7 @@ impl SessionStore {
                 else {
                     return Err(StoreError::Other(format!(
                         "锚点消息 {anchor_message_id} 不在会话 {channel}/{chat_id} 的活动视图里\
-                         （可能已被压缩折叠进摘要）。请换一个仍可见的消息，或用完整转录分叉"
+                         （可能已被压缩折叠进摘要）。请换一条仍可见的消息"
                     )));
                 };
                 // 视图顺序 = 会话顺序（head ++ [boundary] ++ kept ++ after）；按锚点在视图
@@ -757,7 +777,7 @@ impl SessionStore {
                 // 连同它之后的尾窗错切掉。
                 view[..=anchor_pos].to_vec()
             };
-            // full 分支的锚点存在性（视图分支已在定位时报错）：前缀末行必须是锚点本身。
+            // 锚点存在性（视图定位已保证命中）：前缀末行必须是锚点本身。
             if prefix.last().is_none_or(|(id, _)| *id != anchor_message_id) {
                 return Err(StoreError::Other(format!(
                     "锚点消息 {anchor_message_id} 不在会话 {channel}/{chat_id} 的转录里"
@@ -770,14 +790,15 @@ impl SessionStore {
             let new_sid = session_id(tx, channel, new_chat_id)?.ok_or_else(|| {
                 StoreError::Other(format!("会话行创建后不可见: {channel}/{new_chat_id}"))
             })?;
-            // role/ts 从源行随取（data 里的 ts 是序列化冗余，列值才是事实源）。
+            // role/ts/meta 从源行随取（data 里的 ts 是序列化冗余，列值才是事实源）。
             let mut stmt = tx.prepare_cached(
-                "SELECT role, ts FROM message WHERE session_id = ?1 AND id = ?2",
+                "SELECT role, ts, meta FROM message WHERE session_id = ?1 AND id = ?2",
             )?;
             for (id, data) in &prefix {
-                let (role, ts): (String, i64) = stmt.query_row(params![sid, id], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })?;
+                let (role, ts, meta): (String, i64, Option<String>) =
+                    stmt.query_row(params![sid, id], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?;
                 // artifact 句柄重写：命中源会话目录前缀的路径改指新会话目录（事务提交后
                 // 整目录复制补上实体文件）；不含句柄的行原样复制。
                 let data = if data.contains(source_prefix.as_str()) {
@@ -785,9 +806,16 @@ impl SessionStore {
                 } else {
                     data.clone()
                 };
+                // boundary 行降级为普通行（旧 meta 锚点引用源会话 id，带过去即坏）；
+                // 其余 meta（如 fork 告知行）原样保留——降级成 NULL 会让它以普通用户
+                // 消息的形态混进前端回放。
+                let meta = match meta {
+                    Some(raw) if CompactionMeta::parse(&raw).is_some() => None,
+                    other => other,
+                };
                 tx.execute(
-                    "INSERT INTO message(session_id, role, ts, data, meta) VALUES (?1, ?2, ?3, ?4, NULL)",
-                    params![new_sid, role, ts, data],
+                    "INSERT INTO message(session_id, role, ts, data, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![new_sid, role, ts, data, meta],
                 )?;
             }
             let lineage = serde_json::json!({
@@ -1374,28 +1402,45 @@ fn ensure_session_untouched(conn: &Connection, channel: &str, chat_id: &str) -> 
     })
 }
 
-/// 最后一个 compaction boundary 行：`(id, meta JSON)`。
-fn latest_boundary(conn: &Connection, sid: i64) -> Result<Option<(i64, String)>> {
-    Ok(conn
-        .query_row(
-            "SELECT id, meta FROM message WHERE session_id = ?1 AND meta IS NOT NULL \
-             ORDER BY id DESC LIMIT 1",
-            params![sid],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?)
+/// 最后一个 compaction boundary 行:`(id, 已解析 meta)`。
+///
+/// 只认 meta 真为 compaction 形态的行(`meta` 列还装其它种类,如 fork 告知行)——
+/// 裸 `meta IS NOT NULL` 会把最新一条任意 meta 行误当 boundary:视图拼接退化成完整
+/// 历史、boundary 锚点校验被静默跳过。
+fn latest_boundary(conn: &Connection, sid: i64) -> Result<Option<(i64, CompactionMeta)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, meta FROM message WHERE session_id = ?1 AND meta IS NOT NULL \
+         ORDER BY id DESC LIMIT 32",
+    )?;
+    let mut rows = stmt.query_map(params![sid], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    while let Some(row) = rows.next() {
+        let (id, raw): (i64, String) = row?;
+        if let Some(meta) = CompactionMeta::parse(&raw) {
+            return Ok(Some((id, meta)));
+        }
+    }
+    Ok(None)
 }
 
-/// 该 id 是否是本会话的一条普通消息行（非 boundary）。
+/// 该 id 是否是本会话的一条普通消息行（非 compaction boundary）。
+///
+/// `meta` 列里非 compaction 形态的行（如 fork 告知行）也是模型可见的普通行，
+/// 可作压缩锚点（head_until / tail_from 落在它上合法）；boundary 行不行——
+/// 视图拼接按它切三段，锚到它会让保留窗口错切。
 fn plain_message_exists(conn: &Connection, sid: i64, id: i64) -> Result<bool> {
-    Ok(conn
+    let meta: Option<Option<String>> = conn
         .query_row(
-            "SELECT 1 FROM message WHERE session_id = ?1 AND id = ?2 AND meta IS NULL",
+            "SELECT meta FROM message WHERE session_id = ?1 AND id = ?2",
             params![sid, id],
-            |_| Ok(()),
+            |row| row.get(0),
         )
-        .optional()?
-        .is_some())
+        .optional()?;
+    Ok(meta.is_some_and(|meta| match meta {
+        None => true,
+        Some(raw) => CompactionMeta::parse(&raw).is_none(),
+    }))
 }
 
 /// `append_compaction` 的锚点校验（见其文档）。
@@ -1417,10 +1462,7 @@ fn validate_compaction_anchors(
             )));
         }
     }
-    if let Some((prev_id, raw)) = latest_boundary(conn, sid)? {
-        let Some(prev) = CompactionMeta::parse(&raw) else {
-            return Ok(());
-        };
+    if let Some((prev_id, prev)) = latest_boundary(conn, sid)? {
         if tail_from < prev.tail_from {
             return Err(StoreError::Other(format!(
                 "compaction 锚点非法：tail_from={tail_from} 回退到上一 boundary（id={prev_id}）\
@@ -1646,11 +1688,7 @@ fn load_active_raw(conn: &Connection, sid: i64, limit: Option<usize>) -> Result<
             ),
         }
     };
-    let Some((boundary_id, raw_meta)) = boundary else {
-        return full_history(conn);
-    };
-    let Some(meta) = CompactionMeta::parse(&raw_meta) else {
-        tracing::warn!("compaction boundary meta 不可解析，按完整历史加载: id={boundary_id}");
+    let Some((boundary_id, meta)) = boundary else {
         return full_history(conn);
     };
     let after = match limit {

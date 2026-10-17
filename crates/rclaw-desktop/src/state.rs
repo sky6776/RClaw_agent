@@ -25,6 +25,9 @@ pub struct RunningAgent {
     /// 会话生命周期句柄：删会话时同步清掉 agent loop 里该会话的运行期状态
     /// （usage 锚点、压缩防抖 / 冷却），库与内存一起归零。
     pub session_lifecycle: SessionLifecycle,
+    /// 统一分叉入口句柄：桌面「分叉」按钮直连 runtime 的 fork_chat（复制历史 +
+    /// 自动文件回滚 + 子会话告知行），与 `/fork` 斜杠命令同一实现。
+    pub fork: rclaw_runtime::ForkHandle,
     /// 多 agent 工具运行时（Agent 状态面板读后台执行快照）。
     pub agent_runtime: AgentToolRuntime,
     /// 工具注册表（工具面板的列表与禁能开关）。
@@ -119,13 +122,13 @@ impl AppState {
             .map(|a| a.session_lifecycle.clone())
     }
 
-    /// Bot 注册表克隆（bot 会话的身份判定：分叉会话无法继承 persona）。
-    pub fn bots(&self) -> Option<Arc<BotRegistry>> {
+    /// 统一分叉入口句柄克隆。
+    pub fn fork(&self) -> Option<rclaw_runtime::ForkHandle> {
         self.agent
             .read()
             .expect("AppState.agent 锁未被毒化")
             .as_ref()
-            .map(|a| a.bots.clone())
+            .map(|a| a.fork.clone())
     }
 
     /// 多 agent 运行时句柄克隆。

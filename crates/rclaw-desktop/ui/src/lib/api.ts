@@ -86,10 +86,16 @@ export interface ChatHistoryDelta {
   more: boolean;
 }
 
-/** chat_fork 结果：新会话 id 与复制的消息条数。 */
+/** chat_fork 结果：新会话 id、复制的历史条数与文件回滚结果。 */
 export interface ChatForkResult {
   chat_id: string;
   copied: number;
+  /** 撤销的文件写入条数（0 = 锚点之后没有 checkpointed 写入）。 */
+  restored_files: number;
+  /** 执行了文件回滚时 = 明细报告（每文件一行）；回滚失败时 = ⚠️ 警告文案；null = 未执行回滚。 */
+  restore_report: string | null;
+  /** 文件回滚是否失败（分叉本身已成功，历史不回退）。 */
+  restore_failed: boolean;
 }
 
 /** PlanRun 步骤状态（与后端 PlanStepDto.status 同集合）。 */
@@ -392,9 +398,9 @@ export const api = {
   chatHistorySince: (chatId: string, after: number) =>
     invoke<ChatHistoryDelta>("chat_history_since", { chatId, after }),
 
-  /** 从任意消息锚点分叉出新会话（原会话不动）；full = 携带完整转录（含被压缩折叠的原文）。 */
-  chatFork: (chatId: string, anchorMessageId: number, full?: boolean) =>
-    invoke<ChatForkResult>("chat_fork", { chatId, anchorMessageId, full }),
+  /** 从任意消息锚点分叉出新会话：复制可见历史 + 自动回滚锚点之后的文件改动（原会话不动）。 */
+  chatFork: (chatId: string, anchorMessageId: number) =>
+    invoke<ChatForkResult>("chat_fork", { chatId, anchorMessageId }),
 
   /** 最近若干个 PlanRun 计划的状态（流程步骤 / todo 轮询）。 */
   planStatus: () => invoke<PlanStatus[]>("plan_status"),

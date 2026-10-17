@@ -28,7 +28,7 @@ use rclaw_tools::ToolRegistry;
 
 use crate::options::AgentOptions;
 use crate::slash::SlashRegistry;
-use crate::turn::TurnManager;
+use crate::turn::{ForkChatOutcome, TurnManager};
 
 /// agent 主循环：持有 [`TurnManager`]，循环把 inbound 消息路由出去。
 pub struct AgentLoop {
@@ -84,6 +84,14 @@ impl AgentLoop {
         }
     }
 
+    /// 分叉句柄（在 `run()` 之前取走、可跨任务持有）：宿主桌面命令直连统一的分叉
+    /// 入口（复制历史 + 自动文件回滚 + 子会话告知行），与 `/fork` 斜杠命令同一实现。
+    pub fn fork_handle(&self) -> ForkHandle {
+        ForkHandle {
+            turn_mgr: self.turn_mgr.clone(),
+        }
+    }
+
     /// 运行主循环：收到一条 inbound 就交给 [`TurnManager::route`]，直到 inbound 关闭。
     ///
     /// `route` 自身不阻塞在长 turn 上（turn 在独立任务里跑），因此 loop 能持续路由新消息。
@@ -101,6 +109,28 @@ impl AgentLoop {
 #[derive(Clone)]
 pub struct SessionLifecycle {
     turn_mgr: Arc<TurnManager>,
+}
+
+/// 分叉句柄：对 [`TurnManager`] 的薄封装，只暴露宿主桌面命令需要的统一分叉入口，
+/// 不把核心组件本身交给前端 / 宿主层（与 [`SessionLifecycle`] 同一模式）。
+#[derive(Clone)]
+pub struct ForkHandle {
+    turn_mgr: Arc<TurnManager>,
+}
+
+impl ForkHandle {
+    /// 统一分叉入口：复制可见历史前缀到新会话 + 自动回滚锚点之后的 checkpointed
+    /// 文件写入 + 往子会话写「分叉告知」行。持静默门：任务运行中 / 后台 review 时拒绝。
+    pub async fn fork_chat(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        anchor_message_id: i64,
+    ) -> Result<ForkChatOutcome, String> {
+        self.turn_mgr
+            .fork_chat(channel, chat_id, anchor_message_id)
+            .await
+    }
 }
 
 impl SessionLifecycle {
