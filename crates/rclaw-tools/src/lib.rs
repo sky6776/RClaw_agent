@@ -14,6 +14,7 @@ pub mod access;
 pub mod cdp_browser;
 pub mod cron_controller;
 pub mod cron_tools;
+pub mod download_media;
 pub mod files;
 pub mod mcp;
 pub mod memory_tool;
@@ -270,6 +271,8 @@ impl ToolRegistry {
         reg.register(Box::new(DeleteFile::new(base.clone())));
         reg.register(Box::new(ListDir::new(base.clone())));
         reg.register(Box::new(Grep::new(base.clone())));
+        // 远程媒体下载进 media/ 沙箱（聊天卡片渲染 / open_media / publish_media 的素材入口）。
+        reg.register(Box::new(download_media::DownloadMedia::new(base.clone())));
         // shell 与 shell_poll 共享同一张后台任务表（T1：yield + id + poll）。
         let jobs = shell_jobs::ShellJobTable::new();
         reg.register(Box::new(Shell::with_job_table(base.clone(), jobs.clone())));

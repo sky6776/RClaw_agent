@@ -44,9 +44,15 @@ final class BrowserSession {
     /** WebView 当前是否挂载在悬浮窗容器里。 */
     private static boolean attached;
 
+    /** WebView 创建代际：每次真正 new WebView 递增（复用不递增）。随 okJson
+     *  带回 Rust 作为触摸降级标志的「实例代际」——myPid 是应用进程号，
+     *  WebView 销毁重建也不变，不能当实例身份。 */
+    private static int createEpoch = 0;
+
     /** 启动（或复用）会话。返回 JSON：
-     *  {"ok":true,"pid":N,"width":W,"height":H,"dpr":D} / {"ok":false,"error":"..."}
+     *  {"ok":true,"pid":N,"epoch":E,"width":W,"height":H,"dpr":D} / {"ok":false,"error":"..."}
      *  ——Rust 据此拼 DevTools socket 名 webview_devtools_remote_<pid> 连 CDP；
+     *  epoch 是 WebView 创建代际（复用不变、重建递增），供触摸降级标志判定；
      *  尺寸为离屏布局的物理像素（CSS 视口 = width/dpr），供指纹一致性记录。 */
     static String start(android.content.Context context) {
         synchronized (LOCK) {
@@ -77,6 +83,7 @@ final class BrowserSession {
                     // 此开关必须在主线程切换。
                     android.webkit.WebView.setWebContentsDebuggingEnabled(true);
                     android.webkit.WebView wv = new android.webkit.WebView(ctx);
+                    createEpoch++;
                     android.webkit.WebSettings settings = wv.getSettings();
                     settings.setJavaScriptEnabled(true);
                     settings.setDomStorageEnabled(true);
@@ -564,6 +571,7 @@ final class BrowserSession {
 
     private static String okJson() {
         return "{\"ok\":true,\"pid\":" + android.os.Process.myPid()
+                + ",\"epoch\":" + createEpoch
                 + ",\"width\":" + viewW + ",\"height\":" + viewH
                 + ",\"dpr\":" + viewDpr + "}";
     }

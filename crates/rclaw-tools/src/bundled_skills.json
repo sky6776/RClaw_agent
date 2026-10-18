@@ -35,6 +35,8 @@
     "seedream-image",
     "seedream-prompt-gen",
     "taobao-scrape",
-    "xlsx"
+    "xlsx",
+    "xhs-scrape",
+    "xianyu-scrape"
   ]
 }

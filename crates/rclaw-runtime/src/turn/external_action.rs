@@ -310,6 +310,11 @@ pub(super) fn tool_receipt_matches_action(receipt: &ToolReceipt, action: Externa
         };
     }
 
+    if tool == "download_media" {
+        // 下载 = 把远程内容写进工作区媒体沙箱（「已下载/已保存」类声明）。
+        return matches!(action, ExternalAction::WriteUpdate | ExternalAction::Create);
+    }
+
     let contains_any = |needles: &[&str]| needles.iter().any(|needle| tool.contains(needle));
     match action {
         ExternalAction::Create => {

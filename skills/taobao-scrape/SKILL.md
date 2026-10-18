@@ -9,7 +9,7 @@ description: 采集淘宝/天猫商品搜索结果并整理成 CSV 表格——�
 
 ## 工具面与会话
 
-- 只依赖 7 个 browser_* 工具：`browser_navigate`（打开 URL 并返回标题/最终 URL/正文，正文上限 6000 字）、`browser_snapshot`（可交互元素清单，每项 `[ref] 角色: 文本 → 链接`，链接截断到 150 字符，单次最多 250 项）、`browser_click`（按 ref 点按）、`browser_type`（按 ref 输入，先清空再输入，不发送回车）、`browser_scroll`（滚轮，一格约 120px，单次 1-30 格）、`browser_screenshot`（PNG 存工作区 browser/ 下）、`browser_close`。
+- browser_* 工具：`browser_navigate`（打开 URL 并返回标题/最终 URL/正文，正文上限 6000 字）、`browser_snapshot`（可交互元素清单，每项 `[ref] 角色: 文本 → 链接`，链接截断到 150 字符，单次最多 250 项）、`browser_click`（按 ref 点按）、`browser_type`（按 ref 输入，先清空再输入，不发送回车）、`browser_scroll`（滚轮，一格约 120px，单次 1-30 格）、`browser_screenshot`（PNG 存工作区 browser/ 下）、`browser_media`（当前页图片/视频 URL 清单）、`browser_close`。APK 上另有 `open_media`（系统查看器/播放器打开 workspace 图片/视频）。
 - 会话跨调用保持 Cookie 与登录态；**不要在采集过程中调用 `browser_close`**（销毁会话会丢掉当前页面状态，下次调用自动重建但要重新导航）。
 - 内置风控标注只识别 Google 验证页，**淘宝的拦截页要靠本技能自己的判定规则识别**（见下）。
 
@@ -93,6 +93,15 @@ https://s.taobao.com/search?q=<关键词>&tab=mall            仅天猫
 3. 写 `report.md`：关键词、排序、采集时间、共 N 个商品（去重后）、结果表（markdown 表）、异常与墙记录（是否遇到登录/风控、跳过了哪些步骤）。
 4. 回复用户时给结论摘要（数量、价格区间、销量前三）+ 文件路径。用户在 QQ 通道且要求发文件时，用 `skill__glm_master_skill__publish_media` 交付 CSV/报告。
 5. 用户要 Excel（.xlsx）时按宿主分流：**桌面端**（有 shell 与 LibreOffice）才用 xlsx 技能从 CSV 转换；**手机 APK**（无系统 shell、xlsx 技能的转换工具链不可用）如实说明当前设备只能交付 CSV，xlsx 请在桌面端处理。不得在手机上编造「已生成 xlsx」。
+
+## 媒体交付（推送到聊天面板）
+
+- **链接**：回复里给重点商品的 markdown 链接（`[标题](https://item.taobao.com/item.htm?id=…)`），用户在会话里点击即可打开。
+- **图文**：用户想"直接看"某商品时，`browser_navigate` 打开详情页 → `browser_screenshot` 截图 → APK 调 `open_media` 用系统查看器打开该 PNG；桌面宿主复制进媒体沙箱（Windows：`copy /Y browser\<截图名>.png media\<截图名>.png`；macOS/Linux：`cp browser/<截图名>.png media/<截图名>.png`）并引用 `media/<截图名>.png` 路径（聊天面板据此渲染；`browser/` 路径不要直接贴）。截图名自带毫秒时间戳，**保留原名**（跨任务天然唯一，自编序号会覆盖别的任务的交付）。
+- **图片直链**：详情页调 `browser_media` 取商品图清单（`[图]` 条目 = 原图 URL），可附在回复里。
+- **图片/视频下载**：`download_media` 把 `browser_media` 拿到的直链落进 `media/download/`（≤200 MB、仅公网地址）——下载后引用 `media/…` 路径出聊天卡片，用户可直接保存或分享。
+- **视频**：商品详情若带视频，`browser_media` 的 `[视频]` 条目即直链，附在回复里供点击播放；用户要本地文件时按上一条下载。
+- QQ 通道且用户要求发文件时：用 `skill__glm_master_skill__publish_media`（path 限 workspace 相对路径）；标记独占一行，不手写 marker。
 
 ## 纪律与限制
 

@@ -19,6 +19,9 @@
 //! - 交互事件词汇随 UA 判定：移动端（Android UA）走 `Input.dispatchTouchEvent`
 //!   触摸事件 + 逐字符键盘事件（手机不发鼠标事件，`insertText` 不产生键盘
 //!   事件流——事件词汇与 UA 矛盾是行为检测的直接证据），桌面保持鼠标/滚轮；
+//!   触摸事件带 3 秒短超时与降级通路（真机实测部分 WebView 页面触摸管线会
+//!   终身卡死：失败置位降级标志，click/type/scroll 自动改走鼠标/键盘，详见
+//!   [`CdpBrowser::touch_call`]）；
 //! - Cookie 由真实网络栈跨调用保持（Java 侧 teardown 时 `CookieManager.flush`
 //!   落盘，进程被杀不丢已养的风控信誉）。
 //!
@@ -532,6 +535,13 @@ pub trait DevtoolsTransport: Send + Sync {
     fn device_metrics(&self) -> Option<(i64, i64, f64)> {
         None
     }
+    /// 浏览器实例代际：同一实例的重连必须返回同值，实例真正重建（重新拉起
+    /// 无头浏览器 / WebView 销毁重建）才变化。触摸降级标志只在代际变化时
+    /// 重置——卡死的触摸管线跨 CDP 重连存活，跟随重连重置会让每次重连后
+    /// 都白白重试一轮超时（真机实测：WebView83 系部分页面触摸终身卡死）。
+    fn instance_generation(&self) -> u64 {
+        0
+    }
 }
 
 /// CDP `Page.captureScreenshot` → PNG 落盘（传输双轨的 CDP 轨：桌面无头实例
@@ -571,6 +581,8 @@ pub struct HeadlessChromiumTransport {
     profile_dir: std::path::PathBuf,
     /// 可见模式：true = 下次拉起带窗口的真实浏览器（共享给人用）。
     visible: std::sync::atomic::AtomicBool,
+    /// 浏览器实例代际：每次 launch 递增（重连复用不递增）。
+    generation: std::sync::atomic::AtomicU64,
 }
 
 struct RunningChromium {
@@ -842,6 +854,7 @@ impl HeadlessChromiumTransport {
             // 孤儿由 kill_orphans_holding_profile 按各自目录特征清杀）。
             profile_dir: std::env::temp_dir().join(format!("rclaw-browser-profile-{}", std::process::id())),
             visible: std::sync::atomic::AtomicBool::new(false),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1120,6 +1133,8 @@ impl DevtoolsTransport for HeadlessChromiumTransport {
         };
         let pair = Self::try_connect_page(&run.endpoint).await?;
         *guard = Some(run);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(pair)
     }
 
@@ -1130,6 +1145,11 @@ impl DevtoolsTransport for HeadlessChromiumTransport {
         }
         kill_headless_processes();
         Ok(())
+    }
+
+    fn instance_generation(&self) -> u64 {
+        self.generation
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn screenshot_dir(&self) -> std::path::PathBuf {
@@ -1166,6 +1186,16 @@ pub struct CdpBrowser {
     /// 逐字符键盘事件），false = 桌面（鼠标/滚轮）。会话建立时由
     /// humanize 的 UA 读取更新（UA 是会话级覆写，词汇必须同源）。
     mobile_input: std::sync::atomic::AtomicBool,
+    /// 触摸通路降级标志：真机实测（vivo WebView83 系）部分页面首个 touchStart
+    /// ACK 后触摸管线即终身卡死——后续所有 touch 事件无 ACK，reload/换导航
+    /// 均不愈，只有重建 WebView 才恢复；鼠标与键盘通路完全独立不受影响。
+    /// 置位后本会话所有触摸尝试直接走鼠标/键盘回退，避免每次调用干等超时。
+    /// 重置只在 [`DevtoolsTransport::instance_generation`] 变化（WebView 真正
+    /// 重建）时进行——CDP 断线重连不重建 WebView，卡死会跨重连存活。
+    touch_broken: std::sync::atomic::AtomicBool,
+    /// 上次会话的浏览器实例代际（0 = 尚未建立；与 transport 的
+    /// instance_generation 比对决定是否重置触摸降级标志）。
+    view_generation: std::sync::atomic::AtomicU64,
 }
 
 /// park 过码等待：页面恢复轮询间隔。
@@ -1191,6 +1221,8 @@ impl CdpBrowser {
             session: AsyncMutex::new(None),
             op: AsyncMutex::new(()),
             mobile_input: std::sync::atomic::AtomicBool::new(false),
+            touch_broken: std::sync::atomic::AtomicBool::new(false),
+            view_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1222,6 +1254,16 @@ impl CdpBrowser {
         let mobile = humanize_session(&session).await;
         self.mobile_input
             .store(mobile, std::sync::atomic::Ordering::Relaxed);
+        // 触摸降级标志只在浏览器实例真正重建（代际变化）时重置：卡死的触摸
+        // 管线跨 CDP 重连存活（安卓 WebView 复用、桌面无头实例复用同理）。
+        let generation = self.transport.instance_generation();
+        let previous = self
+            .view_generation
+            .swap(generation, std::sync::atomic::Ordering::Relaxed);
+        if previous != generation {
+            self.touch_broken
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         // 视口一致性：老 WebView 的 app-context 度量把 CSS 视口折成非标准值
         // （真机实测 480/1440，真手机上不可能出现）。用设备真实 Display 的
         // CSS 视口钉住渲染器（mobile=true 同时启用移动视口语义），Playwright
@@ -1383,6 +1425,35 @@ impl CdpBrowser {
             .is_some_and(|blocked| blocked.contains("CAPTCHA")))
     }
 
+    /// 媒体资源清单（MEDIA_JS 提取；只读，不导航）。
+    pub async fn extract_media(&self) -> Result<String, String> {
+        let _op = self.op.lock().await;
+        let session = self.session().await?;
+        let reply = session
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": MEDIA_JS, "returnByValue": true }),
+                Duration::from_secs(15),
+            )
+            .await?;
+        let value = evaluate_string(&reply)?;
+        let parsed: Value = serde_json::from_str(&value).map_err(|e| format!("{e}"))?;
+        if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(
+                parsed
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("媒体提取失败")
+                    .to_string(),
+            );
+        }
+        Ok(parsed
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("页面未发现可提取的图片/视频")
+            .to_string())
+    }
+
     /// 紧凑可交互元素清单（每项带 ref，供 browser_click / browser_type 定位）。
     pub async fn snapshot(&self) -> Result<String, String> {
         let _op = self.op.lock().await;
@@ -1416,38 +1487,111 @@ impl CdpBrowser {
     /// 按抬起随机节奏；UA 声称 Android 手机却发鼠标事件是行为检测的直接矛盾）；
     /// 桌面保持鼠标词汇——点按前先落两步鼠标移动（目标附近小偏移 → 目标中心），
     /// 按下与抬起之间随机静置——反爬会查“零轨迹瞬移 + 恒定间隔”的点按。
+    /// 触摸事件单发失败的三种形态：处置各不相同——
+    /// - [`TouchFailure::Degraded`]：进入前已降级，事件未派发 → 回退鼠标安全；
+    /// - [`TouchFailure::Rejected`]：CDP 显式拒收（快速应答），事件确定未送达
+    ///   → 回退鼠标安全；
+    /// - [`TouchFailure::TimedOut`]：3 秒无应答，事件可能已送达并在处理 →
+    ///   **不得**回退重放（会二次执行动作），只上报歧义让 agent 复核。
+    async fn touch_call(&self, session: &Session, params: Value) -> Result<(), TouchFailure> {
+        if self
+            .touch_broken
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(TouchFailure::Degraded);
+        }
+        if let Err(error) = session
+            .call("Input.dispatchTouchEvent", params, Duration::from_secs(3))
+            .await
+        {
+            self.touch_broken
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = session
+                .call(
+                    "Input.dispatchTouchEvent",
+                    json!({ "type": "touchCancel", "touchPoints": [] }),
+                    Duration::from_secs(2),
+                )
+                .await;
+            // Session::call 的超时错误固定带「超时」字样；其余为 CDP 显式错误。
+            if error.contains("超时") {
+                return Err(TouchFailure::TimedOut(error));
+            }
+            return Err(TouchFailure::Rejected(error));
+        }
+        Ok(())
+    }
+
     pub async fn click(&self, r: u32) -> Result<String, String> {
         let _op = self.op.lock().await;
         let session = self.session().await?;
         let (x, y) = self.element_center(&session, r).await?;
-        if self.mobile_input.load(std::sync::atomic::Ordering::Relaxed) {
-            session
-                .call(
-                    "Input.dispatchTouchEvent",
+        // 触摸点按失败的三种处置：降级/显式被拒（事件确定未送达）→ 鼠标
+        // 回退；超时（事件可能已送达并在处理）→ 不重复执行，上报歧义让
+        // agent 复核（重放会二次执行动作：误下单/误跳转）。
+        let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
+        let mut touched = false;
+        let mut touch_note = String::new();
+        let mut use_mouse = !mobile;
+        if mobile {
+            // 已送达标记：一旦有事件 ACK，页面状态就可能已改变——后续失败
+            // 一律按 Partial 处理（不得鼠标重放，会二次执行动作）。
+            let mut delivered = false;
+            let seq_result = async {
+                self.touch_call(
+                    &session,
                     json!({ "type": "touchStart", "touchPoints": [{ "x": x, "y": y }] }),
-                    Duration::from_secs(10),
                 )
-                .await?;
-            // 手指按下后的按压微动（1-2 帧小偏移），随后静置再抬起。
-            session
-                .call(
-                    "Input.dispatchTouchEvent",
+                .await
+                .map_err(|failure| {
+                    if delivered {
+                        TouchFailure::Partial(format!("{failure:?}"))
+                    } else {
+                        failure
+                    }
+                })?;
+                delivered = true;
+                // 手指按下后的按压微动（1-2 帧小偏移），随后静置再抬起。
+                self.touch_call(
+                    &session,
                     json!({
                         "type": "touchMove",
                         "touchPoints": [{ "x": x + jitter(-4, 4), "y": y + jitter(-4, 4) }]
                     }),
-                    Duration::from_secs(10),
                 )
-                .await?;
-            tokio::time::sleep(Duration::from_millis(jitter(50, 140) as u64)).await;
-            session
-                .call(
-                    "Input.dispatchTouchEvent",
-                    json!({ "type": "touchEnd", "touchPoints": [] }),
-                    Duration::from_secs(10),
-                )
-                .await?;
-        } else {
+                .await
+                .map_err(|failure| {
+                    if delivered {
+                        TouchFailure::Partial(format!("{failure:?}"))
+                    } else {
+                        failure
+                    }
+                })?;
+                tokio::time::sleep(Duration::from_millis(jitter(50, 140) as u64)).await;
+                self.touch_call(&session, json!({ "type": "touchEnd", "touchPoints": [] }))
+                    .await
+                    .map_err(|failure| {
+                        if delivered {
+                            TouchFailure::Partial(format!("{failure:?}"))
+                        } else {
+                            failure
+                        }
+                    })
+            };
+            match seq_result.await {
+                Ok(()) => touched = true,
+                Err(TouchFailure::TimedOut(error)) | Err(TouchFailure::Partial(error)) => {
+                    touch_note = format!(
+                        "（触摸事件已派发但未完整生效，可能已产生效果——未重复点击；请用 browser_snapshot 核实页面状态后再决定是否重试：{error}）"
+                    );
+                }
+                Err(failure) => {
+                    touch_note = "（触摸通路不可用，已改用鼠标事件）".to_string();
+                    use_mouse = true;
+                }
+            }
+        }
+        if use_mouse {
             for (mx, my) in [(x + jitter(-24, 24), y + jitter(-18, 18)), (x, y)] {
                 session
                     .call(
@@ -1476,7 +1620,7 @@ impl CdpBrowser {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let info = self.page_info(&session).await?;
         Ok(format!(
-            "已在 ({x},{y}) 点按 [ref {r}]。\n{}",
+            "已在 ({x},{y}) 点按 [ref {r}]。{touch_note}\n{}",
             format_report(&info)
         ))
     }
@@ -1490,16 +1634,24 @@ impl CdpBrowser {
         let _op = self.op.lock().await;
         let session = self.session().await?;
         let (x, y) = self.element_center(&session, r).await?;
+        // 触摸聚焦是行为拟真，不是功能必需——下方 JS `el.focus()` 才是真正的
+        // 聚焦通路。可卡死页面上它必超时，故 best-effort：失败照常输入。
+        let mut touch_note = String::new();
         if self.mobile_input.load(std::sync::atomic::Ordering::Relaxed) {
-            for kind in ["touchStart", "touchEnd"] {
-                let params = if kind == "touchStart" {
-                    json!({ "type": kind, "touchPoints": [{ "x": x, "y": y }] })
-                } else {
-                    json!({ "type": kind, "touchPoints": [] })
-                };
-                session
-                    .call("Input.dispatchTouchEvent", params, Duration::from_secs(10))
-                    .await?;
+            let start = self
+                .touch_call(
+                    &session,
+                    json!({ "type": "touchStart", "touchPoints": [{ "x": x, "y": y }] }),
+                )
+                .await;
+            let end = match start {
+                Ok(()) => self
+                    .touch_call(&session, json!({ "type": "touchEnd", "touchPoints": [] }))
+                    .await,
+                Err(error) => Err(error),
+            };
+            if end.is_err() {
+                touch_note = "（触摸聚焦不可用，已用 JS focus 继续输入）".to_string();
             }
         } else {
             for kind in ["mousePressed", "mouseReleased"] {
@@ -1577,7 +1729,7 @@ impl CdpBrowser {
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
         Ok(format!(
-            "已在 [ref {r}] 输入 {} 个字符。",
+            "已在 [ref {r}] 输入 {} 个字符。{touch_note}",
             text.chars().count()
         ))
     }
@@ -1594,8 +1746,39 @@ impl CdpBrowser {
         let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
         let (w, h) = if mobile { visual } else { inner };
         let (x, y) = (w / 2, h / 2);
-        if self.mobile_input.load(std::sync::atomic::Ordering::Relaxed) {
-            self.touch_drag(&session, x, y, notches).await?;
+        let mut touch_note = String::new();
+        let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
+        if mobile {
+            match self.touch_drag(&session, x, y, notches).await {
+                Ok(()) => {}
+                Err(TouchFailure::TimedOut(error)) | Err(TouchFailure::Partial(error)) => {
+                    // 拖拽可能已部分送达（touchStart 常先 ACK），补滚轮会过量
+                    // 滚动——上报歧义；降级标志已置位，下次调用直接走滚轮。
+                    touch_note = format!(
+                        "（触摸滚动未完整生效，滚动可能已部分发生——未追加滚轮；请用 browser_snapshot 核实位置：{error}）"
+                    );
+                }
+                Err(failure) => {
+                    // 降级/显式被拒：触摸事件确定未产生滚动，滚轮回退安全。
+                    touch_note = "（触摸不可用，已用鼠标滚轮）".to_string();
+                    for _ in 0..notches.unsigned_abs() {
+                        session
+                            .call(
+                                "Input.dispatchMouseEvent",
+                                json!({
+                                    "type": "mouseWheel",
+                                    "x": x + jitter(-8, 8),
+                                    "y": y + jitter(-8, 8),
+                                    "deltaX": 0,
+                                    "deltaY": 120 * notches.signum(),
+                                }),
+                                Duration::from_secs(10),
+                            )
+                            .await?;
+                        tokio::time::sleep(Duration::from_millis(jitter(60, 160) as u64)).await;
+                    }
+                }
+            }
         } else {
             for _ in 0..notches.unsigned_abs() {
                 session
@@ -1618,7 +1801,7 @@ impl CdpBrowser {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let info = self.page_info(&session).await?;
         Ok(format!(
-            "已{}滑动 {} 格。\n{}",
+            "已{}滑动 {} 格。{touch_note}\n{}",
             if notches > 0 { "向下" } else { "向上" },
             notches.unsigned_abs(),
             format_report(&info)
@@ -1635,44 +1818,60 @@ impl CdpBrowser {
         x: i64,
         y: i64,
         notches: i32,
-    ) -> Result<(), String> {
+    ) -> Result<(), TouchFailure> {
         let total = -120.0 * notches as f64; // 手指位移（页面向下滚 → 手指向上）
         let steps = (notches.unsigned_abs().clamp(4, 12) * 2) as i64;
         let start_y = y as f64 + jitter(-6, 6) as f64;
-        session
-            .call(
-                "Input.dispatchTouchEvent",
-                json!({
-                    "type": "touchStart",
-                    "touchPoints": [{ "x": x + jitter(-4, 4), "y": start_y as i64 }]
-                }),
-                Duration::from_secs(10),
-            )
-            .await?;
+        // 已送达事件标记：一旦有事件 ACK，页面状态就可能已改变——后续失败
+        // 一律按 Partial 处理（不得按原距离重放滚轮，会过量滚动）。
+        let mut delivered = false;
+        self.touch_call(
+            session,
+            json!({
+                "type": "touchStart",
+                "touchPoints": [{ "x": x + jitter(-4, 4), "y": start_y as i64 }]
+            }),
+        )
+        .await
+        .map_err(|failure| {
+            if delivered {
+                TouchFailure::Partial(format!("{failure:?}"))
+            } else {
+                failure
+            }
+        })?;
+        delivered = true;
         for step in 1..=steps {
             let t = step as f64 / steps as f64;
             // smoothstep 缓动：起步/收尾慢，中段快（真人拖拽的速度轮廓）。
             let eased = t * t * (3.0 - 2.0 * t);
             let py = start_y + total * eased + jitter(-2, 2) as f64;
-            session
-                .call(
-                    "Input.dispatchTouchEvent",
-                    json!({
-                        "type": "touchMove",
-                        "touchPoints": [{ "x": x + jitter(-3, 3), "y": py as i64 }]
-                    }),
-                    Duration::from_secs(10),
-                )
-                .await?;
+            self.touch_call(
+                session,
+                json!({
+                    "type": "touchMove",
+                    "touchPoints": [{ "x": x + jitter(-3, 3), "y": py as i64 }]
+                }),
+            )
+            .await
+            .map_err(|failure| {
+                if delivered {
+                    TouchFailure::Partial(format!("{failure:?}"))
+                } else {
+                    failure
+                }
+            })?;
             tokio::time::sleep(Duration::from_millis(jitter(16, 48) as u64)).await;
         }
-        session
-            .call(
-                "Input.dispatchTouchEvent",
-                json!({ "type": "touchEnd", "touchPoints": [] }),
-                Duration::from_secs(10),
-            )
-            .await?;
+        self.touch_call(session, json!({ "type": "touchEnd", "touchPoints": [] }))
+            .await
+            .map_err(|failure| {
+                if delivered {
+                    TouchFailure::Partial(format!("{failure:?}"))
+                } else {
+                    failure
+                }
+            })?;
         Ok(())
     }
 
@@ -2242,6 +2441,15 @@ const PAGE_INFO_JS: &str = "(function(){var href=location.href||'';var text=(doc
 /// `[ref] 角色: 文本 → 链接` 扁平列表（模型按 ref 定位操作）。
 const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):clean(el.innerText||'');var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+text.slice(0,120);if(href)line+=' → '+String(href).slice(0,150);out.push(line);}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素'});})()";
 
+/// 媒体资源提取（browser_media）：img + video（含 source 子元素）+ og 元信息，
+/// 按 DOM 顺序统一遍历后再限量 40 条（分开遍历会让图片先耗尽配额、视频整页
+/// 丢失）。小图过滤只认「已加载内容的真实渲染尺寸」（currentSrc 为 HTTP 且
+/// naturalWidth<100）——懒加载占位图的 1×1 尺寸不描述真图，不能参与否决；
+/// 相对/协议相对 URL 按 document.baseURI 解析；src 为 data: 占位时回退
+/// data-src 取真链——给「图文/视频推送到聊天」提供 URL 素材（snapshot 只列
+/// 可交互元素，媒体 URL 只有这里拿得到）。
+const MEDIA_JS: &str = "(function(){var LIMIT=40,out=[],seen={};function abs(u){try{return new URL(u,document.baseURI).href;}catch(e){return '';}}function usable(u){u=(u||'').trim();if(!u||/^(data|blob):/i.test(u))return '';var a=abs(u);return /^https?:/.test(a)?a:'';}function push(kind,url,alt){url=usable(url);if(!url)return;var k=kind+' '+url;if(seen[k])return;seen[k]=1;if(out.length>=LIMIT)return;out.push((out.length+1)+'. ['+kind+'] '+url+(alt?(' | '+(alt||'').replace(/\\s+/g,' ').slice(0,60)):''));}var nodes=document.querySelectorAll('img,video,meta[property=\"og:image\"],meta[property=\"og:video\"],meta[property=\"og:video:url\"]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var tag=el.tagName;if(tag==='IMG'){var prim=usable(el.currentSrc)||usable(el.getAttribute('src'));var lazy=usable(el.getAttribute('data-src'));var cur=usable(el.currentSrc);var u=lazy||prim;var w=el.naturalWidth||0;if(cur&&w&&w<100&&cur===u)continue;push('图',u,el.alt||el.title||'');}else if(tag==='VIDEO'){var vc=[el.currentSrc,el.getAttribute('src')];var vu='';for(var c2=0;c2<vc.length&&!vu;c2++)vu=usable(vc[c2]);if(!vu){var ss=el.querySelectorAll('source');for(var s2=0;s2<ss.length&&!vu;s2++)vu=usable(ss[s2].getAttribute('src'));}push('视频',vu,'时长约'+Math.round(el.duration||0)+'秒');}else{var mc=el.getAttribute('content')||'';var mp=el.getAttribute('property')||'';push(/video/i.test(mp)?'视频':'og图',mc,'');}}return JSON.stringify({ok:true,text:out.length?out.join('\\n'):'页面未发现可提取的图片/视频'});})()";
+
 /// 页面提取（browser_navigate）：引擎感知的搜索结果列表
 /// （bing/baidu/google，过滤广告）+ Readability 式主文正文 + 风控/同意页
 /// 检测。google 分支的摘要选择器加 gbox 兜底。
@@ -2358,6 +2566,9 @@ pub fn register(tools: &mut crate::ToolRegistry, transport: Arc<dyn DevtoolsTran
     tools.register(Box::new(BrowserScreenshotTool {
         browser: browser.clone(),
     }));
+    tools.register(Box::new(BrowserMediaTool {
+        browser: browser.clone(),
+    }));
     tools.register(Box::new(BrowserCloseTool { browser }));
 }
 
@@ -2424,8 +2635,45 @@ macro_rules! browser_tool_impl {
     };
 }
 
+/// 触摸单发失败的分类（见 [`CdpBrowser::touch_call`] 文档）。
+#[derive(Debug)]
+enum TouchFailure {
+    /// 进入前已降级：事件未派发，回退鼠标安全。
+    Degraded,
+    /// CDP 显式拒收（快速应答）：事件确定未送达且此前无已送达事件，回退
+    /// 鼠标安全。
+    Rejected(String),
+    /// 应答超时：事件可能已送达，不得重放，只上报歧义。
+    TimedOut(String),
+    /// 手势部分生效（前序事件已送达、后续被拒）：页面状态已改变，不得按
+    /// 原距离/原动作重放，只上报歧义。
+    Partial(String),
+}
+
 pub struct BrowserNavigateTool {
     browser: Arc<CdpBrowser>,
+}
+
+pub struct BrowserMediaTool {
+    browser: Arc<CdpBrowser>,
+}
+
+browser_tool_impl!(
+    BrowserMediaTool,
+    "browser_media",
+    "CDP 浏览器：提取当前页面的图片/视频资源 URL（含 og 元信息；过滤小图标，按 DOM 顺序最多 40 条）。把图文/视频链接转给用户、给媒体下载/分享流程提供 URL 素材时用。只读当前页面，不导航；需要元素交互用 browser_snapshot。",
+    async fn execute(&self, _input: Value) -> ToolResult {
+        match self.browser.extract_media().await {
+            Ok(text) => ToolResult::ok(text),
+            Err(error) => ToolResult::err(error),
+        }
+    }
+);
+
+impl BrowserMediaTool {
+    fn input_schema_impl() -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
 }
 
 browser_tool_impl!(

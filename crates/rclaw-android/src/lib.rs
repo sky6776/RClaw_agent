@@ -156,6 +156,10 @@ pub fn install_update(apk_abs: &str) -> Result<()> {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct BrowserSessionInfo {
     pub pid: u32,
+    /// WebView 创建代际（Java 侧 createEpoch）：复用不变、重建递增。
+    /// 触摸降级标志据此判定「WebView 是否真的换了」（pid 是应用进程号，
+    /// 销毁重建也不变，不能当实例身份）。
+    pub epoch: u32,
     pub width: i64,
     pub height: i64,
     pub dpr: f64,
@@ -1620,6 +1624,7 @@ pub mod jni_bridge {
                 .get("pid")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow!("会话应答缺少 pid"))? as u32,
+            epoch: reply.get("epoch").and_then(Value::as_u64).unwrap_or(0) as u32,
             width: reply.get("width").and_then(Value::as_i64).unwrap_or(0),
             height: reply.get("height").and_then(Value::as_i64).unwrap_or(0),
             dpr: reply.get("dpr").and_then(Value::as_f64).unwrap_or(1.0),

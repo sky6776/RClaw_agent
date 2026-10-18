@@ -25,8 +25,53 @@ pub fn register(tools: &mut rclaw_tools::ToolRegistry) {
         Arc::new(AndroidTransport {
             screenshot_dir,
             metrics: std::sync::Mutex::new(None),
+            last_epoch: std::sync::atomic::AtomicU64::new(0),
         }),
     );
+    // 媒体打开：APK 沙箱文件经 FileProvider 只读 URI 交给系统查看器/播放器
+    //（聊天面板是纯文本出站，图片/视频「直接看到/播放」走这条通路）。
+    tools.register(Box::new(OpenMediaTool));
+}
+
+/// 打开工作区媒体文件（系统查看器/播放器）。
+struct OpenMediaTool;
+
+#[async_trait::async_trait]
+impl rclaw_tools::Tool for OpenMediaTool {
+    fn name(&self) -> &str {
+        "open_media"
+    }
+    fn description(&self) -> &str {
+        "打开工作区内的媒体文件（图片/视频/音频——经 FileProvider 只读 URI 交给系统查看器或播放器，即「用其他应用打开」）。参数 path 为工作区相对路径（如 browser/xxx.png）。把搜索到的图文/视频展示给用户时用；桌面宿主无此工具。"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "工作区相对路径（如 browser/screenshot_1.png、media/note.mp4）" }
+            },
+            "required": ["path"]
+        })
+    }
+    async fn execute(&self, input: serde_json::Value) -> rclaw_tools::ToolResult {
+        let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
+            return rclaw_tools::ToolResult::err("缺少参数 path");
+        };
+        if path.starts_with('/')
+            || path.starts_with('\\')
+            || path.split(['/', '\\']).any(|seg| seg == "..")
+        {
+            return rclaw_tools::ToolResult::err(
+                "path 必须是工作区相对路径（禁止绝对路径与 .. 越界）",
+            );
+        }
+        let owned = path.to_string();
+        match tokio::task::spawn_blocking(move || crate::open_media(&owned)).await {
+            Ok(Ok(())) => rclaw_tools::ToolResult::ok(format!("已交给系统打开：{path}")),
+            Ok(Err(error)) => rclaw_tools::ToolResult::err(format!("{error:#}")),
+            Err(error) => rclaw_tools::ToolResult::err(format!("JNI 调度失败: {error}")),
+        }
+    }
 }
 
 pub struct AndroidTransport {
@@ -34,6 +79,11 @@ pub struct AndroidTransport {
     /// 会话启动时 Java 带回的设备视口（CSS 尺寸 + dpr），供内核钉住渲染视口
     /// （connect 时写入；同一连接的 humanize/视口覆写随即读取）。
     metrics: std::sync::Mutex<Option<(i64, i64, f64)>>,
+    /// 上次会话的 WebView 创建代际（Java 侧 createEpoch，经 BrowserSessionInfo
+    /// 带回）：BrowserSession.start 复用已有 WebView 时代际不变——触摸降级
+    /// 标志跨重连保持；WebView 真正重建时代际递增（内核据此重置标志）。
+    /// 注意不能用 pid 当代际：myPid 是应用进程号，WebView 重建也不变。
+    last_epoch: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait::async_trait]
@@ -50,14 +100,15 @@ impl DevtoolsTransport for AndroidTransport {
         if let Ok(mut slot) = self.metrics.lock() {
             *slot = Some((css_w, css_h, info.dpr));
         }
+        self.last_epoch
+            .store(info.epoch as u64, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             pid = info.pid,
             width = info.width,
             height = info.height,
             dpr = info.dpr,
             "WebView 会话就绪（离屏布局物理像素；CSS 视口 = 物理/dpr）"
-        );
-        let socket_name = format!("webview_devtools_remote_{}", info.pid);
+        );        let socket_name = format!("webview_devtools_remote_{}", info.pid);
         // WebView 创建后调试 socket 就绪有延迟：整体带重试。
         let mut last = String::new();
         for _ in 0..12 {
@@ -124,6 +175,11 @@ impl DevtoolsTransport for AndroidTransport {
             Ok(slot) => *slot,
             Err(_) => None,
         }
+    }
+
+    fn instance_generation(&self) -> u64 {
+        self.last_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
