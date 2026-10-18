@@ -582,6 +582,9 @@ export const api = {
   /** 用系统方式打开外部链接（Android 浏览器 / 桌面默认浏览器）。 */
   openUrl: (url: string) => invoke<void>("open_url", { url }),
 
+  /** 聊天链接默认入口：Android 应用内浏览器面板导航，桌面系统浏览器。 */
+  browserOpenUrl: (url: string) => invoke<void>("browser_open_url", { url }),
+
   themeGet: () => invoke<string>("theme_get"),
 
   themeSet: (theme: string) => invoke<void>("theme_set", { theme }),

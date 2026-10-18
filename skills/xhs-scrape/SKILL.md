@@ -89,7 +89,8 @@ https://www.xiaohongshu.com/search_result?keyword=<关键词>&type=51
    - 视频封面/截图可作附带预览（`browser_screenshot` + `open_media`）。
 3. **图片直链与下载**：`browser_media` 的 `[图]` 条目是原图 URL；用户要"保存下来"时用 `download_media` 落进 `media/download/` 后引用路径。
 4. **批量交付**：多篇结果优先给「标题 + 一句话摘要 + 点赞数」清单（速览不含链接——快照链接截断丢 token，见第 3 步）；用户点名哪篇再逐篇详解拿可用链接与媒体——不要一上来全量截图刷屏。
-5. QQ 通道且用户要求发文件时：`skill__glm_master_skill__publish_media`（path 限 workspace 相对路径，media_type 按文件类型）；标记独占一行，不手写 marker。
+5. **文档**：用户要把内容落成文件（如攻略合集 `.md`）时，产出写进工作区（如 `output/xhs_<关键词>.md`），回复里用**反引号包裹的工作区相对路径**引用——聊天面板据此出「点开」卡片：点击用系统应用打开，长按可保存到本地 / 转发到微信等其它应用。不要只写裸文件名或不可点的纯文本路径。
+6. QQ 通道且用户要求发文件时：`skill__glm_master_skill__publish_media`（path 限 workspace 相对路径，media_type 按文件类型）；标记独占一行，不手写 marker。
 
 ## 纪律与限制
 

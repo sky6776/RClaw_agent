@@ -216,6 +216,20 @@ pub fn browser_overlay_expand() -> Result<()> {
     }
 }
 
+/// CDP 浏览器悬浮窗：展开面板并导航到指定 http(s) URL（聊天链接默认应用内
+/// 打开；仅 Android 宿主可用，桌面走系统浏览器）。
+pub fn browser_overlay_open_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::browser_overlay_open_url(url)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = url;
+        Err(anyhow!("CDP 浏览器仅在 Android 宿主可用"))
+    }
+}
+
 /// CDP 浏览器悬浮窗：收起为气泡（WebView 摘回离屏，agent 不受影响）。
 pub fn browser_overlay_collapse() -> Result<()> {
     #[cfg(target_os = "android")]
@@ -1653,6 +1667,46 @@ pub mod jni_bridge {
         if reply.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(anyhow!(
                 "悬浮窗展开失败: {}",
+                reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知原因")
+            ));
+        }
+        Ok(())
+    }
+
+    /// CDP 浏览器悬浮窗：展开面板并导航到指定 http(s) URL（聊天链接默认
+    /// 应用内打开；复用地址栏同一导航通路）。
+    pub(super) fn browser_overlay_open_url(url: &str) -> Result<()> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加悬浮窗线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let jurl = env
+            .new_string(url)
+            .map_err(|e| anyhow!("创建 jstring 失败: {e}"))?;
+        let result = env
+            .call_static_method(
+                class,
+                "browserOverlayOpenUrl",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[(&jurl).into()],
+            )
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.browserOverlayOpenUrl 失败: {error}")
+            })?
+            .l()?;
+        let value = JString::from(result);
+        let payload = env.get_string(&value)?.to_string_lossy().into_owned();
+        let reply: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|e| anyhow!("解析悬浮窗应答失败: {e}（原文: {payload}）"))?;
+        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(anyhow!(
+                "悬浮窗打开链接失败: {}",
                 reply
                     .get("error")
                     .and_then(Value::as_str)

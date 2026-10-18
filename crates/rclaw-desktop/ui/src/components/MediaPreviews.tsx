@@ -87,6 +87,23 @@ export function parseMediaItems(content: string): PreviewItem[] {
     const p = m[0].replace(/[.,\s]+$/, "");
     push(p, p.split("/").pop() ?? p);
   }
+  // 4) 文档引用：反引号包裹、带目录段的工作区相对路径（技能/agent 交付文档的
+  //    固定书写式，如 `xianyu_output/<run>/items.csv`）——出「点开」卡，动作
+  //    与媒体卡一致（系统打开 / 保存 / 转发）。正则放宽、循环里收紧：不含
+  //    协议头；根目录段（首个 / 之前）必须是单一无点 token（`cat output/x.md`
+  //    的首段是 "cat output"、"https://…" 的首段带冒号，都拒）；中间段允许
+  //    空白——任务名可含空格（如 `xianyu_output/iPhone 15_…/items.csv`）。
+  const reDoc =
+    /`([^`\n]+\/[^`\n]+?\.(?:csv|tsv|md|markdown|txt|log|json|html?|pdf|zip|xlsx?|docx?|pptx?))`/gi;
+  while ((m = reDoc.exec(content)) !== null) {
+    const raw = m[1];
+    if (raw.includes("://")) continue;
+    const rootSeg = raw.replace(/\\/g, "/").split("/")[0];
+    if (!rootSeg || /\s/.test(rootSeg) || rootSeg.includes(".") || rootSeg.includes(":")) {
+      continue;
+    }
+    push(raw.replace(/\\/g, "/"), raw.split("/").pop() ?? raw, "open");
+  }
   // 3) 裸文件名兜底：按惯例在 media/ 下找（agent 常只写文件名；找不到静默）。
   const reBare = /\b[A-Za-z0-9_\-]+\.(?:mp4|webm|m4v|mov|png|jpe?g|webp|gif)\b/gi;
   while ((m = reBare.exec(content)) !== null) {

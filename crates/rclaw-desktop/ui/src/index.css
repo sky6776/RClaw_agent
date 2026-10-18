@@ -149,6 +149,14 @@ html.android-app textarea {
   -webkit-user-select: text;
   user-select: text;
 }
+/* 文字选择模式（Chat 长按菜单「选择文字」进入）：仅该条消息正文恢复原生
+   选择。该条消息的气泡长按 handlers 已按 textSelectId 摘除，原生选择手势
+   与应用菜单不再互抢；长按出手势手柄，按范围复制后点「完成选择」退出。 */
+html.android-app .text-selectable,
+html.android-app .text-selectable * {
+  -webkit-user-select: text;
+  user-select: text;
+}
 
 /* Markdown 正文（assistant 消息） */
 .md-body {

@@ -347,6 +347,29 @@ pub async fn open_url(url: String) -> Result<(), String> {
     }
 }
 
+/// 聊天面板链接的默认打开方式：Android 展开应用内浏览器面板并导航（不再
+/// 跳系统浏览器，会话上下文不丢）；桌面维持系统浏览器。仅接受 http(s)。
+#[tauri::command]
+pub async fn browser_open_url(url: String) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("仅支持 http(s) 链接".into());
+    }
+    #[cfg(all(target_os = "android", feature = "apk-host"))]
+    {
+        rclaw_android::browser_overlay_open_url(&url)
+            .map_err(|e| format!("应用内打开链接失败: {e}"))
+    }
+    #[cfg(not(all(target_os = "android", feature = "apk-host")))]
+    {
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", &url])
+            .spawn()
+            .map_err(|e| format!("打开链接失败: {e}"))?;
+        Ok(())
+    }
+}
+
 /// `get_status` 返回值。
 #[derive(Debug, Serialize)]
 pub struct StatusDto {

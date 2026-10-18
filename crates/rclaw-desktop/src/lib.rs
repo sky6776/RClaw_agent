@@ -96,6 +96,7 @@ pub fn run() {
             commands::update_check,
             commands::update_download_install,
             commands::open_url,
+            commands::browser_open_url,
             commands::media_base64,
             commands::media_preview,
             commands::media_stream_url,

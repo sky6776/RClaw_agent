@@ -563,6 +563,17 @@ export default function Chat({
   } | null>(null);
   // 媒体操作反馈气泡（保存成功 / 已复制；错误走 App toast）。
   const [notice, setNotice] = useState<string | null>(null);
+  // 文字选择模式（安卓）：长按菜单「选择文字」进入——该条消息正文恢复原生
+  // 选择（user-select:text），长按出手势选择手柄按范围复制；点「完成」退出。
+  // 默认关着的原因见 index.css 的 android-app user-select 注释（原生选择
+  // 手势会掐掉长按菜单的计时器，两者不能同时生效）。
+  const [textSelectId, setTextSelectId] = useState<number | null>(null);
+  // 切会话 / 新会话时退出文字选择模式（选区挂在旧会话的正文上，留着只会
+  // 显示一个没有可选正文的「完成选择」钮）。
+  useEffect(() => {
+    setTextSelectId(null);
+    window.getSelection?.()?.removeAllRanges();
+  }, [sessionKey]);
   const noticeTimer = useRef<number | undefined>(undefined);
   const [exporting, setExporting] = useState(false);
   const [exportResult, setExportResult] = useState<string | null>(null);
@@ -1202,6 +1213,10 @@ export default function Chat({
 
   // 系统返回键关一层菜单 / 选择模式（与弹层栈共用管道）。
   useBackClose(msgMenu !== null, () => setMsgMenu(null));
+  useBackClose(textSelectId !== null, () => {
+    setTextSelectId(null);
+    window.getSelection?.()?.removeAllRanges();
+  });
   useBackClose(selectIds !== null, () => setSelectIds(null));
   useBackClose(gallery !== null, () => setGallery(null));
   useBackClose(attachMenuOpen, () => setAttachMenuOpen(false));
@@ -1445,7 +1460,9 @@ export default function Chat({
               role="group"
               aria-label="用户消息"
               className="flex justify-end"
-              {...(selectIds ? undefined : bubblePressHandlers(e))}
+              {...(selectIds || textSelectId === e.id
+                ? undefined
+                : bubblePressHandlers(e))}
             >
               {selectIds && (
                 <button
@@ -1476,7 +1493,7 @@ export default function Chat({
                 <div
                   className={`whitespace-pre-wrap rounded-lg bg-[#1a1f29] px-4 py-2 text-sm text-gray-200 [overflow-wrap:anywhere] max-md:px-3.5 max-md:text-[15px] max-md:leading-relaxed ${
                     selectIds && selected ? "ring-2 ring-indigo-300" : ""
-                  }`}
+                  } ${textSelectId === e.id ? "text-selectable" : ""}`}
                 >
                   {e.content}
                 </div>
@@ -1512,7 +1529,9 @@ export default function Chat({
             role="group"
             aria-label="助手消息"
             className="flex justify-start"
-            {...(selectIds ? undefined : bubblePressHandlers(e))}
+            {...(selectIds || textSelectId === e.id
+              ? undefined
+              : bubblePressHandlers(e))}
           >
             {selectIds && (
               <button
@@ -1536,10 +1555,11 @@ export default function Chat({
               <div
                 className={`md-body w-full text-sm text-gray-200 max-md:text-[15px] max-md:leading-relaxed ${
                   selectIds && selected ? "rounded-md ring-2 ring-indigo-400" : ""
-                }`}
+                } ${textSelectId === e.id ? "text-selectable" : ""}`}
               >
-                {/* 外部链接不在 WebView 内导航（会顶掉 GUI）：http(s) 一律交系统
-                    浏览器打开（open_url：桌面 cmd start / Android ACTION_VIEW）。 */}
+                {/* 外部链接不在 WebView 内导航（会顶掉 GUI）：http(s) 默认交
+                    应用内浏览器（browser_open_url：安卓展开面板导航，桌面走
+                    系统浏览器）。 */}
                 <ReactMarkdown
                   remarkPlugins={[remarkGfm]}
                   components={{
@@ -1557,7 +1577,7 @@ export default function Chat({
                             return;
                           }
                           e.preventDefault();
-                          void api.openUrl(href).catch(() => undefined);
+                          void api.browserOpenUrl(href).catch(() => undefined);
                         }}
                       >
                         {children}
@@ -1605,7 +1625,7 @@ export default function Chat({
     // 变化（依赖 activeId），必须列入——否则分叉闭包捕获旧会话 id，切会话后
     // 点「分叉」会 fork 到上一个会话。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork],
+    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId],
   );
 
   return (
@@ -2256,6 +2276,22 @@ export default function Chat({
             >
               复制
             </button>
+            {/* 选择文字（安卓限定；桌面本来就可用原生拖选；仅用户/助手正文——
+                思考/工具/状态行没有接 text-selectable 渲染）。进入该条消息的
+                原生选择模式，长按出手势手柄按范围复制。 */}
+            {isAndroidDevice() &&
+              (msgMenu.entry.role === "user" ||
+                msgMenu.entry.role === "assistant") && (
+                <button
+                  className={MENU_ITEM}
+                  onClick={closeMenuAnd((m) => {
+                    setTextSelectId(m.entry.id);
+                    flashNotice("长按文字拖动手柄选择范围");
+                  })}
+                >
+                  选择文字
+                </button>
+              )}
             {/* 多选（全部条目类型可进选择模式：用户/助手/思考/工具行）。 */}
             <button
               className={MENU_ITEM}
@@ -2285,6 +2321,19 @@ export default function Chat({
         <div className="fixed bottom-24 left-1/2 z-50 -translate-x-1/2 rounded-full border border-[#2a2f3a] bg-[#141821] px-4 py-1.5 text-xs text-gray-300 shadow-xl">
           {notice}
         </div>
+      )}
+
+      {/* 文字选择模式的退出钮：系统选择手柄在消息正文上，完成即恢复长按菜单。 */}
+      {textSelectId !== null && (
+        <button
+          className="fixed bottom-24 right-1/2 z-50 translate-x-1/2 rounded-full border border-[#2a2f3a] bg-[#141821] px-5 py-1.5 text-xs text-gray-300 shadow-xl"
+          onClick={() => {
+            setTextSelectId(null);
+            window.getSelection?.()?.removeAllRanges();
+          }}
+        >
+          完成选择
+        </button>
       )}
 
       {/* 全屏媒体画廊：图片查看器 / 视频播放器 + 左右滑切换上一个/下一个。 */}

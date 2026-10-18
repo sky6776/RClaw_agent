@@ -72,7 +72,7 @@ public final class NativeBridge {
             }
             android.net.Uri uri = androidx.core.content.FileProvider.getUriForFile(
                     context, context.getPackageName() + ".fileprovider", file);
-            String mime = context.getContentResolver().getType(uri);
+            String mime = sharedMime(context, file, uri);
             android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
             intent.setDataAndType(uri, mime != null ? mime : "application/octet-stream");
             intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -83,6 +83,34 @@ public final class NativeBridge {
             // getCanonicalPath 抛受检 IOException；统一按失败处理
             android.util.Log.e("NativeBridge", "openMedia failed", error);
             return false;
+        }
+    }
+
+    /** 分享/打开共用 MIME：FileProvider 按 MimeTypeMap 反查，对 md/csv 等
+     *  文本类扩展常回 null/octet-stream——系统查看器拒收、微信收成乱码文件。
+     *  按扩展名显式补表，未命中的回落 ContentResolver 结果。 */
+    private static String sharedMime(android.content.Context context,
+            java.io.File file, android.net.Uri uri) {
+        String name = file.getName().toLowerCase(java.util.Locale.ROOT);
+        String ext = name.contains(".") ? name.substring(name.lastIndexOf('.') + 1) : "";
+        switch (ext) {
+            case "csv":
+                return "text/csv";
+            case "tsv":
+                return "text/tab-separated-values";
+            case "md": case "markdown": case "txt": case "log":
+                return "text/plain";
+            case "json":
+                return "application/json";
+            case "html": case "htm":
+                return "text/html";
+            case "pdf":
+                return "application/pdf";
+            case "zip":
+                return "application/zip";
+            default:
+                String resolved = context.getContentResolver().getType(uri);
+                return resolved != null ? resolved : "application/octet-stream";
         }
     }
 
@@ -174,6 +202,38 @@ public final class NativeBridge {
         });
     }
 
+    /** 会话内点开外链：展开浏览器面板、挂载 WebView 并导航到指定 URL
+     *  （聊天面板链接默认应用内打开的 JNI 入口）。仅接受 http(s)。协议头
+     *  大小写不敏感（markdown 允许 HTTPS:// 写法，前端/Rust 校验都不挑大
+     *  小写，这里只把协议段小写化——路径段大小写有语义，不动）。 */
+    static String browserOverlayOpenUrl(String url) {
+        if (url == null) {
+            return "{\"ok\":false,\"error\":\"仅支持 http(s) 链接\"}";
+        }
+        String lower = url.toLowerCase(java.util.Locale.ROOT);
+        if (!(lower.startsWith("http://") || lower.startsWith("https://"))) {
+            return "{\"ok\":false,\"error\":\"仅支持 http(s) 链接\"}";
+        }
+        int schemeEnd = lower.indexOf("://") + 3;
+        String normalized = lower.substring(0, schemeEnd) + url.substring(schemeEnd);
+        synchronized (OVERLAY_SERIAL) {
+            try {
+                String started = ensureSessionStarted();
+                if (!started.contains("\"ok\":true")) {
+                    return started;
+                }
+                if (!BrowserOverlay.ensureExpanded(appContext)) {
+                    return "{\"ok\":false,\"error\":\"应用窗口未就绪，稍后重试\"}";
+                }
+                String attached = BrowserSession.attach(BrowserOverlay.webviewHost());
+                BrowserSession.loadFromAddressBar(normalized);
+                return attached;
+            } catch (Throwable t) {
+                return bridgeError("browserOverlayOpenUrl", t);
+            }
+        }
+    }
+
     /** 收起面板：WebView 摘回离屏（agent 不受影响），聊天 UI 重新可见。 */
     static String browserOverlayCollapse() {
         synchronized (OVERLAY_SERIAL) {
@@ -259,7 +319,7 @@ public final class NativeBridge {
             }
             android.net.Uri uri = androidx.core.content.FileProvider.getUriForFile(
                     context, context.getPackageName() + ".fileprovider", file);
-            String mime = context.getContentResolver().getType(uri);
+            String mime = sharedMime(context, file, uri);
             android.content.Intent send = new android.content.Intent(android.content.Intent.ACTION_SEND);
             send.setType(mime != null ? mime : "application/octet-stream");
             send.putExtra(android.content.Intent.EXTRA_STREAM, uri);

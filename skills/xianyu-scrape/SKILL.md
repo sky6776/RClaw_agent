@@ -84,6 +84,7 @@ https://www.goofish.com/search?q=<关键词>
 - **图片 URL**：详情页调 `browser_media` 取商品图清单，可作为图片直链附在回复里（点击可看原图）。
 - **视频**：闲鱼商品若带视频，`browser_media` 的 `[视频]` 条目即直链；用户要本地文件时用 `download_media` 落进 `media/download/` 后引用路径（聊天卡片可播，可保存/分享）。
 - **下载**：`download_media`（≤200 MB、仅公网地址）把任意媒体直链落进 `media/download/`，下载后引用 `media/…` 路径出聊天卡片。
+- **文档**：回复里引用 `xianyu_output/<run>/items.csv`、`report.md` 等产出文件一律用**反引号包裹的工作区相对路径**（如 `` `xianyu_output/iPhone15_20261018_180153/items.csv` ``）——聊天面板据此出「点开」卡片：点击用系统应用打开，长按可保存到本地 / 转发到微信等其它应用。不要只写裸文件名或不可点的纯文本路径。
 - QQ 通道且用户要求发文件时：用 `skill__glm_master_skill__publish_media`（path 限 workspace 相对路径，media_type 按文件类型）；标记必须独占一行，不手写 marker。
 
 ## 纪律与限制

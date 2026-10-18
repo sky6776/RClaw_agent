@@ -102,6 +102,7 @@ https://s.taobao.com/search?q=<关键词>&tab=mall            仅天猫
 - **图片直链**：详情页调 `browser_media` 取商品图清单（`[图]` 条目 = 原图 URL），可附在回复里。
 - **图片/视频下载**：`download_media` 把 `browser_media` 拿到的直链落进 `media/download/`（≤200 MB、仅公网地址）——下载后引用 `media/…` 路径出聊天卡片，用户可直接保存或分享。
 - **视频**：商品详情若带视频，`browser_media` 的 `[视频]` 条目即直链，附在回复里供点击播放；用户要本地文件时按上一条下载。
+- **文档**：回复里引用 `taobao_output/<run>/items.csv`、`report.md` 等产出文件一律用**反引号包裹的工作区相对路径**（如 `` `taobao_output/…/items.csv` ``）——聊天面板据此出「点开」卡片：点击用系统应用打开，长按可保存到本地 / 转发到微信等其它应用。不要只写裸文件名或不可点的纯文本路径。
 - QQ 通道且用户要求发文件时：用 `skill__glm_master_skill__publish_media`（path 限 workspace 相对路径）；标记独占一行，不手写 marker。
 
 ## 纪律与限制
