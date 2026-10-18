@@ -1637,7 +1637,13 @@ impl CdpBrowser {
         // 下拉框（select）分支：对 select 的「输入」语义是选中含指定文本的
         // 选项（登录页国家区号等）。触摸 tap 会弹原生选择器阻塞流程，
         // clear+逐字符键盘对 select 也无意义——都不做，直接 JS 选中并派发
-        // change（真机实测闲鱼登录页 +82 韩国 → +86 中国大陆 生效）。
+        // input/change。【必须用原生 value setter 赋值】：selectedIndex 直接
+        // 赋值绕过 React/Angular 的值跟踪——事件被去重、页面状态与原生控件
+        // 绘制的标签都不刷新（真机淘宝登录页实测：select 停在 +86、页面状态
+        // +1，selectedIndex 法后可见区号仍是 +1；原生 setter + change 才真正
+        // 同步）。setter 按 value 落首个匹配项，重复 value 的选项随后按索引
+        // 校正。changed=false（本就停在目标项）时页面可见状态不可信，须
+        // 截图目检——Rust 侧返回文案会提醒。
         let select_check = session
             .call(
                 "Runtime.evaluate",
@@ -1653,7 +1659,7 @@ impl CdpBrowser {
         if let Ok(reply) = &select_check {
             if evaluate_string(reply)? == "SELECT" {
                 let select_js = format!(
-                    "(function(ref,text){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');if(!el)return JSON.stringify({{ok:false,error:'引用不存在（页面可能已跳转，请重新 browser_snapshot）'}});var t=text.toLowerCase();var best=-1;for(var i=0;i<el.options.length;i++){{var hay=((el.options[i].text||'')+' '+(el.options[i].value||'')).toLowerCase();if(hay.indexOf(t)>=0){{best=i;break;}}}}if(best<0)return JSON.stringify({{ok:false,error:'下拉框没有含「'+text+'」的选项（共 '+el.options.length+' 项）'}});var label=(el.options[best].text||'').slice(0,40);var changed=el.selectedIndex!==best;el.selectedIndex=best;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return JSON.stringify({{ok:true,selected:label,changed:changed}});}})({r},{})",
+                    "(function(ref,text){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');if(!el)return JSON.stringify({{ok:false,error:'引用不存在（页面可能已跳转，请重新 browser_snapshot）'}});var t=text.toLowerCase();var best=-1;for(var i=0;i<el.options.length;i++){{var hay=((el.options[i].text||'')+' '+(el.options[i].value||'')).toLowerCase();if(hay.indexOf(t)>=0){{best=i;break;}}}}if(best<0)return JSON.stringify({{ok:false,error:'下拉框没有含「'+text+'」的选项（共 '+el.options.length+' 项）'}});var label=(el.options[best].text||'').slice(0,40);var changed=el.selectedIndex!==best;var desc=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value');if(desc&&desc.set){{desc.set.call(el,el.options[best].value);}}if(el.selectedIndex!==best){{el.selectedIndex=best;}}el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return JSON.stringify({{ok:true,selected:label,changed:changed}});}})({r},{})",
                     json!(text)
                 );
                 let reply = session
@@ -1672,7 +1678,18 @@ impl CdpBrowser {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    return Ok(format!("已在 [ref {r}] 下拉框选中「{selected}」。"));
+                    let changed = parsed.get("changed").and_then(Value::as_bool).unwrap_or(true);
+                    if changed {
+                        return Ok(format!("已在 [ref {r}] 下拉框选中「{selected}」。"));
+                    }
+                    // changed=false：select 此前就停在目标项，本次没有任何值变化。
+                    // 页面若有自绘标签/原生控件绘制的可见值，它可能是陈旧状态
+                    // （真机淘宝登录页实测：select 停 +86、页面仍显 +1）。
+                    return Ok(format!(
+                        "已在 [ref {r}] 下拉框选中「{selected}」（下拉框此前就停在该项，值未变化）。\
+                         注意：页面可见的选项标签可能仍是陈旧状态，向用户报告前请先用 \
+                         browser_screenshot 目检可见文本核实。"
+                    ));
                 }
                 return Err(
                     parsed

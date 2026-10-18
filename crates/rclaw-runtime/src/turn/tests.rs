@@ -274,6 +274,51 @@ fn blocking_task_list_wait_does_not_trip_repetition_circuit() {
 }
 
 #[test]
+fn browser_scrape_loop_survives_repeated_observations_with_varied_scrolls() {
+    // 淘宝采集主循环的合法序列：导航 → 快照 → 滚动 → 快照 → 滚动 → 快照…
+    // 快照是只读：每次成功的导航/滚动（effectful）都会清掉其指纹，快照可以
+    // 无限重复而不撞熔断（此前快照被误标 effectful，第 3 次同参快照即软熔断、
+    // 第 4 次硬停——真机淘宝搜索实测）。
+    // 滚动保持 effectful（滚动改变视口/触发懒加载，且需要它清旧快照），
+    // 但同参数滚动仍全 turn 累计：技能侧必须变化格数（5/8/10 轮换）。
+    let mut status = Run::new("scrape search results", 32);
+    let navigate = tool_outcome(
+        "browser_navigate",
+        json!({"url": "https://s.taobao.com/search?q=iPhone"}),
+    );
+    let snapshot = tool_outcome("browser_snapshot", json!({}));
+    let scrolls = [
+        tool_outcome("browser_scroll", json!({"amount": 5})),
+        tool_outcome("browser_scroll", json!({"amount": 8})),
+        tool_outcome("browser_scroll", json!({"amount": 10})),
+    ];
+
+    assert!(matches!(
+        status.record_tool_calls(&navigate.tool_calls),
+        LoopDecision::Continue
+    ));
+    status.record_tool_results(&navigate, &tool_result_message("call-0", "page loaded", false));
+
+    for round in 0..6 {
+        assert!(
+            matches!(
+                status.record_tool_calls(&snapshot.tool_calls),
+                LoopDecision::Continue
+            ),
+            "第 {round} 轮快照不应触发熔断"
+        );
+        status.record_tool_results(&snapshot, &tool_result_message("snap", "items", false));
+
+        let scroll = &scrolls[round % scrolls.len()];
+        assert!(matches!(
+            status.record_tool_calls(&scroll.tool_calls),
+            LoopDecision::Continue
+        ));
+        status.record_tool_results(scroll, &tool_result_message("scroll", "scrolled", false));
+    }
+}
+
+#[test]
 fn agent_status_records_read_only_tool_errors() {
     let mut status = Run::new("inspect a file", 8);
     let read = tool_outcome("read", json!({"path":"missing.txt"}));
@@ -2269,6 +2314,25 @@ fn all_direct_search_tools_are_read_only_and_summarized_consistently() {
         let summary = summarize_tool_result(name, &json!({"query": "rust"}), "search results");
         assert!(summary.contains(&format!("[{name}]")), "{summary}");
         assert!(summary.contains("query='rust'"), "{summary}");
+    }
+}
+
+#[test]
+fn browser_observation_tools_are_read_only_while_actions_stay_effectful() {
+    // 纯观察：只读当前页面，不改状态——指纹必须能被后续状态变化清除，
+    // 否则采集循环里合法的反复快照会撞循环熔断（真机淘宝搜索实测）。
+    for name in ["browser_snapshot", "browser_screenshot", "browser_media"] {
+        assert!(!tool_is_effectful(name), "{name} 应为只读工具");
+    }
+    // 改状态的动作保持 effectful：导航/点按/输入/滚动成功后才允许清旧读数。
+    for name in [
+        "browser_navigate",
+        "browser_click",
+        "browser_type",
+        "browser_scroll",
+        "browser_close",
+    ] {
+        assert!(tool_is_effectful(name), "{name} 应为 effectful 工具");
     }
 }
 

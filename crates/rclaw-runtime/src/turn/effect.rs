@@ -760,6 +760,14 @@ pub(super) fn tool_is_effectful(name: &str) -> bool {
             | "TaskGet"
             | "AgentStatus"
             | "AgentWait"
+            // CDP 浏览器的纯观察工具：只读当前页面，不改任何状态。必须按只读
+            // 处理，否则它们的指纹全 turn 累计且永不因后续状态变化清除——
+            // browser_snapshot 无参数（每次规范化输入都是 {}），采集循环里
+            // 「滚动→快照」合法地反复出现，第 3 次就撞循环熔断（真机淘宝
+            // 搜索实测：未登录空壳页上 3 次快照软熔断、4 次硬停）。
+            | "browser_snapshot"
+            | "browser_screenshot"
+            | "browser_media"
     )
 }
 
