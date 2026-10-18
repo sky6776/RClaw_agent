@@ -1634,6 +1634,55 @@ impl CdpBrowser {
         let _op = self.op.lock().await;
         let session = self.session().await?;
         let (x, y) = self.element_center(&session, r).await?;
+        // 下拉框（select）分支：对 select 的「输入」语义是选中含指定文本的
+        // 选项（登录页国家区号等）。触摸 tap 会弹原生选择器阻塞流程，
+        // clear+逐字符键盘对 select 也无意义——都不做，直接 JS 选中并派发
+        // change（真机实测闲鱼登录页 +82 韩国 → +86 中国大陆 生效）。
+        let select_check = session
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": format!(
+                        "(function(ref){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');return el?(el.tagName==='SELECT'?'SELECT':'OTHER'):'MISSING';}})({r})"
+                    ),
+                    "returnByValue": true
+                }),
+                Duration::from_secs(10),
+            )
+            .await;
+        if let Ok(reply) = &select_check {
+            if evaluate_string(reply)? == "SELECT" {
+                let select_js = format!(
+                    "(function(ref,text){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');if(!el)return JSON.stringify({{ok:false,error:'引用不存在（页面可能已跳转，请重新 browser_snapshot）'}});var t=text.toLowerCase();var best=-1;for(var i=0;i<el.options.length;i++){{var hay=((el.options[i].text||'')+' '+(el.options[i].value||'')).toLowerCase();if(hay.indexOf(t)>=0){{best=i;break;}}}}if(best<0)return JSON.stringify({{ok:false,error:'下拉框没有含「'+text+'」的选项（共 '+el.options.length+' 项）'}});var label=(el.options[best].text||'').slice(0,40);var changed=el.selectedIndex!==best;el.selectedIndex=best;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return JSON.stringify({{ok:true,selected:label,changed:changed}});}})({r},{})",
+                    json!(text)
+                );
+                let reply = session
+                    .call(
+                        "Runtime.evaluate",
+                        json!({ "expression": select_js, "returnByValue": true }),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .map_err(|error| format!("下拉选中失败: {error}"))?;
+                let value = evaluate_string(&reply)?;
+                let parsed: Value = serde_json::from_str(&value).map_err(|e| format!("{e}"))?;
+                if parsed.get("ok").and_then(Value::as_bool) == Some(true) {
+                    let selected = parsed
+                        .get("selected")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    return Ok(format!("已在 [ref {r}] 下拉框选中「{selected}」。"));
+                }
+                return Err(
+                    parsed
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("下拉选中失败")
+                        .to_string(),
+                );
+            }
+        }
         // 触摸聚焦是行为拟真，不是功能必需——下方 JS `el.focus()` 才是真正的
         // 聚焦通路。可卡死页面上它必超时，故 best-effort：失败照常输入。
         let mut touch_note = String::new();
@@ -2439,7 +2488,7 @@ const PAGE_INFO_JS: &str = "(function(){var href=location.href||'';var text=(doc
 
 /// 紧凑可交互元素清单：给每个可交互/标题元素盖 data-rclaw-ref 章，输出
 /// `[ref] 角色: 文本 → 链接` 扁平列表（模型按 ref 定位操作）。
-const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):clean(el.innerText||'');var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+text.slice(0,120);if(href)line+=' → '+String(href).slice(0,150);out.push(line);}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素'});})()";
+const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+text.slice(0,120);if(href)line+=' → '+String(href).slice(0,150);out.push(line);}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素'});})()";
 
 /// 媒体资源提取（browser_media）：img + video（含 source 子元素）+ og 元信息，
 /// 按 DOM 顺序统一遍历后再限量 40 条（分开遍历会让图片先耗尽配额、视频整页
@@ -2856,7 +2905,7 @@ pub struct BrowserTypeTool {
 browser_tool_impl!(
     BrowserTypeTool,
     "browser_type",
-    "CDP 浏览器：聚焦 [ref] 输入框，先清空原内容再输入文本（IME 通路，事件完整；适合搜索框/表单）。",
+    "CDP 浏览器：聚焦 [ref] 输入框，先清空原内容再输入文本（IME 通路，事件完整；适合搜索框/表单）。目标若是下拉框（select，如登录页国家区号），则改为选中含指定文本的选项并派发 change（传「中国大陆」或「+86」即可）。",
     async fn execute(&self, input: Value) -> ToolResult {
         let (Some(r), Some(text)) = (
             input.get("ref").and_then(Value::as_u64),
