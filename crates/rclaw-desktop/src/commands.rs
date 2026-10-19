@@ -207,6 +207,15 @@ pub async fn update_download_install(app: AppHandle) -> Result<(), String> {
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| format!("创建更新目录失败: {e}"))?;
+        // 下载前清掉上次更新残留的安装包（装完即无用；同名文件本会被覆盖，
+        // 这里兜底清历史遗留）。失败不阻断下载。
+        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().is_file() {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
+            }
+        }
         dir.join(UPDATE_ASSET_NAME)
     };
     #[cfg(not(all(target_os = "android", feature = "apk-host")))]

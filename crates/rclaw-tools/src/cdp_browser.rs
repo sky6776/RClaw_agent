@@ -16,12 +16,14 @@
 //!   离屏 + LAYER_TYPE_SOFTWARE 不影响 WebGL 的 GL 上下文】，不做 hook，
 //!   canvas 噪声/字体/AudioContext 指纹破坏正常页面或性价比低，明确不做）；
 //! - `Fetch` 拦截摘掉 WebView 网络栈强加的 `X-Requested-With`（应用包名指纹）；
-//! - 交互事件词汇随 UA 判定：移动端（Android UA）走 `Input.dispatchTouchEvent`
-//!   触摸事件 + 逐字符键盘事件（手机不发鼠标事件，`insertText` 不产生键盘
-//!   事件流——事件词汇与 UA 矛盾是行为检测的直接证据），桌面保持鼠标/滚轮；
-//!   触摸事件带 3 秒短超时与降级通路（真机实测部分 WebView 页面触摸管线会
-//!   终身卡死：失败置位降级标志，click/type/scroll 自动改走鼠标/键盘，详见
-//!   [`CdpBrowser::touch_call`]）；
+//! - 交互事件词汇随 UA 与挂载态分流（真机 vivo WebView83 实测）：移动端
+//!   attached（面板展开）用 `Input.synthesize*` 合成手势（tap/scroll，真实
+//!   手势管线 → trusted 输入）；离屏（面板收起、合成器不活跃）一切注入事件
+//!   ack 照常但滚动/点击零效果——滚动/点击改走页内 JS（scrollBy / click，
+//!   isTrusted=false），输入的 insertText/键盘通路不受影响；桌面保持鼠标/
+//!   滚轮。`Input.dispatchTouchEvent` 在本机 attached/离屏都不可靠（拖拽链
+//!   动辄秒级 ack 甚至超时），已弃用；鼠标滚轮在手机上不作为回退（非人形
+//!   输入且离屏无效）；
 //! - Cookie 由真实网络栈跨调用保持（Java 侧 teardown 时 `CookieManager.flush`
 //!   落盘，进程被杀不丢已养的风控信誉）。
 //!
@@ -535,12 +537,12 @@ pub trait DevtoolsTransport: Send + Sync {
     fn device_metrics(&self) -> Option<(i64, i64, f64)> {
         None
     }
-    /// 浏览器实例代际：同一实例的重连必须返回同值，实例真正重建（重新拉起
-    /// 无头浏览器 / WebView 销毁重建）才变化。触摸降级标志只在代际变化时
-    /// 重置——卡死的触摸管线跨 CDP 重连存活，跟随重连重置会让每次重连后
-    /// 都白白重试一轮超时（真机实测：WebView83 系部分页面触摸终身卡死）。
-    fn instance_generation(&self) -> u64 {
-        0
+    /// WebView 是否挂载在悬浮窗面板里（attached = 有真实窗口 + 活跃合成器）。
+    /// 移动端输入分流依据：attached 态合成手势（synthesize*）真实生效；离屏
+    /// 态一切注入事件 ack 照常但滚动/点击零效果（真机实测：合成器不活跃），
+    /// 须走 JS 兜底。桌面无此概念，默认 false（桌面不查此标志）。
+    async fn overlay_attached(&self) -> bool {
+        false
     }
 }
 
@@ -581,8 +583,6 @@ pub struct HeadlessChromiumTransport {
     profile_dir: std::path::PathBuf,
     /// 可见模式：true = 下次拉起带窗口的真实浏览器（共享给人用）。
     visible: std::sync::atomic::AtomicBool,
-    /// 浏览器实例代际：每次 launch 递增（重连复用不递增）。
-    generation: std::sync::atomic::AtomicU64,
 }
 
 struct RunningChromium {
@@ -854,7 +854,6 @@ impl HeadlessChromiumTransport {
             // 孤儿由 kill_orphans_holding_profile 按各自目录特征清杀）。
             profile_dir: std::env::temp_dir().join(format!("rclaw-browser-profile-{}", std::process::id())),
             visible: std::sync::atomic::AtomicBool::new(false),
-            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1133,8 +1132,6 @@ impl DevtoolsTransport for HeadlessChromiumTransport {
         };
         let pair = Self::try_connect_page(&run.endpoint).await?;
         *guard = Some(run);
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(pair)
     }
 
@@ -1145,11 +1142,6 @@ impl DevtoolsTransport for HeadlessChromiumTransport {
         }
         kill_headless_processes();
         Ok(())
-    }
-
-    fn instance_generation(&self) -> u64 {
-        self.generation
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn screenshot_dir(&self) -> std::path::PathBuf {
@@ -1182,20 +1174,10 @@ pub struct CdpBrowser {
     /// 「导航→等加载→提取」这类多步事务必须整体串行，否则两个并发取页会互相
     /// 覆盖页面、各自提取到对方的 URL。
     op: AsyncMutex<()>,
-    /// 会话 UA 的事件词汇判定：true = 移动端（Android UA → touch 事件 +
-    /// 逐字符键盘事件），false = 桌面（鼠标/滚轮）。会话建立时由
+    /// 会话 UA 的事件词汇判定：true = 移动端（Android UA → 合成手势 + JS
+    /// 兜底 + 逐字符键盘事件），false = 桌面（鼠标/滚轮）。会话建立时由
     /// humanize 的 UA 读取更新（UA 是会话级覆写，词汇必须同源）。
     mobile_input: std::sync::atomic::AtomicBool,
-    /// 触摸通路降级标志：真机实测（vivo WebView83 系）部分页面首个 touchStart
-    /// ACK 后触摸管线即终身卡死——后续所有 touch 事件无 ACK，reload/换导航
-    /// 均不愈，只有重建 WebView 才恢复；鼠标与键盘通路完全独立不受影响。
-    /// 置位后本会话所有触摸尝试直接走鼠标/键盘回退，避免每次调用干等超时。
-    /// 重置只在 [`DevtoolsTransport::instance_generation`] 变化（WebView 真正
-    /// 重建）时进行——CDP 断线重连不重建 WebView，卡死会跨重连存活。
-    touch_broken: std::sync::atomic::AtomicBool,
-    /// 上次会话的浏览器实例代际（0 = 尚未建立；与 transport 的
-    /// instance_generation 比对决定是否重置触摸降级标志）。
-    view_generation: std::sync::atomic::AtomicU64,
 }
 
 /// park 过码等待：页面恢复轮询间隔。
@@ -1221,8 +1203,6 @@ impl CdpBrowser {
             session: AsyncMutex::new(None),
             op: AsyncMutex::new(()),
             mobile_input: std::sync::atomic::AtomicBool::new(false),
-            touch_broken: std::sync::atomic::AtomicBool::new(false),
-            view_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1254,16 +1234,6 @@ impl CdpBrowser {
         let mobile = humanize_session(&session).await;
         self.mobile_input
             .store(mobile, std::sync::atomic::Ordering::Relaxed);
-        // 触摸降级标志只在浏览器实例真正重建（代际变化）时重置：卡死的触摸
-        // 管线跨 CDP 重连存活（安卓 WebView 复用、桌面无头实例复用同理）。
-        let generation = self.transport.instance_generation();
-        let previous = self
-            .view_generation
-            .swap(generation, std::sync::atomic::Ordering::Relaxed);
-        if previous != generation {
-            self.touch_broken
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-        }
         // 视口一致性：老 WebView 的 app-context 度量把 CSS 视口折成非标准值
         // （真机实测 480/1440，真手机上不可能出现）。用设备真实 Display 的
         // CSS 视口钉住渲染器（mobile=true 同时启用移动视口语义），Playwright
@@ -1296,15 +1266,23 @@ impl CdpBrowser {
     }
 
     /// 导航公共段：Page.navigate → 等 loadEventFired → 静置 800ms。
-    async fn navigate_wait(&self, url: &str, load_timeout: Duration) -> Result<Session, String> {
+    /// `referrer` 是来源页 URL：CDP 命令式导航没有 initiator，请求不带
+    /// Referer 头、document.referrer 为空（等价地址栏直达）；站内跳转传
+    /// 上一页 URL 才像真人点链。None = 与现状相同的无 referrer 直达。
+    async fn navigate_wait(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+        load_timeout: Duration,
+    ) -> Result<Session, String> {
         let session = self.session().await?;
         let pre = *session.load_rx.borrow();
+        let mut params = json!({ "url": url });
+        if let Some(from) = referrer {
+            params["referrer"] = json!(from);
+        }
         session
-            .call(
-                "Page.navigate",
-                json!({ "url": url }),
-                Duration::from_secs(20),
-            )
+            .call("Page.navigate", params, Duration::from_secs(20))
             .await?;
         session.wait_load(pre, load_timeout).await?;
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1326,9 +1304,16 @@ impl CdpBrowser {
 
     /// 打开 URL 并等加载完成，返回页面提取结果（正文 + SERP 结果 +
     /// Google 风控页/同意页检测标注）。命中风控页进入 park 等待（见模块注释）。
-    pub async fn navigate_and_extract(&self, url: &str) -> Result<PagePayload, String> {
+    /// `referrer` 语义见 [`Self::navigate_wait`]。
+    pub async fn navigate_and_extract(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+    ) -> Result<PagePayload, String> {
         let _op = self.op.lock().await;
-        let session = self.navigate_wait(url, Duration::from_secs(40)).await?;
+        let session = self
+            .navigate_wait(url, referrer, Duration::from_secs(40))
+            .await?;
         let mut payload = self.extract_page(&session).await?;
         if payload.blocked.contains("CAPTCHA") {
             // 单点通知（通知+悬浮窗展开失败只记日志，park 照常等待）。
@@ -1481,117 +1466,67 @@ impl CdpBrowser {
             .to_string())
     }
 
-    /// 点按 ref 元素（CDP 真实输入事件，非 JS 合成点击）。
-    ///
-    /// 事件词汇随会话 UA：移动端派发 touchStart/Move/End（手指按下微移 +
-    /// 按抬起随机节奏；UA 声称 Android 手机却发鼠标事件是行为检测的直接矛盾）；
-    /// 桌面保持鼠标词汇——点按前先落两步鼠标移动（目标附近小偏移 → 目标中心），
-    /// 按下与抬起之间随机静置——反爬会查“零轨迹瞬移 + 恒定间隔”的点按。
-    /// 触摸事件单发失败的三种形态：处置各不相同——
-    /// - [`TouchFailure::Degraded`]：进入前已降级，事件未派发 → 回退鼠标安全；
-    /// - [`TouchFailure::Rejected`]：CDP 显式拒收（快速应答），事件确定未送达
-    ///   → 回退鼠标安全；
-    /// - [`TouchFailure::TimedOut`]：3 秒无应答，事件可能已送达并在处理 →
-    ///   **不得**回退重放（会二次执行动作），只上报歧义让 agent 复核。
-    async fn touch_call(&self, session: &Session, params: Value) -> Result<(), TouchFailure> {
-        if self
-            .touch_broken
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(TouchFailure::Degraded);
-        }
-        if let Err(error) = session
-            .call("Input.dispatchTouchEvent", params, Duration::from_secs(3))
-            .await
-        {
-            self.touch_broken
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = session
-                .call(
-                    "Input.dispatchTouchEvent",
-                    json!({ "type": "touchCancel", "touchPoints": [] }),
-                    Duration::from_secs(2),
-                )
-                .await;
-            // Session::call 的超时错误固定带「超时」字样；其余为 CDP 显式错误。
-            if error.contains("超时") {
-                return Err(TouchFailure::TimedOut(error));
-            }
-            return Err(TouchFailure::Rejected(error));
-        }
-        Ok(())
-    }
-
+    /// 点按 ref 元素。事件词汇随会话 UA 与挂载态分流（真机 vivo WebView83
+    /// 实测）：移动端 attached（面板展开、合成器活跃）走
+    /// `Input.synthesizeTapGesture` 合成手势（真实手势管线 → trusted click，
+    /// 0.2s ack）；离屏（面板收起）注入点击在本机无效或超时，走页内 JS
+    /// click（isTrusted=false，页面理论可辨别——离屏态这是唯一可靠通路）；
+    /// 桌面保持鼠标词汇——点按前先落两步鼠标移动（目标附近小偏移 → 目标
+    /// 中心），按下与抬起之间随机静置——反爬会查“零轨迹瞬移 + 恒定间隔”的
+    /// 点按。合成手势超时沿用触摸超时语义：事件可能已送达，**不得**重放
+    /// （会二次执行动作：误下单/误跳转），只上报歧义让 agent 复核。
     pub async fn click(&self, r: u32) -> Result<String, String> {
         let _op = self.op.lock().await;
         let session = self.session().await?;
         let (x, y) = self.element_center(&session, r).await?;
-        // 触摸点按失败的三种处置：降级/显式被拒（事件确定未送达）→ 鼠标
-        // 回退；超时（事件可能已送达并在处理）→ 不重复执行，上报歧义让
-        // agent 复核（重放会二次执行动作：误下单/误跳转）。
         let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
-        let mut touched = false;
-        let mut touch_note = String::new();
-        let mut use_mouse = !mobile;
+        let mut note = String::new();
         if mobile {
-            // 已送达标记：一旦有事件 ACK，页面状态就可能已改变——后续失败
-            // 一律按 Partial 处理（不得鼠标重放，会二次执行动作）。
-            let mut delivered = false;
-            let seq_result = async {
-                self.touch_call(
-                    &session,
-                    json!({ "type": "touchStart", "touchPoints": [{ "x": x, "y": y }] }),
-                )
-                .await
-                .map_err(|failure| {
-                    if delivered {
-                        TouchFailure::Partial(format!("{failure:?}"))
-                    } else {
-                        failure
-                    }
-                })?;
-                delivered = true;
-                // 手指按下后的按压微动（1-2 帧小偏移），随后静置再抬起。
-                self.touch_call(
-                    &session,
-                    json!({
-                        "type": "touchMove",
-                        "touchPoints": [{ "x": x + jitter(-4, 4), "y": y + jitter(-4, 4) }]
-                    }),
-                )
-                .await
-                .map_err(|failure| {
-                    if delivered {
-                        TouchFailure::Partial(format!("{failure:?}"))
-                    } else {
-                        failure
-                    }
-                })?;
-                tokio::time::sleep(Duration::from_millis(jitter(50, 140) as u64)).await;
-                self.touch_call(&session, json!({ "type": "touchEnd", "touchPoints": [] }))
+            let attached = self.transport.overlay_attached().await;
+            let mut clicked = false;
+            if attached {
+                match session
+                    .call(
+                        "Input.synthesizeTapGesture",
+                        json!({ "x": x, "y": y }),
+                        Duration::from_secs(15),
+                    )
                     .await
-                    .map_err(|failure| {
-                        if delivered {
-                            TouchFailure::Partial(format!("{failure:?}"))
-                        } else {
-                            failure
+                {
+                    Ok(_) => clicked = true,
+                    Err(error) => {
+                        if error.contains("超时") {
+                            return Err(format!(
+                                "点击已派发但未确认生效（合成手势超时）——不要重放，\
+                                 请用 browser_snapshot 核实页面状态后再决定是否重试: {error}"
+                            ));
                         }
-                    })
-            };
-            match seq_result.await {
-                Ok(()) => touched = true,
-                Err(TouchFailure::TimedOut(error)) | Err(TouchFailure::Partial(error)) => {
-                    touch_note = format!(
-                        "（触摸事件已派发但未完整生效，可能已产生效果——未重复点击；请用 browser_snapshot 核实页面状态后再决定是否重试：{error}）"
-                    );
+                        note = format!("（合成手势点击失败: {error}，已改用页内点击）");
+                    }
                 }
-                Err(failure) => {
-                    touch_note = "（触摸通路不可用，已改用鼠标事件）".to_string();
-                    use_mouse = true;
+            } else {
+                note = "（面板收起：本机离屏态注入点击无效果，已用页内点击）".to_string();
+            }
+            if !clicked {
+                let js = format!(
+                    "(function(){{var el=document.querySelector('[data-rclaw-ref=\"{r}\"]');\
+                     if(!el)return 'MISSING';\
+                     if(typeof el.click==='function'){{el.click();}}\
+                     else{{el.dispatchEvent(new MouseEvent('click',{{bubbles:true,cancelable:true}}));}}\
+                     return 'OK';}})()"
+                );
+                let reply = session
+                    .call(
+                        "Runtime.evaluate",
+                        json!({ "expression": js, "returnByValue": true }),
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                if evaluate_string(&reply)? != "OK" {
+                    return Err("元素不存在（页面可能已跳转，请重新 browser_snapshot）".to_string());
                 }
             }
-        }
-        if use_mouse {
+        } else {
             for (mx, my) in [(x + jitter(-24, 24), y + jitter(-18, 18)), (x, y)] {
                 session
                     .call(
@@ -1620,7 +1555,7 @@ impl CdpBrowser {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let info = self.page_info(&session).await?;
         Ok(format!(
-            "已在 ({x},{y}) 点按 [ref {r}]。{touch_note}\n{}",
+            "已在 ({x},{y}) 点按 [ref {r}]。{note}\n{}",
             format_report(&info)
         ))
     }
@@ -1701,23 +1636,22 @@ impl CdpBrowser {
             }
         }
         // 触摸聚焦是行为拟真，不是功能必需——下方 JS `el.focus()` 才是真正的
-        // 聚焦通路。可卡死页面上它必超时，故 best-effort：失败照常输入。
+        // 聚焦通路。仅 attached 态做合成 tap 聚焦（真实手势；离屏态注入点击
+        // 在本机无效/超时，直接跳过），失败照常输入。
         let mut touch_note = String::new();
-        if self.mobile_input.load(std::sync::atomic::Ordering::Relaxed) {
-            let start = self
-                .touch_call(
-                    &session,
-                    json!({ "type": "touchStart", "touchPoints": [{ "x": x, "y": y }] }),
-                )
-                .await;
-            let end = match start {
-                Ok(()) => self
-                    .touch_call(&session, json!({ "type": "touchEnd", "touchPoints": [] }))
-                    .await,
-                Err(error) => Err(error),
-            };
-            if end.is_err() {
-                touch_note = "（触摸聚焦不可用，已用 JS focus 继续输入）".to_string();
+        let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
+        if mobile {
+            if self.transport.overlay_attached().await
+                && session
+                    .call(
+                        "Input.synthesizeTapGesture",
+                        json!({ "x": x, "y": y }),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .is_err()
+            {
+                touch_note = "（触摸聚焦失败，已用 JS focus 继续输入）".to_string();
             }
         } else {
             for kind in ["mousePressed", "mouseReleased"] {
@@ -1800,10 +1734,13 @@ impl CdpBrowser {
         ))
     }
 
-    /// 滑动页面。事件词汇随会话 UA：移动端走 `Input.dispatchTouchEvent` 拖拽链
-    /// （手指按下 → 8-14 步缓动位移 → 抬起，Chromium 按末速自然施加惯性——
-    /// 手机没有滚轮）；桌面保持真实滚轮事件（`mouseWheel`，逐格带拟人抖动）。
-    /// 匀速瞬时大位移是机器滚动的典型特征，也是触发懒加载的自然方式。
+    /// 滑动页面。事件词汇随会话 UA 与挂载态分流（真机 vivo WebView83 实测）：
+    /// 桌面走真实滚轮事件（`mouseWheel`，逐格带拟人抖动）；移动端 attached
+    /// （面板展开、合成器活跃）走 `Input.synthesizeScrollGesture` 合成手势
+    /// （唯一有效的注入滚动通路：0.2s ack + 真实滚动与惯性）；离屏（面板
+    /// 收起、agent 自主驱动）合成器不活跃——touch/wheel/synthesize 全部
+    /// ack 照常但位移为零，直接走页内程序化滚动（滚动事件照常派发，懒加载
+    /// 正常触发）。鼠标滚轮在手机上既非人形输入、离屏又无效，不作为回退。
     pub async fn scroll(&self, notches: i32) -> Result<String, String> {
         let _op = self.op.lock().await;
         let session = self.session().await?;
@@ -1812,38 +1749,93 @@ impl CdpBrowser {
         let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
         let (w, h) = if mobile { visual } else { inner };
         let (x, y) = (w / 2, h / 2);
-        let mut touch_note = String::new();
-        let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
+        let mut note = String::new();
+        let mut actual_px: i64 = 0;
         if mobile {
-            match self.touch_drag(&session, x, y, notches).await {
-                Ok(()) => {}
-                Err(TouchFailure::TimedOut(error)) | Err(TouchFailure::Partial(error)) => {
-                    // 拖拽可能已部分送达（touchStart 常先 ACK），补滚轮会过量
-                    // 滚动——上报歧义；降级标志已置位，下次调用直接走滚轮。
-                    touch_note = format!(
-                        "（触摸滚动未完整生效，滚动可能已部分发生——未追加滚轮；请用 browser_snapshot 核实位置：{error}）"
-                    );
-                }
-                Err(failure) => {
-                    // 降级/显式被拒：触摸事件确定未产生滚动，滚轮回退安全。
-                    touch_note = "（触摸不可用，已用鼠标滚轮）".to_string();
-                    for _ in 0..notches.unsigned_abs() {
-                        session
-                            .call(
-                                "Input.dispatchMouseEvent",
-                                json!({
-                                    "type": "mouseWheel",
-                                    "x": x + jitter(-8, 8),
-                                    "y": y + jitter(-8, 8),
-                                    "deltaX": 0,
-                                    "deltaY": 120 * notches.signum(),
-                                }),
-                                Duration::from_secs(10),
-                            )
-                            .await?;
-                        tokio::time::sleep(Duration::from_millis(jitter(60, 160) as u64)).await;
+            let attached = self.transport.overlay_attached().await;
+            let sign: i64 = if notches > 0 { 1 } else { -1 };
+            let total_px = 120i64 * notches.unsigned_abs() as i64;
+            let mut ambiguous = false;
+            let mut attempted = false;
+            let mut js_ran = false;
+            if attached {
+                // 逐段手势、逐段登记测量：600px 手势之间视口内容会移动（落点
+                // 命中的容器可能变化），每段都对当前内容重新登记滚动链、实测
+                // 该段位移——跨段复用首段登记会把新容器的位移记到旧链头上，
+                // 造成漏记进度与重复补滚。登记与手势共用同一个抖动后的落点：
+                // 中心贴着相邻容器边界时，差几个像素就是另一个滚动容器。
+                while actual_px < total_px {
+                    let chunk = (total_px - actual_px).min(600);
+                    let gx = x + jitter(-6, 6);
+                    let gy = y + jitter(-6, 6);
+                    let before = self.scroll_target_begin(&session, gx, gy).await?;
+                    // 登记即算「手势阶段已在此链上执行」：手势显式失败（事件
+                    // 确定未送达）时补滚沿用这条链，而不是换落点重登记——抖动
+                    // 落点可能命中 contain 边界面板，换中心点会绕过边界。
+                    attempted = true;
+                    if let Err(error) = self.synth_scroll(&session, gx, gy, chunk, notches > 0).await
+                    {
+                        if error.contains("超时") {
+                            ambiguous = true;
+                            note = format!(
+                                "（触摸手势超时，滚动可能仍在进行——未追加补滚；请用 browser_snapshot 核实位置: {error}）"
+                            );
+                        } else {
+                            note =
+                                format!("（触摸手势滚动失败: {error}，缺口改用页内程序化滚动）");
+                        }
+                        break;
                     }
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let after = self.scroll_target_pos(&session).await?;
+                    // 只设下限不设上限：scroll-snap 等会把终点调过头，实测超量
+                    // 也是真实发生的位移，钳掉会少报并多滚缺口。
+                    let gained = ((after - before) * sign).max(0);
+                    if gained == 0 {
+                        // 首段就零位移：手势被内核丢弃/被页面吞掉，直接转 JS。
+                        if actual_px == 0 {
+                            note = "（触摸手势未产生滚动，已改用页内程序化滚动）".to_string();
+                        }
+                        break;
+                    }
+                    actual_px += gained;
                 }
+            } else {
+                note = "（面板收起：本机离屏态注入滚动无效果，已用页内程序化滚动——滚动事件正常触发懒加载）"
+                    .to_string();
+            }
+            if !ambiguous && actual_px < total_px {
+                if attempted && note.is_empty() {
+                    note = "（触摸手势部分生效，缺口已用页内程序化滚动）".to_string();
+                }
+                // 补滚沿用登记链（手势阶段就在那条链上执行——含显式失败与
+                // overscroll 截断链；换落点重新登记会命中旁边的背景容器，
+                // 绕过手势被正确拦下的边界）。仅当手势阶段未执行（面板收起）
+                // 时才按 (x,y) 新登记。
+                if !attempted {
+                    let _ = self.scroll_target_begin(&session, x, y).await?;
+                }
+                let moved = self
+                    .js_scroll(&session, sign * (total_px - actual_px))
+                    .await?;
+                js_ran = true;
+                actual_px += moved;
+                if actual_px < total_px {
+                    note.push_str(&format!(
+                        "（仍有 {}px 未能滚动：已到页面边界或滚动容器特殊）",
+                        total_px - actual_px
+                    ));
+                }
+            }
+            if !ambiguous {
+                let path = if !attempted || actual_px == 0 {
+                    "页内程序化滚动"
+                } else if js_ran {
+                    "触摸手势+页内程序化滚动"
+                } else {
+                    "触摸手势"
+                };
+                note = format!("（通路：{path}；实际位移 {actual_px}px/请求 {total_px}px）{note}");
             }
         } else {
             for _ in 0..notches.unsigned_abs() {
@@ -1867,78 +1859,179 @@ impl CdpBrowser {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let info = self.page_info(&session).await?;
         Ok(format!(
-            "已{}滑动 {} 格。{touch_note}\n{}",
+            "已{}滑动 {} 格。{note}\n{}",
             if notches > 0 { "向下" } else { "向上" },
             notches.unsigned_abs(),
             format_report(&info)
         ))
     }
 
-    /// 移动端触摸拖拽链：手指从视口中部按下，按「起步加速 → 匀速 → 收尾减速」
-    /// 缓动走完 120px×格数 的反向位移（手指上滑 = 页面下滚），每步坐标带抖动、
-    /// 间隔 16-48ms；抬起瞬间 Chromium 按末段速度施加惯性滚动。`steps` 随
-    /// 格数增减（长滑更慢更自然），上限 24 步防超长拖拽。
-    async fn touch_drag(
+    /// attached 态合成触摸滚动：整段位移切块为 ≤600px/段的手势，段间
+    /// 80-200ms 抖动停顿、speed 抖动拟人。方向：`down` 为真 = 手指上移 =
+    /// yDistance 负。`(x,y)` 必须与 [`Self::scroll_target_begin`] 的登记落点
+    /// 完全一致（由调用方抖动一次后共用）——落点差几个像素可能命中相邻的
+    /// 另一个滚动容器，登记 A 实际滚 B 会漏记进度。任一段失败即中止返回
+    /// Err（已完成进度由调用方按实测位移校准，不在此累计）。
+    async fn synth_scroll(
         &self,
         session: &Session,
         x: i64,
         y: i64,
-        notches: i32,
-    ) -> Result<(), TouchFailure> {
-        let total = -120.0 * notches as f64; // 手指位移（页面向下滚 → 手指向上）
-        let steps = (notches.unsigned_abs().clamp(4, 12) * 2) as i64;
-        let start_y = y as f64 + jitter(-6, 6) as f64;
-        // 已送达事件标记：一旦有事件 ACK，页面状态就可能已改变——后续失败
-        // 一律按 Partial 处理（不得按原距离重放滚轮，会过量滚动）。
-        let mut delivered = false;
-        self.touch_call(
-            session,
-            json!({
-                "type": "touchStart",
-                "touchPoints": [{ "x": x + jitter(-4, 4), "y": start_y as i64 }]
-            }),
-        )
-        .await
-        .map_err(|failure| {
-            if delivered {
-                TouchFailure::Partial(format!("{failure:?}"))
-            } else {
-                failure
+        total_px: i64,
+        down: bool,
+    ) -> Result<(), String> {
+        let mut remaining = total_px;
+        while remaining > 0 {
+            let step = remaining.min(600);
+            let distance = if down { -step } else { step };
+            session
+                .call(
+                    "Input.synthesizeScrollGesture",
+                    json!({
+                        "x": x,
+                        "y": y,
+                        "xDistance": 0,
+                        "yDistance": distance,
+                        "speed": jitter(1600, 2800),
+                    }),
+                    Duration::from_secs(15),
+                )
+                .await?;
+            remaining -= step;
+            if remaining > 0 {
+                tokio::time::sleep(Duration::from_millis(jitter(80, 200) as u64)).await;
             }
-        })?;
-        delivered = true;
-        for step in 1..=steps {
-            let t = step as f64 / steps as f64;
-            // smoothstep 缓动：起步/收尾慢，中段快（真人拖拽的速度轮廓）。
-            let eased = t * t * (3.0 - 2.0 * t);
-            let py = start_y + total * eased + jitter(-2, 2) as f64;
-            self.touch_call(
-                session,
-                json!({
-                    "type": "touchMove",
-                    "touchPoints": [{ "x": x + jitter(-3, 3), "y": py as i64 }]
-                }),
-            )
-            .await
-            .map_err(|failure| {
-                if delivered {
-                    TouchFailure::Partial(format!("{failure:?}"))
-                } else {
-                    failure
-                }
-            })?;
-            tokio::time::sleep(Duration::from_millis(jitter(16, 48) as u64)).await;
         }
-        self.touch_call(session, json!({ "type": "touchEnd", "touchPoints": [] }))
-            .await
-            .map_err(|failure| {
-                if delivered {
-                    TouchFailure::Partial(format!("{failure:?}"))
-                } else {
-                    failure
-                }
-            })?;
         Ok(())
+    }
+
+    /// 滚动链登记（每次 scroll 调用开始时执行一次）：从手势落点 (x,y) 向上收
+    /// 集滚动容器链。入链条件：computed overflowY ∈ auto/scroll/overlay（是
+    /// 滚动容器）且内容超高——overflow visible/hidden 不是滚动容器，不算边
+    /// 界也不入链。命中 `overscroll-behavior-y: contain/none` 的滚动容器即截
+    /// 断向上收集（根也不追加）——原生手势在此边界停住，进度测量与 JS 补滚
+    /// 同样不得越过它滚背景；无溢出的滚动容器同样构成边界。遍历到根
+    /// （scrollingElement）即止且根只以链尾身份出现一次。反向容器标志只认
+    /// 真实 flex 布局的纵向反转（display 含 flex 且 flex-direction 含 column
+    /// 与 reverse；row-reverse / 非 flex 元素的纵向 scrollTop 仍是常规
+    /// [0,max]）。链节点与标志存 `window.__rclawSc`，后续读数与补滚全部引用
+    /// 同一登记：前后两次 elementFromPoint 会因滚动把原容器移出落点，跨登记
+    /// 读数会错账。返回链上 scrollTop 基线之和（是否截断保存在登记状态里，
+    /// js_scroll 的 END 语义天然尊重它）。
+    /// 表达式必须返回字符串（[`evaluate_string`] 契约）。
+    async fn scroll_target_begin(&self, session: &Session, x: i64, y: i64) -> Result<i64, String> {
+        let js = format!(
+            "(function(){{var se=document.scrollingElement||document.documentElement;\
+             var chain=[],rev=[],el=document.elementFromPoint({x},{y}),bounded=false;\
+             while(el&&el!==se){{\
+             var cs=null;try{{cs=window.getComputedStyle(el);}}catch(e){{cs=null;}}\
+             var oy=cs?cs.overflowY:'';\
+             if(oy==='auto'||oy==='scroll'||oy==='overlay'){{\
+             if(el.scrollHeight>el.clientHeight+1){{\
+             var disp=cs?(cs.display||''):'';var fd=cs?(cs.flexDirection||''):'';\
+             chain.push(el);rev.push(disp.indexOf('flex')>=0&&fd.indexOf('column')>=0&&fd.indexOf('reverse')>=0);}}\
+             var ob=cs?(cs.overscrollBehaviorY||''):'';\
+             if(ob==='contain'||ob==='none'){{bounded=true;break;}}}}\
+             el=el.parentElement;}}\
+             if(!bounded){{chain.push(se);rev.push(false);}}\
+             window.__rclawSc={{c:chain,r:rev}};\
+             var sum=0;for(var i=0;i<chain.length;i++)sum+=(chain[i].scrollTop|0);\
+             return String(sum+'|'+(bounded?'1':'0'));}})()"
+        );
+        let reply = session
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": js, "returnByValue": true }),
+                Duration::from_secs(10),
+            )
+            .await?;
+        let value = evaluate_string(&reply)?;
+        value
+            .split('|')
+            .next()
+            .and_then(|v| v.parse::<i64>().ok())
+            .ok_or_else(|| format!("解析滚动进度失败: {value}"))
+    }
+
+    /// 读登记滚动链（[`Self::scroll_target_begin`]）全部节点 scrollTop 之和。
+    /// 单方向滚动下「和之差 = 各节点位移之和」= 内容实际移动距离（内层到边
+    /// 链到外层的情形由根节点项覆盖）。
+    async fn scroll_target_pos(&self, session: &Session) -> Result<i64, String> {
+        let reply = session
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression":
+                        "(function(){var s=window.__rclawSc;if(!s)return '0';\
+                         var t=0;for(var i=0;i<s.c.length;i++)t+=(s.c[i].scrollTop|0);\
+                         return String(t);})()",
+                    "returnByValue": true
+                }),
+                Duration::from_secs(10),
+            )
+            .await?;
+        evaluate_string(&reply)?
+            .parse::<i64>()
+            .map_err(|e| format!("解析滚动进度失败: {e}"))
+    }
+
+    /// 页内程序化滚动：对 [`Self::scroll_target_begin`] 登记的滚动链分步滚动
+    /// （每步申请 ≤240px，30-90ms 节奏）。每步从链最内层起找第一个「当前方向
+    /// 仍有剩余空间」的节点执行滚动并**回传实际位移**（容量可能小于申请步长：
+    /// 容器钳位后余量自动落到链上更外层），Rust 按实际位移扣账，避免「扣了
+    /// 整步、只滚了几像素」的距离丢失。容量按登记的反向标志（flex-direction
+    /// 含 reverse，如 column-reverse 的 scrollTop ∈ [-max,0]）选择公式，常规
+    /// 容器不受影响。根（scrollingElement）用 window.scrollBy，普通元素用
+    /// `Element.scrollBy({behavior:'instant'})` 强制瞬时（容器声明
+    /// scroll-behavior:smooth 时默认动画会被步进节奏打断而丢距离；老内核无
+    /// Element.scrollBy 时回退 scrollTop 直写）。滚动事件照常派发（懒加载/
+    /// IntersectionObserver 正常触发）；返回实际位移的绝对值。
+    async fn js_scroll(&self, session: &Session, px: i64) -> Result<i64, String> {
+        let dir = px.signum();
+        let mut moved_total: i64 = 0;
+        let mut remaining = px.abs();
+        while remaining > 0 {
+            let step = remaining.min(240);
+            let js = format!(
+                "(function(){{var s=window.__rclawSc;if(!s||!s.c)return 'NO';\
+                 function sum(){{var t=0;for(var i=0;i<s.c.length;i++)t+=(s.c[i].scrollTop|0);return t;}}\
+                 var b=sum();\
+                 for(var i=0;i<s.c.length;i++){{var n=s.c[i];\
+                 var max=n.scrollHeight-n.clientHeight,st=n.scrollTop,cap;\
+                 if(s.r[i]){{cap=({dir}>0)?(-st):(st+max);}}\
+                 else{{cap=({dir}>0)?(max-st):st;}}\
+                 if(cap>1){{\
+                 if(n===document.scrollingElement||n===document.documentElement){{\
+                 window.scrollBy({{left:0,top:{},behavior:'instant'}});}}\
+                 else if(typeof n.scrollBy==='function'){{\
+                 n.scrollBy({{left:0,top:{},behavior:'instant'}});}}\
+                 else{{n.scrollTop+={};}}\
+                 return String(sum()-b);}}}}\
+                 return 'END';}})()",
+                dir * step,
+                dir * step,
+                dir * step
+            );
+            let reply = session
+                .call(
+                    "Runtime.evaluate",
+                    json!({ "expression": js, "returnByValue": true }),
+                    Duration::from_secs(10),
+                )
+                .await?;
+            let value = evaluate_string(&reply)?;
+            if value == "END" {
+                break; // 整条链在当前方向都已到边：剩余距离滚不动，如实上报。
+            }
+            let moved = value.parse::<i64>().unwrap_or(0).abs();
+            moved_total += moved;
+            remaining -= moved;
+            if moved == 0 {
+                break; // 该步实际没滚到任何距离：继续只会空转，如实上报。
+            }
+            tokio::time::sleep(Duration::from_millis(jitter(30, 90) as u64)).await;
+        }
+        Ok(moved_total)
     }
 
     /// 事件坐标基准视口（双口径）：桌面滚轮用窗口 innerWidth/innerHeight
@@ -2701,21 +2794,6 @@ macro_rules! browser_tool_impl {
     };
 }
 
-/// 触摸单发失败的分类（见 [`CdpBrowser::touch_call`] 文档）。
-#[derive(Debug)]
-enum TouchFailure {
-    /// 进入前已降级：事件未派发，回退鼠标安全。
-    Degraded,
-    /// CDP 显式拒收（快速应答）：事件确定未送达且此前无已送达事件，回退
-    /// 鼠标安全。
-    Rejected(String),
-    /// 应答超时：事件可能已送达，不得重放，只上报歧义。
-    TimedOut(String),
-    /// 手势部分生效（前序事件已送达、后续被拒）：页面状态已改变，不得按
-    /// 原距离/原动作重放，只上报歧义。
-    Partial(String),
-}
-
 pub struct BrowserNavigateTool {
     browser: Arc<CdpBrowser>,
 }
@@ -2745,14 +2823,21 @@ impl BrowserMediaTool {
 browser_tool_impl!(
     BrowserNavigateTool,
     "browser_navigate",
-    "CDP 浏览器：打开 URL 并读取页面（真实 Chromium 内核，UA 与交互已拟人化，可正常访问 Google 等风控站点）。普通页返回页面标题、最终 URL 与正文文本；搜索引擎结果页 URL（引擎自由选择，如 https://www.bing.com/search?q=检索词 或 google/baidu 的搜索 URL）返回解析后的结果列表（标题/链接/摘要，广告已过滤）。命中 Google 风控页（CAPTCHA）时本调用会挂起等待人工过码（已自动通知用户并展开悬浮窗），恢复后返回结果并标注；最多等 180 秒，超时返回风控页标注——超时后不要立即重试，向用户报告即可。同意页（consent）仅标注，可用 browser_snapshot 后点按勾选框继续。需要交互（点击/输入/滚动/截图）用 browser_snapshot / browser_click / browser_type / browser_scroll / browser_screenshot。",
+    "CDP 浏览器：打开 URL 并读取页面（真实 Chromium 内核，UA 与交互已拟人化，可正常访问 Google 等风控站点）。普通页返回页面标题、最终 URL 与正文文本；搜索引擎结果页 URL（引擎自由选择，如 https://www.bing.com/search?q=检索词 或 google/baidu 的搜索 URL）返回解析后的结果列表（标题/链接/摘要，广告已过滤）。站内跳转（如首页→列表页→详情页）建议带 referrer=上一页 URL，导航会携带真实 Referer（不带则等价地址栏直达，部分站点风控会拦无来源的深链直达）。命中 Google 风控页（CAPTCHA）时本调用会挂起等待人工过码（已自动通知用户并展开悬浮窗），恢复后返回结果并标注；最多等 180 秒，超时返回风控页标注——超时后不要立即重试，向用户报告即可。同意页（consent）仅标注，可用 browser_snapshot 后点按勾选框继续。需要交互（点击/输入/滚动/截图）用 browser_snapshot / browser_click / browser_type / browser_scroll / browser_screenshot。",
     async fn execute(&self, input: Value) -> ToolResult {
         let url = match input.get("url").and_then(Value::as_str) {
             Some(url) => url,
             None => return ToolResult::err("缺少参数 url"),
         };
+        let referrer = match input.get("referrer").and_then(Value::as_str) {
+            Some(from) if !from.trim().is_empty() => match normalize_url(from) {
+                Ok(from) => Some(from),
+                Err(error) => return ToolResult::err(format!("referrer 非法: {error}")),
+            },
+            _ => None,
+        };
         match normalize_url(url) {
-            Ok(url) => match self.browser.navigate_and_extract(&url).await {
+            Ok(url) => match self.browser.navigate_and_extract(&url, referrer.as_deref()).await {
                 Ok(page) => ToolResult::ok(format_navigated_page(&page)),
                 Err(error) => ToolResult::err(error),
             },
@@ -2766,7 +2851,8 @@ impl BrowserNavigateTool {
         json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "目标页面 URL（无 scheme 自动补 https://）" }
+                "url": { "type": "string", "description": "目标页面 URL（无 scheme 自动补 https://）" },
+                "referrer": { "type": "string", "description": "可选来源页 URL（如上一页/站点首页）——携带真实 Referer，站内跳转建议传；缺省 = 无来源直达" }
             },
             "required": ["url"]
         })
@@ -2888,7 +2974,7 @@ pub struct BrowserClickTool {
 browser_tool_impl!(
     BrowserClickTool,
     "browser_click",
-    "CDP 浏览器：点按 snapshot 给出的 [ref] 元素（真实鼠标事件，非 JS 合成点击）。返回点按位置与当前页面标题/URL。",
+    "CDP 浏览器：点按 snapshot 给出的 [ref] 元素（桌面/手机面板展开时是真实输入事件；手机面板收起时自动用页内点击，结果里标注）。返回点按位置与当前页面标题/URL。",
     async fn execute(&self, input: Value) -> ToolResult {
         let Some(r) = input.get("ref").and_then(Value::as_u64) else {
             return ToolResult::err("缺少参数 ref（browser_snapshot 列表里的编号）");
@@ -2960,7 +3046,7 @@ pub struct BrowserScrollTool {
 browser_tool_impl!(
     BrowserScrollTool,
     "browser_scroll",
-    "CDP 浏览器：在当前页面滚轮滑动（真实滚轮事件，逐格带拟人抖动；可触发懒加载）。返回当前页面标题/URL。长页面读正文、翻找内容、往下加载更多时用。",
+    "CDP 浏览器：在当前页面滚动（桌面滚轮事件；手机 attached 走触摸手势、面板收起自动用页内程序化滚动，懒加载均正常触发；结果里会标注实际采用的通路）。返回当前页面标题/URL。长页面读正文、翻找内容、往下加载更多时用。",
     async fn execute(&self, input: Value) -> ToolResult {
         let direction = input
             .get("direction")
@@ -3479,7 +3565,7 @@ fn headless_browser_end_to_end_smoke() {
         let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
         let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
         eprintln!("[cdp] navigate example.com…");
-        let page = browser.navigate_and_extract("https://example.com").await?;
+        let page = browser.navigate_and_extract("https://example.com", None).await?;
         eprintln!("[cdp] navigate 完成: {}（{} 字符正文）", page.url, page.text.chars().count());
         assert!(page.url.contains("example"), "{:?}", page.url);
         assert!(!page.text.is_empty(), "正文为空");

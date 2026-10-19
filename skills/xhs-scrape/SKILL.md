@@ -14,6 +14,8 @@ description: 采集小红书（RedNote）搜索结果与笔记内容——搜小
 - browser_* 工具：`browser_navigate`（正文上限 6000 字）、`browser_snapshot`（可交互元素 `[ref] 文本 → 链接`，链接截 150 字符，单次 250 项）、`browser_click`、`browser_type`、`browser_scroll`、`browser_screenshot`（PNG 存 workspace `browser/`）、`browser_media`（当前页图片/视频 URL 清单，含 video 直链）、`browser_close`。APK 上另有 `open_media`（系统查看器/播放器打开 workspace 文件）。
 - 会话跨调用保持 Cookie；采集过程中不要 `browser_close`。
 - 内置风控标注只认 Google 验证页；小红书的墙靠本技能规则识别。
+- 小红书 web 是响应式同域（`www.xiaohongshu.com` 手机/桌面同一套页面），无 PC/手机 URL 形态之分。
+- 手机宿主的滚动/点击由工具按面板挂载态自动分流：面板展开 = 触摸手势/真实 tap；面板收起 = 页内程序化滚动与页内点击（结果文案标注实际通路与位移）——**手机上没有鼠标滚轮回退**；桌面始终是滚轮/鼠标事件。
 
 ## 执行流程
 
@@ -46,7 +48,7 @@ https://www.xiaohongshu.com/search_result?keyword=<关键词>&type=51
 
 背景（真机实测沉淀）：未登录 + 移动端 UA + 数据中心出口的组合下，小红书把移动网页流量整体导向 App——搜索页 404/拦截、首页是引导页、搜索引擎零站内收录，三个「会弹登录浮层」的触发点（内容页/详情卡片/搜索落地页）全部不可达。这是产品策略墙，不是客户端 bug；第 6 步的登录协作只在「真的出现了登录浮层/登录页」时进入，不可登录态没有入口可登录，不要空转。
 
-滚动已知形态：`browser_scroll` 触摸滚动超时（WebView 触摸通路限制）或滚动后截图全白（懒加载空白区）时，以 snapshot 为准并如实标注「截图不可用」，不反复滚动硬等。
+滚动已知形态：滚动后截图全白（懒加载空白区）时，以 snapshot 为准并如实标注「截图不可用」，不反复滚动硬等。（工具侧已修复触摸滚动超时：手机宿主自动分流到触摸手势或页内程序化滚动。）
 
 ### 第 3 步：搜索结果采集
 

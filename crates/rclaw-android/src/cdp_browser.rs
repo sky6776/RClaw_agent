@@ -25,7 +25,6 @@ pub fn register(tools: &mut rclaw_tools::ToolRegistry) {
         Arc::new(AndroidTransport {
             screenshot_dir,
             metrics: std::sync::Mutex::new(None),
-            last_epoch: std::sync::atomic::AtomicU64::new(0),
         }),
     );
     // 媒体打开：APK 沙箱文件经 FileProvider 只读 URI 交给系统查看器/播放器
@@ -79,11 +78,6 @@ pub struct AndroidTransport {
     /// 会话启动时 Java 带回的设备视口（CSS 尺寸 + dpr），供内核钉住渲染视口
     /// （connect 时写入；同一连接的 humanize/视口覆写随即读取）。
     metrics: std::sync::Mutex<Option<(i64, i64, f64)>>,
-    /// 上次会话的 WebView 创建代际（Java 侧 createEpoch，经 BrowserSessionInfo
-    /// 带回）：BrowserSession.start 复用已有 WebView 时代际不变——触摸降级
-    /// 标志跨重连保持；WebView 真正重建时代际递增（内核据此重置标志）。
-    /// 注意不能用 pid 当代际：myPid 是应用进程号，WebView 重建也不变。
-    last_epoch: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait::async_trait]
@@ -100,8 +94,6 @@ impl DevtoolsTransport for AndroidTransport {
         if let Ok(mut slot) = self.metrics.lock() {
             *slot = Some((css_w, css_h, info.dpr));
         }
-        self.last_epoch
-            .store(info.epoch as u64, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             pid = info.pid,
             width = info.width,
@@ -177,9 +169,10 @@ impl DevtoolsTransport for AndroidTransport {
         }
     }
 
-    fn instance_generation(&self) -> u64 {
-        self.last_epoch
-            .load(std::sync::atomic::Ordering::Relaxed)
+    async fn overlay_attached(&self) -> bool {
+        tokio::task::spawn_blocking(crate::browser_overlay_attached)
+            .await
+            .unwrap_or(false)
     }
 }
 
