@@ -319,6 +319,52 @@ fn browser_scrape_loop_survives_repeated_observations_with_varied_scrolls() {
 }
 
 #[test]
+fn jd_scrape_loop_survives_repeated_evaluate_extractions() {
+    // jd-scrape 采集循环的合法序列：导航 → 提取 → 滚动 → 提取 → …（选择器
+    // 固定不变）。browser_extract 是只读：滚动（effectful）清旧指纹后可无限
+    // 重复；若被误标 effectful，第 3 次同参提取即撞熔断（codex review
+    // 2026-10-19 发现的回归）。
+    let mut status = Run::new("scrape jd search results", 32);
+    let navigate = tool_outcome(
+        "browser_navigate",
+        json!({"url": "https://so.m.jd.com/ware/search.action?keyword=keyboard"}),
+    );
+    let evaluate = tool_outcome(
+        "browser_extract",
+        json!({"selector": "[pure_item_link],[id^=link_]"}),
+    );
+    let scrolls = [
+        tool_outcome("browser_scroll", json!({"amount": 5})),
+        tool_outcome("browser_scroll", json!({"amount": 8})),
+        tool_outcome("browser_scroll", json!({"amount": 10})),
+    ];
+
+    assert!(matches!(
+        status.record_tool_calls(&navigate.tool_calls),
+        LoopDecision::Continue
+    ));
+    status.record_tool_results(&navigate, &tool_result_message("call-0", "page loaded", false));
+
+    for round in 0..6 {
+        assert!(
+            matches!(
+                status.record_tool_calls(&evaluate.tool_calls),
+                LoopDecision::Continue
+            ),
+            "第 {round} 轮提取不应触发熔断"
+        );
+        status.record_tool_results(&evaluate, &tool_result_message("eval", "{\"count\":13}", false));
+
+        let scroll = &scrolls[round % scrolls.len()];
+        assert!(matches!(
+            status.record_tool_calls(&scroll.tool_calls),
+            LoopDecision::Continue
+        ));
+        status.record_tool_results(scroll, &tool_result_message("scroll", "scrolled", false));
+    }
+}
+
+#[test]
 fn agent_status_records_read_only_tool_errors() {
     let mut status = Run::new("inspect a file", 8);
     let read = tool_outcome("read", json!({"path":"missing.txt"}));
@@ -2321,7 +2367,13 @@ fn all_direct_search_tools_are_read_only_and_summarized_consistently() {
 fn browser_observation_tools_are_read_only_while_actions_stay_effectful() {
     // 纯观察：只读当前页面，不改状态——指纹必须能被后续状态变化清除，
     // 否则采集循环里合法的反复快照会撞循环熔断（真机淘宝搜索实测）。
-    for name in ["browser_snapshot", "browser_screenshot", "browser_media"] {
+    // browser_extract 同理：jd-scrape 采集循环「滚动→同一选择器提取」每轮重跑。
+    for name in [
+        "browser_snapshot",
+        "browser_screenshot",
+        "browser_media",
+        "browser_extract",
+    ] {
         assert!(!tool_is_effectful(name), "{name} 应为只读工具");
     }
     // 改状态的动作保持 effectful：导航/点按/输入/滚动成功后才允许清旧读数。

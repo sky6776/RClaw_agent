@@ -765,9 +765,12 @@ pub(super) fn tool_is_effectful(name: &str) -> bool {
             // browser_snapshot 无参数（每次规范化输入都是 {}），采集循环里
             // 「滚动→快照」合法地反复出现，第 3 次就撞循环熔断（真机淘宝
             // 搜索实测：未登录空壳页上 3 次快照软熔断、4 次硬停）。
+            // browser_extract 同理：jd-scrape 采集循环「滚动→同一选择器提取」
+            // 每轮重跑属合法观察调用（固定模板只读，不执行模型 JS）。
             | "browser_snapshot"
             | "browser_screenshot"
             | "browser_media"
+            | "browser_extract"
     )
 }
 

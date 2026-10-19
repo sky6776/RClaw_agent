@@ -6,14 +6,15 @@
 
 | 用途 | URL |
 |---|---|
-| 搜索 | `https://search.jd.com/Search?keyword=<关键词>&enc=utf-8&page=1` |
-| 翻页 | 把已有 `page` 参数**就地替换**为新值（搜索 URL 自带 `page=1`，追加会产生 `page=1&page=2` 冲突）；翻页后 sku 集合与上页完全相同 = 到底或不支持，如实收尾 |
+| 搜索（桌面） | `https://search.jd.com/Search?keyword=<关键词>&enc=utf-8&page=1` |
+| 搜索（手机形态，手机上仅作识别、桌面可直达兜底） | `https://so.m.jd.com/ware/search.action?keyword=<关键词>&searchFrom=home`——手机上**禁止直接导航**（无来源直达命中风控），只能走首页搜索框人形路径；桌面 PC 形态遇登录墙时按 SKILL 第 1 步兜底可直达此 URL。此 URL 同时用于核对最终落点 |
+| 翻页（桌面） | 把已有 `page` 参数**就地替换**为新值（搜索 URL 自带 `page=1`，追加会产生 `page=1&page=2` 冲突）；翻页后 sku 集合与上页完全相同 = 到底或不支持，如实收尾。手机形态无翻页参数（无限滚动），不适用 |
 | 排序 | 不做 URL 参数假设——用结果页排序控件（snapshot 找「销量」「价格」按钮点击） |
-| 商品详情（规范形式） | `https://item.jd.com/<sku>.html` |
+| 商品详情（规范形式） | `https://item.jd.com/<sku>.html`；移动形态 `https://item.m.jd.com/product/<sku>.html` 同商品等价 |
 | 评论接口（best-effort） | `https://club.jd.com/comment/productPageComments.action?productId=<sku>&score=0&sortType=5&page=0&pageSize=10`（正文即 JSON 文本） |
 
 - 手机 WebView 里搜索 URL 会被重定向到 m/so.m 形态等价页，属正常，以最终 URL 内容判定成败。
-- **sku 提取**：商品链接路径里的纯数字段（正则思路：`item\.jd\.com/(\d+)\.html`；变体域名下兜底 `/(\d{6,})\.html`）。链接路径非纯数字 sku 的（如活动页、店铺页）一律丢弃，不猜。
+- **sku 提取（按宿主形态）**：手机形态商品卡走 `browser_extract` 属性提取（selector `[pure_item_link],[id^=link_]`，attributes `["pure_item_link","tourl"]`）——卡片 `id="link_<sku>"`，商品链在 `pure_item_link` 属性（`item.m.jd.com/product/<纯数字>.html`），sku 直接取 id 纯数字段；桌面形态从锚点链接路径提取（正则思路：`item\.jd\.com/(\d+)\.html`；变体域名下兜底 `/(\d{6,})\.html`）。路径非纯数字 sku 的（活动页、店铺页）一律丢弃，不猜。
 - 提取到可信 sku 后统一规范化为 `https://item.jd.com/<sku>.html`，丢弃 tracking 参数。
 
 ## 三堵墙特征（URL + 页面文本 + 标题）
@@ -21,7 +22,7 @@
 | 墙 | 特征 |
 |---|---|
 | 风控验证 | URL 主机名或**路径**含 `risk_handler`（查询参数不参与判定）；页面出现「验证一下」「快速验证」组件；标题含「京东验证」 |
-| 登录墙 | 标题含「欢迎登录」；或硬重定向到 `passport.jd.com` 且商品不可提取。页头「你好，请登录」常驻链接不算墙 |
+| 登录墙 | 标题含「欢迎登录」；或硬重定向到 `passport.jd.com`/`plogin.m.jd.com` 且商品不可提取。页头「你好，请登录」常驻链接不算墙 |
 | 异常页 | URL 主机名或**路径**含 `error`、`global.jd`（查询参数不参与判定——搜索词本身可能含这些字母） |
 
 京东搜索/列表一般无需登录（比淘宝宽松）；评论接口常要求登录——评论取不到就留空标注「接口限制」，不硬闯。
@@ -51,8 +52,8 @@
 
 | 形态 | 识别 | 处置 |
 |---|---|---|
-| 结果区持续「加载中」 | 搜索壳加载完成但无商品链接渲染 | 按异常页分支：截图留证、如实报告，不编造 |
-| 链接截断切进 sku | 链接顶满 150 字符且数字贴末尾 | 找同商品完整链接；找不到就丢条并标注「链接截断」 |
+| 结果区持续「加载中」 | 搜索壳加载完成、属性提取 `count:0` 且滚动多轮后仍 0 | 先完成软返空判定序列（滚动×2 → 排序点击×1 → 换词×1）再按风控降级收尾：截图留证、如实报告，不编造、不硬闯 |
+| 链接截断切进 sku | 桌面锚点形态：链接顶满 150 字符且数字贴末尾 | 找同商品完整链接；找不到就丢条并标注「链接截断」（手机属性提取的链接来自 DOM 属性，无此问题） |
 | 评论接口空/报错 | 正文非 JSON 或无 comments 字段 | 留空标注「评论未取到（接口限制）」，重试不超过 1 次 |
 | page 参数无效 | 翻页后 sku 集合与上一页完全相同 | 如实报告「已采集 K 个」收尾，不堆页数 |
 | 商品链接跳中间页 | 详情页 URL 路径非纯数字 sku | 按 sku 规范化 URL 重开一次，仍异常标注「链接异常」 |

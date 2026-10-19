@@ -358,7 +358,7 @@ fn append_shared_body(
             s.push('\n');
         }
     }
-    let cdp_browser_line = "- browser_*: 内置 CDP 浏览器（真实 Chromium 内核，UA 与交互已拟人化，可正常访问 Google 等风控站点）。browser_navigate 打开 URL：普通页返回标题+最终 URL+正文；搜索引擎结果页 URL 返回解析后的结果列表（标题/链接/摘要，广告已过滤）——联网检索直接 navigate 到任意引擎的搜索 URL（引擎自由选择，如 https://www.bing.com/search?q=检索词、https://www.google.com/search?q=…、https://www.baidu.com/s?wd=…）；检测到风控页/同意页会明确标注。browser_snapshot 列出可交互元素（[ref] 编号，页面跳转后需重照）；browser_click 真实鼠标点按 [ref]；browser_type 往 [ref] 输入框输入；browser_scroll 滚轮滑动（可触发懒加载）；browser_screenshot 截图存工作区 browser/；browser_close 关闭会话。适合联网搜索工具不可用、页面依赖 JS 渲染、需要点击/登录/翻页/截图的场景；每次调用较慢（数秒），常规检索仍优先联网搜索工具。\n";
+    let cdp_browser_line = "- browser_*: 内置 CDP 浏览器（真实 Chromium 内核，UA 与交互已拟人化，可正常访问 Google 等风控站点）。browser_navigate 打开 URL：普通页返回标题+最终 URL+正文；搜索引擎结果页 URL 返回解析后的结果列表（标题/链接/摘要，广告已过滤）——联网检索直接 navigate 到任意引擎的搜索 URL（引擎自由选择，如 https://www.bing.com/search?q=检索词、https://www.google.com/search?q=…、https://www.baidu.com/s?wd=…）；检测到风控页/同意页会明确标注。browser_snapshot 列出可交互元素（[ref] 编号，页面跳转后需重照）；browser_click 真实鼠标点按 [ref]；browser_type 往 [ref] 输入框输入；browser_scroll 滚轮滑动（可触发懒加载）；browser_extract 按选择器只读枚举元素及其属性/文本（页面把可点击内容渲染成无 href 元素、snapshot 看不到时的结构化提取通道）；browser_screenshot 截图存工作区 browser/；browser_close 关闭会话。适合联网搜索工具不可用、页面依赖 JS 渲染、需要点击/登录/翻页/截图的场景；每次调用较慢（数秒），常规检索仍优先联网搜索工具。\n";
     s.push_str(host.browser_tool_line(cdp_browser_line));
     s.push_str("- 审计/交叉验证完整性：来源原始值、单位、摘录、URL 和定位必须忠实来自所列证据；归一化复核值只能由审计工具计算。两个来源槽位在首次判决时锁定；判决不通过后只能修正被审计产物并重新提取，或如实保持失败并交由人工复核。禁止改写或更换既有来源、删除证据账本、反复挑选来源直到碰到有利数值，或为了让检查通过而把第二来源改成与被审计值一致。\n");
     if host.has_tool("cron_add") {

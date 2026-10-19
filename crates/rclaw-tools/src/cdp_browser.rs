@@ -1172,8 +1172,9 @@ pub struct CdpBrowser {
     session: AsyncMutex<Option<Session>>,
     /// 操作互斥：浏览器是进程级单例（对话 turn / cron turn 可能并发调工具），
     /// 「导航→等加载→提取」这类多步事务必须整体串行，否则两个并发取页会互相
-    /// 覆盖页面、各自提取到对方的 URL。
-    op: AsyncMutex<()>,
+    /// 覆盖页面、各自提取到对方的 URL。Arc 包装：browser_extract 的清理任务
+    /// 需要 'static 的锁句柄（见 evaluate）。
+    op: Arc<AsyncMutex<()>>,
     /// 会话 UA 的事件词汇判定：true = 移动端（Android UA → 合成手势 + JS
     /// 兜底 + 逐字符键盘事件），false = 桌面（鼠标/滚轮）。会话建立时由
     /// humanize 的 UA 读取更新（UA 是会话级覆写，词汇必须同源）。
@@ -1201,7 +1202,7 @@ impl CdpBrowser {
         CdpBrowser {
             transport,
             session: AsyncMutex::new(None),
-            op: AsyncMutex::new(()),
+            op: Arc::new(AsyncMutex::new(())),
             mobile_input: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1464,6 +1465,159 @@ impl CdpBrowser {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string())
+    }
+
+    /// 结构化提取（browser_extract）：只读 DOM 采集原语——按选择器枚举元素，
+    /// 读取 id、指定属性与去空白 innerText。JS 模板固定、在 Rust 侧拼装，模型
+    /// 只传选择器/属性名/skip/条数，不注入可执行 JS，从构造上保证只读（codex
+    /// review 2026-10-20 四轮：任意 JS 求值的"只读"无法用黑名单穷尽，约束
+    /// 接口才是正解）。querySelectorAll 的选择器参数不具执行能力。
+    /// skip：跳过前 N 个匹配——无限滚动页保留早先卡片，固定窗口会恒取同一批，
+    /// 由调用方按已采集条数推进窗口（codex review 2026-10-20）。
+    /// 取消安全：预提交（抢 op 锁 + 建会话）在外层 future 内，/cancel drop 即
+    /// 放弃，排队中的提取不会稍后偷跑；提交后移交 OwnedMutexGuard 进
+    /// detached worker，求值与超时清理（terminateExecution + no-op 吸收）必然
+    /// 持锁跑完，不与其他浏览器操作交错。
+    pub async fn extract(
+        self: Arc<Self>,
+        selector: &str,
+        attributes: &[String],
+        skip: usize,
+        limit: usize,
+    ) -> Result<String, String> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err("selector 不能为空".to_string());
+        }
+        let limit = limit.clamp(1, 200);
+        let selector_json = serde_json::to_string(selector).unwrap_or_default();
+        // 保留名拒绝：调用方传 "text"/"id" 会覆盖模板内建字段（codex review
+        // 2026-10-20）。
+        let attributes: Vec<String> = attributes
+            .iter()
+            .filter(|a| a.as_str() != "text" && a.as_str() != "id")
+            .take(8)
+            .cloned()
+            .collect();
+        let attrs_json = serde_json::to_string(&attributes).unwrap_or_default();
+        let script = format!(
+            r#"(function(){{
+var out=[];
+var els=document.querySelectorAll({selector_json});
+var attrs={attrs_json};
+for(var i={skip};i<els.length&&out.length<{limit};i++){{
+var el=els[i];
+// 截断按 Unicode 码点（Array.from）而非 UTF-16 单元——slice 劈开代理对会产生
+// 孤立代理，JSON.stringify 后 serde_json 拒解析（codex review 2026-10-20）。
+var cps=function(s,n){{var a=Array.from(s);return a.length>n?a.slice(0,n).join(''):s;}};
+var item={{id:cps(el.id||'',64),text:cps((el.innerText||'').replace(/\s+/g,' ').trim(),300)}};
+for(var j=0;j<attrs.length;j++){{item[attrs[j]]=cps(el.getAttribute(attrs[j])||'',300);}}
+out.push(item);
+}}
+return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}});
+}})()"#
+        );
+        // 预提交阶段（抢 op 锁 + 建会话）放在外层、可取消：turn /cancel drop
+        // 本 future 时直接放弃，不会稍后被排队执行。
+        let op_guard = self.op.clone().lock_owned().await;
+        let session = self.session().await?;
+        // 提交后的清理必须强保证：移交 OwnedMutexGuard 进 detached worker——
+        // 即使本 future 被 drop，worker 也会持锁跑完求值与清理。
+        let worker = tokio::spawn(async move {
+            let _op = op_guard;
+            let reply = match session
+                .call(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": script,
+                        "returnByValue": true
+                    }),
+                    Duration::from_secs(15),
+                )
+                .await
+            {
+                Ok(reply) => reply,
+                Err(error) => {
+                    // 超时只是本端放弃等待：渲染进程里的脚本仍在跑，会一直阻塞
+                    // 共享 WebView——显式终止当前执行；再跑一个 no-op 吸收可能
+                    // 挂起的终止状态。固定脚本无延迟回调，terminate 即恢复。
+                    if error.starts_with("CDP 命令 Runtime.evaluate 超时") {
+                        let _ = session
+                            .call(
+                                "Runtime.terminateExecution",
+                                json!({}),
+                                Duration::from_secs(3),
+                            )
+                            .await;
+                        let _ = session
+                            .call(
+                                "Runtime.evaluate",
+                                json!({ "expression": "0", "returnByValue": true }),
+                                Duration::from_secs(3),
+                            )
+                            .await;
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(exception) = reply.get("exceptionDetails") {
+                let text = exception
+                    .get("exception")
+                    .and_then(|e| e.get("description"))
+                    .and_then(Value::as_str)
+                    .or_else(|| exception.get("text").and_then(Value::as_str))
+                    .unwrap_or("未知脚本异常");
+                return Err(format!("页面脚本异常: {}", single_line(text)));
+            }
+            // 预算内截断：解析后从尾部丢完整条目，保证返回恒为合法 JSON——
+            // 文本级 truncate 会把对象拦腰截断（codex review 2026-10-20）。
+            const BUDGET: usize = 40_000;
+            let value = match reply.get("result").and_then(|r| r.get("value")) {
+                Some(Value::String(s)) => {
+                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone()))
+                }
+                Some(other) => other.clone(),
+                Some(Value::Null) | None => Value::Null,
+            };
+            if value.get("items").and_then(Value::as_array).is_some() {
+                let mut value = value;
+                while serde_json::to_string(&value).unwrap_or_default().len() > BUDGET {
+                    let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) else {
+                        break;
+                    };
+                    if items.len() <= 1 {
+                        break;
+                    }
+                    items.pop();
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("truncated".to_string(), Value::Bool(true));
+                    }
+                }
+                // 丢尾后重算 count：调用方按 items.length 推进 skip，count 与
+                // 返回条目不一致会让它静默跳过被丢弃的卡片（codex review
+                // 2026-10-20）。
+                let retained = value
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("count".to_string(), serde_json::json!(retained));
+                }
+                let text = serde_json::to_string(&value).unwrap_or_default();
+                return Ok(text);
+            }
+            let text = match reply.get("result").and_then(|r| r.get("value")) {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => serde_json::to_string(other).unwrap_or_default(),
+                Some(Value::Null) | None => "页面脚本无返回值".to_string(),
+            };
+            Ok(truncate_chars(&text, 40_000))
+        });
+        match worker.await {
+            Ok(result) => result,
+            Err(join_error) => Err(format!("extract worker: {join_error}")),
+        }
     }
 
     /// 点按 ref 元素。事件词汇随会话 UA 与挂载态分流（真机 vivo WebView83
@@ -2713,6 +2867,9 @@ pub fn register(tools: &mut crate::ToolRegistry, transport: Arc<dyn DevtoolsTran
     tools.register(Box::new(BrowserSnapshotTool {
         browser: browser.clone(),
     }));
+    tools.register(Box::new(BrowserExtractTool {
+        browser: browser.clone(),
+    }));
     tools.register(Box::new(BrowserClickTool {
         browser: browser.clone(),
     }));
@@ -2964,6 +3121,60 @@ browser_tool_impl!(
 impl BrowserSnapshotTool {
     fn input_schema_impl() -> Value {
         json!({ "type": "object", "properties": {} })
+    }
+}
+
+pub struct BrowserExtractTool {
+    browser: Arc<CdpBrowser>,
+}
+
+browser_tool_impl!(
+    BrowserExtractTool,
+    "browser_extract",
+    "CDP 浏览器：按 CSS 选择器枚举元素并读取 id、指定属性与文本（只读结构化提取）。部分站点把可点击内容渲染成无 href 的元素（如京东搜索结果页的商品卡：纯 div、商品链接只在 pure_item_link 属性里、点击走事件委托），browser_snapshot 的可交互元素清单看不到它们——用本工具按 DOM 属性取结构化数据。返回 JSON：{count, total, skip, items:[{id, text, <指定属性>…}]}，text 为去空白 innerText（截 300 字符）。skip=跳过的匹配数（无限滚动页保留早先卡片，重复提取时按已采集条数推进 skip 才能拿到新卡）；items 上限 200，超预算自动丢尾部条目并置 truncated=true。只读、不执行任何模型提供的 JS；需要交互用 browser_click/type/scroll，需要正文用 browser_navigate。",
+    async fn execute(&self, input: Value) -> ToolResult {
+        let Some(selector) = input.get("selector").and_then(Value::as_str) else {
+            return ToolResult::err("缺少参数 selector（CSS 选择器）");
+        };
+        let attributes: Vec<String> = input
+            .get("attributes")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let skip = input.get("skip").and_then(Value::as_u64).unwrap_or(0);
+        let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(100);
+        let (Ok(skip), Ok(limit)) = (usize::try_from(skip), usize::try_from(limit)) else {
+            return ToolResult::err("skip/limit 超出范围");
+        };
+        match self
+            .browser
+            .clone()
+            .extract(selector, &attributes, skip, limit)
+            .await
+        {
+            Ok(text) => ToolResult::ok(text),
+            Err(error) => ToolResult::err(error),
+        }
+    }
+);
+
+impl BrowserExtractTool {
+    fn input_schema_impl() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "selector": { "type": "string", "description": "CSS 选择器（只用于 querySelectorAll，不具执行能力）" },
+                "attributes": { "type": "array", "items": { "type": "string" }, "description": "要读取的属性名列表（可选，如 [\"pure_item_link\",\"tourl\"]）" },
+                "skip": { "type": "integer", "description": "跳过前 N 个匹配（可选；无限滚动页重复提取时推进此值拿新卡片）" },
+                "limit": { "type": "integer", "description": "最多返回条数（可选，默认 100，上限 200）" }
+            },
+            "required": ["selector"]
+        })
     }
 }
 
