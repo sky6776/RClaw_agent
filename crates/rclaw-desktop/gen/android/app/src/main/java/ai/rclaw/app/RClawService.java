@@ -34,7 +34,15 @@ public final class RClawService extends Service {
     private static final String FATAL_PROCESS_RESTART = "FATAL_PROCESS_RESTART:";
     private static final int NOTIFICATION_ID = 1001;
     private static final long HEALTH_CHECK_INTERVAL_SECONDS = 60L;
-    private static final long WAKE_LOCK_LEASE_MS = 20 * 60 * 1000L;
+    // wake lock 按需持有（此前 20 分钟租约每 10 分钟续 = CPU 永不休眠）：Doze 下
+    // 非白名单应用的 wake lock 本就被系统忽略，常驻持锁只在非 Doze 时段实打实
+    // 耗电，正是厂商「后台高耗电」杀手的识别特征。现在只在三个窗口持有：
+    // 启动装配期（低端机 Python 导入可超 60s）、turn 执行期（Rust 推送 busy）、
+    // 看门狗 tick（闹钟唤醒后把健康检查做完）。空闲期靠 WebSocket 入站包唤醒 CPU，
+    // 配合电池白名单（KeepAliveGuide）网络在 Doze 里保持可用。
+    private static final long STARTUP_WAKE_LOCK_MS = 5 * 60 * 1000L;
+    private static final long TURN_WAKE_LOCK_MS = 15 * 60 * 1000L;
+    private static final long TICK_WAKE_LOCK_MS = 10 * 1000L;
     private static final AtomicBoolean PROCESS_NATIVE_START_ATTEMPTED = new AtomicBoolean();
 
     private final AtomicBoolean startRequested = new AtomicBoolean();
@@ -55,7 +63,9 @@ public final class RClawService extends Service {
             new android.os.Handler(android.os.Looper.getMainLooper());
     private volatile boolean nativeStarted;
     private volatile long nativeStartedAtMs;
-    private PowerManager.WakeLock wakeLock;
+    private PowerManager.WakeLock startupWakeLock;
+    private PowerManager.WakeLock turnWakeLock;
+    private PowerManager.WakeLock tickWakeLock;
     private WifiManager.WifiLock wifiLock;
     private ConnectivityManager connectivityManager;
     private boolean networkRequested;
@@ -83,6 +93,14 @@ public final class RClawService extends Service {
                 CHANNEL_ID,
                 getString(R.string.runtime_channel),
                 NotificationManager.IMPORTANCE_LOW));
+        PowerManager power = getSystemService(PowerManager.class);
+        if (power == null) {
+            Log.e(TAG, "PowerManager is unavailable");
+        } else {
+            startupWakeLock = newWakeLock(power, "rclaw:startup");
+            turnWakeLock = newWakeLock(power, "rclaw:turn");
+            tickWakeLock = newWakeLock(power, "rclaw:tick");
+        }
         installCrashHandler();
         watchdogExecutor.scheduleWithFixedDelay(
                 this::checkNativeRuntime,
@@ -136,15 +154,18 @@ public final class RClawService extends Service {
             showForegroundNotification(getString(nativeStarted
                     ? R.string.runtime_running
                     : R.string.runtime_starting));
-            maintainKeepAliveResources(true);
+            maintainKeepAliveResources();
             if (nativeStarted) {
+                // 闹钟唤醒的健康检查排在 runtimeExecutor 上异步跑：系统为广播
+                // 持有的 wake lock 到 onStartCommand 返回就没了，这里自己兜 10s。
+                acquireTimed(tickWakeLock, TICK_WAKE_LOCK_MS);
                 runtimeExecutor.execute(this::checkNativeRuntime);
             }
             return START_STICKY;
         }
 
         showForegroundNotification(getString(R.string.runtime_starting));
-        maintainKeepAliveResources(keepAliveStart);
+        maintainKeepAliveResources();
         // v2：配置改动经 GUI 热启动生效，不再走「杀进程重载」。已尝试过启动的
         // 进程收到 keep-alive 类 intent 时只维持前台状态（装配失败由 GUI 展示，
         // 用户修改配置后经 ACTION_APPLY_CONFIG 显式重试）。
@@ -152,7 +173,7 @@ public final class RClawService extends Service {
             showForegroundNotification(getString(nativeStarted
                     ? R.string.runtime_running
                     : R.string.runtime_starting));
-            maintainKeepAliveResources(keepAliveStart);
+            maintainKeepAliveResources();
             return START_STICKY;
         }
         if (startRequested.compareAndSet(false, true)) {
@@ -164,12 +185,17 @@ public final class RClawService extends Service {
             showForegroundNotification(getString(nativeStarted
                     ? R.string.runtime_running
                     : R.string.runtime_starting));
-            maintainKeepAliveResources(keepAliveStart);
+            maintainKeepAliveResources();
         }
         return START_STICKY;
     }
 
     private void startNativeRuntime(boolean recoveryStart) {
+        // 启动装配期持锁：nativeStart 秒回但装配（Python 导入、通道连接）在后台
+        // 线程继续，息屏后不能被挂起。Rust 首次推送运行状态即装配完成，届时
+        // 在 updateTurnLocks 释放；失败路径在 handleStartupFailure 释放；最晚
+        // 5 分钟（= 启动截止）自动到期。
+        acquireTimed(startupWakeLock, STARTUP_WAKE_LOCK_MS);
         try {
             RuntimeAssets.installBundledSkills(this);
             PROCESS_NATIVE_START_ATTEMPTED.set(true);
@@ -215,6 +241,7 @@ public final class RClawService extends Service {
     }
 
     private void handleStartupFailure(String error, boolean recoveryStart) {
+        releaseLock(startupWakeLock);
         if (recoveryStart
                 && AppConfig.preferences(this).getBoolean("should_run", false)) {
             long delay = WatchdogScheduler.scheduleRecovery(this);
@@ -382,7 +409,9 @@ public final class RClawService extends Service {
         }
         releaseActiveNetworkRequest();
         releaseWifiLock();
-        releaseWakeLock();
+        releaseLock(startupWakeLock);
+        releaseLock(turnWakeLock);
+        releaseLock(tickWakeLock);
         runtimeExecutor.execute(() -> {
             try {
                 if (nativeStarted || PROCESS_NATIVE_START_ATTEMPTED.get()) {
@@ -397,50 +426,55 @@ public final class RClawService extends Service {
         super.onDestroy();
     }
 
-    private void maintainKeepAliveResources(boolean forceWakeLockRenewal) {
-        updateWakeLock(forceWakeLockRenewal);
-        acquireWifiLock();
+    /** 常驻资源：钉住物理网络 + 看门狗周期闹钟。wake lock / Wi-Fi 锁不在此列
+     *  （按需持有，见 STARTUP/TURN/TICK_WAKE_LOCK_MS 与 updateTurnLocks）。 */
+    private void maintainKeepAliveResources() {
         requestActiveNetwork();
         WatchdogScheduler.schedulePeriodic(this);
     }
 
-    private void updateWakeLock(boolean forceRenewal) {
-        if (wakeLock == null) {
-            PowerManager manager = getSystemService(PowerManager.class);
-            if (manager == null) {
-                Log.e(TAG, "PowerManager is unavailable");
-                return;
-            }
-            wakeLock = manager.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "rclaw:runtime-wakelock");
-            wakeLock.setReferenceCounted(false);
-        }
-        try {
-            if (forceRenewal && wakeLock.isHeld()) {
-                wakeLock.release();
-            }
-            if (!wakeLock.isHeld()) {
-                wakeLock.acquire(WAKE_LOCK_LEASE_MS);
-                Log.i(TAG, forceRenewal
-                        ? "CPU wake lock renewed for 20 minutes"
-                        : "CPU wake lock acquired for 20 minutes");
-            }
-        } catch (RuntimeException error) {
-            Log.e(TAG, "Unable to acquire CPU wake lock", error);
+    /** Rust 运行状态推送驱动的 turn 期锁：busy 期间持 CPU + Wi-Fi 锁（每次推送
+     *  续期，租约兜底），回空闲即释放。首次推送也意味着装配完成，启动期锁一并放掉。 */
+    private void updateTurnLocks(boolean busy) {
+        releaseLock(startupWakeLock);
+        if (busy) {
+            acquireTimed(turnWakeLock, TURN_WAKE_LOCK_MS);
+            acquireWifiLock();
+        } else {
+            releaseLock(turnWakeLock);
+            releaseWifiLock();
         }
     }
 
-    private void releaseWakeLock() {
-        if (wakeLock == null) {
+    private static PowerManager.WakeLock newWakeLock(PowerManager power, String tag) {
+        PowerManager.WakeLock lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, tag);
+        // 非引用计数：重复 acquire(timeout) 只是把到期时间往后推（续期），release
+        // 一次即放。
+        lock.setReferenceCounted(false);
+        return lock;
+    }
+
+    private static void acquireTimed(PowerManager.WakeLock lock, long timeoutMs) {
+        if (lock == null) {
             return;
         }
         try {
-            if (wakeLock.isHeld()) {
-                wakeLock.release();
+            lock.acquire(timeoutMs);
+        } catch (RuntimeException error) {
+            Log.e(TAG, "Unable to acquire wake lock " + lock, error);
+        }
+    }
+
+    private static void releaseLock(PowerManager.WakeLock lock) {
+        if (lock == null) {
+            return;
+        }
+        try {
+            if (lock.isHeld()) {
+                lock.release();
             }
         } catch (RuntimeException error) {
-            Log.w(TAG, "CPU wake lock was already revoked", error);
+            Log.w(TAG, "Wake lock was already revoked: " + lock, error);
         }
     }
 
@@ -526,7 +560,10 @@ public final class RClawService extends Service {
         }
         service.runtimeStatusText = text;
         service.runtimeBusy = busy;
-        service.mainHandler.post(service::renderForegroundNotification);
+        service.mainHandler.post(() -> {
+            service.updateTurnLocks(busy);
+            service.renderForegroundNotification();
+        });
     }
 
     private void showForegroundNotification(String text) {
@@ -543,6 +580,11 @@ public final class RClawService extends Service {
                 ? runtimeStatusText
                 : (lifecycleText != null ? lifecycleText : getString(R.string.runtime_starting));
         boolean busy = dynamic && runtimeBusy;
+        // 未加入电池白名单：Doze 下网络被切、wake lock 被忽略，后台通道实际不可用。
+        // 提示只进展开态大字（折叠行保持状态文案），引导到 GUI 保活卡片一键开启。
+        String bigText = KeepAliveGuide.isBatteryWhitelisted(this)
+                ? text
+                : text + "\n" + getString(R.string.keepalive_hint);
 
         Intent open = new Intent(this, MainActivity.class);
         PendingIntent openIntent = PendingIntent.getActivity(
@@ -562,7 +604,7 @@ public final class RClawService extends Service {
                 .setSmallIcon(R.drawable.ic_bagua)
                 .setContentTitle(getString(R.string.app_name))
                 .setContentText(text)
-                .setStyle(new Notification.BigTextStyle().bigText(text))
+                .setStyle(new Notification.BigTextStyle().bigText(bigText))
                 .setContentIntent(openIntent)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)

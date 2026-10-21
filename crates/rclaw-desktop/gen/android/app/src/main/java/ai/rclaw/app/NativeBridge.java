@@ -586,6 +586,36 @@ public final class NativeBridge {
         RClawService.applyRuntimeStatus(text, busy);
     }
 
+    // ------------------------------------------------------------------
+    // 保活引导（GUI「关于与设置 → 后台保活」卡片的 JNI 入口，见 KeepAliveGuide）。
+    // ------------------------------------------------------------------
+
+    /** 电池白名单 / 厂商 / 厂商自启动页可达性快照（JSON；无 context 返回 null）。 */
+    static String keepAliveStatus() {
+        android.content.Context context = appContext;
+        if (context == null) {
+            return null;
+        }
+        try {
+            return KeepAliveGuide.statusJson(context);
+        } catch (RuntimeException error) {
+            android.util.Log.e("NativeBridge", "keepAliveStatus failed", error);
+            return null;
+        }
+    }
+
+    /** 拉起系统「忽略电池优化」确认弹窗。 */
+    static boolean keepAliveRequestBatteryWhitelist() {
+        android.content.Context context = appContext;
+        return context != null && KeepAliveGuide.requestBatteryWhitelist(context);
+    }
+
+    /** 跳转厂商自启动/后台管理页（不可达时回退应用详情页）。 */
+    static boolean keepAliveOpenOemSettings() {
+        android.content.Context context = appContext;
+        return context != null && KeepAliveGuide.openOemSettings(context);
+    }
+
     /** turn 收尾提醒（独立「任务完成」通道，有声/横幅；autoCancel 点开进应用）。
      *  调用方（Rust）已按前台门闸过滤。 */
     static void notifyTurnDone(String text) {

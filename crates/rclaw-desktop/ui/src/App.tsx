@@ -38,6 +38,7 @@ import TitleBar from "./components/TitleBar";
 import MobileTopBar, { Drawer, DrawerScrim } from "./components/MobileChrome";
 import PhotoEditor from "./components/PhotoEditor";
 import CaptureDialog from "./components/CaptureDialog";
+import KeepAliveCard from "./components/KeepAliveCard";
 import { useIsMobile, isAndroidDevice } from "./lib/useIsMobile";
 import { useEdgeSwipe } from "./lib/useEdgeSwipe";
 import { installBackNavigation, useBackClose } from "./lib/backNav";
@@ -2500,6 +2501,8 @@ function About({ home }: { home: string }) {
         </div>
         {/* 检查更新（原在配置页）：版本信息紧跟着给更新入口。 */}
         <UpdateCard currentVersion={versions?.app} />
+        {/* 后台保活（仅安卓）：电池白名单 + 厂商自启动页引导。 */}
+        {isAndroidDevice() && <KeepAliveCard />}
         <div className="rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">
           <h2 className="mb-2 text-sm font-medium text-gray-200">在对话里直接用命令</h2>
           <ul className="space-y-1 text-xs leading-relaxed">

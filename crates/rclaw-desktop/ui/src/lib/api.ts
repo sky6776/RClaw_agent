@@ -355,6 +355,18 @@ export interface UpdateInfo {
   error: string | null;
 }
 
+/** 后台保活状态（keep_alive_status）。 */
+export interface KeepAliveStatus {
+  /** 是否安卓宿主；桌面恒 false（其余字段为占位值，卡片不渲染）。 */
+  supported: boolean;
+  /** 是否已加入电池优化白名单（Doze 期间网络/唤醒锁才真正生效）。 */
+  battery_whitelisted: boolean;
+  /** Build.MANUFACTURER 原值。 */
+  manufacturer: string;
+  /** 本机是否有可达的厂商自启动/后台管理页（否则按钮退化为「应用详情」）。 */
+  oem_settings: boolean;
+}
+
 /** 应用内更新进度（update_progress 事件载荷）。 */
 export interface UpdateProgress {
   phase: "download" | "install";
@@ -467,6 +479,16 @@ export const api = {
   /** 退出应用 GUI（安卓返回键在侧边栏上的「退出」语义）：结束 GUI 进程；
    *  常驻运行时由 START_STICKY 服务稍后无头拉起（keep-alive 设计，不停 agent）。 */
   appExit: () => invoke<void>("app_exit"),
+
+  /** 后台保活状态（安卓：电池白名单 / 厂商 / 厂商自启动页可达；桌面 supported=false）。 */
+  keepAliveStatus: () => invoke<KeepAliveStatus>("keep_alive_status"),
+
+  /** 拉起系统「忽略电池优化」确认弹窗；回到应用后应重查 keepAliveStatus。 */
+  keepAliveRequestBatteryWhitelist: () =>
+    invoke<void>("keep_alive_request_battery_whitelist"),
+
+  /** 跳转厂商自启动/后台管理页（不可达时回退本应用的应用详情页）。 */
+  keepAliveOpenOemSettings: () => invoke<void>("keep_alive_open_oem_settings"),
 
   /** 查询 GitHub 最新 release 并与当前版本比较。 */
   skillApprovalsPending: () => invoke<SkillApprovalItem[]>("skill_approvals_pending"),

@@ -26,6 +26,8 @@ mod home;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod insights;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
+mod keep_alive;
+#[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod media_stream;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod permissions;
@@ -126,6 +128,9 @@ pub fn run() {
             commands::copy_home_path,
             commands::open_home_dir,
             commands::app_exit,
+            keep_alive::keep_alive_status,
+            keep_alive::keep_alive_request_battery_whitelist,
+            keep_alive::keep_alive_open_oem_settings,
             commands::wizard_save,
             commands::send_message,
             commands::cancel,
