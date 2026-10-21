@@ -210,10 +210,21 @@ def ui_install(before):
 
 
 def adb_install(before):
-    """兜底：adb install -r + 弹窗轮询。返回 True=安装完成。"""
-    install = subprocess.run([ADB, "install", "-r", sys.argv[1]],
-                             capture_output=True, text=True, timeout=900)
-    print(f"[adb-install] {install.stdout.strip() or install.stderr.strip()}")
+    """兜底：adb install -r + 弹窗轮询。返回 True=安装完成。
+
+    注：adb 只认 .apk/.apex 后缀的文件名——重打包产物命名须以 .apk 收尾，
+    否则这里秒退（实测坑：`.apk.signed` 直接被拒）。
+    900s 超时（streamed install 卡 vivo 安全弹窗时会发生）按失败处理，
+    不带崩整个脚本——屏幕上的安装会话仍可人工/后续步骤接管。"""
+    try:
+        install = subprocess.run([ADB, "install", "-r", sys.argv[1]],
+                                 capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        print("[adb-install] 900s 超时（大概率卡在 vivo 安全弹窗）"
+              "——屏幕上的安装会话保持原状，可直接接管完成安装")
+        install = None
+    if install is not None:
+        print(f"[adb-install] {install.stdout.strip() or install.stderr.strip()}")
     deadline = time.time() + 360
     while time.time() < deadline:
         now = last_update_time()
