@@ -1394,9 +1394,16 @@ fn table_retriever(
     let mut stmt = conn.prepare(&sql)?;
     let mut results = Vec::new();
     let mut seen_tables = std::collections::HashSet::new();
-    let batch_limit = top_k.saturating_mul(8).clamp(32, 5000) as i64;
+    // 扫描预算：每一轮 OFFSET 分页都会让 FTS5 对全部命中行重新算 bm25、排序再跳过 offset
+    // 行，一个命中百万行的常见词配合"每表只取一行"的去重会循环上万轮、每轮全量排序，
+    // 搜索请求直接挂死。最多扫 MAX_TABLE_RETRIEVER_BATCHES 轮，超出部分的表格放弃
+    // （召回略降，可接受）；首轮批量放大到至少 256 行以减少对召回的影响。
+    const MAX_TABLE_RETRIEVER_BATCHES: usize = 4;
+    let batch_limit = top_k.saturating_mul(8).clamp(256, 5000) as i64;
     let mut offset = 0i64;
+    let mut batches = 0usize;
     loop {
+        batches += 1;
         let row_count = {
             let mut param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 param_values.iter().map(|p| p.as_ref()).collect();
@@ -1424,7 +1431,10 @@ fn table_retriever(
             row_count
         };
 
-        if results.len() >= top_k || row_count < batch_limit {
+        if results.len() >= top_k
+            || row_count < batch_limit
+            || batches >= MAX_TABLE_RETRIEVER_BATCHES
+        {
             break;
         }
         offset += row_count;

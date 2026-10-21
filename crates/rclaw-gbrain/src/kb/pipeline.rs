@@ -219,42 +219,58 @@ fn infer_segment_kind(ext: &str, block_spans: &[BlockSpan]) -> &'static str {
     "paragraph"
 }
 
-fn media_refs_for_chunk(
-    media_refs: &[MediaRef],
-    page_num: Option<i32>,
-    chunk: &str,
-) -> Vec<MediaRef> {
+/// 无页码媒体的文本探针（storage_path / alt / caption / OCR 文本），trim + 小写，与
+/// `media_refs` 一一对应；有页码的媒体按页对齐、不需要探针，留空。
+///
+/// 每个文档只算一次：原先每个 (chunk, media) 组合都重新 `to_lowercase()` 整块 chunk 和
+/// OCR 文本，几百张图 × 几万块就是上百 GB 的小写化，唯一的索引 worker 会被钉死数小时。
+fn build_media_probes(media_refs: &[MediaRef]) -> Vec<Vec<String>> {
     media_refs
         .iter()
-        .filter(|media| media_ref_matches_chunk(media, page_num, chunk))
-        .cloned()
+        .map(|media| {
+            if media.page_number.is_some() {
+                return Vec::new();
+            }
+            [
+                Some(media.storage_path.as_str()),
+                media.alt_text.as_deref(),
+                media.caption.as_deref(),
+                media.ocr_text.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|probe| !probe.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+        })
         .collect()
 }
 
-fn media_ref_matches_chunk(media: &MediaRef, page_num: Option<i32>, chunk: &str) -> bool {
-    if let Some(media_page) = media.page_number {
-        return page_num == Some(media_page);
-    }
-
-    // HTML/Markdown 通常没有页码，只能用 chunk 文本中的 URL/alt/caption/OCR 命中做节点级对齐。
-    if page_num.is_some() {
-        return false;
-    }
-    let chunk_lower = chunk.to_lowercase();
-    let mut probes: Vec<&str> = vec![media.storage_path.as_str()];
-    if let Some(s) = media.alt_text.as_deref() {
-        probes.push(s);
-    }
-    if let Some(s) = media.caption.as_deref() {
-        probes.push(s);
-    }
-    if let Some(s) = media.ocr_text.as_deref() {
-        probes.push(s);
-    }
-    probes.iter().any(|probe| {
-        let probe = probe.trim();
-        !probe.is_empty() && chunk_lower.contains(&probe.to_lowercase())
-    })
+fn media_refs_for_chunk(
+    media_refs: &[MediaRef],
+    media_probes: &[Vec<String>],
+    page_num: Option<i32>,
+    chunk: &str,
+) -> Vec<MediaRef> {
+    // chunk 只在真的需要文本对齐时小写化一次。
+    let mut chunk_lower: Option<String> = None;
+    media_refs
+        .iter()
+        .zip(media_probes)
+        .filter(|(media, probes)| {
+            if let Some(media_page) = media.page_number {
+                return page_num == Some(media_page);
+            }
+            // HTML/Markdown 通常没有页码，只能用 chunk 文本中的 URL/alt/caption/OCR 命中做节点级对齐。
+            if page_num.is_some() {
+                return false;
+            }
+            let chunk_lower = chunk_lower.get_or_insert_with(|| chunk.to_lowercase());
+            probes.iter().any(|probe| chunk_lower.contains(probe.as_str()))
+        })
+        .map(|(media, _)| media.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -598,6 +614,19 @@ fn apply_embedded_image_ocr(
 /// - 例：full_text="abcdef"、chunks ["abcd","cdef"]
 ///   若第一块后 cursor=4，第二块从 4 开始 find("cdef") 找不到，fallback 记录 4..8
 ///   正确做法：搜索第二块前回退 cursor 到 2，从 2 开始 find("cdef") 精确匹配 2..6
+/// 精确定位块时的搜索窗口：块字节长的倍数，与最小窗口字节数取大者。
+const CHUNK_LOCATE_WINDOW_FACTOR: usize = 8;
+const CHUNK_LOCATE_WINDOW_MIN_BYTES: usize = 64 * 1024;
+
+/// `index` 向前退到最近的 char 边界（`index <= text.len()`）。
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 pub fn locate_chunk_char_offsets(
     full_text: &str,
     chunks: &[String],
@@ -606,6 +635,8 @@ pub fn locate_chunk_char_offsets(
     let mut offsets = Vec::with_capacity(chunks.len());
     let mut byte_cursor: usize = 0;
     let mut char_cursor: usize = 0;
+    // 只数一次全文字符数（O(n)），供回退游标时判断是否已越过文末。
+    let total_chars = full_text.chars().count();
 
     for (i, chunk) in chunks.iter().enumerate() {
         // 搜索当前块前，按与前一块的实际 overlap 回退游标到重叠区
@@ -617,20 +648,38 @@ pub fn locate_chunk_char_offsets(
             // 例 full_text="abcdef"、chunks=["a","abcdef"]、max_overlap=1
             // 第一块后 char_cursor=1，overlap_chars=1，应回退到 0 才能精确匹配
             if overlap_chars > 0 && overlap_chars <= char_cursor {
+                // 从游标处倒退到 back_char，而不是从文本开头数到 back_char：后者每块都要
+                // 扫一遍全文，几万块的大文档会把唯一的索引 worker 钉死数小时。
+                // 不变量：byte_cursor 是第 min(char_cursor, total_chars) 个字符的字节偏移
+                // （推算路径可能把 char_cursor 推到文末之后，此时 byte_cursor == len）。
                 let back_char = char_cursor - overlap_chars;
-                byte_cursor = full_text
-                    .char_indices()
-                    .nth(back_char)
-                    .map(|(i, _)| i)
-                    .unwrap_or(full_text.len());
+                if back_char >= total_chars {
+                    byte_cursor = full_text.len();
+                } else {
+                    let chars_back = char_cursor.min(total_chars) - back_char;
+                    byte_cursor = full_text[..byte_cursor]
+                        .char_indices()
+                        .rev()
+                        .nth(chars_back - 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
                 char_cursor = back_char;
             }
         }
 
         // FIX10-R1: 先检查 byte_cursor 不越界，再尝试 find
         // find 成功 → 精确匹配路径；find 失败或 byte_cursor 越界 → fallback 推算路径
+        // 搜索窗口有界：块不是全文的精确子串时（splitter 用不同分隔符重拼了段落），
+        // 无界 find 会为每一块扫到文末，同样是 O(全文 × 块数)。窗口取块长的若干倍，
+        // 覆盖正常的分隔符漂移；超出窗口按推算偏移处理（与原本 find 失败的路径一致）。
         let found = if byte_cursor <= full_text.len() {
-            full_text[byte_cursor..].find(chunk.as_str())
+            let window_end = byte_cursor
+                .saturating_add(chunk.len().saturating_mul(CHUNK_LOCATE_WINDOW_FACTOR))
+                .max(byte_cursor.saturating_add(CHUNK_LOCATE_WINDOW_MIN_BYTES))
+                .min(full_text.len());
+            let window_end = floor_char_boundary(full_text, window_end);
+            full_text[byte_cursor..window_end].find(chunk.as_str())
         } else {
             None
         };
@@ -644,11 +693,8 @@ pub fn locate_chunk_char_offsets(
 
             // 匹配成功后，游标推进到 end_char（不回退）
             // 下一次迭代开始时会根据与当前块的 overlap 回退
-            byte_cursor = full_text
-                .char_indices()
-                .nth(end_char)
-                .map(|(i, _)| i)
-                .unwrap_or(full_text.len());
+            // 精确匹配时块就是全文的子串，终点字节 = 起点 + 块字节长，O(1)。
+            byte_cursor = (start_byte + chunk.len()).min(full_text.len());
             char_cursor = end_char;
         } else {
             // 无法找到精确位置，用推算偏移
@@ -914,11 +960,13 @@ pub fn process_document(conn: &Connection, payload: &KbProcessPayload) -> Result
         modality: infer_modality(&sync_ext),
     };
 
+    let media_probes = build_media_probes(&normalized.media_refs);
     let raptor_nodes: Vec<RaptorNode> = chunks
         .iter()
         .enumerate()
         .map(|(i, chunk)| {
-            let node_media_refs = media_refs_for_chunk(&normalized.media_refs, None, chunk);
+            let node_media_refs =
+                media_refs_for_chunk(&normalized.media_refs, &media_probes, None, chunk);
             let embedding_text = crate::kb::context::build_embedding_text(
                 &doc_title,
                 "",   // 同步管道无章节路径
@@ -1227,6 +1275,9 @@ pub async fn process_document_async(
         }
         _ => crate::kb::metadata::DocumentMetadata::default(),
     };
+    // 原始文件字节到此不再使用：提前释放（最大 kb_max_file_size_mb），别让它陪着全部
+    // 节点和向量一起撑到版本激活事务——安卓进程内存被 LMK 盯着。
+    drop(file_data);
     doc_meta.merge_with(&format_meta);
     // P1-019: 关键词和实体抽取
     let (keywords, entities) = crate::kb::metadata::extract_keywords_and_entities(
@@ -1371,7 +1422,8 @@ pub async fn process_document_async(
             let bs = s_start.unwrap_or(0) as usize;
             let be = s_end.unwrap_or(i32::MAX) as usize;
             let overlap = if chunk_start < be && chunk_end > bs {
-                chunk_end.min(be) - chunk_start.max(bs)
+                // parser 若给出 end < start 的畸形 span，这里不能下溢（debug panic / release 绕回成巨大值选错块）
+                chunk_end.min(be).saturating_sub(chunk_start.max(bs))
             } else {
                 0
             };
@@ -1407,6 +1459,7 @@ pub async fn process_document_async(
         semantic_refined: embedder.is_some(),
         modality: infer_modality(&file_ext),
     };
+    let media_probes = build_media_probes(&normalized.media_refs);
     let mut nodes: Vec<RaptorNode> = chunks
         .iter()
         .enumerate()
@@ -1440,7 +1493,8 @@ pub async fn process_document_async(
             // P1-2/P2: 媒体引用写入 node_metadata.media_refs。
             // PDF 优先按 page_number 对齐；HTML/Markdown 这类无页码文档按 chunk 文本中的
             // URL/alt/caption/OCR 命中对齐，避免文档级全量媒体污染 prompt。
-            let node_media_refs = media_refs_for_chunk(&normalized.media_refs, page_num, chunk);
+            let node_media_refs =
+                media_refs_for_chunk(&normalized.media_refs, &media_probes, page_num, chunk);
             let node_meta = serialize_node_metadata_ex(
                 &node_media_refs,
                 None,
@@ -1684,10 +1738,10 @@ pub async fn process_document_async(
             .collect();
         match emb.embed_batch(&texts).await {
             Ok(vectors) => {
-                for (i, node) in nodes.iter_mut().enumerate() {
-                    if i < vectors.len() {
-                        node.vector = Some(vectors[i].clone());
-                    }
+                // 向量按值移入节点，不再逐个 clone：几万节点 × 1536 维时 clone 会让峰值内存翻倍
+                //（安卓上整条管道本就把全部节点与向量留在内存里到版本激活事务）。
+                for (node, vector) in nodes.iter_mut().zip(vectors) {
+                    node.vector = Some(vector);
                 }
                 // 修复：中间状态更新传入 run_id，防止旧 job 污染新 run 的文档状态
                 kb.update_document_status_with_run_guard(
@@ -2743,7 +2797,9 @@ pub async fn embed_nodes_for_document_version(
                 tracing::warn!(node_id, error = %e, "写入 legacy vec_kb_nodes 失败");
             }
         }
-        KbEngine::new(conn).update_document_status_with_run_guard(
+        // 外层已在 unchecked_transaction 内：必须用不开事务的 _inner 变体（嵌套 BEGIN 会失败并
+        // 把上面刚写入的全部向量一起回滚，embedding 白付费）。
+        KbEngine::new(conn).update_document_status_with_run_guard_inner(
             document_id,
             None,
             None,

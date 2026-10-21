@@ -6,7 +6,7 @@
 //! 3. 候选的 CRUD 和审核流程
 //! 4. apply 时写入 gbrain page 并记录 provenance
 
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{GBrainError, Result};
@@ -14,6 +14,25 @@ use crate::error::{GBrainError, Result};
 use super::provenance;
 use super::store;
 use super::types::*;
+
+/// apply 时写入 review_notes 的页面正文摘要行前缀，rollback 据此确认页面未被二次修改
+const APPLIED_CONTENT_HASH_PREFIX: &str = "applied_content_hash:";
+
+/// 页面 compiled_truth 的 sha256（十六进制）。
+/// 不直接用 pages.content_hash：各写入路径（put_page / upload / sync_page_tokens_and_hash）
+/// 的 content_hash 公式并不一致，内容相同的一次重新保存就会让 hash 变化而误判为"被修改"。
+fn compiled_truth_digest(conn: &Connection, slug: &str) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let truth: Option<String> = conn
+        .query_row(
+            "SELECT compiled_truth FROM pages WHERE slug = ?1",
+            params![slug],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| GBrainError::Database(format!("读取页面内容失败: {}", e)))?;
+    Ok(truth.map(|t| format!("{:x}", Sha256::digest(t.as_bytes()))))
+}
 
 /// 从 KB 文档提取候选变更
 ///
@@ -620,15 +639,24 @@ fn apply_candidate_inner(conn: &Connection, candidate: &mut PromotionCandidate) 
     // 更新候选状态，同时记录 snapshot_version_id 到 review_notes
     // 修复：将 snapshot_version_id 附加到现有 review_notes 后面而非覆盖，
     // 保留审核备注信息（如"自动审核: 低风险高置信度"或"批量审核应用"）。
-    // 格式: {原有审核备注}\nsnapshot_version_id:{id}
-    // rollback 时按行解析首行提取 snapshot_version_id
+    // 格式: {原有审核备注}\napplied_content_hash:{hash}\nsnapshot_version_id:{id}
+    // rollback 时按行解析：最后一行取 snapshot_version_id，applied_content_hash 行用于
+    // 确认页面在 apply 之后没有再被改动（否则回滚会把后续改动一并抹掉）。
     let review_notes = match snapshot_version_id {
         Some(vid) => {
-            if candidate.review_notes.is_empty() {
-                format!("snapshot_version_id:{}", vid)
-            } else {
-                format!("{}\nsnapshot_version_id:{}", candidate.review_notes, vid)
+            let applied_hash = compiled_truth_digest(conn, &candidate.target_slug)?;
+            let mut notes = candidate.review_notes.clone();
+            if let Some(hash) = applied_hash {
+                if !notes.is_empty() {
+                    notes.push('\n');
+                }
+                notes.push_str(&format!("{APPLIED_CONTENT_HASH_PREFIX}{hash}"));
             }
+            if !notes.is_empty() {
+                notes.push('\n');
+            }
+            notes.push_str(&format!("snapshot_version_id:{}", vid));
+            notes
         }
         None => candidate.review_notes.clone(),
     };
@@ -679,16 +707,7 @@ pub fn rollback_candidate(conn: &Connection, candidate_id: i64) -> Result<Promot
     // P1 修复：校验当前 candidate 是否为该 slug 最新的 applied candidate。
     // 同一 slug 多次 apply 后，较早 candidate 的投影已被 superseded，
     // 回滚较早 candidate 会导致页面恢复旧内容但 active 投影仍指向新版本。
-    let latest_applied_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM promotion_candidates
-             WHERE target_slug = ?1 AND status = 'applied'
-             ORDER BY updated_at DESC, id DESC
-             LIMIT 1",
-            params![candidate.target_slug],
-            |row| row.get(0),
-        )
-        .ok();
+    let latest_applied_id = find_latest_applied_candidate_id(conn, &candidate.target_slug)?;
     if let Some(latest_id) = latest_applied_id {
         if latest_id != candidate.id {
             return Err(GBrainError::InvalidInput(format!(
@@ -704,6 +723,51 @@ pub fn rollback_candidate(conn: &Connection, candidate_id: i64) -> Result<Promot
         rollback_candidate_inner(conn, &mut candidate)?;
         Ok(candidate)
     })
+}
+
+/// 从 review_notes 最后一行解析 apply 时记录的 page_versions 快照 id
+fn parse_snapshot_version_id(review_notes: &str) -> Option<i64> {
+    review_notes
+        .lines()
+        .last()
+        .and_then(|line| line.strip_prefix("snapshot_version_id:"))
+        .and_then(|s| s.parse::<i64>().ok())
+}
+
+/// 同一 slug 下最后一个被 apply 的候选 id。
+/// 优先按 apply 时记录的 snapshot_version_id 排序：page_versions.id 是 AUTOINCREMENT，
+/// 严格按 apply 先后递增；而 updated_at 只有秒级精度，同一秒内先 apply 大 id 候选、
+/// 再 apply 小 id 候选时按 (updated_at, id) 会判反，配合回滚前的内容摘要校验，
+/// 会让两个候选都无法回滚。没有快照 id 的旧候选退回 (updated_at, id) 序。
+fn find_latest_applied_candidate_id(conn: &Connection, slug: &str) -> Result<Option<i64>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, review_notes FROM promotion_candidates
+             WHERE target_slug = ?1 AND status = 'applied'
+             ORDER BY updated_at DESC, id DESC",
+        )
+        .map_err(|e| GBrainError::Database(format!("查询已应用候选失败: {}", e)))?;
+    let rows = stmt
+        .query_map(params![slug], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| GBrainError::Database(format!("查询已应用候选失败: {}", e)))?;
+
+    let mut latest_by_order: Option<i64> = None;
+    let mut latest_by_snapshot: Option<(i64, i64)> = None; // (snapshot_version_id, candidate_id)
+    for row in rows {
+        let (id, notes) =
+            row.map_err(|e| GBrainError::Database(format!("读取已应用候选失败: {}", e)))?;
+        if latest_by_order.is_none() {
+            latest_by_order = Some(id);
+        }
+        if let Some(snap) = parse_snapshot_version_id(&notes) {
+            if latest_by_snapshot.is_none_or(|(best, _)| snap > best) {
+                latest_by_snapshot = Some((snap, id));
+            }
+        }
+    }
+    Ok(latest_by_snapshot.map(|(_, id)| id).or(latest_by_order))
 }
 
 /// rollback_candidate 的内部实现，在 savepoint 保护下执行
@@ -934,12 +998,7 @@ fn rollback_shadow_page_update(conn: &Connection, candidate: &PromotionCandidate
     // 避免批量 apply 同秒多候选时 rollback 拿到同页其它候选的快照。
     // snapshot_version_id 存储在 review_notes 的最后一行，格式: snapshot_version_id:{id}
     // 按行解析取最后一行
-    let snapshot_version_id: i64 = candidate
-        .review_notes
-        .lines()
-        .last()
-        .and_then(|line| line.strip_prefix("snapshot_version_id:"))
-        .and_then(|s| s.parse::<i64>().ok())
+    let snapshot_version_id: i64 = parse_snapshot_version_id(&candidate.review_notes)
         .ok_or_else(|| {
             GBrainError::Database(format!(
                 "候选 {} 缺少 snapshot_version_id，无法安全回滚",
@@ -954,6 +1013,33 @@ fn rollback_shadow_page_update(conn: &Connection, candidate: &PromotionCandidate
             |row| row.get(0),
         )
         .map_err(|e| GBrainError::Database(format!("查询页面快照失败: {}", e)))?;
+
+    // 页面在 apply 之后若又被人工 / 其它途径修改，直接覆盖会把这些改动一并抹掉：
+    // 用 apply 时记录的正文摘要与当前值比对，不一致则拒绝回滚。
+    // （没有记录摘要的旧候选无法校验，沿用原行为，但下面仍会先留快照。）
+    let applied_hash = candidate
+        .review_notes
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(APPLIED_CONTENT_HASH_PREFIX))
+        .filter(|h| !h.is_empty());
+    if let Some(applied_hash) = applied_hash {
+        let current_hash = compiled_truth_digest(conn, slug)?;
+        if current_hash.as_deref() != Some(applied_hash) {
+            return Err(GBrainError::InvalidInput(format!(
+                "页面 '{}' 在候选 {} 应用后已被修改，拒绝回滚以免覆盖后续改动；请先确认页面内容",
+                slug, candidate.id
+            )));
+        }
+    }
+
+    // 覆盖前为当前内容留一份 page_versions 快照，被回滚掉的内容可追溯
+    conn.execute(
+        "INSERT INTO page_versions (page_id, compiled_truth, frontmatter, title, page_type)
+         SELECT id, compiled_truth, frontmatter, title, page_type FROM pages WHERE slug = ?1",
+        rusqlite::params![slug],
+    )
+    .map_err(|e| GBrainError::Database(format!("创建回滚前页面快照失败: {}", e)))?;
 
     let now = now_str();
     conn.execute(

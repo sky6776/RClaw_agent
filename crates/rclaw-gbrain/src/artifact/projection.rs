@@ -997,6 +997,53 @@ pub fn find_all_kb_document_ids(conn: &Connection, artifact_id: i64) -> Result<V
     Ok(ids)
 }
 
+/// 是否仍有**其它**活跃 artifact 的活跃投影指向该 kb_document。
+///
+/// 同一来源（source_kind + source_uri）的多个 artifact 会复用同一个 kb_document
+/// （见 find_source_kb_projection_matches），删除其中一个 artifact 时不能把共享的
+/// KB 文档一并软删，否则其它 artifact 的知识直接从检索里消失。
+pub fn kb_document_shared_with_other_artifacts(
+    conn: &Connection,
+    kb_doc_id: i64,
+    artifact_id: i64,
+) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_projections p
+             JOIN source_artifacts a ON a.id = p.artifact_id
+             WHERE p.projection_type = 'kb_document'
+               AND p.projection_ref = ?1
+               AND p.status = 'active'
+               AND p.artifact_id <> ?2
+               AND a.status = 'active'
+               AND a.purged_at IS NULL",
+            params![format!("kb_document:{}", kb_doc_id), artifact_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| GBrainError::Database(format!("查询共享 kb_document 失败: {}", e)))?;
+    Ok(count > 0)
+}
+
+/// delete_artifact 实际会软删的 KB document ID：本 artifact 引用、且没有被其它活跃 artifact 共享
+pub fn find_kb_document_ids_for_delete(conn: &Connection, artifact_id: i64) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for kb_doc_id in find_all_kb_document_ids(conn, artifact_id)? {
+        if ids.contains(&kb_doc_id) {
+            continue;
+        }
+        if kb_document_shared_with_other_artifacts(conn, kb_doc_id, artifact_id)? {
+            tracing::info!(
+                kb_doc_id,
+                artifact_id,
+                "kb_document 仍被其它活跃 artifact 引用，删除 artifact 时保留该文档"
+            );
+            continue;
+        }
+        ids.push(kb_doc_id);
+    }
+    Ok(ids)
+}
+
 /// 查找 restore 操作应恢复的 KB document ID（dedup）
 ///
 /// 修复 P2：restore 只恢复 stale_reason='artifact_deleted' 的 projection，

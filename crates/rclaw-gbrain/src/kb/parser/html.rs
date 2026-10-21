@@ -388,6 +388,7 @@ fn remove_tags(html: &str, tag: &str) -> String {
     let mut pos = 0;
     // 一旦确认后面没有该标签的闭标签，后续开标签不再扫描（见 CloseSearch::NoCloseTag）
     let mut no_close_tag_left = false;
+    let mut matcher = TagMatcher::default();
 
     while pos < html.len() {
         if let Some(m) = open_re.find(&html[pos..]) {
@@ -415,7 +416,7 @@ fn remove_tags(html: &str, tag: &str) -> String {
                 pos = open_end;
             } else {
                 // 普通标签：嵌套深度追踪
-                match find_matching_close(html, open_end, &tag_lower) {
+                match matcher.find_matching_close(html, open_end, &tag_lower) {
                     CloseSearch::Found(subtree_end) => pos = subtree_end,
                     search => {
                         if matches!(search, CloseSearch::NoCloseTag) {
@@ -435,75 +436,148 @@ fn remove_tags(html: &str, tag: &str) -> String {
     result
 }
 
-/// 从 `start` 位置开始，查找与开标签匹配的闭标签位置。
-/// 使用深度计数追踪嵌套同名标签，返回匹配闭标签之后的全局偏移量。
-/// 未找到匹配时返回 None。
-/// m-15: 添加最大嵌套深度限制，防止超深层嵌套 HTML 导致 O(n²)
-const MAX_TAG_NESTING_DEPTH: usize = 256;
-
 /// `find_matching_close` 的结果：区分"没找到匹配"与"后面根本没有该标签的闭标签"，
-/// 后者可让调用方对同名标签直接短路，避免每个未闭合开标签都把剩余文本重扫一遍。
+/// 后者可让调用方对同名标签直接短路。
 enum CloseSearch {
     Found(usize),
     /// 从 `start` 起已无任何该标签的闭标签（对同一 tag、更靠后的起点同样成立）
     NoCloseTag,
-    /// 嵌套过深或闭标签数量不足
+    /// 闭标签数量不足
     Unmatched,
 }
 
-fn find_matching_close(html: &str, start: usize, tag_name: &str) -> CloseSearch {
-    let open_pat = format!(r"(?i)<{}[\s>/]", regex::escape(tag_name));
-    let close_pat = format!(r"(?i)</{}\s*>", regex::escape(tag_name));
-    let Ok(open_re) = regex::Regex::new(&open_pat) else {
-        return CloseSearch::Unmatched;
-    };
-    let Ok(close_re) = regex::Regex::new(&close_pat) else {
-        return CloseSearch::Unmatched;
-    };
+/// 同名标签开 / 闭事件的预建索引：一次正则扫描 + 前缀平衡数组，把"从某个开标签起找匹配
+/// 闭标签"降到 O(log n)。此前每个开标签都从自身位置向后逐个重扫开 / 闭标签，几千个
+/// 闭标签数量不足的 `<div class="hidden">` 就是 O(n²)，几百 KB 的畸形 HTML 能把唯一的
+/// KB worker 挂住几十秒。
+struct TagMatchIndex {
+    /// 按位置排序的事件：(start, end, is_open)
+    events: Vec<(usize, usize, bool)>,
+    /// 最后一个闭标签事件的下标
+    last_close: Option<usize>,
+    /// next_higher[k]：最小的 j > k 使得 bal[j] == bal[k] + 1，
+    /// 其中 bal[k] = 前 k 个事件里 闭标签数 − 开标签数
+    next_higher: Vec<Option<usize>>,
+}
 
-    let mut depth: usize = 1;
-    let mut pos = start;
-
-    while depth > 0 && pos < html.len() {
-        let next_open = open_re
-            .find(&html[pos..])
-            .map(|m| (pos + m.start(), pos + m.end()));
-        let next_close = close_re
-            .find(&html[pos..])
-            .map(|m| (pos + m.start(), pos + m.end()));
-
-        let closest = match (next_open, next_close) {
-            (Some(o), Some(c)) if o.0 < c.0 => (o.0, o.1, true),
-            (Some(_), Some(c)) => (c.0, c.1, false),
-            // 后面已无任何闭标签，不可能再匹配成功：立即返回。此前会继续前进直到
-            // depth > 256 才放弃，每个未闭合开标签都要把剩余文本扫 256 遍，实测 135 KB
-            // 的畸形 HTML 需要 35 s，1 MB 就是半小时以上，唯一的 KB worker 被挂死。
-            (Some(_), None) | (None, None) => {
-                return if pos == start {
-                    CloseSearch::NoCloseTag
-                } else {
-                    CloseSearch::Unmatched
-                };
-            }
-            (None, Some(c)) => (c.0, c.1, false),
-        };
-
-        if closest.2 {
-            depth += 1;
-            // m-15: 超过最大嵌套深度时停止追踪，防止恶意/畸形 HTML 导致 O(n²)
-            if depth > MAX_TAG_NESTING_DEPTH {
-                return CloseSearch::Unmatched;
-            }
-        } else {
-            depth -= 1;
-        }
-        pos = closest.1;
+impl TagMatchIndex {
+    fn build(html: &str, tag_name: &str) -> Option<Self> {
+        let open_pat = format!(r"(?i)<{}[\s>/]", regex::escape(tag_name));
+        let close_pat = format!(r"(?i)</{}\s*>", regex::escape(tag_name));
+        let open_re = regex::Regex::new(&open_pat).ok()?;
+        let close_re = regex::Regex::new(&close_pat).ok()?;
+        let mut events: Vec<(usize, usize, bool)> = open_re
+            .find_iter(html)
+            .map(|m| (m.start(), m.end(), true))
+            .collect();
+        events.extend(close_re.find_iter(html).map(|m| (m.start(), m.end(), false)));
+        Some(Self::from_events(events))
     }
 
-    if depth == 0 {
-        CloseSearch::Found(pos)
-    } else {
-        CloseSearch::Unmatched
+    /// 由（可能无序的）开 / 闭事件构建索引
+    fn from_events(mut events: Vec<(usize, usize, bool)>) -> Self {
+        events.sort_unstable_by_key(|e| e.0);
+        let last_close = events.iter().rposition(|e| !e.2);
+
+        let mut bal: Vec<i64> = Vec::with_capacity(events.len() + 1);
+        bal.push(0);
+        for &(_, _, is_open) in &events {
+            let last = bal[bal.len() - 1];
+            bal.push(if is_open { last - 1 } else { last + 1 });
+        }
+        // 从右向左记录每个平衡值最近出现的位置，即可得到"下一次达到 bal + 1"的下标
+        let mut next_higher = vec![None; bal.len()];
+        let mut last_pos: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for k in (0..bal.len()).rev() {
+            next_higher[k] = last_pos.get(&(bal[k] + 1)).copied();
+            last_pos.insert(bal[k], k);
+        }
+        Self {
+            events,
+            last_close,
+            next_higher,
+        }
+    }
+
+    /// 从 `start`（开标签之后）起以深度 1 开始计数，返回匹配闭标签之后的偏移量
+    fn find_close(&self, start: usize) -> CloseSearch {
+        let first = self.events.partition_point(|e| e.0 < start);
+        if self.last_close.is_none_or(|last| last < first) {
+            return CloseSearch::NoCloseTag;
+        }
+        match self.next_higher[first] {
+            Some(j) => CloseSearch::Found(self.events[j - 1].1),
+            None => CloseSearch::Unmatched,
+        }
+    }
+}
+
+/// 按标签名单独建索引的上限：`remove_elements_matching` 的标签名来自文档本身，
+/// 畸形 HTML 用几十万个不同标签名就能让每个名字都全文重扫一遍（O(k·n)）；
+/// 超过上限后改为一次通扫，把剩余全部标签名的索引一起建好。
+const MAX_PER_TAG_INDEXES: usize = 16;
+
+/// 通扫用的开 / 闭标签正则，与 `TagMatchIndex::build` 的按名正则逐位等价
+/// （`\w+` 贪婪后必须紧跟 `[\s>/]` / `\s*>`，不会在更短的前缀上匹配）。
+static ANY_OPEN_TAG_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"<(\w+)[\s>/]").unwrap());
+static ANY_CLOSE_TAG_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"</(\w+)\s*>").unwrap());
+
+/// 同一份 HTML 内按标签名缓存的匹配索引
+#[derive(Default)]
+struct TagMatcher {
+    indexes: std::collections::HashMap<String, Option<TagMatchIndex>>,
+    /// 已经通扫过全部标签名：不在 `indexes` 里的名字在文档中没有任何事件
+    all_built: bool,
+}
+
+impl TagMatcher {
+    fn find_matching_close(&mut self, html: &str, start: usize, tag_name: &str) -> CloseSearch {
+        if !self.indexes.contains_key(tag_name) {
+            if self.all_built {
+                return CloseSearch::NoCloseTag;
+            }
+            if self.indexes.len() >= MAX_PER_TAG_INDEXES {
+                self.build_all(html);
+                if !self.indexes.contains_key(tag_name) {
+                    return CloseSearch::NoCloseTag;
+                }
+            } else {
+                self.indexes
+                    .insert(tag_name.to_string(), TagMatchIndex::build(html, tag_name));
+            }
+        }
+        match self.indexes.get(tag_name) {
+            Some(Some(index)) => index.find_close(start),
+            _ => CloseSearch::Unmatched,
+        }
+    }
+
+    /// 一次扫描为文档里出现的所有标签名建索引（已建好的保留不动）
+    fn build_all(&mut self, html: &str) {
+        let mut grouped: std::collections::HashMap<String, Vec<(usize, usize, bool)>> =
+            std::collections::HashMap::new();
+        for cap in ANY_OPEN_TAG_RE.captures_iter(html) {
+            let m = cap.get(0).unwrap();
+            grouped
+                .entry(cap[1].to_lowercase())
+                .or_default()
+                .push((m.start(), m.end(), true));
+        }
+        for cap in ANY_CLOSE_TAG_RE.captures_iter(html) {
+            let m = cap.get(0).unwrap();
+            grouped
+                .entry(cap[1].to_lowercase())
+                .or_default()
+                .push((m.start(), m.end(), false));
+        }
+        for (name, events) in grouped {
+            self.indexes
+                .entry(name)
+                .or_insert_with(|| Some(TagMatchIndex::from_events(events)));
+        }
+        self.all_built = true;
     }
 }
 
@@ -515,6 +589,7 @@ fn remove_elements_matching(html: &str, detect: impl Fn(&str) -> bool) -> String
     let mut pos = 0;
     // 已确认后面没有闭标签的标签名：同名开标签直接保留，不再逐个重扫剩余文本
     let mut no_close_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut matcher = TagMatcher::default();
 
     while pos < html.len() {
         let Some(cap) = TAG_OPEN_RE.captures(&html[pos..]) else {
@@ -536,7 +611,7 @@ fn remove_elements_matching(html: &str, detect: impl Fn(&str) -> bool) -> String
             pos = open_end;
         } else if detect(full.as_str()) && !no_close_tags.contains(&tag_name) {
             // 非自闭合标签 + 需要删除：找匹配闭标签，跳过整棵子树
-            match find_matching_close(html, open_end, &tag_name) {
+            match matcher.find_matching_close(html, open_end, &tag_name) {
                 CloseSearch::Found(subtree_end) => pos = subtree_end,
                 search => {
                     if matches!(search, CloseSearch::NoCloseTag) {

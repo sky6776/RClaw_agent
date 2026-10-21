@@ -68,34 +68,38 @@ fn recursive_split(
     let separator = &separators[sep_idx];
     let next_separators = &separators[sep_idx + 1..];
 
-    let parts: Vec<String> = if separator.is_empty() {
-        text.chars().map(|c| c.to_string()).collect()
+    // 惰性借用切片，不把全文复制成 Vec<String>：按单字符兜底切分时原实现给每个字符分配
+    // 一个 String（10MB 无分隔符文本 ≈ 千万次堆分配、数百 MB），安卓上直接被 LMK 杀掉。
+    let parts: Box<dyn Iterator<Item = &str> + '_> = if separator.is_empty() {
+        Box::new(
+            text.char_indices()
+                .map(|(i, c)| &text[i..i + c.len_utf8()]),
+        )
     } else {
-        text.split(separator).map(|s| s.to_string()).collect()
+        Box::new(text.split(separator.as_str()))
     };
+    let separator_len = RecursiveCharSplitter::len_func(separator);
 
     let mut current_chunk = String::new();
+    // 增量维护当前块的字符数：每个 part 都重数一遍 current_chunk 是 O(文本 × chunk_size)。
+    let mut current_len = 0usize;
 
     for part in parts {
-        let part_len = RecursiveCharSplitter::len_func(&part);
+        let part_len = RecursiveCharSplitter::len_func(part);
 
         if current_chunk.is_empty() {
-            current_chunk = part.clone();
-        } else if RecursiveCharSplitter::len_func(&current_chunk)
-            + part_len
-            + RecursiveCharSplitter::len_func(separator)
-            <= chunk_size
-        {
+            current_chunk = part.to_string();
+            current_len = part_len;
+        } else if current_len + part_len + separator_len <= chunk_size {
             current_chunk.push_str(separator);
-            current_chunk.push_str(&part);
+            current_chunk.push_str(part);
+            current_len += separator_len + part_len;
         } else {
             if !current_chunk.is_empty() {
                 // 中间片段同样要受 chunk_size 约束：此前只有循环结束后的末段才会递归细分，
                 // 一个超长的非末尾 part（只有"，"的中文长句、无换行日志、minified 代码）
                 // 会原样输出，上层把本切分器当作硬上限兜底的假设因此失效。
-                if RecursiveCharSplitter::len_func(&current_chunk) > chunk_size
-                    && !next_separators.is_empty()
-                {
+                if current_len > chunk_size && !next_separators.is_empty() {
                     recursive_split(
                         &current_chunk,
                         next_separators,
@@ -104,7 +108,7 @@ fn recursive_split(
                         result,
                     );
                 } else {
-                    result.push(current_chunk.clone());
+                    result.push(std::mem::take(&mut current_chunk));
                 }
             }
             current_chunk = if chunk_overlap > 0 && !result.is_empty() {
@@ -115,14 +119,14 @@ fn recursive_split(
             } else {
                 String::new()
             };
-            current_chunk.push_str(&part);
+            current_len = RecursiveCharSplitter::len_func(&current_chunk);
+            current_chunk.push_str(part);
+            current_len += part_len;
         }
     }
 
     if !current_chunk.is_empty() {
-        if RecursiveCharSplitter::len_func(&current_chunk) > chunk_size
-            && !next_separators.is_empty()
-        {
+        if current_len > chunk_size && !next_separators.is_empty() {
             recursive_split(
                 &current_chunk,
                 next_separators,

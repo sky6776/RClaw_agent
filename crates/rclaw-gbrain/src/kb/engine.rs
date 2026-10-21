@@ -673,7 +673,36 @@ impl<'a> KbEngine<'a> {
         embedding_error: Option<&str>,
         run_id: Option<&str>,
     ) -> Result<()> {
-        self.transaction(|conn| {
+        self.transaction(|_| {
+            self.update_document_status_with_run_guard_inner(
+                id,
+                parsing_status,
+                parsing_progress,
+                parsing_error,
+                embedding_status,
+                embedding_progress,
+                embedding_error,
+                run_id,
+            )
+        })
+    }
+
+    /// 同 [`Self::update_document_status_with_run_guard`]，但不自开事务：SQLite 不支持嵌套
+    /// BEGIN，pipeline 里外层已 `unchecked_transaction` 的代码必须调用本变体，否则整个外层
+    /// 事务（已写入的向量）会随 "cannot start a transaction within a transaction" 一起回滚。
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_document_status_with_run_guard_inner(
+        &self,
+        id: i64,
+        parsing_status: Option<i32>,
+        parsing_progress: Option<i32>,
+        parsing_error: Option<&str>,
+        embedding_status: Option<i32>,
+        embedding_progress: Option<i32>,
+        embedding_error: Option<&str>,
+        run_id: Option<&str>,
+    ) -> Result<()> {
+        self.query(|conn| {
             let mut update = SqlUpdateBuilder::new();
 
             if let Some(s) = parsing_status {

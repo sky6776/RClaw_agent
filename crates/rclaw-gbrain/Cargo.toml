@@ -21,6 +21,8 @@ tracing-subscriber = { workspace = true }
 calamine = { version = "0.26", features = ["picture"] }
 csv = "1"
 dirs = "6"
+# PDF 预扫描按 lopdf 的解码路径限额解压流内容（二者本就是 lopdf 的传递依赖）
+flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 html2text = "0.13"
@@ -47,6 +49,7 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
 unicode-normalization = "0.1"
+weezl = "0.1"
 zip = "2"
 
 [dev-dependencies]

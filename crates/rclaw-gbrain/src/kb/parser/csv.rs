@@ -50,15 +50,17 @@ impl DocumentParser for CsvParser {
                             MAX_CSV_ROWS
                         )));
                     }
+                    // 列数上限对每一行都生效：flexible 模式下数据行的列数不受表头约束，
+                    // 一行 1000 万个逗号会在下面的 collect 里放大成千万个 String。
+                    if record.len() > MAX_CSV_COLUMNS {
+                        return Err(GBrainError::InvalidInput(format!(
+                            "CSV 列数 {} 超过上限 {}，请拆分文件后重试",
+                            record.len(),
+                            MAX_CSV_COLUMNS
+                        )));
+                    }
                     let fields: Vec<String> = record.iter().map(|s| s.to_string()).collect();
                     if headers.is_empty() && !fields.is_empty() {
-                        if fields.len() > MAX_CSV_COLUMNS {
-                            return Err(GBrainError::InvalidInput(format!(
-                                "CSV 列数 {} 超过上限 {}，请拆分文件后重试",
-                                fields.len(),
-                                MAX_CSV_COLUMNS
-                            )));
-                        }
                         headers = normalize_headers(&fields);
                         rows.push(headers.join("\t"));
                         continue;

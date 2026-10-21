@@ -426,8 +426,14 @@ impl<'a> ArtifactService<'a> {
                 let new_projections =
                     store::find_projections_by_artifact(conn, manual_output.artifact_id)
                         .map_err(|e| GBrainError::Database(e.to_string()))?;
+                // 只更新指向本页面的投影：同一 artifact 若还投影到其它 slug，
+                // 用本页 hash 覆盖它们的基线会让那些页面之后全部误判为冲突。
+                let page_ref = format!("brain_page:{}", slug);
                 for p in new_projections {
-                    if p.status == "active" && p.projection_type == "brain_page_update" {
+                    if p.status == "active"
+                        && p.projection_type == "brain_page_update"
+                        && p.projection_ref == page_ref
+                    {
                         store::update_projection_version_hash(conn, p.id, page_hash)
                             .map_err(|e| GBrainError::Database(e.to_string()))?;
                     }
@@ -1161,7 +1167,14 @@ impl<'a> ArtifactService<'a> {
                     })
                 } else if include_content {
                     content_mode = Some("full".to_string());
+                    // 全文输出同样要有硬上限：KB 全部 chunk 拼接或重新解析原始文件可能是几十 MB，
+                    // 原样塞进 MCP 响应会撑爆调用方上下文与进程内存；调用方可用 max_chars 放宽。
+                    let full_cap = content_options
+                        .max_chars
+                        .unwrap_or(DEFAULT_FULL_MAX_CHARS)
+                        .max(1);
                     load_artifact_content(conn, artifact_id, &a)?
+                        .map(|text| truncate_with_ellipsis(&text, full_cap))
                 } else {
                     None
                 };
@@ -1225,8 +1238,8 @@ impl<'a> ArtifactService<'a> {
             store::soft_delete_occurrences_by_artifact(conn, artifact_id)
                 .map_err(|e| GBrainError::Database(e.to_string()))?;
 
-            // 软删除关联的 kb_documents
-            let kb_doc_ids = projection::find_all_kb_document_ids(conn, artifact_id)?;
+            // 软删除关联的 kb_documents（仍被其它活跃 artifact 共享的文档保留）
+            let kb_doc_ids = projection::find_kb_document_ids_for_delete(conn, artifact_id)?;
             for kb_doc_id in kb_doc_ids {
                 crate::kb::lifecycle::soft_delete_document(conn, kb_doc_id)?;
                 provenance::mark_provenance_stale_by_kb_document(
@@ -1256,7 +1269,7 @@ impl<'a> ArtifactService<'a> {
             .map_err(|e| GBrainError::Database(e.to_string()))?
             .len() as i64;
         let kb_document_count =
-            projection::find_all_kb_document_ids(conn, artifact_id)?.len() as i64;
+            projection::find_kb_document_ids_for_delete(conn, artifact_id)?.len() as i64;
         let provenance_count =
             provenance::find_provenance_by_artifact(conn, artifact_id)?.len() as i64;
         Ok(DeleteImpactPreview {
@@ -1527,13 +1540,21 @@ impl<'a> ArtifactService<'a> {
                                 projection_key: old_proj.projection_key.clone(),
                                 projection_ref: old_proj.projection_ref.clone(),
                                 status: "active".to_string(),
+                                // brain_page_update.version_hash 是"上次写入时页面 content_hash"
+                                // 这一冲突检测基线（见 resolve_put_context）。reprocess 并不重写页面，
+                                // 所以原样沿用旧投影的基线：写成 artifact sha256 会让之后每次
+                                // artifact_put 都误判为冲突；改成当前页面 hash 则会把 reprocess 之前
+                                // 的人工修改当成基线，下一次 put 直接静默覆盖。
                                 version_hash: if proj_type == "brain_page_update" {
-                                    artifact.sha256.clone()
+                                    old_proj.version_hash.clone()
                                 } else {
                                     String::new()
                                 },
                                 stale_reason: String::new(),
-                                metadata_json: "{}".to_string(),
+                                // 保留旧投影的 metadata：brain_page_update 投影靠其中的
+                                // candidate_id 与候选关联，写成 "{}" 会让 reprocess 之后
+                                // 该候选的 rollback 永远找不到投影而失败。
+                                metadata_json: old_proj.metadata_json.clone(),
                                 superseded_by: None,
                             };
                             store::insert_projection(conn, &proj)?;
@@ -1880,6 +1901,9 @@ fn load_artifact_content(
 /// 来源：与 `query::query_focused_content_for_artifact` 内部检索预算保持一致，
 /// 调用方未显式传入 `max_chars` 时按此值兜底，避免输出失控。
 const DEFAULT_FOCUSED_MAX_CHARS: usize = 1600;
+
+/// `include_content=true` 全文模式的默认字符上限（未显式传 `max_chars` 时生效）。
+const DEFAULT_FULL_MAX_CHARS: usize = 200_000;
 
 fn load_artifact_focused_content(
     conn: &Connection,
