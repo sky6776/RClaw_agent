@@ -8,6 +8,7 @@
 
 mod bridge_executor;
 mod host_glue;
+pub mod keep_alive;
 #[cfg(unix)]
 pub mod cdp_browser;
 #[cfg(target_os = "android")]
@@ -2260,6 +2261,54 @@ pub mod jni_bridge {
         }
     }
 
+    // ------------------------------------------------------------------
+    // 保活引导（NativeBridge.keepAlive* → KeepAliveGuide），见 crate::keep_alive。
+    // ------------------------------------------------------------------
+
+    fn call_static_bool(name: &str) -> Result<bool> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .with_context(|| format!("附加 {name} 线程到 JavaVM 失败"))?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let value = env
+            .call_static_method(class, name, "()Z", &[])
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.{name} 失败: {error}")
+            })?;
+        Ok(value.z()?)
+    }
+
+    /// 保活状态 JSON（Java 无 application context 时返回 null → 报错而非空串）。
+    pub(super) fn keep_alive_status() -> Result<String> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加保活查询线程到 JavaVM 失败")?;
+        let class = native_bridge_class(&mut env)
+            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let value = env
+            .call_static_method(class, "keepAliveStatus", "()Ljava/lang/String;", &[])
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.keepAliveStatus 失败: {error}")
+            })?;
+        let object = value.l()?;
+        if object.is_null() {
+            return Err(anyhow!("应用未就绪（宿主上下文未初始化，稍后重试）"));
+        }
+        jstring_to_string(&mut env, object)
+    }
+
+    pub(super) fn keep_alive_request_battery_whitelist() -> Result<bool> {
+        call_static_bool("keepAliveRequestBatteryWhitelist")
+    }
+
+    pub(super) fn keep_alive_open_oem_settings() -> Result<bool> {
+        call_static_bool("keepAliveOpenOemSettings")
+    }
 }
 
 #[cfg(test)]

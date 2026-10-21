@@ -797,7 +797,7 @@ pub(crate) async fn assemble_apk_agent(
     );
     let session_lifecycle = agent.session_lifecycle();
     let fork_handle = agent.fork_handle();
-    tokio::spawn(agent.run());
+    let agent_task = tokio::spawn(agent.run());
     tokio::spawn(
         CronService::new(
             core.cron.clone(),
@@ -812,6 +812,9 @@ pub(crate) async fn assemble_apk_agent(
 
     // 喂 watchdog 的健康信号：装配成功置位 + 30s 心跳（v0.2.0 服务
     // checkNativeRuntime 每 60s 查 is_healthy；不喂则进程被周期性杀掉重启）。
+    // 心跳绑定 agent loop 存活：loop 退出（inbound 全部关闭）或 panic 后停止
+    // 喂心跳，150s 内看门狗判死、杀进程由闹钟按退避重启——此前心跳只证明
+    // tokio runtime 活着，agent 死了也一直「健康」。
     // 注意：gbrain 失活不再联动进程级健康信号——gbrain 工具调用超时只降级
     // 该工具（调用返回 unhealthy 错误 + 下方观察循环停机告警）；若在这里把
     // V2 标志翻 false，看门狗 60s 内杀进程，表现为「发消息后应用闪退」。
@@ -821,6 +824,11 @@ pub(crate) async fn assemble_apk_agent(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            if agent_task.is_finished() {
+                tracing::error!("Agent loop 已退出，停止喂看门狗心跳（等待进程级恢复）");
+                crate::android_boot_log("agent loop 已退出，心跳停喂");
+                break;
+            }
             rclaw_android::mark_v2_heartbeat();
         }
     });

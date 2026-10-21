@@ -8,6 +8,7 @@
     <string name="start_failed">启动失败：%1$s</string>
     <string name="config_save_failed">无法保存运行状态</string>
     <string name="stop">停止</string>
+    <string name="keepalive_hint">⚠ 未加入电池白名单：息屏后可能被系统停止。打开 RClaw →「关于与设置」→「后台保活」一键开启。</string>
     <string name="done_channel">任务完成</string>
     <string name="turn_done_title">RClaw 任务完成</string>
     <string name="browser_channel">浏览器</string>
