@@ -182,7 +182,10 @@ pub(super) async fn maybe_auto_compress(
     }
     // rapid-refill breaker：估算未从最近一次压缩的地板回升 5% 之前不再压——
     // 否则「压缩后仍超阈值」的会话（低阈值配置 / 巨型尾窗）会每迭代白耗一次摘要调用。
-    if ctx.history.in_turn_blocked_by_rapid_refill(ctx.key, estimate) {
+    if ctx
+        .history
+        .in_turn_blocked_by_rapid_refill(ctx.key, estimate)
+    {
         tracing::debug!(
             "轮内 auto compact 被 rapid-refill breaker 跳过 ({}:{})",
             ctx.key.channel,
@@ -426,7 +429,8 @@ async fn compress_head_region(
 
     // 落库 compaction boundary（本轮已持久化的尾区消息自然落在 kept 段）；
     // 失败只压内存，库中保留原历史（下次 load 再压）。
-    let (compressed_head, _persist_error) = ctx.history.persist_compaction(ctx.key, completed, true);
+    let (compressed_head, _persist_error) =
+        ctx.history.persist_compaction(ctx.key, completed, true);
 
     // 重建内存历史：compressed_head ++ 本轮尾区（含不落盘的临时上下文，整段原样保留）。
     let tail = messages.split_off(head_len);
@@ -436,9 +440,9 @@ async fn compress_head_region(
     messages.extend(tail);
     *turn_start = new_head_len;
     // rapid-refill breaker：以压缩后的估算为新地板（reactive 路径同样登记，防连压）。
-    let post_estimate =
-        ctx.history
-            .anchored_estimate(ctx.key, ctx.system, messages, ctx.schemas);
+    let post_estimate = ctx
+        .history
+        .anchored_estimate(ctx.key, ctx.system, messages, ctx.schemas);
     ctx.history.record_compression_floor(ctx.key, post_estimate);
     // 新头区 = [受保护头部] + 摘要 + 头区尾窗；被摘要化的条数 = 旧头区 - (新头区 - 摘要 1 条)。
     let summarized = head_len.saturating_sub(new_head_len.saturating_sub(1));
@@ -579,7 +583,11 @@ mod tests {
             })
         }
 
-        async fn chat_stream(&self, req: ChatRequest, _on_text: OnText) -> rclaw_llm::Result<ChatOutcome> {
+        async fn chat_stream(
+            &self,
+            req: ChatRequest,
+            _on_text: OnText,
+        ) -> rclaw_llm::Result<ChatOutcome> {
             self.chat(req).await
         }
     }
@@ -608,7 +616,10 @@ mod tests {
         )
     }
 
-    fn sink(layout: &Layout, reply: &'static str) -> (CompressionSink, Arc<StdMutex<Vec<ChatRequest>>>) {
+    fn sink(
+        layout: &Layout,
+        reply: &'static str,
+    ) -> (CompressionSink, Arc<StdMutex<Vec<ChatRequest>>>) {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let sink = CompressionSink {
             memory: MemoryStore::new(layout.clone()),
@@ -624,9 +635,17 @@ mod tests {
     fn append_turns(session: &SessionStore, start: usize, count: usize) -> Vec<i64> {
         (start..start + count)
             .map(|n| {
-                let role = if n % 2 == 1 { Role::User } else { Role::Assistant };
+                let role = if n % 2 == 1 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
                 session
-                    .append("cli", "console", &Message::plain(role, format!("消息 {n}：一些占位正文")))
+                    .append(
+                        "cli",
+                        "console",
+                        &Message::plain(role, format!("消息 {n}：一些占位正文")),
+                    )
                     .expect("写入测试消息")
             })
             .collect()
@@ -635,7 +654,14 @@ mod tests {
     async fn load_view(loader: &HistoryLoader, sink: CompressionSink) -> LoadedHistory {
         let msg = BusMessage::new("cli", "console", "本轮输入");
         match loader
-            .load(&msg, &CancellationToken::new(), "system", &[], None, Some(sink))
+            .load(
+                &msg,
+                &CancellationToken::new(),
+                "system",
+                &[],
+                None,
+                Some(sink),
+            )
             .await
             .expect("加载历史")
         {
@@ -664,20 +690,35 @@ mod tests {
         let loaded = load_view(&loader, sink(&layout, "unused").0).await;
         assert_eq!(loaded.messages.len(), 6, "按 max_history 裁剪");
         assert!(!loaded.provenance.complete, "裁掉前缀后视图不完整");
-        assert!(loaded.provenance.trimmed_summary.is_none(), "没有 boundary 就没有旧摘要");
+        assert!(
+            loaded.provenance.trimmed_summary.is_none(),
+            "没有 boundary 就没有旧摘要"
+        );
 
         // 落一条 boundary（尾窗从第 9 条起）后再追加 8 条：活动视图 = 摘要 + 第 9..22 条，
         // 裁到最后 6 条时摘要被裁掉 → 摘要正文随视图返回。
         session
-            .append_compaction("cli", "console", &context_summary_message("旧摘要正文"), None, ids[0] + 8)
+            .append_compaction(
+                "cli",
+                "console",
+                &context_summary_message("旧摘要正文"),
+                None,
+                ids[0] + 8,
+            )
             .expect("写入 boundary");
         append_turns(&session, 15, 8);
         let loaded = load_view(&loader, sink(&layout, "unused").0).await;
         assert_eq!(loaded.messages.len(), 6);
         assert!(!loaded.provenance.complete);
-        assert_eq!(loaded.provenance.trimmed_summary.as_deref(), Some("旧摘要正文"));
+        assert_eq!(
+            loaded.provenance.trimmed_summary.as_deref(),
+            Some("旧摘要正文")
+        );
         assert!(
-            loaded.messages.iter().all(|m| context_summary_body(m).is_none()),
+            loaded
+                .messages
+                .iter()
+                .all(|m| context_summary_body(m).is_none()),
             "被裁掉的摘要不在视图里"
         );
     }
@@ -707,9 +748,16 @@ mod tests {
 
         // 加载期不压缩（阈值极高），按 max_history=12 裁成后缀：旧摘要与受保护头部都被裁掉。
         let load_opts = options(12, usize::MAX);
-        let loaded = load_view(&loader(&session, &layout, &load_opts), sink(&layout, "unused").0).await;
+        let loaded = load_view(
+            &loader(&session, &layout, &load_opts),
+            sink(&layout, "unused").0,
+        )
+        .await;
         assert!(!loaded.provenance.complete);
-        assert_eq!(loaded.provenance.trimmed_summary.as_deref(), Some("旧摘要正文"));
+        assert_eq!(
+            loaded.provenance.trimmed_summary.as_deref(),
+            Some("旧摘要正文")
+        );
         let mut messages = loaded.messages;
         assert_eq!(messages.len(), 12);
         let turn_start_id = messages[0].id;
@@ -744,7 +792,10 @@ mod tests {
             maybe_auto_compress(&ctx, &mut messages, &mut turn_start).await,
             "应完成一次轮内压缩"
         );
-        assert!(!prefix_unavailable.load(Ordering::Relaxed), "前缀取回成功不置位");
+        assert!(
+            !prefix_unavailable.load(Ordering::Relaxed),
+            "前缀取回成功不置位"
+        );
 
         // 落库成功：活动视图 = [新 boundary] ++ 尾窗（从裁剪后缀的第 5 条起，keep_recent=8），
         // 没有任何受保护头部行、也没有复活被裁掉的前缀。
@@ -754,9 +805,17 @@ mod tests {
             Some("新摘要正文"),
             "首条应为新 boundary 的摘要：{view:#?}"
         );
-        assert_eq!(view[1].id, turn_start_id + 4, "尾窗起点 = 裁剪后缀的第 5 条");
+        assert_eq!(
+            view[1].id,
+            turn_start_id + 4,
+            "尾窗起点 = 裁剪后缀的第 5 条"
+        );
         assert!(view.iter().skip(1).all(|m| m.id >= turn_start_id + 4));
-        assert_eq!(view.last().unwrap().id, messages.last().unwrap().id, "本轮消息仍在尾区");
+        assert_eq!(
+            view.last().unwrap().id,
+            messages.last().unwrap().id,
+            "本轮消息仍在尾区"
+        );
 
         // 内存视图与库一致（库视图经 fold 归一后同形）：摘要 + 尾窗 + 本轮消息，
         // turn_start 指向本轮消息。
@@ -769,22 +828,40 @@ mod tests {
         let prompt = requests[0]
             .messages
             .first()
-            .and_then(|m| m.content.iter().filter_map(rclaw_core::ContentBlock::as_text).next())
+            .and_then(|m| {
+                m.content
+                    .iter()
+                    .filter_map(rclaw_core::ContentBlock::as_text)
+                    .next()
+            })
             .map(str::to_string)
             .unwrap_or_default();
-        assert!(prompt.contains("PREVIOUS COMPACTED SUMMARY"), "应为增量更新模式");
+        assert!(
+            prompt.contains("PREVIOUS COMPACTED SUMMARY"),
+            "应为增量更新模式"
+        );
         assert!(prompt.contains("旧摘要正文"), "应带上被裁掉的旧摘要");
         // 被裁掉的前缀（第 1..3、9..12 条）与头区被摘要区（第 13..16 条）都是摘要素材；
         // 尾窗（第 17 条起）与本轮消息不进；前缀里的旧摘要载体不作为正文重复出现
         // （只在 PREVIOUS 块里出现一次）。
         for n in [1, 3, 10, 12, 13, 16] {
-            assert!(prompt.contains(&format!("消息 {n}：")), "第 {n} 条应进摘要素材");
+            assert!(
+                prompt.contains(&format!("消息 {n}：")),
+                "第 {n} 条应进摘要素材"
+            );
         }
         for n in [17, 20, 24] {
-            assert!(!prompt.contains(&format!("消息 {n}：")), "第 {n} 条在尾窗，不进摘要");
+            assert!(
+                !prompt.contains(&format!("消息 {n}：")),
+                "第 {n} 条在尾窗，不进摘要"
+            );
         }
         assert!(!prompt.contains("本轮输入"), "本轮消息不进摘要");
-        assert_eq!(prompt.matches("旧摘要正文").count(), 1, "旧摘要只作为 previous_summary 出现");
+        assert_eq!(
+            prompt.matches("旧摘要正文").count(),
+            1,
+            "旧摘要只作为 previous_summary 出现"
+        );
     }
 
     /// 首条 boundary 由裁剪后缀视图上的轮内压缩产生（库里没有上一 boundary）时，会话开头
@@ -799,15 +876,30 @@ mod tests {
         // 60 条大消息（每条 ~1900 字，渲染上限内）：裁成 12 条后缀后前缀 48 条远超 transcript
         // 预算，只能部分纳入。
         for n in 1..=60usize {
-            let role = if n % 2 == 1 { Role::User } else { Role::Assistant };
+            let role = if n % 2 == 1 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
             session
-                .append("cli", "console", &Message::plain(role, format!("消息 {n}：{}", "占".repeat(1900))))
+                .append(
+                    "cli",
+                    "console",
+                    &Message::plain(role, format!("消息 {n}：{}", "占".repeat(1900))),
+                )
                 .expect("写入测试消息");
         }
         let load_opts = options(12, usize::MAX);
-        let loaded = load_view(&loader(&session, &layout, &load_opts), sink(&layout, "unused").0).await;
+        let loaded = load_view(
+            &loader(&session, &layout, &load_opts),
+            sink(&layout, "unused").0,
+        )
+        .await;
         assert!(!loaded.provenance.complete);
-        assert!(loaded.provenance.trimmed_summary.is_none(), "没有上一 boundary");
+        assert!(
+            loaded.provenance.trimmed_summary.is_none(),
+            "没有上一 boundary"
+        );
         let mut messages = loaded.messages;
         assert_eq!(messages.len(), 12);
         let mut current = Message::plain(Role::User, "本轮输入");
@@ -844,16 +936,27 @@ mod tests {
         let prompt = requests[0]
             .messages
             .first()
-            .and_then(|m| m.content.iter().filter_map(rclaw_core::ContentBlock::as_text).next())
+            .and_then(|m| {
+                m.content
+                    .iter()
+                    .filter_map(rclaw_core::ContentBlock::as_text)
+                    .next()
+            })
             .map(str::to_string)
             .unwrap_or_default();
         // 会话开头 3 条（受保护头部口径）与紧挨被摘要区的前缀尾段、被摘要区（第 49..52 条）
         // 都在素材里；前缀中段因预算让位；尾窗（第 53 条起）与本轮消息不进。
         for n in [1, 2, 3, 48, 49, 52] {
-            assert!(prompt.contains(&format!("消息 {n}：")), "第 {n} 条应进摘要素材");
+            assert!(
+                prompt.contains(&format!("消息 {n}：")),
+                "第 {n} 条应进摘要素材"
+            );
         }
         for n in [4, 5, 10, 20, 53, 60] {
-            assert!(!prompt.contains(&format!("消息 {n}：")), "第 {n} 条不应进摘要素材");
+            assert!(
+                !prompt.contains(&format!("消息 {n}：")),
+                "第 {n} 条不应进摘要素材"
+            );
         }
         assert!(!prompt.contains("本轮输入"), "本轮消息不进摘要");
         assert!(prompt.contains("更早的"), "让位的前缀应有提示：{prompt}");
@@ -871,7 +974,11 @@ mod tests {
 
         // 加载期不压缩，按 max_history=12 裁成后缀（首条 = 第 13 条）。
         let load_opts = options(12, usize::MAX);
-        let loaded = load_view(&loader(&session, &layout, &load_opts), sink(&layout, "unused").0).await;
+        let loaded = load_view(
+            &loader(&session, &layout, &load_opts),
+            sink(&layout, "unused").0,
+        )
+        .await;
         assert!(!loaded.provenance.complete);
         let mut messages = loaded.messages;
         assert_eq!(messages[0].id, ids[12]);
@@ -882,7 +989,13 @@ mod tests {
 
         // 并发 boundary：尾窗从第 15 条起 → 视图首条（第 13 条）不再在库的活动视图里。
         session
-            .append_compaction("cli", "console", &context_summary_message("并发摘要"), None, ids[14])
+            .append_compaction(
+                "cli",
+                "console",
+                &context_summary_message("并发摘要"),
+                None,
+                ids[14],
+            )
             .expect("写入并发 boundary");
 
         let turn_opts = options(12, 1);
@@ -906,8 +1019,14 @@ mod tests {
         };
         let before = messages.clone();
         assert!(!maybe_auto_compress(&ctx, &mut messages, &mut turn_start).await);
-        assert!(prefix_unavailable.load(Ordering::Relaxed), "取不回前缀应置位");
-        assert!(requests.lock().unwrap().is_empty(), "没有前缀就不该发摘要请求");
+        assert!(
+            prefix_unavailable.load(Ordering::Relaxed),
+            "取不回前缀应置位"
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "没有前缀就不该发摘要请求"
+        );
         assert_eq!(messages, before, "内存视图不改写");
         assert_eq!(turn_start, 12);
 
@@ -935,7 +1054,10 @@ mod tests {
         assert!(!reactive_compress(&ctx2, &mut messages, &mut turn_start).await);
         assert!(requests2.lock().unwrap().is_empty(), "置位后不再尝试压缩");
         assert_eq!(messages, before);
-        assert!(session2.load_all("cli", "console").unwrap().len() == 24, "没有落 boundary");
+        assert!(
+            session2.load_all("cli", "console").unwrap().len() == 24,
+            "没有落 boundary"
+        );
     }
 
     /// 回归：头区只有几条、但每条都是巨型消息（尾窗按 token 预算收到 `min_floor`）时，
@@ -950,7 +1072,11 @@ mod tests {
         // 9 条巨型消息（每条约 4000 token）：旧门槛 9 <= keep_recent(8) + 2 直接放弃。
         let ids: Vec<i64> = (1..=9)
             .map(|n| {
-                let role = if n % 2 == 1 { Role::User } else { Role::Assistant };
+                let role = if n % 2 == 1 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
                 session
                     .append(
                         "cli",
@@ -969,7 +1095,11 @@ mod tests {
             compression_threshold_tokens: usize::MAX,
             ..opts.clone()
         };
-        let loaded = load_view(&loader(&session, &layout, &load_opts), sink(&layout, "unused").0).await;
+        let loaded = load_view(
+            &loader(&session, &layout, &load_opts),
+            sink(&layout, "unused").0,
+        )
+        .await;
         assert!(loaded.provenance.complete);
         let mut messages = loaded.messages;
         assert_eq!(messages.len(), 9);
@@ -1006,7 +1136,11 @@ mod tests {
         let view = session.load_all("cli", "console").unwrap();
         assert_eq!(view[0].id, ids[0]);
         assert_eq!(view[2].id, ids[2]);
-        assert_eq!(context_summary_body(&view[3]).as_deref(), Some("新摘要正文"), "{view:#?}");
+        assert_eq!(
+            context_summary_body(&view[3]).as_deref(),
+            Some("新摘要正文"),
+            "{view:#?}"
+        );
         assert_eq!(view[4].id, ids[7], "尾窗从第 8 条起");
         assert_eq!(view.last().unwrap().id, current.id, "本轮消息仍在尾区");
 
@@ -1016,15 +1150,26 @@ mod tests {
         let prompt = requests.lock().unwrap()[0]
             .messages
             .first()
-            .and_then(|m| m.content.iter().filter_map(rclaw_core::ContentBlock::as_text).next())
+            .and_then(|m| {
+                m.content
+                    .iter()
+                    .filter_map(rclaw_core::ContentBlock::as_text)
+                    .next()
+            })
             .map(str::to_string)
             .unwrap_or_default();
         assert!(!prompt.contains("本轮输入"), "本轮消息不进摘要");
         for n in [4, 7] {
-            assert!(prompt.contains(&format!("消息 {n}：")), "第 {n} 条应进摘要素材");
+            assert!(
+                prompt.contains(&format!("消息 {n}：")),
+                "第 {n} 条应进摘要素材"
+            );
         }
         for n in [1, 3, 8, 9] {
-            assert!(!prompt.contains(&format!("消息 {n}：")), "第 {n} 条在受保护头部 / 尾窗，不进摘要");
+            assert!(
+                !prompt.contains(&format!("消息 {n}：")),
+                "第 {n} 条在受保护头部 / 尾窗，不进摘要"
+            );
         }
     }
 
@@ -1071,7 +1216,14 @@ mod tests {
             },
         ];
         for id in 3..=12 {
-            messages.push(plain(id, if id % 2 == 1 { Role::User } else { Role::Assistant }));
+            messages.push(plain(
+                id,
+                if id % 2 == 1 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+            ));
         }
         let (pruned, pruned_count) = prune_old_tool_results(&messages, 2, 0, 0);
         assert!(pruned_count >= 1, "旧 tool 输出应被摘要化");
@@ -1140,7 +1292,9 @@ mod tests {
             LlmError::StreamAborted("This model's maximum context length is 131072 tokens".into()),
             LlmError::BadStatus {
                 status: 400,
-                body: r#"{"error":{"code":"context_length_exceeded","message":"prompt is too long"}}"#.into(),
+                body:
+                    r#"{"error":{"code":"context_length_exceeded","message":"prompt is too long"}}"#
+                        .into(),
             },
             LlmError::BadStatus {
                 status: 400,

@@ -160,7 +160,9 @@ impl Provider for SwappableProvider {
         on_reasoning: OnReasoning,
     ) -> Result<ChatOutcome> {
         let provider = self.state.read().map_err(|_| lock_err())?.inner.clone();
-        provider.chat_stream_reasoning(req, on_text, on_reasoning).await
+        provider
+            .chat_stream_reasoning(req, on_text, on_reasoning)
+            .await
     }
 }
 

@@ -48,8 +48,7 @@ pub fn server(agent_root: PathBuf) -> &'static StreamServer {
                 .collect()
         };
         // 端口 0 = 内核随机分配，避免与其它本地服务冲突。
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("绑定本地流媒体端口失败");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地流媒体端口失败");
         let port = listener.local_addr().expect("读取本地端口失败").port();
         let agent_root = agent_root.canonicalize().unwrap_or(agent_root);
         std::thread::spawn(move || {
@@ -92,7 +91,11 @@ pub fn stream_url(path: &str) -> Option<String> {
 /// 扩展名白名单（与 media_base64 的媒体扩展守卫同一防御纵深）：工作区里的
 /// 非媒体文件（会话记录 / 配置等）不进 HTTP 面。
 fn is_streamable(path: &str) -> bool {
-    let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    let ext = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     STREAM_TYPES.iter().any(|(e, _)| *e == ext)
 }
 
@@ -163,7 +166,10 @@ fn parse_request(socket: &mut std::net::TcpStream) -> Option<(String, Option<(u6
     // Range: bytes=start-end（end 可省略 = 到文件尾）。
     let mut range = None;
     for line in lines {
-        if let Some(value) = line.strip_prefix("Range: ").or(line.strip_prefix("range: ")) {
+        if let Some(value) = line
+            .strip_prefix("Range: ")
+            .or(line.strip_prefix("range: "))
+        {
             if let Some(spec) = value.strip_prefix("bytes=") {
                 let mut parts = spec.trim().split('-');
                 let start = parts.next().and_then(|s| s.parse::<u64>().ok());
@@ -200,7 +206,10 @@ fn percent_decode(encoded: &str) -> Option<String> {
 
 fn handle_conn(mut socket: std::net::TcpStream) {
     let Some((path, range)) = parse_request(&mut socket) else {
-        let _ = write_all(&mut socket, b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        let _ = write_all(
+            &mut socket,
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        );
         return;
     };
     let server = match SERVER.get() {
@@ -209,15 +218,24 @@ fn handle_conn(mut socket: std::net::TcpStream) {
     };
     // 请求期复验扩展名（URL 可能被手工构造）：非媒体文件一律 404。
     if !is_streamable(&path) {
-        let _ = write_all(&mut socket, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        let _ = write_all(
+            &mut socket,
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        );
         return;
     }
     let Some(full) = resolve_media_path(&server.agent_root, &path) else {
-        let _ = write_all(&mut socket, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        let _ = write_all(
+            &mut socket,
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        );
         return;
     };
     let Ok(meta) = std::fs::metadata(&full) else {
-        let _ = write_all(&mut socket, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        let _ = write_all(
+            &mut socket,
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        );
         return;
     };
     let total = meta.len();

@@ -1145,7 +1145,11 @@ pub(super) fn compute_tail_start_after_head(
     if let Some(lu) = last_real_user_index(history) {
         let anchored_tail_fits = policy.token_budget == 0
             || lu >= start
-            || history[lu..].iter().map(estimate_message_tokens).sum::<usize>() <= soft_ceiling;
+            || history[lu..]
+                .iter()
+                .map(estimate_message_tokens)
+                .sum::<usize>()
+                <= soft_ceiling;
         if anchored_tail_fits {
             start = start.min(lu);
         }
@@ -1456,8 +1460,14 @@ pub(super) fn merge_prefix_into_summary_material(
         }
     };
     let opening_len = opening_len.min(prefix.len());
-    let opening: Vec<Message> = prefix[..opening_len].iter().filter_map(strip_carrier).collect();
-    let rest: Vec<Message> = prefix[opening_len..].iter().filter_map(strip_carrier).collect();
+    let opening: Vec<Message> = prefix[..opening_len]
+        .iter()
+        .filter_map(strip_carrier)
+        .collect();
+    let rest: Vec<Message> = prefix[opening_len..]
+        .iter()
+        .filter_map(strip_carrier)
+        .collect();
     let prefix_total = opening.len() + rest.len();
     // 预留让位提示那一条的体量（按最大可能条数估；它的下标是 `opening_kept`，按上界
     // `opening.len()` 估编号位数，实际只会更少），保证最终 transcript 不会反过来省略被摘要区。
@@ -1519,13 +1529,19 @@ pub(super) fn latest_user_input_verbatim(
     rendered: &RenderedTranscript,
 ) -> Option<LatestUserInput> {
     let idx = last_real_user_index(messages)?;
-    let texts: Vec<&str> = messages[idx].content.iter().filter_map(|b| b.as_text()).collect();
+    let texts: Vec<&str> = messages[idx]
+        .content
+        .iter()
+        .filter_map(|b| b.as_text())
+        .collect();
     let text = texts.join("\n");
     if text.trim().is_empty() {
         return None;
     }
     let fully_in_transcript = rendered.fully_rendered(idx)
-        && texts.iter().all(|t| t.chars().count() <= TRANSCRIPT_TEXT_MAX_CHARS);
+        && texts
+            .iter()
+            .all(|t| t.chars().count() <= TRANSCRIPT_TEXT_MAX_CHARS);
     if fully_in_transcript {
         return None;
     }

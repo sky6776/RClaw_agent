@@ -6,7 +6,10 @@
 
 // release 构建按 GUI 子系统链接：双击运行不弹控制台框；debug 构建保留
 // console 子系统，`cargo run` 时日志仍直接可见。
-#![cfg_attr(all(not(debug_assertions), not(target_os = "android")), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), not(target_os = "android")),
+    windows_subsystem = "windows"
+)]
 
 #[cfg(not(target_os = "android"))]
 fn main() {

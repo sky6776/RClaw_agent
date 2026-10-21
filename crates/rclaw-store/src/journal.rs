@@ -157,11 +157,9 @@ impl JournalStore {
     pub fn kv_get(&self, key: &str) -> Result<Option<Value>> {
         self.db.with(|conn| {
             let text: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM kv WHERE key = ?1",
-                    params![key],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |row| {
+                    row.get(0)
+                })
                 .optional()?;
             Ok(text.and_then(|t| match serde_json::from_str(&t) {
                 Ok(v) => Some(v),
@@ -265,7 +263,10 @@ mod tests {
         assert_eq!(j.append(JOURNAL_PLAN, "p1", &json!({"e": 1})).unwrap(), 1);
         assert_eq!(j.append(JOURNAL_PLAN, "p1", &json!({"e": 2})).unwrap(), 2);
         assert_eq!(j.append(JOURNAL_PLAN, "p2", &json!({"e": 1})).unwrap(), 1);
-        assert_eq!(j.append(JOURNAL_WORKFLOW, "p1", &json!({"w": 1})).unwrap(), 1);
+        assert_eq!(
+            j.append(JOURNAL_WORKFLOW, "p1", &json!({"w": 1})).unwrap(),
+            1
+        );
 
         let p1 = j.load(JOURNAL_PLAN, "p1").unwrap();
         assert_eq!(p1.len(), 2);
@@ -284,7 +285,10 @@ mod tests {
             j.load_tail(JOURNAL_PLAN, "p1", 2).unwrap(),
             vec![(2, json!({"e": 2})), (3, json!({"e": 3}))]
         );
-        assert_eq!(j.load_tail(JOURNAL_PLAN, "p1", 10).unwrap(), j.load(JOURNAL_PLAN, "p1").unwrap());
+        assert_eq!(
+            j.load_tail(JOURNAL_PLAN, "p1", 10).unwrap(),
+            j.load(JOURNAL_PLAN, "p1").unwrap()
+        );
         assert!(j.load_tail(JOURNAL_PLAN, "nope", 5).unwrap().is_empty());
     }
 
@@ -303,9 +307,12 @@ mod tests {
     #[test]
     fn kv_delete_if_only_removes_the_expected_value() {
         let (_dir, j) = store();
-        j.kv_set("k", &json!({"created_at": 1, "objective": "A"})).unwrap();
+        j.kv_set("k", &json!({"created_at": 1, "objective": "A"}))
+            .unwrap();
         // 值不符（目标已被 /goal 换掉）：不删，返回 false。
-        assert!(!j.kv_delete_if("k", &json!({"created_at": 0, "objective": "A"})).unwrap());
+        assert!(!j
+            .kv_delete_if("k", &json!({"created_at": 0, "objective": "A"}))
+            .unwrap());
         assert!(j.kv_get("k").unwrap().is_some());
         // 值一致（读回的 Value 再序列化与库内文本逐字节一致）：原子删除。
         let current = j.kv_get("k").unwrap().unwrap();
@@ -321,7 +328,8 @@ mod tests {
         let layout = Layout::new(dir.path().join("agent"));
         let session = crate::SessionStore::open(layout).unwrap();
         let j = session.journal();
-        j.append(JOURNAL_TEAM_STATE, "", &json!({"teams": {}})).unwrap();
+        j.append(JOURNAL_TEAM_STATE, "", &json!({"teams": {}}))
+            .unwrap();
         // 第二个连接打开同一 state.sqlite：事务已提交，立即可见。
         let again = JournalStore::open(session.layout()).unwrap();
         assert_eq!(again.load(JOURNAL_TEAM_STATE, "").unwrap().len(), 1);
@@ -333,13 +341,12 @@ mod tests {
         j.append(JOURNAL_PLAN, "p", &json!({"ok": 1})).unwrap();
         j.kv_set("k", &json!({"ok": 1})).unwrap();
         // 直接篡改落库内容，模拟损坏。
-        j.db
-            .with(|conn| {
-                conn.execute("UPDATE journal_event SET payload = '{not json'", [])?;
-                conn.execute("UPDATE kv SET value = '{not json'", [])?;
-                Ok(())
-            })
-            .unwrap();
+        j.db.with(|conn| {
+            conn.execute("UPDATE journal_event SET payload = '{not json'", [])?;
+            conn.execute("UPDATE kv SET value = '{not json'", [])?;
+            Ok(())
+        })
+        .unwrap();
         assert!(j.load(JOURNAL_PLAN, "p").unwrap().is_empty());
         assert_eq!(j.latest(JOURNAL_PLAN, "p").unwrap(), None);
         assert!(j.exists(JOURNAL_PLAN, "p").unwrap(), "行仍在，只是不可解析");
@@ -367,14 +374,18 @@ mod tests {
             (Some(2), "resolved")
         );
         // 另一条连接（另一进程的等价物）再试：读到的是已提交的应答 → 不写。
-        let other = JournalStore::open(&Layout::new(j.db.path().parent().unwrap().to_path_buf()))
-            .unwrap();
+        let other =
+            JournalStore::open(&Layout::new(j.db.path().parent().unwrap().to_path_buf())).unwrap();
         assert_eq!(
             other.append_guarded(JOURNAL_PLAN, "p", resolve).unwrap(),
             (None, "already_resolved")
         );
         assert_eq!(j.load(JOURNAL_PLAN, "p").unwrap().len(), 2, "只有一条应答");
         // 不写的分支不会占用 seq。
-        assert_eq!(j.append(JOURNAL_PLAN, "p", &json!({"event": "done"})).unwrap(), 3);
+        assert_eq!(
+            j.append(JOURNAL_PLAN, "p", &json!({"event": "done"}))
+                .unwrap(),
+            3
+        );
     }
 }

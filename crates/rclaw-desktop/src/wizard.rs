@@ -157,7 +157,10 @@ mod tests {
         assert_eq!(entry.model.as_deref(), Some("glm-5.3-flash"));
         assert_eq!(entry.api_key.as_deref(), Some("sk-test-123"));
         assert_eq!(entry.context_length, 131_072);
-        assert_eq!(cfg.llm.max_tokens, 128_000, "向导应显式写 max_tokens（默认 4096 会被推理模型思考打爆）");
+        assert_eq!(
+            cfg.llm.max_tokens, 128_000,
+            "向导应显式写 max_tokens（默认 4096 会被推理模型思考打爆）"
+        );
         assert!(cfg.agent.session_compression, "会话自动压缩应默认显式开启");
         assert!(cfg.agent.auto_memory, "自进化记忆应默认开启");
         assert!(cfg.agent.auto_evolve, "自进化应默认开启");

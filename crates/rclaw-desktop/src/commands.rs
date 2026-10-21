@@ -14,7 +14,6 @@ use crate::home;
 use crate::state::AppState;
 use crate::wizard::{self, WizardParams};
 
-
 // ---------------------------------------------------------------------------
 // 检查更新：GitHub releases（安卓装 APK、Windows 换单文件 exe，应用内直接
 // 下载并触发安装；进度经 update_progress 事件推给前端）。
@@ -122,8 +121,8 @@ pub async fn update_check(app: AppHandle) -> Result<UpdateInfo, String> {
         .await
         .map_err(|e| format!("解析 release JSON 失败: {e}"))?;
     let latest = release.tag_name.trim_start_matches('v').to_string();
-    let has_newer =
-        version_cmp(&parse_version(&latest), &parse_version(&current)) == std::cmp::Ordering::Greater;
+    let has_newer = version_cmp(&parse_version(&latest), &parse_version(&current))
+        == std::cmp::Ordering::Greater;
     let mut notes = release.body;
     if let Some(body) = notes.as_mut() {
         body.truncate(2000);
@@ -812,7 +811,9 @@ pub async fn chat_fork(
         return Err(format!("非法会话 id: {chat_id}"));
     }
     let fork = state.fork().ok_or("agent 尚未启动")?;
-    let outcome = fork.fork_chat(CHANNEL_DESKTOP, &chat_id, anchor_message_id).await?;
+    let outcome = fork
+        .fork_chat(CHANNEL_DESKTOP, &chat_id, anchor_message_id)
+        .await?;
     Ok(ChatForkDto {
         chat_id: outcome.new_chat_id,
         copied: outcome.copied,
@@ -1008,7 +1009,11 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
                         .get("awaiting_verdict")
                         .and_then(serde_json::Value::as_bool)
                         == Some(true);
-                    step.status = if awaiting { "verifying".into() } else { outcome.to_string() };
+                    step.status = if awaiting {
+                        "verifying".into()
+                    } else {
+                        outcome.to_string()
+                    };
                     step.summary = summary.chars().take(160).collect();
                 }
             }
@@ -1032,7 +1037,11 @@ fn project_plan_events(plan: &mut PlanDto, events: &[(u64, serde_json::Value)]) 
                 let exhausted =
                     event.get("exhausted").and_then(serde_json::Value::as_bool) == Some(true);
                 if let Some(step) = plan.steps.iter_mut().find(|s| s.id == id) {
-                    step.status = if exhausted { "failed".into() } else { "pending".into() };
+                    step.status = if exhausted {
+                        "failed".into()
+                    } else {
+                        "pending".into()
+                    };
                     let reasons = event
                         .get("reasons")
                         .and_then(serde_json::Value::as_array)
@@ -1969,10 +1978,7 @@ pub fn config_import_raw_for(home: &std::path::Path, content: &str) -> Result<()
         .map_err(|e| format!("rclaw.toml 解析失败: {e}"))?;
     rclaw_cli::config::Config::parse_str(content)
         .map_err(|e| format!("导入被校验拒绝（未写入文件）: {e}"))?;
-    validate_provider_names(
-        content,
-        ["llm.provider", "llm.review_provider"].into_iter(),
-    )?;
+    validate_provider_names(content, ["llm.provider", "llm.review_provider"].into_iter())?;
     rclaw_store::RclawToml::new(home.join("rclaw.toml")).write_text(content)
 }
 
@@ -2520,12 +2526,27 @@ mod tests {
         // 叶子就是条目本身（父目录 canonical + 原名），供 delete/rename 直接操作。
         assert_eq!(canon, base.join("media").join("a.txt"));
         // 穿越 / 反斜杠 / 绝对路径 / 空路径 / `.` / 空分量 / 不存在一律拒绝。
-        for bad in ["../a.txt", "a\\b", "/etc/passwd", "", ".", "media/", "media//a.txt", "nope.txt"] {
-            assert!(super::resolve_workspace_entry(&root, bad).is_err(), "{bad:?}");
+        for bad in [
+            "../a.txt",
+            "a\\b",
+            "/etc/passwd",
+            "",
+            ".",
+            "media/",
+            "media//a.txt",
+            "nope.txt",
+        ] {
+            assert!(
+                super::resolve_workspace_entry(&root, bad).is_err(),
+                "{bad:?}"
+            );
         }
         #[cfg(windows)]
         for bad in ["C:evil", "media/a.txt:ads", "media/a.txt.", "media /a.txt"] {
-            assert!(super::resolve_workspace_entry(&root, bad).is_err(), "{bad:?}");
+            assert!(
+                super::resolve_workspace_entry(&root, bad).is_err(),
+                "{bad:?}"
+            );
         }
         #[cfg(unix)]
         {
@@ -2533,7 +2554,10 @@ mod tests {
             std::os::unix::fs::symlink(root.join("media/a.txt"), root.join("media/link")).unwrap();
             let (base, entry) = super::resolve_workspace_entry(&root, "media/link").unwrap();
             assert_eq!(entry, base.join("media").join("link"));
-            assert!(std::fs::symlink_metadata(&entry).unwrap().file_type().is_symlink());
+            assert!(std::fs::symlink_metadata(&entry)
+                .unwrap()
+                .file_type()
+                .is_symlink());
             // 复制要读内容：跟随后仍在工作区内的普通文件才放行。
             assert_eq!(
                 super::resolve_workspace_file_content(&base, &entry).unwrap(),
@@ -2544,7 +2568,8 @@ mod tests {
             let (base, entry) = super::resolve_workspace_entry(&root, "media/escape").unwrap();
             assert!(super::resolve_workspace_file_content(&base, &entry).is_err());
             std::fs::write(root.join("state.sqlite"), b"db").unwrap();
-            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("media/dblink")).unwrap();
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("media/dblink"))
+                .unwrap();
             let (base, entry) = super::resolve_workspace_entry(&root, "media/dblink").unwrap();
             assert_eq!(
                 super::resolve_workspace_file_content(&base, &entry).unwrap_err(),
@@ -2579,8 +2604,18 @@ mod tests {
             super::resolve_agent_path(home, "uploads/sub/clip.mp4").unwrap(),
             canonical_root.join("uploads").join("sub").join("clip.mp4")
         );
-        assert_eq!(super::resolve_agent_path(home, "state.sqlite").unwrap_err(), super::STATE_DB_PROTECTED);
-        for bad in ["../agent/notes.md", "uploads/../../x", "/etc/passwd", "missing.md", "", "a\\b"] {
+        assert_eq!(
+            super::resolve_agent_path(home, "state.sqlite").unwrap_err(),
+            super::STATE_DB_PROTECTED
+        );
+        for bad in [
+            "../agent/notes.md",
+            "uploads/../../x",
+            "/etc/passwd",
+            "missing.md",
+            "",
+            "a\\b",
+        ] {
             assert!(super::resolve_agent_path(home, bad).is_err(), "{bad:?}");
         }
         // 采集产物入口：必须落在 uploads/ 之内；uploads 本身、工作区别处、数据库都不行。
@@ -2588,18 +2623,31 @@ mod tests {
             super::resolve_upload_path(home, "uploads/photo.jpg").unwrap(),
             canonical_root.join("uploads").join("photo.jpg")
         );
-        for bad in ["uploads", "uploads/", "notes.md", "state.sqlite", "uploads/../notes.md", "uploads/nope.jpg"] {
+        for bad in [
+            "uploads",
+            "uploads/",
+            "notes.md",
+            "state.sqlite",
+            "uploads/../notes.md",
+            "uploads/nope.jpg",
+        ] {
             assert!(super::resolve_upload_path(home, bad).is_err(), "{bad:?}");
         }
         #[cfg(unix)]
         {
             // uploads/ 里指向数据库 / 工作区外的链接：按真实落点判，一律拒绝；指向 uploads/
             // 内文件的链接放行（落点仍在 uploads/ 内）。
-            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("uploads/dblink")).unwrap();
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("uploads/dblink"))
+                .unwrap();
             std::os::unix::fs::symlink("/etc/passwd", root.join("uploads/escape")).unwrap();
-            std::os::unix::fs::symlink(root.join("notes.md"), root.join("uploads/outside")).unwrap();
-            std::os::unix::fs::symlink(root.join("uploads/photo.jpg"), root.join("uploads/inside")).unwrap();
-            assert_eq!(super::resolve_upload_path(home, "uploads/dblink").unwrap_err(), super::STATE_DB_PROTECTED);
+            std::os::unix::fs::symlink(root.join("notes.md"), root.join("uploads/outside"))
+                .unwrap();
+            std::os::unix::fs::symlink(root.join("uploads/photo.jpg"), root.join("uploads/inside"))
+                .unwrap();
+            assert_eq!(
+                super::resolve_upload_path(home, "uploads/dblink").unwrap_err(),
+                super::STATE_DB_PROTECTED
+            );
             assert!(super::resolve_upload_path(home, "uploads/escape").is_err());
             assert!(super::resolve_upload_path(home, "uploads/outside").is_err());
             assert_eq!(
@@ -2611,30 +2659,79 @@ mod tests {
 
     #[test]
     fn workspace_rel_paths_are_plain_segments() {
-        for ok in ["a.md", "dir/sub/x.txt", "名字.md", "a..b.md", "state.sqlite"] {
+        for ok in [
+            "a.md",
+            "dir/sub/x.txt",
+            "名字.md",
+            "a..b.md",
+            "state.sqlite",
+        ] {
             assert!(super::validate_workspace_rel_path(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "", ".", "..", "../x", "a/../b", "a/./b/..", "/abs", "a\\b", "a//b", "a/", "tab\tx",
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/../b",
+            "a/./b/..",
+            "/abs",
+            "a\\b",
+            "a//b",
+            "a/",
+            "tab\tx",
             "\\\\?\\C:\\x",
         ] {
             assert!(super::validate_workspace_rel_path(bad).is_err(), "{bad:?}");
         }
         #[cfg(windows)]
-        for bad in ["C:evil", "a:b", "a/b.", "a /b", "a<b", "a|b", "a?b", "a*b", "a\"b"] {
+        for bad in [
+            "C:evil", "a:b", "a/b.", "a /b", "a<b", "a|b", "a?b", "a*b", "a\"b",
+        ] {
             assert!(super::validate_workspace_rel_path(bad).is_err(), "{bad:?}");
         }
         // Windows DOS 设备名：分量主干（第一个点之前）命中即拒，不分大小写；类 Unix 是普通名。
         #[cfg(windows)]
         {
-            for bad in ["con", "CON", "nul.md", "dir/Com1/x.txt", "lpt9.log", "aux.tar.gz", "prn", "COM¹.md", "dir/lpt³/x.txt"] {
+            for bad in [
+                "con",
+                "CON",
+                "nul.md",
+                "dir/Com1/x.txt",
+                "lpt9.log",
+                "aux.tar.gz",
+                "prn",
+                "COM¹.md",
+                "dir/lpt³/x.txt",
+            ] {
                 assert!(super::validate_workspace_rel_path(bad).is_err(), "{bad:?}");
             }
             // 上标数字 ¹²³ 也是设备名尾字符（按字符数而非字节数判断）。
-            for bad in ["con", "CON", "nul.md", "Com1", "lpt9.log", "aux.tar.gz", "prn", "COM¹", "com²", "LPT³.txt"] {
+            for bad in [
+                "con",
+                "CON",
+                "nul.md",
+                "Com1",
+                "lpt9.log",
+                "aux.tar.gz",
+                "prn",
+                "COM¹",
+                "com²",
+                "LPT³.txt",
+            ] {
                 assert!(super::validate_entry_name(bad).is_err(), "{bad:?}");
             }
-            for ok in ["console.md", "com10.txt", "com0", "nulls", "lpt", "aux-notes.md", "prnt", "com⁴", "lpt¹x"] {
+            for ok in [
+                "console.md",
+                "com10.txt",
+                "com0",
+                "nulls",
+                "lpt",
+                "aux-notes.md",
+                "prnt",
+                "com⁴",
+                "lpt¹x",
+            ] {
                 assert!(super::validate_workspace_rel_path(ok).is_ok(), "{ok}");
                 assert!(super::validate_entry_name(ok).is_ok(), "{ok}");
             }
@@ -2647,7 +2744,13 @@ mod tests {
 
     #[test]
     fn state_db_names_and_entries_are_recognized_case_insensitively() {
-        for name in ["state.sqlite", "STATE.SQLITE", "State.SQLite-wal", "state.sqlite-shm", "state.sqlite-journal"] {
+        for name in [
+            "state.sqlite",
+            "STATE.SQLITE",
+            "State.SQLite-wal",
+            "state.sqlite-shm",
+            "state.sqlite-journal",
+        ] {
             assert!(super::is_state_db_name(name), "{name}");
         }
         // Unicode 大小写折叠后同形（长 s `ſ` 的大写是 `S`）：大小写不敏感的文件系统把它们
@@ -2655,12 +2758,22 @@ mod tests {
         for name in ["ſtate.sqlite", "ſtate.ſqlite-wal", "STATE.SQLITE-JOURNAL"] {
             assert!(super::is_state_db_name(name), "{name}");
         }
-        for name in ["state.sqlite-backup", "state.sqlite2", "my-state.sqlite", "rclaw.toml", ""] {
+        for name in [
+            "state.sqlite-backup",
+            "state.sqlite2",
+            "my-state.sqlite",
+            "rclaw.toml",
+            "",
+        ] {
             assert!(!super::is_state_db_name(name), "{name}");
         }
         // Win32 会静默剥掉尾随点 / 空格：落盘名就是保留名。
         #[cfg(windows)]
-        for name in ["state.sqlite-journal.", "state.sqlite ", "state.sqlite-wal.."] {
+        for name in [
+            "state.sqlite-journal.",
+            "state.sqlite ",
+            "state.sqlite-wal..",
+        ] {
             assert!(super::is_state_db_name(name), "{name:?}");
         }
         #[cfg(not(windows))]
@@ -2672,8 +2785,14 @@ mod tests {
         let base = root.canonicalize().unwrap();
         // 只有根下直接子项算；子目录里的同名文件、根本身都不算。
         assert!(super::is_state_db_entry(&base, &base.join("state.sqlite")));
-        assert!(super::is_state_db_entry(&base, &base.join("STATE.SQLITE-WAL")));
-        assert!(!super::is_state_db_entry(&base, &base.join("backups").join("state.sqlite")));
+        assert!(super::is_state_db_entry(
+            &base,
+            &base.join("STATE.SQLITE-WAL")
+        ));
+        assert!(!super::is_state_db_entry(
+            &base,
+            &base.join("backups").join("state.sqlite")
+        ));
         assert!(!super::is_state_db_entry(&base, &base));
         assert!(!super::is_state_db_entry(&base, &base.join("notes.md")));
     }
@@ -2692,7 +2811,10 @@ mod tests {
             super::copy_workspace_file(&home, "docs/notes.md").unwrap(),
             "docs/notes-副本.md"
         );
-        assert_eq!(std::fs::read(root.join("docs/notes-副本.md")).unwrap(), b"hello");
+        assert_eq!(
+            std::fs::read(root.join("docs/notes-副本.md")).unwrap(),
+            b"hello"
+        );
         assert_eq!(
             super::copy_workspace_file(&home, "docs/notes.md").unwrap(),
             "docs/notes-副本2.md"
@@ -2721,9 +2843,13 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink());
-            assert_eq!(std::fs::read(root.join("docs/plan-副本2.md")).unwrap(), b"plan");
+            assert_eq!(
+                std::fs::read(root.join("docs/plan-副本2.md")).unwrap(),
+                b"plan"
+            );
             // 指向库文件的链接：内容不可复制。
-            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("docs/dblink.md")).unwrap();
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("docs/dblink.md"))
+                .unwrap();
             assert_eq!(
                 super::copy_workspace_file(&home, "docs/dblink.md").unwrap_err(),
                 super::STATE_DB_PROTECTED
@@ -2743,7 +2869,9 @@ mod tests {
         assert!(super::open_for_write_nofollow(&link, false).is_err());
         assert!(!outside.exists(), "不得顺着悬空链接创建目标文件");
         assert_eq!(
-            super::open_for_write_nofollow(&link, true).unwrap_err().kind(),
+            super::open_for_write_nofollow(&link, true)
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::AlreadyExists
         );
         assert!(!outside.exists());
@@ -2792,7 +2920,8 @@ mod tests {
         #[cfg(unix)]
         {
             // 叫保留名的链接不是真实目录：仍拒绝。普通目录链接删的是链接本身。
-            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("state.sqlite-wal")).unwrap();
+            std::os::unix::fs::symlink(root.join("state.sqlite"), root.join("state.sqlite-wal"))
+                .unwrap();
             assert_eq!(
                 super::delete_workspace_entry(&home, "state.sqlite-wal").unwrap_err(),
                 super::STATE_DB_PROTECTED
@@ -2903,16 +3032,26 @@ mod tests {
                 buf.len() as u32,
             )
         };
-        assert!(len > 0 && (len as usize) < buf.len(), "GetShortPathNameW 失败");
+        assert!(
+            len > 0 && (len as usize) < buf.len(),
+            "GetShortPathNameW 失败"
+        );
         let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]));
-        let Some(alias) = short.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        let Some(alias) = short
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
             panic!("短名不可解析: {short:?}");
         };
         if alias.eq_ignore_ascii_case("state.sqlite") {
             eprintln!("卷未启用 8.3 短名生成，跳过");
             return;
         }
-        assert!(!super::is_state_db_name(&alias), "{alias} 字面不是保留名，才是本测试要挡的别名");
+        assert!(
+            !super::is_state_db_name(&alias),
+            "{alias} 字面不是保留名，才是本测试要挡的别名"
+        );
         assert_eq!(
             super::delete_workspace_entry(&home, &alias).unwrap_err(),
             super::STATE_DB_PROTECTED
@@ -2977,15 +3116,42 @@ mod tests {
 
     #[test]
     fn entry_names_must_be_single_plain_components() {
-        for ok in ["笔记.md", "a-b_c.txt", "no-ext", "state.sqlite-backup", "x.y.z", "a..b.md"] {
+        for ok in [
+            "笔记.md",
+            "a-b_c.txt",
+            "no-ext",
+            "state.sqlite-backup",
+            "x.y.z",
+            "a..b.md",
+        ] {
             assert!(super::validate_entry_name(ok).is_ok(), "{ok}");
             // 单分量名 join 后父目录不变（rename / new_folder 的二次核对依赖此性质）。
             let joined = std::path::Path::new("parent").join(ok);
-            assert_eq!(joined.parent(), Some(std::path::Path::new("parent")), "{ok}");
+            assert_eq!(
+                joined.parent(),
+                Some(std::path::Path::new("parent")),
+                "{ok}"
+            );
         }
         for bad in [
-            "", ".", "..", "a/b", "a\\b", "../x", "C:evil", "C:\\evil", "state.sqlite:ads",
-            "a<b", "a>b", "a|b", "a?b", "a*b", "a\"b", "tab\tname", "trailing.", "trailing ",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "../x",
+            "C:evil",
+            "C:\\evil",
+            "state.sqlite:ads",
+            "a<b",
+            "a>b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "a\"b",
+            "tab\tname",
+            "trailing.",
+            "trailing ",
             "\\\\?\\C:\\x",
         ] {
             assert!(super::validate_entry_name(bad).is_err(), "{bad:?}");
@@ -3042,7 +3208,10 @@ mod tests {
         // 无同名真实文件：虚拟条目生效；仅根级精确名命中。
         assert!(super::config_virtual_active(&home.join("agent")));
         assert!(super::is_config_virtual(&home.join("agent"), "rclaw.toml"));
-        assert!(!super::is_config_virtual(&home.join("agent"), "sub/rclaw.toml"));
+        assert!(!super::is_config_virtual(
+            &home.join("agent"),
+            "sub/rclaw.toml"
+        ));
         assert!(!super::is_config_virtual(&home.join("agent"), "other.toml"));
         let body = "[agent]\nbase_dir = \"agent\"\n";
         std::fs::write(home.join("rclaw.toml"), body).unwrap();
@@ -3124,12 +3293,7 @@ mod tests {
         assert_eq!(model.current.as_deref(), Some("glm-5.3"));
         // [llm].model 未显式配置：「默认」展示回填为选中 provider 的真实生效模型，
         // 而不是示例占位（glm-5.3）。
-        let llm = state
-            .doc
-            .sections
-            .iter()
-            .find(|s| s.path == "llm")
-            .unwrap();
+        let llm = state.doc.sections.iter().find(|s| s.path == "llm").unwrap();
         let llm_model = llm.items.iter().find(|i| i.key == "model").unwrap();
         assert!(llm_model.current.is_none());
         assert_eq!(llm_model.default_raw, "\"glm-5.3\"");
@@ -3479,7 +3643,6 @@ pub async fn group_cancel(
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // 技能运行面：会话内嵌媒体读取、脚本审批、技能配置编辑。
 // ---------------------------------------------------------------------------
@@ -3573,8 +3736,7 @@ fn media_preview_blocking(home: &std::path::Path, path: &str) -> Result<MediaPay
         hasher.update(path.as_bytes());
         hasher.update(meta.len().to_le_bytes());
         hasher.update(mtime.to_le_bytes());
-        hasher
-            .finalize()[..12]
+        hasher.finalize()[..12]
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
@@ -3619,7 +3781,11 @@ fn media_preview_blocking(home: &std::path::Path, path: &str) -> Result<MediaPay
     let _ = std::fs::create_dir_all(&cache_dir);
     let _ = std::fs::write(&cache_path, &encoded); // 缓存写失败只影响下次，不挡返回
     Ok(MediaPayload {
-        mime: if has_alpha { "image/png".into() } else { "image/jpeg".into() },
+        mime: if has_alpha {
+            "image/png".into()
+        } else {
+            "image/jpeg".into()
+        },
         base64: encode_base64(&encoded),
     })
 }
@@ -3627,7 +3793,10 @@ fn media_preview_blocking(home: &std::path::Path, path: &str) -> Result<MediaPay
 /// 读取 agent 工作区内的媒体文件（相对 `agent/` 的路径，如 `media/x.png`），
 /// 供会话流内嵌预览。路径校验：归一后必须仍位于 `agent/` 之内。
 #[tauri::command]
-pub async fn media_base64(state: State<'_, AppState>, path: String) -> Result<MediaPayload, String> {
+pub async fn media_base64(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<MediaPayload, String> {
     // 最大 25MB 的同步读 + 编码挪到阻塞线程池（与同文件其他命令一致），
     // 避免卡住 Tauri 命令线程（低端安卓设备上明显）。
     let home = state.home.clone();
@@ -3811,31 +3980,33 @@ pub async fn skill_config_list() -> Result<Vec<SkillConfigEntry>, String> {
     #[cfg(all(target_os = "android", feature = "apk-host"))]
     {
         let gate = rclaw_android::approval_gate().ok_or("技能闸门尚未就绪")?;
-        let scan = tauri::async_runtime::spawn_blocking(move || -> std::io::Result<Vec<SkillConfigEntry>> {
-            let mut entries: Vec<SkillConfigEntry> = Vec::new();
-            for entry in std::fs::read_dir(&gate.skills_dir)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if entry.file_type()?.is_dir() {
-                    for inner in std::fs::read_dir(entry.path())? {
-                        let inner = inner?;
-                        if inner.file_name().to_string_lossy().ends_with(".toml") {
-                            entries.push(SkillConfigEntry {
-                                path: format!("{name}/{}", inner.file_name().to_string_lossy()),
-                                size: inner.metadata().map(|m| m.len()).unwrap_or(0),
-                            });
+        let scan = tauri::async_runtime::spawn_blocking(
+            move || -> std::io::Result<Vec<SkillConfigEntry>> {
+                let mut entries: Vec<SkillConfigEntry> = Vec::new();
+                for entry in std::fs::read_dir(&gate.skills_dir)? {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if entry.file_type()?.is_dir() {
+                        for inner in std::fs::read_dir(entry.path())? {
+                            let inner = inner?;
+                            if inner.file_name().to_string_lossy().ends_with(".toml") {
+                                entries.push(SkillConfigEntry {
+                                    path: format!("{name}/{}", inner.file_name().to_string_lossy()),
+                                    size: inner.metadata().map(|m| m.len()).unwrap_or(0),
+                                });
+                            }
                         }
+                    } else if name.ends_with(".toml") {
+                        entries.push(SkillConfigEntry {
+                            path: name,
+                            size: entry.metadata().map(|m| m.len()).unwrap_or(0),
+                        });
                     }
-                } else if name.ends_with(".toml") {
-                    entries.push(SkillConfigEntry {
-                        path: name,
-                        size: entry.metadata().map(|m| m.len()).unwrap_or(0),
-                    });
                 }
-            }
-            entries.sort_by(|a, b| a.path.cmp(&b.path));
-            Ok(entries)
-        })
+                entries.sort_by(|a, b| a.path.cmp(&b.path));
+                Ok(entries)
+            },
+        )
         .await
         .map_err(|e| format!("配置扫描任务失败: {e}"))?;
         scan.map_err(|e| format!("扫描技能配置失败: {e}"))
@@ -3939,12 +4110,13 @@ static BROWSER_TRANSPORT: std::sync::OnceLock<
 pub fn browser_transport_or_init(
     screenshot_dir: impl Into<std::path::PathBuf>,
 ) -> std::sync::Arc<rclaw_tools::cdp_browser::HeadlessChromiumTransport> {
-    BROWSER_TRANSPORT.get_or_init(|| {
-        std::sync::Arc::new(rclaw_tools::cdp_browser::HeadlessChromiumTransport::new(
-            screenshot_dir,
-        ))
-    })
-    .clone()
+    BROWSER_TRANSPORT
+        .get_or_init(|| {
+            std::sync::Arc::new(rclaw_tools::cdp_browser::HeadlessChromiumTransport::new(
+                screenshot_dir,
+            ))
+        })
+        .clone()
 }
 
 /// 「打开浏览器」按钮（桌面）：切到可见模式并重建会话——拉起真实浏览器窗口，
@@ -3990,7 +4162,8 @@ pub async fn browser_toggle_visible() -> Result<bool, String> {
 /// 会话内点开工作区媒体：安卓经 FileProvider 拉起系统播放器/查看器，
 /// 桌面用系统默认程序打开（路径校验同 media_base64）。
 #[tauri::command]
-pub async fn open_media(state: State<'_, AppState>, path: String) -> Result<(), String> {    let full = resolve_media_file(&state.home, &path)?;
+pub async fn open_media(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let full = resolve_media_file(&state.home, &path)?;
 
     #[cfg(target_os = "android")]
     {
@@ -4136,7 +4309,12 @@ pub async fn export_messages(
             &fmt,
         );
         let bytes = if fmt == "docx" {
-            crate::export::render_docx(&title, &stamp.format("%Y-%m-%d %H:%M").to_string(), &parsed, &agent_root)?
+            crate::export::render_docx(
+                &title,
+                &stamp.format("%Y-%m-%d %H:%M").to_string(),
+                &parsed,
+                &agent_root,
+            )?
         } else {
             crate::export::render_markdown(
                 &title,
@@ -4370,9 +4548,7 @@ fn open_for_write_nofollow(
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(
-            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
-        );
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     #[cfg(unix)]
     {
@@ -4556,10 +4732,7 @@ pub async fn workspace_list(
         });
         // 根目录置顶注入主配置虚拟条目（实体在 home 根且已存在——wizard
         // 完成前没有 rclaw.toml，不注入空壳；空 path = agent 根）。
-        if path.is_empty()
-            && config_virtual_active(&dir)
-            && home.join(CONFIG_NAME).is_file()
-        {
+        if path.is_empty() && config_virtual_active(&dir) && home.join(CONFIG_NAME).is_file() {
             out.insert(0, config_entry_dto(&home));
         }
         Ok(out)
@@ -4574,9 +4747,35 @@ const WORKSPACE_TEXT_MAX_BYTES: u64 = 1024 * 1024;
 /// 可编辑文本的扩展名白名单（无扩展名文件经 NUL 探测放行，如 LICENSE）。
 fn is_workspace_editable_text(name: &str) -> bool {
     const TEXT_EXTS: &[&str] = &[
-        "md", "txt", "json", "jsonl", "toml", "yaml", "yml", "py", "rs", "ts", "tsx", "js",
-        "jsx", "css", "html", "xml", "csv", "log", "sh", "bat", "ps1", "ini", "cfg", "conf",
-        "env", "gitignore", "prompt", "skill", "lock",
+        "md",
+        "txt",
+        "json",
+        "jsonl",
+        "toml",
+        "yaml",
+        "yml",
+        "py",
+        "rs",
+        "ts",
+        "tsx",
+        "js",
+        "jsx",
+        "css",
+        "html",
+        "xml",
+        "csv",
+        "log",
+        "sh",
+        "bat",
+        "ps1",
+        "ini",
+        "cfg",
+        "conf",
+        "env",
+        "gitignore",
+        "prompt",
+        "skill",
+        "lock",
     ];
     let lower = name.to_lowercase();
     match lower.rsplit_once('.') {
@@ -4596,8 +4795,7 @@ pub async fn workspace_read(state: State<'_, AppState>, path: String) -> Result<
         if is_config_virtual(&root, &path) {
             let target = home.join(CONFIG_NAME);
             let bytes = std::fs::read(&target).map_err(|e| format!("读取主配置失败: {e}"))?;
-            return String::from_utf8(bytes)
-                .map_err(|_| "主配置不是 UTF-8 文本".into());
+            return String::from_utf8(bytes).map_err(|_| "主配置不是 UTF-8 文本".into());
         }
         let base = root
             .canonicalize()
@@ -4693,8 +4891,8 @@ pub async fn workspace_write(
         }
         // 上面的探测与这里的打开之间仍有窗口（悬空链接被摆进来）：打开后按句柄核对，
         // 核对通过才截断、写入。
-        let mut file = open_for_write_nofollow(&target, false)
-            .map_err(|e| format!("保存失败: {e}"))?;
+        let mut file =
+            open_for_write_nofollow(&target, false).map_err(|e| format!("保存失败: {e}"))?;
         file.set_len(0)
             .and_then(|()| std::io::Write::write_all(&mut file, content.as_bytes()))
             .map_err(|e| format!("保存失败: {e}"))?;
@@ -4725,9 +4923,7 @@ fn resolve_workspace_entry(
         (Some(parent), Some(name)) => (parent.to_path_buf(), name.to_os_string()),
         _ => return Err("非法路径".into()),
     };
-    let canonical_parent = parent
-        .canonicalize()
-        .map_err(|e| format!("不存在: {e}"))?;
+    let canonical_parent = parent.canonicalize().map_err(|e| format!("不存在: {e}"))?;
     if !canonical_parent.starts_with(&base) {
         return Err("路径越出工作区".into());
     }
@@ -4744,8 +4940,8 @@ fn remove_symlink(entry: &std::path::Path) -> std::io::Result<()> {
     {
         use std::os::windows::fs::FileTypeExt;
         type RemoveFn = fn(&std::path::Path) -> std::io::Result<()>;
-        let is_dir_link = std::fs::symlink_metadata(entry)
-            .is_ok_and(|meta| meta.file_type().is_symlink_dir());
+        let is_dir_link =
+            std::fs::symlink_metadata(entry).is_ok_and(|meta| meta.file_type().is_symlink_dir());
         let (first, second): (RemoveFn, RemoveFn) = if is_dir_link {
             (|p| std::fs::remove_dir(p), |p| std::fs::remove_file(p))
         } else {
@@ -4768,9 +4964,7 @@ fn resolve_workspace_file_content(
     base: &std::path::Path,
     entry: &std::path::Path,
 ) -> Result<std::path::PathBuf, String> {
-    let target = entry
-        .canonicalize()
-        .map_err(|e| format!("不存在: {e}"))?;
+    let target = entry.canonicalize().map_err(|e| format!("不存在: {e}"))?;
     if !target.starts_with(base) {
         return Err("链接指向工作区外，拒绝复制".into());
     }
@@ -4953,7 +5147,11 @@ pub async fn workspace_rename(
 }
 
 /// [`workspace_rename`] 的核心（与 Tauri 状态解耦便于测试）。
-fn rename_workspace_entry(home: &std::path::Path, path: &str, new_name: &str) -> Result<(), String> {
+fn rename_workspace_entry(
+    home: &std::path::Path,
+    path: &str,
+    new_name: &str,
+) -> Result<(), String> {
     let name = new_name.trim();
     validate_entry_name(name)?;
     let root = home.join("agent");
@@ -5190,7 +5388,9 @@ pub struct PendingShareDto {
 }
 
 #[tauri::command]
-pub async fn consume_pending_share(state: State<'_, AppState>) -> Result<Option<PendingShareDto>, String> {
+pub async fn consume_pending_share(
+    state: State<'_, AppState>,
+) -> Result<Option<PendingShareDto>, String> {
     let home = state.home.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let path = home.join("pending_share.json");
@@ -5199,8 +5399,8 @@ pub async fn consume_pending_share(state: State<'_, AppState>) -> Result<Option<
         };
         // 读到即删：分享只消费一次（解析失败也删，防坏文件永久卡消费）。
         let _ = std::fs::remove_file(&path);
-        let value: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("pending_share.json 解析失败: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("pending_share.json 解析失败: {e}"))?;
         let files: Vec<String> = value
             .get("files")
             .and_then(|v| v.as_array())
@@ -5273,14 +5473,18 @@ pub async fn consume_capture_result(
         };
         // 读到即删：结果只消费一次。
         let _ = std::fs::remove_file(&path);
-        let value: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("capture_result.json 解析失败: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("capture_result.json 解析失败: {e}"))?;
         let kind = value
             .get("kind")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        if value.get("cancelled").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if value
+            .get("cancelled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return Ok(Some(CaptureResultDto { kind, file: None }));
         }
         let file = value
@@ -5353,12 +5557,12 @@ pub async fn record_cancel() -> Result<(), String> {
 ///
 /// 与文件面板同一套路径校验（[`validate_workspace_rel_path`]）；运行时数据库不经任何
 /// 宿主命令读取 / 复制——哪怕只是「保存到相册」，没有 -wal 的快照也是一份不一致的库。
-fn resolve_agent_path(
-    home: &std::path::Path,
-    rel: &str,
-) -> Result<std::path::PathBuf, String> {
+fn resolve_agent_path(home: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
     validate_workspace_rel_path(rel).map_err(|_| "非法文件路径".to_string())?;
-    let root = home.join("agent").canonicalize().map_err(|e| format!("工作区不可用: {e}"))?;
+    let root = home
+        .join("agent")
+        .canonicalize()
+        .map_err(|e| format!("工作区不可用: {e}"))?;
     let canonical = root
         .join(rel)
         .canonicalize()
@@ -5424,10 +5628,7 @@ pub async fn save_to_gallery(
 /// 一个删除入口、保存到相册是一个复制出去的入口，都只允许碰这里的临时文件——工作区
 /// 别处的文件（包括根下的 state.sqlite）不经这两个入口删除 / 复制；按解析后的真实路径
 /// 判断，`./uploads/..` 等拼写不影响。
-fn resolve_upload_path(
-    home: &std::path::Path,
-    rel: &str,
-) -> Result<std::path::PathBuf, String> {
+fn resolve_upload_path(home: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
     let canonical = resolve_agent_path(home, rel)?;
     let uploads = home
         .join("agent")
@@ -5561,7 +5762,13 @@ pub async fn whisper_model_status(
                 total = value.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
             }
         }
-        Ok(WhisperModelStatus { installed, size, downloading, received, total })
+        Ok(WhisperModelStatus {
+            installed,
+            size,
+            downloading,
+            received,
+            total,
+        })
     })
     .await
     .map_err(|e| format!("读取模型状态任务失败: {e}"))?
@@ -5622,17 +5829,21 @@ pub async fn whisper_transcribe(
     if !model.is_file() {
         return Err("whisper 模型未下载（先在录音面板下载模型）".into());
     }
-    let lang = language.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "auto".into());
+    let lang = language
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "auto".into());
     #[cfg(target_os = "android")]
     {
         tauri::async_runtime::spawn_blocking(move || {
-            let wav = home.join(format!("whisper-tmp-{}-{}.wav", chrono_like_ts(), temp_file_seq()));
+            let wav = home.join(format!(
+                "whisper-tmp-{}-{}.wav",
+                chrono_like_ts(),
+                temp_file_seq()
+            ));
             let result = (|| -> Result<String, String> {
-                let decode = rclaw_android::decode_to_wav(
-                    &audio.to_string_lossy(),
-                    &wav.to_string_lossy(),
-                )
-                .map_err(|e| format!("音频解码调用失败: {e}"))?;
+                let decode =
+                    rclaw_android::decode_to_wav(&audio.to_string_lossy(), &wav.to_string_lossy())
+                        .map_err(|e| format!("音频解码调用失败: {e}"))?;
                 if decode != "ok" {
                     return Err(decode.trim_start_matches("error:").to_string());
                 }
@@ -5716,7 +5927,10 @@ mod plan_projection_tests {
         assert_eq!(plan.steps[1].status, "pending");
         project_plan_events(
             &mut plan,
-            &[event("plan_started", serde_json::json!({"steps": ["a", "b"], "resumed": true}))],
+            &[event(
+                "plan_started",
+                serde_json::json!({"steps": ["a", "b"], "resumed": true}),
+            )],
         );
         assert!(!plan.completed && !plan.aborted);
 
@@ -5755,7 +5969,10 @@ mod plan_projection_tests {
             &[
                 event("plan_started", serde_json::json!({"steps": ["a", "b"]})),
                 event("step_started", serde_json::json!({"step": "a"})),
-                event("step_finished", serde_json::json!({"step": "a", "outcome": "succeeded"})),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "a", "outcome": "succeeded"}),
+                ),
                 event("step_started", serde_json::json!({"step": "b"})),
                 event("plan_completed", serde_json::json!({"succeeded": 1})),
             ],
@@ -5783,7 +6000,10 @@ mod plan_projection_tests {
                 "step_finished",
                 serde_json::json!({"step": "a", "outcome": "succeeded", "summary": "完成"}),
             ),
-            event("step_skipped", serde_json::json!({"step": "b", "reason": "依赖未成功"})),
+            event(
+                "step_skipped",
+                serde_json::json!({"step": "b", "reason": "依赖未成功"}),
+            ),
             event("plan_completed", serde_json::json!({"succeeded": 1})),
         ];
         project_plan_events(&mut plan, &events);
@@ -5823,8 +6043,14 @@ mod plan_projection_tests {
                         "steps": [{"id": "a", "task": "t"}, {"id": "b", "task": "u"}]
                     }),
                 ),
-                (2, serde_json::json!({"ts": 1100, "event": "step_started", "step": "a"})),
-                (3, serde_json::json!({"ts": 1200, "event": "step_started", "step": "b"})),
+                (
+                    2,
+                    serde_json::json!({"ts": 1100, "event": "step_started", "step": "a"}),
+                ),
+                (
+                    3,
+                    serde_json::json!({"ts": 1200, "event": "step_started", "step": "b"}),
+                ),
             ],
         );
         assert_eq!(plan.steps[0].status, "running");
@@ -5832,12 +6058,18 @@ mod plan_projection_tests {
         // 终态覆盖运行中；重跑（started 在 finished 后）重新置 running。
         project_plan_events(
             &mut plan,
-            &[(4, serde_json::json!({"ts": 1300, "event": "step_finished", "step": "a", "outcome": "succeeded"}))],
+            &[(
+                4,
+                serde_json::json!({"ts": 1300, "event": "step_finished", "step": "a", "outcome": "succeeded"}),
+            )],
         );
         assert_eq!(plan.steps[0].status, "succeeded");
         project_plan_events(
             &mut plan,
-            &[(5, serde_json::json!({"ts": 1400, "event": "step_started", "step": "a"}))],
+            &[(
+                5,
+                serde_json::json!({"ts": 1400, "event": "step_started", "step": "a"}),
+            )],
         );
         assert_eq!(plan.steps[0].status, "running");
     }
@@ -5908,7 +6140,10 @@ mod plan_projection_tests {
         // 无法解析的 ts 不清零已有值。
         project_plan_events(
             &mut plan,
-            &[(3, serde_json::json!({"ts": "not-a-time", "event": "plan_resumed"}))],
+            &[(
+                3,
+                serde_json::json!({"ts": "not-a-time", "event": "plan_resumed"}),
+            )],
         );
         assert_eq!(plan.updated_at, 1_791_899_277_000);
         assert!(!plan.paused);
@@ -5920,7 +6155,10 @@ mod plan_projection_tests {
         // 揪出）——暂停后恢复必须翻得回 false。
         let mut plan = blank_plan();
         let events = vec![
-            event("plan_started", serde_json::json!({"name": "n", "steps": [{"id": "a", "task": "t"}]})),
+            event(
+                "plan_started",
+                serde_json::json!({"name": "n", "steps": [{"id": "a", "task": "t"}]}),
+            ),
             event("plan_paused", serde_json::json!({})),
             event("plan_resumed", serde_json::json!({})),
         ];
@@ -5932,7 +6170,10 @@ mod plan_projection_tests {
         project_plan_events(
             &mut held,
             &[
-                event("plan_started", serde_json::json!({"steps": [{"id": "a", "task": "t"}]})),
+                event(
+                    "plan_started",
+                    serde_json::json!({"steps": [{"id": "a", "task": "t"}]}),
+                ),
                 event("plan_paused", serde_json::json!({})),
                 event("plan_unpaused", serde_json::json!({})),
             ],
@@ -5958,27 +6199,49 @@ mod plan_projection_tests {
         project_plan_events(
             &mut plan,
             &[
-                event("plan_started", serde_json::json!({"steps": [{"id": "t", "task": "干活"}, {"id": "v", "task": "验证"}]})),
-                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true, "summary": "产出"})),
+                event(
+                    "plan_started",
+                    serde_json::json!({"steps": [{"id": "t", "task": "干活"}, {"id": "v", "task": "验证"}]}),
+                ),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true, "summary": "产出"}),
+                ),
             ],
         );
-        assert_eq!(plan.steps[0].status, "verifying", "awaiting_verdict 不是终态成功");
+        assert_eq!(
+            plan.steps[0].status, "verifying",
+            "awaiting_verdict 不是终态成功"
+        );
 
         // 未耗尽：目标带失败原因回 pending（执行器重跑）。
         project_plan_events(
             &mut plan,
-            &[event("verdict_failed", serde_json::json!({"verifier": "v", "target": "t", "round": 1, "reasons": ["缺测试", "断言错"]}))],
+            &[event(
+                "verdict_failed",
+                serde_json::json!({"verifier": "v", "target": "t", "round": 1, "reasons": ["缺测试", "断言错"]}),
+            )],
         );
         assert_eq!(plan.steps[0].status, "pending");
-        assert!(plan.steps[0].summary.contains("缺测试"), "{}", plan.steps[0].summary);
+        assert!(
+            plan.steps[0].summary.contains("缺测试"),
+            "{}",
+            plan.steps[0].summary
+        );
 
         // 重跑 → verifying → 轮次耗尽：目标 failed（验证者自己的 step_finished 不覆盖目标）。
         project_plan_events(
             &mut plan,
             &[
                 event("step_started", serde_json::json!({"step": "t"})),
-                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true})),
-                event("verdict_failed", serde_json::json!({"verifier": "v", "target": "t", "round": 2, "exhausted": true, "reasons": ["仍缺测试"]})),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true}),
+                ),
+                event(
+                    "verdict_failed",
+                    serde_json::json!({"verifier": "v", "target": "t", "round": 2, "exhausted": true, "reasons": ["仍缺测试"]}),
+                ),
             ],
         );
         assert_eq!(plan.steps[0].status, "failed", "轮次耗尽必须落 failed");
@@ -5988,8 +6251,14 @@ mod plan_projection_tests {
             &mut plan,
             &[
                 event("step_started", serde_json::json!({"step": "t"})),
-                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true})),
-                event("verdict_passed", serde_json::json!({"verifier": "v", "target": "t", "round": 3})),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true}),
+                ),
+                event(
+                    "verdict_passed",
+                    serde_json::json!({"verifier": "v", "target": "t", "round": 3}),
+                ),
             ],
         );
         assert_eq!(plan.steps[0].status, "succeeded");
@@ -5999,9 +6268,18 @@ mod plan_projection_tests {
         project_plan_events(
             &mut unverified,
             &[
-                event("plan_started", serde_json::json!({"steps": [{"id": "t", "task": "t"}]})),
-                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true})),
-                event("step_unverified", serde_json::json!({"step": "t", "verifier": "v", "reason": "验证者不可用"})),
+                event(
+                    "plan_started",
+                    serde_json::json!({"steps": [{"id": "t", "task": "t"}]}),
+                ),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true}),
+                ),
+                event(
+                    "step_unverified",
+                    serde_json::json!({"step": "t", "verifier": "v", "reason": "验证者不可用"}),
+                ),
             ],
         );
         assert_eq!(unverified.steps[0].status, "failed");
@@ -6014,9 +6292,18 @@ mod plan_projection_tests {
         project_plan_events(
             &mut plan,
             &[
-                event("plan_started", serde_json::json!({"name": "巡检", "steps": [{"id": "a", "task": "收集"}, {"id": "b", "task": "汇总"}]})),
-                event("step_finished", serde_json::json!({"step": "a", "outcome": "succeeded", "summary": "数据就绪"})),
-                event("step_finished", serde_json::json!({"step": "b", "outcome": "failed", "summary": "源挂了"})),
+                event(
+                    "plan_started",
+                    serde_json::json!({"name": "巡检", "steps": [{"id": "a", "task": "收集"}, {"id": "b", "task": "汇总"}]}),
+                ),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "a", "outcome": "succeeded", "summary": "数据就绪"}),
+                ),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "b", "outcome": "failed", "summary": "源挂了"}),
+                ),
                 event("plan_completed", serde_json::json!({"succeeded": 1})),
             ],
         );
@@ -6028,7 +6315,10 @@ mod plan_projection_tests {
         project_plan_events(
             &mut plan,
             &[
-                event("plan_started", serde_json::json!({"name": "巡检", "steps": [{"id": "a", "task": "收集"}, {"id": "b", "task": "汇总改"}]})),
+                event(
+                    "plan_started",
+                    serde_json::json!({"name": "巡检", "steps": [{"id": "a", "task": "收集"}, {"id": "b", "task": "汇总改"}]}),
+                ),
                 event("plan_resumed", serde_json::json!({})),
             ],
         );
@@ -6046,12 +6336,24 @@ mod plan_projection_tests {
         project_plan_events(
             &mut verifying,
             &[
-                event("plan_started", serde_json::json!({"steps": [{"id": "t", "task": "t"}, {"id": "v", "task": "v"}]})),
-                event("step_finished", serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true})),
-                event("plan_started", serde_json::json!({"steps": [{"id": "t", "task": "t"}, {"id": "v", "task": "v"}]})),
+                event(
+                    "plan_started",
+                    serde_json::json!({"steps": [{"id": "t", "task": "t"}, {"id": "v", "task": "v"}]}),
+                ),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "t", "outcome": "succeeded", "awaiting_verdict": true}),
+                ),
+                event(
+                    "plan_started",
+                    serde_json::json!({"steps": [{"id": "t", "task": "t"}, {"id": "v", "task": "v"}]}),
+                ),
             ],
         );
-        assert_eq!(verifying.steps[0].status, "verifying", "等验证者的目标跨代保留");
+        assert_eq!(
+            verifying.steps[0].status, "verifying",
+            "等验证者的目标跨代保留"
+        );
         assert_eq!(verifying.steps[1].status, "pending");
     }
 
@@ -6064,19 +6366,37 @@ mod plan_projection_tests {
         project_plan_events(
             &mut plan,
             &[
-                event("plan_started", serde_json::json!({"name": "n", "steps": [{"id": "impl", "task": "干"}, {"id": "prove", "task": "验"}]})),
-                event("step_finished", serde_json::json!({"step": "impl", "outcome": "succeeded", "awaiting_verdict": true})),
-                event("step_finished", serde_json::json!({"step": "prove", "outcome": "failed", "verdict": "fail", "target": "impl"})),
-                event("verdict_failed", serde_json::json!({"verifier": "prove", "target": "impl", "round": 2, "exhausted": true})),
+                event(
+                    "plan_started",
+                    serde_json::json!({"name": "n", "steps": [{"id": "impl", "task": "干"}, {"id": "prove", "task": "验"}]}),
+                ),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "impl", "outcome": "succeeded", "awaiting_verdict": true}),
+                ),
+                event(
+                    "step_finished",
+                    serde_json::json!({"step": "prove", "outcome": "failed", "verdict": "fail", "target": "impl"}),
+                ),
+                event(
+                    "verdict_failed",
+                    serde_json::json!({"verifier": "prove", "target": "impl", "round": 2, "exhausted": true}),
+                ),
                 event("plan_completed", serde_json::json!({"succeeded": 0})),
                 // resume：新一代开始（启发式只继承 succeeded/verifying，impl/prove 都会
                 // 归零），随后 plan_seeded 给出权威状态。
-                event("plan_started", serde_json::json!({"name": "n", "steps": [{"id": "impl", "task": "干"}, {"id": "prove", "task": "验"}]})),
+                event(
+                    "plan_started",
+                    serde_json::json!({"name": "n", "steps": [{"id": "impl", "task": "干"}, {"id": "prove", "task": "验"}]}),
+                ),
                 event("plan_resumed", serde_json::json!({})),
-                event("plan_seeded", serde_json::json!({
-                    "inherited": 0,
-                    "states": {"impl": "failed", "prove": "failed"}
-                })),
+                event(
+                    "plan_seeded",
+                    serde_json::json!({
+                        "inherited": 0,
+                        "states": {"impl": "failed", "prove": "failed"}
+                    }),
+                ),
             ],
         );
         assert!(!plan.completed, "resume 复位收尾态");
@@ -6145,13 +6465,21 @@ mod history_entries_tests {
         assert_eq!(
             entries,
             vec![
-                HistoryMsgDto { id: 1, role: "user".into(), content: "hello".into() },
+                HistoryMsgDto {
+                    id: 1,
+                    role: "user".into(),
+                    content: "hello".into()
+                },
                 HistoryMsgDto {
                     id: 3,
                     role: "status".into(),
                     content: "🔧 调用工具: shell".into(),
                 },
-                HistoryMsgDto { id: 5, role: "assistant".into(), content: "done".into() },
+                HistoryMsgDto {
+                    id: 5,
+                    role: "assistant".into(),
+                    content: "done".into()
+                },
             ]
         );
     }
@@ -6162,7 +6490,11 @@ mod history_entries_tests {
         let entries = history_entries(&msgs, false);
         assert_eq!(
             entries,
-            vec![HistoryMsgDto { id: 5, role: "assistant".into(), content: "done".into() }]
+            vec![HistoryMsgDto {
+                id: 5,
+                role: "assistant".into(),
+                content: "done".into()
+            }]
         );
     }
 }

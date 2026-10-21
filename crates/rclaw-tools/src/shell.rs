@@ -539,7 +539,9 @@ mod tests {
         std::fs::create_dir_all(b.join("memory")).unwrap();
         let base_name = b.file_name().unwrap().to_string_lossy().into_owned();
         for cwd in ["memory", &format!("{base_name}/memory")] {
-            let resolved = resolve_cwd(&b, Some(cwd)).await.unwrap_or_else(|e| panic!("{cwd}: {}", e.content));
+            let resolved = resolve_cwd(&b, Some(cwd))
+                .await
+                .unwrap_or_else(|e| panic!("{cwd}: {}", e.content));
             assert_eq!(resolved, b.join("memory"), "{cwd}");
         }
         let err = resolve_cwd(&b, Some("missing")).await.unwrap_err();

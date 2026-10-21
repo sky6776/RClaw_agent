@@ -363,7 +363,10 @@ mod tests {
         assert!(!m.is_cron_task());
         assert_eq!(m.agent_chain(), ["RClaw".to_string()].as_slice());
         assert_eq!(m.handoff_id(), Some(7));
-        assert_eq!(BusMessage::new(CHANNEL_CLI, "console", "hi").handoff_id(), None);
+        assert_eq!(
+            BusMessage::new(CHANNEL_CLI, "console", "hi").handoff_id(),
+            None
+        );
 
         // 普通消息与 cron/heartbeat 交接链均为空。
         assert!(BusMessage::new(CHANNEL_CLI, "console", "hi")

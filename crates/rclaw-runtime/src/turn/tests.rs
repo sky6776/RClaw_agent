@@ -297,7 +297,10 @@ fn browser_scrape_loop_survives_repeated_observations_with_varied_scrolls() {
         status.record_tool_calls(&navigate.tool_calls),
         LoopDecision::Continue
     ));
-    status.record_tool_results(&navigate, &tool_result_message("call-0", "page loaded", false));
+    status.record_tool_results(
+        &navigate,
+        &tool_result_message("call-0", "page loaded", false),
+    );
 
     for round in 0..6 {
         assert!(
@@ -343,7 +346,10 @@ fn jd_scrape_loop_survives_repeated_evaluate_extractions() {
         status.record_tool_calls(&navigate.tool_calls),
         LoopDecision::Continue
     ));
-    status.record_tool_results(&navigate, &tool_result_message("call-0", "page loaded", false));
+    status.record_tool_results(
+        &navigate,
+        &tool_result_message("call-0", "page loaded", false),
+    );
 
     for round in 0..6 {
         assert!(
@@ -353,7 +359,10 @@ fn jd_scrape_loop_survives_repeated_evaluate_extractions() {
             ),
             "第 {round} 轮提取不应触发熔断"
         );
-        status.record_tool_results(&evaluate, &tool_result_message("eval", "{\"count\":13}", false));
+        status.record_tool_results(
+            &evaluate,
+            &tool_result_message("eval", "{\"count\":13}", false),
+        );
 
         let scroll = &scrolls[round % scrolls.len()];
         assert!(matches!(
@@ -1229,9 +1238,18 @@ fn upload_receipt_verifies_create_and_update_claims() {
         error_category: None,
         summary: String::new(),
     };
-    assert!(tool_receipt_matches_action(&receipt, ExternalAction::Create));
-    assert!(tool_receipt_matches_action(&receipt, ExternalAction::WriteUpdate));
-    assert!(!tool_receipt_matches_action(&receipt, ExternalAction::Delete));
+    assert!(tool_receipt_matches_action(
+        &receipt,
+        ExternalAction::Create
+    ));
+    assert!(tool_receipt_matches_action(
+        &receipt,
+        ExternalAction::WriteUpdate
+    ));
+    assert!(!tool_receipt_matches_action(
+        &receipt,
+        ExternalAction::Delete
+    ));
 }
 
 #[test]
@@ -1247,9 +1265,18 @@ fn put_receipt_verifies_create_and_update_claims() {
         error_category: None,
         summary: String::new(),
     };
-    assert!(tool_receipt_matches_action(&receipt, ExternalAction::Create));
-    assert!(tool_receipt_matches_action(&receipt, ExternalAction::WriteUpdate));
-    assert!(!tool_receipt_matches_action(&receipt, ExternalAction::Delete));
+    assert!(tool_receipt_matches_action(
+        &receipt,
+        ExternalAction::Create
+    ));
+    assert!(tool_receipt_matches_action(
+        &receipt,
+        ExternalAction::WriteUpdate
+    ));
+    assert!(!tool_receipt_matches_action(
+        &receipt,
+        ExternalAction::Delete
+    ));
 }
 
 // ---- /context 命令：识别与渲染 ----
@@ -1892,8 +1919,12 @@ async fn oversized_tool_result_spills_to_artifact_with_reference_handle() {
     let dir = tempfile::tempdir().unwrap();
     let layout = layout_in(dir.path());
     let big = layout.base.join("big.log");
-    let body = format!("{}
-", "x".repeat(99)).repeat(600); // ~60KB，600 行
+    let body = format!(
+        "{}
+",
+        "x".repeat(99)
+    )
+    .repeat(600); // ~60KB，600 行
     std::fs::write(&big, &body).unwrap();
     let small = layout.base.join("small.txt");
     std::fs::write(&small, "small content").unwrap();
@@ -2135,12 +2166,19 @@ fn unregistered_package_skill_has_no_root_doc_injection() {
 
 #[test]
 fn read_macro_and_pick_funds_root_docs_are_injected() {
-    for (package_name, doc_name) in [("read-macro", "read-macro.md"), ("pick-funds", "pick-funds.md")] {
+    for (package_name, doc_name) in [
+        ("read-macro", "read-macro.md"),
+        ("pick-funds", "pick-funds.md"),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let layout = layout_in(dir.path());
         let package = layout.skills_dir.join(package_name);
         std::fs::create_dir_all(package.join("skills").join("demo")).unwrap();
-        std::fs::write(package.join(doc_name), format!("{package_name} 包根共享规范")).unwrap();
+        std::fs::write(
+            package.join(doc_name),
+            format!("{package_name} 包根共享规范"),
+        )
+        .unwrap();
         let skill_path = package.join("skills").join("demo").join("SKILL.md");
         let mut loaded_package_skills = HashMap::new();
 
@@ -2701,7 +2739,10 @@ fn tail_start_user_anchor_yields_when_anchored_tail_blows_the_budget() {
         min_floor: 2,
     };
     let start = compute_tail_start(&hist, &budgeted);
-    assert!(start > 2, "锚定整轮会超出 soft ceiling，user 锚点应让位：start={start}");
+    assert!(
+        start > 2,
+        "锚定整轮会超出 soft ceiling，user 锚点应让位：start={start}"
+    );
     assert!(!hist[start].is_tool_result_carrier());
     // 不带预算时锚点照常生效。
     let unbudgeted = TailPolicy {
@@ -4014,7 +4055,10 @@ async fn is_session_busy_counts_only_live_turns_of_that_session() {
             final_delivered: false,
         },
     );
-    assert!(mgr.is_session_busy(CHANNEL_CLI, "console"), "cron 分键同样计入");
+    assert!(
+        mgr.is_session_busy(CHANNEL_CLI, "console"),
+        "cron 分键同样计入"
+    );
     assert!(!mgr.is_session_busy(CHANNEL_CLI, "other"));
     assert!(!mgr.is_session_busy("desktop", "console"));
 
@@ -5210,8 +5254,14 @@ fn second_compression_summarizes_previous_head_and_merged_carrier_before_tail() 
         rendered.contains("h0") && rendered.contains("h1"),
         "上一轮受保护头部不再出现在视图里，必须进入被摘要区: {rendered}"
     );
-    assert!(rendered.contains("carried user"), "merge 载体中的原 user 正文进入被摘要区");
-    assert!(!rendered.contains("old summary"), "旧摘要正文只经 previous_summary 传递");
+    assert!(
+        rendered.contains("carried user"),
+        "merge 载体中的原 user 正文进入被摘要区"
+    );
+    assert!(
+        !rendered.contains("old summary"),
+        "旧摘要正文只经 previous_summary 传递"
+    );
     assert!(!rendered.contains(MERGED_PRIOR_CONTEXT_HEADER));
     assert!(!rendered.contains("a6"), "载体之后的消息留在尾窗");
 
@@ -7780,7 +7830,10 @@ fn forget_session_clears_only_that_chat_including_cron_keys() {
     }
     mgr.forget_session("desktop", "c-dead");
     assert!(mgr.history.compression_skip_reason(&doomed, 1).is_none());
-    assert!(mgr.history.compression_skip_reason(&doomed_cron, 1).is_none());
+    assert!(mgr
+        .history
+        .compression_skip_reason(&doomed_cron, 1)
+        .is_none());
     assert!(!mgr.history.in_turn_blocked_by_rapid_refill(&doomed, 1));
     assert!(
         mgr.history.compression_skip_reason(&other, 1).is_some(),
@@ -7853,9 +7906,17 @@ async fn compact_holds_gate_slot_and_is_cancellable() {
     let layout = layout_in(dir.path());
     let session = SessionStore::new(layout.clone());
     for n in 0..20 {
-        let role = if n % 2 == 0 { Role::User } else { Role::Assistant };
+        let role = if n % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
         session
-            .append(CHANNEL_CLI, "console", &Message::plain(role, format!("m{n}")))
+            .append(
+                CHANNEL_CLI,
+                "console",
+                &Message::plain(role, format!("m{n}")),
+            )
             .unwrap();
     }
     let (outbound_tx, _rx) = mpsc::channel(8);
@@ -7878,7 +7939,8 @@ async fn compact_holds_gate_slot_and_is_cancellable() {
     ));
 
     let task_mgr = mgr.clone();
-    let compact = tokio::spawn(async move { task_mgr.handle_compact(CHANNEL_CLI, "console").await });
+    let compact =
+        tokio::spawn(async move { task_mgr.handle_compact(CHANNEL_CLI, "console").await });
     // 摘要调用永远阻塞：等 /compact 登记进 active map。
     let turn_key = TurnKey {
         channel: CHANNEL_CLI.into(),
@@ -7942,7 +8004,11 @@ async fn compact_prunes_persists_boundary_and_records_refill_floor() {
             },
             3 => tool_result_message("call-old", &raw_output, false),
             _ => Message::plain(
-                if n % 2 == 0 { Role::User } else { Role::Assistant },
+                if n % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
                 format!("m{n}"),
             ),
         };
@@ -7992,7 +8058,10 @@ async fn compact_prunes_persists_boundary_and_records_refill_floor() {
     );
     let refused = mgr.handle_compact(CHANNEL_CLI, "console").await;
     assert!(refused.contains("正在运行的任务"), "{refused}");
-    assert!(requests.lock().unwrap().is_empty(), "拒绝时不得调用摘要模型");
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "拒绝时不得调用摘要模型"
+    );
     drop(live_rx);
     // 同 chat 上活着的 cron 轮次既不加载也不持久化会话历史，不挡 /compact（落库前复查同理）。
     // 判定依据是 spawn 时按消息来源登记的 `touches_history`，不是键的形状（旧式无 job id 的
@@ -8071,10 +8140,13 @@ async fn compact_prunes_persists_boundary_and_records_refill_floor() {
         &mgr.request_tool_schemas(None),
     );
     assert!(
-        mgr.history.in_turn_blocked_by_rapid_refill(&key, post_estimate),
+        mgr.history
+            .in_turn_blocked_by_rapid_refill(&key, post_estimate),
         "/compact 刚结束时轮内压缩应被 rapid-refill 地板压住"
     );
-    assert!(!mgr.history.in_turn_blocked_by_rapid_refill(&key, post_estimate * 2));
+    assert!(!mgr
+        .history
+        .in_turn_blocked_by_rapid_refill(&key, post_estimate * 2));
 }
 
 /// 摘要素材预算：被摘要区优先，被裁掉的前缀只拿剩余额度、从最早的让起；前缀里的旧摘要
@@ -8083,7 +8155,11 @@ async fn compact_prunes_persists_boundary_and_records_refill_floor() {
 fn merged_summary_material_gives_head_priority_over_trimmed_prefix() {
     let big = |n: usize| {
         Message::plain(
-            if n.is_multiple_of(2) { Role::User } else { Role::Assistant },
+            if n.is_multiple_of(2) {
+                Role::User
+            } else {
+                Role::Assistant
+            },
             format!("消息 {n}：{}", "字".repeat(1_900)),
         )
     };
@@ -8101,16 +8177,24 @@ fn merged_summary_material_gives_head_priority_over_trimmed_prefix() {
     let kept_prefix = prefix.len() - merged.omitted_prefix;
     assert_eq!(merged.material.len(), 1 + kept_prefix + head.len());
     assert_eq!(merged.material[0].role, Role::System, "首条是让位说明");
-    let transcript =
-        render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
-    assert!(!transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX), "头区不得被省略");
+    let transcript = render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    assert!(
+        !transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX),
+        "头区不得被省略"
+    );
     assert!(
         transcript.ends_with(&render_message_block(merged.material.len() - 1, &head[19])),
         "头区末条必须完整保留在 transcript 末尾"
     );
     assert!(transcript.contains("消息 100："), "头区首条");
-    assert!(transcript.contains(&format!("消息 {}：", merged.omitted_prefix + 1)), "保留的前缀首条");
-    assert!(!transcript.contains(&format!("消息 {}：", merged.omitted_prefix)), "被让掉的前缀末条");
+    assert!(
+        transcript.contains(&format!("消息 {}：", merged.omitted_prefix + 1)),
+        "保留的前缀首条"
+    );
+    assert!(
+        !transcript.contains(&format!("消息 {}：", merged.omitted_prefix)),
+        "被让掉的前缀末条"
+    );
     assert!(transcript.contains(&format!("更早的 {} 条", merged.omitted_prefix)));
 
     // 被摘要区自身超预算：前缀全部让位，且连让位说明都不加（它只会把被摘要区再挤掉
@@ -8122,11 +8206,13 @@ fn merged_summary_material_gives_head_priority_over_trimmed_prefix() {
     assert_eq!(merged.omitted_prefix, prefix.len());
     assert_eq!(merged.prefix_total, prefix.len());
     assert_eq!(merged.material.len(), huge_head.len());
-    let transcript =
-        render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    let transcript = render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
     assert!(transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX));
     assert!(transcript.chars().count() <= SUMMARY_TRANSCRIPT_MAX_CHARS);
-    assert!(transcript.starts_with(&render_message_block(0, &huge_head[0])), "开头保留");
+    assert!(
+        transcript.starts_with(&render_message_block(0, &huge_head[0])),
+        "开头保留"
+    );
     assert!(
         transcript.ends_with(&render_message_block(29, &huge_head[29])),
         "紧挨尾窗的最新一条保留"
@@ -8162,8 +8248,7 @@ fn merged_summary_material_gives_head_priority_over_trimmed_prefix() {
     assert!(!merged.head_overflows);
     assert_eq!(merged.omitted_prefix, prefix.len());
     assert_eq!(merged.material.len(), edge_head.len(), "不加让位说明");
-    let transcript =
-        render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    let transcript = render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
     assert!(!transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX));
     assert!(transcript.ends_with(&render_message_block(edge_head.len() - 1, &edge_head[23])));
 
@@ -8185,12 +8270,20 @@ fn merged_summary_material_gives_head_priority_over_trimmed_prefix() {
     let texts: Vec<String> = merged
         .material
         .iter()
-        .map(|m| m.content.iter().filter_map(ContentBlock::as_text).collect::<String>())
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(ContentBlock::as_text)
+                .collect::<String>()
+        })
         .collect();
     assert_eq!(texts.len(), 4, "{texts:?}");
     assert_eq!(texts[0], "普通消息");
     assert_eq!(texts[1], "原始提问");
-    assert!(merged.material.iter().all(|m| context_summary_body(m).is_none()));
+    assert!(merged
+        .material
+        .iter()
+        .all(|m| context_summary_body(m).is_none()));
 
     // 无前缀：素材即被摘要区。
     let merged =
@@ -8207,7 +8300,11 @@ fn merged_summary_material_gives_head_priority_over_trimmed_prefix() {
 fn merged_summary_material_keeps_previous_protected_head_before_other_prefix() {
     let big = |n: usize| {
         Message::plain(
-            if n.is_multiple_of(2) { Role::User } else { Role::Assistant },
+            if n.is_multiple_of(2) {
+                Role::User
+            } else {
+                Role::Assistant
+            },
             format!("消息 {n}：{}", "字".repeat(1_900)),
         )
     };
@@ -8221,7 +8318,8 @@ fn merged_summary_material_keeps_previous_protected_head_before_other_prefix() {
     ];
     prefix.extend((5..31).map(big));
 
-    let merged = merge_prefix_into_summary_material(&prefix, 3, &head, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    let merged =
+        merge_prefix_into_summary_material(&prefix, 3, &head, SUMMARY_TRANSCRIPT_MAX_CHARS);
     assert!(!merged.head_overflows);
     assert_eq!(merged.prefix_total, prefix.len() - 1, "载体不计入分母");
     assert!(
@@ -8232,36 +8330,67 @@ fn merged_summary_material_keeps_previous_protected_head_before_other_prefix() {
     let texts: Vec<String> = merged
         .material
         .iter()
-        .map(|m| m.content.iter().filter_map(ContentBlock::as_text).collect::<String>())
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(ContentBlock::as_text)
+                .collect::<String>()
+        })
         .collect();
     assert!(texts[0].starts_with("消息 1："), "{texts:?}");
     assert!(texts[1].starts_with("消息 2："));
     assert!(texts[2].starts_with("消息 3："));
-    assert_eq!(merged.material[3].role, Role::System, "让位说明紧跟受保护头部");
+    assert_eq!(
+        merged.material[3].role,
+        Role::System,
+        "让位说明紧跟受保护头部"
+    );
     assert!(texts[3].contains(&format!("更早的 {} 条", merged.omitted_prefix)));
-    assert!(!texts[3].contains("PREVIOUS COMPACTED SUMMARY"), "被让掉的消息没有被任何摘要覆盖");
+    assert!(
+        !texts[3].contains("PREVIOUS COMPACTED SUMMARY"),
+        "被让掉的消息没有被任何摘要覆盖"
+    );
     // 让掉的是紧跟受保护头部之后、最早的那段；保留的是紧挨被摘要区的一段。
     let first_kept = 5 + merged.omitted_prefix;
-    assert!(texts[4].starts_with(&format!("消息 {first_kept}：")), "{}", texts[4]);
-    assert!(!texts.iter().any(|t| t.starts_with(&format!("消息 {}：", first_kept - 1))));
-    assert!(merged.material.iter().all(|m| context_summary_body(m).is_none()));
+    assert!(
+        texts[4].starts_with(&format!("消息 {first_kept}：")),
+        "{}",
+        texts[4]
+    );
+    assert!(!texts
+        .iter()
+        .any(|t| t.starts_with(&format!("消息 {}：", first_kept - 1))));
+    assert!(merged
+        .material
+        .iter()
+        .all(|m| context_summary_body(m).is_none()));
     let transcript = render_messages_for_summary(&merged.material, SUMMARY_TRANSCRIPT_MAX_CHARS);
-    assert!(!transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX), "头区不得被省略");
+    assert!(
+        !transcript.contains(TRANSCRIPT_ELIDED_MARKER_PREFIX),
+        "头区不得被省略"
+    );
     assert!(transcript.contains("最初的任务"));
 
     // 受保护头部本身是巨型消息、预算只够装下第一条：从它的末尾起让，其余前缀全部让位。
     let mut huge_opening: Vec<Message> = (1..4).map(big).collect();
     huge_opening.extend((5..8).map(big));
     let tight_head: Vec<Message> = (100..122).map(big).collect();
-    let merged =
-        merge_prefix_into_summary_material(&huge_opening, 3, &tight_head, SUMMARY_TRANSCRIPT_MAX_CHARS);
+    let merged = merge_prefix_into_summary_material(
+        &huge_opening,
+        3,
+        &tight_head,
+        SUMMARY_TRANSCRIPT_MAX_CHARS,
+    );
     assert!(!merged.head_overflows);
     let kept_opening = merged
         .material
         .iter()
         .take_while(|m| m.role != Role::System)
         .count();
-    assert!((1..3).contains(&kept_opening), "受保护头部部分保留：{kept_opening}");
+    assert!(
+        (1..3).contains(&kept_opening),
+        "受保护头部部分保留：{kept_opening}"
+    );
     assert_eq!(merged.omitted_prefix, huge_opening.len() - kept_opening);
     assert_eq!(merged.material.len(), kept_opening + 1 + tight_head.len());
 }
@@ -8278,7 +8407,11 @@ fn transcript_over_budget_elides_the_middle_and_keeps_both_ends() {
     assert!((0..5).all(|i| full.fully_rendered(i)));
     // 预算不足：开头、结尾各留整条，中段省略并以标记隔开；总量不超预算。
     let cut = render_transcript(&messages, 1_200);
-    assert!(cut.text.chars().count() <= 1_200, "{}", cut.text.chars().count());
+    assert!(
+        cut.text.chars().count() <= 1_200,
+        "{}",
+        cut.text.chars().count()
+    );
     assert!(cut.text.starts_with(&render_message_block(0, &messages[0])));
     assert!(cut.text.ends_with(&render_message_block(4, &messages[4])));
     assert!(cut.text.contains(&transcript_elided_marker(3)));
@@ -8295,7 +8428,11 @@ fn transcript_over_budget_elides_the_middle_and_keeps_both_ends() {
     assert_eq!(render_messages_for_summary(&messages, total), full.text);
     // 预算连一条整的都装不下：按字符保留最后一条的开头，以 … 收尾，其余整条省略。
     let tiny = render_transcript(&messages, 400);
-    assert!(tiny.text.chars().count() <= 400, "{}", tiny.text.chars().count());
+    assert!(
+        tiny.text.chars().count() <= 400,
+        "{}",
+        tiny.text.chars().count()
+    );
     assert_eq!(tiny.elided, 0..4);
     assert_eq!(tiny.clipped_last, Some(4));
     assert!(tiny.text.contains("### Message 5 (User)"));
@@ -8308,7 +8445,10 @@ fn transcript_over_budget_elides_the_middle_and_keeps_both_ends() {
 #[test]
 fn summary_prompt_carries_latest_user_input_verbatim_when_transcript_cannot() {
     let msg = BusMessage::new("cli", "console", "x");
-    let long_task = format!("请按下面的规格实现：{}END-OF-SPEC", "细".repeat(TRANSCRIPT_TEXT_MAX_CHARS + 500));
+    let long_task = format!(
+        "请按下面的规格实现：{}END-OF-SPEC",
+        "细".repeat(TRANSCRIPT_TEXT_MAX_CHARS + 500)
+    );
     // 1) 正文超过单块上限：transcript 里被截，verbatim 块给全文。
     let material = vec![
         mk_user("q1"),
@@ -8321,9 +8461,18 @@ fn summary_prompt_carries_latest_user_input_verbatim_when_transcript_cannot() {
     let prompt = build_session_summary_prompt(&material, &msg, None);
     assert!(prompt.contains("LATEST USER INPUT IN THE TRANSCRIPT (Message 3, verbatim"));
     assert!(prompt.contains(&long_task), "verbatim 块必须含完整原文");
-    assert_eq!(prompt.matches("END-OF-SPEC").count(), 1, "transcript 里的那份被截，只有 verbatim 块含结尾");
+    assert_eq!(
+        prompt.matches("END-OF-SPEC").count(),
+        1,
+        "transcript 里的那份被截，只有 verbatim 块含结尾"
+    );
     // 2) 短正文、完整在 transcript 里：不重复给。
-    let material = vec![mk_user("q1"), mk_assistant_text("a1"), mk_user("短任务"), mk_assistant_text("a2")];
+    let material = vec![
+        mk_user("q1"),
+        mk_assistant_text("a1"),
+        mk_user("短任务"),
+        mk_assistant_text("a2"),
+    ];
     let prompt = build_session_summary_prompt(&material, &msg, None);
     assert!(!prompt.contains("LATEST USER INPUT IN THE TRANSCRIPT"));
     assert!(prompt.contains("短任务"));
@@ -8333,14 +8482,22 @@ fn summary_prompt_carries_latest_user_input_verbatim_when_transcript_cannot() {
     material.push(mk_user("中段里的任务"));
     material.extend((15..30).map(big));
     let rendered = render_transcript(&material, SUMMARY_TRANSCRIPT_MAX_CHARS);
-    assert!(rendered.elided.contains(&14), "测试前提：user 消息落在被省略的中段 {:?}", rendered.elided);
+    assert!(
+        rendered.elided.contains(&14),
+        "测试前提：user 消息落在被省略的中段 {:?}",
+        rendered.elided
+    );
     let prompt = build_session_summary_prompt(&material, &msg, None);
     assert!(prompt.contains("LATEST USER INPUT IN THE TRANSCRIPT (Message 15, verbatim"));
     assert!(prompt.contains("中段里的任务"));
     // 4) 超长正文按上限截断，并明确标成「前缀」而不是「逐字全文」。
     let huge = "长".repeat(ACTIVE_TASK_VERBATIM_MAX_CHARS + 10);
     let material = vec![mk_user(&huge), mk_assistant_text("a")];
-    let input = latest_user_input_verbatim(&material, &render_transcript(&material, SUMMARY_TRANSCRIPT_MAX_CHARS)).unwrap();
+    let input = latest_user_input_verbatim(
+        &material,
+        &render_transcript(&material, SUMMARY_TRANSCRIPT_MAX_CHARS),
+    )
+    .unwrap();
     assert_eq!(input.idx, 0);
     assert!(input.truncated);
     assert_eq!(input.text.chars().count(), ACTIVE_TASK_VERBATIM_MAX_CHARS);
@@ -8560,8 +8717,7 @@ fn usage_anchor_estimates_real_value_plus_increment() {
     ];
 
     // 锚定请求 = 历史到锚点为止；锚点取请求里最后一条有 id 的消息。
-    mgr.history
-        .record_usage_anchor(&key, &history[..3], 1_000);
+    mgr.history.record_usage_anchor(&key, &history[..3], 1_000);
     let anchored = mgr.history.anchored_estimate(&key, "sys", &history, &[]);
     assert_eq!(
         anchored,
@@ -8585,8 +8741,7 @@ fn usage_anchor_estimates_real_value_plus_increment() {
         chat_id: "zero".into(),
         cron_job_id: None,
     };
-    mgr.history
-        .record_usage_anchor(&key_zero, &history[..3], 0);
+    mgr.history.record_usage_anchor(&key_zero, &history[..3], 0);
     let still_fallback = mgr
         .history
         .anchored_estimate(&key_zero, "sys", &history, &[]);
@@ -8784,13 +8939,21 @@ async fn fork_command_lists_anchors_and_forks_to_new_session() {
             .append("cli", "console", &Message::plain(Role::User, "先做调研"))
             .unwrap(),
         mgr.session
-            .append("cli", "console", &Message::plain(Role::Assistant, "调研完成"))
+            .append(
+                "cli",
+                "console",
+                &Message::plain(Role::Assistant, "调研完成"),
+            )
             .unwrap(),
         mgr.session
             .append("cli", "console", &Message::plain(Role::User, "再写报告"))
             .unwrap(),
         mgr.session
-            .append("cli", "console", &Message::plain(Role::Assistant, "报告已写"))
+            .append(
+                "cli",
+                "console",
+                &Message::plain(Role::Assistant, "报告已写"),
+            )
             .unwrap(),
     ];
 
@@ -8818,15 +8981,16 @@ async fn fork_command_lists_anchors_and_forks_to_new_session() {
     // 复制的历史 + 尾部多一条「分叉告知」行（模型可见；本锚点之后无文件改动，
     // 告知行如实说明无需回滚）。
     assert_eq!(texts.len(), 4, "{texts:?}");
-    assert_eq!(&texts[..3], &["先做调研", "调研完成", "再写报告"], "{texts:?}");
+    assert_eq!(
+        &texts[..3],
+        &["先做调研", "调研完成", "再写报告"],
+        "{texts:?}"
+    );
     assert!(texts[3].starts_with("【会话分叉】"), "{texts:?}");
     assert!(texts[3].contains("不要假设分叉点之后的消息"), "{texts:?}");
     assert!(texts[3].contains("没有可回滚的文件写入"), "{texts:?}");
     assert_eq!(
-        mgr.session
-            .load_all("cli", "console")
-            .unwrap()
-            .len(),
+        mgr.session.load_all("cli", "console").unwrap().len(),
         4,
         "源会话不得被 fork 改动"
     );
@@ -8915,9 +9079,7 @@ async fn goal_command_sets_shows_and_clears_session_goal() {
     let layout = layout_in(dir.path());
     let (outbound_tx, _outbound_rx) = mpsc::channel(8);
     let mgr = TurnManager::new(
-        Arc::new(ScriptedProvider {
-            reply: "ok".into(),
-        }),
+        Arc::new(ScriptedProvider { reply: "ok".into() }),
         None,
         SessionStore::new(layout.clone()),
         MemoryStore::new(layout.clone()),
@@ -8947,9 +9109,7 @@ async fn goal_command_sets_shows_and_clears_session_goal() {
         .kv_get(&key)
         .unwrap()
         .expect("目标应已落库");
-    assert_eq!(
-        stored["objective"], "把日志模块迁到新框架并通过全部测试"
-    );
+    assert_eq!(stored["objective"], "把日志模块迁到新框架并通过全部测试");
     assert!(mgr
         .session
         .journal()
@@ -8963,7 +9123,9 @@ async fn goal_command_sets_shows_and_clears_session_goal() {
     assert!(show.contains("迁到新框架"), "{show}");
 
     // 超长目标拒绝。
-    let too_long = mgr.handle_goal("cli", "console", &format!("/goal {}", "长".repeat(2001))).await;
+    let too_long = mgr
+        .handle_goal("cli", "console", &format!("/goal {}", "长".repeat(2001)))
+        .await;
     assert!(too_long.contains("过长"), "{too_long}");
 
     // 收尾：清除（幂等）。
@@ -8991,8 +9153,8 @@ fn goal_reminder_block_renders_objective_and_clears_with_goal() {
             &serde_json::json!({"objective": "完成迁移并通过测试"}),
         )
         .unwrap();
-    let block = TurnManager::goal_reminder_block(&journal, "cli", "console")
-        .expect("有目标应产提醒块");
+    let block =
+        TurnManager::goal_reminder_block(&journal, "cli", "console").expect("有目标应产提醒块");
     assert!(block.contains("[Session goal]"), "{block}");
     assert!(block.contains("完成迁移并通过测试"), "{block}");
     assert!(block.contains("/goal clear"), "{block}");
@@ -9006,7 +9168,6 @@ fn goal_reminder_block_renders_objective_and_clears_with_goal() {
     assert!(TurnManager::goal_reminder_block(&journal, "cli", "console").is_none());
 }
 
-
 #[test]
 fn parse_goal_audit_accepts_json_and_fails_closed() {
     // 纯 JSON / 带前置散文的 JSON 都能提取；goal_met 非布尔 / 缺失 / 不可解析 → None
@@ -9016,11 +9177,19 @@ fn parse_goal_audit_accepts_json_and_fails_closed() {
         Some((true, "测试全绿".to_string()))
     );
     assert_eq!(
-        TurnManager::parse_goal_audit("审计结论如下：\n{\"goal_met\": false, \"evidence_summary\": \"仍在进行\"}"),
+        TurnManager::parse_goal_audit(
+            "审计结论如下：\n{\"goal_met\": false, \"evidence_summary\": \"仍在进行\"}"
+        ),
         Some((false, "仍在进行".to_string()))
     );
-    assert_eq!(TurnManager::parse_goal_audit(r#"{"goal_met": "yes"}"#), None);
-    assert_eq!(TurnManager::parse_goal_audit(r#"{"evidence_summary": "x"}"#), None);
+    assert_eq!(
+        TurnManager::parse_goal_audit(r#"{"goal_met": "yes"}"#),
+        None
+    );
+    assert_eq!(
+        TurnManager::parse_goal_audit(r#"{"evidence_summary": "x"}"#),
+        None
+    );
     assert_eq!(TurnManager::parse_goal_audit("不是 JSON"), None);
     assert_eq!(
         TurnManager::parse_goal_audit(r#"{"goal_met": true}"#),
@@ -9082,8 +9251,14 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
     }
     let (receipt, intermediate) = receipt.expect("审计通过应投系统回执");
     assert!(receipt.contains("已达成"), "{receipt}");
-    assert!(intermediate, "回执必须按 intermediate 投递（不得解除忙碌态）");
-    assert!(mgr.session.journal().kv_get(&key).unwrap().is_none(), "目标应被清除");
+    assert!(
+        intermediate,
+        "回执必须按 intermediate 投递（不得解除忙碌态）"
+    );
+    assert!(
+        mgr.session.journal().kv_get(&key).unwrap().is_none(),
+        "目标应被清除"
+    );
 
     // 审计不确认 → 目标保持。
     mgr.handle_goal("cli", "console", "/goal 另一个目标").await;
@@ -9165,9 +9340,16 @@ async fn goal_audit_clears_goal_when_evidence_confirms_and_keeps_it_otherwise() 
         "console".to_string(),
     );
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let still_there = mgr.session.journal().kv_get(&key).unwrap().expect("新目标必须保留");
+    let still_there = mgr
+        .session
+        .journal()
+        .kv_get(&key)
+        .unwrap()
+        .expect("新目标必须保留");
     assert_eq!(
-        still_there.get("created_at").and_then(serde_json::Value::as_i64),
+        still_there
+            .get("created_at")
+            .and_then(serde_json::Value::as_i64),
         Some(created_at2),
         "过期版本的审计通过也不得清掉现目标"
     );

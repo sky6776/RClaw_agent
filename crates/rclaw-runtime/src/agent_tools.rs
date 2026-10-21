@@ -36,13 +36,13 @@ use crate::turn::{
 };
 
 mod plan;
-mod workflow;
-/// AST 级工作流脚本分析（oxc：依赖图 + .ask<T>→schema 编译，第十二轮）。
-pub(crate) mod workflow_ast;
 mod subagent;
 mod team;
 mod tools;
 mod verify;
+mod workflow;
+/// AST 级工作流脚本分析（oxc：依赖图 + .ask<T>→schema 编译，第十二轮）。
+pub(crate) mod workflow_ast;
 
 /// 子 Agent 循环的适配器：唯一的结构差异是完成后的团队任务闸门。
 struct SubagentRunAdapter<'a> {
@@ -67,8 +67,8 @@ impl RunAdapter for SubagentRunAdapter<'_> {
 
 mod escalate;
 pub use escalate::{EscalateTool, ResolveWorkflowQuestionTool};
-pub use workflow::WorkflowRunTool;
 pub use plan::{plan_pause_key, PlanRunTool};
+pub use workflow::WorkflowRunTool;
 
 /// 某 PlanRun 计划是否正在【本进程】执行（宿主 UI 的 plan_status / plan_pause 用：
 /// journal 停在进行中但执行者已不在的计划投影成已中止，不在执行的计划拒绝落暂停）。
@@ -151,7 +151,11 @@ pub(crate) struct EventLog {
 }
 
 impl EventLog {
-    pub(crate) fn new(journal: &JournalStore, kind: &'static str, stream: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        journal: &JournalStore,
+        kind: &'static str,
+        stream: impl Into<String>,
+    ) -> Self {
         EventLog {
             journal: journal.clone(),
             kind,
@@ -1133,41 +1137,43 @@ impl AgentToolRuntime {
                     .plan_id
                     .clone()
                     .map(|plan_id| (plan_id, spec.step_id.clone().unwrap_or_default()));
-                let result = team::CURRENT_PLAN.scope(plan_context, rclaw_tools::turn_state::scope(
-                    async {
-                        if let Some(error) = registration_failure {
-                            return Err(RunTaskFailure::Failed {
-                                error: format!("团队成员注册失败: {error}"),
-                                completed_steps: 0,
-                                media_publish_attempted: false,
-                            });
-                        }
-                        if let Some(identity) = identity.clone() {
-                            CURRENT_AGENT
-                                .scope(
-                                    identity.clone(),
-                                    self.run_task_inner(
-                                        &spec,
-                                        control.as_ref(),
-                                        &registry,
-                                        &static_schema,
-                                        &mut state,
-                                    ),
+                let result = team::CURRENT_PLAN
+                    .scope(
+                        plan_context,
+                        rclaw_tools::turn_state::scope(async {
+                            if let Some(error) = registration_failure {
+                                return Err(RunTaskFailure::Failed {
+                                    error: format!("团队成员注册失败: {error}"),
+                                    completed_steps: 0,
+                                    media_publish_attempted: false,
+                                });
+                            }
+                            if let Some(identity) = identity.clone() {
+                                CURRENT_AGENT
+                                    .scope(
+                                        identity.clone(),
+                                        self.run_task_inner(
+                                            &spec,
+                                            control.as_ref(),
+                                            &registry,
+                                            &static_schema,
+                                            &mut state,
+                                        ),
+                                    )
+                                    .await
+                            } else {
+                                self.run_task_inner(
+                                    &spec,
+                                    control.as_ref(),
+                                    &registry,
+                                    &static_schema,
+                                    &mut state,
                                 )
                                 .await
-                        } else {
-                            self.run_task_inner(
-                                &spec,
-                                control.as_ref(),
-                                &registry,
-                                &static_schema,
-                                &mut state,
-                            )
-                            .await
-                        }
-                    },
-                ))
-                .await;
+                            }
+                        }),
+                    )
+                    .await;
                 turn_state = Some(state);
                 result
             }

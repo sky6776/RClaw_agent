@@ -473,7 +473,10 @@ fn member_turn_prompt(
             s.push_str(&format!("用户: {}\n", line.text));
         } else if let Some(bot) = line.who.strip_prefix("bot:") {
             // 成员发言是转播数据：控制帧语法先消毒再入提示。
-            s.push_str(&format!("@{bot}: {}\n", rclaw_runtime::sanitize_control_frames(&line.text)));
+            s.push_str(&format!(
+                "@{bot}: {}\n",
+                rclaw_runtime::sanitize_control_frames(&line.text)
+            ));
         } else {
             s.push_str(&format!("{}: {}\n", line.who, line.text));
         }

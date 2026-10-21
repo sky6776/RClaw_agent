@@ -65,12 +65,16 @@ pub fn extract_image_paths(contents: &[String]) -> Vec<String> {
             Some(i) => ws[i + "/agent/".len()..].to_string(),
             None => ws.trim_start_matches('/').to_string(),
         };
-        let rel = rel.trim().trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace());
+        let rel = rel
+            .trim()
+            .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace());
         if rel.is_empty() {
             return;
         }
         let lower = rel.to_lowercase();
-        let is_image = [".png", ".jpg", ".jpeg", ".gif", ".bmp"].iter().any(|e| lower.ends_with(e));
+        let is_image = [".png", ".jpg", ".jpeg", ".gif", ".bmp"]
+            .iter()
+            .any(|e| lower.ends_with(e));
         if is_image && !paths.iter().any(|p| p == rel) {
             paths.push(rel.to_string());
         }
@@ -79,9 +83,15 @@ pub fn extract_image_paths(contents: &[String]) -> Vec<String> {
         // 1) 媒体回执行里的 path（绝对或相对）。
         let mut rest = content.as_str();
         while let Some(start) = rest.find("[:") {
-            let Some(end) = rest[start..].find(']') else { break };
+            let Some(end) = rest[start..].find(']') else {
+                break;
+            };
             let marker = &rest[start..start + end];
-            if let Some(p) = marker.split("path=\"").nth(1).and_then(|s| s.split('"').next()) {
+            if let Some(p) = marker
+                .split("path=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+            {
                 push(p);
             }
             rest = &rest[start + end..];
@@ -123,9 +133,7 @@ pub fn extract_image_paths(contents: &[String]) -> Vec<String> {
 
 /// 解析 PNG/JPEG/GIF/BMP 头部的像素宽高（避免引入解码库；仅用于排版比例）。
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() >= 24
-        && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
-    {
+    if bytes.len() >= 24 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a] {
         let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
         let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
         return Some((w, h));
@@ -181,7 +189,14 @@ pub fn render_markdown(title: &str, stamp: &str, messages: &[ExportMessage]) -> 
             _ => "工具",
         };
         let body = strip_media_control_lines(&msg.content).trim().to_string();
-        out.push_str(&format!("## {who}\n\n{}\n\n", if body.is_empty() { "（媒体消息）" } else { &body }));
+        out.push_str(&format!(
+            "## {who}\n\n{}\n\n",
+            if body.is_empty() {
+                "（媒体消息）"
+            } else {
+                &body
+            }
+        ));
     }
     out
 }
@@ -235,7 +250,11 @@ pub fn render_docx(
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_else(|| "png".into());
-        let ext = if ext == "jpeg" { "jpg".to_string() } else { ext };
+        let ext = if ext == "jpeg" {
+            "jpg".to_string()
+        } else {
+            ext
+        };
         images.push(DocxImage {
             rel_id: format!("rIdImg{}", idx + 1),
             file_name: format!("image{}.{}", idx + 1, ext),
@@ -395,7 +414,12 @@ fn image_paragraph(image: &DocxImage, doc_id: i32) -> String {
 
 /// 导出目标文件名（output/exports/ 下的相对路径）。
 pub fn export_rel_path(title: &str, stamp_compact: &str, ext: &str) -> String {
-    format!("output/exports/{}-{}.{}", stamp_compact, safe_file_name(title), ext)
+    format!(
+        "output/exports/{}-{}.{}",
+        stamp_compact,
+        safe_file_name(title),
+        ext
+    )
 }
 
 /// 解析导出相对路径为绝对路径（供命令层落盘；调用方保证 agent 根）。
@@ -417,10 +441,7 @@ mod tests {
     #[test]
     fn strip_media_control_lines_removes_markers_only() {
         let content = "正文\nMEDIA_MARKER=[:desktop-media type=image path=\"x\"]\n下一行";
-        assert_eq!(
-            strip_media_control_lines(content),
-            "正文\n下一行"
-        );
+        assert_eq!(strip_media_control_lines(content), "正文\n下一行");
     }
 
     #[test]
@@ -451,10 +472,22 @@ mod tests {
             "标题",
             "2026-10-03 22:00",
             &[
-                ExportMessage { role: "user".into(), content: "你好".into() },
-                ExportMessage { role: "assistant".into(), content: "MEDIA_MARKER=[:x-media type=image path=\"p\"]\n图如下".into() },
-                ExportMessage { role: "thinking".into(), content: "先列出目录".into() },
-                ExportMessage { role: "status".into(), content: "🔧 调用工具: list output".into() },
+                ExportMessage {
+                    role: "user".into(),
+                    content: "你好".into(),
+                },
+                ExportMessage {
+                    role: "assistant".into(),
+                    content: "MEDIA_MARKER=[:x-media type=image path=\"p\"]\n图如下".into(),
+                },
+                ExportMessage {
+                    role: "thinking".into(),
+                    content: "先列出目录".into(),
+                },
+                ExportMessage {
+                    role: "status".into(),
+                    content: "🔧 调用工具: list output".into(),
+                },
             ],
         );
         assert!(md.contains("## 用户"));
@@ -475,9 +508,10 @@ mod tests {
         png.extend_from_slice(&10u32.to_be_bytes());
         png.extend_from_slice(&20u32.to_be_bytes());
         std::fs::write(dir.path().join("media/a.png"), &png).unwrap();
-        let messages = vec![
-            ExportMessage { role: "user".into(), content: "看 media/a.png".into() },
-        ];
+        let messages = vec![ExportMessage {
+            role: "user".into(),
+            content: "看 media/a.png".into(),
+        }];
         let bytes = render_docx("标题", "2026-10-03", &messages, dir.path()).unwrap();
         let cursor = std::io::Cursor::new(&bytes);
         let mut zip = zip::ZipArchive::new(cursor).unwrap();
@@ -486,7 +520,10 @@ mod tests {
         assert!(names.contains(&"word/document.xml".to_string()));
         assert!(names.contains(&"word/media/image1.png".to_string()));
         let mut doc = String::new();
-        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+        zip.by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut doc)
+            .unwrap();
         assert!(doc.contains("用户"));
         assert!(doc.contains("rIdImg1"));
         assert!(doc.contains("cx=\"95250\"")); // 10px * 9525

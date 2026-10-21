@@ -85,9 +85,11 @@ fn stored_data_omits_id_and_load_restores_it() {
     let data: String = s
         .db()
         .with(|c| {
-            Ok(c.query_row("SELECT data FROM message WHERE id = ?1", params![id], |r| {
-                r.get(0)
-            })?)
+            Ok(
+                c.query_row("SELECT data FROM message WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })?,
+            )
         })
         .unwrap();
     assert!(!data.contains("\"id\""), "data 不应含 id: {data}");
@@ -189,8 +191,12 @@ fn max_msgs_trims_to_tail() {
 fn max_bytes_trims_from_head() {
     let (_g, s) = store();
     for i in 0..5 {
-        s.append("cli", "c", &Message::plain(Role::User, "x".repeat(200) + &i.to_string()))
-            .unwrap();
+        s.append(
+            "cli",
+            "c",
+            &Message::plain(Role::User, "x".repeat(200) + &i.to_string()),
+        )
+        .unwrap();
     }
     let h = s.load_history("cli", "c", 100, 700).unwrap();
     assert!(h.len() < 5 && !h.is_empty(), "{}", h.len());
@@ -727,7 +733,10 @@ fn compaction_boundary_splices_active_view_and_keeps_transcript() {
         } else {
             Role::Assistant
         };
-        ids.push(s.append("cli", "c", &Message::plain(role, format!("m{i}"))).unwrap());
+        ids.push(
+            s.append("cli", "c", &Message::plain(role, format!("m{i}")))
+                .unwrap(),
+        );
     }
     // 受保护头部 = m0,m1；摘要掉 m2..m5；尾窗 = m6,m7。
     let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
@@ -744,7 +753,8 @@ fn compaction_boundary_splices_active_view_and_keeps_transcript() {
     assert_eq!(view[2].id, b, "boundary 行回填自己的 id");
 
     // 压缩后继续追加：落在 after 段。
-    s.append("cli", "c", &Message::plain(Role::User, "m8")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "m8"))
+        .unwrap();
     let view = s.load_history("cli", "c", 100, 1024 * 1024).unwrap();
     assert_eq!(
         texts(&view),
@@ -775,8 +785,11 @@ fn compaction_boundary_splices_active_view_and_keeps_transcript() {
         },
     )
     .unwrap();
-    s.append("cli", "c", &Message::plain(Role::Assistant, "m9")).unwrap();
-    let tail = s.load_transcript_tail("cli", "c", 100, 1024 * 1024).unwrap();
+    s.append("cli", "c", &Message::plain(Role::Assistant, "m9"))
+        .unwrap();
+    let tail = s
+        .load_transcript_tail("cli", "c", 100, 1024 * 1024)
+        .unwrap();
     assert_eq!(
         texts(&tail),
         vec!["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "", "m9"],
@@ -789,27 +802,69 @@ fn compaction_boundary_splices_active_view_and_keeps_transcript() {
     assert_eq!(texts(&tail), vec!["m9"]);
     // 预算恰好装下最新两条（逐条序列化累计）：第三条起不再纳入。
     let all = s.load_transcript_tail("cli", "c", 6, 1024 * 1024).unwrap();
-    let size = |m: &Message| serde_json::to_string(std::slice::from_ref(m)).unwrap().len();
+    let size = |m: &Message| {
+        serde_json::to_string(std::slice::from_ref(m))
+            .unwrap()
+            .len()
+    };
     let two = size(&all[all.len() - 1]) + size(&all[all.len() - 2]);
     let tail = s.load_transcript_tail("cli", "c", 6, two).unwrap();
     assert_eq!(texts(&tail), vec!["", "m9"]);
-    assert_eq!(texts(&s.load_transcript_tail("cli", "c", 6, two - 1).unwrap()), vec!["m9"]);
-    assert!(s.load_transcript_tail("cli", "none", 6, 1024).unwrap().is_empty());
+    assert_eq!(
+        texts(&s.load_transcript_tail("cli", "c", 6, two - 1).unwrap()),
+        vec!["m9"]
+    );
+    assert!(s
+        .load_transcript_tail("cli", "none", 6, 1024)
+        .unwrap()
+        .is_empty());
 
     // 手改坏的行不让 JSON 函数把整条查询报错：非法 JSON 由 `json_valid` 挡在 SQL 层；
     // `content` 不是数组（标量）时 `json_each` 给出一行非对象值，`CASE` 不去 `json_extract`
     // 它——该行留给 `parse_message`，而 serde 接受「content 为字符串」的简写，所以它照常
     // 出现在 tail 里；数组里的非对象元素同样不被 `json_extract`，解析失败才被跳过。
     raw_insert(&s, "cli", "c", "user", "{not json");
-    raw_insert(&s, "cli", "c", "user", r#"{"role":"user","content":"plain string","ts":1}"#);
-    raw_insert(&s, "cli", "c", "user", r#"{"role":"user","content":["bare", 1, null],"ts":1}"#);
-    s.append("cli", "c", &Message::plain(Role::User, "m10")).unwrap();
-    let tail = s.load_transcript_tail("cli", "c", 100, 1024 * 1024).unwrap();
+    raw_insert(
+        &s,
+        "cli",
+        "c",
+        "user",
+        r#"{"role":"user","content":"plain string","ts":1}"#,
+    );
+    raw_insert(
+        &s,
+        "cli",
+        "c",
+        "user",
+        r#"{"role":"user","content":["bare", 1, null],"ts":1}"#,
+    );
+    s.append("cli", "c", &Message::plain(Role::User, "m10"))
+        .unwrap();
+    let tail = s
+        .load_transcript_tail("cli", "c", 100, 1024 * 1024)
+        .unwrap();
     assert_eq!(
         texts(&tail),
-        vec!["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "", "m9", "plain string", "m10"]
+        vec![
+            "m0",
+            "m1",
+            "m2",
+            "m3",
+            "m4",
+            "m5",
+            "m6",
+            "m7",
+            "m8",
+            "",
+            "m9",
+            "plain string",
+            "m10"
+        ]
     );
-    assert_eq!(texts(&s.load_transcript_tail("cli", "c", 1, 1024 * 1024).unwrap()), vec!["m10"]);
+    assert_eq!(
+        texts(&s.load_transcript_tail("cli", "c", 1, 1024 * 1024).unwrap()),
+        vec!["m10"]
+    );
 }
 
 /// 受保护头部以一条没有 tool_result 的 tool_use 收尾（工具执行被中断后压缩，`head_until`
@@ -818,7 +873,9 @@ fn compaction_boundary_splices_active_view_and_keeps_transcript() {
 #[test]
 fn compaction_splice_resynthesizes_placeholder_after_dangling_head_tool_use() {
     let (_g, s) = store();
-    let m0 = s.append("cli", "c", &Message::plain(Role::User, "m0")).unwrap();
+    let m0 = s
+        .append("cli", "c", &Message::plain(Role::User, "m0"))
+        .unwrap();
     let dangling = raw_insert_msg(&s, "cli", "c", &tool_use_assistant("call_1"));
     let mut ids = vec![m0, dangling];
     for i in 2..8 {
@@ -827,7 +884,10 @@ fn compaction_splice_resynthesizes_placeholder_after_dangling_head_tool_use() {
         } else {
             Role::Assistant
         };
-        ids.push(s.append("cli", "c", &Message::plain(role, format!("m{i}"))).unwrap());
+        ids.push(
+            s.append("cli", "c", &Message::plain(role, format!("m{i}")))
+                .unwrap(),
+        );
     }
     let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
     let b = s
@@ -888,10 +948,16 @@ fn first_user_messages_skip_boundary_rows_and_tool_result_carriers() {
         },
     )
     .unwrap();
-    let q1 = s.append("cli", "c", &Message::plain(Role::User, "第一问")).unwrap();
-    s.append("cli", "c", &Message::plain(Role::Assistant, "答")).unwrap();
-    let q2 = s.append("cli", "c", &Message::plain(Role::User, "第二问")).unwrap();
-    s.append("cli", "c", &Message::plain(Role::Assistant, "答2")).unwrap();
+    let q1 = s
+        .append("cli", "c", &Message::plain(Role::User, "第一问"))
+        .unwrap();
+    s.append("cli", "c", &Message::plain(Role::Assistant, "答"))
+        .unwrap();
+    let q2 = s
+        .append("cli", "c", &Message::plain(Role::User, "第二问"))
+        .unwrap();
+    s.append("cli", "c", &Message::plain(Role::Assistant, "答2"))
+        .unwrap();
     // boundary 行（role=user 的摘要）排在最前面也不会被选中。
     s.append_compaction(
         "cli",
@@ -914,26 +980,47 @@ fn second_compaction_without_head_supersedes_first() {
     let (_g, s) = store();
     let mut ids = Vec::new();
     for i in 0..6 {
-        ids.push(s.append("cli", "c", &Message::plain(Role::User, format!("m{i}"))).unwrap());
+        ids.push(
+            s.append("cli", "c", &Message::plain(Role::User, format!("m{i}")))
+                .unwrap(),
+        );
     }
     let b1 = s
-        .append_compaction("cli", "c", &Message::plain(Role::User, "S1"), Some(ids[0]), ids[4])
+        .append_compaction(
+            "cli",
+            "c",
+            &Message::plain(Role::User, "S1"),
+            Some(ids[0]),
+            ids[4],
+        )
         .unwrap();
-    let m6 = s.append("cli", "c", &Message::plain(Role::User, "m6")).unwrap();
-    let m7 = s.append("cli", "c", &Message::plain(Role::User, "m7")).unwrap();
+    let m6 = s
+        .append("cli", "c", &Message::plain(Role::User, "m6"))
+        .unwrap();
+    let m7 = s
+        .append("cli", "c", &Message::plain(Role::User, "m7"))
+        .unwrap();
     // 视图：m0 S1 m4 m5 m6 m7 → 第二次压缩：无受保护头部，尾窗从 m6 起（S1、m4、m5 被摘要）。
-    assert_eq!(texts(&s.load_all("cli", "c").unwrap()), vec!["m0", "S1", "m4", "m5", "m6", "m7"]);
+    assert_eq!(
+        texts(&s.load_all("cli", "c").unwrap()),
+        vec!["m0", "S1", "m4", "m5", "m6", "m7"]
+    );
     let b2 = s
         .append_compaction("cli", "c", &Message::plain(Role::User, "S2"), None, m6)
         .unwrap();
     assert!(b2 > b1 && b1 > ids[5] && m7 > m6);
-    assert_eq!(texts(&s.load_all("cli", "c").unwrap()), vec!["S2", "m6", "m7"]);
+    assert_eq!(
+        texts(&s.load_all("cli", "c").unwrap()),
+        vec!["S2", "m6", "m7"]
+    );
 }
 
 #[test]
 fn compaction_rejects_inverted_anchors() {
     let (_g, s) = store();
-    let a = s.append("cli", "c", &Message::plain(Role::User, "a")).unwrap();
+    let a = s
+        .append("cli", "c", &Message::plain(Role::User, "a"))
+        .unwrap();
     let err = s
         .append_compaction("cli", "c", &Message::plain(Role::User, "S"), Some(a), a)
         .unwrap_err();
@@ -946,9 +1033,14 @@ fn in_turn_compaction_keeps_current_turn_rows() {
     let (_g, s) = store();
     let mut ids = Vec::new();
     for i in 0..4 {
-        ids.push(s.append("cli", "c", &Message::plain(Role::User, format!("h{i}"))).unwrap());
+        ids.push(
+            s.append("cli", "c", &Message::plain(Role::User, format!("h{i}")))
+                .unwrap(),
+        );
     }
-    let turn_user = s.append("cli", "c", &Message::plain(Role::User, "turn-user")).unwrap();
+    let turn_user = s
+        .append("cli", "c", &Message::plain(Role::User, "turn-user"))
+        .unwrap();
     let (a, _t) = s
         .append_tool_chain(
             "cli",
@@ -989,11 +1081,15 @@ fn list_archive_delete_and_stats() {
     let (_g, s) = store();
     assert!(s.list_sessions(None).unwrap().is_empty());
     assert!(!s.session_exists("desktop", "a").unwrap());
-    s.append("desktop", "a", &Message::plain(Role::User, "1")).unwrap();
-    s.append("desktop", "a", &Message::plain(Role::Assistant, "2")).unwrap();
+    s.append("desktop", "a", &Message::plain(Role::User, "1"))
+        .unwrap();
+    s.append("desktop", "a", &Message::plain(Role::Assistant, "2"))
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(3));
-    s.append("desktop", "b", &Message::plain(Role::User, "3")).unwrap();
-    s.append("cli", "console", &Message::plain(Role::User, "4")).unwrap();
+    s.append("desktop", "b", &Message::plain(Role::User, "3"))
+        .unwrap();
+    s.append("cli", "console", &Message::plain(Role::User, "4"))
+        .unwrap();
 
     let desktop = s.list_sessions(Some("desktop")).unwrap();
     assert_eq!(desktop.len(), 2);
@@ -1005,7 +1101,13 @@ fn list_archive_delete_and_stats() {
 
     assert!(s.set_archived("desktop", "a", true).unwrap());
     assert!(!s.set_archived("desktop", "ghost", true).unwrap());
-    assert_eq!(s.session_stats().unwrap(), SessionStats { active: 2, archived: 1 });
+    assert_eq!(
+        s.session_stats().unwrap(),
+        SessionStats {
+            active: 2,
+            archived: 1
+        }
+    );
     let a = s.session_summary("desktop", "a").unwrap().unwrap();
     assert!(a.archived);
     assert!(s.set_archived("desktop", "a", false).unwrap());
@@ -1032,7 +1134,8 @@ fn list_archive_delete_and_stats() {
 #[test]
 fn clear_all_sessions_empties_tables_and_keeps_journal() {
     let (_g, s) = store();
-    s.append("cli", "c", &Message::plain(Role::User, "1")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "1"))
+        .unwrap();
     s.append_file_checkpoints(
         "cli",
         "c",
@@ -1070,23 +1173,34 @@ fn clear_all_sessions_empties_tables_and_keeps_journal() {
     assert_eq!(s.load_usage_anchor("cli", "c", "").unwrap(), None);
     assert_eq!(s.journal().load(crate::JOURNAL_PLAN, "p").unwrap().len(), 1);
     // 清空后可继续使用。
-    let id = s.append("cli", "c", &Message::plain(Role::User, "again")).unwrap();
+    let id = s
+        .append("cli", "c", &Message::plain(Role::User, "again"))
+        .unwrap();
     assert!(id > 0);
 }
 
 #[test]
 fn first_user_messages_and_scan() {
     let (_g, s) = store();
-    s.append("desktop", "a", &Message::plain(Role::Assistant, "greeting")).unwrap();
-    s.append("desktop", "a", &Message::plain(Role::User, "title here")).unwrap();
-    s.append("desktop", "a", &Message::plain(Role::User, "second")).unwrap();
+    s.append("desktop", "a", &Message::plain(Role::Assistant, "greeting"))
+        .unwrap();
+    s.append("desktop", "a", &Message::plain(Role::User, "title here"))
+        .unwrap();
+    s.append("desktop", "a", &Message::plain(Role::User, "second"))
+        .unwrap();
     let firsts = s.first_user_messages("desktop", "a", 1).unwrap();
     assert_eq!(texts(&firsts), vec!["title here"]);
-    assert!(s.first_user_messages("desktop", "none", 5).unwrap().is_empty());
+    assert!(s
+        .first_user_messages("desktop", "none", 5)
+        .unwrap()
+        .is_empty());
 
     let mut seen = Vec::new();
     s.scan_messages(Some("desktop"), |summary, m| {
-        seen.push((summary.chat_id.clone(), texts(std::slice::from_ref(m))[0].clone()));
+        seen.push((
+            summary.chat_id.clone(),
+            texts(std::slice::from_ref(m))[0].clone(),
+        ));
     })
     .unwrap();
     assert_eq!(seen.len(), 3);
@@ -1110,13 +1224,18 @@ fn file_checkpoints_keep_insert_order_and_group() {
         is_rewind: gid == 0,
         anchor_message_id: None,
     };
-    s.append_file_checkpoints("cli", "c", 10, &[cp("a", 0), cp("b", 0)]).unwrap();
-    s.append_file_checkpoints("cli", "c", 20, &[cp("c", 0)]).unwrap();
+    s.append_file_checkpoints("cli", "c", 10, &[cp("a", 0), cp("b", 0)])
+        .unwrap();
+    s.append_file_checkpoints("cli", "c", 20, &[cp("c", 0)])
+        .unwrap();
     // 记录自带 group_id 优先于参数。
-    s.append_file_checkpoints("cli", "c", 30, &[cp("d", 99)]).unwrap();
+    s.append_file_checkpoints("cli", "c", 30, &[cp("d", 99)])
+        .unwrap();
     let all = s.load_file_checkpoints("cli", "c").unwrap();
     assert_eq!(
-        all.iter().map(|c| (c.path.as_str(), c.group_id)).collect::<Vec<_>>(),
+        all.iter()
+            .map(|c| (c.path.as_str(), c.group_id))
+            .collect::<Vec<_>>(),
         vec![("a", 10), ("b", 10), ("c", 20), ("d", 99)]
     );
     assert!(all.windows(2).all(|w| w[0].id < w[1].id));
@@ -1150,7 +1269,9 @@ fn usage_anchor_upsert_and_delete() {
 #[test]
 fn export_transcript_jsonl_includes_ids_and_all_rows() {
     let (_g, s) = store();
-    let a = s.append("cli", "c", &Message::plain(Role::User, "hi")).unwrap();
+    let a = s
+        .append("cli", "c", &Message::plain(Role::User, "hi"))
+        .unwrap();
     s.append_compaction("cli", "c", &Message::plain(Role::User, "S"), None, a)
         .unwrap();
     let out = s.export_transcript_jsonl("cli", "c").unwrap();
@@ -1169,9 +1290,16 @@ fn export_transcript_jsonl_includes_ids_and_all_rows() {
 #[test]
 fn search_messages_prefilters_all_terms_case_insensitively() {
     let (_g, s) = store();
-    s.append("cli", "c1", &Message::plain(Role::User, "Rust 的 borrow checker")).unwrap();
-    s.append("cli", "c2", &Message::plain(Role::User, "python borrow")).unwrap();
-    s.append("cli", "c3", &Message::plain(Role::Assistant, "rust only")).unwrap();
+    s.append(
+        "cli",
+        "c1",
+        &Message::plain(Role::User, "Rust 的 borrow checker"),
+    )
+    .unwrap();
+    s.append("cli", "c2", &Message::plain(Role::User, "python borrow"))
+        .unwrap();
+    s.append("cli", "c3", &Message::plain(Role::Assistant, "rust only"))
+        .unwrap();
     s.set_archived("cli", "c3", true).unwrap();
 
     let rows = s
@@ -1185,7 +1313,10 @@ fn search_messages_prefilters_all_terms_case_insensitively() {
     let rows = s.search_messages(&["rust".to_string()], 100).unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().any(|r| r.chat_id == "c3" && r.archived));
-    assert_eq!(s.search_messages(&["rust".to_string()], 1).unwrap().len(), 1);
+    assert_eq!(
+        s.search_messages(&["rust".to_string()], 1).unwrap().len(),
+        1
+    );
     assert!(s.search_messages(&[String::new()], 10).unwrap().is_empty());
 }
 
@@ -1193,11 +1324,22 @@ fn search_messages_prefilters_all_terms_case_insensitively() {
 fn search_messages_folds_unicode_case_and_only_looks_at_text_blocks() {
     let (_g, s) = store();
     // Unicode 大小写：SQLite 内建 lower() 只折 ASCII，这里必须走 rclaw_lower。
-    s.append("cli", "c1", &Message::plain(Role::User, "ПРИВЕТ, Ärger mit Ｎｇｉｎｘ")).unwrap();
+    s.append(
+        "cli",
+        "c1",
+        &Message::plain(Role::User, "ПРИВЕТ, Ärger mit Ｎｇｉｎｘ"),
+    )
+    .unwrap();
     // 只在 JSON 骨架 / 工具参数里出现的词不算命中。
-    s.append("cli", "c2", &tool_use_assistant("call_1")).unwrap();
+    s.append("cli", "c2", &tool_use_assistant("call_1"))
+        .unwrap();
     // 文本里含需要 JSON 转义的字符：按解码后的文本匹配。
-    s.append("cli", "c3", &Message::plain(Role::User, r#"path "C:\tmp" quoted"#)).unwrap();
+    s.append(
+        "cli",
+        "c3",
+        &Message::plain(Role::User, r#"path "C:\tmp" quoted"#),
+    )
+    .unwrap();
     // 工具结果载体不参与搜索。
     s.append(
         "cli",
@@ -1216,9 +1358,17 @@ fn search_messages_folds_unicode_case_and_only_looks_at_text_blocks() {
     )
     .unwrap();
     // compaction boundary 行不参与搜索。
-    let a = s.append("cli", "c5", &Message::plain(Role::User, "plain")).unwrap();
-    s.append_compaction("cli", "c5", &Message::plain(Role::User, "привет summary"), None, a)
+    let a = s
+        .append("cli", "c5", &Message::plain(Role::User, "plain"))
         .unwrap();
+    s.append_compaction(
+        "cli",
+        "c5",
+        &Message::plain(Role::User, "привет summary"),
+        None,
+        a,
+    )
+    .unwrap();
 
     let hit = |term: &str| {
         s.search_messages(&[term.to_string()], 100)
@@ -1227,10 +1377,17 @@ fn search_messages_folds_unicode_case_and_only_looks_at_text_blocks() {
             .map(|r| r.chat_id)
             .collect::<Vec<_>>()
     };
-    assert_eq!(hit("привет"), vec!["c1"], "西里尔大小写折叠；tool 结果与 boundary 不计");
+    assert_eq!(
+        hit("привет"),
+        vec!["c1"],
+        "西里尔大小写折叠；tool 结果与 boundary 不计"
+    );
     assert_eq!(hit("ärger"), vec!["c1"]);
     assert_eq!(hit("ｎｇｉｎｘ"), vec!["c1"], "全角字母大小写折叠");
-    assert!(hit("read_file").is_empty(), "工具名只在 tool_use 块里，不算文本命中");
+    assert!(
+        hit("read_file").is_empty(),
+        "工具名只在 tool_use 块里，不算文本命中"
+    );
     assert!(hit("text").is_empty(), "JSON 骨架字段名不算命中");
     assert_eq!(hit(r#""c:\tmp""#), vec!["c3"], "按解码后的文本匹配转义字符");
 }
@@ -1238,9 +1395,15 @@ fn search_messages_folds_unicode_case_and_only_looks_at_text_blocks() {
 #[test]
 fn compaction_rejects_anchors_outside_session_or_on_boundary_rows() {
     let (_g, s) = store();
-    let a = s.append("cli", "c", &Message::plain(Role::User, "a")).unwrap();
-    let b = s.append("cli", "c", &Message::plain(Role::User, "b")).unwrap();
-    let other = s.append("cli", "other", &Message::plain(Role::User, "o")).unwrap();
+    let a = s
+        .append("cli", "c", &Message::plain(Role::User, "a"))
+        .unwrap();
+    let b = s
+        .append("cli", "c", &Message::plain(Role::User, "b"))
+        .unwrap();
+    let other = s
+        .append("cli", "other", &Message::plain(Role::User, "o"))
+        .unwrap();
 
     // tail_from 属于别的会话。
     let err = s
@@ -1261,7 +1424,9 @@ fn compaction_rejects_anchors_outside_session_or_on_boundary_rows() {
     let b1 = s
         .append_compaction("cli", "c", &Message::plain(Role::User, "S1"), Some(a), b)
         .unwrap();
-    let c = s.append("cli", "c", &Message::plain(Role::User, "c")).unwrap();
+    let c = s
+        .append("cli", "c", &Message::plain(Role::User, "c"))
+        .unwrap();
     // tail_from 指向 boundary 行本身。
     let err = s
         .append_compaction("cli", "c", &Message::plain(Role::User, "S2"), None, b1)
@@ -1282,7 +1447,9 @@ fn compaction_rejects_anchors_outside_session_or_on_boundary_rows() {
         .unwrap();
     assert_eq!(texts(&s.load_all("cli", "c").unwrap()), vec!["S2", "c"]);
     // 已无受保护头部后不得再引入头部。
-    let d = s.append("cli", "c", &Message::plain(Role::User, "d")).unwrap();
+    let d = s
+        .append("cli", "c", &Message::plain(Role::User, "d"))
+        .unwrap();
     let err = s
         .append_compaction("cli", "c", &Message::plain(Role::User, "S3"), Some(c), d)
         .unwrap_err();
@@ -1296,11 +1463,15 @@ fn active_view_never_includes_older_boundary_rows() {
     let (_g, s) = store();
     let mut ids = Vec::new();
     for i in 0..4 {
-        ids.push(s.append("cli", "c", &Message::plain(Role::User, format!("m{i}"))).unwrap());
+        ids.push(
+            s.append("cli", "c", &Message::plain(Role::User, format!("m{i}")))
+                .unwrap(),
+        );
     }
     s.append_compaction("cli", "c", &Message::plain(Role::User, "S1"), None, ids[2])
         .unwrap();
-    s.append("cli", "c", &Message::plain(Role::User, "m4")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "m4"))
+        .unwrap();
     // 尾窗仍从 m2 起（允许：未回退），区间 [m2, B2) 内含 m2 m3 B1 m4。
     s.append_compaction("cli", "c", &Message::plain(Role::User, "S2"), None, ids[2])
         .unwrap();
@@ -1314,11 +1485,16 @@ fn active_view_never_includes_older_boundary_rows() {
 #[test]
 fn export_transcript_marks_boundary_rows_with_meta() {
     let (_g, s) = store();
-    let a = s.append("cli", "c", &Message::plain(Role::User, "hi")).unwrap();
+    let a = s
+        .append("cli", "c", &Message::plain(Role::User, "hi"))
+        .unwrap();
     s.append_compaction("cli", "c", &Message::plain(Role::User, "S"), None, a)
         .unwrap();
     let out = s.export_transcript_jsonl("cli", "c").unwrap();
-    let lines: Vec<serde_json::Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let lines: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
     assert!(lines[0].get("meta").is_none(), "普通行不带 meta");
     assert_eq!(lines[1]["meta"]["compaction"]["tail_from"], json!(a));
     assert!(lines[1]["meta"]["compaction"]["head_until"].is_null());
@@ -1337,18 +1513,24 @@ fn checkpoint_meta_and_range_loaders() {
         is_rewind: false,
         anchor_message_id: None,
     };
-    s.append_file_checkpoints("cli", "c", 10, &[cp("a", "A0"), cp("b", "B0")]).unwrap();
-    s.append_file_checkpoints("cli", "c", 20, &[cp("a", "A1")]).unwrap();
+    s.append_file_checkpoints("cli", "c", 10, &[cp("a", "A0"), cp("b", "B0")])
+        .unwrap();
+    s.append_file_checkpoints("cli", "c", 20, &[cp("a", "A1")])
+        .unwrap();
 
     let meta = s.load_file_checkpoint_meta("cli", "c").unwrap();
     assert_eq!(meta.len(), 3);
     assert_eq!(
-        meta.iter().map(|m| (m.path.as_str(), m.group_id)).collect::<Vec<_>>(),
+        meta.iter()
+            .map(|m| (m.path.as_str(), m.group_id))
+            .collect::<Vec<_>>(),
         vec![("a", 10), ("b", 10), ("a", 20)]
     );
     assert_eq!(meta[2].before_hash.as_deref(), Some("h-A1"));
 
-    let from_second_group = s.load_file_checkpoints_from("cli", "c", meta[2].id).unwrap();
+    let from_second_group = s
+        .load_file_checkpoints_from("cli", "c", meta[2].id)
+        .unwrap();
     assert_eq!(from_second_group.len(), 1);
     assert_eq!(from_second_group[0].before.as_deref(), Some("A1"));
     assert_eq!(
@@ -1356,15 +1538,20 @@ fn checkpoint_meta_and_range_loaders() {
         3,
         "min_id=0 等价于全部"
     );
-    assert!(s.load_file_checkpoint_meta("cli", "none").unwrap().is_empty());
+    assert!(s
+        .load_file_checkpoint_meta("cli", "none")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
 fn checkpoint_only_writes_do_not_touch_session_updated_at() {
     let (_g, s) = store();
-    s.append("cli", "a", &Message::plain(Role::User, "1")).unwrap();
+    s.append("cli", "a", &Message::plain(Role::User, "1"))
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(3));
-    s.append("cli", "b", &Message::plain(Role::User, "2")).unwrap();
+    s.append("cli", "b", &Message::plain(Role::User, "2"))
+        .unwrap();
     assert_eq!(s.list_sessions(None).unwrap()[0].chat_id, "b");
     std::thread::sleep(std::time::Duration::from_millis(3));
 
@@ -1385,8 +1572,15 @@ fn checkpoint_only_writes_do_not_touch_session_updated_at() {
         }],
     )
     .unwrap();
-    assert_eq!(s.session_summary("cli", "a").unwrap().unwrap().updated_at, before);
-    assert_eq!(s.list_sessions(None).unwrap()[0].chat_id, "b", "a 不应被顶到最前");
+    assert_eq!(
+        s.session_summary("cli", "a").unwrap().unwrap().updated_at,
+        before
+    );
+    assert_eq!(
+        s.list_sessions(None).unwrap()[0].chat_id,
+        "b",
+        "a 不应被顶到最前"
+    );
     // 不存在的会话：checkpoint 写入仍会创建会话行。
     s.append_file_checkpoints(
         "cli",
@@ -1412,9 +1606,13 @@ fn ids_keep_growing_after_clear_all_sessions() {
     // AUTOINCREMENT：清空后新 id 仍大于清空前的最大 id，旧的 usage / 压缩锚点不会被
     // 新行“顶替”。
     let (_g, s) = store();
-    let before = s.append("cli", "c", &Message::plain(Role::User, "1")).unwrap();
+    let before = s
+        .append("cli", "c", &Message::plain(Role::User, "1"))
+        .unwrap();
     s.clear_all_sessions().unwrap();
-    let after = s.append("cli", "c", &Message::plain(Role::User, "2")).unwrap();
+    let after = s
+        .append("cli", "c", &Message::plain(Role::User, "2"))
+        .unwrap();
     assert!(after > before, "{after} <= {before}");
 }
 
@@ -1422,7 +1620,8 @@ fn ids_keep_growing_after_clear_all_sessions() {
 fn tool_chain_failure_rolls_back_whole_transaction() {
     // 把 file_checkpoint 表改名制造插入失败：assistant 行不得单独落库。
     let (_g, s) = store();
-    s.append("cli", "c", &Message::plain(Role::User, "u")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "u"))
+        .unwrap();
     s.db()
         .with(|c| {
             c.execute_batch("ALTER TABLE file_checkpoint RENAME TO file_checkpoint_gone")?;
@@ -1487,8 +1686,15 @@ fn tool_use_counts_only_counts_assistant_tool_uses() {
 fn chat_sequence(s: &SessionStore, n: usize) -> Vec<i64> {
     let mut ids = Vec::new();
     for i in 0..n {
-        let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
-        ids.push(s.append("cli", "c", &Message::plain(role, format!("m{i}"))).unwrap());
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        ids.push(
+            s.append("cli", "c", &Message::plain(role, format!("m{i}")))
+                .unwrap(),
+        );
     }
     ids
 }
@@ -1593,7 +1799,8 @@ fn recent_user_anchors_list_real_user_messages_newest_first() {
     };
     s.append("cli", "c", &carrier).unwrap();
     let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
-    s.append_compaction("cli", "c", &summary, None, ids[1]).unwrap();
+    s.append_compaction("cli", "c", &summary, None, ids[1])
+        .unwrap();
 
     let anchors = s.recent_user_anchors("cli", "c", 10).unwrap();
     let preview_ids: Vec<i64> = anchors.iter().map(|(id, _, _)| *id).collect();
@@ -1602,11 +1809,7 @@ fn recent_user_anchors_list_real_user_messages_newest_first() {
     assert_eq!(anchors[0].2, "m2");
     // 长文本截断到 120 字符。
     let long = s
-        .append(
-            "cli",
-            "c",
-            &Message::plain(Role::User, "长".repeat(200)),
-        )
+        .append("cli", "c", &Message::plain(Role::User, "长".repeat(200)))
         .unwrap();
     let anchors = s.recent_user_anchors("cli", "c", 10).unwrap();
     assert_eq!(anchors[0].0, long);
@@ -1633,7 +1836,8 @@ fn delete_session_cascades_artifact_dir_and_clear_wipes_root() {
         .join(crate::session::artifact_chat_key("cli", "other"));
     std::fs::create_dir_all(&other_dir).unwrap();
     // 无关会话的 artifact 也在（键规则与 runtime artifact.rs 同源）。
-    s.append("cli", "console", &Message::plain(Role::User, "m")).unwrap();
+    s.append("cli", "console", &Message::plain(Role::User, "m"))
+        .unwrap();
 
     assert!(s.delete_session("cli", "console").unwrap());
     assert!(!a_dir.exists(), "会话删除应级联清理其 artifact 目录");
@@ -1653,8 +1857,14 @@ fn delete_session_cascades_artifact_dir_and_clear_wipes_root() {
     s.clear_all_sessions().unwrap();
     assert!(!a_dir.exists(), "clear 应清空会话 artifact 目录");
     assert!(!other_dir.exists(), "clear 应清空全部会话 artifact 目录");
-    assert!(foreign_dir.join("keep.md").exists(), "非会话目录不得被 clear 抹掉");
-    assert!(base.join("artifacts").join("loose.txt").exists(), "根下散文件不得被 clear 抹掉");
+    assert!(
+        foreign_dir.join("keep.md").exists(),
+        "非会话目录不得被 clear 抹掉"
+    );
+    assert!(
+        base.join("artifacts").join("loose.txt").exists(),
+        "根下散文件不得被 clear 抹掉"
+    );
 }
 
 #[test]
@@ -1663,7 +1873,9 @@ fn fork_copy_skips_atomic_write_sidecars() {
     // fork 复制目录时跳过（半截内容不该成为新分支的句柄实体）。
     let (_g, s) = store();
     let base = s.layout().base.clone();
-    let anchor = s.append("cli", "c", &Message::plain(Role::User, "m")).unwrap();
+    let anchor = s
+        .append("cli", "c", &Message::plain(Role::User, "m"))
+        .unwrap();
     let src_dir = base
         .join("artifacts")
         .join(crate::session::artifact_chat_key("cli", "c"));
@@ -1675,26 +1887,40 @@ fn fork_copy_skips_atomic_write_sidecars() {
         .join("artifacts")
         .join(crate::session::artifact_chat_key("cli", "c-fork"));
     assert!(fork_dir.join("7-shell.txt").exists());
-    assert!(!fork_dir.join(".8-shell.txt.0123456789abcdef.tmp").exists(), "tmp sidecar 不复制");
+    assert!(
+        !fork_dir.join(".8-shell.txt.0123456789abcdef.tmp").exists(),
+        "tmp sidecar 不复制"
+    );
 }
 
 #[test]
 fn fork_lineage_kv_is_cascaded_on_delete_and_clear() {
     // 血缘 kv 随会话删除 / 全清：留着会让复用 chat_id 的新会话被当成旧分叉。
     let (_g, s) = store();
-    let anchor = s.append("cli", "c", &Message::plain(Role::User, "m")).unwrap();
+    let anchor = s
+        .append("cli", "c", &Message::plain(Role::User, "m"))
+        .unwrap();
     s.fork_session("cli", "c", anchor, "c-fork").unwrap();
     assert!(s.fork_parent("cli", "c-fork").unwrap().is_some());
     assert!(s.delete_session("cli", "c-fork").unwrap());
-    assert!(s.fork_parent("cli", "c-fork").unwrap().is_none(), "会话删除应级联血缘 kv");
+    assert!(
+        s.fork_parent("cli", "c-fork").unwrap().is_none(),
+        "会话删除应级联血缘 kv"
+    );
 
     s.fork_session("cli", "c", anchor, "c-fork-2").unwrap();
     s.journal()
         .kv_set("plan-pause/plan-1", &serde_json::json!({"at": 0}))
         .unwrap();
     s.clear_all_sessions().unwrap();
-    assert!(s.fork_parent("cli", "c-fork-2").unwrap().is_none(), "/clear 应清空全部血缘 kv");
-    assert!(s.journal().kv_get("plan-pause/plan-1").unwrap().is_some(), "运行时 kv 不受牵连");
+    assert!(
+        s.fork_parent("cli", "c-fork-2").unwrap().is_none(),
+        "/clear 应清空全部血缘 kv"
+    );
+    assert!(
+        s.journal().kv_get("plan-pause/plan-1").unwrap().is_some(),
+        "运行时 kv 不受牵连"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1714,7 +1940,10 @@ fn artifact_chat_key_is_collision_resistant_and_stable() {
     // 摘要后必须不同。
     let long_a = format!("{}A", "x".repeat(56));
     let long_b = format!("{}B", "x".repeat(56));
-    assert_ne!(artifact_chat_key("desktop", &long_a), artifact_chat_key("desktop", &long_b));
+    assert_ne!(
+        artifact_chat_key("desktop", &long_a),
+        artifact_chat_key("desktop", &long_b)
+    );
 
     // 路径分隔符 / 空白替换成下划线，不允许逃出目录；摘要仍区分。
     assert_eq!(
@@ -1770,23 +1999,34 @@ fn fork_rewrites_and_copies_artifact_handles() {
         })
         .collect::<String>();
     assert!(
-        text.contains(&format!("/artifacts/{}/42-grep.txt", crate::session::artifact_chat_key("cli", "c-fork"))),
+        text.contains(&format!(
+            "/artifacts/{}/42-grep.txt",
+            crate::session::artifact_chat_key("cli", "c-fork")
+        )),
         "句柄应重写到新目录: {text}"
     );
     assert!(
-        !text.contains(&format!("/artifacts/{}/", crate::session::artifact_chat_key("cli", "c"))),
+        !text.contains(&format!(
+            "/artifacts/{}/",
+            crate::session::artifact_chat_key("cli", "c")
+        )),
         "不得残留源目录句柄: {text}"
     );
 
     // 父会话删除不再牵连 fork 的副本。
     assert!(s.delete_session("cli", "c").unwrap());
-    assert!(fork_dir.join("42-grep.txt").exists(), "删父会话不得删 fork 的 artifact");
+    assert!(
+        fork_dir.join("42-grep.txt").exists(),
+        "删父会话不得删 fork 的 artifact"
+    );
 }
 
 #[test]
 fn fork_without_artifacts_stays_clean() {
     let (_g, s) = store();
-    let anchor = s.append("cli", "c", &Message::plain(Role::User, "m")).unwrap();
+    let anchor = s
+        .append("cli", "c", &Message::plain(Role::User, "m"))
+        .unwrap();
     // 源会话没有 artifact 目录：fork 照常成功（best-effort 跳过）。
     let fork = s.fork_session("cli", "c", anchor, "c-fork").unwrap();
     assert_eq!(fork.copied, 1);
@@ -1797,10 +2037,15 @@ fn session_goal_kv_is_cascaded_on_delete_and_clear() {
     let (_g, s) = store();
     let journal = s.journal();
     let key = crate::session::session_goal_key("cli", "console");
-    journal.kv_set(&key, &serde_json::json!({"objective": "旧目标"})).unwrap();
+    journal
+        .kv_set(&key, &serde_json::json!({"objective": "旧目标"}))
+        .unwrap();
     // 非 会话级 的 kv（plan / workflow 等）不受牵连。
-    journal.kv_set("plan-pause/plan-1", &serde_json::json!({"at": 0})).unwrap();
-    s.append("cli", "console", &Message::plain(Role::User, "m")).unwrap();
+    journal
+        .kv_set("plan-pause/plan-1", &serde_json::json!({"at": 0}))
+        .unwrap();
+    s.append("cli", "console", &Message::plain(Role::User, "m"))
+        .unwrap();
 
     // 单会话删除：目标 kv 级联，其余 kv 保留。
     assert!(s.delete_session("cli", "console").unwrap());
@@ -1808,13 +2053,19 @@ fn session_goal_kv_is_cascaded_on_delete_and_clear() {
     assert!(journal.kv_get("plan-pause/plan-1").unwrap().is_some());
 
     // 全清：所有 session-goal 键清空，plan 等 journal kv 保留。
-    s.append("cli", "c2", &Message::plain(Role::User, "m")).unwrap();
+    s.append("cli", "c2", &Message::plain(Role::User, "m"))
+        .unwrap();
     journal
-        .kv_set(&crate::session::session_goal_key("cli", "c2"), &serde_json::json!({"objective": "x"}))
+        .kv_set(
+            &crate::session::session_goal_key("cli", "c2"),
+            &serde_json::json!({"objective": "x"}),
+        )
         .unwrap();
     s.clear_all_sessions().unwrap();
     assert_eq!(
-        journal.kv_get(&crate::session::session_goal_key("cli", "c2")).unwrap(),
+        journal
+            .kv_get(&crate::session::session_goal_key("cli", "c2"))
+            .unwrap(),
         None,
         "/clear 应清空全部会话目标"
     );
@@ -1826,15 +2077,24 @@ fn fork_notice_reaches_model_context_but_stays_out_of_replay() {
     let (_g, s) = store();
     let ids = chat_sequence(&s, 4);
     s.fork_session("cli", "c", ids[2], "c-fork").unwrap();
-    s.append_fork_notice("cli", "c-fork", "c", ids[2], "已回滚 2 个文件到分叉点时刻。")
-        .unwrap();
+    s.append_fork_notice(
+        "cli",
+        "c-fork",
+        "c",
+        ids[2],
+        "已回滚 2 个文件到分叉点时刻。",
+    )
+    .unwrap();
 
     // 模型上下文（活动视图）读得到告知行：继承说明 + 文件回滚结果 + 继续指令。
     let model_view = texts(&s.load_all("cli", "c-fork").unwrap());
     assert_eq!(model_view.len(), 4, "m0,m1,m2 + 告知行");
     assert!(model_view[3].contains("【会话分叉】"), "{model_view:?}");
     assert!(model_view[3].contains("已回滚 2 个文件"), "{model_view:?}");
-    assert!(model_view[3].contains("不要假设分叉点之后的消息"), "{model_view:?}");
+    assert!(
+        model_view[3].contains("不要假设分叉点之后的消息"),
+        "{model_view:?}"
+    );
 
     // 前端回放（尾部窗口，REPLAYABLE_FILTER 的 meta IS NULL）不显示告知行。
     let tail = s
@@ -1850,7 +2110,8 @@ fn fork_notice_reaches_model_context_but_stays_out_of_replay() {
     // 压缩的默认受保护头部（protect_first=3）会落在告知行上——非 compaction meta
     // 行是普通行，必须能作压缩锚点（回归：meta IS NULL 硬校验会让分叉后的会话
     // 永远无法落压缩 boundary）。
-    s.append("cli", "c-fork", &Message::plain(Role::User, "m4")).unwrap();
+    s.append("cli", "c-fork", &Message::plain(Role::User, "m4"))
+        .unwrap();
     let child = s.load_all("cli", "c-fork").unwrap();
     let summary = Message::plain(Role::User, "[CONTEXT COMPACTION] summary");
     // 受保护头部 = 告知行（child[3]）；尾窗 m4（child[4]）。
@@ -1903,12 +2164,15 @@ fn tool_result_carrier(call_id: &str) -> Message {
 #[test]
 fn delta_from_snapshot_cursor_consumes_exactly_once() {
     let (_g, s) = store();
-    s.append("cli", "c", &Message::plain(Role::User, "q1")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "q1"))
+        .unwrap();
     s.append("cli", "c", &Message::plain(Role::Assistant, "a1"))
         .unwrap();
 
     // 快照：cursor = 当时最大行 id（含工具链等被过滤行）。
-    let snap = s.load_chat_snapshot("cli", "c", 200, 4 * 1024 * 1024).unwrap();
+    let snap = s
+        .load_chat_snapshot("cli", "c", 200, 4 * 1024 * 1024)
+        .unwrap();
     assert_eq!(texts(&snap.messages), vec!["q1", "a1"]);
     let max_after_two = s.load_transcript("cli", "c").unwrap().last().unwrap().id;
     assert_eq!(snap.cursor, max_after_two);
@@ -1919,7 +2183,12 @@ fn delta_from_snapshot_cursor_consumes_exactly_once() {
 
     // 新一轮落库（含被过滤的 tool 链与 boundary），增量只回可回放行、游标越过被过滤行。
     let (ta, _tr) = s
-        .append_tool_chain("cli", "c", &assistant_tool_use("read", "c1"), &tool_result_carrier("c1"))
+        .append_tool_chain(
+            "cli",
+            "c",
+            &assistant_tool_use("read", "c1"),
+            &tool_result_carrier("c1"),
+        )
         .unwrap();
     s.append("cli", "c", &Message::plain(Role::Assistant, "a2"))
         .unwrap();
@@ -1929,7 +2198,10 @@ fn delta_from_snapshot_cursor_consumes_exactly_once() {
     assert!(d2.messages[0].has_tool_calls());
     assert_eq!(d2.messages[1].content[0].as_text().unwrap(), "a2");
     let max_now = s.load_transcript("cli", "c").unwrap().last().unwrap().id;
-    assert_eq!(d2.cursor, max_now, "不满批：游标直达当前最大行 id（越过被过滤行）");
+    assert_eq!(
+        d2.cursor, max_now,
+        "不满批：游标直达当前最大行 id（越过被过滤行）"
+    );
     assert!(!d2.more);
     assert!(ta > max_after_two);
 
@@ -1972,9 +2244,12 @@ fn delta_pages_with_more_and_row_cursor_when_full() {
 fn snapshot_tail_window_keeps_global_cursor_over_filtered_rows() {
     let (_g, s) = store();
     // 3 条可回放 + 尾部一条 tool 载体（turn 以工具调用收尾时真实存在）。
-    s.append("cli", "c", &Message::plain(Role::User, "q")).unwrap();
-    s.append("cli", "c", &Message::plain(Role::Assistant, "a")).unwrap();
-    s.append("cli", "c", &Message::plain(Role::User, "q2")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "q"))
+        .unwrap();
+    s.append("cli", "c", &Message::plain(Role::Assistant, "a"))
+        .unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "q2"))
+        .unwrap();
     s.append("cli", "c", &tool_result_carrier("cx")).unwrap();
 
     // 窗口只装 2 条：最旧的可回放行被裁掉，但游标仍是全局最大（含被裁行与载体行）。
@@ -2000,7 +2275,8 @@ fn snapshot_and_delta_on_missing_session_are_empty() {
 #[test]
 fn delta_skips_compaction_boundary_but_cursor_passes_it() {
     let (_g, s) = store();
-    s.append("cli", "c", &Message::plain(Role::User, "m0")).unwrap();
+    s.append("cli", "c", &Message::plain(Role::User, "m0"))
+        .unwrap();
     s.append("cli", "c", &Message::plain(Role::Assistant, "m1"))
         .unwrap();
     let boundary = s
@@ -2025,11 +2301,17 @@ fn delta_skips_compaction_boundary_but_cursor_passes_it() {
 #[test]
 fn delta_page_fullness_counts_raw_rows_not_parsed_messages() {
     let (_g, s) = store();
-    let v1 = s.append("cli", "c", &Message::plain(Role::User, "v1")).unwrap();
+    let v1 = s
+        .append("cli", "c", &Message::plain(Role::User, "v1"))
+        .unwrap();
     // 一行合法 JSON 但反序列化不成 Message：query 层面占页额度，只是映射不出条目。
     let bad = raw_insert(&s, "cli", "c", "user", r#"{"not":"a message"}"#);
-    let v2 = s.append("cli", "c", &Message::plain(Role::User, "v2")).unwrap();
-    let v3 = s.append("cli", "c", &Message::plain(Role::User, "v3")).unwrap();
+    let v2 = s
+        .append("cli", "c", &Message::plain(Role::User, "v2"))
+        .unwrap();
+    let v3 = s
+        .append("cli", "c", &Message::plain(Role::User, "v3"))
+        .unwrap();
     assert!(bad > v1 && v2 > bad && v3 > v2);
 
     // limit=2 的第一页吃到 (v1, bad)：映射出 1 条，但页是【满】的——more=true 且

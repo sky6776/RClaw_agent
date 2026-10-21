@@ -41,8 +41,8 @@ pub use session_search::SessionSearchTool;
 pub use shell::Shell;
 pub use shell_jobs::ShellPoll;
 pub use skill_entrypoint::{
-    load_skill_entrypoints, clear_python_script_executor, clear_skill_output_limit,
-    clear_skill_script_change_hook, set_python_script_executor, set_skill_output_limit,
+    clear_python_script_executor, clear_skill_output_limit, clear_skill_script_change_hook,
+    load_skill_entrypoints, set_python_script_executor, set_skill_output_limit,
     set_skill_script_change_hook, PythonResolver, PythonScriptExecutor, PythonScriptRequest,
     ScriptFailure, ScriptOutcome, SkillEntrypointTool, SkillScriptChangeHook,
 };

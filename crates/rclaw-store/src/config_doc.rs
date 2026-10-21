@@ -406,7 +406,10 @@ mod tests {
             assert!(
                 doc.sections.iter().any(|s| s.path == p),
                 "缺段 {p}: {:?}",
-                doc.sections.iter().map(|s| s.path.as_str()).collect::<Vec<_>>()
+                doc.sections
+                    .iter()
+                    .map(|s| s.path.as_str())
+                    .collect::<Vec<_>>()
             );
         }
         let agent = doc

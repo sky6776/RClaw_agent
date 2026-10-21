@@ -66,7 +66,9 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                 let chat_id = msg.chat_id.clone();
                 tokio::spawn(async move {
                     let response = manager.handle_compact(&channel, &chat_id).await;
-                    manager.send_command_reply(&channel, &chat_id, response).await;
+                    manager
+                        .send_command_reply(&channel, &chat_id, response)
+                        .await;
                 });
                 return true;
             }
@@ -84,11 +86,17 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                 let content = msg.content.clone();
                 tokio::spawn(async move {
                     let response = manager.handle_fork(&channel, &chat_id, &content).await;
-                    manager.send_command_reply(&channel, &chat_id, response).await;
+                    manager
+                        .send_command_reply(&channel, &chat_id, response)
+                        .await;
                 });
                 return true;
             }
-            RuntimeCommand::Goal => manager.handle_goal(&msg.channel, &msg.chat_id, &msg.content).await,
+            RuntimeCommand::Goal => {
+                manager
+                    .handle_goal(&msg.channel, &msg.chat_id, &msg.content)
+                    .await
+            }
             RuntimeCommand::Export => {
                 // 导出要把整段 transcript（可能上千条）读出来并渲染、落盘：虽然走的是
                 // spawn_blocking，但在路由任务上 await 它同样会让别的会话排队。与 /compact
@@ -99,7 +107,9 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                 let content = msg.content.clone();
                 tokio::spawn(async move {
                     let response = manager.handle_export(&channel, &chat_id, &content).await;
-                    manager.send_command_reply(&channel, &chat_id, response).await;
+                    manager
+                        .send_command_reply(&channel, &chat_id, response)
+                        .await;
                 });
                 return true;
             }

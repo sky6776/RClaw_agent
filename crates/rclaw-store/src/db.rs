@@ -22,7 +22,8 @@ pub const SCHEMA_VERSION: i64 = 2;
 /// v1 → v2：`file_checkpoint` 加 `anchor_message_id` 列（checkpoint 与同事务写入的
 /// tool_result 消息行的关联；「fork + 文件回滚到锚点」按它切回滚集。旧行 NULL =
 /// 迁移前的记录，归属未知，按消息锚点回滚时不参与）。
-const SCHEMA_V2_MIGRATION: &str = "ALTER TABLE file_checkpoint ADD COLUMN anchor_message_id INTEGER;";
+const SCHEMA_V2_MIGRATION: &str =
+    "ALTER TABLE file_checkpoint ADD COLUMN anchor_message_id INTEGER;";
 
 /// v1 schema。字段语义见 `docs/superpowers/specs/2026-10-12-sqlite-state-store-design.md`。
 const SCHEMA_V1: &str = r#"
@@ -156,7 +157,10 @@ impl Db {
     }
 
     /// 在 `BEGIN IMMEDIATE` 写事务里执行一组操作；闭包返回 `Err` 自动回滚。
-    pub(crate) fn transaction<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+    pub(crate) fn transaction<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let out = f(&tx)?;
@@ -175,7 +179,9 @@ impl Db {
         let conn = self.lock();
         conn.execute_batch("VACUUM")?;
         if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
-            tracing::warn!("state.sqlite WAL checkpoint 失败（主库已回收，WAL 残留待下次 checkpoint）: {e}");
+            tracing::warn!(
+                "state.sqlite WAL checkpoint 失败（主库已回收，WAL 残留待下次 checkpoint）: {e}"
+            );
         }
         Ok(())
     }
@@ -347,7 +353,10 @@ mod tests {
 
         let res: Result<()> = db.read_snapshot(|_| Err(crate::StoreError::Other("boom".into())));
         assert!(res.is_err());
-        assert!(db.with(|c| Ok(c.is_autocommit())).unwrap(), "Err 路径也不留事务");
+        assert!(
+            db.with(|c| Ok(c.is_autocommit())).unwrap(),
+            "Err 路径也不留事务"
+        );
 
         db.transaction(|tx| {
             tx.execute(
@@ -396,7 +405,10 @@ mod tests {
         let builtin: String = db
             .with(|c| Ok(c.query_row("SELECT lower('ПРИВЕТ')", [], |r| r.get(0))?))
             .unwrap();
-        assert_eq!(builtin, "ПРИВЕТ", "内建 lower() 只折 ASCII，正是需要自定义函数的原因");
+        assert_eq!(
+            builtin, "ПРИВЕТ",
+            "内建 lower() 只折 ASCII，正是需要自定义函数的原因"
+        );
         let null: Option<String> = db
             .with(|c| Ok(c.query_row("SELECT rclaw_lower(NULL)", [], |r| r.get(0))?))
             .unwrap();
@@ -421,7 +433,9 @@ mod v2_migration_tests {
                 [],
             )
             .unwrap();
-            let sid: i64 = conn.query_row("SELECT id FROM session", [], |r| r.get(0)).unwrap();
+            let sid: i64 = conn
+                .query_row("SELECT id FROM session", [], |r| r.get(0))
+                .unwrap();
             conn.execute(
                 "INSERT INTO file_checkpoint(session_id, group_id, path, before, before_hash, \
                  after_hash, is_rewind) VALUES (?1, 100, 'a.txt', 'v1', 'h1', 'h2', 0)",
@@ -441,7 +455,10 @@ mod v2_migration_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             assert_eq!(count, 1, "迁移不丢数据");
-            assert_eq!(anchor, None, "旧行 anchor 为 NULL（归属未知，不参与按消息回滚）");
+            assert_eq!(
+                anchor, None,
+                "旧行 anchor 为 NULL（归属未知，不参与按消息回滚）"
+            );
             Ok(())
         })
         .unwrap();

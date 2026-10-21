@@ -7,18 +7,18 @@
 //! 桥）执行。
 
 mod bridge_executor;
-mod host_glue;
-#[cfg(unix)]
-pub mod cdp_browser;
 #[cfg(target_os = "android")]
 pub mod browser;
+#[cfg(unix)]
+pub mod cdp_browser;
+mod host_glue;
 
 pub use bridge_executor::{BridgePythonExecutor, PendingApproval, SkillApprovalStore};
+pub use host_glue::prepare_gbrain;
 pub use host_glue::{
     approval_gate, build_channels, install_skill_gate, prepare_environment, ApkChannels,
     ApprovalGateHandle, PreparedEnvironment,
 };
-pub use host_glue::prepare_gbrain;
 
 #[cfg(target_os = "android")]
 pub use jni_bridge::{set_java_vm, set_python_bridge};
@@ -82,15 +82,26 @@ pub fn log_boot(step: &str) {
     let path = context.files_dir.join("boot_debug.log");
     // 诊断日志只增不减会无限增长：超过 1MB 时截断重开（保留最近一次启动从
     // from_toml 取证起的内容会随下次启动自然补齐，无需归档）。
-    if std::fs::metadata(&path).map(|m| m.len() > 1024 * 1024).unwrap_or(false) {
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 1024 * 1024)
+        .unwrap_or(false)
+    {
         let _ = std::fs::write(&path, "");
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         use std::io::Write;
-        let _ = writeln!(f, "[{}] {step}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0));
+        let _ = writeln!(
+            f,
+            "[{}] {step}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
     }
 }
 
@@ -132,7 +143,9 @@ pub fn open_url(url: &str) -> Result<()> {
     #[cfg(not(target_os = "android"))]
     {
         let _ = url;
-        Err(anyhow!("open_url 仅在 Android 宿主可用（桌面走系统 shell）"))
+        Err(anyhow!(
+            "open_url 仅在 Android 宿主可用（桌面走系统 shell）"
+        ))
     }
 }
 
@@ -147,7 +160,9 @@ pub fn install_update(apk_abs: &str) -> Result<()> {
     #[cfg(not(target_os = "android"))]
     {
         let _ = apk_abs;
-        Err(anyhow!("install_update 仅在 Android 宿主可用（桌面走自替换脚本）"))
+        Err(anyhow!(
+            "install_update 仅在 Android 宿主可用（桌面走自替换脚本）"
+        ))
     }
 }
 
@@ -291,7 +306,9 @@ pub fn open_media(relative_path: &str) -> Result<()> {
     #[cfg(not(target_os = "android"))]
     {
         let _ = relative_path;
-        Err(anyhow!("open_media 仅在 Android 宿主可用（桌面走系统 shell）"))
+        Err(anyhow!(
+            "open_media 仅在 Android 宿主可用（桌面走系统 shell）"
+        ))
     }
 }
 
@@ -567,7 +584,6 @@ pub fn host_context() -> Option<AndroidHostContext> {
 
 static GBRAIN_ENV_ORIGINALS: OnceLock<Mutex<HashMap<String, Option<OsString>>>> = OnceLock::new();
 
-
 pub(crate) struct GBrainEnvGuardForProcess;
 impl Drop for GBrainEnvGuardForProcess {
     fn drop(&mut self) {
@@ -675,13 +691,12 @@ pub fn resolve_android_config(launch: AndroidConfig) -> Result<ResolvedAndroidCo
         Some(text) => text,
         None => {
             let path = PathBuf::from(files_dir.as_os_str()).join("rclaw.toml");
-            toml_from_file = std::fs::read_to_string(&path)
-                .map_err(|error| {
-                    anyhow!(
-                        "rclaw.toml 未提供且无法读取 {}: {error}（首次使用请完成配置向导）",
-                        path.display()
-                    )
-                })?;
+            toml_from_file = std::fs::read_to_string(&path).map_err(|error| {
+                anyhow!(
+                    "rclaw.toml 未提供且无法读取 {}: {error}（首次使用请完成配置向导）",
+                    path.display()
+                )
+            })?;
             toml_from_file.as_str()
         }
     };
@@ -1399,9 +1414,7 @@ pub mod jni_bridge {
 
     /// 取 NativeBridge 类：优先全局缓存；兜底 find_class（仅 Java 线程上下文可用，
     /// 失败时清掉挂起异常避免跨界 FATAL）。
-    pub(super) fn native_bridge_class<'local>(
-        env: &mut JNIEnv<'local>,
-    ) -> Result<JClass<'local>> {
+    pub(super) fn native_bridge_class<'local>(env: &mut JNIEnv<'local>) -> Result<JClass<'local>> {
         if let Some(global) = NATIVE_BRIDGE_CLASS.get() {
             // 从全局引用建本地引用（JObject 无 Clone；NewLocalRef 一次 JNI 调用，
             // 相对系统调用可忽略）。
@@ -1495,8 +1508,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加打开链接线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jurl = env.new_string(url)?;
         let result = env
             .call_static_method(
@@ -1524,8 +1537,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加安装更新线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jpath = env.new_string(apk_abs)?;
         let result = env
             .call_static_method(
@@ -1553,8 +1566,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加状态推送线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jtext = env.new_string(text)?;
         env.call_static_method(
             class,
@@ -1578,8 +1591,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加完成通知线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jtext = env.new_string(text)?;
         env.call_static_method(
             class,
@@ -1601,15 +1614,10 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加 CDP 浏览器线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let result = env
-            .call_static_method(
-                class,
-                "browserSessionStart",
-                "()Ljava/lang/String;",
-                &[],
-            )
+            .call_static_method(class, "browserSessionStart", "()Ljava/lang/String;", &[])
             .map_err(|error| {
                 let _ = env.exception_clear();
                 anyhow!("调用 NativeBridge.browserSessionStart 失败: {error}")
@@ -1651,8 +1659,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加悬浮窗线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let result = env
             .call_static_method(class, "browserOverlayExpand", "()Ljava/lang/String;", &[])
             .map_err(|error| {
@@ -1683,8 +1691,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加悬浮窗线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jurl = env
             .new_string(url)
             .map_err(|e| anyhow!("创建 jstring 失败: {e}"))?;
@@ -1722,8 +1730,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加悬浮窗线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let result = env
             .call_static_method(class, "browserOverlayCollapse", "()Ljava/lang/String;", &[])
             .map_err(|error| {
@@ -1753,8 +1761,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加悬浮窗线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let result = env
             .call_static_method(class, "browserOverlayDismiss", "()Ljava/lang/String;", &[])
             .map_err(|error| {
@@ -1784,8 +1792,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加悬浮窗查询线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let result = env
             .call_static_method(class, "browserOverlayAttached", "()Z", &[])
             .map_err(|error| {
@@ -1802,8 +1810,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加过码通知线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jurl = env.new_string(url)?;
         env.call_static_method(
             class,
@@ -1824,8 +1832,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加 CDP 浏览器线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         env.call_static_method(class, "browserSessionStop", "()Z", &[])
             .map_err(|error| {
                 let _ = env.exception_clear();
@@ -1841,8 +1849,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加 CDP 浏览器线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jpath = env.new_string(abs_path)?;
         let result = env
             .call_static_method(
@@ -1867,8 +1875,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加前台查询线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let result = env
             .call_static_method(class, "isAppForeground", "()Z", &[])
             .map_err(|error| {
@@ -1885,8 +1893,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加打开媒体线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jpath = env.new_string(relative_path)?;
         let result = env
             .call_static_method(
@@ -1912,8 +1920,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加转发线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jpath = env.new_string(relative_path)?;
         let result = env
             .call_static_method(
@@ -1961,8 +1969,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加分享线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jtitle = env.new_string(title)?;
         let jtext = env.new_string(text)?;
         let result = env
@@ -1991,8 +1999,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加剪贴板线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jdir = env.new_string(dest_dir)?;
         let value = env
             .call_static_method(
@@ -2015,8 +2023,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加剪贴板线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let jpath = env.new_string(abs_path)?;
         let result = env
             .call_static_method(
@@ -2052,8 +2060,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .with_context(|| format!("附加 {name} 线程到 JavaVM 失败"))?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let value = env
             .call_static_method(class, name, sig, args)
             .map_err(|error| {
@@ -2098,7 +2106,9 @@ pub mod jni_bridge {
 
     pub(super) fn record_active() -> Result<bool> {
         let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
-        let mut env = vm.attach_current_thread().context("附加线程到 JavaVM 失败")?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加线程到 JavaVM 失败")?;
         let class = native_bridge_class(&mut env)?;
         let value = env
             .call_static_method(class, "recordActive", "()Z", &[])
@@ -2111,7 +2121,9 @@ pub mod jni_bridge {
 
     pub(super) fn record_cancel() -> Result<bool> {
         let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
-        let mut env = vm.attach_current_thread().context("附加线程到 JavaVM 失败")?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加线程到 JavaVM 失败")?;
         let class = native_bridge_class(&mut env)?;
         let value = env
             .call_static_method(class, "recordCancel", "()Z", &[])
@@ -2124,7 +2136,9 @@ pub mod jni_bridge {
 
     pub(super) fn save_to_gallery(abs_path: &str, kind: &str) -> Result<String> {
         let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
-        let mut env = vm.attach_current_thread().context("附加线程到 JavaVM 失败")?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加线程到 JavaVM 失败")?;
         let class = native_bridge_class(&mut env)?;
         let jpath = env.new_string(abs_path)?;
         let jkind = env.new_string(kind)?;
@@ -2133,7 +2147,10 @@ pub mod jni_bridge {
                 class,
                 "saveToGallery",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-                &[JValue::Object(&JObject::from(jpath)), JValue::Object(&JObject::from(jkind))],
+                &[
+                    JValue::Object(&JObject::from(jpath)),
+                    JValue::Object(&JObject::from(jkind)),
+                ],
             )
             .map_err(|error| {
                 let _ = env.exception_clear();
@@ -2145,7 +2162,9 @@ pub mod jni_bridge {
 
     pub(super) fn decode_to_wav(audio_abs: &str, wav_abs: &str) -> Result<String> {
         let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
-        let mut env = vm.attach_current_thread().context("附加线程到 JavaVM 失败")?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加线程到 JavaVM 失败")?;
         let class = native_bridge_class(&mut env)?;
         let jaudio = env.new_string(audio_abs)?;
         let jwav = env.new_string(wav_abs)?;
@@ -2154,7 +2173,10 @@ pub mod jni_bridge {
                 class,
                 "decodeToWav",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-                &[JValue::Object(&JObject::from(jaudio)), JValue::Object(&JObject::from(jwav))],
+                &[
+                    JValue::Object(&JObject::from(jaudio)),
+                    JValue::Object(&JObject::from(jwav)),
+                ],
             )
             .map_err(|error| {
                 let _ = env.exception_clear();
@@ -2166,7 +2188,9 @@ pub mod jni_bridge {
 
     pub(super) fn load_whisper_lib() -> Result<bool> {
         let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
-        let mut env = vm.attach_current_thread().context("附加线程到 JavaVM 失败")?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加线程到 JavaVM 失败")?;
         let class = native_bridge_class(&mut env)?;
         let value = env
             .call_static_method(class, "loadWhisperLib", "()Z", &[])
@@ -2207,7 +2231,9 @@ pub mod jni_bridge {
 
     pub(super) fn whisper_model_download(urls: &[&str], dest_name: &str) -> Result<bool> {
         let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
-        let mut env = vm.attach_current_thread().context("附加线程到 JavaVM 失败")?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加线程到 JavaVM 失败")?;
         let class = native_bridge_class(&mut env)?;
         let empty = env.new_string("")?;
         let array = env
@@ -2223,7 +2249,10 @@ pub mod jni_bridge {
                 class,
                 "downloadWhisperModel",
                 "([Ljava/lang/String;Ljava/lang/String;)Z",
-                &[JValue::Object(&JObject::from(array)), JValue::Object(&JObject::from(jdest))],
+                &[
+                    JValue::Object(&JObject::from(array)),
+                    JValue::Object(&JObject::from(jdest)),
+                ],
             )
             .map_err(|error| {
                 let _ = env.exception_clear();
@@ -2242,31 +2271,26 @@ pub mod jni_bridge {
                 .map_err(|_| anyhow!("PythonRuntime JNI 状态锁已中毒"))?
                 .clone()
                 .ok_or_else(|| anyhow!("PythonRuntime 尚未注册"))?;
-            let mut env = vm.attach_current_thread().context("附加中断线程到 JavaVM 失败")?;
-            env.call_method(
-                bridge.as_obj(),
-                "interruptScript",
-                "()Z",
-                &[],
-            )
-            .map_err(|error| {
-                let _ = env.exception_clear();
-                anyhow!("调用 APK Python 中断入口失败: {error}")
-            })?;
+            let mut env = vm
+                .attach_current_thread()
+                .context("附加中断线程到 JavaVM 失败")?;
+            env.call_method(bridge.as_obj(), "interruptScript", "()Z", &[])
+                .map_err(|error| {
+                    let _ = env.exception_clear();
+                    anyhow!("调用 APK Python 中断入口失败: {error}")
+                })?;
             Ok(())
         };
         if let Err(error) = run() {
             tracing::warn!(%error, "向 APK Python 运行时注入中断失败（继续按超时处置）");
         }
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-
 
     #[test]
     fn runtime_heartbeat_expires_after_stale_threshold() {

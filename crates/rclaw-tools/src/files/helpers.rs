@@ -85,7 +85,11 @@ pub(super) async fn resolve_path_with(
 /// 确定的文件。类 Unix 下没有 Prefix 分量，这一条恒为假。
 pub(crate) fn join_workspace_path(base: &Path, path: &str) -> Result<PathBuf, ToolResult> {
     let raw = Path::new(path);
-    if matches!(raw.components().next(), Some(std::path::Component::Prefix(_))) && !raw.has_root() {
+    if matches!(
+        raw.components().next(),
+        Some(std::path::Component::Prefix(_))
+    ) && !raw.has_root()
+    {
         return Err(ToolResult::err(format!(
             "拒绝盘符相对路径 {path}：请写成带根的绝对路径（如 C:\\dir\\file）或相对 {}/ 的路径",
             base_str(base)
@@ -316,9 +320,8 @@ fn entry_identity(path: &Path) -> Option<(PathBuf, std::ffi::OsString)> {
 
 #[cfg(windows)]
 fn same_entry_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
-    let plain = |name: &std::ffi::OsStr| {
-        platform_plain_name(&name.to_string_lossy()).to_lowercase()
-    };
+    let plain =
+        |name: &std::ffi::OsStr| platform_plain_name(&name.to_string_lossy()).to_lowercase();
     plain(a) == plain(b)
 }
 

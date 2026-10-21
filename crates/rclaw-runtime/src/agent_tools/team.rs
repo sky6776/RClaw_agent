@@ -126,7 +126,10 @@ tokio::task_local! {
 
 /// 当前计划步骤上下文；非计划步骤 / 作用域外返回 None。
 pub(crate) fn current_plan_context() -> Option<(String, String)> {
-    CURRENT_PLAN.try_with(std::clone::Clone::clone).ok().flatten()
+    CURRENT_PLAN
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
 }
 
 #[derive(Clone, Debug)]
@@ -1301,7 +1304,9 @@ pub(super) fn append_team_state_log(
     journal
         .append(JOURNAL_TEAM_STATE, TEAM_STATE_STREAM, &payload)
         .map(|_| ())
-        .map_err(|error| format!("写入团队事件日志失败（state.sqlite journal {JOURNAL_TEAM_STATE}）: {error}"))
+        .map_err(|error| {
+            format!("写入团队事件日志失败（state.sqlite journal {JOURNAL_TEAM_STATE}）: {error}")
+        })
 }
 
 /// 读取团队运行态快照流的全部事件（测试 / 诊断用；无法解析的事件跳过）。

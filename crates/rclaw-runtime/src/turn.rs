@@ -473,12 +473,11 @@ fn clear_agent_state(
     session
         .clear_all_sessions()
         .map_err(|e| before_delete(e.to_string()))?;
-    let memory = rclaw_store::fs::clear_dir_contents(&layout.memory_dir).map_err(|e| {
-        ClearFailure {
+    let memory =
+        rclaw_store::fs::clear_dir_contents(&layout.memory_dir).map_err(|e| ClearFailure {
             sessions_cleared: true,
             message: e.to_string(),
-        }
-    })?;
+        })?;
     Ok(format!(
         "• state.sqlite：删除 {sessions} 个会话（含当前会话）及其文件 checkpoint、用量锚点、会话目标与分叉血缘\n\
          • artifacts/：删除各会话的工具结果落盘目录（转录里的落盘句柄随之失效）\n\
@@ -876,11 +875,7 @@ impl TurnManager {
     /// 身份校验条目——旧 turn 主体结束到外壳清理之间，路由层可能已用同 key 换上
     /// 新 turn，无条件按 key 标记会把新 turn 误标成「已投递」（其命令回复会提前
     /// 解除忙碌态、放行排队消息）。
-    fn mark_final_delivered_if_same(
-        &self,
-        key: &TurnKey,
-        event_tx: &mpsc::Sender<Interjection>,
-    ) {
+    fn mark_final_delivered_if_same(&self, key: &TurnKey, event_tx: &mpsc::Sender<Interjection>) {
         let mut active = self.active.lock().expect("active map 锁未被毒化");
         if let Some(turn) = active.get_mut(key) {
             if turn.event_tx.same_channel(event_tx) {
@@ -1264,9 +1259,9 @@ impl TurnManager {
                             &self.request_tool_schemas(persona.as_deref()),
                         );
                         self.history.record_compression_floor(&key, post_estimate);
-                        if let Err(e) =
-                            sink.memory
-                                .write_session_summary(channel, chat_id, &summary)
+                        if let Err(e) = sink
+                            .memory
+                            .write_session_summary(channel, chat_id, &summary)
                         {
                             tracing::warn!("/compact 摘要文件写入失败（不影响 session）: {e}");
                         }
@@ -1618,8 +1613,11 @@ impl TurnManager {
         }
         let fork = {
             let session = self.session.clone();
-            let (channel2, chat2, target) =
-                (channel.to_string(), chat_id.to_string(), fork_target.clone());
+            let (channel2, chat2, target) = (
+                channel.to_string(),
+                chat_id.to_string(),
+                fork_target.clone(),
+            );
             tokio::task::spawn_blocking(move || {
                 session
                     .fork_session(&channel2, &chat2, anchor_message_id, &target)
@@ -1645,9 +1643,7 @@ impl TurnManager {
                 Ok(Ok((false, _, note))) => (0, Some(note), false),
                 Ok(Err(error)) => (
                     0,
-                    Some(format!(
-                        "⚠️ 文件回滚未执行（新会话历史不受影响）：{error}"
-                    )),
+                    Some(format!("⚠️ 文件回滚未执行（新会话历史不受影响）：{error}")),
                     true,
                 ),
                 Err(error) => (0, Some(format!("⚠️ 文件回滚任务异常: {error}")), true),
@@ -1812,43 +1808,44 @@ impl TurnManager {
         let layout = self.layout.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();
-        let exported = tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
-            let targets: Vec<(String, String)> = if all {
-                session
-                    .list_sessions(None)
-                    .map_err(|e| format!("读取会话列表失败：{e}"))?
-                    .into_iter()
-                    .map(|summary| (summary.channel, summary.chat_id))
-                    .collect()
-            } else {
-                vec![(channel, chat_id)]
-            };
-            if targets.is_empty() {
-                return Ok("没有可导出的会话。".to_string());
-            }
-            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-            let mut lines = Vec::with_capacity(targets.len());
-            for (channel, chat_id) in &targets {
-                let jsonl = session
-                    .export_transcript_jsonl(channel, chat_id)
-                    .map_err(|e| format!("读取会话 {channel}:{chat_id} 失败：{e}"))?;
-                let count = jsonl.lines().count();
-                let path = layout.export_path(channel, chat_id, &stamp);
-                rclaw_store::fs::ensure_parent_dir(&path).map_err(|e| e.to_string())?;
-                std::fs::write(&path, jsonl)
-                    .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
-                lines.push(format!(
-                    "- {channel}:{chat_id} → {}（{count} 条）",
-                    path.display()
-                ));
-            }
-            Ok(format!(
-                "✅ 已导出 {} 个会话的完整记录（含已被压缩的消息）：\n{}",
-                targets.len(),
-                lines.join("\n")
-            ))
-        })
-        .await;
+        let exported =
+            tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
+                let targets: Vec<(String, String)> = if all {
+                    session
+                        .list_sessions(None)
+                        .map_err(|e| format!("读取会话列表失败：{e}"))?
+                        .into_iter()
+                        .map(|summary| (summary.channel, summary.chat_id))
+                        .collect()
+                } else {
+                    vec![(channel, chat_id)]
+                };
+                if targets.is_empty() {
+                    return Ok("没有可导出的会话。".to_string());
+                }
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+                let mut lines = Vec::with_capacity(targets.len());
+                for (channel, chat_id) in &targets {
+                    let jsonl = session
+                        .export_transcript_jsonl(channel, chat_id)
+                        .map_err(|e| format!("读取会话 {channel}:{chat_id} 失败：{e}"))?;
+                    let count = jsonl.lines().count();
+                    let path = layout.export_path(channel, chat_id, &stamp);
+                    rclaw_store::fs::ensure_parent_dir(&path).map_err(|e| e.to_string())?;
+                    std::fs::write(&path, jsonl)
+                        .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+                    lines.push(format!(
+                        "- {channel}:{chat_id} → {}（{count} 条）",
+                        path.display()
+                    ));
+                }
+                Ok(format!(
+                    "✅ 已导出 {} 个会话的完整记录（含已被压缩的消息）：\n{}",
+                    targets.len(),
+                    lines.join("\n")
+                ))
+            })
+            .await;
         match exported {
             Ok(Ok(report)) => report,
             Ok(Err(error)) => format!("⚠️ 导出失败：{error}"),
@@ -2457,7 +2454,10 @@ impl TurnManager {
         // Layer 2a（ZCode 移植）：顶层 turn 的取消令牌进 task-local，供前台子代理
         // 自动转后台建立「父取消 → 子取消」联动（detach 后由调用方解除）。
         let cancel_for_scope = cancel.clone();
-        let chat_scope = Some((panic_report_target.channel.clone(), panic_report_target.chat_id.clone()));
+        let chat_scope = Some((
+            panic_report_target.channel.clone(),
+            panic_report_target.chat_id.clone(),
+        ));
         // 内层也要事件通道发送端：终局投递标记按它校验 active 条目身份（防误标换代
         // 后的新 turn）；外壳自身在清理时还要用，克隆一份随闭包 move。
         let event_tx_for_inner = event_tx.clone();

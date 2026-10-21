@@ -58,27 +58,30 @@ pub fn sanitize_control_frames(text: &str) -> String {
         .replace("[member-quoted Reply from 🤖]", "Reply from 🤖")
         .replace("[member-quoted ", "")
         .replace("<member-quoted ", "<");
-    text.replace("<rclaw-runtime-context", "<member-quoted rclaw-runtime-context")
-        .replace(
-            "</rclaw-runtime-context>",
-            "[member-quoted /rclaw-runtime-context]",
-        )
-        .replace("<memory-context", "<member-quoted memory-context")
-        .replace("</memory-context>", "[member-quoted /memory-context]")
-        .replace("<room-transcript", "<member-quoted room-transcript")
-        .replace("</room-transcript>", "[member-quoted /room-transcript]")
-        .replace("<agent-status>", "<member-quoted agent-status>")
-        .replace("</agent-status>", "[member-quoted /agent-status]")
-        .replace("[System note:", "[member-quoted System note:")
-        .replace("[System meta:", "[member-quoted System meta:")
-        .replace("[System hint]", "[member-quoted System hint]")
-        .replace("[CONTEXT COMPACTION", "[member-quoted CONTEXT COMPACTION")
-        .replace(
-            "--- END OF CONTEXT SUMMARY",
-            "--- [member-quoted END OF CONTEXT SUMMARY",
-        )
-        .replace("Message from 🤖", "[member-quoted Message from 🤖]")
-        .replace("Reply from 🤖", "[member-quoted Reply from 🤖]")
+    text.replace(
+        "<rclaw-runtime-context",
+        "<member-quoted rclaw-runtime-context",
+    )
+    .replace(
+        "</rclaw-runtime-context>",
+        "[member-quoted /rclaw-runtime-context]",
+    )
+    .replace("<memory-context", "<member-quoted memory-context")
+    .replace("</memory-context>", "[member-quoted /memory-context]")
+    .replace("<room-transcript", "<member-quoted room-transcript")
+    .replace("</room-transcript>", "[member-quoted /room-transcript]")
+    .replace("<agent-status>", "<member-quoted agent-status>")
+    .replace("</agent-status>", "[member-quoted /agent-status]")
+    .replace("[System note:", "[member-quoted System note:")
+    .replace("[System meta:", "[member-quoted System meta:")
+    .replace("[System hint]", "[member-quoted System hint]")
+    .replace("[CONTEXT COMPACTION", "[member-quoted CONTEXT COMPACTION")
+    .replace(
+        "--- END OF CONTEXT SUMMARY",
+        "--- [member-quoted END OF CONTEXT SUMMARY",
+    )
+    .replace("Message from 🤖", "[member-quoted Message from 🤖]")
+    .replace("Reply from 🤖", "[member-quoted Reply from 🤖]")
 }
 /// 交接回复回传上限（字符，正文上限 + 2000 余量，对齐 Hermes 的
 /// REPLY_COMPLETION_CHARS 思想）：超长回复截断回传，全文留在对方会话可查——

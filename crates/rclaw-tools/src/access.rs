@@ -207,14 +207,22 @@ fn physical_target(resolved: &Path) -> PathBuf {
 /// ——否则弹窗会说「删除：/home/u/dir」、授权也记在 `/home/u/dir` 上：用户批准的比实际发生
 /// 的更重，而且之后直接 `delete /home/u/dir` 会免询问。这种授权记为 [`GrantKind::Entry`]：
 /// 只在之后的请求同样是「删链接条目」时命中；同一位置换成真实目录 / 文件后再删，要重新问。
-fn affected_target(resolved: &Path, op: PathOp, followed: &Path) -> (PathBuf, GrantKind, Option<String>) {
+fn affected_target(
+    resolved: &Path,
+    op: PathOp,
+    followed: &Path,
+) -> (PathBuf, GrantKind, Option<String>) {
     if op == PathOp::Delete && is_symlink_leaf(resolved) {
         if let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) {
             let note = format!(
                 "符号链接条目本身，指向 {}；不碰目标",
                 display_path(followed)
             );
-            return (physical_normalize(parent).join(name), GrantKind::Entry, Some(note));
+            return (
+                physical_normalize(parent).join(name),
+                GrantKind::Entry,
+                Some(note),
+            );
         }
     }
     (followed.to_path_buf(), GrantKind::Object, None)
@@ -274,7 +282,12 @@ pub fn path_readable_now(base: &Path, resolved: &Path) -> bool {
 }
 
 /// 为 `resolved` 上的 `op` 构造授权请求（展示形式见 [`display_path`]）。
-fn confirm_request(resolved: &Path, op: PathOp, physical: &Path, note: Option<String>) -> PathConfirmRequest {
+fn confirm_request(
+    resolved: &Path,
+    op: PathOp,
+    physical: &Path,
+    note: Option<String>,
+) -> PathConfirmRequest {
     PathConfirmRequest {
         target: display_path(physical),
         requested: display_path(resolved),
@@ -400,16 +413,27 @@ mod tests {
         // 没有钩子：工作区外路径仍按既有文案拒绝，已授权的路径按（操作）放行。
         let denied = ensure_path_allowed(&base, &real, PathOp::Write, "deny-text").await;
         assert_eq!(denied.unwrap_err().content, "deny-text", "读授权不放行写");
-        assert!(ensure_path_allowed(&base, &folded, PathOp::Read, "deny-text").await.is_ok());
+        assert!(
+            ensure_path_allowed(&base, &folded, PathOp::Read, "deny-text")
+                .await
+                .is_ok()
+        );
         // 拼写带 `..` 但折叠后仍在工作区内：不是工作区外访问，不经钩子（无钩子也放行）。
         std::fs::create_dir_all(base.join("sub")).unwrap();
         let inside = base.join("sub/../inside.md");
-        assert!(ensure_path_allowed(&base, &inside, PathOp::Write, "deny-text").await.is_ok());
+        assert!(
+            ensure_path_allowed(&base, &inside, PathOp::Write, "deny-text")
+                .await
+                .is_ok()
+        );
         assert!(path_readable_now(&base, &inside));
         // 折叠后越出工作区的照旧拒绝。
         let escaped = base.join("sub/../../outside/other2.txt");
         assert_eq!(
-            ensure_path_allowed(&base, &escaped, PathOp::Read, "deny-text").await.unwrap_err().content,
+            ensure_path_allowed(&base, &escaped, PathOp::Read, "deny-text")
+                .await
+                .unwrap_err()
+                .content,
             "deny-text"
         );
         assert!(!path_readable_now(&base, &escaped));
@@ -451,8 +475,14 @@ mod tests {
     /// （`\\?\C:\…`），不剥掉的话请求拼写与落点永远不等，「请求拼写 … 指向它」就 100% 触发。
     #[test]
     fn display_path_strips_verbatim_prefix() {
-        assert_eq!(display_path(Path::new(r"\\?\C:\Users\u\x.txt")), "C:/Users/u/x.txt");
-        assert_eq!(display_path(Path::new(r"\\?\UNC\srv\share\f.txt")), "//srv/share/f.txt");
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\u\x.txt")),
+            "C:/Users/u/x.txt"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\srv\share\f.txt")),
+            "//srv/share/f.txt"
+        );
         assert_eq!(display_path(Path::new("/home/u/x.txt")), "/home/u/x.txt");
         assert_eq!(display_path(Path::new(r"C:\plain\x.txt")), "C:/plain/x.txt");
     }
@@ -479,7 +509,11 @@ mod tests {
         let (physical, _, note) = affected_target(&folded, PathOp::Read, &followed);
         let request = confirm_request(&folded, PathOp::Read, &physical, note);
         assert_ne!(request.target, request.requested);
-        assert!(request.display().contains("（请求拼写 "), "{}", request.display());
+        assert!(
+            request.display().contains("（请求拼写 "),
+            "{}",
+            request.display()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -503,7 +537,10 @@ mod tests {
         let entry_key = std::fs::canonicalize(&base).unwrap().join("link");
         let (physical, kind, note) = affected_target(&link, PathOp::Delete, &followed);
         assert_eq!((physical, kind), (entry_key.clone(), GrantKind::Entry));
-        assert!(note.as_deref().unwrap().contains("符号链接条目本身"), "{note:?}");
+        assert!(
+            note.as_deref().unwrap().contains("符号链接条目本身"),
+            "{note:?}"
+        );
         let (physical, kind, note) = affected_target(&link, PathOp::Write, &followed);
         assert_eq!(
             (physical, kind, note),
@@ -512,38 +549,67 @@ mod tests {
         );
         // 对链接条目的删除授权不放行对目标的删除（也不放行对链接的写）。
         grant_for_tests_keyed(&entry_key, GrantKind::Entry, PathOp::Delete);
-        assert!(ensure_path_allowed(&base, &link, PathOp::Delete, "deny-text").await.is_ok());
+        assert!(
+            ensure_path_allowed(&base, &link, PathOp::Delete, "deny-text")
+                .await
+                .is_ok()
+        );
         assert_eq!(
-            ensure_path_allowed(&base, &target_dir, PathOp::Delete, "deny-text").await.unwrap_err().content,
+            ensure_path_allowed(&base, &target_dir, PathOp::Delete, "deny-text")
+                .await
+                .unwrap_err()
+                .content,
             "deny-text"
         );
         assert_eq!(
-            ensure_path_allowed(&base, &link, PathOp::Write, "deny-text").await.unwrap_err().content,
+            ensure_path_allowed(&base, &link, PathOp::Write, "deny-text")
+                .await
+                .unwrap_err()
+                .content,
             "deny-text"
         );
         // 工作区外的链接条目：批准删条目之后，同一位置换成真实文件再删要重新问，也不因此
         // 可读；反过来批准删真实文件之后换成链接条目，同样重新问。
         let outside_link = dir.join("outside/link2");
         std::os::unix::fs::symlink(&target_dir, &outside_link).unwrap();
-        let outside_entry_key = std::fs::canonicalize(dir.join("outside")).unwrap().join("link2");
+        let outside_entry_key = std::fs::canonicalize(dir.join("outside"))
+            .unwrap()
+            .join("link2");
         grant_for_tests_keyed(&outside_entry_key, GrantKind::Entry, PathOp::Delete);
-        assert!(ensure_path_allowed(&base, &outside_link, PathOp::Delete, "deny-text").await.is_ok());
+        assert!(
+            ensure_path_allowed(&base, &outside_link, PathOp::Delete, "deny-text")
+                .await
+                .is_ok()
+        );
         std::fs::remove_file(&outside_link).unwrap();
         std::fs::write(&outside_link, b"real now").unwrap();
         assert_eq!(
-            ensure_path_allowed(&base, &outside_link, PathOp::Delete, "deny-text").await.unwrap_err().content,
+            ensure_path_allowed(&base, &outside_link, PathOp::Delete, "deny-text")
+                .await
+                .unwrap_err()
+                .content,
             "deny-text",
             "条目授权不覆盖同一位置上的真实文件"
         );
-        assert!(!path_readable_now(&base, &outside_link), "条目授权不让真实文件变得可读");
+        assert!(
+            !path_readable_now(&base, &outside_link),
+            "条目授权不让真实文件变得可读"
+        );
         let outside_real = dir.join("outside/real2.txt");
         std::fs::write(&outside_real, b"x").unwrap();
         grant_for_tests(&outside_real, PathOp::Delete);
-        assert!(ensure_path_allowed(&base, &outside_real, PathOp::Delete, "deny-text").await.is_ok());
+        assert!(
+            ensure_path_allowed(&base, &outside_real, PathOp::Delete, "deny-text")
+                .await
+                .is_ok()
+        );
         std::fs::remove_file(&outside_real).unwrap();
         std::os::unix::fs::symlink(&target_dir, &outside_real).unwrap();
         assert_eq!(
-            ensure_path_allowed(&base, &outside_real, PathOp::Delete, "deny-text").await.unwrap_err().content,
+            ensure_path_allowed(&base, &outside_real, PathOp::Delete, "deny-text")
+                .await
+                .unwrap_err()
+                .content,
             "deny-text",
             "对象授权不覆盖同一位置上的链接条目"
         );
@@ -564,13 +630,20 @@ mod tests {
         let physical = physical_target(&real);
         grant_for_tests_keyed(&physical, GrantKind::Entry, PathOp::Delete);
         assert_eq!(
-            ensure_path_allowed(&base, &real, PathOp::Delete, "deny-text").await.unwrap_err().content,
+            ensure_path_allowed(&base, &real, PathOp::Delete, "deny-text")
+                .await
+                .unwrap_err()
+                .content,
             "deny-text",
             "真实文件的删除不命中条目授权"
         );
         assert!(!path_readable_now(&base, &real));
         grant_for_tests_keyed(&physical, GrantKind::Object, PathOp::Delete);
-        assert!(ensure_path_allowed(&base, &real, PathOp::Delete, "deny-text").await.is_ok());
+        assert!(
+            ensure_path_allowed(&base, &real, PathOp::Delete, "deny-text")
+                .await
+                .is_ok()
+        );
         assert!(path_readable_now(&base, &real));
         let _ = std::fs::remove_dir_all(&dir);
     }

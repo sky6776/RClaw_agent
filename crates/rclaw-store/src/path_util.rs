@@ -144,7 +144,8 @@ mod tests {
     /// 不能撞成同一个会话摘要 / 导出文件名。
     #[test]
     fn joined_keys_are_injective() {
-        let join = |ch: &str, id: &str| format!("{}_{}", percent_encode_key(ch), percent_encode_key(id));
+        let join =
+            |ch: &str, id: &str| format!("{}_{}", percent_encode_key(ch), percent_encode_key(id));
         assert_ne!(join("a_b", "c"), join("a", "b_c"));
         assert_ne!(join("a", "b_c"), join("a_b", "c"));
         assert_ne!(join("", "a_b"), join("a", "b"));

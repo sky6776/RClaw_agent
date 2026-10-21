@@ -1596,8 +1596,9 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                 Some(Value::String(s)) => {
                     serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.clone()))
                 }
-                Some(other) => other.clone(),
+                // Null/缺失须排在 Some(other) 之前，否则 Null 被通配臂吞掉（不可达）。
                 Some(Value::Null) | None => Value::Null,
+                Some(other) => other.clone(),
             };
             if value.get("items").and_then(Value::as_array).is_some() {
                 let mut value = value;
@@ -1629,8 +1630,8 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
             }
             let text = match reply.get("result").and_then(|r| r.get("value")) {
                 Some(Value::String(s)) => s.clone(),
-                Some(other) => serde_json::to_string(other).unwrap_or_default(),
                 Some(Value::Null) | None => "页面脚本无返回值".to_string(),
+                Some(other) => serde_json::to_string(other).unwrap_or_default(),
             };
             Ok(truncate_chars(&text, 40_000))
         });
@@ -2363,10 +2364,13 @@ const WEBDRIVER_MASK_JS: &str =
 /// - `navigator.plugins/mimeTypes`：WebView 空数组（sannysoft 两项红），补齐
 ///   Chrome Mobile 标准 PDF Viewer 三件套（PluginArray/MimeTypeArray 原型链
 ///   保真，instanceof 检测过）。
-/// 明确不做（实测无需或有意放弃，防后人补）：WebGL UNMASKED_RENDERER hook——
-/// 真机实测已是真 GPU（Adreno 616，离屏 + 软件层不影响 WebGL 的 GL 上下文，
-/// sannysoft 该项绿）；canvas 噪声注入破坏正常页面渲染；字体/AudioContext
-/// 指纹性价比低；Runtime.enable 深层检测对抗无干净解法。
+///
+/// 明确不做（实测无需或有意放弃，防后人补）：
+/// - WebGL UNMASKED_RENDERER hook——真机实测已是真 GPU（Adreno 616，离屏 +
+///   软件层不影响 WebGL 的 GL 上下文，sannysoft 该项绿）；
+/// - canvas 噪声注入——破坏正常页面渲染；
+/// - 字体/AudioContext 指纹——性价比低；
+/// - Runtime.enable 深层检测对抗——无干净解法。
 const STEALTH_JS: &str = r#"(function(){
   try { Object.defineProperty(document, 'hasFocus', { value: function(){ return true; }, configurable: true }); } catch (e) {}
   try {

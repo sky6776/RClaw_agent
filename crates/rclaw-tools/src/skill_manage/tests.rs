@@ -665,7 +665,11 @@ async fn skills_list_returns_addressable_skills_only() {
     write_skill(&skills, "alpha/SKILL.md", "# Alpha\nfirst skill here.\n");
     write_skill(&skills, "beta/SKILL.md", "# Beta\nsecond skill here.\n");
     // 包内嵌套子技能（<pkg>/skills/<sub>/SKILL.md）按内层名不可被 skill_manage 寻址 → 不应出现。
-    write_skill(&skills, "watch-positions/skills/close-recap/SKILL.md", "# Close Recap\nnested here.\n");
+    write_skill(
+        &skills,
+        "watch-positions/skills/close-recap/SKILL.md",
+        "# Close Recap\nnested here.\n",
+    );
     // loose .md 不带可寻址 dir 名 → 不应出现。
     std::fs::write(skills.join("loose.md"), "# Loose\n\n").unwrap();
     // .archive 目录里的归档技能也不应出现（build_summaries 不枚举 .archive）。
@@ -921,11 +925,18 @@ async fn archive_then_restore_via_execute_does_not_deadlock() {
     write_skill(&skills, "demo/SKILL.md", "# Demo\n\nbody\n");
     let tool = fg(skills.clone());
 
-    let archived = tool.execute(json!({"action":"archive","name":"demo"})).await;
+    let archived = tool
+        .execute(json!({"action":"archive","name":"demo"}))
+        .await;
     assert!(!archived.is_error, "{}", archived.content);
-    assert!(!skills.join("demo").exists(), "归档后目录应已移出 skills 根");
+    assert!(
+        !skills.join("demo").exists(),
+        "归档后目录应已移出 skills 根"
+    );
 
-    let restored = tool.execute(json!({"action":"restore","name":"demo"})).await;
+    let restored = tool
+        .execute(json!({"action":"restore","name":"demo"}))
+        .await;
     assert!(!restored.is_error, "{}", restored.content);
     assert!(
         skills.join("demo").join("SKILL.md").is_file(),

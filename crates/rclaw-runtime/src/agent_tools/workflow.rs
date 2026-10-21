@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use rquickjs::{AsyncContext, AsyncRuntime, Context, Function, Runtime};
 use rquickjs::prelude::Async as AsyncFn;
+use rquickjs::{AsyncContext, AsyncRuntime, Context, Function, Runtime};
 use serde_json::{json, Value};
 
 use super::subagent::get_str;
@@ -89,9 +89,15 @@ pub(crate) struct FacadeDiagnostic {
 /// 提交期的二道防线）。只在代码上匹配（字符串/注释已遮蔽），且要求模式前（以及以标识符
 /// 结尾的模式后）不是标识符字符——`formatDate(` / `myeval(` 不会误报。
 const BANNED_PATTERNS: &[(&str, &str)] = &[
-    ("Date.now", "时间必须确定：脚本内禁用 Date.now（沙箱已钉死为固定纪元）"),
+    (
+        "Date.now",
+        "时间必须确定：脚本内禁用 Date.now（沙箱已钉死为固定纪元）",
+    ),
     ("Date.prototype", "禁用 Date.prototype（沙箱已钉死时间源）"),
-    ("Date(", "时间必须确定：脚本内禁用 Date() / new Date()（沙箱已钉死为固定纪元）"),
+    (
+        "Date(",
+        "时间必须确定：脚本内禁用 Date() / new Date()（沙箱已钉死为固定纪元）",
+    ),
     ("Math.random =", "禁用改写 Math.random（沙箱已钉死并冻结）"),
     ("eval", "禁用 eval（动态求值，沙箱已拆除）"),
     ("Function(", "禁用 Function 构造（动态求值，沙箱已拆除）"),
@@ -279,7 +285,10 @@ fn run_with_timeout(
     timeout: Duration,
 ) -> Option<std::process::Output> {
     use std::process::Stdio;
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn().ok()?;
     let stdout = drain_pipe(child.stdout.take());
     let stderr = drain_pipe(child.stderr.take());
@@ -485,16 +494,15 @@ fn json_schema_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Object(left), Value::Object(right)) => {
             left.len() == right.len()
-                && left
-                    .iter()
-                    .all(|(key, value)| right.get(key).is_some_and(|other| json_schema_equal(value, other)))
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| json_schema_equal(value, other))
+                })
         }
         (Value::Array(left), Value::Array(right)) => {
             left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(m, n)| json_schema_equal(m, n))
+                && left.iter().zip(right).all(|(m, n)| json_schema_equal(m, n))
         }
         _ => scalar_numeric_equal(a, b),
     }
@@ -577,7 +585,10 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
         }
     }
     if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
-        if !variants.iter().any(|variant| json_schema_equal(variant, value)) {
+        if !variants
+            .iter()
+            .any(|variant| json_schema_equal(variant, value))
+        {
             return Err(format!(
                 "枚举不符：期望 {} 之一，实际 {value}",
                 serde_json::to_string(variants).unwrap_or_default()
@@ -604,7 +615,10 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
             };
         }
         if !matched {
-            return Err(format!("类型不符：期望 {}，实际 {value}", expected.join("|")));
+            return Err(format!(
+                "类型不符：期望 {}，实际 {value}",
+                expected.join("|")
+            ));
         }
     }
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
@@ -631,9 +645,7 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
     if let Some(prefix_items) = schema.get("prefixItems").and_then(Value::as_array) {
         if let Some(array) = value.as_array() {
             // 定长元组：前缀按位校验；min/maxItems 约束长度。
-            for (index, (item, subschema)) in
-                array.iter().zip(prefix_items.iter()).enumerate()
-            {
+            for (index, (item, subschema)) in array.iter().zip(prefix_items.iter()).enumerate() {
                 validate_json_schema(item, subschema, depth + 1)
                     .map_err(|error| format!("[{index}]: {error}"))?;
             }
@@ -655,14 +667,20 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
     if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64) {
         if let Some(array) = value.as_array() {
             if array.len() < min_items as usize {
-                return Err(format!("数组长度不足：期望 ≥ {min_items}，实际 {}", array.len()));
+                return Err(format!(
+                    "数组长度不足：期望 ≥ {min_items}，实际 {}",
+                    array.len()
+                ));
             }
         }
     }
     if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64) {
         if let Some(array) = value.as_array() {
             if array.len() > max_items as usize {
-                return Err(format!("数组超长：期望 ≤ {max_items}，实际 {}", array.len()));
+                return Err(format!(
+                    "数组超长：期望 ≤ {max_items}，实际 {}",
+                    array.len()
+                ));
             }
         }
     }
@@ -795,8 +813,8 @@ fn text_parse_dependency_graph(script: &str) -> DependencyGraph {
             }
         }
         if in_wave {
-            wave_depth += depth_scope.matches('(').count() as i32
-                - depth_scope.matches(')').count() as i32;
+            wave_depth +=
+                depth_scope.matches('(').count() as i32 - depth_scope.matches(')').count() as i32;
             wave_depth = wave_depth.max(0);
         }
         for mut node in asks_on_line(line, &bindings, line_no) {
@@ -830,7 +848,10 @@ fn text_parse_dependency_graph(script: &str) -> DependencyGraph {
                 edges.push((prev.clone(), nodes[member].id.clone()));
             }
         }
-        last_boundary = wave.iter().map(|&member| nodes[member].id.clone()).collect();
+        last_boundary = wave
+            .iter()
+            .map(|&member| nodes[member].id.clone())
+            .collect();
         i = wave.last().copied().unwrap_or(i) + 1;
     }
 
@@ -864,11 +885,7 @@ fn parse_agent_binding(rest: &str) -> Option<(String, String)> {
 
 /// 解析一行内的 ask 调用点（`<handle>.ask(...)` / `<handle>.askJson(...)`，可多个，
 /// 逗号/括号分隔均可——只提取句柄与行号，不解析参数）。
-fn asks_on_line(
-    line: &str,
-    bindings: &[(String, String)],
-    line_no: usize,
-) -> Vec<DependencyNode> {
+fn asks_on_line(line: &str, bindings: &[(String, String)], line_no: usize) -> Vec<DependencyNode> {
     let mut nodes = Vec::new();
     let mut search_from = 0usize;
     while let Some(found) = line[search_from..].find(".ask") {
@@ -1383,7 +1400,10 @@ async fn ask_host(
     let input_hash = fnv1a64(&format!("{actor}\u{0}{question}"));
     let hash_hex = format!("{input_hash:016x}");
     let ask_seq = {
-        let mut engine = shared.engine.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut engine = shared
+            .engine
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         engine.asks_total += 1;
         // 调用点身份 = (actor, inputHash, 本 run 内第几次)：同一问题问两次是两个调用点，
         // 重放按它精确配对；本 run 内不做去重（ZCode 亦无——缓存答案没有可认领的门序）。
@@ -1393,10 +1413,7 @@ async fn ask_host(
             .or_insert(0);
         let index = *occurrence;
         *occurrence += 1;
-        if let Some(replayed) = engine
-            .replay
-            .remove(&(actor.clone(), input_hash, index))
-        {
+        if let Some(replayed) = engine.replay.remove(&(actor.clone(), input_hash, index)) {
             engine.asks_replayed += 1;
             // 答案一并落本 run 的 journal：再次 resume 时本 journal 自足（不必追 amended_from）。
             append_workflow_event(
@@ -1696,7 +1713,9 @@ fn register_workflow_hosts(
         }),
     )
     .expect("注册 __ask_raw");
-    ctx.globals().set("__ask_raw", ask_fn).expect("set __ask_raw");
+    ctx.globals()
+        .set("__ask_raw", ask_fn)
+        .expect("set __ask_raw");
     let result_shared = Arc::clone(&shared);
     let result_fn = Function::new(ctx.clone(), move |text: String| -> String {
         result_shared
@@ -1707,7 +1726,9 @@ fn register_workflow_hosts(
         "ok".to_string()
     })
     .expect("注册 __result");
-    ctx.globals().set("__result", result_fn).expect("set __result");
+    ctx.globals()
+        .set("__result", result_fn)
+        .expect("set __result");
     let json_fn = Function::new(
         ctx.clone(),
         AsyncFn(move |actor: String, question: String, schema: String| {
@@ -2018,7 +2039,12 @@ impl Tool for WorkflowRunTool {
                 .enable_all()
                 .build()
                 .map_err(|error| format!("workflow 内嵌 runtime 创建失败: {error}"))?;
-            inner.block_on(drive_engine(exec_script, max_run, engine_runtime, engine_shared))
+            inner.block_on(drive_engine(
+                exec_script,
+                max_run,
+                engine_runtime,
+                engine_shared,
+            ))
         })
         .await;
         let outcome = match executed {
@@ -2029,7 +2055,11 @@ impl Tool for WorkflowRunTool {
         };
         let (asks_total, asks_replayed, final_result) = {
             let engine = shared.engine.lock().unwrap_or_else(|p| p.into_inner());
-            (engine.asks_total, engine.asks_replayed, engine.result.clone())
+            (
+                engine.asks_total,
+                engine.asks_replayed,
+                engine.result.clone(),
+            )
         };
         // 结算判定：引擎错误 / 取消 / 超时 / CPU 片中断 / 脚本抛错 / 未结算 → run_failed
         //（journal 保留已完成问答，可 resume）；只有 IIFE 正常返回才算 completed。
@@ -2156,7 +2186,10 @@ mod tests {
         assert_eq!(graph.nodes.len(), 3);
         // 波 → fixer 的边。
         assert!(
-            graph.edges.iter().any(|(from, to)| from == "ask-3" && to == "ask-5"),
+            graph
+                .edges
+                .iter()
+                .any(|(from, to)| from == "ask-3" && to == "ask-5"),
             "并行波末节点 → 后续 ask 应有边: {:?}",
             graph.edges
         );
@@ -2180,11 +2213,19 @@ mod tests {
         let graph = analyze_dependency_graph(script);
         let ids: Vec<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, vec!["ask-4", "ask-4-2", "ask-5", "ask-7"], "{ids:?}");
-        assert!(graph.nodes[..3].iter().all(|n| n.parallel), "跨行波内节点应并行");
+        assert!(
+            graph.nodes[..3].iter().all(|n| n.parallel),
+            "跨行波内节点应并行"
+        );
         assert!(!graph.nodes[3].parallel);
         assert_eq!(graph.waves.len(), 2, "{:?}", graph.waves);
         assert_eq!(graph.waves[0].len(), 3);
-        assert_eq!(graph.edges.len(), 3, "波内每个节点 → 后续 ask: {:?}", graph.edges);
+        assert_eq!(
+            graph.edges.len(),
+            3,
+            "波内每个节点 → 后续 ask: {:?}",
+            graph.edges
+        );
         assert_eq!(analyze_workflow_script(script).ask_count, 4);
     }
 
@@ -2202,7 +2243,9 @@ mod tests {
                     "ok".to_string()
                 })
                 .expect("注册 __result");
-                ctx.globals().set("__result", result_fn).expect("set __result");
+                ctx.globals()
+                    .set("__result", result_fn)
+                    .expect("set __result");
             },
         )
         .await;
@@ -2223,10 +2266,12 @@ mod tests {
             "__result(v);"
         ))
         .await;
-        assert!(matches!(outcome, Ok(Some(ScriptOutcome::Returned(None)))), "{outcome:?}");
+        assert!(
+            matches!(outcome, Ok(Some(ScriptOutcome::Returned(None)))),
+            "{outcome:?}"
+        );
         assert_eq!(
-            observed,
-            "[0,0.5,0,\"1970-01-01T00:00:00.000Z\",true,0,0,0,0,5,true]",
+            observed, "[0,0.5,0,\"1970-01-01T00:00:00.000Z\",true,0,0,0,0,5,true]",
             "确定性钉死值必须生效"
         );
     }
@@ -2241,7 +2286,10 @@ mod tests {
             "var g; try { g = (async function () {}).constructor(\"return 2\"); } catch (err) { g = \"blocked\"; }\n",
             "__result(JSON.stringify([typeof e, f, g]));"
         );
-        assert!(check_script(script, false).is_empty(), "lint 不应命中字符串内的 eval");
+        assert!(
+            check_script(script, false).is_empty(),
+            "lint 不应命中字符串内的 eval"
+        );
         let (outcome, observed) = observe(script).await;
         assert!(outcome.is_ok(), "{outcome:?}");
         assert_eq!(observed, "[\"undefined\",\"blocked\",\"blocked\"]");
@@ -2321,7 +2369,9 @@ mod tests {
         let key = |occurrence: u32| ("coder".to_string(), fnv1a64("coder\u{0}same"), occurrence);
         // 不存在的 run：明确报错而不是当空 journal。
         let missing = EventLog::workflow(&store, "nope");
-        assert!(load_workflow_journal(&missing).unwrap_err().contains("不存在"));
+        assert!(load_workflow_journal(&missing)
+            .unwrap_err()
+            .contains("不存在"));
         // 同问两次（Promise.all），完成顺序相反；answer 经 ask_seq（= 发起事件的库内 seq）
         // 精确配对，不按 hash 猜。
         let path = EventLog::workflow(&store, "run");
@@ -2380,10 +2430,17 @@ mod tests {
         );
         let _other = ActiveRunGuard::acquire("guard-test-run-2").expect("不同 run 互不影响");
         // plan 与 workflow 的 id 空间互不干扰：同名 plan 可与 workflow run 并存。
-        let _plan = ActiveRunGuard::acquire_plan("guard-test-run").expect("plan 键带前缀，不与 workflow 冲突");
-        assert!(ActiveRunGuard::acquire_plan("guard-test-run").is_none(), "同一 plan_id 不能并发持有");
+        let _plan = ActiveRunGuard::acquire_plan("guard-test-run")
+            .expect("plan 键带前缀，不与 workflow 冲突");
+        assert!(
+            ActiveRunGuard::acquire_plan("guard-test-run").is_none(),
+            "同一 plan_id 不能并发持有"
+        );
         drop(first);
-        assert!(ActiveRunGuard::acquire("guard-test-run").is_some(), "Drop 即释放");
+        assert!(
+            ActiveRunGuard::acquire("guard-test-run").is_some(),
+            "Drop 即释放"
+        );
     }
 
     // ---- 端到端（最小 runtime + 计数 provider）----
@@ -2536,7 +2593,10 @@ mod tests {
         let first = run_bounded(&tool, json!({"script": script, "type_check": false})).await;
         assert_eq!(first["asks_total"], 2);
         assert_eq!(first["asks_replayed"], 0);
-        assert_eq!(first["result"], "#1|#2", "同问两次是两个调用点，各自真实执行");
+        assert_eq!(
+            first["result"], "#1|#2",
+            "同问两次是两个调用点，各自真实执行"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let run_id = first["run_id"].as_str().unwrap().to_string();
         let second = run_bounded(
@@ -2615,7 +2675,10 @@ mod check_tests {
     fn banned_patterns_reported_with_line_and_col() {
         let script = "const t = Date.now();\nconst r = eval('1');";
         let diagnostics = diagnose(script);
-        assert!(diagnostics.iter().any(|d| d.message.contains("Date.now")), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("Date.now")),
+            "{diagnostics:?}"
+        );
         let eval_diag = diagnostics
             .iter()
             .find(|d| d.message.contains("eval"))
@@ -2640,13 +2703,26 @@ mod check_tests {
             "const d = formatDate(1); function formatDate(x) { return x; }\n",
             "result(r + 'process.exit' + d);\n"
         );
-        assert!(diagnose(prompt_text).is_empty(), "{:?}", diagnose(prompt_text));
+        assert!(
+            diagnose(prompt_text).is_empty(),
+            "{:?}",
+            diagnose(prompt_text)
+        );
         // 间接 eval / 函数式 Date() / Function 构造 / 字符串转义不打断遮蔽。
         let indirect = "const s = \"a\\\"b\"; const e = (0, eval)(s); const t = Date(); const f = new Function(\"x\");";
         let diagnostics = diagnose(indirect);
-        assert!(diagnostics.iter().any(|d| d.message.contains("eval")), "{diagnostics:?}");
-        assert!(diagnostics.iter().any(|d| d.message.contains("Date()")), "{diagnostics:?}");
-        assert!(diagnostics.iter().any(|d| d.message.contains("Function")), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("eval")),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("Date()")),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("Function")),
+            "{diagnostics:?}"
+        );
     }
 }
 
@@ -2687,7 +2763,10 @@ mod schema_and_insight_tests {
         assert!(validate_json_schema(&Value::Null, &nullable, 0).is_ok());
         assert!(validate_json_schema(&json!(1), &nullable, 0).is_err());
         let unknown = json!({"type": "strng"});
-        assert!(validate_json_schema(&json!("x"), &unknown, 0).is_err(), "未知类型名必须报错");
+        assert!(
+            validate_json_schema(&json!("x"), &unknown, 0).is_err(),
+            "未知类型名必须报错"
+        );
         // 超过深度上限：报错而不是静默放行。
         let mut deep_schema = json!({"type": "number"});
         let mut deep_value = json!(1);
@@ -2708,11 +2787,13 @@ mod schema_and_insight_tests {
             "result(a + b);\n"
         );
         let insight = analyze_workflow_script(script);
-        assert_eq!(insight.actors, vec!["coder".to_string(), "reviewer".to_string()]);
+        assert_eq!(
+            insight.actors,
+            vec!["coder".to_string(), "reviewer".to_string()]
+        );
         assert_eq!(insight.ask_count, 2);
         assert!(insight.parallel);
     }
-
 }
 
 #[cfg(test)]
@@ -2744,8 +2825,9 @@ mod validator_tests {
             },
             "required": ["zone"]
         });
-        assert!(validate_json_schema(&json!({"zone": "a", "tags": ["x", "x"]}), &compiled, 0)
-        .is_ok());
+        assert!(
+            validate_json_schema(&json!({"zone": "a", "tags": ["x", "x"]}), &compiled, 0).is_ok()
+        );
         assert!(validate_json_schema(&json!({"zone": "c"}), &compiled, 0).is_err());
         assert!(validate_json_schema(&json!({"zone": "a", "tags": ["y"]}), &compiled, 0).is_err());
     }
@@ -2851,19 +2933,19 @@ mod validator_tests {
             0
         )
         .is_ok());
-        assert!(
-            validate_json_schema(&json!({"result": {"score": 2, "tags": ["a", 2]}}), &schema, 0)
-                .is_err()
-        );
+        assert!(validate_json_schema(
+            &json!({"result": {"score": 2, "tags": ["a", 2]}}),
+            &schema,
+            0
+        )
+        .is_err());
         assert!(
             validate_json_schema(&json!({"result": {"score": 1, "tags": ["a"]}}), &schema, 0)
                 .is_err(),
             "数组长度不同不得相等"
         );
         // 键集合不同不得相等。
-        assert!(
-            validate_json_schema(&json!({"result": {"score": 1}}), &schema, 0).is_err()
-        );
+        assert!(validate_json_schema(&json!({"result": {"score": 1}}), &schema, 0).is_err());
     }
 }
 

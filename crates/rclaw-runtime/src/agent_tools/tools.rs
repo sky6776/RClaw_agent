@@ -594,7 +594,12 @@ impl Tool for ClaudeAgentTool {
             Err(e) => return ToolResult::err(e),
         };
         // Layer 2b：model 名在入参校验期把关（运行期解析失败回落主 provider，不静默换模型）。
-        if let Some(model) = spec.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        if let Some(model) = spec
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
             if !self.runtime.has_model_provider(model) {
                 return ToolResult::err(format!(
                     "unknown model '{model}': 未在 [[llm.providers]] 中配置同名 provider；可用名称见 /llmodel 或配置文件。"
@@ -629,11 +634,7 @@ impl Tool for ClaudeAgentTool {
             .unwrap_or_default()
             .to_string();
         if should_run_background {
-            let output = match self
-                .runtime
-                .launch_background_task(spec, description)
-                .await
-            {
+            let output = match self.runtime.launch_background_task(spec, description).await {
                 Ok(output) => output,
                 Err(error) => return ToolResult::err(error),
             };

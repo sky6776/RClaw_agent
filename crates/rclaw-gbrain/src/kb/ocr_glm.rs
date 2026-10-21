@@ -656,9 +656,7 @@ mod tests {
                 options.base_url = "http://127.0.0.1:9/".to_string(); // 不可路由，快速失败
                 options.timeout_seconds_per_page = 2;
                 let input = OcrInput::Image {
-                    file: crate::kb::ocr_provider::OcrFilePayload::Base64(
-                        "aGVsbG8=".to_string(),
-                    ),
+                    file: crate::kb::ocr_provider::OcrFilePayload::Base64("aGVsbG8=".to_string()),
                     mime_type: "image/png".to_string(),
                     document_id: -1,
                     run_id: "regression-test".to_string(),

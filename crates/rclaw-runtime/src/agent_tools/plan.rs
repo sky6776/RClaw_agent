@@ -325,7 +325,11 @@ struct PlanAbortGuard {
 }
 
 impl PlanAbortGuard {
-    fn new(plan_log: &EventLog, journal: &rclaw_store::journal::JournalStore, plan_id: &str) -> Self {
+    fn new(
+        plan_log: &EventLog,
+        journal: &rclaw_store::journal::JournalStore,
+        plan_id: &str,
+    ) -> Self {
         PlanAbortGuard {
             plan_log: plan_log.clone(),
             pause_key: plan_pause_key(plan_id),
@@ -491,7 +495,10 @@ fn scan_json_objects(content: &str, mode: ScanMode) -> JsonObjectScan {
             // 相位自愈（见 [`ScanMode::PhaseRobust`]）：`{"` 先于转义判断——`\{` 本就不是合法
             // 转义，字面存在的对象不该因它漏掉。只认紧跟着键的 `{"`：`"a{"` 里 `{` 后面的 `"`
             // 是收尾引号，不是相位错位。
-            if mode == ScanMode::PhaseRobust && ch == '{' && looks_like_json_key_start(content, index) {
+            if mode == ScanMode::PhaseRobust
+                && ch == '{'
+                && looks_like_json_key_start(content, index)
+            {
                 in_string = false;
                 escaped = false;
                 stack.push(index);
@@ -611,7 +618,9 @@ fn verdict_object(value: &Value) -> Option<&Value> {
     if is_verdict_shaped(value) {
         Some(value)
     } else {
-        value.get("verdict").filter(|verdict| is_verdict_shaped(verdict))
+        value
+            .get("verdict")
+            .filter(|verdict| is_verdict_shaped(verdict))
     }
 }
 
@@ -802,7 +811,8 @@ fn classify_verdict(content: &str, task_text: &str, target_summary: &str) -> Ver
              只给出一个独立的 {\"pass\": bool, \"reasons\": [...]} 对象"
                 .to_string()
         } else {
-            "验证步骤未返回 JSON verdict 对象（需 {\"pass\": bool, \"reasons\": [...]}）".to_string()
+            "验证步骤未返回 JSON verdict 对象（需 {\"pass\": bool, \"reasons\": [...]}）"
+                .to_string()
         });
     }
     // 引用集建不起来（任务文本 / 简报里未闭合的 JSON 残骸多到重扫上限）就不判：这不是
@@ -923,13 +933,19 @@ fn merge_reasons(candidates: Vec<(bool, Vec<String>)>) -> Vec<String> {
 /// 空白、省略号、提示词模板里的 `"..."` 占位：不是证据。
 fn is_placeholder_reason(reason: &str) -> bool {
     let trimmed = reason.trim();
-    trimmed.is_empty() || trimmed.chars().all(|ch| matches!(ch, '.' | '…' | '。' | '-' | '_'))
+    trimmed.is_empty()
+        || trimmed
+            .chars()
+            .all(|ch| matches!(ch, '.' | '…' | '。' | '-' | '_'))
 }
 
 /// fail 而没给 reasons 时的兜底提示（目标重跑时总得有可注入的方向）。
 fn fail_reasons_or_fallback(reasons: Vec<String>) -> Vec<String> {
     if reasons.is_empty() {
-        vec!["verdict 为 fail 但未给出 reasons；请假设上一轮产出未满足验收标准并全面复查".to_string()]
+        vec![
+            "verdict 为 fail 但未给出 reasons；请假设上一轮产出未满足验收标准并全面复查"
+                .to_string(),
+        ]
     } else {
         reasons
     }
@@ -1080,7 +1096,9 @@ fn event_reasons(event: &Value) -> Vec<String> {
 /// journal 是合法的：首步就 escalate 的计划正是这种形态，应答后必须能 resume。
 pub(super) fn load_plan_journal(plan_log: &EventLog) -> Result<PlanJournal, String> {
     let events = plan_log.load().map_err(|error| {
-        format!("{error}。resume 需要一个已存在 plan 的 id（见先前 PlanRun 结果里的事件日志标识）。")
+        format!(
+            "{error}。resume 需要一个已存在 plan 的 id（见先前 PlanRun 结果里的事件日志标识）。"
+        )
     })?;
     if events.is_empty() {
         return Err(format!(
@@ -1109,8 +1127,7 @@ pub(super) fn load_plan_journal(plan_log: &EventLog) -> Result<PlanJournal, Stri
                 let Some(step) = event.get("step").and_then(Value::as_str) else {
                     continue;
                 };
-                let succeeded =
-                    event.get("outcome").and_then(Value::as_str) == Some("succeeded");
+                let succeeded = event.get("outcome").and_then(Value::as_str) == Some("succeeded");
                 let summary = event
                     .get("summary")
                     .and_then(Value::as_str)
@@ -1409,7 +1426,10 @@ fn resolve_stalled_pairs(
         let verifier_id = &verifier.id;
         let verifier_state = status.get(verifier_id).cloned();
         match (status.get(target_id).cloned(), verifier_state) {
-            (Some(StepStatus::Verifying), Some(verifier_state @ (StepStatus::Failed | StepStatus::Skipped))) => {
+            (
+                Some(StepStatus::Verifying),
+                Some(verifier_state @ (StepStatus::Failed | StepStatus::Skipped)),
+            ) => {
                 let previous = summaries.get(target_id).cloned().unwrap_or_default();
                 let verifier_awaiting = awaiting_input.iter().any(|(id, _)| id == verifier_id);
                 if verifier_awaiting {
@@ -1991,8 +2011,7 @@ impl Tool for PlanRunTool {
                     .iter()
                     .map(|dep| (dep.clone(), summaries.get(dep).cloned().unwrap_or_default()))
                     .collect();
-                let step_escalations =
-                    step_answers.get(&step.id).cloned().unwrap_or_default();
+                let step_escalations = step_answers.get(&step.id).cloned().unwrap_or_default();
                 let verifier_of = verifier_target.get(&step.id);
                 let mut spec = plan_step_spec(
                     &plan_name,
@@ -2012,7 +2031,10 @@ impl Tool for PlanRunTool {
                     // 残骸的继承摘要撞上派发前预检。
                     let target_brief = target_briefs.get(target_id).cloned().unwrap_or_else(|| {
                         neutralize_unclosed_json(&truncate_text(
-                            summaries.get(target_id).map(String::as_str).unwrap_or_default(),
+                            summaries
+                                .get(target_id)
+                                .map(String::as_str)
+                                .unwrap_or_default(),
                             VERIFICATION_BRIEF_MAX_CHARS,
                         ))
                     });
@@ -2043,7 +2065,10 @@ impl Tool for PlanRunTool {
                     ));
                     // 目标收到过的编排者答复是它产出的前提（「按答复 B 做」而不是任务原文的 A）：
                     // 验证者看不到就会按原文判它跑偏。
-                    if let Some(answers) = step_answers.get(target_id).filter(|answers| !answers.is_empty()) {
+                    if let Some(answers) = step_answers
+                        .get(target_id)
+                        .filter(|answers| !answers.is_empty())
+                    {
                         spec.task.push_str(
                             "\n\n## Orchestrator answers to the target（编排者给被验证步骤的答复，判定时视为事实依据）",
                         );
@@ -2083,10 +2108,11 @@ impl Tool for PlanRunTool {
                     task_text: spec.task.clone(),
                     target_brief: verifier_brief.unwrap_or_default(),
                 });
-                if let Some((inputs, failure)) = verifier_inputs
-                    .as_ref()
-                    .and_then(|inputs| inputs.reference_set_failure().map(|failure| (inputs, failure)))
-                {
+                if let Some((inputs, failure)) = verifier_inputs.as_ref().and_then(|inputs| {
+                    inputs
+                        .reference_set_failure()
+                        .map(|failure| (inputs, failure))
+                }) {
                     let target_id = inputs.target.clone();
                     // 诊断分两种归因：简报建不起来（重跑目标会变）与只有任务文本建不起来（目标
                     // 任务文本 / 依赖摘要 / 升级答案——重跑目标改变不了，别许诺 resume 能修好）。
@@ -2174,7 +2200,9 @@ impl Tool for PlanRunTool {
                     // journal 读不到就分不清「正常收尾」与「提了问题挂起」：本波全部按
                     // skipped 收口（安全方向：不交给验证者、不被依赖方消费），终止计划并把
                     // 原因写进报告——resume 时这些步骤回到 Pending 重跑。
-                    tracing::warn!("计划 {plan_id} 本波收尾时读取 journal 失败，整波按 skipped 处理: {error}");
+                    tracing::warn!(
+                        "计划 {plan_id} 本波收尾时读取 journal 失败，整波按 skipped 处理: {error}"
+                    );
                     for (step_id, result, _) in results {
                         status.insert(step_id.clone(), StepStatus::Skipped);
                         summaries.insert(
@@ -2486,7 +2514,10 @@ impl Tool for PlanRunTool {
                             .get(target_id)
                             .filter(|reasons| !reasons.trim().is_empty())
                             .map(|reasons| {
-                                format!("；最后原因：{}", truncate_text(reasons, MAX_VERDICT_REASON_CHARS))
+                                format!(
+                                    "；最后原因：{}",
+                                    truncate_text(reasons, MAX_VERDICT_REASON_CHARS)
+                                )
                             })
                             .unwrap_or_default();
                         if round == 0 {
@@ -2571,7 +2602,11 @@ impl Tool for PlanRunTool {
             for open in &orphaned {
                 report.push_str(&escalation_row(
                     open,
-                    if open.answered_late { "（已有应答）" } else { "" },
+                    if open.answered_late {
+                        "（已有应答）"
+                    } else {
+                        ""
+                    },
                 ));
             }
         }
@@ -2783,7 +2818,8 @@ mod tests {
             ],
         )
         .1;
-        let loaded = load_plan_journal(&unfinished).expect("无 step_finished 的 journal 也应可加载");
+        let loaded =
+            load_plan_journal(&unfinished).expect("无 step_finished 的 journal 也应可加载");
         assert!(loaded.steps.is_empty());
         assert_eq!(loaded.escalations.len(), 1);
         assert_eq!(loaded.escalations[0].step, "ask");
@@ -2835,13 +2871,9 @@ mod tests {
         assert_eq!(reasons, vec!["cargo test 12 passed".to_string()]);
 
         // 提取失败 / 解析失败 / 缺 pass 字段 → 一律 fail（验证者输出不规范 ≠ 通过）。
-        for (index, content) in [
-            "没有任何 JSON",
-            "{not json",
-            "{\"reasons\": []}",
-        ]
-        .iter()
-        .enumerate()
+        for (index, content) in ["没有任何 JSON", "{not json", "{\"reasons\": []}"]
+            .iter()
+            .enumerate()
         {
             let (pass, reasons) = parse_verdict(content, "");
             assert!(!pass, "case {index} 应判 fail");
@@ -2901,7 +2933,10 @@ mod tests {
         // pass 是字符串 "true" → 必须 fail-closed。
         let (pass, reasons) = parse_verdict("{\"pass\": \"true\", \"reasons\": []}", "");
         assert!(!pass);
-        assert!(reasons[0].contains("布尔") || reasons[0].contains("字符串"), "{reasons:?}");
+        assert!(
+            reasons[0].contains("布尔") || reasons[0].contains("字符串"),
+            "{reasons:?}"
+        );
         // 前一个对象 pass 非布尔、不算候选；后一个对象 pass=false 判 fail。
         let (pass, _) = parse_verdict("{\"pass\": \"yes\"} {\"pass\": false}", "");
         assert!(!pass);
@@ -2931,7 +2966,10 @@ mod tests {
             "",
         );
         assert!(!pass);
-        assert_eq!(reasons, vec!["缺测试".to_string(), "文档未更新".to_string()]);
+        assert_eq!(
+            reasons,
+            vec!["缺测试".to_string(), "文档未更新".to_string()]
+        );
     }
 
     #[test]
@@ -3045,7 +3083,8 @@ mod tests {
         );
         assert!(pass);
         // 按 max_output_chars 截断的输出：即使前面有完整 verdict 也不采信（尾部可能有更正）。
-        let marked = format!("{{\"pass\": true, \"reasons\": [\"ok\"]}}\n更正：{OUTPUT_TRUNCATED_MARKER}");
+        let marked =
+            format!("{{\"pass\": true, \"reasons\": [\"ok\"]}}\n更正：{OUTPUT_TRUNCATED_MARKER}");
         let (pass, reasons) = parse_verdict(&marked, "");
         assert!(!pass);
         assert!(reasons[0].contains("截断"), "{reasons:?}");
@@ -3056,7 +3095,8 @@ mod tests {
         assert_eq!(reasons, vec!["缺少迁移脚本".to_string()]);
         // 这条捷径只认【目标产出摘要】里的失败自述：同一段 JSON 若只出现在任务文本的别处
         // （上游依赖摘要 / 通过标准里的示例），说明不了目标的状态，仍走验证者反馈回路。
-        let task_text = format!("依赖 dep 的产出摘要：{echoed_fail}\n\n被验证步骤的产出摘要：功能已实现。");
+        let task_text =
+            format!("依赖 dep 的产出摘要：{echoed_fail}\n\n被验证步骤的产出摘要：功能已实现。");
         assert!(matches!(
             classify_verdict(echoed_fail, &task_text, "功能已实现。"),
             VerdictParse::Malformed(diagnostic) if diagnostic.contains("完全相同")
@@ -3075,7 +3115,11 @@ mod tests {
             VerdictParse::Malformed(_)
         ));
         assert!(matches!(
-            classify_verdict("{\"pass\": true, \"reasons\": []} {\"pass\": false, \"reasons\": []}", "", ""),
+            classify_verdict(
+                "{\"pass\": true, \"reasons\": []} {\"pass\": false, \"reasons\": []}",
+                "",
+                ""
+            ),
             VerdictParse::Malformed(_)
         ));
         assert!(matches!(
@@ -3104,8 +3148,10 @@ mod tests {
             );
         }
         // 重同步扫描本身：未闭合对象之后的完整对象仍被收集，散文花括号不算。
-        let values = all_json_values(&format!("{{\"summary\": \"截断\n见 {{ 下文 {self_claim} {{\"pass\": false}}"))
-            .expect("个位数的未闭合对象在重扫上限内");
+        let values = all_json_values(&format!(
+            "{{\"summary\": \"截断\n见 {{ 下文 {self_claim} {{\"pass\": false}}"
+        ))
+        .expect("个位数的未闭合对象在重扫上限内");
         assert_eq!(values.len(), 2, "{values:?}");
         assert_eq!(values[0]["reasons"][0], "自测 12 项全部通过");
         assert_eq!(values[1], json!({"pass": false}));
@@ -3120,7 +3166,10 @@ mod tests {
         ));
         // 重扫有上限：塞满未闭合对象的任务文本不会把扫描拖成平方级，也不会悄悄缩小引用集
         // 放行——建不起引用集就 fail-closed，诊断指向目标产出 / 依赖摘要那一侧。
-        let hostile = format!("{}\n{clean_task}", "{\"k\": \"v\n".repeat(MAX_JSON_RESCANS + 1));
+        let hostile = format!(
+            "{}\n{clean_task}",
+            "{\"k\": \"v\n".repeat(MAX_JSON_RESCANS + 1)
+        );
         assert!(all_json_values(&hostile).is_none());
         assert!(matches!(
             classify_verdict(
@@ -3131,8 +3180,13 @@ mod tests {
             VerdictParse::Malformed(diagnostic) if diagnostic.contains("未闭合的 JSON 对象超过")
         ));
         // 上限以内的残骸照常重同步。
-        let tolerable = format!("{}\n{clean_task}", "{\"k\": \"v\n".repeat(MAX_JSON_RESCANS / 2));
-        assert!(all_json_values(&tolerable).is_some_and(|values| values.contains(&json!({"pass": true, "reasons": ["自测 12 项全部通过"]}))));
+        let tolerable = format!(
+            "{}\n{clean_task}",
+            "{\"k\": \"v\n".repeat(MAX_JSON_RESCANS / 2)
+        );
+        assert!(all_json_values(&tolerable).is_some_and(
+            |values| values.contains(&json!({"pass": true, "reasons": ["自测 12 项全部通过"]}))
+        ));
     }
 
     #[test]
@@ -3143,13 +3197,25 @@ mod tests {
             evidence: vec!["cargo test 全绿".to_string(), "   ".to_string()],
             artifacts: vec!["src/compress.rs".to_string()],
             open_risks: Vec::new(),
-            validation: (0..BRIEF_LIST_MAX_ITEMS + 5).map(|i| format!("check-{i}")).collect(),
+            validation: (0..BRIEF_LIST_MAX_ITEMS + 5)
+                .map(|i| format!("check-{i}"))
+                .collect(),
         };
         let brief = verification_brief("  实现完成  ", &handoff);
-        assert!(brief.starts_with("实现完成\n\n自报证据（evidence）：\n- cargo test 全绿"), "{brief}");
-        assert!(brief.contains("\n\n自报产物（artifacts）：\n- src/compress.rs"), "{brief}");
+        assert!(
+            brief.starts_with("实现完成\n\n自报证据（evidence）：\n- cargo test 全绿"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("\n\n自报产物（artifacts）：\n- src/compress.rs"),
+            "{brief}"
+        );
         assert!(!brief.contains("自报风险"), "空列表不出现: {brief}");
-        assert_eq!(brief.matches("\n- check-").count(), BRIEF_LIST_MAX_ITEMS, "{brief}");
+        assert_eq!(
+            brief.matches("\n- check-").count(),
+            BRIEF_LIST_MAX_ITEMS,
+            "{brief}"
+        );
         assert!(!brief.contains("- \n"), "空白条目被过滤: {brief}");
         // 单条上限：一个列表装满也只有 20 × 400 ≈ 8k 字符，触不到 12000 的总量上限。
         let long_item = "长".repeat(BRIEF_ITEM_MAX_CHARS * 3);
@@ -3163,11 +3229,20 @@ mod tests {
         };
         let brief = verification_brief("摘要", &handoff);
         assert_eq!(
-            brief.matches(&format!("{}{TEXT_TRUNCATED_SUFFIX}", "长".repeat(BRIEF_ITEM_MAX_CHARS))).count(),
+            brief
+                .matches(&format!(
+                    "{}{TEXT_TRUNCATED_SUFFIX}",
+                    "长".repeat(BRIEF_ITEM_MAX_CHARS)
+                ))
+                .count(),
             BRIEF_LIST_MAX_ITEMS,
             "每条都裁到单条上限"
         );
-        assert!(brief.chars().count() < VERIFICATION_BRIEF_MAX_CHARS, "{}", brief.chars().count());
+        assert!(
+            brief.chars().count() < VERIFICATION_BRIEF_MAX_CHARS,
+            "{}",
+            brief.chars().count()
+        );
         // 总量上限：四个列表装满完整的小 JSON 对象（4 × 20 × 329 ≈ 26k 字符）才触及 12000 的
         // 总量截断。截断点落在第二个列表第 17 条（下标 16）的字符串值里：该条对象起点在
         // 2 + 17 + 20×329 + 18 + 16×329 + 3 = 11884，`{"name": "` 之后的 300 个 x 覆盖
@@ -3189,21 +3264,44 @@ mod tests {
             VERIFICATION_BRIEF_MAX_CHARS + TEXT_TRUNCATED_SUFFIX.chars().count(),
             "总量裁到上限"
         );
-        let tail: String = brief.chars().rev().take(140).collect::<Vec<_>>().into_iter().rev().collect();
+        let tail: String = brief
+            .chars()
+            .rev()
+            .take(140)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         let expected_end = format!(
             "\", \"pass\": true}}\n- ｛\"name\": \"{}{TEXT_TRUNCATED_SUFFIX}",
             "x".repeat(106)
         );
-        assert!(brief.ends_with(&expected_end), "被截断点切开的那个对象被中和: {tail}");
+        assert!(
+            brief.ends_with(&expected_end),
+            "被截断点切开的那个对象被中和: {tail}"
+        );
         assert_eq!(brief.matches('｛').count(), 1, "{tail}");
         assert!(earliest_unclosed_json_start(&brief).is_none(), "{tail}");
         let values = all_json_values(&brief).expect("干净的简报不触及重扫上限");
-        assert!(values.contains(&serde_json::from_str::<Value>(&item).unwrap()), "{}", values.len());
-        assert!(brief.contains("\n\n自报产物（artifacts）：\n- {\"name\""), "{tail}");
-        assert!(!brief.contains("自报验证") && !brief.contains("自报风险"), "后两个列表在截断点之后");
+        assert!(
+            values.contains(&serde_json::from_str::<Value>(&item).unwrap()),
+            "{}",
+            values.len()
+        );
+        assert!(
+            brief.contains("\n\n自报产物（artifacts）：\n- {\"name\""),
+            "{tail}"
+        );
+        assert!(
+            !brief.contains("自报验证") && !brief.contains("自报风险"),
+            "后两个列表在截断点之后"
+        );
         // 超长的 JSON 列表项被裁断后不能各留一个未闭合的 `{"`（每个都要吃一次重扫预算）：
         // 残骸的 `{` 中和成全角 `｛`，条目前缀照旧可读；完整闭合的小对象照常保留（引用集要靠它们）。
-        let long_json = format!("{{\"name\": \"{}\", \"pass\": true}}", "x".repeat(BRIEF_ITEM_MAX_CHARS * 2));
+        let long_json = format!(
+            "{{\"name\": \"{}\", \"pass\": true}}",
+            "x".repeat(BRIEF_ITEM_MAX_CHARS * 2)
+        );
         let handoff = StructuredHandoff {
             goal: String::new(),
             summary: "{\"summary\": \"done\"}".to_string(),
@@ -3214,14 +3312,28 @@ mod tests {
         };
         let brief = verification_brief("{\"summary\": \"done\"}", &handoff);
         assert!(earliest_unclosed_json_start(&brief).is_none(), "{brief}");
-        assert_eq!(brief.matches("\n- ｛\"name\": \"xxx").count(), BRIEF_LIST_MAX_ITEMS, "{brief}");
-        assert_eq!(brief.matches(TEXT_TRUNCATED_SUFFIX).count(), BRIEF_LIST_MAX_ITEMS, "{brief}");
+        assert_eq!(
+            brief.matches("\n- ｛\"name\": \"xxx").count(),
+            BRIEF_LIST_MAX_ITEMS,
+            "{brief}"
+        );
+        assert_eq!(
+            brief.matches(TEXT_TRUNCATED_SUFFIX).count(),
+            BRIEF_LIST_MAX_ITEMS,
+            "{brief}"
+        );
         let values = all_json_values(&brief).expect("没有未闭合对象，不会触及重扫上限");
         assert!(values.contains(&json!({"summary": "done"})), "{values:?}");
         assert!(values.contains(&json!({"path": "a.rs"})), "{values:?}");
         // 原文本就带残缺 JSON 的单条：同样只中和残骸，后文保留，不影响其它条目。
-        assert_eq!(neutralize_unclosed_json("见 {\"k\": \"v 后文"), "见 ｛\"k\": \"v 后文");
-        assert_eq!(neutralize_unclosed_json("完整 {\"k\": 1} 结尾"), "完整 {\"k\": 1} 结尾");
+        assert_eq!(
+            neutralize_unclosed_json("见 {\"k\": \"v 后文"),
+            "见 ｛\"k\": \"v 后文"
+        );
+        assert_eq!(
+            neutralize_unclosed_json("完整 {\"k\": 1} 结尾"),
+            "完整 {\"k\": 1} 结尾"
+        );
     }
 
     #[test]
@@ -3242,15 +3354,22 @@ mod tests {
             brief.starts_with("实现完成 ｛\"level\": \"info 后文说明\n第二行仍然可见"),
             "{brief}"
         );
-        assert!(brief.contains("\n\n自报验证（validation）：\n- cargo test -p x"), "{brief}");
+        assert!(
+            brief.contains("\n\n自报验证（validation）：\n- cargo test -p x"),
+            "{brief}"
+        );
         assert!(earliest_unclosed_json_start(&brief).is_none(), "{brief}");
         assert!(!brief.contains(TEXT_TRUNCATED_SUFFIX), "{brief}");
         // 中和不会让简报里字面存在的对象掉出引用集：残骸之后完整的对象照常提取。
         let summary = "日志 {\"level\": \"info 断行\n自述 {\"pass\": true, \"reasons\": [\"ok\"]}";
         let brief = verification_brief(summary, &handoff);
         let values = all_json_values(&brief).expect("没有未闭合对象");
-        assert!(values.contains(&json!({"pass": true, "reasons": ["ok"]})), "{values:?}");
-        assert!(all_json_values(summary).is_some_and(|raw| raw.contains(&json!({"pass": true, "reasons": ["ok"]}))));
+        assert!(
+            values.contains(&json!({"pass": true, "reasons": ["ok"]})),
+            "{values:?}"
+        );
+        assert!(all_json_values(summary)
+            .is_some_and(|raw| raw.contains(&json!({"pass": true, "reasons": ["ok"]}))));
         // 残骸多到超过中和预算（模型可控文本塞满 `{"`）才退回裁切，且只裁摘要自身：列表仍在，
         // 引用集建得起来。
         let flood = "{\"a\" ".repeat(MAX_JSON_RESCANS + 6);
@@ -3258,7 +3377,10 @@ mod tests {
         assert!(earliest_unclosed_json_start(&brief).is_none(), "{brief}");
         assert_eq!(brief.matches('｛').count(), MAX_JSON_RESCANS, "{brief}");
         assert!(brief.contains(TEXT_TRUNCATED_SUFFIX), "{brief}");
-        assert!(brief.contains("\n\n自报验证（validation）：\n- cargo test -p x"), "{brief}");
+        assert!(
+            brief.contains("\n\n自报验证（validation）：\n- cargo test -p x"),
+            "{brief}"
+        );
         assert!(all_json_values(&brief).is_some(), "{brief}");
     }
 
@@ -3274,7 +3396,10 @@ mod tests {
         let raw = all_json_values(text).expect("两个残骸，远在重扫上限内");
         assert!(raw.contains(&verdict), "{raw:?}");
         let neutralised = neutralize_unclosed_json(text);
-        assert_eq!(neutralised, "｛\"a\": \"｛\"b {\"pass\": true, \"reasons\": [\"r\"]}\"}");
+        assert_eq!(
+            neutralised,
+            "｛\"a\": \"｛\"b {\"pass\": true, \"reasons\": [\"r\"]}\"}"
+        );
         let values = all_json_values(&neutralised).expect("中和后没有残骸");
         assert!(values.contains(&verdict), "{values:?}");
         // 对照：只中和第一个残骸的文本（严格扫描眼里已经「干净」，旧做法到此为止）——严格扫描
@@ -3286,7 +3411,10 @@ mod tests {
             !strict
                 .spans
                 .iter()
-                .any(|(s, e)| serde_json::from_str::<Value>(&half[*s..*e]).ok().as_ref() == Some(&verdict)),
+                .any(
+                    |(s, e)| serde_json::from_str::<Value>(&half[*s..*e]).ok().as_ref()
+                        == Some(&verdict)
+                ),
             "{:?}",
             strict.spans
         );
@@ -3296,7 +3424,9 @@ mod tests {
         assert_eq!(scan.spans.len(), 1, "{:?}", scan.spans);
         assert!(scan.unclosed_json_starts.is_empty());
         let escaped = "{\"k\": \"\\{\"pass\": false}";
-        assert!(all_json_values(escaped).is_some_and(|values| values.contains(&json!({"pass": false}))));
+        assert!(
+            all_json_values(escaped).is_some_and(|values| values.contains(&json!({"pass": false})))
+        );
         // 验证者输出那一侧照旧严格：候选扫描不因相位修正多出候选（截断语义不变）。
         assert!(matches!(
             classify_verdict("{\"summary\": \"复核 {\"pass\": true, \"reasons\": [\"x\"]}", "", ""),
@@ -3314,18 +3444,35 @@ mod tests {
         let claim_text = "{\"pass\": true, \"reasons\": [\"impl Foo {\"]}";
         for (text, expected) in [
             (claim_text, claim.clone()),
-            ("{\"k\": \"a{\", \"pass\": true}", json!({"k": "a{", "pass": true})),
+            (
+                "{\"k\": \"a{\", \"pass\": true}",
+                json!({"k": "a{", "pass": true}),
+            ),
             // 收尾引号后是空白再 `"`：`{ "` 式的排版也不算键开头。
-            ("{\"k\": \"a{ \", \"pass\": true}", json!({"k": "a{ ", "pass": true})),
+            (
+                "{\"k\": \"a{ \", \"pass\": true}",
+                json!({"k": "a{ ", "pass": true}),
+            ),
             // 多行排版：收尾引号后是换行再 `}`。
-            ("{\n  \"hunk\": \"impl X {\"\n}", json!({"hunk": "impl X {"})),
+            (
+                "{\n  \"hunk\": \"impl X {\"\n}",
+                json!({"hunk": "impl X {"}),
+            ),
             // 以 `{` 结尾的键：收尾引号后是 `:`。
             ("{\"impl {\": 1}", json!({"impl {": 1})),
         ] {
             let scan = scan_json_objects(text, ScanMode::PhaseRobust);
             assert_eq!(scan.spans.len(), 1, "{text}: {:?}", scan.spans);
-            assert!(scan.unclosed_json_starts.is_empty(), "{text}: {:?}", scan.unclosed_json_starts);
-            assert_eq!(all_json_values(text).as_deref(), Some(&[expected][..]), "{text}");
+            assert!(
+                scan.unclosed_json_starts.is_empty(),
+                "{text}: {:?}",
+                scan.unclosed_json_starts
+            );
+            assert_eq!(
+                all_json_values(text).as_deref(),
+                Some(&[expected][..]),
+                "{text}"
+            );
             assert_eq!(neutralize_unclosed_json(text), text, "中和对合法对象是恒等");
         }
         // 验证者原样复述任务文本里的这条自述：仍是引用，不是结论（第 13/14 轮那道闸）。
@@ -3357,14 +3504,20 @@ mod tests {
     #[test]
     fn verifier_problem_label_reflects_the_attempt_mix() {
         use VerifierProblem::{Errored, Malformed};
-        assert_eq!(VerifierProblem::exhausted_label(&[Errored, Errored]), "连续两次执行失败");
+        assert_eq!(
+            VerifierProblem::exhausted_label(&[Errored, Errored]),
+            "连续两次执行失败"
+        );
         assert_eq!(
             VerifierProblem::exhausted_label(&[Malformed, Malformed]),
             "连续两次未给出有效 verdict"
         );
         for mixed in [[Errored, Malformed], [Malformed, Errored]] {
             let label = VerifierProblem::exhausted_label(&mixed);
-            assert!(label.contains("执行失败") && label.contains("不规范"), "{label}");
+            assert!(
+                label.contains("执行失败") && label.contains("不规范"),
+                "{label}"
+            );
         }
         assert_eq!(Errored.event(), "verifier_errored");
         assert_eq!(Malformed.event(), "verifier_malformed");
@@ -3374,7 +3527,11 @@ mod tests {
     fn bound_verdict_reasons_caps_item_and_total_length() {
         let long = "x".repeat(1_000);
         let bounded = bound_verdict_reasons(vec![long.clone(); 10]);
-        assert!(bounded.len() <= 6, "总量上限应截断条目数: {}", bounded.len());
+        assert!(
+            bounded.len() <= 6,
+            "总量上限应截断条目数: {}",
+            bounded.len()
+        );
         for reason in &bounded {
             assert!(reason.chars().count() <= MAX_VERDICT_REASON_CHARS + 40);
         }
@@ -3472,9 +3629,7 @@ mod tests {
     #[test]
     fn parse_steps_rejects_invalid_verification_relations() {
         let merge = |mut base: Value, extra: Value| {
-            if let (Some(target), Some(source)) =
-                (base.as_object_mut(), extra.as_object())
-            {
+            if let (Some(target), Some(source)) = (base.as_object_mut(), extra.as_object()) {
                 for (key, value) in source {
                     target.insert(key.clone(), value.clone());
                 }
@@ -3490,28 +3645,24 @@ mod tests {
             })
         };
         // 自引用。
-        let error = parse_steps(&base(
-            json!({"verified_by": "a"}),
-            json!({}),
-        )).unwrap_err();
+        let error = parse_steps(&base(json!({"verified_by": "a"}), json!({}))).unwrap_err();
         assert!(error.contains("不能指向自己"), "{error}");
         // 指向不存在的步骤。
-        let error = parse_steps(&base(
-            json!({"verified_by": "ghost"}),
-            json!({}),
-        )).unwrap_err();
+        let error = parse_steps(&base(json!({"verified_by": "ghost"}), json!({}))).unwrap_err();
         assert!(error.contains("不存在"), "{error}");
         // 链式验证（验证者自己也声明 verified_by）。
         let error = parse_steps(&base(
             json!({"verified_by": "b"}),
             json!({"verified_by": "a"}),
-        )).unwrap_err();
+        ))
+        .unwrap_err();
         assert!(error.contains("一层验证关系"), "{error}");
         // 验证者 depends_on 被验证者（死锁）。
         let error = parse_steps(&base(
             json!({"verified_by": "b"}),
             json!({"depends_on": ["a"]}),
-        )).unwrap_err();
+        ))
+        .unwrap_err();
         assert!(error.contains("死锁"), "{error}");
     }
 
@@ -3527,10 +3678,20 @@ mod tests {
             superseded: false,
         };
         // 未耗尽的失败：双方回 Pending + feedback + 轮次续算。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Succeeded), ("prove".to_string(), StepStatus::Succeeded)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Succeeded),
+            ("prove".to_string(), StepStatus::Succeeded),
+        ]);
         let mut feedback = HashMap::new();
         let mut rounds = HashMap::new();
-        seed_verdict_replay(&[record(1, false)], &verifier_target, 2, &mut status, &mut feedback, &mut rounds);
+        seed_verdict_replay(
+            &[record(1, false)],
+            &verifier_target,
+            2,
+            &mut status,
+            &mut feedback,
+            &mut rounds,
+        );
         assert_eq!(status["impl"], StepStatus::Pending);
         assert_eq!(status["prove"], StepStatus::Pending);
         assert_eq!(rounds["impl"], 1);
@@ -3539,21 +3700,48 @@ mod tests {
         let mut status = HashMap::new();
         let mut feedback = HashMap::new();
         let mut rounds = HashMap::new();
-        seed_verdict_replay(&[record(1, false), record(2, false)], &verifier_target, 2, &mut status, &mut feedback, &mut rounds);
+        seed_verdict_replay(
+            &[record(1, false), record(2, false)],
+            &verifier_target,
+            2,
+            &mut status,
+            &mut feedback,
+            &mut rounds,
+        );
         assert_eq!(status["impl"], StepStatus::Failed);
         assert_eq!(status["prove"], StepStatus::Failed);
         assert_eq!(rounds["impl"], 2);
         // 已通过：维持继承，不再扰动。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Succeeded), ("prove".to_string(), StepStatus::Succeeded)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Succeeded),
+            ("prove".to_string(), StepStatus::Succeeded),
+        ]);
         let mut feedback = HashMap::new();
         let mut rounds = HashMap::new();
-        seed_verdict_replay(&[record(1, false), record(2, true)], &verifier_target, 2, &mut status, &mut feedback, &mut rounds);
+        seed_verdict_replay(
+            &[record(1, false), record(2, true)],
+            &verifier_target,
+            2,
+            &mut status,
+            &mut feedback,
+            &mut rounds,
+        );
         assert_eq!(status["impl"], StepStatus::Succeeded);
         assert_eq!(status["prove"], StepStatus::Succeeded);
         assert!(feedback.is_empty());
         // 已通过但旧日志里验证者没有 step_finished（Pending）：补齐为 Succeeded。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Succeeded), ("prove".to_string(), StepStatus::Pending)]);
-        seed_verdict_replay(&[record(1, true)], &verifier_target, 2, &mut status, &mut HashMap::new(), &mut HashMap::new());
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Succeeded),
+            ("prove".to_string(), StepStatus::Pending),
+        ]);
+        seed_verdict_replay(
+            &[record(1, true)],
+            &verifier_target,
+            2,
+            &mut status,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert_eq!(status["prove"], StepStatus::Succeeded);
     }
 
@@ -3569,24 +3757,54 @@ mod tests {
             superseded,
         };
         // amend 换了验证者：旧验证者的 verdict 不复用 → 目标有产出则 Verifying、新验证者 Pending。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Succeeded), ("prove".to_string(), StepStatus::Pending)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Succeeded),
+            ("prove".to_string(), StepStatus::Pending),
+        ]);
         let mut rounds = HashMap::new();
-        seed_verdict_replay(&[record("old-prover", 1, true, false)], &verifier_target, 2, &mut status, &mut HashMap::new(), &mut rounds);
+        seed_verdict_replay(
+            &[record("old-prover", 1, true, false)],
+            &verifier_target,
+            2,
+            &mut status,
+            &mut HashMap::new(),
+            &mut rounds,
+        );
         assert_eq!(status["impl"], StepStatus::Verifying);
         assert_eq!(status["prove"], StepStatus::Pending);
         assert!(rounds.is_empty(), "别的验证者的轮次不入账");
         // verdict 已被目标的后续重跑取代：状态按无 verdict 处理，但轮次续算。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Succeeded), ("prove".to_string(), StepStatus::Succeeded)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Succeeded),
+            ("prove".to_string(), StepStatus::Succeeded),
+        ]);
         let mut feedback = HashMap::new();
         let mut rounds = HashMap::new();
-        seed_verdict_replay(&[record("prove", 1, false, true)], &verifier_target, 2, &mut status, &mut feedback, &mut rounds);
+        seed_verdict_replay(
+            &[record("prove", 1, false, true)],
+            &verifier_target,
+            2,
+            &mut status,
+            &mut feedback,
+            &mut rounds,
+        );
         assert_eq!(status["impl"], StepStatus::Verifying);
         assert_eq!(status["prove"], StepStatus::Pending);
         assert_eq!(rounds["impl"], 1);
         assert!(feedback.is_empty(), "过时 verdict 的 reasons 不再注入");
         // 目标没有 succeeded 产出（failed）时 → 双方 Pending。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Pending), ("prove".to_string(), StepStatus::Succeeded)]);
-        seed_verdict_replay(&[record("prove", 1, true, true)], &verifier_target, 2, &mut status, &mut HashMap::new(), &mut HashMap::new());
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Pending),
+            ("prove".to_string(), StepStatus::Succeeded),
+        ]);
+        seed_verdict_replay(
+            &[record("prove", 1, true, true)],
+            &verifier_target,
+            2,
+            &mut status,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert_eq!(status["impl"], StepStatus::Pending);
         assert_eq!(status["prove"], StepStatus::Pending);
     }
@@ -3604,7 +3822,10 @@ mod tests {
         };
         // fail(1) → pass(2) 收口了一个对抗周期；之后目标因编排者答案重跑（pass 被 superseded）。
         // 新产出是新周期：预算从零起算，否则它只要被否决一次就「耗尽」（1 轮 fail + 旧 pass = 2）。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Succeeded), ("prove".to_string(), StepStatus::Succeeded)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Succeeded),
+            ("prove".to_string(), StepStatus::Succeeded),
+        ]);
         let mut feedback = HashMap::new();
         let mut rounds = HashMap::new();
         seed_verdict_replay(
@@ -3617,10 +3838,16 @@ mod tests {
         );
         assert_eq!(status["impl"], StepStatus::Verifying);
         assert_eq!(status["prove"], StepStatus::Pending);
-        assert!(rounds.is_empty(), "被取代的 pass 收口了周期，不应把旧轮次带进新周期: {rounds:?}");
+        assert!(
+            rounds.is_empty(),
+            "被取代的 pass 收口了周期，不应把旧轮次带进新周期: {rounds:?}"
+        );
         assert!(feedback.is_empty(), "{feedback:?}");
         // 对照：最后一条是被取代的 fail（周期未收口）→ 轮次续算。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Succeeded), ("prove".to_string(), StepStatus::Succeeded)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Succeeded),
+            ("prove".to_string(), StepStatus::Succeeded),
+        ]);
         let mut rounds = HashMap::new();
         seed_verdict_replay(
             &[record(1, false, false), record(2, false, true)],
@@ -3653,13 +3880,24 @@ mod tests {
             ],
         );
         let journal = load_plan_journal(&plan_log).unwrap();
-        let step = |id: &str| journal.steps.iter().find(|(step, _, _)| step == id).unwrap().clone();
+        let step = |id: &str| {
+            journal
+                .steps
+                .iter()
+                .find(|(step, _, _)| step == id)
+                .unwrap()
+                .clone()
+        };
         assert!(step("a").1);
         assert!(!step("b").1, "b 的 succeeded 早于未决提问，应降级");
         assert!(step("c").1);
         assert_eq!(journal.consumed_answers.len(), 1);
         assert_eq!(journal.consumed_answers[0].question_id, "p:a:q-1");
-        let ids: Vec<&str> = journal.escalations.iter().map(|e| e.question_id.as_str()).collect();
+        let ids: Vec<&str> = journal
+            .escalations
+            .iter()
+            .map(|e| e.question_id.as_str())
+            .collect();
         assert_eq!(ids, vec!["p:b:q-2", "p:c:q-3"]);
         assert!(journal.escalations[0].answer.is_none());
         assert_eq!(journal.escalations[1].answer.as_deref(), Some("按新口径"));
@@ -3676,7 +3914,10 @@ mod tests {
         assert_eq!(status["b"], StepStatus::Skipped);
         assert_eq!(status["c"], StepStatus::Pending);
         assert_eq!(awaiting, vec![("b".to_string(), "p:b:q-2".to_string())]);
-        assert_eq!(answers["c"], vec![("口径？".to_string(), "按新口径".to_string())]);
+        assert_eq!(
+            answers["c"],
+            vec![("口径？".to_string(), "按新口径".to_string())]
+        );
         assert!(!answers.contains_key("a"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3698,7 +3939,10 @@ mod tests {
             let (answers, awaiting) = apply_escalation_seeding(&mut status, &records);
             assert_eq!(status["s"], StepStatus::Skipped, "{records:?}");
             assert_eq!(awaiting, vec![("s".to_string(), "p:s:q-1".to_string())]);
-            assert_eq!(answers["s"], vec![("q for p:s:q-2".to_string(), "a2".to_string())]);
+            assert_eq!(
+                answers["s"],
+                vec![("q for p:s:q-2".to_string(), "a2".to_string())]
+            );
         }
     }
 
@@ -3783,9 +4027,16 @@ mod tests {
             ],
         );
         let journal = load_plan_journal(&plan_log).unwrap();
-        assert_eq!(journal.verdicts.len(), 2, "同轮两条事件只登记一次，丢失的一轮从 step_finished 补回");
+        assert_eq!(
+            journal.verdicts.len(),
+            2,
+            "同轮两条事件只登记一次，丢失的一轮从 step_finished 补回"
+        );
         let last = journal.verdicts.last().unwrap();
-        assert_eq!((last.round, last.passed, last.superseded), (2, false, false));
+        assert_eq!(
+            (last.round, last.passed, last.superseded),
+            (2, false, false)
+        );
         assert_eq!(last.reasons, vec!["仍缺测试".to_string()]);
 
         // 补回的第 2 轮记录驱动重放：预算 2 轮已耗尽 → 双双 Failed，不再多跑一轮。
@@ -3833,10 +4084,21 @@ mod tests {
             ],
         );
         let journal = load_plan_journal(&plan_log).unwrap();
-        let seen: Vec<(u32, bool)> = journal.verdicts.iter().map(|v| (v.round, v.passed)).collect();
-        assert_eq!(seen, vec![(1, false), (2, true), (1, false)], "新周期的第 1 轮不是旧周期第 1 轮的重复");
+        let seen: Vec<(u32, bool)> = journal
+            .verdicts
+            .iter()
+            .map(|v| (v.round, v.passed))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(1, false), (2, true), (1, false)],
+            "新周期的第 1 轮不是旧周期第 1 轮的重复"
+        );
         let last = journal.verdicts.last().unwrap();
-        assert_eq!((last.round, last.passed, last.superseded), (1, false, false));
+        assert_eq!(
+            (last.round, last.passed, last.superseded),
+            (1, false, false)
+        );
         assert_eq!(last.reasons, vec!["新口径没落实".to_string()]);
         // 重放：新周期第 1 轮失败、预算 2 未耗尽 → 双方 Pending、反馈注入，而不是把
         // 周期二当成「无 verdict」只补跑验证者。
@@ -3848,7 +4110,14 @@ mod tests {
         ]);
         let mut feedback = HashMap::new();
         let mut rounds = HashMap::new();
-        seed_verdict_replay(&journal.verdicts, &verifier_target, 2, &mut status, &mut feedback, &mut rounds);
+        seed_verdict_replay(
+            &journal.verdicts,
+            &verifier_target,
+            2,
+            &mut status,
+            &mut feedback,
+            &mut rounds,
+        );
         assert_eq!(status["impl"], StepStatus::Pending);
         assert_eq!(status["prove"], StepStatus::Pending);
         assert_eq!(rounds["impl"], 1);
@@ -3860,7 +4129,11 @@ mod tests {
     fn append_plan_event_writes_one_record_per_event() {
         let (dir, plan_log) = journal_in_temp("append", &[]);
         assert!(!plan_log.exists().unwrap());
-        append_plan_event(&plan_log, "step_finished", json!({"step": "a", "summary": "多行\n摘要"}));
+        append_plan_event(
+            &plan_log,
+            "step_finished",
+            json!({"step": "a", "summary": "多行\n摘要"}),
+        );
         append_plan_event(&plan_log, "plan_completed", json!({"succeeded": 1}));
         assert!(plan_log.exists().unwrap());
         let events = plan_log.load().unwrap();
@@ -3889,31 +4162,86 @@ mod tests {
         let verifier_target = HashMap::from([("prove".to_string(), "impl".to_string())]);
         let (dir, plan_log) = journal_in_temp("stalled", &[]);
         // (a) 验证者因依赖失败被 Skipped → Verifying 目标判 Failed（验证者不可用）。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Verifying), ("prove".to_string(), StepStatus::Skipped)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Verifying),
+            ("prove".to_string(), StepStatus::Skipped),
+        ]);
         let mut summaries = HashMap::from([("impl".to_string(), "产出".to_string())]);
         let mut feedback = HashMap::new();
-        assert!(resolve_stalled_pairs(&steps, &verifier_target, &[], &mut status, &mut summaries, &mut feedback, &plan_log));
+        assert!(resolve_stalled_pairs(
+            &steps,
+            &verifier_target,
+            &[],
+            &mut status,
+            &mut summaries,
+            &mut feedback,
+            &plan_log
+        ));
         assert_eq!(status["impl"], StepStatus::Failed);
         assert!(summaries["impl"].contains("不可用"));
         // 报告的对抗环小节靠这条反馈解释「为什么 Failed」：验证者是被跳过的，不是产出不达标。
-        assert_eq!(feedback["impl"], "验证者 'prove' 因依赖未成功被跳过，产出未能被证明");
-        assert!(!resolve_stalled_pairs(&steps, &verifier_target, &[], &mut status, &mut summaries, &mut feedback, &plan_log));
+        assert_eq!(
+            feedback["impl"],
+            "验证者 'prove' 因依赖未成功被跳过，产出未能被证明"
+        );
+        assert!(!resolve_stalled_pairs(
+            &steps,
+            &verifier_target,
+            &[],
+            &mut status,
+            &mut summaries,
+            &mut feedback,
+            &plan_log
+        ));
         // (a'') 验证者自身执行失败：措辞区分。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Verifying), ("prove".to_string(), StepStatus::Failed)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Verifying),
+            ("prove".to_string(), StepStatus::Failed),
+        ]);
         let mut feedback = HashMap::new();
-        assert!(resolve_stalled_pairs(&steps, &verifier_target, &[], &mut status, &mut HashMap::new(), &mut feedback, &plan_log));
+        assert!(resolve_stalled_pairs(
+            &steps,
+            &verifier_target,
+            &[],
+            &mut status,
+            &mut HashMap::new(),
+            &mut feedback,
+            &plan_log
+        ));
         assert_eq!(status["impl"], StepStatus::Failed);
         assert_eq!(feedback["impl"], "验证者 'prove' 执行失败，产出未能被证明");
         // (a') 验证者在等升级应答 → 目标 Skipped 而非 Failed，且不写失败反馈。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Verifying), ("prove".to_string(), StepStatus::Skipped)]);
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Verifying),
+            ("prove".to_string(), StepStatus::Skipped),
+        ]);
         let awaiting = vec![("prove".to_string(), "p:prove:q-1".to_string())];
         let mut feedback = HashMap::new();
-        assert!(resolve_stalled_pairs(&steps, &verifier_target, &awaiting, &mut status, &mut HashMap::new(), &mut feedback, &plan_log));
+        assert!(resolve_stalled_pairs(
+            &steps,
+            &verifier_target,
+            &awaiting,
+            &mut status,
+            &mut HashMap::new(),
+            &mut feedback,
+            &plan_log
+        ));
         assert_eq!(status["impl"], StepStatus::Skipped);
         assert!(feedback.is_empty(), "{feedback:?}");
         // (b) 目标失败 → Pending 验证者 Skipped。
-        let mut status = HashMap::from([("impl".to_string(), StepStatus::Failed), ("prove".to_string(), StepStatus::Pending)]);
-        assert!(resolve_stalled_pairs(&steps, &verifier_target, &[], &mut status, &mut HashMap::new(), &mut HashMap::new(), &plan_log));
+        let mut status = HashMap::from([
+            ("impl".to_string(), StepStatus::Failed),
+            ("prove".to_string(), StepStatus::Pending),
+        ]);
+        assert!(resolve_stalled_pairs(
+            &steps,
+            &verifier_target,
+            &[],
+            &mut status,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &plan_log
+        ));
         assert_eq!(status["prove"], StepStatus::Skipped);
         let text = plan_log
             .load()
@@ -4021,14 +4349,28 @@ mod tests {
         assert!(!first.is_error, "{}", first.content);
         assert!(first.content.contains("ask [skipped]"), "{}", first.content);
         assert!(first.content.contains("use [skipped]"), "{}", first.content);
-        assert!(first.content.contains("ask [awaiting_escalation]"), "{}", first.content);
-        assert!(first.content.contains("部署凭据放在哪里？"), "报告须带问题原文: {}", first.content);
         assert!(
-            first.content.contains("\n  佐证：deploy.sh 读取 DEPLOY_TOKEN，环境里没有"),
+            first.content.contains("ask [awaiting_escalation]"),
+            "{}",
+            first.content
+        );
+        assert!(
+            first.content.contains("部署凭据放在哪里？"),
+            "报告须带问题原文: {}",
+            first.content
+        );
+        assert!(
+            first
+                .content
+                .contains("\n  佐证：deploy.sh 读取 DEPLOY_TOKEN，环境里没有"),
             "报告须带步骤附的佐证: {}",
             first.content
         );
-        assert!(first.content.contains("ResolveWorkflowQuestion"), "{}", first.content);
+        assert!(
+            first.content.contains("ResolveWorkflowQuestion"),
+            "{}",
+            first.content
+        );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "依赖方不得执行");
         let events = plan_log.load().unwrap();
         assert!(
@@ -4055,14 +4397,34 @@ mod tests {
             .execute(json!({"steps": steps, "resume_plan_id": "plan-esc-e2e"}))
             .await;
         assert!(!second.is_error, "{}", second.content);
-        assert!(second.content.contains("ask [succeeded]"), "{}", second.content);
-        assert!(second.content.contains("use [succeeded]"), "{}", second.content);
+        assert!(
+            second.content.contains("ask [succeeded]"),
+            "{}",
+            second.content
+        );
+        assert!(
+            second.content.contains("use [succeeded]"),
+            "{}",
+            second.content
+        );
         assert!(!second.content.contains("待应答"), "{}", second.content);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         let prompts = provider.prompts.lock().unwrap();
-        assert!(prompts[1].contains("Orchestrator answers"), "{}", prompts[1]);
-        assert!(prompts[1].contains("用 vault 里的 deploy-key"), "{}", prompts[1]);
-        assert!(prompts[2].contains("第 2 次调用的产出"), "use 应消费 ask 重跑后的摘要: {}", prompts[2]);
+        assert!(
+            prompts[1].contains("Orchestrator answers"),
+            "{}",
+            prompts[1]
+        );
+        assert!(
+            prompts[1].contains("用 vault 里的 deploy-key"),
+            "{}",
+            prompts[1]
+        );
+        assert!(
+            prompts[2].contains("第 2 次调用的产出"),
+            "use 应消费 ask 重跑后的摘要: {}",
+            prompts[2]
+        );
         drop(prompts);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4171,27 +4533,51 @@ mod tests {
             .execute(json!({"steps": steps, "resume_plan_id": "plan-vesc-e2e"}))
             .await;
         assert!(!first.is_error, "{}", first.content);
-        assert!(first.content.contains("prove [skipped]"), "{}", first.content);
-        assert!(first.content.contains("impl [skipped]"), "{}", first.content);
-        assert!(first.content.contains("prove [awaiting_escalation]"), "{}", first.content);
-        assert!(first.content.contains("测试要连真实数据库吗？"), "{}", first.content);
+        assert!(
+            first.content.contains("prove [skipped]"),
+            "{}",
+            first.content
+        );
+        assert!(
+            first.content.contains("impl [skipped]"),
+            "{}",
+            first.content
+        );
+        assert!(
+            first.content.contains("prove [awaiting_escalation]"),
+            "{}",
+            first.content
+        );
+        assert!(
+            first.content.contains("测试要连真实数据库吗？"),
+            "{}",
+            first.content
+        );
         assert!(
             first.content.contains("等待验证者 'prove' 的编排者应答"),
             "{}",
             first.content
         );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2, "impl 一次 + 验证者一次");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "impl 一次 + 验证者一次"
+        );
         let events = plan_log.load().unwrap();
         assert!(
-            events.iter().any(|(_, event)| event["event"] == "step_skipped"
-                && event["step"] == "impl"
-                && event["reason"] == "verifier 'prove' awaiting escalation answer"),
+            events
+                .iter()
+                .any(|(_, event)| event["event"] == "step_skipped"
+                    && event["step"] == "impl"
+                    && event["reason"] == "verifier 'prove' awaiting escalation answer"),
             "{events:?}"
         );
         assert!(
-            events.iter().any(|(_, event)| event["event"] == "step_finished"
-                && event["step"] == "impl"
-                && event["awaiting_verdict"] == true),
+            events
+                .iter()
+                .any(|(_, event)| event["event"] == "step_finished"
+                    && event["step"] == "impl"
+                    && event["awaiting_verdict"] == true),
             "目标产出须留在 awaiting_verdict 记录里: {events:?}"
         );
         assert!(
@@ -4208,9 +4594,21 @@ mod tests {
             .execute(json!({"steps": steps, "resume_plan_id": "plan-vesc-e2e"}))
             .await;
         assert!(!parked.is_error, "{}", parked.content);
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2, "答案未到：目标与验证者都不该跑");
-        assert!(parked.content.contains("impl [skipped]"), "{}", parked.content);
-        assert!(parked.content.contains("prove [skipped]"), "{}", parked.content);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "答案未到：目标与验证者都不该跑"
+        );
+        assert!(
+            parked.content.contains("impl [skipped]"),
+            "{}",
+            parked.content
+        );
+        assert!(
+            parked.content.contains("prove [skipped]"),
+            "{}",
+            parked.content
+        );
         assert!(
             parked.content.contains("等待验证者 'prove' 的编排者应答"),
             "{}",
@@ -4241,19 +4639,43 @@ mod tests {
             .execute(json!({"steps": steps, "resume_plan_id": "plan-vesc-e2e"}))
             .await;
         assert!(!second.is_error, "{}", second.content);
-        assert!(second.content.contains("impl [succeeded]"), "{}", second.content);
-        assert!(second.content.contains("prove [succeeded]"), "{}", second.content);
-        assert!(second.content.contains("impl ⟷ prove: 第 1 轮通过"), "{}", second.content);
+        assert!(
+            second.content.contains("impl [succeeded]"),
+            "{}",
+            second.content
+        );
+        assert!(
+            second.content.contains("prove [succeeded]"),
+            "{}",
+            second.content
+        );
+        assert!(
+            second.content.contains("impl ⟷ prove: 第 1 轮通过"),
+            "{}",
+            second.content
+        );
         assert!(!second.content.contains("待应答"), "{}", second.content);
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3, "resume 只补跑验证者，目标不重跑");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            3,
+            "resume 只补跑验证者，目标不重跑"
+        );
         let prompts = provider.prompts.lock().unwrap();
-        assert!(prompts[2].contains("Verification mission"), "{}", prompts[2]);
+        assert!(
+            prompts[2].contains("Verification mission"),
+            "{}",
+            prompts[2]
+        );
         assert!(
             prompts[2].contains("### Q: 测试要连真实数据库吗？\nA: 用内存 SQLite，不连真实库"),
             "{}",
             prompts[2]
         );
-        assert!(prompts[2].contains("第 1 次实现产出"), "验证者须拿到继承的目标简报: {}", prompts[2]);
+        assert!(
+            prompts[2].contains("第 1 次实现产出"),
+            "验证者须拿到继承的目标简报: {}",
+            prompts[2]
+        );
         drop(prompts);
         let events = plan_log.load().unwrap();
         assert!(
@@ -4338,7 +4760,10 @@ mod tests {
         // 等第一个执行真正跑进步骤（守卫已持有、provider 卡在门上）。
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while provider.calls.load(Ordering::SeqCst) == 0 {
-            assert!(tokio::time::Instant::now() < deadline, "第一个 PlanRun 未开始执行步骤");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "第一个 PlanRun 未开始执行步骤"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let second = tool
@@ -4346,7 +4771,11 @@ mod tests {
             .await;
         assert!(second.is_error, "{}", second.content);
         assert!(second.content.contains("正在执行中"), "{}", second.content);
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "被拒的 resume 不得执行任何步骤");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "被拒的 resume 不得执行任何步骤"
+        );
         // 另一个 plan 不受影响（放两张许可：排队在前的第一个执行先拿一张，另一个计划拿一张）。
         let other_log = EventLog::plan(&tool.runtime.journal, "plan-guard-other");
         other_log

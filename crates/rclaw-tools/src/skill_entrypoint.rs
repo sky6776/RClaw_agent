@@ -95,7 +95,10 @@ pub enum ScriptFailure {
 /// `BridgePythonExecutor`（JNI → Chaquopy 桥，见 rclaw-android）。
 #[async_trait]
 pub trait PythonScriptExecutor: Send + Sync {
-    async fn execute(&self, request: PythonScriptRequest<'_>) -> Result<ScriptOutcome, ScriptFailure>;
+    async fn execute(
+        &self,
+        request: PythonScriptRequest<'_>,
+    ) -> Result<ScriptOutcome, ScriptFailure>;
 }
 
 /// 进程级注入槽（范式同 `access.rs::PATH_CONFIRM_HOOK`）：宿主启动时注入，
@@ -158,7 +161,10 @@ impl ProcessPythonExecutor {
 
 #[async_trait]
 impl PythonScriptExecutor for ProcessPythonExecutor {
-    async fn execute(&self, request: PythonScriptRequest<'_>) -> Result<ScriptOutcome, ScriptFailure> {
+    async fn execute(
+        &self,
+        request: PythonScriptRequest<'_>,
+    ) -> Result<ScriptOutcome, ScriptFailure> {
         let program = (self.resolver)().map_err(ScriptFailure::Resolve)?;
         let spec = ProcessSpawnSpec {
             program: &program,
@@ -177,7 +183,10 @@ impl PythonScriptExecutor for ProcessPythonExecutor {
 
 /// 取当前生效的 Python 执行器：宿主注入优先，否则即时构造进程执行器
 /// （闭包捕获 base/venv 克隆，每次执行回调解析，语义与拆分前一致）。
-fn current_python_executor(base: &Path, python_venv: &Option<PathBuf>) -> Arc<dyn PythonScriptExecutor> {
+fn current_python_executor(
+    base: &Path,
+    python_venv: &Option<PathBuf>,
+) -> Arc<dyn PythonScriptExecutor> {
     if let Some(injected) = PYTHON_EXECUTOR_SLOT
         .get_or_init(|| RwLock::new(None))
         .read()
@@ -1189,12 +1198,18 @@ impl SkillEntrypointTool {
             },
         };
 
-        let preamble: &[&str] = if matches!(self.runtime, RuntimeKind::PlatformShell) && cfg!(windows)
-        {
-            &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
-        } else {
-            &[]
-        };
+        let preamble: &[&str] =
+            if matches!(self.runtime, RuntimeKind::PlatformShell) && cfg!(windows) {
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ]
+            } else {
+                &[]
+            };
         let outcome = spawn_and_collect(ProcessSpawnSpec {
             program: &program,
             preamble,
@@ -1306,12 +1321,14 @@ async fn spawn_and_collect(spec: ProcessSpawnSpec<'_>) -> Result<ScriptOutcome, 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let limit = spec.max_output_bytes;
-    let mut stdout_task = AbortTaskOnDrop::new(tokio::spawn(async move {
-        read_limited(stdout, limit).await
-    }));
-    let mut stderr_task = AbortTaskOnDrop::new(tokio::spawn(async move {
-        read_limited(stderr, limit).await
-    }));
+    let mut stdout_task =
+        AbortTaskOnDrop::new(tokio::spawn(
+            async move { read_limited(stdout, limit).await },
+        ));
+    let mut stderr_task =
+        AbortTaskOnDrop::new(tokio::spawn(
+            async move { read_limited(stderr, limit).await },
+        ));
 
     let started_at = Instant::now();
     let status = match timeout(spec.timeout, child.wait()).await {
@@ -1350,13 +1367,13 @@ async fn spawn_and_collect(spec: ProcessSpawnSpec<'_>) -> Result<ScriptOutcome, 
             return Err(ScriptFailure::OutputCollectTimeout);
         }
     };
-    let (stdout_text, stdout_truncated) = stdout_result
-        .map_err(|error| ScriptFailure::OutputCollect {
+    let (stdout_text, stdout_truncated) =
+        stdout_result.map_err(|error| ScriptFailure::OutputCollect {
             stream: "stdout",
             error: error.to_string(),
         })?;
-    let (stderr_text, stderr_truncated) = stderr_result
-        .map_err(|error| ScriptFailure::OutputCollect {
+    let (stderr_text, stderr_truncated) =
+        stderr_result.map_err(|error| ScriptFailure::OutputCollect {
             stream: "stderr",
             error: error.to_string(),
         })?;
@@ -1371,10 +1388,13 @@ async fn spawn_and_collect(spec: ProcessSpawnSpec<'_>) -> Result<ScriptOutcome, 
 
 /// venv 优先、否则 PATH 搜索的解释器解析（原 `SkillEntrypointTool::resolve_python`
 /// 主体；每次执行前经 resolver 回调调用，重建/切换后即时生效）。
-fn resolve_python_interpreter(base: &Path, python_venv: &Option<PathBuf>) -> Result<PathBuf, String> {
+fn resolve_python_interpreter(
+    base: &Path,
+    python_venv: &Option<PathBuf>,
+) -> Result<PathBuf, String> {
     if let Some(venv) = python_venv {
-        let safe_venv = resolve_safe_path(base, venv)
-            .map_err(|e| format!("Python venv 路径不安全: {e}"))?;
+        let safe_venv =
+            resolve_safe_path(base, venv).map_err(|e| format!("Python venv 路径不安全: {e}"))?;
         let candidates = if cfg!(windows) {
             vec![
                 safe_venv.join("Scripts/python.exe"),
@@ -1402,8 +1422,8 @@ fn resolve_python_interpreter(base: &Path, python_venv: &Option<PathBuf>) -> Res
     } else {
         &["python3", "python"]
     };
-    let path =
-        std::env::var_os("PATH").ok_or_else(|| "PATH 未配置，无法定位 Python 解释器".to_string())?;
+    let path = std::env::var_os("PATH")
+        .ok_or_else(|| "PATH 未配置，无法定位 Python 解释器".to_string())?;
     for directory in std::env::split_paths(&path) {
         for name in names {
             let candidate = directory.join(name);
@@ -2787,9 +2807,7 @@ flag = "--file"
         assert!(result.is_error);
         assert_eq!(
             result.content,
-            format!(
-                "专用工具执行超时（{DEFAULT_TIMEOUT_MS} ms）: skill__demo_skill__analyze_file"
-            )
+            format!("专用工具执行超时（{DEFAULT_TIMEOUT_MS} ms）: skill__demo_skill__analyze_file")
         );
 
         // Unavailable：APK 桥 poisoned 的宿主侧状态映射。

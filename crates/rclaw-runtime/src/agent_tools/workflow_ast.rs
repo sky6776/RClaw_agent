@@ -22,8 +22,8 @@
 use std::collections::HashMap;
 
 use oxc_allocator::Allocator;
-use oxc_ast::ast::*;
 use oxc_allocator::CloneIn;
+use oxc_ast::ast::*;
 use oxc_ast_visit::walk::{walk_call_expression, walk_variable_declarator};
 use oxc_ast_visit::Visit;
 use oxc_parser::Parser;
@@ -295,7 +295,11 @@ fn actor_of_agent_call(call: &CallExpression<'_>) -> Option<String> {
     ) {
         return None;
     }
-    match call.arguments.first().and_then(|argument| argument.as_expression()) {
+    match call
+        .arguments
+        .first()
+        .and_then(|argument| argument.as_expression())
+    {
         Some(Expression::StringLiteral(literal)) => {
             let name = literal.value.as_str();
             (!name.is_empty()).then(|| name.to_string())
@@ -407,7 +411,11 @@ impl<'a> GraphWalker<'a> {
     fn collect_join(&mut self, call: &CallExpression<'a>) {
         let mut members: Vec<usize> = Vec::new();
         let mut walk_targets: Vec<&Expression<'a>> = Vec::new();
-        if let Some(expr) = call.arguments.first().and_then(|argument| argument.as_expression()) {
+        if let Some(expr) = call
+            .arguments
+            .first()
+            .and_then(|argument| argument.as_expression())
+        {
             match expr {
                 Expression::ArrayExpression(array) => {
                     for element in &array.elements {
@@ -626,7 +634,9 @@ fn compile_typed_asks_inner(script: &str) -> Result<TypedAskTransform, Vec<Facad
     //（遮蔽内置对象，TDZ 场景重写体直接 ReferenceError——原脚本能过 tsc，重写后
     // 才炸）。
     if !walker.replacements.is_empty() {
-        let mut bindings = BindingNameCollector { declares_json: false };
+        let mut bindings = BindingNameCollector {
+            declares_json: false,
+        };
         bindings.visit_program(&program);
         if bindings.declares_json {
             return Err(vec![FacadeDiagnostic {
@@ -704,12 +714,10 @@ pub(crate) struct AliasDef<'a> {
 impl<'a> Visit<'a> for AliasCollector<'a> {
     fn visit_ts_type_alias_declaration(&mut self, it: &TSTypeAliasDeclaration<'a>) {
         // 声明 span（去包裹头）记录下来，编译期从可执行脚本抹除（TS-only 语法）。
-        let (start, end) = (
-            it.span.start as usize,
-            it.span.end as usize,
-        );
+        let (start, end) = (it.span.start as usize, it.span.end as usize);
         if start >= WRAPPER_HEAD.len() && end >= WRAPPER_HEAD.len() {
-            self.spans.push((start - WRAPPER_HEAD.len(), end - WRAPPER_HEAD.len()));
+            self.spans
+                .push((start - WRAPPER_HEAD.len(), end - WRAPPER_HEAD.len()));
         }
         let params: Vec<String> = it
             .type_parameters
@@ -781,7 +789,8 @@ impl<'a> TypedAskWalker<'a> {
     fn diag(&mut self, offset: u32, message: String) {
         let source = &self.wrapped[WRAPPER_HEAD.len()..];
         let (line, col) = line_col(source, offset);
-        self.diagnostics.push(FacadeDiagnostic { line, col, message });
+        self.diagnostics
+            .push(FacadeDiagnostic { line, col, message });
     }
 
     fn script_span(&self, span: Span) -> Option<(usize, usize)> {
@@ -892,8 +901,7 @@ impl<'a> Visit<'a> for TypedAskWalker<'a> {
                 // schema 以 JSON 文本 → JS 字符串字面量 → JSON.parse 嵌入：直接内联对象
                 // 字面量会把 `__proto__` 键变成原型设置而非自有属性（JSON.stringify 随即
                 // 丢掉该约束，校验被静默放宽）；parse 路径的键语义与 JSON 完全一致。
-                let schema_literal =
-                    serde_json::to_string(&schema.to_string()).unwrap_or_default();
+                let schema_literal = serde_json::to_string(&schema.to_string()).unwrap_or_default();
                 format!("{receiver}{chain}askJson{call_mark}({question_src}, JSON.parse({schema_literal})")
             };
             // 原调用跨多行（类型实参 / 参数各占一行）时替换文本会变短：补回被吃掉的换行，
@@ -1237,10 +1245,8 @@ impl<'a> SchemaCompiler<'a> {
                     );
                 }
                 None => {
-                    self.diagnostics.push((
-                        property.span.start,
-                        format!("属性 `{key}` 缺少类型注解"),
-                    ));
+                    self.diagnostics
+                        .push((property.span.start, format!("属性 `{key}` 缺少类型注解")));
                     continue;
                 }
             }
@@ -1281,20 +1287,18 @@ impl<'a> SchemaCompiler<'a> {
             .find_map(|frame| frame.get(name).cloned());
         if let Some(schema) = hit {
             self.charge(schema_size(&schema), span_start);
-            return if self.budget.over {
-                json!({})
-            } else {
-                schema
-            };
+            return if self.budget.over { json!({}) } else { schema };
         }
         // Array<T>（内置特判在参数帧之后——参数名可以遮蔽内置名）。
         if name == "Array" && self.aliases.get(name).is_none() {
             let Some(params) = &reference.type_arguments else {
-                self.diagnostics.push((span_start, "Array 需要元素类型参数".to_string()));
+                self.diagnostics
+                    .push((span_start, "Array 需要元素类型参数".to_string()));
                 return json!({});
             };
             let Some(element) = params.params.first() else {
-                self.diagnostics.push((span_start, "Array<> 的类型参数列表为空".to_string()));
+                self.diagnostics
+                    .push((span_start, "Array<> 的类型参数列表为空".to_string()));
                 return json!({});
             };
             return json!({"type": "array", "items": self.compile(element, depth + 1, alias_depth)});
@@ -1308,7 +1312,8 @@ impl<'a> SchemaCompiler<'a> {
             return json!({});
         };
         if alias_depth > MAX_ALIAS_DEPTH {
-            self.diagnostics.push((span_start, "类型别名循环引用".to_string()));
+            self.diagnostics
+                .push((span_start, "类型别名循环引用".to_string()));
             return json!({});
         }
         // 实参个数与声明对齐：无参数别名不允许带实参引用；带参数别名必须给全。
@@ -1335,7 +1340,10 @@ impl<'a> SchemaCompiler<'a> {
         // T=number 错编成 string）。
         let mut frame: HashMap<String, Value> = HashMap::new();
         for (param, argument) in alias.params.iter().zip(arguments) {
-            frame.insert(param.clone(), self.compile(argument, depth + 1, alias_depth));
+            frame.insert(
+                param.clone(),
+                self.compile(argument, depth + 1, alias_depth),
+            );
         }
         let outer_frames = std::mem::take(&mut self.type_args);
         self.type_args = vec![frame];
@@ -1405,7 +1413,10 @@ mod tests {
                       const [x, y] = await Promise.all([a.ask(\"并1\"), a.ask(\"并2\")]); \
                       const last = await a.ask(\"后\");";
         let graph = build_dependency_graph(script).expect("AST 解析应成功");
-        assert_eq!(node_ids(&graph), vec!["ask-1", "ask-1-2", "ask-1-3", "ask-1-4"]);
+        assert_eq!(
+            node_ids(&graph),
+            vec!["ask-1", "ask-1-2", "ask-1-3", "ask-1-4"]
+        );
         assert!(!graph.nodes[0].parallel, "首个串行 ask 不在波内");
         assert!(graph.nodes[1].parallel && graph.nodes[2].parallel);
         assert!(!graph.nodes[3].parallel);
@@ -1413,7 +1424,11 @@ mod tests {
         assert_eq!(graph.edges.len(), 4, "{:?}", graph.edges);
         assert!(graph.edges.contains(&("ask-1".into(), "ask-1-2".into())));
         assert!(graph.edges.contains(&("ask-1".into(), "ask-1-3".into())));
-        assert!(!graph.edges.contains(&("ask-1-2".into(), "ask-1".into())), "{:?}", graph.edges);
+        assert!(
+            !graph.edges.contains(&("ask-1-2".into(), "ask-1".into())),
+            "{:?}",
+            graph.edges
+        );
     }
 
     #[test]
@@ -1482,7 +1497,9 @@ mod tests {
             "{}",
             transform.exec_script
         );
-        assert!(transform.exec_script.contains("\\\"type\\\":\\\"object\\\""));
+        assert!(transform
+            .exec_script
+            .contains("\\\"type\\\":\\\"object\\\""));
         assert!(!transform.exec_script.contains(".ask<"));
         assert_eq!(transform.typed_asks.len(), 1);
         let (_, schema) = &transform.typed_asks[0];
@@ -1506,7 +1523,10 @@ mod tests {
         let transform = compile_typed_asks(script).expect("编译应成功");
         assert_eq!(transform.typed_asks.len(), 4);
         let (_, alias_schema) = &transform.typed_asks[0];
-        assert_eq!(alias_schema["properties"]["zone"]["enum"], json!(["a", "b"]));
+        assert_eq!(
+            alias_schema["properties"]["zone"]["enum"],
+            json!(["a", "b"])
+        );
         assert_eq!(alias_schema["required"], json!(["name", "zone"]));
         let (_, array_schema) = &transform.typed_asks[1];
         assert_eq!(array_schema["type"], "array");
@@ -1521,22 +1541,33 @@ mod tests {
     fn typed_ask_rejects_unsupported_types_with_diagnostics() {
         let bad_any = "const h = agent(\"h\");\nawait h.ask<any>(\"任意\");\n";
         let diagnostics = compile_typed_asks(bad_any).unwrap_err();
-        assert!(diagnostics.iter().any(|d| d.message.contains("any")), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("any")),
+            "{diagnostics:?}"
+        );
 
         let bad_ref = "const h = agent(\"h\");\nawait h.ask<Date>(\"时间\");\n";
         let diagnostics = compile_typed_asks(bad_ref).unwrap_err();
-        assert!(diagnostics.iter().any(|d| d.message.contains("未知类型")), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("未知类型")),
+            "{diagnostics:?}"
+        );
 
         let bad_args = "const h = agent(\"h\");\nawait h.ask<{a: string}>(\"q\", \"多余\");\n";
         let diagnostics = compile_typed_asks(bad_args).unwrap_err();
         assert!(
-            diagnostics.iter().any(|d| d.message.contains("一个问题参数")),
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("一个问题参数")),
             "{diagnostics:?}"
         );
 
         let bad_json = "const h = agent(\"h\");\nawait h.askJson<{a: string}>(\"q\", {});\n";
         let diagnostics = compile_typed_asks(bad_json).unwrap_err();
-        assert!(diagnostics.iter().any(|d| d.message.contains("askJson")), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("askJson")),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]
@@ -1582,10 +1613,9 @@ mod extended_type_tests {
         assert_eq!(schema["minItems"], 3);
         assert_eq!(schema["maxItems"], 3);
         // 可选 / rest 元素拒绝。
-        let bad = compile_typed_asks(
-            "const h = agent(\"h\");\nawait h.ask<[string, number?]>(\"q\");\n",
-        )
-        .unwrap_err();
+        let bad =
+            compile_typed_asks("const h = agent(\"h\");\nawait h.ask<[string, number?]>(\"q\");\n")
+                .unwrap_err();
         assert!(bad.iter().any(|d| d.message.contains("可选")), "{bad:?}");
     }
 
@@ -1639,14 +1669,20 @@ mod extended_type_tests {
             "type Box<T> = { value: T };\nconst h = agent(\"h\");\nawait h.ask<Box>(\"q\");\n",
         )
         .unwrap_err();
-        assert!(bad.iter().any(|d| d.message.contains("1 个类型参数")), "{bad:?}");
+        assert!(
+            bad.iter().any(|d| d.message.contains("1 个类型参数")),
+            "{bad:?}"
+        );
         // 嵌套实例化：Box<Box<string>>。
         let nested = compile_typed_asks(
             "type Box<T> = { value: T };\nconst h = agent(\"h\");\nawait h.ask<Box<Box<string>>>(\"q\");\n",
         )
         .expect("嵌套实例化应成功");
         let (_, schema) = &nested.typed_asks[0];
-        assert_eq!(schema["properties"]["value"]["properties"]["value"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["value"]["properties"]["value"]["type"],
+            "string"
+        );
 
         // 回归：别名链上实参本身是上层参数名（`type Outer<T> = Inner<T>`，ask<
         // Outer<string>>）——实参必须先在调用方环境解析再入栈，否则 Inner 帧把
@@ -1691,7 +1727,10 @@ mod extended_type_tests {
             .position(|line| line.contains("ask<Host>"))
             .expect("原行存在");
         assert_eq!(rewrite_line, original_line);
-        assert!(transform.exec_script.contains("result(r.name);"), "后续代码原样保留");
+        assert!(
+            transform.exec_script.contains("result(r.name);"),
+            "后续代码原样保留"
+        );
     }
 
     #[test]
@@ -1702,9 +1741,7 @@ mod extended_type_tests {
                       const r = await h.ask<{ v: string }>(`外层 ${await h.ask<string>(\"内层\")}`);\n";
         let diagnostics = compile_typed_asks(script).unwrap_err();
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.contains("嵌套不支持")),
+            diagnostics.iter().any(|d| d.message.contains("嵌套不支持")),
             "{diagnostics:?}"
         );
     }
@@ -1799,9 +1836,15 @@ mod extended_type_tests {
         );
         assert!(!transform.exec_script.contains(".ask<"));
         // 普通点号调用不受影响。
-        let plain = compile_typed_asks("const h = agent(\"h\");\nconst r = await h.ask<number>(\"普通\");\n")
-            .expect("编译应成功");
-        assert!(plain.exec_script.contains("h.askJson("), "{}", plain.exec_script);
+        let plain = compile_typed_asks(
+            "const h = agent(\"h\");\nconst r = await h.ask<number>(\"普通\");\n",
+        )
+        .expect("编译应成功");
+        assert!(
+            plain.exec_script.contains("h.askJson("),
+            "{}",
+            plain.exec_script
+        );
         // 调用本身的可选标记（`ask?.<T>(..)`，flag 在 CallExpression 上）同样保留——
         // 位置在参数括号前（`askJson?.(...)` 是 JS 可选调用语法；`(...)?` 不是 JS）。
         let optional_call = compile_typed_asks(
@@ -1826,7 +1869,10 @@ mod extended_type_tests {
             "result(String(r.ok));\n"
         );
         let transform = compile_typed_asks(script).expect("类型别名 JSON 不构成冲突");
-        assert_eq!(transform.typed_asks[0].1["properties"]["ok"]["type"], "boolean");
+        assert_eq!(
+            transform.typed_asks[0].1["properties"]["ok"]["type"],
+            "boolean"
+        );
         assert!(transform.exec_script.contains("JSON.parse("));
     }
 
@@ -1955,7 +2001,10 @@ mod extended_type_tests {
             "type Box<Array> = { value: Array };\nconst h = agent(\"h\");\nconst r = await h.ask<Box<string>>(\"q\");\n",
         )
         .expect("参数遮蔽内置名应按实参解析");
-        assert_eq!(shadowed.typed_asks[0].1["properties"]["value"]["type"], "string");
+        assert_eq!(
+            shadowed.typed_asks[0].1["properties"]["value"]["type"],
+            "string"
+        );
         // 泛型代入仍要过展开预算：深实参经遮蔽内置名的参数名展开时同样受深度上限
         // 约束（编译完成后统一核对）。尖括号用 format! 构造，避免手写失衡被解析器
         // 吃成比较运算后静默降级。
@@ -1979,7 +2028,9 @@ mod extended_type_tests {
         );
         let diagnostics = compile_typed_asks(&script).unwrap_err();
         assert!(
-            diagnostics.iter().any(|d| d.message.contains("超过") && d.message.contains("层")),
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("超过") && d.message.contains("层")),
             "{diagnostics:?}"
         );
         // 校验器口径内的嵌套不受影响（Box9 展开 = 9 条 properties 递归边，string 叶在
@@ -2017,7 +2068,10 @@ mod extended_type_tests {
         let diagnostics = compile_typed_asks(&bracket_bomb).unwrap_err();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].line, 2, "{diagnostics:?}");
-        assert!(diagnostics[0].message.contains("嵌套过深"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("嵌套过深"),
+            "{diagnostics:?}"
+        );
         assert!(build_dependency_graph(&bracket_bomb).is_none());
         assert!(extract_actors(&bracket_bomb).is_none());
         // 泛型嵌套同样受限（`<>` 不进括号计数）。
@@ -2027,7 +2081,10 @@ mod extended_type_tests {
             ">".repeat(depth)
         );
         let diagnostics = compile_typed_asks(&generic_bomb).unwrap_err();
-        assert!(diagnostics[0].message.contains("嵌套过深"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("嵌套过深"),
+            "{diagnostics:?}"
+        );
         // 字符串 / 注释里的括号不计；比较运算符与箭头函数不触发泛型计数。
         let benign = format!(
             "const h = agent(\"h\");\n// {}\nconst s = \"{}\";\nconst f = (a, b) => a < b && a <= b && b >= a && b > a;\nfor (let i = 0; i < 3; i++) {{ h.ask(`x${{i}}`); }}\nresult(s);\n",
@@ -2078,7 +2135,9 @@ mod extended_type_tests {
         let script = "const h = agent(\"h\");\nconst r = await h.ask<string, number>(\"多参\");\n";
         let diagnostics = compile_typed_asks(script).unwrap_err();
         assert!(
-            diagnostics.iter().any(|d| d.message.contains("只接受一个类型参数")),
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("只接受一个类型参数")),
             "{diagnostics:?}"
         );
     }
@@ -2087,12 +2146,20 @@ mod extended_type_tests {
     fn string_typed_ask_stays_plain_ask() {
         // `ask<string>` 与默认的 ask(question): Promise<string> 同义：不该要求子代理回
         // JSON 字符串字面量，只抹掉类型实参。
-        let script = "const h = agent(\"h\");\nconst r = await h?.ask<string>(\"文本\");\nresult(r);\n";
+        let script =
+            "const h = agent(\"h\");\nconst r = await h?.ask<string>(\"文本\");\nresult(r);\n";
         let transform = compile_typed_asks(script).expect("ask<string> 应编译");
-        assert!(transform.exec_script.contains("h?.ask(\"文本\")"), "{}", transform.exec_script);
-        assert!(!transform.exec_script.contains("askJson"), "{}", transform.exec_script);
+        assert!(
+            transform.exec_script.contains("h?.ask(\"文本\")"),
+            "{}",
+            transform.exec_script
+        );
+        assert!(
+            !transform.exec_script.contains("askJson"),
+            "{}",
+            transform.exec_script
+        );
     }
-
 
     #[test]
     fn duplicate_alias_declarations_are_rejected() {

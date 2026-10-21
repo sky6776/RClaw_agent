@@ -135,8 +135,7 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     // rclaw_tools::cdp_browser；CLI/Termux 不注册，无浏览器工具）。截图落工作区 browser/。
     // transport 经 commands::browser_transport_or_init 单源获取：装配重试时
     // 命令层（「打开浏览器」）与工具注册始终同一实例。
-    let browser_transport =
-        crate::commands::browser_transport_or_init(layout.base.join("browser"));
+    let browser_transport = crate::commands::browser_transport_or_init(layout.base.join("browser"));
     let core = rclaw_cli::bootstrap::assemble_core_with(
         &cfg,
         &layout,
@@ -281,9 +280,8 @@ async fn outbound_bridge(app: tauri::AppHandle, mut rx: mpsc::Receiver<BusMessag
 /// 之外的路径时，经 [`permissions::ask`] 弹窗询问用户；允许才放行（每次授权按
 /// （操作, 物理落点）缓存在工具层）。完全访问模式的消息直接带 `Unrestricted`，不经过此钩子。
 fn install_permission_hook(app: tauri::AppHandle) {
-    let hook: rclaw_tools::access::PathConfirmHook = Arc::new(move |request| {
-        Box::pin(crate::permissions::ask(app.clone(), request))
-    });
+    let hook: rclaw_tools::access::PathConfirmHook =
+        Arc::new(move |request| Box::pin(crate::permissions::ask(app.clone(), request)));
     if !rclaw_tools::access::set_path_confirm_hook(hook) {
         tracing::debug!("工具权限确认钩子已注册过，跳过");
     }
@@ -542,7 +540,6 @@ pub fn write_permission_mode(home: &std::path::Path, mode: &str) -> Result<(), S
     write_prefs(home, &value)
 }
 
-
 // ---------------------------------------------------------------------------
 // APK 宿主（android + apk-host）：GUI 与前台服务共享单运行时。
 //
@@ -555,21 +552,18 @@ pub fn write_permission_mode(home: &std::path::Path, mode: &str) -> Result<(), S
 #[cfg(all(target_os = "android", feature = "apk-host"))]
 async fn start_agent_inner(app: &tauri::AppHandle, _home: PathBuf) -> Result<(), String> {
     install_permission_hook(app.clone());
-    let context = rclaw_android::host_context()
-        .ok_or("Android 宿主上下文未初始化（nativeInit 未调用）")?;
+    let context =
+        rclaw_android::host_context().ok_or("Android 宿主上下文未初始化（nativeInit 未调用）")?;
     let mut slot = crate::android_host::apk_runtime_slot().lock().await;
     let pending_outbound = match slot.as_mut() {
         Some(runtime) => runtime.pending_outbound.take(),
         None => {
             // GUI 可能早于服务装配：启动 JSON 只是 nativeInit 的最小上下文，
             // toml 由 resolve_android_config 从 filesDir/rclaw.toml 回读。
-            let launch = rclaw_android::AndroidConfig::minimal(
-                &context.files_dir.to_string_lossy(),
-            );
-            let config_json =
-                serde_json::to_string(&launch).map_err(|e| e.to_string())?;
-            let (running, _gui_attached) = match assemble_apk_agent(&config_json, Some(app)).await
-            {
+            let launch =
+                rclaw_android::AndroidConfig::minimal(&context.files_dir.to_string_lossy());
+            let config_json = serde_json::to_string(&launch).map_err(|e| e.to_string())?;
+            let (running, _gui_attached) = match assemble_apk_agent(&config_json, Some(app)).await {
                 Ok(result) => result,
                 Err(error) => {
                     #[cfg(all(target_os = "android", feature = "apk-host"))]
@@ -806,9 +800,7 @@ pub(crate) async fn assemble_apk_agent(
         )
         .run(),
     );
-    tokio::spawn(
-        Heartbeat::new(layout, inbound_tx.clone(), cfg.heartbeat.interval_sec).run(),
-    );
+    tokio::spawn(Heartbeat::new(layout, inbound_tx.clone(), cfg.heartbeat.interval_sec).run());
 
     // 喂 watchdog 的健康信号：装配成功置位 + 30s 心跳（v0.2.0 服务
     // checkNativeRuntime 每 60s 查 is_healthy；不喂则进程被周期性杀掉重启）。
