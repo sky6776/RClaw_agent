@@ -103,7 +103,9 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     let mut truncated: String = text.chars().take(max_chars).collect();
-    truncated.push_str(&format!("\n\n（正文共 {count} 字符，已截断至 {max_chars}）"));
+    truncated.push_str(&format!(
+        "\n\n（正文共 {count} 字符，已截断至 {max_chars}）"
+    ));
     truncated
 }
 
@@ -120,7 +122,8 @@ pub type RawStream = Box<dyn RawDuplex>;
 pub type Ws = WebSocketStream<RawStream>;
 
 /// `/json/list` 探测请求（Connection: close，一发一收读到 EOF）。
-const HTTP_JSON_LIST: &[u8] = b"GET /json/list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+const HTTP_JSON_LIST: &[u8] =
+    b"GET /json/list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
 /// `/json/list` 应答里挑 page target。调试开关会暴露同进程的其它 WebView
 /// （安卓的 Tauri 主界面 / 桌面的扩展页）：按 URL 排除应用界面
@@ -165,7 +168,10 @@ pub async fn probe_page_target<S: tokio::io::AsyncRead + tokio::io::AsyncWrite +
     stream: &mut S,
 ) -> Result<String, String> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    stream.write_all(HTTP_JSON_LIST).await.map_err(|e| format!("探测请求失败: {e}"))?;
+    stream
+        .write_all(HTTP_JSON_LIST)
+        .await
+        .map_err(|e| format!("探测请求失败: {e}"))?;
     let mut buf: Vec<u8> = Vec::new();
     let read_all = async {
         let mut chunk = [0u8; 8192];
@@ -178,7 +184,7 @@ pub async fn probe_page_target<S: tokio::io::AsyncRead + tokio::io::AsyncWrite +
                     .and_then(|(_, value)| value.trim().parse::<usize>().ok());
                 match content_length {
                     Some(len) if at + 4 + len <= buf.len() => return Ok(()),
-                    Some(_) => {} // 响应体未读满，继续收
+                    Some(_) => {}          // 响应体未读满，继续收
                     None => return Ok(()), // 无长度声明：读到哪算哪（服务关流即完）
                 }
             }
@@ -378,8 +384,12 @@ async fn run_connection(ws: Ws, mut rx: mpsc::Receiver<CdpCommand>, load_tx: wat
                         if failed {
                             if let Some(params) = attempts.next() {
                                 send_fire_and_forget(
-                                    &mut sink, &mut next_id, &mut fetch_retry,
-                                    &request_id, attempts, params,
+                                    &mut sink,
+                                    &mut next_id,
+                                    &mut fetch_retry,
+                                    &request_id,
+                                    attempts,
+                                    params,
                                 )
                                 .await;
                                 continue;
@@ -416,13 +426,8 @@ async fn run_connection(ws: Ws, mut rx: mpsc::Receiver<CdpCommand>, load_tx: wat
                 }
                 match value.get("method").and_then(Value::as_str).unwrap_or("") {
                     "Fetch.requestPaused" => {
-                        handle_fetch_paused(
-                            &mut sink,
-                            &mut next_id,
-                            &mut fetch_retry,
-                            &value,
-                        )
-                        .await;
+                        handle_fetch_paused(&mut sink, &mut next_id, &mut fetch_retry, &value)
+                            .await;
                     }
                     "Page.loadEventFired" => {
                         load_tx.send_modify(|count| *count += 1);
@@ -701,7 +706,10 @@ fn cmdline_holds_dir(cmdline: &str, dir: &str) -> bool {
     let mut from = 0;
     while let Some(at) = cmdline[from..].find(dir) {
         let end = from + at + dir.len();
-        if matches!(cmdline[end..].chars().next(), None | Some(' ') | Some('"') | Some('\'')) {
+        if matches!(
+            cmdline[end..].chars().next(),
+            None | Some(' ') | Some('"') | Some('\'')
+        ) {
             return true;
         }
         from += at + 1;
@@ -779,10 +787,13 @@ fn kill_profile_holders(dirs: &[std::path::PathBuf]) {
 /// `Remove-Item -LiteralPath` 删目录（不展开通配）。
 #[cfg(windows)]
 fn windows_kill_and_remove(entries: &[serde_json::Value], own_pid: u32) {
-    use std::os::windows::process::CommandExt as _;
     use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_string(entries).unwrap_or_default().as_bytes());
+    use std::os::windows::process::CommandExt as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(
+        serde_json::to_string(entries)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     let script = format!(
         "$own = {own}; \
          $entries = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')) | \
@@ -852,7 +863,8 @@ impl HeadlessChromiumTransport {
             screenshot_dir: screenshot_dir.into(),
             // 按进程隔离：两个应用实例各用各的 profile，不互相抢锁（崩溃残留的
             // 孤儿由 kill_orphans_holding_profile 按各自目录特征清杀）。
-            profile_dir: std::env::temp_dir().join(format!("rclaw-browser-profile-{}", std::process::id())),
+            profile_dir: std::env::temp_dir()
+                .join(format!("rclaw-browser-profile-{}", std::process::id())),
             visible: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -949,7 +961,11 @@ impl HeadlessChromiumTransport {
                 // 成位置参数（URL），profile 落回默认目录——撞上已运行的实例
                 // 就立即退出，stderr 随之关闭。
                 .arg(format!("--user-data-dir={}", profile.display()))
-                .args(["--no-first-run", "--no-default-browser-check", "about:blank"]);
+                .args([
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "about:blank",
+                ]);
             if !visible {
                 command.args(["--disable-gpu", "--hide-scrollbars"]);
             }
@@ -983,8 +999,10 @@ impl HeadlessChromiumTransport {
                     }
                     if let Some(rest) = line.strip_prefix("DevTools listening on ws://") {
                         let authority = rest.split('/').next().unwrap_or_default();
-                        if let Some(found) =
-                            authority.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
+                        if let Some(found) = authority
+                            .rsplit(':')
+                            .next()
+                            .and_then(|p| p.parse::<u16>().ok())
                         {
                             port = Some(found);
                             sent = true;
@@ -1158,7 +1176,9 @@ impl DevtoolsTransport for HeadlessChromiumTransport {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Ok(format!("已截图：browser/{name}（工作区内，可用 read 读取）"))
+        Ok(format!(
+            "已截图：browser/{name}（工作区内，可用 read 读取）"
+        ))
     }
 }
 
@@ -1425,13 +1445,11 @@ impl CdpBrowser {
         let value = evaluate_string(&reply)?;
         let parsed: Value = serde_json::from_str(&value).map_err(|e| format!("{e}"))?;
         if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(
-                parsed
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("媒体提取失败")
-                    .to_string(),
-            );
+            return Err(parsed
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("媒体提取失败")
+                .to_string());
         }
         Ok(parsed
             .get("text")
@@ -1769,7 +1787,10 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    let changed = parsed.get("changed").and_then(Value::as_bool).unwrap_or(true);
+                    let changed = parsed
+                        .get("changed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
                     if changed {
                         return Ok(format!("已在 [ref {r}] 下拉框选中「{selected}」。"));
                     }
@@ -1782,13 +1803,11 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                          browser_screenshot 目检可见文本核实。"
                     ));
                 }
-                return Err(
-                    parsed
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("下拉选中失败")
-                        .to_string(),
-                );
+                return Err(parsed
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("下拉选中失败")
+                    .to_string());
             }
         }
         // 触摸聚焦是行为拟真，不是功能必需——下方 JS `el.focus()` 才是真正的
@@ -1844,11 +1863,7 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                     "text": unit, "unmodifiedText": unit,
                 });
                 match session
-                    .call(
-                        "Input.dispatchKeyEvent",
-                        down,
-                        Duration::from_secs(10),
-                    )
+                    .call("Input.dispatchKeyEvent", down, Duration::from_secs(10))
                     .await
                 {
                     Ok(_) => {}
@@ -1929,7 +1944,9 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                     // 确定未送达）时补滚沿用这条链，而不是换落点重登记——抖动
                     // 落点可能命中 contain 边界面板，换中心点会绕过边界。
                     attempted = true;
-                    if let Err(error) = self.synth_scroll(&session, gx, gy, chunk, notches > 0).await
+                    if let Err(error) = self
+                        .synth_scroll(&session, gx, gy, chunk, notches > 0)
+                        .await
                     {
                         if error.contains("超时") {
                             ambiguous = true;
@@ -1937,8 +1954,7 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                                 "（触摸手势超时，滚动可能仍在进行——未追加补滚；请用 browser_snapshot 核实位置: {error}）"
                             );
                         } else {
-                            note =
-                                format!("（触摸手势滚动失败: {error}，缺口改用页内程序化滚动）");
+                            note = format!("（触摸手势滚动失败: {error}，缺口改用页内程序化滚动）");
                         }
                         break;
                     }
@@ -2196,10 +2212,7 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
     /// 980 布局回退再缩小）innerWidth 是布局宽度而非可视宽度，可视宽度恒等
     /// 于 screen.width，可视高度 = visualViewport.height × scale（未缩放时
     /// ≈ innerHeight）。
-    async fn viewports(
-        &self,
-        session: &Session,
-    ) -> Result<((i64, i64), (i64, i64)), String> {
+    async fn viewports(&self, session: &Session) -> Result<((i64, i64), (i64, i64)), String> {
         let reply = session
             .call(
                 "Runtime.evaluate",
@@ -2777,7 +2790,14 @@ fn append_snapshot_hint(text: String, non_interactive: Option<u64>) -> String {
     )
 }
 
-const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+text.slice(0,120);if(href)line+=' → '+String(href).slice(0,150);out.push(line);}var ni=0;try{var skip={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1};var all=document.body?document.body.querySelectorAll('*'):[];for(var j=0;j<all.length;j++){var e=all[j];if(skip[e.tagName]||e.childElementCount>0)continue;if(e.closest&&e.closest('a,button,input,textarea,select,[role],[onclick]'))continue;if(clean(e.textContent||'').length>=30)ni++;}}catch(e2){}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素',non_interactive:ni});})()";
+/// 快照盲区普查（SNAPSHOT_JS 尾部的 non_interactive 计数）三条不变量：
+/// ① 排除表与快照收录选择器对齐（含 h1-h3——已可见的标题不是盲区，codex r1 P3）；
+/// ② 只数「直接文本」——元素自己的文本节点合计 ≥30 字。textContent 不行：它含全部
+///    子孙文本，会把快照已可见的 button 文本经父容器重复计入（codex r2 P3），也会让
+///    公共容器一次吞掉全部卡片的计数（codex r2 P2）；③ 不做祖先去重——按直接文本
+///    计数天然无父子重复。已知边界：标题拆成多个 <30 字短 span 的卡片不计（阈值
+///    信号，不求精确）；计数是「≥5 触发提示」的信号，不求精确 inventory。
+const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+text.slice(0,120);if(href)line+=' → '+String(href).slice(0,150);out.push(line);}var ni=0;try{var skip={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1};var all=document.body?document.body.querySelectorAll('*'):[];for(var j=0;j<all.length;j++){var e=all[j];if(skip[e.tagName])continue;if(e.closest&&e.closest('a,button,input,textarea,select,[role],[onclick],h1,h2,h3'))continue;var t='';for(var c=e.firstChild;c;c=c.nextSibling){if(c.nodeType===3)t+=c.nodeValue||'';}if(clean(t).length>=30)ni++;}}catch(e2){}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素',non_interactive:ni});})()";
 
 /// 媒体资源提取（browser_media）：img + video（含 source 子元素）+ og 元信息，
 /// 按 DOM 顺序统一遍历后再限量 40 条（分开遍历会让图片先耗尽配额、视频整页
@@ -2946,11 +2966,13 @@ fn normalize_url(url: &str) -> Result<String, String> {
     if url.contains("://") && !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(format!("仅支持 http(s) URL: {url}"));
     }
-    Ok(if url.starts_with("http://") || url.starts_with("https://") {
-        url.to_string()
-    } else {
-        format!("https://{url}")
-    })
+    Ok(
+        if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else {
+            format!("https://{url}")
+        },
+    )
 }
 
 /// 工具样板：name / description / schema / 串行安全位（共享长驻会话，保守
@@ -3064,7 +3086,9 @@ fn format_navigated_page(page: &PagePayload) -> String {
         push_blocked_note(&mut out, &page.blocked);
     }
     if page.text.trim().is_empty() {
-        out.push_str("\n\n（页面没有可读正文——可能是交互页/纯媒体页，可用 browser_snapshot 查看可交互元素）");
+        out.push_str(
+            "\n\n（页面没有可读正文——可能是交互页/纯媒体页，可用 browser_snapshot 查看可交互元素）",
+        );
     } else {
         out.push('\n');
         out.push('\n');
@@ -3115,7 +3139,11 @@ fn format_serp_page(page: &PagePayload) -> String {
         page.results.len()
     );
     for (index, entry) in page.results.iter().enumerate() {
-        out.push_str(&format!("\n\n[{}] {}", index + 1, single_line(&entry.title)));
+        out.push_str(&format!(
+            "\n\n[{}] {}",
+            index + 1,
+            single_line(&entry.title)
+        ));
         if !entry.url.is_empty() {
             out.push_str(&format!("\nURL: {}", single_line(&entry.url)));
         }
@@ -3380,7 +3408,10 @@ mod tests {
     #[test]
     fn classify_profile_dir_distinguishes_legacy_pid_and_foreign_names() {
         assert_eq!(classify_profile_dir("rclaw-browser-profile"), Some(None));
-        assert_eq!(classify_profile_dir("rclaw-browser-profile-120"), Some(Some(120)));
+        assert_eq!(
+            classify_profile_dir("rclaw-browser-profile-120"),
+            Some(Some(120))
+        );
         // 非本产品命名：不碰。
         assert_eq!(classify_profile_dir("rclaw-browser-profiles"), None);
         assert_eq!(classify_profile_dir("rclaw-browser-profile-backup"), None);
@@ -3628,7 +3659,9 @@ mod tests {
         assert!(looks_like_serp("https://m.baidu.com/s?wd=x"));
         assert!(looks_like_serp("https://bing.com/search"));
         // 普通内容页：即使被 EXTRACT_JS 收集到 h3 链接也不按 SERP 输出。
-        assert!(!looks_like_serp("https://docs.google.com/document/d/1/edit"));
+        assert!(!looks_like_serp(
+            "https://docs.google.com/document/d/1/edit"
+        ));
         assert!(!looks_like_serp("https://www.bing.com/images/feed"));
         assert!(!looks_like_serp("https://example.com/search"));
         assert!(!looks_like_serp("not a url"));
@@ -3758,15 +3791,11 @@ mod tests {
             browser: Arc::new(CdpBrowser::new(Arc::new(UnreachableTransport))),
         };
         for bad in [-1i64, 0, 31] {
-            let result = tool
-                .execute(serde_json::json!({ "amount": bad }))
-                .await;
+            let result = tool.execute(serde_json::json!({ "amount": bad })).await;
             assert!(result.is_error, "{bad}");
             assert!(result.content.contains("1-30"), "{bad}: {}", result.content);
         }
-        let result = tool
-            .execute(serde_json::json!({ "amount": "很多" }))
-            .await;
+        let result = tool.execute(serde_json::json!({ "amount": "很多" })).await;
         assert!(result.is_error);
         // 缺省值放行（后续 connect 失败与参数校验无关，错误来自传输层）。
         let result = tool.execute(serde_json::json!({})).await;
@@ -3789,6 +3818,11 @@ mod tests {
     }
 }
 
+/// 无头测试串行锁：#[ignore] 测试并行跑时共用全局子进程登记与
+/// kill_headless_processes 全局清理，互相杀浏览器会出假失败——必须串行。
+#[cfg(test)]
+static HEADLESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 本机真浏览器的端到端冒烟（需装 Chrome/Edge，默认跳过）：
 /// cargo test -p rclaw-tools cdp_browser -- --ignored
 #[test]
@@ -3803,6 +3837,7 @@ fn headless_browser_end_to_end_smoke() {
             kill_headless_processes();
         }
     }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -3815,14 +3850,163 @@ fn headless_browser_end_to_end_smoke() {
         let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
         let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
         eprintln!("[cdp] navigate example.com…");
-        let page = browser.navigate_and_extract("https://example.com", None).await?;
-        eprintln!("[cdp] navigate 完成: {}（{} 字符正文）", page.url, page.text.chars().count());
+        let page = browser
+            .navigate_and_extract("https://example.com", None)
+            .await?;
+        eprintln!(
+            "[cdp] navigate 完成: {}（{} 字符正文）",
+            page.url,
+            page.text.chars().count()
+        );
         assert!(page.url.contains("example"), "{:?}", page.url);
         assert!(!page.text.is_empty(), "正文为空");
         eprintln!("[cdp] snapshot…");
         let snapshot = browser.snapshot().await?;
         eprintln!("[cdp] snapshot 完成（{} 字符）", snapshot.chars().count());
         assert!(!snapshot.is_empty());
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+#[cfg(test)]
+impl CdpBrowser {
+    /// 测试助手：导航到 URL（data: 即可）后取快照。锁分段持有——navigate_wait
+    /// 与 snapshot 各自取 op 锁，静态测试页两步之间无变化。
+    async fn snapshot_after_load(&self, url: &str) -> Result<String, String> {
+        {
+            let _op = self.op.lock().await;
+            self.navigate_wait(url, None, Duration::from_secs(20))
+                .await?;
+        }
+        self.snapshot().await
+    }
+}
+
+/// data: URL 编码（页面内嵌 HTML，免起本地服务；中文按 UTF-8 百分号编码）。
+#[cfg(test)]
+fn data_url(html: &str) -> String {
+    let mut out = String::from("data:text/html;charset=utf-8,");
+    for b in html.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 盲区提示双向无头验证（提交 24dcbe0 的判定条件回归，codex r1 P2/P3）：
+/// A. 仿京东卡片页（12 张非叶卡片：div+img+30 字 span 标题）→ 必须附提示
+///    （旧实现的 childElementCount>0 跳过非叶节点会漏计成 0）；
+/// B. 普通表单页 → 不得附提示；
+/// C. 纯长标题 h2 页 → 不得附提示（h1-h3 在快照收录集合内，不是盲区——
+///    旧实现的排除表缺 h1-h3 会误报）。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_snapshot_hint_jd_cards_vs_form_page() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+
+        let title = "小米 MIX Flip 2 贝壳白 12+256 骁龙8至尊版 1.5K 内屏 5000万像素";
+        // A1 直排文本形态（codex r1 P2 回归点）：标题直接躺在带 img 的非叶 div
+        // 里——childElementCount>0 跳过非叶节点的旧实现会漏计成 0。
+        let cards: String = (0..12)
+            .map(|i| {
+                format!(
+                    r#"<div id="link_1001234567{i:02}" pure_item_link="https://item.m.jd.com/product/1001234567{i:02}.html"><img alt="">{title}</div>"#
+                )
+            })
+            .collect();
+        // 公共容器包裹（codex r3）：textContent+祖先去重的错误实现会把容器计 1
+        // 吞掉全部卡片、提示消失——本断言拦住该回归。
+        let snapshot = browser
+            .snapshot_after_load(&data_url(&format!(
+                "<html><body><div id=\"wrap\">{cards}</div></body></html>"
+            )))
+            .await?;
+        assert!(
+            snapshot.contains("非交互内容") && snapshot.contains("browser_extract"),
+            "直排文本卡片页必须附盲区提示: {snapshot}"
+        );
+        // A2 span 形态（真机京东卡片的常见结构）：标题在 span 里，span 自身计 1。
+        let cards: String = (0..12)
+            .map(|i| {
+                format!(
+                    r#"<div id="link_1001234568{i:02}" pure_item_link="https://item.m.jd.com/product/1001234568{i:02}.html"><img alt=""><span>{title}</span></div>"#
+                )
+            })
+            .collect();
+        let snapshot = browser
+            .snapshot_after_load(&data_url(&format!(
+                "<html><body><div id=\"wrap\">{cards}</div></body></html>"
+            )))
+            .await?;
+        assert!(
+            snapshot.contains("非交互内容"),
+            "span 卡片页必须附盲区提示: {snapshot}"
+        );
+
+        let form = "<html><body><form><input placeholder='搜索'><button>提交</button>\
+                    <select><option>选项</option></select><label>备注</label>\
+                    <textarea></textarea></form></body></html>";
+        let snapshot = browser.snapshot_after_load(&data_url(form)).await?;
+        assert!(
+            !snapshot.contains("非交互内容"),
+            "表单页不得附盲区提示: {snapshot}"
+        );
+
+        let headings: String = (0..6)
+            .map(|i| format!("<h2>第 {i} 节 标题文本足够长以满足三十字门槛的判定条件示例内容</h2>"))
+            .collect();
+        let snapshot = browser
+            .snapshot_after_load(&data_url(&format!(
+                "<html><body>{headings}</body></html>"
+            )))
+            .await?;
+        assert!(
+            !snapshot.contains("非交互内容"),
+            "h2 标题在快照收录集合内，不得计入盲区: {snapshot}"
+        );
+
+        // D 负例（codex r3）：快照已可见的 button 长文本，经父容器 textContent
+        // 重复计入盲区是 r2-P3 回归——textContent 实现会在此误报，直接文本实现不计。
+        let wrapped_buttons: String = (0..6)
+            .map(|i| {
+                format!(
+                    "<div><button>第 {i} 个确认按钮的说明文本足够长以满足三十字门槛判定条件示例</button></div>"
+                )
+            })
+            .collect();
+        let snapshot = browser
+            .snapshot_after_load(&data_url(&format!(
+                "<html><body>{wrapped_buttons}</body></html>"
+            )))
+            .await?;
+        assert!(
+            !snapshot.contains("非交互内容"),
+            "已可见 button 文本不得经父容器计入盲区: {snapshot}"
+        );
+
         browser.close().await?;
         Ok(())
     });
