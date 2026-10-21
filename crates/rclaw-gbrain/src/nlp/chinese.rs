@@ -182,14 +182,12 @@ pub fn escape_fts5_token(token: &str) -> String {
     // FTS5 boolean keywords that must not appear as bare tokens
     const FTS5_KEYWORDS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
 
+    // FTS5 bareword 只允许字母数字、下划线与非 ASCII 字符；jieba 会把 "3.14"、"50%"、
+    // "a#1"、"v2.0" 等整体作为一个 token 输出，黑名单漏掉的 `.` `%` `#` `&` 等 ASCII
+    // 标点会让 `MATCH` 直接报 "fts5: syntax error"，整次 KB 检索失败。改为白名单。
     let filtered: String = token
         .chars()
-        .filter(|c| {
-            !matches!(
-                c,
-                '"' | '\'' | '*' | '(' | ')' | ':' | '^' | '-' | '{' | '}' | '+' | '[' | ']'
-            )
-        })
+        .filter(|c| c.is_alphanumeric() || *c == '_' || !c.is_ascii())
         .collect();
 
     // If the filtered result is an FTS5 keyword, prefix with underscore to neutralize

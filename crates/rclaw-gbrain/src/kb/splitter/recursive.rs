@@ -90,7 +90,22 @@ fn recursive_split(
             current_chunk.push_str(&part);
         } else {
             if !current_chunk.is_empty() {
-                result.push(current_chunk.clone());
+                // 中间片段同样要受 chunk_size 约束：此前只有循环结束后的末段才会递归细分，
+                // 一个超长的非末尾 part（只有"，"的中文长句、无换行日志、minified 代码）
+                // 会原样输出，上层把本切分器当作硬上限兜底的假设因此失效。
+                if RecursiveCharSplitter::len_func(&current_chunk) > chunk_size
+                    && !next_separators.is_empty()
+                {
+                    recursive_split(
+                        &current_chunk,
+                        next_separators,
+                        chunk_size,
+                        chunk_overlap,
+                        result,
+                    );
+                } else {
+                    result.push(current_chunk.clone());
+                }
             }
             current_chunk = if chunk_overlap > 0 && !result.is_empty() {
                 let prev = result.last().expect(

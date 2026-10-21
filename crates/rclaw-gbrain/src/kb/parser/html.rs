@@ -194,10 +194,15 @@ fn convert_attachment_spans_to_markdown(html: &str) -> String {
 /// 处理 <thead>/<tbody>、<th>/<td>、colspan 等常见结构。
 /// 转换后的 Markdown 表格能被向量化引擎保留表格语义。
 fn convert_tables_to_markdown(html: &str) -> String {
+    // colspan 与单元格总数必须封顶：`colspan="4000000000"` 一个 <td> 就能让 push 循环
+    // 吃光内存，Android 上直接被 LMK 杀掉。超限的表格原样保留（不做 Markdown 转换）。
+    const MAX_COLSPAN: usize = 32;
+    const MAX_TABLE_CELLS: usize = 20_000;
     TABLE_RE
         .replace_all(html, |caps: &regex::Captures| {
             let table_content = caps.get(1).unwrap().as_str();
             let mut rows: Vec<Vec<String>> = Vec::new();
+            let mut total_cells = 0usize;
 
             for tr_cap in TR_RE.captures_iter(table_content) {
                 let tr_content = tr_cap.get(1).unwrap().as_str();
@@ -212,7 +217,12 @@ fn convert_tables_to_markdown(html: &str) -> String {
                     let span = COLSPAN_RE
                         .captures(full_tag)
                         .and_then(|c| c.get(1).and_then(|m| m.as_str().parse::<usize>().ok()))
-                        .unwrap_or(1);
+                        .unwrap_or(1)
+                        .clamp(1, MAX_COLSPAN);
+                    total_cells += span;
+                    if total_cells > MAX_TABLE_CELLS {
+                        return caps.get(0).unwrap().as_str().to_string();
+                    }
                     for _ in 0..span {
                         cells.push(cell_text.clone());
                     }
@@ -228,6 +238,9 @@ fn convert_tables_to_markdown(html: &str) -> String {
 
             // 统一列数为最大值
             let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+            if rows.len().saturating_mul(max_cols) > MAX_TABLE_CELLS {
+                return caps.get(0).unwrap().as_str().to_string();
+            }
             for row in &mut rows {
                 while row.len() < max_cols {
                     row.push(String::new());
@@ -373,6 +386,8 @@ fn remove_tags(html: &str, tag: &str) -> String {
 
     let mut result = String::with_capacity(html.len());
     let mut pos = 0;
+    // 一旦确认后面没有该标签的闭标签，后续开标签不再扫描（见 CloseSearch::NoCloseTag）
+    let mut no_close_tag_left = false;
 
     while pos < html.len() {
         if let Some(m) = open_re.find(&html[pos..]) {
@@ -385,18 +400,31 @@ fn remove_tags(html: &str, tag: &str) -> String {
                 pos = open_end;
             } else if let Some(ref cre) = close_re {
                 // raw-text 元素：找第一个闭标签，不追踪嵌套
-                if let Some(close_m) = cre.find(&html[open_end..]) {
+                if no_close_tag_left {
+                    result.push_str(m.as_str());
+                    pos = open_end;
+                } else if let Some(close_m) = cre.find(&html[open_end..]) {
                     pos = open_end + close_m.end();
                 } else {
+                    no_close_tag_left = true;
                     result.push_str(m.as_str());
                     pos = open_end;
                 }
-            } else if let Some(subtree_end) = find_matching_close(html, open_end, &tag_lower) {
-                // 普通标签：嵌套深度追踪
-                pos = subtree_end;
-            } else {
+            } else if no_close_tag_left {
                 result.push_str(m.as_str());
                 pos = open_end;
+            } else {
+                // 普通标签：嵌套深度追踪
+                match find_matching_close(html, open_end, &tag_lower) {
+                    CloseSearch::Found(subtree_end) => pos = subtree_end,
+                    search => {
+                        if matches!(search, CloseSearch::NoCloseTag) {
+                            no_close_tag_left = true;
+                        }
+                        result.push_str(m.as_str());
+                        pos = open_end;
+                    }
+                }
             }
         } else {
             result.push_str(&html[pos..]);
@@ -413,14 +441,24 @@ fn remove_tags(html: &str, tag: &str) -> String {
 /// m-15: 添加最大嵌套深度限制，防止超深层嵌套 HTML 导致 O(n²)
 const MAX_TAG_NESTING_DEPTH: usize = 256;
 
-fn find_matching_close(html: &str, start: usize, tag_name: &str) -> Option<usize> {
+/// `find_matching_close` 的结果：区分"没找到匹配"与"后面根本没有该标签的闭标签"，
+/// 后者可让调用方对同名标签直接短路，避免每个未闭合开标签都把剩余文本重扫一遍。
+enum CloseSearch {
+    Found(usize),
+    /// 从 `start` 起已无任何该标签的闭标签（对同一 tag、更靠后的起点同样成立）
+    NoCloseTag,
+    /// 嵌套过深或闭标签数量不足
+    Unmatched,
+}
+
+fn find_matching_close(html: &str, start: usize, tag_name: &str) -> CloseSearch {
     let open_pat = format!(r"(?i)<{}[\s>/]", regex::escape(tag_name));
     let close_pat = format!(r"(?i)</{}\s*>", regex::escape(tag_name));
     let Ok(open_re) = regex::Regex::new(&open_pat) else {
-        return None;
+        return CloseSearch::Unmatched;
     };
     let Ok(close_re) = regex::Regex::new(&close_pat) else {
-        return None;
+        return CloseSearch::Unmatched;
     };
 
     let mut depth: usize = 1;
@@ -437,16 +475,24 @@ fn find_matching_close(html: &str, start: usize, tag_name: &str) -> Option<usize
         let closest = match (next_open, next_close) {
             (Some(o), Some(c)) if o.0 < c.0 => (o.0, o.1, true),
             (Some(_), Some(c)) => (c.0, c.1, false),
-            (Some(o), None) => (o.0, o.1, true),
+            // 后面已无任何闭标签，不可能再匹配成功：立即返回。此前会继续前进直到
+            // depth > 256 才放弃，每个未闭合开标签都要把剩余文本扫 256 遍，实测 135 KB
+            // 的畸形 HTML 需要 35 s，1 MB 就是半小时以上，唯一的 KB worker 被挂死。
+            (Some(_), None) | (None, None) => {
+                return if pos == start {
+                    CloseSearch::NoCloseTag
+                } else {
+                    CloseSearch::Unmatched
+                };
+            }
             (None, Some(c)) => (c.0, c.1, false),
-            (None, None) => return None,
         };
 
         if closest.2 {
             depth += 1;
             // m-15: 超过最大嵌套深度时停止追踪，防止恶意/畸形 HTML 导致 O(n²)
             if depth > MAX_TAG_NESTING_DEPTH {
-                return None;
+                return CloseSearch::Unmatched;
             }
         } else {
             depth -= 1;
@@ -455,9 +501,9 @@ fn find_matching_close(html: &str, start: usize, tag_name: &str) -> Option<usize
     }
 
     if depth == 0 {
-        Some(pos)
+        CloseSearch::Found(pos)
     } else {
-        None
+        CloseSearch::Unmatched
     }
 }
 
@@ -467,6 +513,8 @@ fn find_matching_close(html: &str, start: usize, tag_name: &str) -> Option<usize
 fn remove_elements_matching(html: &str, detect: impl Fn(&str) -> bool) -> String {
     let mut result = String::with_capacity(html.len());
     let mut pos = 0;
+    // 已确认后面没有闭标签的标签名：同名开标签直接保留，不再逐个重扫剩余文本
+    let mut no_close_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while pos < html.len() {
         let Some(cap) = TAG_OPEN_RE.captures(&html[pos..]) else {
@@ -486,13 +534,17 @@ fn remove_elements_matching(html: &str, detect: impl Fn(&str) -> bool) -> String
                 result.push_str(full.as_str());
             }
             pos = open_end;
-        } else if detect(full.as_str()) {
+        } else if detect(full.as_str()) && !no_close_tags.contains(&tag_name) {
             // 非自闭合标签 + 需要删除：找匹配闭标签，跳过整棵子树
-            if let Some(subtree_end) = find_matching_close(html, open_end, &tag_name) {
-                pos = subtree_end;
-            } else {
-                result.push_str(full.as_str());
-                pos = open_end;
+            match find_matching_close(html, open_end, &tag_name) {
+                CloseSearch::Found(subtree_end) => pos = subtree_end,
+                search => {
+                    if matches!(search, CloseSearch::NoCloseTag) {
+                        no_close_tags.insert(tag_name);
+                    }
+                    result.push_str(full.as_str());
+                    pos = open_end;
+                }
             }
         } else {
             result.push_str(full.as_str());

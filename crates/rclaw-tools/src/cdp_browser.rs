@@ -56,6 +56,12 @@ use crate::{Tool, ToolResult};
 
 /// open 动作返回正文的字符上限（保上下文预算）。
 const PAGE_TEXT_MAX_CHARS: usize = 6_000;
+/// 报告行里页面标题 / URL 的字符上限：二者直接来自页面（document.title / location.href），
+/// 恶意或失控页面能塞进数 MB，不截断会把工具结果连同后续整段对话上下文一起撑爆。
+const PAGE_TITLE_MAX_CHARS: usize = 300;
+const PAGE_URL_MAX_CHARS: usize = 2_000;
+/// 单条 CDP WebSocket 消息的字节上限（见 `ws_over`）。
+const CDP_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// 页面提取结果（提取 JS 的返回契约：字段一一对应）。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -94,6 +100,17 @@ fn single_line(text: &str) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// 单行标签（标题 / URL）的截断：单行化后按字符截断，超长以省略号收尾。
+fn clip_label(text: &str, max_chars: usize) -> String {
+    let line = single_line(text);
+    if line.chars().count() <= max_chars {
+        return line;
+    }
+    let mut clipped: String = line.chars().take(max_chars).collect();
+    clipped.push_str("…（已截断）");
+    clipped
 }
 
 /// 按字符截断（CJK 安全），超长补省略说明。
@@ -207,10 +224,18 @@ async fn ws_over(stream: RawStream, target: &str) -> Result<Ws, String> {
         format!("ws://localhost/devtools/page/{target}")
             .into_client_request()
             .map_err(|e| format!("构造 CDP WebSocket 请求失败: {e}"))?;
+    // 单条 CDP 应答的大小上限：tungstenite 默认允许 64 MiB 的消息，一条超长应答（页面脚本
+    // 返回巨量文本 / 超大截图）就要整块缓冲在内存里，APK 上足以被 OOM 杀掉。截图 PNG 的
+    // base64 通常在个位数 MiB，16 MiB 足够；超限由 tungstenite 判错断连，走正常重连。
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(CDP_MAX_MESSAGE_BYTES),
+        max_frame_size: Some(CDP_MAX_MESSAGE_BYTES),
+        ..Default::default()
+    };
     // 握手无响应（内核卡死）不能无限等。
     let (ws, response) = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio_tungstenite::client_async(request, stream),
+        tokio_tungstenite::client_async_with_config(request, stream, Some(config)),
     )
     .await
     .map_err(|_| "CDP WebSocket 握手超时".to_string())?
@@ -426,6 +451,27 @@ async fn run_connection(ws: Ws, mut rx: mpsc::Receiver<CdpCommand>, load_tx: wat
                     }
                     "Page.loadEventFired" => {
                         load_tx.send_modify(|count| *count += 1);
+                    }
+                    "Page.javascriptDialogOpening" => {
+                        // alert/confirm/prompt/beforeunload 弹窗会阻塞渲染进程的 JS 线程：
+                        // 不处置则此后所有 Runtime.evaluate / 导航统统超时，会话永久卡死。
+                        // 无人值守只能自动处置：beforeunload 放行（导航 / 关闭得以继续），
+                        // 其余一律关闭（不替用户确认任何动作）。
+                        let kind = value
+                            .pointer("/params/type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let accept = kind == "beforeunload";
+                        next_id += 1;
+                        let frame = json!({
+                            "id": next_id,
+                            "method": "Page.handleJavaScriptDialog",
+                            "params": { "accept": accept },
+                        });
+                        if let Err(error) = sink.send(Message::Text(frame.to_string())).await {
+                            tracing::warn!("CDP WebSocket 写失败（关闭页面弹窗）: {error}");
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -1750,7 +1796,7 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
         if let Ok(reply) = &select_check {
             if evaluate_string(reply)? == "SELECT" {
                 let select_js = format!(
-                    "(function(ref,text){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');if(!el)return JSON.stringify({{ok:false,error:'引用不存在（页面可能已跳转，请重新 browser_snapshot）'}});var t=text.toLowerCase();var best=-1;for(var i=0;i<el.options.length;i++){{var hay=((el.options[i].text||'')+' '+(el.options[i].value||'')).toLowerCase();if(hay.indexOf(t)>=0){{best=i;break;}}}}if(best<0)return JSON.stringify({{ok:false,error:'下拉框没有含「'+text+'」的选项（共 '+el.options.length+' 项）'}});var label=(el.options[best].text||'').slice(0,40);var changed=el.selectedIndex!==best;var desc=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value');if(desc&&desc.set){{desc.set.call(el,el.options[best].value);}}if(el.selectedIndex!==best){{el.selectedIndex=best;}}el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return JSON.stringify({{ok:true,selected:label,changed:changed}});}})({r},{})",
+                    "(function(ref,text){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');if(!el)return JSON.stringify({{ok:false,error:'引用不存在（页面可能已跳转，请重新 browser_snapshot）'}});var t=text.toLowerCase();var best=-1;for(var i=0;i<el.options.length;i++){{var hay=((el.options[i].text||'')+' '+(el.options[i].value||'')).toLowerCase();if(hay.indexOf(t)>=0){{best=i;break;}}}}if(best<0)return JSON.stringify({{ok:false,error:'下拉框没有含「'+text+'」的选项（共 '+el.options.length+' 项）'}});var label=Array.from(el.options[best].text||'').slice(0,40).join('');var changed=el.selectedIndex!==best;var desc=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value');if(desc&&desc.set){{desc.set.call(el,el.options[best].value);}}if(el.selectedIndex!==best){{el.selectedIndex=best;}}el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return JSON.stringify({{ok:true,selected:label,changed:changed}});}})({r},{})",
                     json!(text)
                 );
                 let reply = session
@@ -2730,7 +2776,11 @@ struct PageInfo {
 }
 
 fn format_report(info: &PageInfo) -> String {
-    let mut out = format!("已打开：{}\n标题：{}", info.url, info.title);
+    let mut out = format!(
+        "已打开：{}\n标题：{}",
+        clip_label(&info.url, PAGE_URL_MAX_CHARS),
+        clip_label(&info.title, PAGE_TITLE_MAX_CHARS)
+    );
     if !info.blocked.is_empty() {
         push_blocked_note(&mut out, &info.blocked);
     }
@@ -2777,7 +2827,7 @@ fn append_snapshot_hint(text: String, non_interactive: Option<u64>) -> String {
     )
 }
 
-const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+text.slice(0,120);if(href)line+=' → '+String(href).slice(0,150);out.push(line);}var ni=0;try{var skip={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1};var all=document.body?document.body.querySelectorAll('*'):[];for(var j=0;j<all.length;j++){var e=all[j];if(skip[e.tagName]||e.childElementCount>0)continue;if(e.closest&&e.closest('a,button,input,textarea,select,[role],[onclick]'))continue;if(clean(e.textContent||'').length>=30)ni++;}}catch(e2){}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素',non_interactive:ni});})()";
+const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}function cut(s,n){var a=Array.from(String(s||''));return a.length>n?a.slice(0,n).join(''):String(s||'');}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+cut(text,120);if(href)line+=' → '+cut(href,150);out.push(line);}var ni=0;try{var skip={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1};var all=document.body?document.body.querySelectorAll('*'):[];for(var j=0;j<all.length;j++){var e=all[j];if(skip[e.tagName]||e.childElementCount>0)continue;if(e.closest&&e.closest('a,button,input,textarea,select,[role],[onclick]'))continue;if(clean(e.textContent||'').length>=30)ni++;}}catch(e2){}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素',non_interactive:ni});})()";
 
 /// 媒体资源提取（browser_media）：img + video（含 source 子元素）+ og 元信息，
 /// 按 DOM 顺序统一遍历后再限量 40 条（分开遍历会让图片先耗尽配额、视频整页
@@ -2786,7 +2836,7 @@ const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(
 /// 相对/协议相对 URL 按 document.baseURI 解析；src 为 data: 占位时回退
 /// data-src 取真链——给「图文/视频推送到聊天」提供 URL 素材（snapshot 只列
 /// 可交互元素，媒体 URL 只有这里拿得到）。
-const MEDIA_JS: &str = "(function(){var LIMIT=40,out=[],seen={};function abs(u){try{return new URL(u,document.baseURI).href;}catch(e){return '';}}function usable(u){u=(u||'').trim();if(!u||/^(data|blob):/i.test(u))return '';var a=abs(u);return /^https?:/.test(a)?a:'';}function push(kind,url,alt){url=usable(url);if(!url)return;var k=kind+' '+url;if(seen[k])return;seen[k]=1;if(out.length>=LIMIT)return;out.push((out.length+1)+'. ['+kind+'] '+url+(alt?(' | '+(alt||'').replace(/\\s+/g,' ').slice(0,60)):''));}var nodes=document.querySelectorAll('img,video,meta[property=\"og:image\"],meta[property=\"og:video\"],meta[property=\"og:video:url\"]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var tag=el.tagName;if(tag==='IMG'){var prim=usable(el.currentSrc)||usable(el.getAttribute('src'));var lazy=usable(el.getAttribute('data-src'));var cur=usable(el.currentSrc);var u=lazy||prim;var w=el.naturalWidth||0;if(cur&&w&&w<100&&cur===u)continue;push('图',u,el.alt||el.title||'');}else if(tag==='VIDEO'){var vc=[el.currentSrc,el.getAttribute('src')];var vu='';for(var c2=0;c2<vc.length&&!vu;c2++)vu=usable(vc[c2]);if(!vu){var ss=el.querySelectorAll('source');for(var s2=0;s2<ss.length&&!vu;s2++)vu=usable(ss[s2].getAttribute('src'));}push('视频',vu,'时长约'+Math.round(el.duration||0)+'秒');}else{var mc=el.getAttribute('content')||'';var mp=el.getAttribute('property')||'';push(/video/i.test(mp)?'视频':'og图',mc,'');}}return JSON.stringify({ok:true,text:out.length?out.join('\\n'):'页面未发现可提取的图片/视频'});})()";
+const MEDIA_JS: &str = "(function(){var LIMIT=40,out=[],seen={};function cut(s,n){var a=Array.from(String(s||''));return a.length>n?a.slice(0,n).join(''):String(s||'');}function abs(u){try{return new URL(u,document.baseURI).href;}catch(e){return '';}}function usable(u){u=(u||'').trim();if(!u||/^(data|blob):/i.test(u))return '';var a=abs(u);return /^https?:/.test(a)?a:'';}function push(kind,url,alt){url=usable(url);if(!url)return;var k=kind+' '+url;if(seen[k])return;seen[k]=1;if(out.length>=LIMIT)return;out.push((out.length+1)+'. ['+kind+'] '+url+(alt?(' | '+cut((alt||'').replace(/\\s+/g,' '),60)):''));}var nodes=document.querySelectorAll('img,video,meta[property=\"og:image\"],meta[property=\"og:video\"],meta[property=\"og:video:url\"]');for(var i=0;i<nodes.length;i++){var el=nodes[i];var tag=el.tagName;if(tag==='IMG'){var prim=usable(el.currentSrc)||usable(el.getAttribute('src'));var lazy=usable(el.getAttribute('data-src'));var cur=usable(el.currentSrc);var u=lazy||prim;var w=el.naturalWidth||0;if(cur&&w&&w<100&&cur===u)continue;push('图',u,el.alt||el.title||'');}else if(tag==='VIDEO'){var vc=[el.currentSrc,el.getAttribute('src')];var vu='';for(var c2=0;c2<vc.length&&!vu;c2++)vu=usable(vc[c2]);if(!vu){var ss=el.querySelectorAll('source');for(var s2=0;s2<ss.length&&!vu;s2++)vu=usable(ss[s2].getAttribute('src'));}push('视频',vu,'时长约'+Math.round(el.duration||0)+'秒');}else{var mc=el.getAttribute('content')||'';var mp=el.getAttribute('property')||'';push(/video/i.test(mp)?'视频':'og图',mc,'');}}return JSON.stringify({ok:true,text:out.length?out.join('\\n'):'页面未发现可提取的图片/视频'});})()";
 
 /// 页面提取（browser_navigate）：引擎感知的搜索结果列表
 /// （bing/baidu/google，过滤广告）+ Readability 式主文正文 + 风控/同意页
@@ -2794,6 +2844,10 @@ const MEDIA_JS: &str = "(function(){var LIMIT=40,out=[],seen={};function abs(u){
 const EXTRACT_JS: &str = r##"(function () {
   var out = { title: document.title || "", url: location.href, text: "", results: [], blocked: "" };
   function clean(s) { return (s || "").replace(/\s+/g, " ").trim(); }
+  // 按码点截断：String.prototype.slice 按 UTF-16 单元切，切在 emoji / 生僻字的代理对
+  // 中间会留下孤立代理项，JSON.stringify 把它转义成 \udXXX，Rust 侧 serde_json 直接拒收
+  // 整段结果（lone surrogate）。
+  function cut(s, n) { var a = Array.from(String(s || "")); return a.length > n ? a.slice(0, n).join("") : String(s || ""); }
   function adMarked(el) {
     return !!el.querySelector("[class*='ec-'], [class*='ec_'], [class*='tuiguang'], [class*='b_ad']");
   }
@@ -2803,7 +2857,7 @@ const EXTRACT_JS: &str = r##"(function () {
   function push(title, url, snippet) {
     if (!url || seen[url]) return;
     seen[url] = true;
-    out.results.push({ title: clean(title).slice(0, 120), url: url, snippet: clean(snippet).slice(0, 240) });
+    out.results.push({ title: cut(clean(title), 120), url: url, snippet: cut(clean(snippet), 240) });
   }
   if (/(^|\.)bing\.com$/.test(host)) {
     var items = document.querySelectorAll("#b_results li.b_algo");
@@ -2863,7 +2917,7 @@ const EXTRACT_JS: &str = r##"(function () {
   if (root) {
     body = root.innerText || root.textContent || "";
   }
-  out.text = body.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim().slice(0, 20000);
+  out.text = cut(body.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim(), 20000);
   var allText = (document.body && document.body.innerText) || "";
   if (/google\.[a-z.]+\/sorry/i.test(location.href) || /unusual traffic/i.test(allText)) out.blocked = "Google CAPTCHA 风控页（/sorry/）";
   else if (/^consent\./.test(location.hostname) || /before you continue/i.test(allText)) out.blocked = "同意页（consent）";
@@ -3059,7 +3113,11 @@ fn format_navigated_page(page: &PagePayload) -> String {
         }
         return format!("{prefix}{out}");
     }
-    let mut out = format!("已打开：{}\n标题：{}", page.url, single_line(&page.title));
+    let mut out = format!(
+        "已打开：{}\n标题：{}",
+        clip_label(&page.url, PAGE_URL_MAX_CHARS),
+        clip_label(&page.title, PAGE_TITLE_MAX_CHARS)
+    );
     if !page.blocked.is_empty() {
         push_blocked_note(&mut out, &page.blocked);
     }
@@ -3110,14 +3168,14 @@ fn looks_like_serp(url: &str) -> bool {
 fn format_serp_page(page: &PagePayload) -> String {
     let mut out = format!(
         "已打开：{}\n标题：{}\n\n检索结果 {} 条：",
-        page.url,
-        single_line(&page.title),
+        clip_label(&page.url, PAGE_URL_MAX_CHARS),
+        clip_label(&page.title, PAGE_TITLE_MAX_CHARS),
         page.results.len()
     );
     for (index, entry) in page.results.iter().enumerate() {
         out.push_str(&format!("\n\n[{}] {}", index + 1, single_line(&entry.title)));
         if !entry.url.is_empty() {
-            out.push_str(&format!("\nURL: {}", single_line(&entry.url)));
+            out.push_str(&format!("\nURL: {}", clip_label(&entry.url, PAGE_URL_MAX_CHARS)));
         }
         if !entry.snippet.is_empty() {
             out.push_str(&format!("\n{}", single_line(&entry.snippet)));

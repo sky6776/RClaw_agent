@@ -143,7 +143,10 @@ pub fn extract_markdown_metadata(content: &str, _raw_data: &[u8]) -> DocumentMet
 pub fn extract_pdf_metadata(_content: &str, raw_data: &[u8]) -> DocumentMetadata {
     let mut meta = DocumentMetadata::default();
 
-    // 尝试解析 PDF Info dictionary
+    // 尝试解析 PDF Info dictionary（先做嵌套深度预扫描，避免 lopdf 递归栈溢出）
+    if crate::kb::parser::pdf::check_pdf_nesting_depth(raw_data).is_err() {
+        return meta;
+    }
     if let Ok(doc) = lopdf::Document::load_mem(raw_data) {
         // 读取 PDF Info 字典
         if let Ok(lopdf::Object::Dictionary(info_dict)) = doc.trailer.get(b"Info").cloned() {
@@ -187,9 +190,18 @@ pub fn extract_docx_metadata(_content: &str, raw_data: &[u8]) -> DocumentMetadat
     let reader = std::io::Cursor::new(raw_data);
     if let Ok(mut archive) = zip::ZipArchive::new(reader) {
         // 尝试读取 docProps/core.xml
-        if let Ok(mut file) = archive.by_name("docProps/core.xml") {
+        if let Ok(file) = archive.by_name("docProps/core.xml") {
+            // core.xml 正常只有几 KB；解压无上限时一个 zip 炸弹条目就能把进程 OOM 掉
+            const MAX_CORE_XML_BYTES: u64 = 1024 * 1024;
             let mut buf = Vec::new();
-            if std::io::Read::read_to_end(&mut file, &mut buf).is_ok() {
+            if file.size() <= MAX_CORE_XML_BYTES
+                && std::io::Read::read_to_end(
+                    &mut std::io::Read::take(file, MAX_CORE_XML_BYTES + 1),
+                    &mut buf,
+                )
+                .is_ok()
+                && buf.len() as u64 <= MAX_CORE_XML_BYTES
+            {
                 if let Ok(xml_str) = std::str::from_utf8(&buf) {
                     meta = parse_docx_core_props(xml_str, meta);
                 }

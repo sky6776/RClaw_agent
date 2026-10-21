@@ -233,6 +233,53 @@ fn build_toml_snippet(s: &StatusResp) -> String {
     buf
 }
 
+/// 把含 bot_token 的片段落盘：Unix 上以 0600 创建（`fs::write` 沿用 umask 默认 0644，
+/// 多用户主机上其他本地用户可读），且不跟随已存在的符号链接覆盖目标。
+fn write_secret_file(path: &str, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to write through a symlink",
+        ));
+    }
+    // 目标已存在且不是本工具此前写出的 `[weixin]` 片段（典型误用：`--toml-file rclaw.toml`
+    // 指向完整配置）时拒绝覆盖：truncate 会把 [[llm.providers]] 等全部配置整体抹掉。
+    // 判定按结构而非前缀：首次用本工具生成的文件以 `[weixin]` 开头，用户随后在下面追加
+    // [[llm.providers]] / [agent] 等节再重跑一次就会被前缀判定放行；只要出现任何非
+    // `[weixin]` 的表头行就视为完整配置。读失败（非 UTF-8、无权限）一律拒绝，不能失败放行。
+    let existing = match std::fs::read_to_string(path) {
+        Ok(existing) => Some(existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(existing) = existing {
+        let body = existing.trim_start_matches('\u{feff}').trim_start();
+        let foreign_table = body
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with('['))
+            .any(|line| !line.starts_with("[weixin]"));
+        if !body.is_empty() && (!body.starts_with("[weixin]") || foreign_table) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "target exists and is not a [weixin] snippet; refusing to overwrite it \
+                 (paste the printed snippet into rclaw.toml instead)",
+            ));
+        }
+    }
+    let mut file = options.open(path)?;
+    file.write_all(content.as_bytes())?;
+    file.flush()
+}
+
 async fn run(args: &Args) -> Result<()> {
     let client = http_client()?;
 
@@ -274,7 +321,7 @@ async fn run(args: &Args) -> Result<()> {
                 print!("{snippet}");
                 println!("--------------------------");
                 if let Some(path) = &args.toml_file {
-                    std::fs::write(path, &snippet)
+                    write_secret_file(path, &snippet)
                         .with_context(|| format!("write toml file {path}"))?;
                     println!();
                     println!("Saved TOML snippet to: {path}");

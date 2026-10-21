@@ -48,6 +48,38 @@ impl JournalStore {
             .transaction(|tx| insert_event(tx, kind, stream, payload))
     }
 
+    /// 追加一条事件，并在同一事务里只保留该流最新的 `keep_last` 条（含本条）。
+    ///
+    /// 给「每次变更整份落一条快照、读取只看最新一条」的流（团队运行态）用：不裁剪就是
+    /// O(变更次数 × 快照大小) 的只增不减。`seq` 按 `max(seq) + 1` 生成，删旧行不影响单调性。
+    pub fn append_keep_last(
+        &self,
+        kind: &str,
+        stream: &str,
+        payload: &Value,
+        keep_last: usize,
+    ) -> Result<u64> {
+        self.db.transaction(|tx| {
+            let seq = insert_event(tx, kind, stream, payload)?;
+            let cutoff = (seq as i64).saturating_sub(keep_last.max(1) as i64);
+            tx.execute(
+                "DELETE FROM journal_event WHERE kind = ?1 AND stream = ?2 AND seq <= ?3",
+                params![kind, stream, cutoff],
+            )?;
+            Ok(seq)
+        })
+    }
+
+    /// 删除整条事件流（保留策略清理已终态的历史流用）。返回删除的事件数。
+    pub fn delete_stream(&self, kind: &str, stream: &str) -> Result<usize> {
+        self.db.transaction(|tx| {
+            Ok(tx.execute(
+                "DELETE FROM journal_event WHERE kind = ?1 AND stream = ?2",
+                params![kind, stream],
+            )?)
+        })
+    }
+
     /// 「先读整条流、再决定是否追加」，两步在同一个 `BEGIN IMMEDIATE` 写事务里完成。
     ///
     /// `decide` 拿到当前全部事件（`seq` 升序），返回 `(Some(payload), verdict)` 则追加并把

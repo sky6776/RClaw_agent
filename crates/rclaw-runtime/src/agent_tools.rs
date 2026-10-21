@@ -65,6 +65,10 @@ impl RunAdapter for SubagentRunAdapter<'_> {
     }
 }
 
+/// 同时处于排队/运行/取消中的子代理执行上限（Agent/Task 直接启动与 Plan/Workflow 的
+/// 子调用共用一张登记表，这是进程级总闸）。
+const MAX_ACTIVE_EXECUTIONS: usize = 32;
+
 mod escalate;
 pub use escalate::{EscalateTool, ResolveWorkflowQuestionTool};
 pub use workflow::WorkflowRunTool;
@@ -788,6 +792,11 @@ impl AgentToolRuntime {
                 if let Some(identity) = &identity {
                     self.mark_agent_inactive(identity).await;
                 }
+                // started 事件落盘失败就此退出：记录不能停在 Queued 且仍持有取消句柄，
+                // 否则它永远占着并发上限的一个名额、AgentWait 只能等到超时。
+                self.collaboration
+                    .mark_execution_terminal_unpersisted(&agent_id, &error)
+                    .await;
                 return;
             }
             tracing::debug!("执行在启动前已取消，跳过 running 状态：{agent_id}");
@@ -797,7 +806,59 @@ impl AgentToolRuntime {
             agent_id: agent_id.clone(),
             cancel,
         };
-        let mut result = self.run_task(spec, Some(control), identity).await;
+        // 后台任务的 JoinHandle 被调用方丢弃，run_task 内任意 panic 都会被 tokio 静默吞掉：
+        // 终态永不落盘（记录停在 Running/Waiting）、mark_agent_inactive 不执行（同名 teammate
+        // 再启动被拒「already active」、TeamDelete 被拒）、完成通知不发（等待方只能靠超时）。
+        // 这里把 panic 收敛成一次失败结果，走与正常失败相同的终态 / 通知路径
+        //（顶层 turn 对 panic 已有同口径处理，见 turn.rs run_turn 的 JoinError 分支）。
+        let panic_identity = identity.clone();
+        let panic_spec = (
+            spec.name.clone(),
+            spec.role.clone(),
+            spec.task.clone(),
+            spec.max_output_chars,
+        );
+        let mut result = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            self.run_task(spec, Some(control), identity),
+        ))
+        .await
+        {
+            Ok(result) => result,
+            Err(payload) => {
+                let reason = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("未知 panic");
+                tracing::error!(agent_id = %agent_id, "后台子 Agent 执行 panic：{reason}");
+                if let Some(identity) = &panic_identity {
+                    self.mark_agent_inactive(identity).await;
+                }
+                let (name, role, task, max_output_chars) = panic_spec;
+                let content = format!("子 Agent 执行因内部错误（panic）中止：{reason}");
+                AgentTaskResult {
+                    name,
+                    role,
+                    is_error: true,
+                    cancelled: false,
+                    completed_steps: 0,
+                    handoff: bound_structured_handoff(
+                        StructuredHandoff {
+                            goal: task,
+                            summary: content.clone(),
+                            evidence: Vec::new(),
+                            artifacts: Vec::new(),
+                            open_risks: vec!["任务因内部 panic 中止，未形成完整结论".to_string()],
+                            validation: Vec::new(),
+                        },
+                        max_output_chars,
+                    ),
+                    content,
+                    validated_media_markers: Vec::new(),
+                    media_publish_attempted: false,
+                }
+            }
+        };
         // run_task 的最后一次取消检查与终态落盘之间仍有一个很小的竞态窗口。
         // 一旦取消 token 已触发，不能再把刚形成的成功 handoff（尤其媒体 marker）
         // 当作已提交结果；取消方必须重新发起任务才能交付。
@@ -882,6 +943,11 @@ impl AgentToolRuntime {
         }
         if let Some(error) = transition_error {
             tracing::error!("{error}");
+            // 后台 future 到此结束：内存态必须收口为终态并释放取消句柄，否则这条记录会
+            // 永远占着子代理并发上限的一个名额。
+            self.collaboration
+                .mark_execution_terminal_unpersisted(&agent_id, &error)
+                .await;
             // 终态没有成功落盘时，不能把原成功结果当作已提交完成，尤其 Cancelling
             // 与 Succeeded 竞态会让用户取消后的媒体 marker 经邮箱继续向上游传播。
             // 保留原始正文用于诊断，但完成通知降级为失败且不携带发送能力。
@@ -942,6 +1008,15 @@ impl AgentToolRuntime {
             tokio_util::sync::CancellationToken,
         )>,
     ) -> Result<Value, String> {
+        // 并发执行上限：PlanRun（8）/ WorkflowRun（16）各有信号量，直接走 Agent/Task 的后台
+        // 启动此前没有任何上限——模型（或 cron 轮次）一条消息里连发几十个 run_in_background
+        // 子代理，每个都持有自己的上下文并最多跑 256 轮 LLM，APK 上先于一切被 OOM 杀掉。
+        let active = self.collaboration.active_execution_count().await;
+        if active >= MAX_ACTIVE_EXECUTIONS {
+            return Err(format!(
+                "当前已有 {active} 个子代理在排队/运行（上限 {MAX_ACTIVE_EXECUTIONS}）；请先用 AgentWait 等待或 AgentCancel 取消部分任务再发起"
+            ));
+        }
         let resolved_team = self.resolve_agent_team_name(&spec).await?;
         let skill_activity = begin_skill_activity(&self.layout.skills_dir)?;
         // 快照和恢复日志保存规范化后的团队名，避免显式传入带空格/大小写差异的名称后，
@@ -967,7 +1042,7 @@ impl AgentToolRuntime {
             Ok(identity) => identity,
             Err(error) => {
                 let failure = format!("queued execution 已创建，但团队成员注册失败: {error}");
-                let _ = self
+                if let Err(transition_error) = self
                     .transition_execution(
                         &agent_id,
                         ExecutionState::Failed,
@@ -980,7 +1055,14 @@ impl AgentToolRuntime {
                         },
                         "failed",
                     )
-                    .await;
+                    .await
+                {
+                    // 终态落盘失败：内存态也要收口，不能留下一条永远 Queued、仍持句柄的记录
+                    // 占着并发上限名额。
+                    self.collaboration
+                        .mark_execution_terminal_unpersisted(&agent_id, &transition_error)
+                        .await;
+                }
                 return Err(failure);
             }
         };

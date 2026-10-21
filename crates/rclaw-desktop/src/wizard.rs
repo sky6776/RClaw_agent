@@ -38,7 +38,9 @@ pub fn write_config(home: &Path, p: &WizardParams) -> Result<PathBuf, String> {
     let toml_text = render_template(p);
     std::fs::create_dir_all(home).map_err(|e| format!("创建数据目录失败: {e}"))?;
     let path = crate::home::config_path(home);
-    std::fs::write(&path, toml_text).map_err(|e| format!("写入配置失败: {e}"))?;
+    // 原子写：半截 rclaw.toml 会让 has_config 为真而解析失败，用户既进不了向导也启动不了。
+    rclaw_store::atomic_write(&path, toml_text.as_bytes())
+        .map_err(|e| format!("写入配置失败: {e}"))?;
     Ok(path)
 }
 

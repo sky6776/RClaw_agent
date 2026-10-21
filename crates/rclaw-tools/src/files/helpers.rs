@@ -906,12 +906,20 @@ pub(super) fn read_lines_window(
 
     loop {
         line.clear();
-        let n = match reader.read_until(b'\n', &mut line) {
+        // 单行读取也要受扫描上限约束：`read_until` 会把整行攒进内存，一个没有换行的
+        // 超大文件（几 GB 的单行 / 二进制）会在「按行」检查上限之前就把内存耗尽。
+        let remaining = READ_MAX_SCAN_BYTES.saturating_sub(scanned).max(1) as u64;
+        let n = match reader.by_ref().take(remaining).read_until(b'\n', &mut line) {
             Ok(n) => n,
             Err(e) => return Err(ToolResult::err(format!("读取失败 {path}: {e}"))),
         };
         if n == 0 {
             reached_end = true; // EOF
+            break;
+        }
+        if n as u64 == remaining && line.last() != Some(&b'\n') {
+            // 被上限截断在行中间（而非读到行尾 / EOF）：按扫描触顶处理，不把半行当整行。
+            scan_truncated = true;
             break;
         }
         scanned += n;

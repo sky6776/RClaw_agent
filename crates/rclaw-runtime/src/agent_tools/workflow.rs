@@ -1248,6 +1248,60 @@ impl SliceBudget {
     }
 }
 
+/// 第一次 poll 返回 Pending、再被唤醒即就绪：用于"等宿主 future 的任一唤醒"——它们在上一次
+/// `execute_pending_job` 的 poll 里已把本任务的 waker 登记进了调度器，这里只需让出等被叫醒。
+#[derive(Default)]
+struct WakeOnce {
+    polled: bool,
+}
+
+impl std::future::Future for WakeOnce {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if std::mem::replace(&mut self.polled, true) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// 把 JS job 队列与宿主 future 驱动到静止，替代 `AsyncRuntime::idle`：idle 在同一次 poll 里
+/// 把 job 队列一直跑到空、中途不让出，而 QuickJS 的中断处理器只在循环回边 / 构造调用处轮询——
+/// 一条不含循环、自我重排的 microtask 链（`then(loop)` 递归、`await` 递归）既不会触发中断
+/// 处理器，也不会让 idle 返回：墙钟预算、取消令牌乃至外层硬超时后的收尾全部失效，阻塞线程
+/// 被永久占满。这里逐个 job 驱动，job 之间按同一份片预算检查；没有 job 时等宿主 future 唤醒。
+async fn drive_to_quiescence(runtime: &AsyncRuntime, budget: &SliceBudget) {
+    loop {
+        match runtime.execute_pending_job().await {
+            // 跑了一个 job（或宿主 future 有进展）：超出片预算即中断，与中断处理器同一判定。
+            Ok(true) => {
+                if budget.poll_interrupt() {
+                    return;
+                }
+            }
+            // job 抛出未捕获异常：与 idle 一致，丢弃后继续驱动（脚本主链的异常由 IIFE 的
+            // reject 分支经 __script_done 上报，不会丢）。
+            Err(_) => {
+                if budget.poll_interrupt() {
+                    return;
+                }
+            }
+            Ok(false) => {
+                // 没有可跑的 job 也没有待决的宿主 future → 引擎真正静止。
+                if !runtime.is_job_pending().await {
+                    return;
+                }
+                WakeOnce::default().await;
+            }
+        }
+    }
+}
+
 /// 脚本结算形态：async IIFE 正常返回（`undefined` → None，否则 `String(value)`）或抛错。
 #[derive(Debug)]
 enum ScriptOutcome {
@@ -1332,7 +1386,7 @@ async fn eval_deterministic(
     // 时，若顺序门里还有等待者，其位次已不可能被认领（ZCode release-on-settle 同源）→
     // 放行后再驱动一轮；没有等待者则脚本确实挂在永不 resolve 的 promise 上，交调用方判失败。
     loop {
-        runtime.idle().await;
+        drive_to_quiescence(&runtime, &budget).await;
         let is_settled = settled
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1372,6 +1426,17 @@ async fn ask_host(
 ) -> String {
     if question.is_empty() {
         return json!({"ok": false, "error": "ask 的问题为空"}).to_string();
+    }
+    // 与计划步骤的 MAX_STEP_TASK_CHARS 同口径：问题全文会成为子代理的 spec.task，并随每次
+    // 执行状态变更整份克隆进 exec_log 事件（内存 + SQLite）。脚本里一句
+    // `ask("x".repeat(2e7))` 循环几次就能把 APK 进程撑爆；journal 的 ask 事件只是截断记录，
+    // 挡不住这条路，这里直接拒绝超长问题。
+    if question.chars().count() > MAX_QUESTION_CHARS {
+        return json!({
+            "ok": false,
+            "error": format!("ask 的问题超过 {MAX_QUESTION_CHARS} 字符；请把材料写入文件后让子代理自行读取"),
+        })
+        .to_string();
     }
     // 取消后（父 turn /cancel、工具调用被放弃、墙钟超时）引擎还会在宽限期内跑一会儿：
     // 脚本若 try/catch 住失败的 ask 再补问，这里直接拒绝——不占调用点编号、不写 ask 事件、
@@ -2013,14 +2078,29 @@ impl Tool for WorkflowRunTool {
         // spawn_blocking + 内嵌 current_thread runtime 驱动——future 不跨线程，
         // JoinHandle（快照结果）是 Send。ask 的子代理执行 spawn 在外层 runtime 上
         //（EngineShared::outer），结果经 mpsc 回到内嵌 runtime 里的宿主回调。
-        let executed = tokio::task::spawn_blocking(move || {
+        let engine_task = tokio::task::spawn_blocking(move || {
             let inner = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| format!("workflow 内嵌 runtime 创建失败: {error}"))?;
             inner.block_on(drive_engine(exec_script, max_run, engine_runtime, engine_shared))
-        })
-        .await;
+        });
+        // 外层硬超时：引擎内的取消 / 墙钟竞速都要内嵌 runtime 被轮询才生效，而同步 JS 只有
+        // 经中断处理器才会让出；quickjs-ng 的正则回溯不轮询中断处理器，一条灾难性回溯的
+        // 正则（`/(a+)+$/` 之类）就能把阻塞线程永久占死——没有这道上限，这次工具调用连同
+        // 整个 turn（及其执行槽位）会永久挂起。到期放弃等待（线程无法回收，是已知代价）。
+        let hard_deadline = max_run + ENGINE_SLICE_BUDGET + CANCEL_GRACE;
+        let executed = match tokio::time::timeout(hard_deadline, engine_task).await {
+            Ok(executed) => executed,
+            Err(_elapsed) => {
+                shared.cancel.cancel();
+                Ok(Err(format!(
+                    "workflow 引擎超过墙钟预算 {}s 后仍未返回（脚本可能卡在不可中断的同步操作，\
+                     如灾难性回溯的正则），已放弃等待",
+                    max_run.as_secs()
+                )))
+            }
+        };
         let outcome = match executed {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -2275,6 +2355,28 @@ mod tests {
         )
         .await;
         assert!(budget.interrupted(), "死循环必须被单片预算中断");
+        assert!(
+            !matches!(outcome, Ok(Some(ScriptOutcome::Returned(_)))),
+            "被中断的脚本不得看起来像正常完成: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_rescheduling_microtask_chain_is_interrupted() {
+        // 不含循环的自我重排 microtask 链：不经过中断处理器的轮询点，靠 job 之间的片预算检查中断。
+        let budget = Arc::new(SliceBudget::with_slice(Duration::from_millis(200)));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            eval_deterministic(
+                "function tick() { Promise.resolve().then(tick); } tick(); await new Promise(function () {});"
+                    .to_string(),
+                Arc::clone(&budget),
+                |_ctx| {},
+            ),
+        )
+        .await
+        .expect("自我重排的 microtask 链必须在片预算内被中断，而不是让引擎永不返回");
+        assert!(budget.interrupted(), "microtask 链必须被单片预算中断");
         assert!(
             !matches!(outcome, Ok(Some(ScriptOutcome::Returned(_)))),
             "被中断的脚本不得看起来像正常完成: {outcome:?}"

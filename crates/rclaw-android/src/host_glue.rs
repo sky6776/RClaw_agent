@@ -72,12 +72,22 @@ pub fn prepare_environment(resolved: &mut ResolvedAndroidConfig) -> Result<Prepa
         "skill 配置根目录",
     )?;
     reject_symlink(&resolved.skill_configs_dir, "skill 配置根目录")?;
-    if resolved.skill_configs_dir.exists() {
-        remove_managed_node(&resolved.skill_configs_dir, "skill 配置根目录")?;
+    // 只有宿主真的下发了配置才整树重建：GUI 装配抢跑时走的是 `AndroidConfig::minimal`
+    //（skill_configs 为空表），若此时也清空目录，随后前台服务带完整配置的 nativeStart
+    // 会因槽已占用而直接复用运行时、不再应用配置——全部 skill 凭据在本进程生命周期内
+    // 丢失，依赖配置的技能整体失效。空表时保留既有文件（最多残留旧配置，下次非空下发
+    // 时仍会整树重建）。
+    if !resolved.skill_configs.is_empty() {
+        if resolved.skill_configs_dir.exists() {
+            remove_managed_node(&resolved.skill_configs_dir, "skill 配置根目录")?;
+        }
+        std::fs::create_dir_all(&resolved.skill_configs_dir)
+            .context("创建 APK skill 配置根目录失败")?;
+        apply_skill_configs(&resolved.skill_configs, &resolved.skill_configs_dir)?;
+    } else {
+        std::fs::create_dir_all(&resolved.skill_configs_dir)
+            .context("创建 APK skill 配置根目录失败")?;
     }
-    std::fs::create_dir_all(&resolved.skill_configs_dir)
-        .context("创建 APK skill 配置根目录失败")?;
-    apply_skill_configs(&resolved.skill_configs, &resolved.skill_configs_dir)?;
     // APK 宿主标记（§4.1 三态判定）：与 Termux 同为 android target，运行期 APK
     // 专属行为一律以该标记为条件，而非 cfg!(target_os = "android")。
     std::env::set_var(rclaw_runtime::HostKind::APK_MARKER_ENV, "1");

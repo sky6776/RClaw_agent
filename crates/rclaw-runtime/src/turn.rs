@@ -374,12 +374,30 @@ fn resolve_log_name(logs_dir: &Path, name: &str) -> std::result::Result<PathBuf,
         return Err("缺少日志文件名。用法：/log get <名称>".to_string());
     }
     let clean = name.replace('\\', "/");
-    if clean.contains('/') || clean.contains("..") || Path::new(name).is_absolute() {
+    // 结构校验：必须恰好是一个普通路径分量。Windows 下 `C:rclaw.toml` 这类盘符相对路径
+    // 既无分隔符也不算 is_absolute，但 `logs_dir.join` 会整段换成它（落到 C: 盘当前目录），
+    // 靠 `/log get` / `/log del` 就能读删 logs 目录之外的文件；`:` 同时挡 NTFS 备用数据流。
+    let mut components = Path::new(name).components();
+    let single_normal = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if clean.contains('/')
+        || clean.contains("..")
+        || name.contains(':')
+        || !single_normal
+        || Path::new(name).is_absolute()
+    {
         return Err(format!(
             "非法日志文件名「{name}」：仅允许 agent/logs 目录内的文件名。"
         ));
     }
     let path = logs_dir.join(name);
+    if path.parent() != Some(logs_dir) {
+        return Err(format!(
+            "非法日志文件名「{name}」：仅允许 agent/logs 目录内的文件名。"
+        ));
+    }
     // 拒绝符号链接：日志只应是 logs_dir 内的普通文件。/log get 会把文件复制进共享 media 沙箱
     // 并经当前媒体 channel 外发，若放行指向 logs_dir 之外（如 /etc/passwd）的符号链接，
     // 会被诱导读取并外泄沙箱外数据。resolve_log_name 仅做词法校验，这里补符号链接拦截。
@@ -2204,16 +2222,30 @@ impl TurnManager {
             // media 目录不可用或复制失败 → 回退到文本回显。
         }
 
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => return format!("读取日志失败：{e}"),
+        // 只读末尾 MAX_BYTES：daily 日志只按日期轮转、不按大小，debug 级别一天可达数百 MB，
+        // 整文件读进内存既长时间阻塞路由任务，在 APK 上还会直接触发 LMK。
+        let bytes = {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => return format!("读取日志失败：{e}"),
+            };
+            if size > MAX_BYTES as u64 {
+                if let Err(e) = file.seek(SeekFrom::End(-(MAX_BYTES as i64))) {
+                    return format!("读取日志失败：{e}");
+                }
+            }
+            let mut buf = Vec::new();
+            if let Err(e) = file.take(MAX_BYTES as u64).read_to_end(&mut buf) {
+                return format!("读取日志失败：{e}");
+            }
+            buf
         };
-        if bytes.len() <= MAX_BYTES {
+        if size <= MAX_BYTES as u64 {
             let body = String::from_utf8_lossy(&bytes);
             format!("📄 {file_name}（{}）：\n\n{}", format_bytes(size), body)
         } else {
-            let tail = &bytes[bytes.len() - MAX_BYTES..];
-            let body = String::from_utf8_lossy(tail);
+            let body = String::from_utf8_lossy(&bytes);
             format!(
                 "📄 {file_name}（{}，仅显示末尾 {}）：\n\n…(前略)…\n{}",
                 format_bytes(size),

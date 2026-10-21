@@ -134,6 +134,20 @@ impl BackendError {
     pub fn concise(&self) -> String {
         truncate_chars(&self.message.replace(['\r', '\n'], " "), 300)
     }
+
+    /// 网页读取 / 正文提取路径的错误降级：这些失败文本来自任意第三方网页（Cloudflare 403、
+    /// 页面里的 "api key" / "limit" 字样……），被子串启发式归成「后端自身鉴权 / 额度失败」后，
+    /// `record_error` 会把整个 provider 置为 AuthBlocked / QuotaBlocked，且只有人工
+    /// `/search en` 才能恢复——一次被 403 的网页就能让搜索 + 读取整体下线。降为 Permanent
+    /// （不影响健康状态）；provider 自身端点的 401/403/429 由搜索路径继续识别。
+    pub fn demote_for_reader(self) -> Self {
+        match self.kind {
+            BackendErrorKind::Authentication | BackendErrorKind::QuotaExhausted => {
+                Self::permanent(self.message)
+            }
+            _ => self,
+        }
+    }
 }
 
 impl fmt::Display for BackendError {
@@ -143,6 +157,32 @@ impl fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+/// 带上限地读取 HTTP 响应体：`content_length()` 预检只对带 `Content-Length` 的响应有效，
+/// 分块传输时为 `None`，`bytes()` 会把整个 body 读入内存后才能检查大小——上限实际只由
+/// 超时 × 带宽决定。边读边计数，超限立即中止；`Err(None)` 表示超限，`Err(Some(e))` 为读取错误。
+pub(super) async fn read_response_capped(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Option<reqwest::Error>> {
+    use futures::StreamExt as _;
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(None);
+    }
+    let mut stream = response.bytes_stream();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(Some)?;
+        if out.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(None);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
 
 #[derive(Clone, Debug)]
 pub struct SearchRequest {

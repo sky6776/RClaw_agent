@@ -1,5 +1,20 @@
 //! Helpers for OpenAI-compatible chat completion requests.
 
+/// 构造带超时的 HTTP client。`reqwest::Client::new()` 默认没有总超时 / 连接超时，
+/// 移动网络切换、NAT 老化产生的半开连接会让 `send().await` / `json().await` 永不返回，
+/// 而本 crate 的 LLM 调用方多在 `block_on` 里同步等待（搜索线程、唯一的 KB worker、
+/// autopilot、持有 gbrain service 互斥锁的工具线程），一次黑洞就是永久挂死。
+pub fn http_client_with_timeout(total: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(total)
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::warn!("HTTP client 构建失败，使用默认配置: {}", e);
+            reqwest::Client::new()
+        })
+}
+
 /// Some chat APIs enable thinking by default. Most gbrain call sites expect the
 /// final answer in `choices[0].message.content`, JSON, or tool calls, so disable
 /// thinking unless a caller explicitly builds a reasoning request.

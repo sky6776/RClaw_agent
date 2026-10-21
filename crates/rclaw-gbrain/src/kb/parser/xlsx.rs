@@ -21,8 +21,68 @@ impl XlsxParser {
     }
 }
 
+/// 单个 sheet 允许的稠密单元格数（行跨度 × 列跨度）。calamine 的 `worksheet_range`
+/// 会按包围盒做 `vec![Data::default(); rows*cols]` 稠密分配，一个只含 A1 与
+/// XFD1048576 两个单元格的几 KB xlsx 就是 1.7e10 个元素，直接把进程打死。
+const MAX_SHEET_DENSE_CELLS: u64 = 2_000_000;
+/// 单个 sheet 的数据行上限（与 CSV 解析一致）。
+const MAX_SHEET_ROWS: usize = 100_000;
+/// xlsx 内单个 zip 条目声明的解压大小上限（sharedStrings / worksheets / media 在 open
+/// 阶段即被整体读入内存）。声明值可伪造，只作快速拒绝。
+const MAX_XLSX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 流式扫一遍 xlsx sheet 的单元格，返回其包围盒面积；非 xlsx 或读取失败返回 None。
+fn xlsx_sheet_dense_cells<RS: std::io::Read + std::io::Seek>(
+    workbook: &mut calamine::Sheets<RS>,
+    sheet_name: &str,
+) -> Option<u64> {
+    let calamine::Sheets::Xlsx(xlsx) = workbook else {
+        return None;
+    };
+    let mut reader = xlsx.worksheet_cells_reader(sheet_name).ok()?;
+    let (mut min_r, mut max_r, mut min_c, mut max_c) = (u32::MAX, 0u32, u32::MAX, 0u32);
+    let mut any = false;
+    while let Ok(Some(cell)) = reader.next_cell() {
+        let (r, c) = cell.get_position();
+        any = true;
+        min_r = min_r.min(r);
+        max_r = max_r.max(r);
+        min_c = min_c.min(c);
+        max_c = max_c.max(c);
+        let area = (u64::from(max_r - min_r) + 1) * (u64::from(max_c - min_c) + 1);
+        if area > MAX_SHEET_DENSE_CELLS {
+            return Some(area);
+        }
+    }
+    if !any {
+        return Some(0);
+    }
+    Some((u64::from(max_r - min_r) + 1) * (u64::from(max_c - min_c) + 1))
+}
+
+/// 对 xlsx 容器做 zip 条目声明大小的快速检查。
+fn reject_oversized_xlsx_entries(data: &[u8]) -> Result<(), GBrainError> {
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(data)) else {
+        return Ok(()); // 非 zip（如 BIFF xls）交给 calamine 自行报错
+    };
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index_raw(i) else {
+            continue;
+        };
+        if entry.size() > MAX_XLSX_ENTRY_BYTES {
+            return Err(GBrainError::InvalidInput(format!(
+                "spreadsheet 条目 {} 解压后过大 ({} 字节 > 上限 {MAX_XLSX_ENTRY_BYTES})",
+                entry.name(),
+                entry.size()
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl DocumentParser for XlsxParser {
     fn parse(&self, data: &[u8]) -> Result<ParsedDocument, GBrainError> {
+        reject_oversized_xlsx_entries(data)?;
         let cursor = std::io::Cursor::new(data);
         let mut workbook = open_workbook_auto_from_rs(cursor)
             .map_err(|e| GBrainError::FileError(format!("spreadsheet open failed: {}", e)))?;
@@ -35,6 +95,15 @@ impl DocumentParser for XlsxParser {
         let mut global_offset: usize = 0;
 
         for sheet_name in &sheets {
+            if xlsx_sheet_dense_cells(&mut workbook, sheet_name)
+                .is_some_and(|area| area > MAX_SHEET_DENSE_CELLS)
+            {
+                tracing::warn!(
+                    sheet = %sheet_name,
+                    "spreadsheet sheet 单元格范围超过上限 {MAX_SHEET_DENSE_CELLS}，跳过该 sheet"
+                );
+                continue;
+            }
             let sheet_header = format!("=== {} ===", sheet_name);
             // FIX9-04: 记录此 sheet 在全文中的起始偏移
             let start = global_offset;
@@ -67,6 +136,13 @@ impl DocumentParser for XlsxParser {
                         headers = cells.clone();
                         is_header_row = false;
                         continue; // 表头行不参与数据行计数
+                    }
+                    if row_count >= MAX_SHEET_ROWS {
+                        tracing::warn!(
+                            sheet = %sheet_name,
+                            "spreadsheet sheet 行数超过上限 {MAX_SHEET_ROWS}，截断后续行"
+                        );
+                        break;
                     }
 
                     // 存储为 JSON object 而非 JSON string

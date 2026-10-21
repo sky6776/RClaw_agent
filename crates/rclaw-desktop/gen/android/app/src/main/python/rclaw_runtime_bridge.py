@@ -161,6 +161,7 @@ def run_script(script_path, args_json, cwd, env_json=None,
     skills_root = os.path.realpath(os.path.join(cwd, "skills"))
     old_argv = sys.argv[:]
     old_path = sys.path[:]
+    old_dont_write_bytecode = sys.dont_write_bytecode
     old_executable = sys.executable
     old_environment = dict(os.environ)
     old_tempdir = tempfile.tempdir
@@ -172,9 +173,13 @@ def run_script(script_path, args_json, cwd, env_json=None,
         _purge_skill_modules(skills_root)
         sys.argv = [script_path, *[str(value) for value in args]]
         sys.executable = "python"
+        # 与桌面 `python script.py` 一致：只把脚本所在目录放到 sys.path[0]。不再把 cwd
+        # （模型可写的 agent 根目录）加进来——否则放一个 `requests.py` 之类的同名文件
+        # 就能遮蔽入口脚本延迟 import 的模块，绕开 Rust 侧只覆盖 skill 目录的审批哈希。
         sys.path.insert(0, os.path.dirname(script_path))
-        if cwd not in sys.path:
-            sys.path.insert(1, cwd)
+        # 不落 .pyc：审批校验的是 .py 源码，`__pycache__` 里与源文件 mtime/大小匹配的
+        # 字节码会被优先加载而不再读源码（Rust 侧执行前也会清理 skill 目录内的残留）。
+        sys.dont_write_bytecode = True
         private_tmp = os.path.join(cwd, "tmp")
         private_config = os.path.join(cwd, ".config")
         private_cache = os.path.join(cwd, ".cache")
@@ -218,6 +223,7 @@ def run_script(script_path, args_json, cwd, env_json=None,
             watchdog.stop()
         sys.argv = old_argv
         sys.path[:] = old_path
+        sys.dont_write_bytecode = old_dont_write_bytecode
         sys.executable = old_executable
         os.environ.clear()
         os.environ.update(old_environment)

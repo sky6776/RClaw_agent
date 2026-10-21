@@ -5,6 +5,13 @@ pub(super) const MAX_TOOL_ITER: usize = 256;
 pub(super) const DEFAULT_MAX_OUTPUT_CHARS: usize = 48_000;
 pub(super) const MAX_OUTPUT_CHARS: usize = 120_000;
 pub(super) const EXECUTION_EVENT_TAIL: usize = 64;
+/// 启动恢复时最多把多少条【已终态】的历史执行装进内存登记表（最近的优先）；更早的只留在
+/// 库里。每条执行的事件里都整份带着 spec，长寿命安装如果把全部历史都装载，启动内存按
+/// 历史总量线性增长（APK 上直接 OOM）。
+const RECOVERED_TERMINAL_EXECUTIONS_MAX: usize = 256;
+/// 库里保留的已终态执行流上限：超出的最旧流在启动时删除。未终态（可 AgentResume）的流
+/// 不在此列。
+const RETAINED_TERMINAL_EXECUTION_STREAMS: usize = 1_000;
 
 pub(super) type RegistryLink = Arc<OnceLock<Arc<ToolRegistry>>>;
 
@@ -788,6 +795,44 @@ impl CollaborationState {
         Ok(snapshot)
     }
 
+    /// 终态持久化失败后的兜底：后台 future 已经结束，记录却停在非终态且仍持有取消句柄——
+    /// 会被 [`Self::active_execution_count`] 一直当作在飞，磁盘满一阵攒够上限后就再也发不出
+    /// 新子代理（直到重启）。这里只改内存态（journal 已写不进去）：置 Failed、释放句柄、
+    /// 唤醒等待方；重启后按 journal 里最后一条已落盘事件恢复，与其它未落盘终态记录一致。
+    pub(super) async fn mark_execution_terminal_unpersisted(&self, agent_id: &str, error: &str) {
+        let notify = {
+            let mut executions = self.executions.lock().await;
+            let Some(record) = executions.get_mut(agent_id) else {
+                return;
+            };
+            if record.snapshot.state.is_terminal() {
+                return;
+            }
+            record.snapshot.state = ExecutionState::Failed;
+            record.snapshot.progress.stage = "终态持久化失败".to_string();
+            record.snapshot.error = Some(error.to_string());
+            record.snapshot.updated_at = chrono::Utc::now().to_rfc3339();
+            record.cancel = None;
+            Arc::clone(&record.notify)
+        };
+        notify.notify_waiters();
+    }
+
+    /// 本进程内正在占用资源（线程 / 内存 / 模型并发）的执行数。
+    ///
+    /// 以取消句柄而非状态判定：活着的子代理大部分时间处于 `Waiting`（等模型推理 /
+    /// 等工具执行，见 `transition_execution(.., Waiting, ..)`），只数 Queued/Running 会把
+    /// 绝大多数在飞的任务漏掉，上限形同虚设。句柄在终态清空、重启恢复的记录没有句柄，
+    /// 所以 `cancel.is_some() && !terminal` 恰好就是「本进程里还在跑」。
+    pub(super) async fn active_execution_count(&self) -> usize {
+        self.executions
+            .lock()
+            .await
+            .values()
+            .filter(|record| record.cancel.is_some() && !record.snapshot.state.is_terminal())
+            .count()
+    }
+
     pub(super) async fn insert_queued_execution(
         &self,
         agent_id: String,
@@ -1285,6 +1330,9 @@ pub(super) fn append_execution_log(
 
 /// 团队运行态快照流只有一条 stream。
 const TEAM_STATE_STREAM: &str = "";
+/// 快照流只保留最近这么多条：每条都是全量 `TeamRuntimeState`（含全部邮箱），恢复只读最新
+/// 一条，其余仅供诊断；不裁剪则每次 send_message / task_updated 都让库文件按整份状态增长。
+const TEAM_STATE_KEEP_LAST: usize = 32;
 
 pub(super) fn append_team_state_log(
     journal: &JournalStore,
@@ -1299,7 +1347,7 @@ pub(super) fn append_team_state_log(
     let payload =
         serde_json::to_value(&entry).map_err(|error| format!("序列化团队事件失败: {error}"))?;
     journal
-        .append(JOURNAL_TEAM_STATE, TEAM_STATE_STREAM, &payload)
+        .append_keep_last(JOURNAL_TEAM_STATE, TEAM_STATE_STREAM, &payload, TEAM_STATE_KEEP_LAST)
         .map(|_| ())
         .map_err(|error| format!("写入团队事件日志失败（state.sqlite journal {JOURNAL_TEAM_STATE}）: {error}"))
 }
@@ -1382,7 +1430,26 @@ pub(super) fn recover_execution_records(
             return records;
         }
     };
+    // 已终态的历史执行：先只读最后一条事件判定状态，按流的创建顺序（streams() 的顺序）
+    // 收集；最近 RECOVERED_TERMINAL_EXECUTIONS_MAX 条以单事件形态装进登记表，更早的只留
+    // 在库里，超过 RETAINED_TERMINAL_EXECUTION_STREAMS 的最旧流直接删除。
+    let mut terminal: Vec<(String, ExecutionLogEntry)> = Vec::new();
     for stream in streams {
+        let last = match journal.latest(JOURNAL_EXEC_LOG, &stream) {
+            Ok(Some(value)) => serde_json::from_value::<ExecutionLogEntry>(value).ok(),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!("读取子 agent 执行事件流 {stream} 失败，跳过: {error}");
+                None
+            }
+        };
+        let Some(last) = last else {
+            continue;
+        };
+        if last.snapshot.state.is_terminal() {
+            terminal.push((stream, last));
+            continue;
+        }
         // 登记表只保留每条执行的尾部事件（EXECUTION_EVENT_TAIL），恢复时也只读尾部：
         // 长寿命安装里执行流越积越多，整条读取会让每次启动按历史总量线性变慢。
         let mut events = journal
@@ -1437,6 +1504,29 @@ pub(super) fn recover_execution_records(
             ExecutionRecord {
                 snapshot,
                 events,
+                cancel: None,
+                notify: Arc::new(Notify::new()),
+            },
+        );
+    }
+    // 最旧的在前：先清理超出保留上限的流，再把最近的装进登记表。
+    let prune = terminal
+        .len()
+        .saturating_sub(RETAINED_TERMINAL_EXECUTION_STREAMS);
+    for (stream, _) in terminal.drain(..prune) {
+        if let Err(error) = journal.delete_stream(JOURNAL_EXEC_LOG, &stream) {
+            tracing::warn!("清理历史子 agent 执行事件流 {stream} 失败: {error}");
+        }
+    }
+    let skip = terminal
+        .len()
+        .saturating_sub(RECOVERED_TERMINAL_EXECUTIONS_MAX);
+    for (_, last) in terminal.into_iter().skip(skip) {
+        records.insert(
+            last.snapshot.agent_id.clone(),
+            ExecutionRecord {
+                snapshot: last.snapshot.clone(),
+                events: vec![last],
                 cancel: None,
                 notify: Arc::new(Notify::new()),
             },

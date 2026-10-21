@@ -32,6 +32,10 @@ impl DocumentParser for CsvParser {
         let mut headers: Vec<String> = Vec::new();
         // CSV 行数上限，防止超大文件耗尽内存
         const MAX_CSV_ROWS: usize = 100_000;
+        // 列数与总单元格数上限：每个数据行都按表头列数生成键值对，首行 1 万个逗号 +
+        // 1 万行 "a" 的 30 KB 文件会放大成 10 GB 量级的 JSON，行数上限对此无效。
+        const MAX_CSV_COLUMNS: usize = 1024;
+        const MAX_CSV_CELLS: usize = 2_000_000;
         // C4 fix: 存储 serde_json::Value 而非预序列化的 JSON 字符串，
         // 避免最终 serde_json::to_string(&row_records) 产生双重转义。
         let mut row_records: Vec<serde_json::Value> = Vec::new();
@@ -48,9 +52,22 @@ impl DocumentParser for CsvParser {
                     }
                     let fields: Vec<String> = record.iter().map(|s| s.to_string()).collect();
                     if headers.is_empty() && !fields.is_empty() {
+                        if fields.len() > MAX_CSV_COLUMNS {
+                            return Err(GBrainError::InvalidInput(format!(
+                                "CSV 列数 {} 超过上限 {}，请拆分文件后重试",
+                                fields.len(),
+                                MAX_CSV_COLUMNS
+                            )));
+                        }
                         headers = normalize_headers(&fields);
                         rows.push(headers.join("\t"));
                         continue;
+                    }
+                    if (data_row_count + 1).saturating_mul(headers.len()) > MAX_CSV_CELLS {
+                        return Err(GBrainError::InvalidInput(format!(
+                            "CSV 单元格总数超过上限 {}，请拆分文件后重试",
+                            MAX_CSV_CELLS
+                        )));
                     }
                     let row_map: HashMap<String, String> = headers
                         .iter()

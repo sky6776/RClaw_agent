@@ -24,6 +24,25 @@ use super::McpTransport;
 const SESSION_HEADER: &str = "mcp-session-id";
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
+/// 单次响应体上限：`Client::builder().timeout()` 只限时间不限大小，异常 / 恶意 server
+/// 60s 内可灌入 GB 级数据，`text()` 整体读入后分配失败即 abort 整个宿主进程。
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// 带上限地读取响应体为文本（非 UTF-8 字节 lossy 替换）；超限立即中止。
+async fn read_text_capped(resp: reqwest::Response, max: usize) -> Result<String, String> {
+    use futures::StreamExt as _;
+    let mut stream = resp.bytes_stream();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if out.len().saturating_add(chunk.len()) > max {
+            return Err(format!("响应体超过 {max} 字节上限，已中止读取"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
 pub struct HttpTransport {
     name: String,
     url: String,
@@ -50,8 +69,11 @@ impl HttpTransport {
             for (k, v) in map {
                 let hname = HeaderName::from_bytes(k.as_bytes())
                     .map_err(|e| McpError::Config(format!("非法 header 名 '{k}': {e}")))?;
-                let hval = HeaderValue::from_str(&v)
-                    .map_err(|e| McpError::Config(format!("非法 header 值 '{v}': {e}")))?;
+                // 错误文案只带 header 名不带值：值通常是 `Authorization: Bearer <token>`，
+                // 该错误会沿 start_http → client_for 在 manager 的 warn! 里原文落日志。
+                let hval = HeaderValue::from_str(&v).map_err(|e| {
+                    McpError::Config(format!("非法 header 值（header '{k}'）: {e}"))
+                })?;
                 base_headers.insert(hname, hval);
             }
         }
@@ -110,7 +132,11 @@ impl HttpTransport {
 
     /// 处理一次 POST 的完整响应：捕获 session id、按 Content-Type 解析消息、route_inbound、
     /// 回写 server 主动请求的回复。
-    async fn handle_response(&self, resp: reqwest::Response) -> McpResult<()> {
+    ///
+    /// `write_back`：是否把 server 主动请求的回复再 POST 出去。回写请求自己的响应按规范应为
+    /// 202 无正文；若 server 在其中又夹带新请求，不再继续回写——否则 send_raw →
+    /// handle_response → send_raw 会无限递归（每层一个 boxed future，最终栈溢出 / 挂死）。
+    async fn handle_response(&self, resp: reqwest::Response, write_back: bool) -> McpResult<()> {
         if !resp.status().is_success() {
             return Err(McpError::Tool(format!(
                 "MCP[{}]: HTTP {}",
@@ -134,8 +160,7 @@ impl HttpTransport {
             .get_all(CONTENT_TYPE)
             .iter()
             .any(|v| v.to_str().is_ok_and(|s| s.contains("text/event-stream")));
-        let text = resp
-            .text()
+        let text = read_text_capped(resp, MAX_RESPONSE_BYTES)
             .await
             .map_err(|e| McpError::Tool(format!("MCP[{}]: 读取响应失败: {e}", self.name)))?;
         let trimmed = text.trim();
@@ -153,10 +178,27 @@ impl HttpTransport {
                 core.route_inbound(&msg, &mut replies);
             }
         }
+        if !write_back {
+            if !replies.is_empty() {
+                warn!(
+                    server = %self.name,
+                    count = replies.len(),
+                    "http 传输：回写响应中再次夹带 server 请求，忽略不再回写"
+                );
+            }
+            return Ok(());
+        }
         for r in replies {
             // server 主动请求（如 ping）的回写：best-effort。回写失败不应让用户当次的
             // tools/call 整体失败（stdio 的 write_back 同样忽略失败）。
-            let _ = self.send_raw(&r).await;
+            match self.post(&r).await {
+                Ok(resp) => {
+                    let _ = Box::pin(self.handle_response(resp, false)).await;
+                }
+                Err(e) => {
+                    debug!(server = %self.name, error = %e, "http 传输：回写失败（忽略）");
+                }
+            }
         }
         Ok(())
     }
@@ -177,7 +219,7 @@ impl HttpTransport {
 impl McpTransport for HttpTransport {
     async fn send_raw(&self, line: &str) -> McpResult<()> {
         let resp = self.post(line).await?;
-        match self.handle_response(resp).await {
+        match self.handle_response(resp, true).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 warn!(server = %self.name, error = %e, "http 传输请求失败");

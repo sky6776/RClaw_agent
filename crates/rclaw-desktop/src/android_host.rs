@@ -90,6 +90,16 @@ pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeStart(
         // v2 语义：不再走 v0.2.0 的 rclaw_android::start 独立运行时；GUI 场景由
         // tauri setup 装配。服务无头场景（GUI 从未打开）：filesDir/rclaw.toml 已
         // 存在时在独立线程装配共享运行时（napcat/weixin 通道随即可用）。
+        // 同进程「停止 → 再启动」：槽内运行时仍在跑，重新亮起健康信号即可，不再新建
+        // 一个（故意泄漏的）runtime 去发现「已就绪」——每次重启都泄漏一套线程。
+        if apk_runtime_slot()
+            .try_lock()
+            .is_ok_and(|slot| slot.is_some())
+        {
+            rclaw_android::set_runtime_healthy(true);
+            tracing::info!("APK 共享运行时已就绪，nativeStart 复用");
+            return Ok(());
+        }
         if files_dir.join("rclaw.toml").is_file() {
             std::thread::Builder::new()
                 .name("rclaw-apk-headless".into())
@@ -110,6 +120,11 @@ pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeStart(
                     runtime.block_on(async move {
                         let mut slot = apk_runtime_slot().lock().await;
                         if slot.is_some() {
+                            // 同进程「停止 → 再启动」：既有运行时（agent loop / 通道 /
+                            // cron / 心跳任务）仍在泄漏的 runtime 上跑，直接重新亮起
+                            // 健康信号即可，不能再装配一套（否则双 agent 同时消费
+                            // 同一通道与 cron 表：重复回复、定时任务双发）。
+                            rclaw_android::set_runtime_healthy(true);
                             tracing::info!("APK 共享运行时已就绪，无头启动跳过");
                             return;
                         }
@@ -141,14 +156,10 @@ pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeStop(
     _class: JClass<'_>,
 ) -> jstring {
     // v0.2.0 独立 host 线程（rclaw_android::start/stop）已删除：nativeStop
-    // 只做健康信号清除 + v2 共享运行时清槽（GUI 若在前台，其句柄仍有效
-    // 直到进程退出）。
+    // 只做健康信号清除（GUI 若在前台，其句柄仍有效直到进程退出）。
+    // 槽内运行时不清：它跑在故意泄漏的进程级 runtime 上，清槽停不掉任何任务，
+    // 只会让同进程的下一次 nativeStart / GUI 启动再装配一套并行的 agent。
     rclaw_android::set_runtime_healthy(false);
-    if let Some(slot) = APK_RUNTIME.get() {
-        if let Ok(mut guard) = slot.try_lock() {
-            *guard = None;
-        }
-    }
     result_string(env, Ok(()))
 }
 

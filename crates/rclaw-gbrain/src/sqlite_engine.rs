@@ -241,13 +241,35 @@ impl SqliteEngine {
         let conn = self.conn.as_ref().ok_or(GBrainError::NotConnected)?;
         Ok(crate::kb::engine::KbEngine::new(conn))
     }
+    /// 可嵌套的写事务：不在事务中时 BEGIN/COMMIT；已在外层事务（如
+    /// `transaction_with_engine` 的 BEGIN IMMEDIATE）中时改用 SAVEPOINT。
+    /// 此前无条件 `unchecked_transaction()` 在外层事务内会报
+    /// "cannot start a transaction within a transaction"，`artifact_put` 事务路径里的
+    /// `upsert_chunks` / `delete_stale_chunks` / `add_links_batch` 因此静默失败——页面提交了，
+    /// chunks / FTS / 向量一条都没有，且 content_hash 短路使其无法自愈。
     pub fn transaction<T, F>(&self, f: F) -> Result<T>
     where
-        F: FnOnce(&Transaction) -> Result<T>,
+        F: FnOnce(&Connection) -> Result<T>,
     {
         let conn = self.conn()?;
-        let tx = conn.unchecked_transaction()?;
-        let result = f(&tx);
+        if !conn.is_autocommit() {
+            conn.execute_batch("SAVEPOINT sp_engine_tx")?;
+            return match f(conn) {
+                Ok(value) => {
+                    conn.execute_batch("RELEASE SAVEPOINT sp_engine_tx")?;
+                    Ok(value)
+                }
+                Err(e) => {
+                    conn.execute_batch(
+                        "ROLLBACK TO SAVEPOINT sp_engine_tx; RELEASE SAVEPOINT sp_engine_tx",
+                    )
+                    .ok();
+                    Err(e)
+                }
+            };
+        }
+        let tx: Transaction = conn.unchecked_transaction()?;
+        let result = f(&*tx);
         match result {
             Ok(value) => {
                 tx.commit()?;
@@ -1150,6 +1172,11 @@ impl BrainEngine for SqliteEngine {
 
     fn search_keyword(&self, query: &str, opts: SearchOpts) -> Result<Vec<SearchResult>> {
         trace!(query = %query, limit = opts.limit.unwrap_or(20), "FTS5 chunk-level keyword search");
+        // 仅含标点/emoji 的查询经 build_fts_query 后为空串，`MATCH ''` 是 FTS5 语法错误，
+        // 会让整次 hybrid 搜索返回数据库错误而非空结果（search_keyword_chunks 已有同样守卫）。
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn()?;
         let limit = opts.limit.unwrap_or(20);
         let exclude_prefixes = effective_exclude_prefixes(&opts);
@@ -1601,8 +1628,12 @@ impl BrainEngine for SqliteEngine {
              FROM vec_chunks v
              JOIN chunks c ON c.id = v.chunk_id
              JOIN pages p ON p.id = c.page_id
-             WHERE v.embedding MATCH ?1 AND p.deleted_at IS NULL",
+             WHERE v.embedding MATCH ?1 AND k = ?2 AND p.deleted_at IS NULL",
         );
+        // vec0 KNN 与其它表 JOIN 时 LIMIT 不会下推到虚表，sqlite-vec 在 prepare 阶段直接报
+        // "A LIMIT or 'k = ?' constraint is required on vec0 knn queries"，必须显式 k = ?。
+        // vec0 先取 k 近邻再做 JOIN/过滤，故 over-fetch 后在 Rust 侧截到 limit（与 kb/search.rs 一致）。
+        let knn_k = limit.saturating_mul(4).max(limit).min(10_000);
         if opts.page_type.is_some() {
             sql.push_str(" AND p.page_type = ?3");
         }
@@ -1658,14 +1689,14 @@ impl BrainEngine for SqliteEngine {
                 .collect();
             sql.push_str(&format!(" AND {}", clauses.join(" AND ")));
         }
-        sql.push_str(" ORDER BY v.distance LIMIT ?2");
+        sql.push_str(" ORDER BY v.distance");
 
         let mut stmt = conn.prepare(&sql)?;
 
         // Bind parameters dynamically
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         param_values.push(Box::new(query_blob.clone())); // ?1
-        param_values.push(Box::new(limit)); // ?2
+        param_values.push(Box::new(knn_k as i64)); // ?2
         if let Some(ref pt) = opts.page_type {
             param_values.push(Box::new(pt.to_string())); // ?3
         }
@@ -1727,6 +1758,9 @@ impl BrainEngine for SqliteEngine {
         let detail = opts.detail_level.unwrap_or(DetailLevel::Medium);
         let mut results = Vec::new();
         for row_result in rows {
+            if results.len() >= limit {
+                break;
+            }
             let (
                 chunk_id,
                 distance,

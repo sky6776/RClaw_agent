@@ -824,12 +824,19 @@ fn search_file(
             return;
         }
         buf.clear();
-        let n = match reader.read_until(b'\n', &mut buf) {
+        // 单行读取受扫描上限约束：无换行的超大文件否则会在按行检查上限前整段进内存。
+        let remaining = MAX_GREP_FILE_SCAN.saturating_sub(scanned).max(1) as u64;
+        let n = match reader.by_ref().take(remaining).read_until(b'\n', &mut buf) {
             Ok(n) => n,
             Err(_) => return,
         };
         if n == 0 {
             return; // EOF
+        }
+        if n as u64 == remaining && buf.last() != Some(&b'\n') {
+            // 行被上限截断：视为扫描触顶（大文件只搜前缀），半行不参与匹配。
+            acc.capped_files += 1;
+            return;
         }
         lineno += 1;
         if buf.contains(&0u8) {

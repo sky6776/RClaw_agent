@@ -126,7 +126,13 @@ pub async fn update_check(app: AppHandle) -> Result<UpdateInfo, String> {
         version_cmp(&parse_version(&latest), &parse_version(&current)) == std::cmp::Ordering::Greater;
     let mut notes = release.body;
     if let Some(body) = notes.as_mut() {
-        body.truncate(2000);
+        // 发布说明是外部输入且多为中文：`String::truncate` 落在多字节字符中间会 panic，
+        // 先退到字符边界再截断。
+        let mut end = body.len().min(2000);
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
     }
     Ok(UpdateInfo {
         current,
@@ -3496,6 +3502,11 @@ const MEDIA_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 
 /// 预览图长边上限（2K 屏的 1x 显示足够；放大看原图由前端按需加载全图）。
 const MEDIA_PREVIEW_MAX_EDGE: u32 = 1440;
+/// 预览解码时允许的原图最大宽/高与像素缓冲分配上限。image 默认只有 512 MiB 的分配
+/// 上限、无宽高上限：一张 100 KB 的 11000×11000 纯色 PNG 会先申请 ~480 MB 的 RGBA
+/// 缓冲，Android 上会被 LMK 直接杀掉整个进程。前端对会话里每个图片标记都会自动请求预览。
+const MEDIA_DECODE_MAX_EDGE: u32 = 8192;
+const MEDIA_DECODE_MAX_ALLOC: u64 = 128 * 1024 * 1024;
 /// 预览缓存目录（相对 agent/；预览是派生物，进 media/cache 不污染用户文件）。
 const MEDIA_PREVIEW_CACHE_DIR: &str = "media/cache/preview";
 
@@ -3592,7 +3603,15 @@ fn media_preview_blocking(home: &std::path::Path, path: &str) -> Result<MediaPay
         }
     }
 
-    let img = image::load_from_memory(&original).map_err(|e| format!("解码图片失败: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MEDIA_DECODE_MAX_EDGE);
+    limits.max_image_height = Some(MEDIA_DECODE_MAX_EDGE);
+    limits.max_alloc = Some(MEDIA_DECODE_MAX_ALLOC);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&original))
+        .with_guessed_format()
+        .map_err(|e| format!("识别图片格式失败: {e}"))?;
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| format!("解码图片失败: {e}"))?;
     // 长边本就不超上限：原图已足够小，原样返回（不重编码损质量）。
     if img.width() <= MEDIA_PREVIEW_MAX_EDGE && img.height() <= MEDIA_PREVIEW_MAX_EDGE {
         return Ok(MediaPayload {
@@ -3881,7 +3900,9 @@ pub async fn skill_config_write(path: String, content: String) -> Result<(), Str
         let gate = rclaw_android::approval_gate().ok_or("技能闸门尚未就绪")?;
         let full = gate.skills_dir.join(&path);
         tauri::async_runtime::spawn_blocking(move || {
-            std::fs::write(&full, content).map_err(|e| format!("保存配置失败: {e}"))
+            // 原子写：技能配置含 api_key，截断窗口内被杀会整份归零。
+            rclaw_store::atomic_write(&full, content.as_bytes())
+                .map_err(|e| format!("保存配置失败: {e}"))
         })
         .await
         .map_err(|e| format!("配置保存任务失败: {e}"))?
@@ -4017,7 +4038,16 @@ pub async fn open_media(state: State<'_, AppState>, path: String) -> Result<(), 
 pub async fn save_media(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let kind = media_kind_of(&path);
     if kind != "file" {
-        return save_to_gallery(state.clone(), path, kind.to_string()).await;
+        // 会话媒体（agent 生成的 media/out/…、文件面板里的图片/视频）不限于 uploads/，
+        // 与 open/share 同一口径按工作区解析后再进相册；uploads/ 限制只属于采集入口
+        // （`save_to_gallery` / `discard_capture`）。
+        let home = state.home.clone();
+        let kind = kind.to_string();
+        return run_blocking("保存到相册", move || {
+            let abs = resolve_media_file(&home, &path)?;
+            save_to_gallery_abs(&home, &abs, &kind)
+        })
+        .await;
     }
     // 主配置虚拟条目：导出 home 根的实体（配置备份到下载目录）。
     let abs = if is_config_virtual(&state.home.join("agent"), &path) {
@@ -5390,34 +5420,45 @@ pub async fn save_to_gallery(
         // 口径只认 uploads/ 下的文件：工作区别处的文件（更不用说根下的 state.sqlite）不经
         // 此入口复制到相册。
         let abs = resolve_upload_path(&home, &rel)?;
-        let abs = abs.to_string_lossy().to_string();
-        #[cfg(target_os = "android")]
-        {
-            let result = rclaw_android::save_to_gallery(&abs, &kind)
-                .map_err(|e| format!("保存到相册失败: {e}"))?;
-            if let Some(reason) = result.strip_prefix("error:") {
-                return Err(reason.to_string());
-            }
-            Ok(result)
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            let _ = kind;
-            // 桌面兜底：拷贝到用户图片目录的 RClaw 子目录。
-            let base = std::env::var("USERPROFILE")
-                .map(|p| std::path::PathBuf::from(p).join("Pictures"))
-                .unwrap_or_else(|_| home.clone());
-            let dir = base.join("RClaw");
-            std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
-            std::fs::copy(
-                &abs,
-                dir.join(std::path::Path::new(&abs).file_name().unwrap_or_default()),
-            )
-            .map_err(|e| format!("保存失败: {e}"))?;
-            Ok("ok".into())
-        }
+        save_to_gallery_abs(&home, &abs, &kind)
     })
     .await
+}
+
+/// 把一个已解析、已校验落在工作区内的媒体文件写入相册（安卓 MediaStore / 桌面
+/// Pictures/RClaw）。调用方负责路径校验（采集入口限 uploads/，会话媒体限工作区）。
+fn save_to_gallery_abs(
+    home: &std::path::Path,
+    abs: &std::path::Path,
+    kind: &str,
+) -> Result<String, String> {
+    let abs = abs.to_string_lossy().to_string();
+    #[cfg(target_os = "android")]
+    {
+        let _ = home;
+        let result = rclaw_android::save_to_gallery(&abs, kind)
+            .map_err(|e| format!("保存到相册失败: {e}"))?;
+        if let Some(reason) = result.strip_prefix("error:") {
+            return Err(reason.to_string());
+        }
+        Ok(result)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = kind;
+        // 桌面兜底：拷贝到用户图片目录的 RClaw 子目录。
+        let base = std::env::var("USERPROFILE")
+            .map(|p| std::path::PathBuf::from(p).join("Pictures"))
+            .unwrap_or_else(|_| home.to_path_buf());
+        let dir = base.join("RClaw");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+        std::fs::copy(
+            &abs,
+            dir.join(std::path::Path::new(&abs).file_name().unwrap_or_default()),
+        )
+        .map_err(|e| format!("保存失败: {e}"))?;
+        Ok("ok".into())
+    }
 }
 
 /// 采集产物路径：在 [`resolve_agent_path`] 之上再要求落在 `uploads/` 内。放弃采集是

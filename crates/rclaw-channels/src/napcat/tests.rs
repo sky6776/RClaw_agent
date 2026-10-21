@@ -1574,14 +1574,20 @@ async fn outbound_file_stops_without_cascade_on_ambiguous_timeout() {
         file.to_string_lossy()
     );
     // 单个附件失败被吞掉（仅告警），整条出站仍返回 Ok。
+    let media_started = std::sync::atomic::AtomicBool::new(false);
     nap.send_outbound(
         &api_tx,
         &pending,
         BusMessage::new(CHANNEL_NAPCAT, "user:123", marker),
+        &media_started,
     )
     .await
     .unwrap();
     drop(api_tx);
+    assert!(
+        media_started.load(std::sync::atomic::Ordering::Relaxed),
+        "带附件的出站进入附件阶段后必须置位进度标记"
+    );
 
     let (actions, notices) = responder.await.unwrap();
     // upload_file_stream ×2（1 个数据块 + is_complete），upload_private_file 只调用一次；

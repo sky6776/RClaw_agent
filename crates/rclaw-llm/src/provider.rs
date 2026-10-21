@@ -149,13 +149,13 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_error_body(resp).await;
             return Err(LlmError::BadStatus {
                 status: status.as_u16(),
                 body: truncate(&text, 500),
             });
         }
-        let bytes = resp.bytes().await?;
+        let bytes = read_body_capped(resp, MAX_RESPONSE_BYTES).await?;
         let outcome = self.protocol.parse_full_response(
             &bytes,
             &self.cfg.dialect,
@@ -198,7 +198,7 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
 
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_error_body(resp).await;
             return Err(LlmError::BadStatus {
                 status: status.as_u16(),
                 body: truncate(&text, 500),
@@ -260,6 +260,14 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
                     saw_termination = true;
                 }
             }
+            // 完整行已全部消费，buf 里只剩「半行」：半行超过上限说明对端在持续推送不含
+            // '\n' 的字节（异常网关 / 忽略 stream:true 吐出超大非 SSE 体），不能让它一直
+            // 累积到 total timeout 到期——Android 低内存进程会先被 OOM killer 杀掉。
+            if buf.len() > MAX_SSE_LINE_BYTES {
+                return Err(LlmError::StreamAborted(format!(
+                    "SSE 单行超过 {MAX_SSE_LINE_BYTES} 字节上限，已中止读取"
+                )));
+            }
         }
 
         // EOF：必须曾收到 [DONE] 或 finish_reason，否则视为异常断开，拒绝持久化。
@@ -273,6 +281,38 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
         let outcome = parser.into_outcome();
         log_final_output(&self.cfg, &call_id, "stream", &outcome);
         Ok(outcome)
+    }
+}
+
+/// 非流式响应体的最大字节数。reqwest 的 `timeout` 只限时间不限大小，端点 / 前置网关异常时
+/// `bytes()` 会把任意大的响应体整个读进内存（带宽 × 300s），Android 上即 OOM 被杀。
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// SSE 流中单行（两个 '\n' 之间）的最大字节数；正常 SSE 事件只有 KB 级。
+const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// 非 2xx 错误体只取前 1 MiB（调用方最终只保留 500 字符）。
+const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
+
+/// 带上限地读取整个响应体；超限立即中止并返回 `BadResponse`。
+async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    let mut stream = resp.bytes_stream();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if out.len().saturating_add(chunk.len()) > max {
+            return Err(LlmError::BadResponse(format!(
+                "响应体超过 {max} 字节上限，已中止读取"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// 读取非 2xx 的错误体（带上限、读失败按空串处理，与旧 `text().unwrap_or_default()` 等价）。
+async fn read_error_body(resp: reqwest::Response) -> String {
+    match read_body_capped(resp, MAX_ERROR_BODY_BYTES).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
     }
 }
 

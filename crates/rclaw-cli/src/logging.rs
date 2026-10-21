@@ -35,7 +35,10 @@ pub fn init_tracing(log: &LogSection, default_dir: &Path) -> Result<()> {
 
     // 控制台与文件都关闭：不装配任何 layer，丢弃所有日志。
     if !(log.console || log.file) {
-        tracing_subscriber::registry().init();
+        // 用 try_init 而非 init：全局订阅者每进程只能设置一次，`init()` 第二次调用会
+        // panic（桌面/APK 装配失败后「改配置再来」会再次走到这里，panic 发生在 tauri
+        // 任务里 → 命令永不返回、前端永久卡在「正在启动」）。已装配过视为成功。
+        let _ = tracing_subscriber::registry().try_init();
         return Ok(());
     }
 
@@ -78,10 +81,15 @@ pub fn init_tracing(log: &LogSection, default_dir: &Path) -> Result<()> {
         None
     };
 
-    tracing_subscriber::registry()
+    // 同上：已存在全局订阅者时 try_init 返回 Err，沿用既有订阅者即可，不能 panic。
+    if tracing_subscriber::registry()
         .with(console_layer)
         .with(file_layer)
-        .init();
+        .try_init()
+        .is_err()
+    {
+        tracing::debug!("tracing 全局订阅者已存在，沿用既有配置");
+    }
     Ok(())
 }
 

@@ -11,8 +11,86 @@ use std::collections::HashMap;
 
 pub struct PdfParser;
 
+/// PDF 对象允许的最大嵌套深度（数组 `[` / 字典 `<<`）。
+/// lopdf 0.34 的 `array()`/`dictionary()` 组合子无深度上限地递归，5000 层嵌套（10 KB 文件）
+/// 就能在 2 MiB 的 worker 线程栈上溢出——栈溢出不是 panic，catch_unwind 拦不住，整个
+/// APK 进程被 SIGSEGV 杀掉，且重试同一文档会再次崩溃。所以在任何 `load_mem` 之前先做
+/// 一次与解析器无关的线性预扫描。
+const MAX_PDF_OBJECT_NESTING: usize = 256;
+
+/// 单个 PDF 允许解析的最大页数：逐页 `extract_text` 会让 lopdf 每次重建整棵页表，O(P²)，
+/// 几 MB 的空白页 PDF 就能塞下 10 万页，把唯一的 KB worker 占住几小时。
+const MAX_PDF_PAGES: usize = 5000;
+
+/// 线性扫描 PDF 字节，估算对象的最大嵌套深度；跳过字面量字符串 `(...)`、注释与
+/// `stream ... endstream` 之间的二进制数据以避免误报。超过上限返回 Err。
+pub(crate) fn check_pdf_nesting_depth(data: &[u8]) -> Result<(), GBrainError> {
+    let mut depth: usize = 0;
+    let mut i = 0usize;
+    let n = data.len();
+    while i < n {
+        match data[i] {
+            b'(' => {
+                // 字面量字符串：处理转义与括号配对，内容不计入嵌套
+                let mut paren = 1usize;
+                i += 1;
+                while i < n && paren > 0 {
+                    match data[i] {
+                        b'\\' => i += 1,
+                        b'(' => paren += 1,
+                        b')' => paren -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'%' => {
+                // 注释直到行尾
+                while i < n && data[i] != b'\n' && data[i] != b'\r' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b'<' if i + 1 < n && data[i + 1] == b'<' => {
+                depth += 1;
+                i += 1;
+            }
+            b'>' if i + 1 < n && data[i + 1] == b'>' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b's' if data[i..].starts_with(b"stream")
+                && (i == 0 || !data[i - 1].is_ascii_alphanumeric()) =>
+            {
+                // 跳过流数据直到 endstream（压缩流里的随机字节会干扰计数）
+                i += "stream".len();
+                match data[i..]
+                    .windows(b"endstream".len())
+                    .position(|w| w == b"endstream")
+                {
+                    Some(off) => i += off + "endstream".len(),
+                    None => break,
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if depth > MAX_PDF_OBJECT_NESTING {
+            return Err(GBrainError::InvalidInput(format!(
+                "PDF 对象嵌套深度超过上限 {MAX_PDF_OBJECT_NESTING}，拒绝解析"
+            )));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// 快速获取 PDF 页数，不解析文本内容
 pub fn count_pdf_pages(data: &[u8]) -> Result<usize, GBrainError> {
+    check_pdf_nesting_depth(data)?;
     let pdf = lopdf::Document::load_mem(data)
         .map_err(|e| GBrainError::FileError(format!("PDF load failed: {}", e)))?;
     Ok(pdf.get_pages().len())
@@ -32,11 +110,17 @@ impl PdfParser {
 
 impl DocumentParser for PdfParser {
     fn parse(&self, data: &[u8]) -> Result<ParsedDocument, GBrainError> {
+        check_pdf_nesting_depth(data)?;
         let pdf = lopdf::Document::load_mem(data)
             .map_err(|e| GBrainError::FileError(format!("PDF load failed: {}", e)))?;
 
         let pages = pdf.get_pages();
         let total_pages = pages.len();
+        if total_pages > MAX_PDF_PAGES {
+            return Err(GBrainError::InvalidInput(format!(
+                "PDF 页数 {total_pages} 超过上限 {MAX_PDF_PAGES}，请拆分文件后重试"
+            )));
+        }
         // get_pages() 返回 BTreeMap<u32, ObjectId>，value 是 PDF 内真实的 page object ID
         let page_ids: Vec<(u32, lopdf::ObjectId)> = pages.into_iter().collect();
 

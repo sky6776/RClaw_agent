@@ -33,7 +33,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const RUNTIME_HEARTBEAT_STALE_AFTER_MS: u64 = 150_000;
 const SKILL_CONFIG_MAX_COUNT: usize = 128;
@@ -586,19 +586,24 @@ pub fn is_healthy() -> bool {
     // 未完成按故障放行给看门狗恢复。
     if ASSEMBLY_IN_FLIGHT.load(Ordering::Relaxed) {
         let started = ASSEMBLY_STARTED_AT_MS.load(Ordering::Relaxed);
-        if started != 0 && unix_time_millis() - started <= ASSEMBLY_GRACE_MS {
+        if started != 0 && unix_time_millis().saturating_sub(started) <= ASSEMBLY_GRACE_MS {
             return true;
         }
     }
     false
 }
 
+/// 心跳 / 装配计时用的单调毫秒计数（进程内起点，恒 ≥ 1，0 保留为「未置位」）。
+/// 不能用墙钟：安卓开机后 NTP 校时、用户改时间都会让 `SystemTime` 跳变，看门狗
+/// 单次探到「心跳过期 / 时间倒退」就直接杀进程重启，一次校时就是一次无故重启。
 fn unix_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    origin
+        .elapsed()
         .as_millis()
-        .min(u64::MAX as u128) as u64
+        .min(u64::MAX as u128 - 1) as u64
+        + 1
 }
 
 fn heartbeat_is_fresh(now_ms: u64, last_ms: u64) -> bool {
@@ -615,7 +620,9 @@ fn from_toml_purging_legacy(toml: &str, files_dir: &Path) -> Result<RClawConfig>
     let (stripped, removed) = rclaw_cli::config::strip_removed_legacy_sections(toml);
     if !removed.is_empty() {
         let path = files_dir.join("rclaw.toml");
-        match std::fs::write(&path, &stripped) {
+        // 原子写：rclaw.toml 是唯一真源（含 API key），启动期被杀进程若落在
+        // `fs::write` 的截断窗口内，整份配置归零。
+        match rclaw_store::atomic_write(&path, stripped.as_bytes()) {
             Ok(()) => log_boot(&format!(
                 "已从 rclaw.toml 物理移除已退役配置节: {}",
                 removed.join(", ")

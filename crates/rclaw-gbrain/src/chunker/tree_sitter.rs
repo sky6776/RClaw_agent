@@ -411,10 +411,16 @@ fn extract_chunks_from_ast(tree: &Tree, code: &str, lang: &str, path: &str) -> V
         None, // parent qualified name
         &mut chunks,
         &mut chunk_idx,
+        0,
     );
 
     chunks
 }
+
+/// AST 递归遍历的最大深度。tree-sitter 本身用堆上栈解析，对 `[[[[...]]]]`、几千项的
+/// 左结合表达式链、超长 `else if` 链都能产出同样深的树；而这里的递归在 2 MiB 的
+/// spawn_blocking 线程栈上几千层即溢出——栈溢出不是 panic，整个进程被 SIGSEGV 杀掉。
+const MAX_AST_DEPTH: usize = 512;
 
 #[allow(clippy::too_many_arguments)]
 fn walk_node(
@@ -429,7 +435,11 @@ fn walk_node(
     parent_qname: Option<&str>,
     chunks: &mut Vec<RawChunk>,
     chunk_idx: &mut usize,
+    depth: usize,
 ) {
+    if depth > MAX_AST_DEPTH {
+        return;
+    }
     let kind = node.kind();
 
     // Check if this is a top-level semantic unit
@@ -478,6 +488,7 @@ fn walk_node(
                 chunks,
                 chunk_idx,
                 child_config,
+                depth + 1,
             );
             return;
         }
@@ -517,6 +528,7 @@ fn walk_node(
             parent_qname,
             chunks,
             chunk_idx,
+            depth + 1,
         );
     }
 }
@@ -538,7 +550,11 @@ fn walk_nested_children(
     chunks: &mut Vec<RawChunk>,
     chunk_idx: &mut usize,
     child_config: &NestedEmitConfig,
+    depth: usize,
 ) {
+    if depth > MAX_AST_DEPTH {
+        return;
+    }
     // Container node types that hold members but are not members themselves
     let container_types: HashSet<&str> = HashSet::from([
         "declaration_list",       // Rust impl/trait body
@@ -569,6 +585,7 @@ fn walk_nested_children(
                 Some(parent_qname),
                 chunks,
                 chunk_idx,
+                depth + 1,
             );
             continue;
         }
@@ -588,6 +605,7 @@ fn walk_nested_children(
                 chunks,
                 chunk_idx,
                 child_config,
+                depth + 1,
             );
             continue;
         }
@@ -609,6 +627,7 @@ fn walk_nested_children(
                 Some(parent_qname),
                 chunks,
                 chunk_idx,
+                depth + 1,
             );
         }
     }
@@ -1354,7 +1373,7 @@ fn extract_ast_edges(
         .collect();
 
     // Collect all call expressions from the AST
-    let calls = collect_call_expressions(tree.root_node(), code);
+    let calls = collect_call_expressions(tree.root_node(), code, 0);
 
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -1405,8 +1424,12 @@ fn extract_ast_edges(
 }
 
 /// Collect all call expressions from the AST, returning (callee_name, line_number).
-fn collect_call_expressions(node: Node, code: &str) -> Vec<(String, usize)> {
+fn collect_call_expressions(node: Node, code: &str, depth: usize) -> Vec<(String, usize)> {
     let mut calls = Vec::new();
+    // 与 walk_node 同理：深树递归会在 worker 线程栈上溢出，超深部分直接放弃
+    if depth > MAX_AST_DEPTH {
+        return calls;
+    }
 
     // Handle call_expression nodes
     if node.kind() == "call_expression" {
@@ -1431,7 +1454,7 @@ fn collect_call_expressions(node: Node, code: &str) -> Vec<(String, usize)> {
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        calls.extend(collect_call_expressions(child, code));
+        calls.extend(collect_call_expressions(child, code, depth + 1));
     }
 
     calls

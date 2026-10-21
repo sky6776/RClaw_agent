@@ -1020,7 +1020,9 @@ impl Config {
             let normalized = normalize_windows_path_basic_strings(&text);
             let (stripped, removed) = strip_removed_legacy_sections(&normalized);
             if !removed.is_empty() {
-                match std::fs::write(&path, &stripped) {
+                // 原子写：截断窗口内被杀会让整份 rclaw.toml（含 API key）归零，
+                // 下次启动按 Config::default() 加载。Android 路径（lib.rs）已同样处理。
+                match rclaw_store::atomic_write(&path, stripped.as_bytes()) {
                     Ok(()) => tracing::info!(
                         keys = %removed.join(", "),
                         path = %path.display(),

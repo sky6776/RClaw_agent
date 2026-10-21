@@ -162,6 +162,7 @@ impl MemoryStore {
 
     /// 整体覆盖写长期记忆（工具 edit 写回后调用）。使用原子写。
     pub fn write_long_term(&self, content: &str) -> Result<()> {
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         crate::fs::atomic_write(&self.layout.memory_file, content.as_bytes())
     }
 
@@ -172,6 +173,10 @@ impl MemoryStore {
     /// `add_entry`/`apply_batch`（已用 `limit_for(Memory)`）保持同一字符预算——
     /// 否则用户配置的 `memory_char_limit` 在该 review 路径下静默失效。
     pub fn append_long_term_entry(&self, note: &str) -> Result<()> {
+        // 必须与 add_entry/replace_entry/remove_entry 共用同一把锁：它们是「读全文→改→
+        // 原子整文件替换」，本函数若在其读与写之间以 append 模式落了一条 bullet，
+        // 随后的整文件 rename 会把这条刚写入的记忆静默抹掉（lost update，双方都返回 Ok）。
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         append_unique_markdown_bullet(
             &self.layout.memory_file,
             "# Memory\n",
@@ -209,7 +214,7 @@ impl MemoryStore {
         }
         let (header, mut entries) = parse_entries(&raw);
         let header = normalize_header(header, target);
-        let content = validate_auto_note(content)?;
+        let content = validate_bullet_entry(content)?;
         if entries.iter().any(|e| e == &content) {
             return Ok(MemOpResult {
                 changed: 0,
@@ -237,7 +242,7 @@ impl MemoryStore {
         old_substr: &str,
         new_content: &str,
     ) -> Result<MemOpResult> {
-        let new_content = validate_auto_note(new_content)?; // 提前校验，闭包内只赋值
+        let new_content = validate_bullet_entry(new_content)?; // 提前校验，闭包内只赋值
         self.mutate_entry(target, old_substr, |entries, idx| {
             entries[idx] = new_content.clone();
             Ok(())
@@ -272,7 +277,7 @@ impl MemoryStore {
             let act = op.action.trim().to_string();
             let content = match act.as_str() {
                 "add" | "replace" => Some(
-                    validate_auto_note(op.content.as_deref().unwrap_or(""))
+                    validate_bullet_entry(op.content.as_deref().unwrap_or(""))
                         .map_err(|e| StoreError::Other(format!("Operation {}: {e}", i + 1)))?,
                 ),
                 _ => None,
@@ -568,12 +573,25 @@ fn append_unique_markdown_bullet(
     note: &str,
     max_total_chars: usize,
 ) -> Result<()> {
-    let note = validate_auto_note(note)?;
+    let note = validate_bullet_entry(note)?;
     if existing_bullet_contains(path, &note)? {
         return Ok(());
     }
     ensure_file_with_room(path, &note, max_total_chars, true)?;
     append_markdown_bullet(path, header, &note)
+}
+
+/// bullet 条目（MEMORY.md / USER.md）必须是单行：内容里的换行会把它写成「bullet 行 +
+/// 非 bullet 行」，之后每次结构化读写都被 [`detect_drift`] 判为外部篡改而拒绝，文件
+/// 事实上被锁死。这里先把换行折叠成单个空格，再走常规校验。daily 段落不受此限制。
+fn validate_bullet_entry(note: &str) -> Result<String> {
+    let single_line = note
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    validate_auto_note(&single_line)
 }
 
 fn validate_auto_note(note: &str) -> Result<String> {

@@ -50,6 +50,11 @@ pub(super) async fn persist_and_push_user(
 
 /// 排空接收端，收集未处理消息（供上层保留原始 [`MessageSource`] 重新路由）。
 pub(super) fn drain_leftovers(event_rx: &mut mpsc::Receiver<Interjection>) -> Vec<BusMessage> {
+    // 先关闭接收端再排空：否则「最后一次 try_recv 返回 Empty」到「event_rx 随函数返回被
+    // drop」之间，路由层对同一 TurnKey 的 try_send 仍会成功，这条消息只存在于通道缓冲，
+    // 随 Receiver 一起被丢弃（用户输入静默丢失）。close() 后 try_send 立即返回 Closed，
+    // 路由层既有的「移除僵尸条目后重试」路径会把它重新 spawn_turn；已缓冲的消息仍可排空。
+    event_rx.close();
     let mut leftovers = Vec::new();
     while let Ok(Interjection::AppendMessage(msg)) = event_rx.try_recv() {
         leftovers.push(msg);

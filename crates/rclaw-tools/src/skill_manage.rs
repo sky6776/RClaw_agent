@@ -588,6 +588,19 @@ impl SkillManageTool {
             Ok(s) => s,
             Err(e) => return ToolResult::err(e),
         };
+        // 先按「命中数 × new_string」估算替换后的大小再做 replace：大小校验原本在
+        // String::replace 之后，replace_all + 极短 old_string（如单个空格）+ 几十 KB 的
+        // new_string 会先分配出 GB 级字符串（分配失败即 abort，Android 直接被杀）才被拒。
+        let replacements = if replace_all { count } else { 1 };
+        let projected = original.len().saturating_add(
+            replacements.saturating_mul(new_string.len().saturating_sub(old_string.len())),
+        );
+        if projected > MAX_SKILL_CONTENT_CHARS.max(MAX_SKILL_FILE_BYTES) * 4 {
+            return ToolResult::err(format!(
+                "patch would expand the file to ~{projected} bytes ({replacements} replacement(s)); \
+                 exceeds the skill content limit. Narrow old_string or shorten new_string."
+            ));
+        }
         let updated = if replace_all {
             original.replace(old_string, new_string.as_str())
         } else {

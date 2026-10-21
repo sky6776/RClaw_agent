@@ -10,7 +10,7 @@
 //! 多个 stdio server 完全并发互不阻塞。
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -151,10 +151,25 @@ impl StdioTransport {
             }
         };
 
+        // 单行上限：server 往 stdout 写一条极长的无换行数据（超大结果、调试输出、二进制噪声）
+        // 时 `read_until` 会把整行无上限地攒进内存，Android 上一次 OOM 即整进程被杀。
+        // 用 `take(MAX+1)` 限定单次读取量；超限按协议违规处理：跳出循环 → 置失效 +
+        // 唤醒全部等待方（与 stdout 关闭同一收尾路径）。
+        const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
         loop {
             buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
+            match (&mut reader)
+                .take(MAX_LINE_BYTES + 1)
+                .read_until(b'\n', &mut buf)
+            {
                 Ok(0) => break,
+                Ok(_) if buf.len() as u64 > MAX_LINE_BYTES => {
+                    error!(
+                        server = %server_name,
+                        "MCP: stdout 单行超过 {MAX_LINE_BYTES} 字节上限，连接标记为失效"
+                    );
+                    break;
+                }
                 Ok(_) => {
                     let line = String::from_utf8_lossy(&buf).trim().to_string();
                     if line.is_empty() {
@@ -190,8 +205,23 @@ impl StdioTransport {
 
     /// 同步关闭：关 stdin（发 EOF）→ 宽限等待 → 强杀。供 `McpClient::drop` 调用。
     pub fn close_sync(&self) {
-        if let Ok(mut g) = self.stdin.lock() {
-            *g = None; // 丢弃 ChildStdin → 关闭管道，server 读到 EOF。
+        // 用 try_lock：若 send_raw 的阻塞写线程正卡在写满的管道上（server 不读 stdin），
+        // 它会一直持有这把锁，这里 lock() 会把关闭方（含 runtime 线程上的 drop）一起挂死。
+        // 拿不到锁就跳过优雅 EOF，直接走下面的 kill——子进程一死管道断开，卡住的写线程
+        // 会以 broken pipe 出错返回并释放锁。
+        match self.stdin.try_lock() {
+            Ok(mut g) => {
+                *g = None; // 丢弃 ChildStdin → 关闭管道，server 读到 EOF。
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                *p.into_inner() = None;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                warn!(
+                    server = %self.name,
+                    "MCP stdin 仍被阻塞写入占用，跳过优雅关闭直接终止子进程"
+                );
+            }
         }
         if let Ok(mut child) = self.child.lock() {
             let deadline = Instant::now() + SHUTDOWN_GRACE;

@@ -5,9 +5,9 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 
 use super::types::{
-    normalize_api_key, normalize_base_url, safe_endpoint_label, validate_public_http_url,
-    BackendError, BackendErrorKind, BackendId, SearchBackend, SearchHit, SearchRequest,
-    SearchResponse,
+    normalize_api_key, normalize_base_url, read_response_capped, safe_endpoint_label,
+    validate_public_http_url, BackendError, BackendErrorKind, BackendId, SearchBackend,
+    SearchHit, SearchRequest, SearchResponse,
 };
 
 const DEFAULT_CUSTOM_URL: &str = "https://open.feedcoopapi.com/search_api/web_search";
@@ -114,23 +114,17 @@ impl DoubaoBackend {
             .await
             .map_err(|error| BackendError::transient(format!("请求失败: {error}")))?;
         let status = response.status();
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(BackendError::permanent(format!(
-                "响应超过 {MAX_RESPONSE_BYTES} 字节"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| BackendError::transient(format!("读取响应失败: {error}")))?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(BackendError::permanent(format!(
-                "响应超过 {MAX_RESPONSE_BYTES} 字节"
-            )));
-        }
+        let bytes = match read_response_capped(response, MAX_RESPONSE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(None) => {
+                return Err(BackendError::permanent(format!(
+                    "响应超过 {MAX_RESPONSE_BYTES} 字节"
+                )))
+            }
+            Err(Some(error)) => {
+                return Err(BackendError::transient(format!("读取响应失败: {error}")))
+            }
+        };
         if !status.is_success() {
             // 仅在出错时才把响应体转成文本：成功路径直接 from_slice 解析 JSON，
             // 避免每次成功调用都为（可达 8MB 的）响应体分配一份 lossy String。

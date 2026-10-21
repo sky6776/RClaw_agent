@@ -236,7 +236,29 @@ impl Core {
             .map_err(|e| McpError::Tool(format!("MCP[{}]: 序列化请求失败: {e}", self.name)))?;
         debug!(server = %self.name, id, method, "MCP → 请求");
         let transport = self.transport().await?;
-        if let Err(e) = transport.send_raw(&line).await {
+        // 发送同样受调用超时约束：stdio 的 write_all 在 server 不读 stdin（管道写满）时会
+        // 无限阻塞，仅靠「等响应」的超时救不回来——调用方会永久挂起。
+        let sent = match timeout(self.call_timeout, transport.send_raw(&line)).await {
+            Ok(r) => r,
+            Err(_) => {
+                // 发送超时 ≠ 连接已死：http 传输的 send_raw 包含「等 server 执行完并读回
+                // 响应」，tools/call 跑得慢就会走到这里。若据此 mark_dead，provider 会重建
+                // 连接再发一次同样的 tools/call，而首次仍在 server 上执行——非幂等工具被执行
+                // 两次。与下方「等响应超时」同口径：撤销 pending、尽力通知取消、保留连接。
+                if let Ok(mut map) = self.pending.lock() {
+                    map.remove(&id);
+                }
+                if method != "initialize" {
+                    let _ = self.notify_cancelled(id).await;
+                }
+                return Err(McpError::Tool(format!(
+                    "MCP[{}]: 发送 '{method}' 超时（{}s）",
+                    self.name,
+                    self.call_timeout.as_secs()
+                )));
+            }
+        };
+        if let Err(e) = sent {
             if let Ok(mut map) = self.pending.lock() {
                 map.remove(&id);
             }
@@ -278,7 +300,9 @@ impl Core {
         });
         if let Ok(line) = serde_json::to_string(&notif) {
             if let Ok(t) = self.transport().await {
-                let _ = t.send_raw(&line).await;
+                // 走到这里 server 多半已无响应，写入可能同样卡住：短超时兜底，不让
+                // 「取消通知」本身把超时返回再拖住。
+                let _ = timeout(Duration::from_secs(5), t.send_raw(&line)).await;
             }
         }
     }

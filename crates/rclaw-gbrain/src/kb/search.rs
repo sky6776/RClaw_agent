@@ -1035,8 +1035,12 @@ pub async fn rewrite_query_with_context(
     );
 
     // 复用全局 HTTP 客户端，避免每次查询改写都创建新连接池
+    // 带超时：下面的 5s timeout 只包住 send()，读 body 仍需 client 自身总超时兜底，
+    // 否则 rewrite_base_url 可由请求指定的不可信端点返回 200 头后停发即可挂死 kb_query。
     static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = HTTP_CLIENT.get_or_init(reqwest::Client::new);
+    let client = HTTP_CLIENT.get_or_init(|| {
+        crate::llm::http_client_with_timeout(std::time::Duration::from_secs(10))
+    });
     let url = format!("{}/chat/completions", base_url);
 
     let mut body = serde_json::json!({

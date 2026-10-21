@@ -37,6 +37,10 @@ const MAX_SCRIPT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 7_200_000;
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// 子进程退出后等待两条输出读取任务收尾的宽限（与 `shell` 前台路径同一考虑）：读取任务与
+/// 子进程并发排空管道，退出时至多只剩管道缓冲区那点尾巴；但若管道被脚本派生的后台孙进程
+/// 继承（起本地服务的 skill 很常见），EOF 永远不来——按剩余超时额度等就是最长 2 小时的空等。
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // PythonScriptExecutor：宿主无关的 Python 脚本执行面（Android 移植阶段 2.1）
@@ -1243,8 +1247,9 @@ impl SkillEntrypointTool {
                 format!("专用工具执行超时（{} ms）: {}", self.timeout_ms, self.name)
             }
             ScriptFailure::OutputCollectTimeout => format!(
-                "专用工具输出收集超时（{} ms）: {}",
-                self.timeout_ms, self.name
+                "专用工具已退出但输出收集超时（输出管道可能被其派生的后台进程占用；\
+                 需要长驻进程请改用 shell(background=true)）: {}",
+                self.name
             ),
             ScriptFailure::OutputCollect { stream, error } => {
                 format!("专用工具 {stream} 收集失败: {error}")
@@ -1336,7 +1341,10 @@ async fn spawn_and_collect(spec: ProcessSpawnSpec<'_>) -> Result<ScriptOutcome, 
             return Err(ScriptFailure::Timeout);
         }
     };
-    let remaining = spec.timeout.saturating_sub(started_at.elapsed());
+    let remaining = spec
+        .timeout
+        .saturating_sub(started_at.elapsed())
+        .min(OUTPUT_DRAIN_GRACE);
     let collected = timeout(remaining, async {
         let (stdout, stderr) = tokio::join!(stdout_task.join(), stderr_task.join());
         (collect_output(stdout), collect_output(stderr))

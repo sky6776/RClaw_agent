@@ -802,6 +802,24 @@ fn resolve_library_name_conflict(conn: &Connection, desired_name: &str) -> Resul
     Ok(format!("{} (import)", desired_name))
 }
 
+/// 校验归档内的相对路径：只接受由普通组件构成的相对路径（无根、无盘符、无 `.`/`..`），
+/// 返回规范化后的 PathBuf；否则返回 None。
+fn safe_archive_relative(raw: &str) -> Option<std::path::PathBuf> {
+    if raw.is_empty() || raw.contains('\0') {
+        return None;
+    }
+    // 统一把反斜杠视为分隔符，避免在 Unix 上 `..\\x` 被当成单个普通文件名绕过检查
+    let normalized = raw.replace('\\', "/");
+    let mut out = std::path::PathBuf::new();
+    for comp in Path::new(&normalized).components() {
+        match comp {
+            std::path::Component::Normal(seg) => out.push(seg),
+            _ => return None,
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
 fn import_documents(
     conn: &Connection,
     archive_dir: &Path,
@@ -827,47 +845,70 @@ fn import_documents(
         // 源文件不在受控 storage root 内时，保留 original_path，但 storage_path 不指向旧机器路径。
         let old_storage_path = json_str(doc, "storage_path");
         let archive_file_path = json_str(doc, "archive_file_path");
+        // 归档内容不可信：archive_file_path / storage_path 来自 documents.json。
+        // 相对路径只允许普通组件（拒绝绝对路径与 `..`，否则 `Path::join` 遇绝对路径会整体
+        // 替换，可把任意文件、甚至正在使用的主库 `fs::copy` 截断为自身）；
+        // 复制失败时按注释约定不再把旧机器的 storage_path 原样入库（delete_document 会对
+        // source_type=upload 的 storage_path 执行 remove_file），只有仍位于目标 storage root
+        // 内的路径才保留。
+        let retained_old_path = |storage_root: &Path| -> String {
+            if Path::new(&old_storage_path).starts_with(storage_root) {
+                old_storage_path.clone()
+            } else {
+                String::new()
+            }
+        };
         let new_storage_path = if !old_storage_path.is_empty() {
             if let Some(storage_root) = target_storage_dir {
                 // 优先使用 archive_file_path（跨平台兼容）
                 if !archive_file_path.is_empty() {
-                    let archive_file = archive_dir.join("files").join(&archive_file_path);
+                    let Some(relative) = safe_archive_relative(&archive_file_path) else {
+                        return Err(GBrainError::InvalidInput(format!(
+                            "归档中的 archive_file_path 非法: {}",
+                            archive_file_path
+                        )));
+                    };
+                    let archive_file = archive_dir.join("files").join(&relative);
                     if archive_file.exists() {
-                        let dest = storage_root.join(&archive_file_path);
+                        let dest = storage_root.join(&relative);
                         if let Some(parent) = dest.parent() {
                             std::fs::create_dir_all(parent).ok();
                         }
                         if std::fs::copy(&archive_file, &dest).is_ok() {
                             dest.to_string_lossy().to_string()
                         } else {
-                            // 复制失败，保留旧路径
-                            old_storage_path.clone()
+                            // 复制失败，仅保留仍在 storage root 内的旧路径
+                            retained_old_path(storage_root)
                         }
                     } else {
-                        // archive 中没有此文件，保留旧路径
-                        old_storage_path.clone()
+                        // archive 中没有此文件，仅保留仍在 storage root 内的旧路径
+                        retained_old_path(storage_root)
                     }
                 } else {
                     // 回退：兼容旧版导出（无 archive_file_path），尝试从旧路径推断
                     let old_path = std::path::Path::new(&old_storage_path);
-                    if let Ok(relative) = old_path.strip_prefix("/") {
-                        let archive_file = archive_dir.join("files").join(relative);
+                    if let Some(relative) = old_path
+                        .strip_prefix("/")
+                        .ok()
+                        .and_then(|r| safe_archive_relative(&r.to_string_lossy()))
+                    {
+                        let archive_file = archive_dir.join("files").join(&relative);
                         if archive_file.exists() {
-                            let dest = storage_root.join(relative);
+                            let dest = storage_root.join(&relative);
                             if let Some(parent) = dest.parent() {
                                 std::fs::create_dir_all(parent).ok();
                             }
                             if std::fs::copy(&archive_file, &dest).is_ok() {
                                 dest.to_string_lossy().to_string()
                             } else {
-                                old_storage_path.clone()
+                                retained_old_path(storage_root)
                             }
                         } else {
-                            old_storage_path.clone()
+                            retained_old_path(storage_root)
                         }
                     } else {
-                        // 无法提取相对路径，保留旧路径
-                        old_storage_path.clone()
+                        // 无法提取安全的相对路径
+                        retained_old_path(storage_root)
                     }
                 }
             } else {

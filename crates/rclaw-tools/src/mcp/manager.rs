@@ -181,7 +181,13 @@ impl McpManager {
                 continue;
             }
             if let Err(e) = self.client_for(&server_name).await {
-                warn!(server = %server_name, error = %e, "自动启动 MCP 服务器失败");
+                // 启动期错误可能内嵌 reqwest 错误（Display 含完整 URL，query 里可带 token），
+                // 与 provider.rs 的执行期日志同样先脱敏。
+                warn!(
+                    server = %server_name,
+                    error = %rclaw_store::redact_sensitive_text(&e.to_string()),
+                    "自动启动 MCP 服务器失败"
+                );
             }
         }
     }
@@ -254,7 +260,13 @@ impl McpManager {
                 let url = server_cfg.url.as_deref().ok_or_else(|| {
                     McpError::Config(format!("MCP '{server_name}' 缺少 url（http）"))
                 })?;
-                info!(server = %server_name, transport = "http", url = %url, "启动 MCP 服务器");
+                // URL 的 query 里常带 token / key，日志（可经 /log get 外发）只记脱敏后的。
+                info!(
+                    server = %server_name,
+                    transport = "http",
+                    url = %rclaw_store::redact_sensitive_text(url),
+                    "启动 MCP 服务器"
+                );
                 Arc::new(
                     McpClient::start_http(
                         server_name,
@@ -300,7 +312,11 @@ impl McpManager {
             let client = match self.client_for(server_name).await {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!(server = %server_name, error = %e, "跳过不可用的 MCP 服务器");
+                    warn!(
+                        server = %server_name,
+                        error = %rclaw_store::redact_sensitive_text(&e.to_string()),
+                        "跳过不可用的 MCP 服务器"
+                    );
                     continue;
                 }
             };

@@ -26,6 +26,10 @@ use crate::{Tool, ToolResult};
 pub(crate) const MAX_BACKGROUND_JOBS: usize = 64;
 /// 单个后台任务输出文件的落盘上限；达到后停止写入并留标记（读取端可见）。
 pub(crate) const MAX_JOB_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// 磁盘上保留的后台任务日志文件数上限（含先前进程遗留的）。单个日志可达
+/// [`MAX_JOB_OUTPUT_BYTES`] 且此前永不删除，长期使用会把工作区磁盘吃光（手机尤甚）；
+/// 新任务启动时按修改时间淘汰最旧的、且不在当前进程表里的日志。
+pub(crate) const MAX_RETAINED_JOB_LOGS: usize = 128;
 /// `shell_poll` 默认的头/尾保留字节数（每侧）。
 const DEFAULT_POLL_BYTES: u64 = 16_384;
 /// `shell_poll` 每侧头/尾保留的最大字节数。
@@ -138,10 +142,59 @@ impl ShellJobTable {
         Some(job)
     }
 
+    /// 当前进程表里全部任务的输出文件名（运行中与尚未被终态轮询收回的）。
+    fn tracked_log_names(&self) -> std::collections::HashSet<std::ffi::OsString> {
+        self.state
+            .lock()
+            .expect("shell job table 未被毒化")
+            .map
+            .values()
+            .filter_map(|job| job.output_path.file_name().map(ToOwned::to_owned))
+            .collect()
+    }
+
     /// 测试可见性包装：暴露容量检查（驱逐 + 满表拒绝）。
     #[cfg(test)]
     fn ensure_capacity_for_test(&self) -> Result<(), String> {
         self.ensure_capacity()
+    }
+}
+
+/// 淘汰最旧的后台任务日志，使 `jobs_dir` 下的日志总数不超过 [`MAX_RETAINED_JOB_LOGS`]
+/// （为即将创建的新日志留一个位置）。只认本模块命名格式的 `job-*.log`，进程表里任务的
+/// 日志绝不删除；任何 IO 失败都只是放弃本次清理。
+fn prune_job_logs(table: &ShellJobTable, jobs_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(jobs_dir) else {
+        return;
+    };
+    let tracked = table.tracked_log_names();
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let stem = name.to_str()?.strip_suffix(".log")?;
+            if !is_valid_job_id(stem) || tracked.contains(&name) {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            Some((metadata.modified().ok()?, entry.path()))
+        })
+        .collect();
+    let budget = MAX_RETAINED_JOB_LOGS
+        .saturating_sub(1)
+        .saturating_sub(tracked.len());
+    if candidates.len() <= budget {
+        return;
+    }
+    candidates.sort();
+    let excess = candidates.len() - budget;
+    for (_, path) in candidates.into_iter().take(excess) {
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::debug!("清理后台任务日志 {} 失败: {error}", path.display());
+        }
     }
 }
 
@@ -210,6 +263,7 @@ pub(crate) fn spawn_background_job(
     mut cmd: tokio::process::Command,
 ) -> Result<BackgroundSpawn, String> {
     table.ensure_capacity()?;
+    prune_job_logs(table, jobs_dir);
     let seq = table.counter.fetch_add(1, Ordering::Relaxed);
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -518,6 +572,57 @@ mod tests {
             t.peek("done-new").is_none(),
             "应跳过运行中的任务、驱逐已结束者"
         );
+    }
+
+    #[test]
+    fn prune_job_logs_removes_oldest_untracked_and_keeps_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = ShellJobTable::new();
+        // 进程表里的任务日志（即便最旧）绝不删除。
+        let tracked_path = dir.path().join("job-0-tracked.log");
+        std::fs::write(&tracked_path, "tracked").unwrap();
+        t.insert(
+            "job-0-tracked".into(),
+            ShellJob {
+                command: "echo".into(),
+                output_path: tracked_path.clone(),
+                readers: Vec::new(),
+                exit: Arc::new(StdMutex::new(JobExit::Code(0))),
+            },
+        );
+        // 非本模块命名格式的文件不碰。
+        let foreign = dir.path().join("notes.log");
+        std::fs::write(&foreign, "keep").unwrap();
+        // 超出上限的旧日志：按修改时间从旧到新编号。
+        let base = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut names = Vec::new();
+        for i in 0..MAX_RETAINED_JOB_LOGS + 3 {
+            let path = dir.path().join(format!("job-{i}-x.log"));
+            std::fs::write(&path, "x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(base + Duration::from_secs(i as u64))
+                .unwrap();
+            names.push(path);
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&tracked_path)
+            .unwrap()
+            .set_modified(base)
+            .unwrap();
+
+        prune_job_logs(&t, dir.path());
+
+        assert!(tracked_path.exists(), "进程表里的任务日志不得被删除");
+        assert!(foreign.exists(), "非 job-*.log 文件不得被删除");
+        let remaining: Vec<&PathBuf> = names.iter().filter(|p| p.exists()).collect();
+        // 预算 = 上限 - 新日志的 1 个位置 - 进程表里的 1 个。
+        assert_eq!(remaining.len(), MAX_RETAINED_JOB_LOGS - 2);
+        assert!(!names[0].exists(), "最旧的日志应最先淘汰");
+        assert!(names.last().unwrap().exists(), "最新的日志应保留");
     }
 
     #[test]

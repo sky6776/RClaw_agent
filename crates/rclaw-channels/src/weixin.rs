@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures::StreamExt;
 use md5::Digest;
 use rand::Rng;
 use serde_json::{json, Value};
@@ -42,6 +43,8 @@ use crate::{Channel, OutboundReceiver};
 
 /// `base_info.channel_version`（业务 POST body 的协议版本字段）。
 const CHANNEL_VERSION: &str = "0.1.0";
+/// 入站 CDN 媒体单文件上限（密文全量驻留内存解密，超出直接跳过）。
+const CDN_DOWNLOAD_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// 微信通道配置。
 #[derive(Debug, Clone)]
@@ -360,7 +363,8 @@ impl Weixin {
             .as_deref()
             .and_then(decode_hex_key)
             .or_else(|| m.aes_key_field.as_deref().and_then(decode_media_aes_key))?;
-        let plaintext = aes_ecb_decrypt(&ciphertext, &key)?;
+        // 按值交给解密原地处理：避免密文 + 明文两份 256MB 同时驻留内存。
+        let plaintext = aes_ecb_decrypt_in_place(ciphertext, &key)?;
         // 落盘：`media_dir/weixin/<rand>_<safename>`。
         let dir = self.cfg.media_dir.join("weixin");
         if std::fs::create_dir_all(&dir).is_err() {
@@ -393,8 +397,26 @@ impl Weixin {
             tracing::warn!("微信 CDN download HTTP {}", resp.status());
             return None;
         }
-        let bytes = resp.bytes().await.ok()?;
-        Some(bytes.to_vec())
+        // 密文整段驻留内存（ECB 解密需要全量），必须限大小：任意联系人发来的大文件
+        // 没有上限就能把进程（安卓尤甚）直接打到 OOM。先看 Content-Length，再按实际字节兜底。
+        if let Some(len) = resp
+            .content_length()
+            .filter(|len| *len > CDN_DOWNLOAD_MAX_BYTES)
+        {
+            tracing::warn!("微信 CDN 媒体 {len} 字节超过上限 {CDN_DOWNLOAD_MAX_BYTES}，跳过");
+            return None;
+        }
+        let mut stream = resp.bytes_stream();
+        let mut out: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.ok()?;
+            if (out.len() as u64).saturating_add(chunk.len() as u64) > CDN_DOWNLOAD_MAX_BYTES {
+                tracing::warn!("微信 CDN 媒体超过上限 {CDN_DOWNLOAD_MAX_BYTES} 字节，已中止下载");
+                return None;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Some(out)
     }
 
     /// 发送一条文本回复（自动分段），每分片内有限重试。

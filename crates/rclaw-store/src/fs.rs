@@ -261,8 +261,14 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     //    每次 nonce 不同，并发写互不抢名；即便上次崩溃残留了某个 .tmp sidecar，
     //    本次也不会去碰它（残留无害，仅占少量磁盘）。
     let tmp = tmp_path_for(path);
+    // 任一错误路径离开本函数时删除 tmp：否则 ENOSPC 下每次失败都留下一个带部分数据的
+    // 孤儿 sidecar，cron / memory 等周期性写入会反复失败、反复残留，磁盘越写越满，
+    // 永远恢复不了。两处 rename 成功后解除守卫（tmp 已不在）。守卫在 create_new 成功之后
+    // 才武装：open 以 AlreadyExists 失败时该文件属于别的写入方，不能替它删。
+    let mut tmp_guard = TmpGuard { path: &tmp, armed: false };
     {
         let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        tmp_guard.armed = true;
         f.write_all(data)?;
         // 传播 fsync 错误：ENOSPC/EIO 时让整轮失败，而非谎报成功。
         f.sync_all()?;
@@ -271,6 +277,7 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     // 2) 主路径：直接 rename。Unix 与现代 Windows（MOVEFILE_REPLACE_EXISTING）都是
     //    崩溃安全的原子替换；目标不存在时同样成功。
     if fs::rename(&tmp, path).is_ok() {
+        tmp_guard.armed = false;
         // 主路径成功：顺带清理可能残留的旧 sidecar 备份（无残留时 remove_file 返回 Err，忽略）。
         let _ = fs::remove_file(&backup);
         // P3：rename 与备份 remove 改的是父目录项，sync 临时文件内容并不保证它们落盘——
@@ -286,13 +293,12 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     // P1 修复：进入兜底路径前，先用 symlink_metadata 检查目标是否为目录。
     // 若 write 工具错误地以目录路径（如 agent/memory）为目标，旧代码会在下面的
     // rename(path, backup) 里把整个目录挪成 .bak 隐藏备份，然后用普通文件占掉路径，
-    // 破坏 agent 目录结构。这里提前拒绝目录并清理 tmp sidecar（指向目录的链接已在写
+    // 破坏 agent 目录结构。这里提前拒绝目录（tmp sidecar 由守卫清理；指向目录的链接已在写
     // tmp 之前拒绝；指向文件的链接按条目覆盖——链接本身被换成普通文件，目标不动）。
     let had_target = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
             // 目标是个目录 —— 这是工具层写入了错误路径（如写到目录名而非目录内文件）。
-            // 拒绝覆盖，保留目录结构完整。清理本次创建的 tmp sidecar。
-            let _ = fs::remove_file(&tmp);
+            // 拒绝覆盖，保留目录结构完整。
             return Err(crate::StoreError::Other(format!(
                 "atomic_write 拒绝覆盖目录（目标为目录，请检查路径是否为文件）: {}",
                 path.display()
@@ -300,10 +306,7 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
         }
         Ok(_meta) => true, // 普通文件/硬链接 → 可以安全覆盖。
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false, // 目标不存在 → 新文件。
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            return Err(crate::StoreError::Io(e));
-        }
+        Err(e) => return Err(crate::StoreError::Io(e)),
     };
     if had_target {
         // 目标 → sidecar 备份。
@@ -314,9 +317,10 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
         if had_target {
             let _ = fs::rename(&backup, path);
         }
-        // 临时 sidecar 未能就位：残留为孤儿（.tmp，nonce 命名），下次写不会冲突，留待清理。
+        // 临时 sidecar 未能就位，由守卫删除。
         return Err(crate::StoreError::Io(e));
     }
+    tmp_guard.armed = false;
     // 4) 新文件已落地，删除 sidecar 备份（失败不影响最终结果）。
     if had_target {
         let _ = fs::remove_file(&backup);
@@ -324,6 +328,20 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     // P3：兜底路径多次改写父目录项（备份 rename + tmp rename + 备份删除），同样同步父目录收口。
     sync_parent_dir(path);
     Ok(())
+}
+
+/// [`atomic_write`] 的 tmp sidecar 守卫：`armed` 时离开作用域即删除（错误路径兜底）。
+struct TmpGuard<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+impl Drop for TmpGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(self.path);
+        }
+    }
 }
 
 /// 计算目标的 sidecar 备份路径：`<dir>/.<完整文件名>.bak`。

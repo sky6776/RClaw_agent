@@ -67,8 +67,19 @@ impl Embedder {
             dimensions = dimensions,
             "Creating embedding client"
         );
+        // 必须带超时：默认 client 无总超时 / 连接超时，安卓 WiFi↔蜂窝切换、NAT 老化产生的
+        // 半开连接会让 `send().await` 永不返回——调用方多是 `block_on`（搜索线程、唯一的
+        // KB worker、autopilot），一次黑洞就把整条线程永久挂死，重试逻辑对此无效。
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|e| {
+                warn!("embedding HTTP client 构建失败，使用默认配置: {}", e);
+                reqwest::Client::new()
+            });
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             model: model.to_string(),
@@ -330,12 +341,15 @@ impl Embedder {
                         && attempt <= backoff_opts.max_retries
                     {
                         // Parse Retry-After header
+                        // Retry-After 是不可信输入：不封顶会按服务端说的睡上几年（u64 乘法
+                        // 还可能溢出），把 block_on 的调用线程 / KB worker 一起带走。
                         let retry_after_ms = headers
                             .get("retry-after")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| v.parse::<u64>().ok())
-                            .map(|s| s * 1000)
-                            .unwrap_or(0);
+                            .map(|s| s.saturating_mul(1000))
+                            .unwrap_or(0)
+                            .min(backoff_opts.max_ms);
 
                         let calculated_ms = backoff_delay_ms(attempt, &backoff_opts);
                         let wait_ms = retry_after_ms.max(calculated_ms);
@@ -394,10 +408,12 @@ pub fn truncate_at_word_boundary(text: &str, max_chars: usize) -> &str {
         return text;
     }
     let limit = text.floor_char_boundary(max_chars);
-    if let Some(space_pos) = text[..limit].rfind(' ') {
-        &text[..space_pos]
-    } else {
-        &text[..limit]
+    // 只有空格离上限足够近才回退到空格：中文正文几乎没有 ASCII 空格，但标题 / 条款里常有
+    //（"## 第一章 概述"），无条件回退会把整段静默截成开头几个字，向量照样入库、检索却
+    // 命中不了正文。空格太靠前就直接在字符边界硬截。
+    match text[..limit].rfind(' ') {
+        Some(space_pos) if space_pos >= limit / 4 * 3 => &text[..space_pos],
+        _ => &text[..limit],
     }
 }
 

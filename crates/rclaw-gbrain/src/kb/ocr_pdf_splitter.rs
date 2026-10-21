@@ -67,6 +67,7 @@ fn generate_split_bytes(
     source_start_page: i32,
     source_end_page: i32,
 ) -> Result<(Vec<u8>, i32)> {
+    crate::kb::parser::pdf::check_pdf_nesting_depth(source_pdf)?;
     let mut doc = lopdf::Document::load_mem(source_pdf)
         .map_err(|e| GBrainError::FileError(format!("PDF 加载失败: {}", e)))?;
 

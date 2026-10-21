@@ -52,7 +52,21 @@ const MAX_COMPILE_RECURSION: usize = MAX_TYPE_DEPTH * 4;
 /// 解析本身再放到大栈专用线程（[`PARSE_STACK_BYTES`]）上，两道一起把递归深度钉死。
 /// 正常脚本的嵌套远低于此（几层到十几层）。
 const MAX_NESTING_DEPTH: usize = 256;
+/// 不经遮蔽的原文深度硬上限。遮蔽是启发式（模板串连同 `${}` 整段按字符串、`/\/*/` 这类
+/// 正则会被当成注释起点），被绕过就是 oxc 栈溢出 abort；原文计数无法绕过——要让解析器
+/// 真的嵌套 N 层，原文里某一点之前就必须有 N 个未闭合的开括号。正常脚本在字符串 / 注释
+/// 里也凑不出上千个不配对的开括号。泛型 `<` 不能靠 `;` 清零（字符串字面量类型里可合法
+/// 出现 `;`），取 4 倍上限只防失控。
+const MAX_RAW_NESTING_DEPTH: usize = 1024;
 /// oxc 解析 + AST 遍历专用线程的栈大小（虚拟地址预留，按需提交物理页）。
+///
+/// 预检只能卡括号 / 泛型；一元前缀链（`!!!!…x`）、赋值链、箭头链、三元链等同样逐层
+/// 递归且无法靠词法预检穷举。脚本上限（workflow 的 `MAX_SCRIPT_CHARS`）10 万字符，
+/// 栈按每字符 5 KiB 预留才能保证任何形态的脚本都不会把解析线程溢出（溢出是 abort，
+/// 整个进程退出）。64 位目标预留 512 MiB 只占虚拟地址；起不来线程走降级路径。
+#[cfg(target_pointer_width = "64")]
+const PARSE_STACK_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(not(target_pointer_width = "64"))]
 const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 /// 嵌套深度预检：字符串 / 注释遮蔽后，`([{` 与泛型 `<>` 的嵌套任一超过
@@ -63,6 +77,48 @@ const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// 兜住），而比较表达式总在语句结束前被清零，不会跨语句累加。`script` 必须是作者原文
 ///（不含包裹头尾），行列对应原脚本。
 fn check_nesting_depth(script: &str) -> Result<(), FacadeDiagnostic> {
+    // 第一道：原文硬上限（见 [`MAX_RAW_NESTING_DEPTH`]），不受遮蔽启发式的绕过影响。
+    {
+        let raw = script.as_bytes();
+        let (mut bracket, mut angle) = (0usize, 0usize);
+        let mut i = 0usize;
+        while i < raw.len() {
+            let exceeded = match raw[i] {
+                b'(' | b'[' | b'{' => {
+                    bracket += 1;
+                    bracket > MAX_RAW_NESTING_DEPTH
+                }
+                b')' | b']' | b'}' => {
+                    bracket = bracket.saturating_sub(1);
+                    false
+                }
+                b'<' if raw.get(i + 1) == Some(&b'=') => {
+                    i += 1;
+                    false
+                }
+                b'<' => {
+                    angle += 1;
+                    angle > MAX_RAW_NESTING_DEPTH * 4
+                }
+                b'>' => {
+                    angle = angle.saturating_sub(1);
+                    false
+                }
+                _ => false,
+            };
+            if exceeded {
+                let (line, col) = line_col(script, (i + WRAPPER_HEAD.len()) as u32);
+                return Err(FacadeDiagnostic {
+                    line,
+                    col,
+                    message: format!(
+                        "脚本嵌套过深：此处括号 / 泛型嵌套超过 {MAX_NESTING_DEPTH} 层，拆分表达式或类型后重新提交"
+                    ),
+                });
+            }
+            i += 1;
+        }
+    }
     let masked = super::workflow::mask_strings_and_comments(script);
     let bytes = masked.as_bytes();
     let (mut bracket, mut angle) = (0usize, 0usize);

@@ -286,15 +286,22 @@ pub(super) fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
 }
 
 /// AES-128-ECB + PKCS7 解密。密文长度非 16 倍数或填充非法时返回 `None`。
+#[cfg(test)]
 pub(super) fn aes_ecb_decrypt(cipher_bytes: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
+    aes_ecb_decrypt_in_place(cipher_bytes.to_vec(), key)
+}
+
+/// AES-128-ECB + PKCS7 解密，按值接收密文、原地解密：入站媒体上限 256MB，`to_vec` 再复制
+/// 一份会让峰值内存翻倍（密文 + 明文同时存活），Android 上极易触发 LMK 杀进程。
+/// 密文长度非 16 倍数或填充非法时返回 `None`。
+pub(super) fn aes_ecb_decrypt_in_place(mut buf: Vec<u8>, key: &[u8; 16]) -> Option<Vec<u8>> {
     use cipher::{BlockDecrypt, KeyInit};
     use generic_array::GenericArray;
 
-    if cipher_bytes.is_empty() || !cipher_bytes.len().is_multiple_of(16) {
+    if buf.is_empty() || !buf.len().is_multiple_of(16) {
         return None;
     }
     let cipher = aes::Aes128::new(GenericArray::from_slice(key));
-    let mut buf = cipher_bytes.to_vec();
     for chunk in buf.chunks_exact_mut(16) {
         let block = GenericArray::from_mut_slice(chunk);
         cipher.decrypt_block(block);

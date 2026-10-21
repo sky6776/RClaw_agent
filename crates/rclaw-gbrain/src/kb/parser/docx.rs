@@ -69,13 +69,30 @@ fn extract_docx_text_structured(data: &[u8]) -> Result<DocxStructured, GBrainErr
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| GBrainError::FileError(format!("DOCX open failed: {}", e)))?;
 
+    // 解压上限：deflate 最高约 1032:1，1 MB 的 docx 就能把 document.xml 膨胀到 1 GB；
+    // 条目声明的 size() 可伪造，必须用 take() 硬限制实际读取量。
+    const MAX_DOCUMENT_XML_BYTES: u64 = 64 * 1024 * 1024;
     let mut xml_content = String::new();
     {
         let mut file = archive
             .by_name("word/document.xml")
             .map_err(|_| GBrainError::FileError("DOCX missing word/document.xml".to_string()))?;
-        file.read_to_string(&mut xml_content)
+        if file.size() > MAX_DOCUMENT_XML_BYTES {
+            return Err(GBrainError::FileError(format!(
+                "DOCX document.xml 解压后过大 ({} 字节 > 上限 {MAX_DOCUMENT_XML_BYTES})",
+                file.size()
+            )));
+        }
+        let read = file
+            .by_ref()
+            .take(MAX_DOCUMENT_XML_BYTES + 1)
+            .read_to_string(&mut xml_content)
             .map_err(|e| GBrainError::FileError(format!("DOCX read failed: {}", e)))?;
+        if read as u64 > MAX_DOCUMENT_XML_BYTES {
+            return Err(GBrainError::FileError(format!(
+                "DOCX document.xml 解压后过大 (> 上限 {MAX_DOCUMENT_XML_BYTES})"
+            )));
+        }
     }
 
     let (content, headings, blocks) = extract_docx_text_from_document_xml(&xml_content)?;
@@ -86,8 +103,17 @@ fn extract_docx_text_structured(data: &[u8]) -> Result<DocxStructured, GBrainErr
 fn extract_docx_embedded_images<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> Vec<MediaRef> {
+    // 单个媒体 / 媒体总量 / 数量封顶：全部读入内存并 base64 保留到 pipeline 结束，
+    // 不设上限时一个 zip 炸弹即可让 Android 进程被 LMK 杀掉。
+    const MAX_MEDIA_ITEM_BYTES: u64 = 16 * 1024 * 1024;
+    const MAX_MEDIA_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_MEDIA_COUNT: usize = 200;
     let mut refs = Vec::new();
+    let mut total_bytes: u64 = 0;
     for i in 0..archive.len() {
+        if refs.len() >= MAX_MEDIA_COUNT || total_bytes >= MAX_MEDIA_TOTAL_BYTES {
+            break;
+        }
         let Ok(mut file) = archive.by_index(i) else {
             continue;
         };
@@ -95,10 +121,21 @@ fn extract_docx_embedded_images<R: std::io::Read + std::io::Seek>(
         if !name.starts_with("word/media/") || name.ends_with('/') {
             continue;
         }
-        let mut bytes = Vec::new();
-        if file.read_to_end(&mut bytes).is_err() {
+        let budget = MAX_MEDIA_ITEM_BYTES.min(MAX_MEDIA_TOTAL_BYTES - total_bytes);
+        if file.size() > budget {
             continue;
         }
+        let mut bytes = Vec::new();
+        if file
+            .by_ref()
+            .take(budget + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > budget
+        {
+            continue;
+        }
+        total_bytes += bytes.len() as u64;
         if let Some(media) =
             super::embedded_media::embedded_image_ref(format!("embedded://docx/{}", name), bytes)
         {

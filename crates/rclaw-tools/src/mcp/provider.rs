@@ -197,6 +197,16 @@ fn resolve_existing_path(raw: &str, server_cwd: Option<&str>) -> Option<String> 
     if raw.is_empty() || raw.contains('\0') {
         return None;
     }
+    // UNC / 网络路径（`\\host\share\..`、`//host/share/..`）不在本进程解析：Windows 上
+    // `canonicalize` 会真的去连 445 端口 / WebDAV 并自动带上当前用户的 NTLM 凭据——模型
+    // 被注入一个指向攻击者主机的 path 就能把凭据哈希送出去。原样透传给 server 自行处理。
+    // 两个前导分隔符任意混用（`/\host\..`、`\/host\..`）在 Windows 和 Rust 的前缀解析里
+    // 同样是 UNC，所以按字节判断而不是只看 `\\` / `//` 两种写法。
+    let bytes = raw.as_bytes();
+    let is_separator = |byte: u8| byte == b'\\' || byte == b'/';
+    if bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]) {
+        return None;
+    }
 
     let raw_path = Path::new(raw);
     if raw_path.is_absolute() {
@@ -239,7 +249,23 @@ fn non_empty_path(path: Option<&str>) -> Option<PathBuf> {
 }
 
 /// 返回规范路径字符串。路径不存在或无权限解析时返回 None。
+///
+/// Windows 上带网络 / 设备前缀（UNC、`\\?\UNC\`、`\\.\`、`\\?\` 裸前缀）的候选一律不
+/// canonicalize：`resolve_existing_path` 已拒绝原始入参里的 UNC 写法，这里是最后一道闸，
+/// 防止拼接 / 解析规则变化后仍有网络路径漏到 `canonicalize`（会对外连接并自动送出 NTLM 凭据）。
 fn canonical_path_string(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            if matches!(
+                prefix.kind(),
+                Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..) | Prefix::Verbatim(..)
+            ) {
+                return None;
+            }
+        }
+    }
     let canonical = path.canonicalize().ok()?;
     Some(display_path_string(&canonical))
 }
@@ -296,13 +322,16 @@ impl Tool for McpToolWrapper {
         let client = match self.manager.client_for(&self.server_name).await {
             Ok(c) => c,
             Err(e) => {
+                // 传输错误文案可能带完整 URL（reqwest 的 Display 含 query，里面常有
+                // token）：进日志、回给模型前都先脱敏。
+                let text = rclaw_store::redact_sensitive_text(&e.to_string());
                 warn!(
                     local = %self.schema_name,
                     remote = %self.mcp_tool_name,
-                    error = %e,
+                    error = %text,
                     "MCP client 获取失败"
                 );
-                return ToolResult::err(e.to_string());
+                return ToolResult::err(text);
             }
         };
 
@@ -321,6 +350,8 @@ impl Tool for McpToolWrapper {
                 }
             }
             Err(e) => {
+                // 同上：错误文案先脱敏再进日志 / 回给模型。
+                let e = rclaw_store::redact_sensitive_text(&e.to_string());
                 // 仅当 client 已判定死亡（server 退出）时，重建连接并重试一次；
                 // 普通失败（工具 isError、超时但连接仍存活）不重试，避免无谓重复。
                 if !client.is_alive() {
@@ -332,7 +363,14 @@ impl Tool for McpToolWrapper {
                     );
                     if let Ok(client2) = self.manager.client_for(&self.server_name).await {
                         if let Ok(result) = client2.call_tool(&self.mcp_tool_name, input).await {
-                            return ToolResult::ok(render_tool_result(&result));
+                            // 与首次调用同一口径：isError 的结果必须以 err 交给模型，
+                            // 否则重试路径会把工具失败伪装成成功。
+                            let rendered = render_tool_result(&result);
+                            return if result.is_error {
+                                ToolResult::err(rendered)
+                            } else {
+                                ToolResult::ok(rendered)
+                            };
                         }
                     }
                 }
@@ -342,7 +380,7 @@ impl Tool for McpToolWrapper {
                     error = %e,
                     "MCP 工具调用失败"
                 );
-                ToolResult::err(e.to_string())
+                ToolResult::err(e)
             }
         }
     }
@@ -490,6 +528,22 @@ mod tests {
         let out = normalize_mcp_path_arguments(input, Some("agent"));
 
         assert_eq!(out["path"], "agent/missing/doc.md");
+    }
+
+    #[test]
+    fn network_paths_are_never_resolved_locally() {
+        // 任意两个前导分隔符的组合都是 UNC 写法：不得进入 canonicalize（会对外连接并带出
+        // NTLM 凭据），原样透传。
+        for raw in [
+            r"\\attacker.example\share\x",
+            "//attacker.example/share/x",
+            r"/\attacker.example\share\x",
+            r"\/attacker.example\share\x",
+            r"\\?\UNC\attacker.example\share\x",
+            r"\\.\pipe\x",
+        ] {
+            assert_eq!(resolve_existing_path(raw, Some("agent")), None, "{raw}");
+        }
     }
 
     #[test]

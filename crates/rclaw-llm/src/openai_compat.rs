@@ -820,13 +820,19 @@ impl StreamParser for OpenAiSseParser {
                                 _ => slot.name = Some(n.to_string()),
                             }
                         }
-                        if let Some(a) = f
-                            .get("arguments")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                        {
-                            // arguments 是增量字符串，需拼接。
-                            slot.args.push_str(a);
+                        match f.get("arguments") {
+                            Some(Value::String(a)) if !a.is_empty() => {
+                                // arguments 是增量字符串，需拼接。
+                                slot.args.push_str(a);
+                            }
+                            // 与非流式路径（parse_tool_call 的 `Some(other) => other.to_string()`）
+                            // 对齐：部分兼容网关把 arguments 直接给成 JSON 对象。此前 as_str()
+                            // 对对象返回 None → 参数被静默丢弃，空串又被 normalize_arguments
+                            // 视为合法的 "{}"，工具最终以空参数执行并把结果持久化进会话。
+                            Some(other) if !other.is_null() && !other.is_string() => {
+                                slot.args.push_str(&other.to_string());
+                            }
+                            _ => {}
                         }
                     }
                 }

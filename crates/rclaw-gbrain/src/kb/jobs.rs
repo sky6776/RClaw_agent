@@ -232,19 +232,47 @@ pub fn claim_next_kb_job(conn: &Connection) -> Result<Option<(i64, KbProcessPayl
 /// 分钟的作业重置回 pending，让正常的状态机接管。
 ///
 /// 阈值兜底防止误伤其他活跃进程正在处理的作业。
+///
+/// 回收时同样套用 `max_attempts`：会把进程直接打死（OOM/LMK/栈溢出）的作业永远走不到
+/// `fail()`，若无条件复位为 pending 就会"认领 → 崩溃 → 2 小时后再认领"无限循环，
+/// attempts 一路递增却永不进入终态。达到上限的直接置 failed，并把对应文档标为 failed，
+/// 否则文档会永久停在 processing。
 pub fn recover_stale_running_jobs(conn: &Connection, stale_after_minutes: i64) -> Result<usize> {
+    const STALE_EXHAUSTED_ERROR: &str = "stale running job exceeded max_attempts";
+    let stale_before = format!("-{} minutes", stale_after_minutes);
+    // 先把耗尽重试次数的文档作业对应的文档标为 failed（带 run_id 守卫，不污染新 run）
+    let failed_docs = conn.execute(
+        "UPDATE kb_documents
+         SET document_status = 'failed', index_status = 'failed',
+             parsing_error = ?2, updated_at = datetime('now')
+         WHERE EXISTS (
+             SELECT 1 FROM jobs j
+             WHERE j.status = 'running'
+               AND COALESCE(j.started_at, j.updated_at) < datetime('now', ?1)
+               AND j.attempts >= j.max_attempts
+               AND j.job_type IN ('kb_process_document', 'kb_ocr_document')
+               AND CAST(json_extract(j.payload, '$.document_id') AS INTEGER) = kb_documents.id
+               AND COALESCE(json_extract(j.payload, '$.processing_run_id'), '') = kb_documents.processing_run_id
+         )
+         AND document_status NOT IN ('ready', 'failed', 'deleted')",
+        rusqlite::params![stale_before, STALE_EXHAUSTED_ERROR],
+    )?;
     let updated = conn.execute(
         "UPDATE jobs
-         SET status = 'pending', updated_at = datetime('now')
+         SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
+             error = CASE WHEN attempts >= max_attempts THEN ?2 ELSE error END,
+             completed_at = CASE WHEN attempts >= max_attempts THEN datetime('now') ELSE NULL END,
+             updated_at = datetime('now')
          WHERE status = 'running'
            AND COALESCE(started_at, updated_at) < datetime('now', ?1)",
-        rusqlite::params![format!("-{} minutes", stale_after_minutes)],
+        rusqlite::params![stale_before, STALE_EXHAUSTED_ERROR],
     )?;
     if updated > 0 {
         tracing::warn!(
             recovered = updated,
+            failed_docs,
             stale_after_minutes,
-            "jobs: 回收孤儿 running 作业为 pending"
+            "jobs: 回收孤儿 running 作业（未耗尽重试的复位为 pending，耗尽的置 failed）"
         );
     }
     Ok(updated)

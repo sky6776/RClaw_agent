@@ -3653,8 +3653,13 @@ fn run_priority_workers(engine: &SqliteEngine, config: &Config) -> bool {
 /// 会把另一进程正在跑的合法长作业误回收成双重执行。
 const STALE_RUNNING_JOB_MINUTES: i64 = 120;
 
-/// worker 启动时回收上次进程遗留的孤儿 running 作业。
+/// worker pool 空轮期间两次孤儿回收之间的最小间隔（秒）。
+const STALE_RECOVER_INTERVAL_SECS: u64 = 300;
+
+/// worker 启动时（及空闲期周期性）回收上次进程遗留的孤儿 running 作业，
+/// 并顺带清扫已死进程遗留的 OCR 临时目录。
 fn recover_stale_jobs_once(engine: &SqliteEngine) {
+    crate::kb::temp_guard::sweep_orphaned_dirs("gbrain_ocr_");
     let Ok(conn) = engine.connection() else {
         return;
     };
@@ -3763,6 +3768,10 @@ pub fn spawn_kb_worker_pool(
                     // 只让 0 号 worker 做启动回收，避免多线程重复扫
                     recover_stale_jobs_once(&engine);
                 }
+                // 0 号 worker 在空轮时周期性回收：进程被 kill 时遗留的 running 作业
+                // 若距 started_at 不足阈值，启动回收会放过它，之后若不再扫描就永久卡死
+                // （run_kb_worker_loop 有此逻辑，APK 使用的 pool 此前没有）。
+                let mut idle_secs_since_recover: u64 = 0;
 
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
@@ -3773,6 +3782,14 @@ pub fn spawn_kb_worker_pool(
                     let had_work = run_priority_workers(&engine, &config);
                     if had_work {
                         continue;
+                    }
+                    if i == 0 {
+                        idle_secs_since_recover =
+                            idle_secs_since_recover.saturating_add(interval_secs.max(1));
+                        if idle_secs_since_recover >= STALE_RECOVER_INTERVAL_SECS {
+                            idle_secs_since_recover = 0;
+                            recover_stale_jobs_once(&engine);
+                        }
                     }
                     // 无作业时短暂等待，但提前检查 shutdown
                     for _ in 0..interval_secs {

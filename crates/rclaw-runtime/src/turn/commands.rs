@@ -36,6 +36,45 @@ impl RuntimeCommand {
             _ => None,
         }
     }
+
+    /// 是否属于「影响全局 / 外泄数据」的命令：清空全部会话与长期记忆、读取或删除日志、
+    /// 回滚工作区文件、Skill 生命周期变更、导出全部会话。这些命令只认 [`is_privileged`]
+    /// 的会话。`/cancel`、`/context`、`/compact`、`/goal`、`/tools`、`/fork`、单会话
+    /// `/export`、只读 `/skills list|status|help` 仍对所有用户开放。
+    fn requires_privilege(self, content: &str) -> bool {
+        let second = content
+            .trim()
+            .split_whitespace()
+            .nth(1)
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match self {
+            Self::Clear | Self::Log | Self::Rewind => true,
+            Self::Skills => matches!(
+                second.as_str(),
+                "pin" | "unpin" | "adopt" | "restore" | "curate"
+            ),
+            Self::Export => second == "all",
+            Self::Cancel
+            | Self::Context
+            | Self::Tools
+            | Self::Compact
+            | Self::Fork
+            | Self::Goal => false,
+        }
+    }
+}
+
+/// 本机通道（cli / desktop 虚拟通道）或通道层已提升为 [`ToolAccess::Unrestricted`] 的消息
+/// （如 napcat `max_from` 私聊）才算特权会话。外部通道（QQ 群成员、allow 名单里的普通
+/// 用户、微信等）默认 `Sandboxed`：允许聊天不等于允许一句 `/clear confirm` 抹掉所有人的
+/// 会话与记忆、用 `/log get` 把含他人输入的日志拉到自己聊天里。
+fn is_privileged(msg: &BusMessage) -> bool {
+    // 桌面虚拟通道名由 rclaw-desktop 定义（`CHANNEL_DESKTOP = "desktop"`），runtime 不依赖
+    // 该 crate，这里按字面量比对（与 rclaw-channels 的路由一致）。
+    msg.tool_access() == rclaw_core::ToolAccess::Unrestricted
+        || msg.channel == CHANNEL_CLI
+        || msg.channel == "desktop"
 }
 
 /// 在进入活动 turn 路由前处理所有即时命令。
@@ -48,6 +87,23 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
     }
 
     if let Some(command) = RuntimeCommand::parse(&msg.content) {
+        if command.requires_privilege(&msg.content) && !is_privileged(msg) {
+            tracing::warn!(
+                "拒绝非特权会话 {}:{} 的运行时命令 {}",
+                msg.channel,
+                msg.chat_id,
+                msg.content.trim()
+            );
+            manager
+                .send_command_reply(
+                    &msg.channel,
+                    &msg.chat_id,
+                    "权限不足：该命令会影响全部会话或工作区，只能在本机（cli / desktop）或已授权的管理员会话中执行。"
+                        .to_string(),
+                )
+                .await;
+            return true;
+        }
         let response = match command {
             RuntimeCommand::Cancel => {
                 manager.route_cancel(TurnKey::from_msg(msg)).await;

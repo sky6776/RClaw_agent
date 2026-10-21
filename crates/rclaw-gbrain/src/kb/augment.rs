@@ -10,7 +10,10 @@ static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::
 
 /// 获取全局共享的 HTTP 客户端
 fn get_http_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(reqwest::Client::new)
+    // 带超时：外层 10s 只包住 send()，读 body 仍需 client 自身的总超时兜底
+    HTTP_CLIENT.get_or_init(|| {
+        crate::llm::http_client_with_timeout(std::time::Duration::from_secs(60))
+    })
 }
 
 const AUGMENT_MAX_OUTPUT_TOKENS: usize = 1024;

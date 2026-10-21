@@ -146,6 +146,19 @@ impl SkillApprovalStore {
 
     /// 执行闸门：当前哈希 == `user` 哈希，或无 `user` 条目时 == `baseline` 哈希。
     /// 拒绝文案自描述（脚本路径 + 原因 + 批准入口），供模型向用户转述。
+    ///
+    /// 只验入口文件等于没验：桥把入口所在目录放在 `sys.path[0]`，入口 `import` 的兄弟
+    /// 模块、与标准库同名的遮蔽模块都从那里加载，模型写一个 `helper.py` 就能让未经审批
+    /// 的代码跟着跑；不少内置 skill 还会把别的 skill 目录（如 glm-master-skill/scripts）
+    /// 插进 `sys.path`。因此：
+    /// - 入口所在 skill 目录下的**全部** `.py` 必须逐个过闸（未知文件也拒绝）；
+    /// - `skills/` 下其它目录里**已在审批表中**的 `.py` 必须与批准/基线一致（防篡改
+    ///   跨 skill 复用的模块）；
+    /// - 审批表里**已出现过**的 skill 目录（至少有一个条目）里的未知 `.py` 同样拒绝：这些
+    ///   目录正是会被别的 skill 插进 `sys.path` 跨目录复用的，一个与延迟导入的模块同名的
+    ///   未知文件（如 `glm-master-skill/scripts/tomllib.py`）就能在已批准的入口里跑未审批
+    ///   代码；只有一个条目都没有的全新目录才不影响本次执行，免得一个待批准的新 skill 把
+    ///   所有 skill 都卡住。
     pub fn check(&self, skills_dir: &Path, script: &Path) -> Result<(), String> {
         let relative = Self::relative_to_skills(skills_dir, script)?;
         let key = relative_slash(&relative)
@@ -153,12 +166,62 @@ impl SkillApprovalStore {
         let actual = script_sha256(script)
             .map_err(|error| format!("读取 skill 脚本 {key} 失败: {error}"))?;
         let entries = self.lock_entries();
-        match entries.get(&key) {
+        Self::check_entry(&entries, &key, &actual)?;
+
+        let skill_root = skill_root_of(skills_dir, &relative);
+        let known_roots: std::collections::HashSet<&str> = entries
+            .keys()
+            .filter_map(|entry_key| key_skill_root(entry_key))
+            .collect();
+        let mut scripts = Vec::new();
+        collect_python_scripts(skills_dir, &mut scripts);
+        for other in scripts {
+            let Ok(other_relative) = other.strip_prefix(skills_dir) else {
+                continue;
+            };
+            let Some(other_key) = relative_slash(other_relative) else {
+                continue;
+            };
+            if other_key == key {
+                continue;
+            }
+            let same_skill = skill_root
+                .as_deref()
+                .is_some_and(|root| other.starts_with(root));
+            let approved_module = entries.contains_key(&other_key);
+            let known_root =
+                key_skill_root(&other_key).is_some_and(|root| known_roots.contains(root));
+            if !same_skill && !approved_module && !known_root {
+                continue;
+            }
+            let sha = script_sha256(&other)
+                .map_err(|error| format!("读取 skill 脚本 {other_key} 失败: {error}"))?;
+            Self::check_entry(&entries, &other_key, &sha).map_err(|message| {
+                if same_skill {
+                    format!("{message}（与入口脚本 {key} 同属一个 skill 目录）")
+                } else if approved_module {
+                    format!("{message}（已审批的 skill 模块被改动，入口脚本 {key} 可能会加载它）")
+                } else {
+                    format!(
+                        "{message}（所在 skill 目录已有审批记录，可能被入口脚本 {key} 经 sys.path 加载）"
+                    )
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn check_entry(
+        entries: &HashMap<String, ApprovalEntry>,
+        key: &str,
+        actual: &str,
+    ) -> Result<(), String> {
+        match entries.get(key) {
             Some(entry) => {
-                if entry.user.as_deref() == Some(actual.as_str()) {
+                if entry.user.as_deref() == Some(actual) {
                     return Ok(());
                 }
-                if entry.user.is_none() && entry.baseline.as_deref() == Some(actual.as_str()) {
+                if entry.user.is_none() && entry.baseline.as_deref() == Some(actual) {
                     return Ok(());
                 }
                 if entry.user.is_some() {
@@ -303,7 +366,9 @@ impl SkillApprovalStore {
         };
         match serde_json::to_string_pretty(&file) {
             Ok(raw) => {
-                if let Err(error) = std::fs::write(&self.path, raw) {
+                // 原子写：`std::fs::write` 先截断再写，LMK / 看门狗杀进程落在窗口内会留下
+                // 半截文件，下次 load 按空表处理并被 baseline 覆盖——用户批准记录全部丢失。
+                if let Err(error) = rclaw_store::atomic_write(&self.path, raw.as_bytes()) {
                     tracing::warn!(
                         path = %self.path.display(),
                         %error,
@@ -362,6 +427,48 @@ fn collect_python_scripts(root: &Path, out: &mut Vec<PathBuf>) {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
         {
             out.push(path);
+        }
+    }
+}
+
+/// 入口脚本所属的 skill 目录（`skills/<skill>/`）：取相对路径的首个目录分量。
+/// 直接放在 `skills/` 根下的脚本没有独立目录，返回 None（只验它自己）。
+fn skill_root_of(skills_dir: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut components = relative.components();
+    let first = components.next()?;
+    // 只有一个分量说明脚本就在 skills/ 根下。
+    components.next()?;
+    match first {
+        Component::Normal(name) => Some(skills_dir.join(name)),
+        _ => None,
+    }
+}
+
+/// 审批表键（`skill/子路径/x.py`，`/` 分隔）所属的 skill 目录名；键只有一个分量（脚本直接
+/// 在 skills/ 根下）时为 None。
+fn key_skill_root(key: &str) -> Option<&str> {
+    let (root, rest) = key.split_once('/')?;
+    (!root.is_empty() && !rest.is_empty()).then_some(root)
+}
+
+/// 删除 skill 目录内的全部 `__pycache__`：Python 会优先加载与源文件 mtime/大小匹配的
+/// `.pyc` 而不再读源码，审批哈希只看 `.py`，留着缓存就等于给未审代码开了旁门。
+/// 桥侧同时关闭字节码写入，正常运行不会再生成；失败只记日志。
+fn remove_pycache_dirs(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.file_name().is_some_and(|name| name == "__pycache__") {
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                tracing::warn!(path = %path.display(), %error, "清理 skill __pycache__ 失败");
+            }
+        } else {
+            remove_pycache_dirs(&path);
         }
     }
 }
@@ -455,16 +562,25 @@ impl PythonScriptExecutor for BridgePythonExecutor {
                     .to_string(),
             ));
         }
-        // 执行闸门：审批通过才进解释器（改码必须过人）。
-        if let Err(message) = self.approvals.check(&self.skills_dir, request.script) {
-            return Err(ScriptFailure::Rejected(message));
-        }
-
         // 层 1：严格串行化（进程内共享解释器的必然约束）。
         let _serial = self
             .execute_lock
             .lock()
             .await;
+
+        // 执行闸门：审批通过才进解释器（改码必须过人）。放在拿到串行锁之后：排队等待
+        // 前一个脚本（可长达其超时）期间脚本若被改写，锁前算好的哈希就成了过期凭证，
+        // 未经审批的改动会顺着跑进解释器。
+        if let Err(message) = self.approvals.check(&self.skills_dir, request.script) {
+            return Err(ScriptFailure::Rejected(message));
+        }
+        // 过审的是 .py 源码：进解释器前清掉该 skill 目录里可能绕过源码的 __pycache__。
+        if let Some(skill_root) = SkillApprovalStore::relative_to_skills(&self.skills_dir, request.script)
+            .ok()
+            .and_then(|relative| skill_root_of(&self.skills_dir, &relative))
+        {
+            remove_pycache_dirs(&skill_root);
+        }
 
         let args: Vec<String> = request
             .argv
@@ -635,6 +751,33 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("demo/scripts/run.py"), "{err}");
         assert!(err.contains("批准") || err.contains("内置"), "{err}");
+    }
+
+    #[test]
+    fn unknown_script_in_known_skill_dir_blocks_other_entries() {
+        let dir = store_dir("cross-skill");
+        let bundled = dir.path().join("bundled");
+        let skills = dir.path().join("skills");
+        // 两个内置 skill：a 的入口会把 b/scripts 插进 sys.path 复用 b 的模块。
+        write(&bundled.join("a/scripts/run.py"), "import sys\n");
+        write(&bundled.join("b/scripts/shared.py"), "X = 1\n");
+        write(&skills.join("a/scripts/run.py"), "import sys\n");
+        write(&skills.join("b/scripts/shared.py"), "X = 1\n");
+        let store = SkillApprovalStore::load(dir.path().join(APPROVALS_FILE_NAME));
+        store.refresh_baseline(&bundled);
+        assert!(store.check(&skills, &skills.join("a/scripts/run.py")).is_ok());
+
+        // 模型往已有审批记录的 b 目录里塞一个与延迟导入模块同名的未知文件 → a 也不能跑。
+        write(&skills.join("b/scripts/tomllib.py"), "print('pwned')\n");
+        let err = store
+            .check(&skills, &skills.join("a/scripts/run.py"))
+            .unwrap_err();
+        assert!(err.contains("b/scripts/tomllib.py"), "{err}");
+        std::fs::remove_file(skills.join("b/scripts/tomllib.py")).unwrap();
+
+        // 一个条目都没有的全新目录（待批准的新 skill）不影响其它 skill 执行。
+        write(&skills.join("fresh/scripts/new.py"), "print('new')\n");
+        assert!(store.check(&skills, &skills.join("a/scripts/run.py")).is_ok());
     }
 
     #[test]

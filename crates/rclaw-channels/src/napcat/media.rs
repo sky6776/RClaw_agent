@@ -537,6 +537,8 @@ pub(super) struct StreamDownloadState {
     pub(super) total_chunks: Option<usize>,
     pub(super) total_bytes: Option<u64>,
     pub(super) name: Option<String>,
+    /// 已收到分块的累计字节数（入站上限按实际字节兜底，不只信对端声明）。
+    pub(super) received_bytes: u64,
 }
 
 impl StreamDownloadState {
@@ -550,6 +552,15 @@ impl StreamDownloadState {
                     if self.total_bytes.is_none() {
                         self.total_bytes = value_u64(data.get("file_size"));
                     }
+                    if self
+                        .total_bytes
+                        .is_some_and(|size| size > INBOUND_MEDIA_MAX_BYTES)
+                    {
+                        return Err(format!(
+                            "stream 文件 {} 字节超过入站上限 {INBOUND_MEDIA_MAX_BYTES} 字节",
+                            self.total_bytes.unwrap_or_default()
+                        ));
+                    }
                 }
                 Some("file_chunk") => {
                     let index = value_usize(data.get("index"))
@@ -560,6 +571,14 @@ impl StreamDownloadState {
                     let bytes = base64::engine::general_purpose::STANDARD
                         .decode(encoded)
                         .map_err(|e| format!("stream chunk base64 解码失败: {e}"))?;
+                    // 分块全部驻留内存直到拼接：按实际累计字节卡上限，声明值不实也挡得住。
+                    self.received_bytes = self.received_bytes.saturating_add(bytes.len() as u64);
+                    if self.received_bytes > INBOUND_MEDIA_MAX_BYTES {
+                        return Err(format!(
+                            "stream 累计 {} 字节超过入站上限 {INBOUND_MEDIA_MAX_BYTES} 字节",
+                            self.received_bytes
+                        ));
+                    }
                     self.chunks.insert(index, bytes);
                 }
                 Some(other) => {
@@ -598,12 +617,9 @@ impl StreamDownloadState {
             return Ok(None);
         }
 
-        let expected_total = self.total_bytes.unwrap_or_default() as usize;
-        let mut bytes = if expected_total > 0 {
-            Vec::with_capacity(expected_total)
-        } else {
-            Vec::new()
-        };
+        // 预留容量只信已实际收到的字节数（对端声明的 total_bytes 不可信：一个虚报的
+        // 几十 GB 会让 with_capacity 直接分配失败 abort）。
+        let mut bytes = Vec::with_capacity(self.received_bytes as usize);
         for i in 0..total {
             let chunk = self
                 .chunks
@@ -723,6 +739,7 @@ pub(super) fn echo_str(v: Option<&Value>) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 pub(super) fn is_stream_packet(resp: &Value) -> bool {
     if resp.get("stream").and_then(|v| v.as_str()) == Some("stream-action") {
         return true;
@@ -1239,7 +1256,9 @@ pub(super) fn temp_download_path(target: &Path) -> PathBuf {
     tmp
 }
 
-pub(super) async fn write_bytes_to_path(target: &Path, bytes: &[u8]) -> Result<(), String> {
+/// 按值接收字节：`tokio::fs::write` 对借用切片会先整份拷贝成 owned 再交给阻塞线程，
+/// 256MB 上限的入站媒体会因此再多一倍峰值内存（Android 上易触发 LMK）。
+pub(super) async fn write_bytes_to_path(target: &Path, bytes: Vec<u8>) -> Result<(), String> {
     let tmp = temp_download_path(target);
     if let Err(e) = tokio::fs::write(&tmp, bytes).await {
         let _ = std::fs::remove_file(&tmp);
@@ -1253,6 +1272,17 @@ pub(super) async fn write_bytes_to_path(target: &Path, bytes: &[u8]) -> Result<(
 }
 
 pub(super) async fn copy_local_file_to_path(source: &Path, target: &Path) -> Result<(), String> {
+    // 与 HTTP / Stream 下载路径同一入站上限：NapCat 与 RClaw 同机部署时，HTTP 路径按上限
+    // 拒绝后会落到本地路径分支，GB 级群文件原样复制进媒体目录。
+    let len = tokio::fs::metadata(source)
+        .await
+        .map_err(|e| e.to_string())?
+        .len();
+    if len > INBOUND_MEDIA_MAX_BYTES {
+        return Err(format!(
+            "本地媒体 {len} 字节超过入站上限 {INBOUND_MEDIA_MAX_BYTES} 字节，跳过复制"
+        ));
+    }
     let tmp = temp_download_path(target);
     if let Err(e) = tokio::fs::copy(source, &tmp).await {
         let _ = std::fs::remove_file(&tmp);

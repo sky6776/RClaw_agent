@@ -235,6 +235,19 @@ pub(super) fn read_pdf(
     offset: usize,
     limit: usize,
 ) -> ToolResult {
+    // 前置校验：检测与提取都会把整份 PDF 载入内存，必须先按普通文件 + 附件同一上限把关
+    // ——否则一个超大 .pdf（或改名成 .pdf 的任意大文件）在任何分支被整份读入前就能把
+    // 进程内存打爆；超限文件即便走降级附件路径最终也会被同一上限拒绝。
+    let meta = match regular_file_meta(path) {
+        Ok(meta) => meta,
+        Err(error) => return error,
+    };
+    if meta.len() > MAX_MEDIA_FILE_SIZE {
+        return ToolResult::err(format!(
+            "PDF 文件过大 ({} 字节 > 上限 {MAX_MEDIA_FILE_SIZE})，不读取。",
+            meta.len()
+        ));
+    }
     // 检测（仅元数据，便宜）。
     let info = match pdf_inspector::detect_pdf(path) {
         Ok(info) => info,

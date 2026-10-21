@@ -20,8 +20,19 @@ use rclaw_cli::bootstrap;
 use rclaw_cli::config::Config;
 use rclaw_cli::logging;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(async_main());
+    // tokio Runtime 的 Drop 会无限期等待 spawn_blocking 任务结束，而 console 通道的
+    // rustyline / 管道 stdin 读取在没有输入（或管道对端一直不关）时永不返回：Ctrl+C 或
+    // agent loop 结束后进程会卡住不退出。限时关停后直接返回，残留的阻塞线程随进程结束。
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
+
+async fn async_main() -> Result<()> {
     // daemon 后台模式：runtime 内部经 AgentOptions.daemon 消费（C3）；
     // 环境变量仅保留为 shell/skill 子进程契约（技能脚本经 os.environ 读取）。
     let daemon = std::env::args().any(|a| a == "--daemon");

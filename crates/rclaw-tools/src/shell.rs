@@ -145,16 +145,28 @@ impl Tool for Shell {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // 让包装 shell 自成进程组：超时 / 取消时按组 SIGKILL 才能连带 python、node
+            // 等真正干活的孙进程一起终止（见 ForegroundChild）。
+            cmd.as_std_mut().process_group(0);
+        }
 
-        let mut child = match cmd.spawn() {
+        let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 return ToolResult::err(format!("命令启动失败: {e}"));
             }
         };
+        let mut guard = ForegroundChild {
+            child,
+            readers: Vec::new(),
+            finished: false,
+        };
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = guard.child.stdout.take();
+        let stderr = guard.child.stderr.take();
         let stdout_task = tokio::spawn(async move {
             match stdout {
                 Some(out) => read_limited(out, MAX_STREAM_BYTES).await,
@@ -167,19 +179,23 @@ impl Tool for Shell {
                 None => Ok((String::new(), 0, false)),
             }
         });
+        guard.readers = vec![stdout_task.abort_handle(), stderr_task.abort_handle()];
 
         let mut timed_out = false;
-        let status = match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+        let status = match timeout(Duration::from_millis(timeout_ms), guard.child.wait()).await {
             Ok(Ok(status)) => Some(status),
             Ok(Err(e)) => {
                 return ToolResult::err(format!("等待命令结束失败: {e}"));
             }
             Err(_) => {
                 timed_out = true;
-                let _ = child.kill().await;
+                guard.kill_tree().await;
                 None
             }
         };
+        // 包装进程已退出 / 已被整树终止：之后不再触发兜底（正常退出后仍存活的派生后台进程
+        // 属用户意图，交给 join_reader 的宽限逻辑处理而不杀）。
+        guard.finished = true;
 
         let (stdout, stdout_total, stdout_truncated) = join_reader(stdout_task).await;
         let (stderr, stderr_total, stderr_truncated) = join_reader(stderr_task).await;
@@ -335,6 +351,69 @@ fn shell_command(command: &str) -> TokioCommand {
     cmd
 }
 
+/// 前台命令的进程树兜底。`kill_on_drop` / `child.kill()` 只能杀到 `cmd.exe` / `sh` 这一层
+/// 包装进程：超时或工具 future 被取消（turn 取消、运行时关停）后，真正干活的孙进程
+/// （python、node、编译器……）会继续跑完，长期占住 CPU / 内存，两个输出读取任务也因管道
+/// 不 EOF 而一直挂着。未正常收尾（`finished == false`）即整树终止并中止读取任务。
+struct ForegroundChild {
+    child: tokio::process::Child,
+    readers: Vec<tokio::task::AbortHandle>,
+    finished: bool,
+}
+
+impl ForegroundChild {
+    /// 超时路径：先整树终止（Windows 的 taskkill 需在包装进程仍存活时遍历），再回收包装进程。
+    async fn kill_tree(&mut self) {
+        if let Some(pid) = self.child.id() {
+            let _ = timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || kill_process_tree(pid)),
+            )
+            .await;
+        }
+        let _ = self.child.kill().await;
+    }
+}
+
+impl Drop for ForegroundChild {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(pid) = self.child.id() {
+            kill_process_tree(pid);
+        }
+        for reader in &self.readers {
+            reader.abort();
+        }
+    }
+}
+
+/// 整树终止：Windows 用 `taskkill /T`（按父子关系遍历，故须在包装进程仍存活时调用）；
+/// Unix 对进程组发 SIGKILL（前台命令 spawn 时已 `process_group(0)` 自成一组）。
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：桌面版下不闪控制台。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY：仅向自己 spawn 且尚未回收（PID 不会被复用）的进程组发送信号。
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
 /// 流式读取子进程输出：头尾各半保留（HeadTailBuffer），内存有界，持续排空管道。
 ///
 /// 返回（截断后文本，原始总字节数，是否截断）。中段省略标记已内嵌在文本里。
@@ -355,13 +434,28 @@ where
     Ok((out.text, out.total_bytes, out.truncated))
 }
 
+/// 子进程退出后等待读取任务收尾的宽限。读取任务与子进程并发排空管道，退出时最多只剩
+/// 管道缓冲区那点尾巴；但若管道被脱离的孙进程继承（`cmd &`、`start`、守护进程），EOF
+/// 永远不来——没有上限就会把这次工具调用、进而整个 turn 永久挂住。
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
 async fn join_reader(
-    task: tokio::task::JoinHandle<std::io::Result<(String, usize, bool)>>,
+    mut task: tokio::task::JoinHandle<std::io::Result<(String, usize, bool)>>,
 ) -> (String, usize, bool) {
-    match task.await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => (format!("[读取输出失败: {e}]"), 0, false),
-        Err(e) => (format!("[读取输出任务失败: {e}]"), 0, false),
+    match timeout(READER_DRAIN_GRACE, &mut task).await {
+        Ok(Ok(Ok(r))) => r,
+        Ok(Ok(Err(e))) => (format!("[读取输出失败: {e}]"), 0, false),
+        Ok(Err(e)) => (format!("[读取输出任务失败: {e}]"), 0, false),
+        Err(_elapsed) => {
+            task.abort();
+            (
+                "[子进程已退出，但输出管道仍被其派生的后台进程占用，已停止等待读取；\
+                 需要长驻进程请用 background=true]"
+                    .to_string(),
+                0,
+                false,
+            )
+        }
     }
 }
 

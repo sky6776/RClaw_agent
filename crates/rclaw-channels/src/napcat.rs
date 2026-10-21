@@ -50,7 +50,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -86,6 +86,23 @@ const FORWARD_NODE_BYTES: usize = 3000;
 const FORWARD_API_TIMEOUT: Duration = Duration::from_secs(120);
 /// API 请求-响应匹配的最长等待（防止 echo 永不返回时卡住发送任务）。
 const API_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单次 WS 写入（含 flush）的基础等待。对端停止 ACK（半开连接）时 `send` 会一直 Pending，
+/// 主 select 循环随之冻结：读侧、心跳、空闲检测全部停摆，只能等内核 RTO 耗尽。
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 大帧按体积追加等待（每 MiB 加 8s，即按 ≥128 KiB/s ≈ 1 Mbps 的最低吞吐放宽）：base64
+/// 内联媒体一帧可达 ~133 MB，慢上行（手机热点 / 弱网 2–5 Mbps）下按固定 15s 或 1s/MiB 都会把
+/// 正常的慢写误判为僵死、重连后再重发、循环不止。写超时的目标只是识别对端停止 ACK 的
+/// 半开连接，宁可对真死连接多等几分钟，也不能把活连接判死。
+const WS_WRITE_SECS_PER_MIB: u64 = 8;
+/// 连续多少次心跳没有等到任何入站帧即判定连接僵死。
+const HEARTBEAT_MAX_UNANSWERED: u32 = 3;
+/// 一条消息因连接中断被放回队首重投的次数上限：没有上限时，一条怎么也写不出去的消息
+/// （如超出上行能力的大帧触发写超时）会让通道在「断开 → 重连 → 重发 → 再断开」里无限
+/// 打转，每轮还把其它会话正在发的消息一并重发、把该会话的新消息堵在队列里直到溢出丢弃。
+const OUTBOUND_MAX_REQUEUES: u8 = 1;
+/// 连接中断时附件阶段已开始 / 重投次数耗尽后投给用户的提示（附件没有幂等键，不自动重发）。
+const OUTBOUND_INTERRUPTED_NOTICE: &str =
+    "⚠️ 与 QQ 协议端的连接在发送过程中中断，这条回复可能未完整送达（为避免重复，附件不会自动重发）。如果没有收到完整内容，请回复“重发”。";
 /// 文本分段遇到可恢复发送超时时的额外重试次数（不含首次）。
 ///
 /// 同时覆盖 NapCat `sendMsg` 服务层 NTEvent 超时和客户端等待 API 回执超时。两者的实际
@@ -115,6 +132,10 @@ const STREAM_FILE_RETENTION_MS: u64 = 30 * 60 * 1000;
 /// 这样 NapCat 与 RClaw 不共享本地文件系统且 Stream 不可用时，小/常规媒体仍有兼容回退。
 /// 100MB 对齐 NapCat 文档里普通视频上限；更大的文件改走 upload_file_stream，避免把超大文件整体塞进 WS JSON。
 const OUTBOUND_BASE64_MAX_BYTES: u64 = 100 * 1024 * 1024;
+/// 入站媒体（HTTP / Stream 下载）单文件上限。群里任何成员都能投递文件，没有上限就是
+/// 一条几 GB 的群文件把媒体目录（安卓是应用私有存储）撑爆；Stream 路径还会按对端声明的
+/// file_size 一次性预留内存。256MB 覆盖 QQ 常规图片 / 语音 / 视频，超出的记日志跳过。
+const INBOUND_MEDIA_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// 单连接最多缓存多少 message_id 做去重；超出后淘汰一半。
 const DEDUP_CAP: usize = 10_000;
 /// 单连接最多保留多少条已落盘媒体索引，用于群聊 `at_only` 的静默接收后复用。
@@ -134,6 +155,20 @@ const MAX_RECONNECT_DELAY: u64 = 60;
 /// 单个 chat 的出站发送。主循环继续处理 API 响应，避免发送任务等待响应时阻塞 WS 读循环。
 /// future 完成时返回 chat_id，以便启动该会话的下一条待发消息。
 type OutboundSend = Pin<Box<dyn Future<Output = String> + Send>>;
+
+/// 出站队列项：消息 + 因连接中断被放回队首重投的次数（上限 [`OUTBOUND_MAX_REQUEUES`]）。
+struct QueuedOutbound {
+    msg: BusMessage,
+    requeues: u8,
+}
+
+/// 发送中的消息：队列项 + 进度标记。`media_started` 由 [`NapCat::send_outbound`]
+/// 在进入附件阶段前置位——附件没有幂等键，连接中断后不能整条重发（会制造重复附件），
+/// 只能改投提示；文本阶段的重复则是本模块已接受的代价。
+struct InFlightOutbound {
+    item: QueuedOutbound,
+    media_started: Arc<AtomicBool>,
+}
 
 /// NapCatQQ 通道配置。
 #[derive(Debug, Clone)]
@@ -383,8 +418,11 @@ impl NapCat {
         wait: Duration,
     ) -> Result<Value, String> {
         let echo = self.next_echo();
-        let req = json!({ "action": action, "params": params, "echo": echo.clone() });
-        let text = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+        // 序列化后立即释放 `params`：base64 回退路径里它可达百 MB，不能再跨整个响应等待存活。
+        let text = {
+            let req = json!({ "action": action, "params": params, "echo": echo.clone() });
+            serde_json::to_string(&req).map_err(|e| e.to_string())?
+        };
 
         let (tx, rx) = oneshot::channel();
         {
@@ -444,19 +482,21 @@ impl NapCat {
             // 无 post_type → API 响应。按 echo 路由到等待中的发送方。
             let echo = echo_str(val.get("echo"));
             if let Some(echo) = echo {
-                if is_stream_packet(&val) {
-                    let stream_tx = stream_pending
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.get(&echo).cloned());
-                    if let Some(tx) = stream_tx {
-                        if tx.send(val).await.is_err() {
-                            if let Ok(mut m) = stream_pending.lock() {
-                                m.remove(&echo);
-                            }
+                // 先按 echo 找 stream 等待方，不看包形状：Stream API 的失败回包（NapCat 不支持
+                // 该 api、file 引用非法等）是普通 OneBot 响应而非 stream 包，若只按形状路由会
+                // 落到 pending（stream echo 从未登记）被静默丢弃，等待方要白等 STREAM_IDLE_TIMEOUT
+                //（每个媒体最多 3 次 stream 尝试）才失败，整条消息因此延迟数分钟才到 agent。
+                let stream_tx = stream_pending
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&echo).cloned());
+                if let Some(tx) = stream_tx {
+                    if tx.send(val).await.is_err() {
+                        if let Ok(mut m) = stream_pending.lock() {
+                            m.remove(&echo);
                         }
-                        return;
                     }
+                    return;
                 }
 
                 let waiter = pending.lock().ok().and_then(|mut m| m.remove(&echo));
@@ -1149,7 +1189,7 @@ impl NapCat {
 
                 if let Some(raw) = candidate.strip_prefix("base64://") {
                     match base64::engine::general_purpose::STANDARD.decode(raw) {
-                        Ok(bytes) => match write_bytes_to_path(target, &bytes).await {
+                        Ok(bytes) => match write_bytes_to_path(target, bytes).await {
                             Ok(()) => return true,
                             Err(e) => warn!("NapCat base64 媒体落盘失败 ({}): {e}", m.kind.label()),
                         },
@@ -1223,11 +1263,20 @@ impl NapCat {
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
+        if let Some(len) = resp
+            .content_length()
+            .filter(|len| *len > INBOUND_MEDIA_MAX_BYTES)
+        {
+            return Err(format!(
+                "媒体 {len} 字节超过入站上限 {INBOUND_MEDIA_MAX_BYTES} 字节，跳过下载"
+            ));
+        }
 
         let mut file = tokio::fs::File::create(&tmp)
             .await
             .map_err(|e| e.to_string())?;
         let mut stream = resp.bytes_stream();
+        let mut received: u64 = 0;
         while let Some(chunk) = stream.next().await {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
@@ -1236,6 +1285,15 @@ impl NapCat {
                     return Err(e.to_string());
                 }
             };
+            received = received.saturating_add(bytes.len() as u64);
+            if received > INBOUND_MEDIA_MAX_BYTES {
+                // Content-Length 缺失 / 不实时按实际字节兜底。
+                drop(file);
+                cleanup();
+                return Err(format!(
+                    "媒体超过入站上限 {INBOUND_MEDIA_MAX_BYTES} 字节，已中止下载"
+                ));
+            }
             if let Err(e) = file.write_all(&bytes).await {
                 cleanup();
                 return Err(e.to_string());
@@ -1274,7 +1332,7 @@ impl NapCat {
         if let Some(name) = download.name.as_deref() {
             debug!("NapCat Stream 媒体下载完成: {name} -> {}", target.display());
         }
-        write_bytes_to_path(target, &download.bytes).await
+        write_bytes_to_path(target, download.bytes).await
     }
 
     async fn download_file_stream(
@@ -1361,6 +1419,7 @@ impl NapCat {
         api_tx: &mpsc::Sender<String>,
         pending: &PendingMap,
         msg: BusMessage,
+        media_started: &AtomicBool,
     ) -> Result<(), String> {
         let (target, id) = parse_chat_id(&msg.chat_id);
         let action = match target {
@@ -1419,7 +1478,11 @@ impl NapCat {
             );
         }
 
-        // 2) 再逐个发媒体（可选 caption 作为前置文本）。
+        // 2) 再逐个发媒体（可选 caption 作为前置文本）。进入附件阶段先置位进度标记：此后
+        //    连接中断不能再整条重投（见 InFlightOutbound）。
+        if !intents.is_empty() {
+            media_started.store(true, Ordering::Relaxed);
+        }
         for intent in intents {
             if let Some(cap) = intent.caption.as_deref() {
                 if !cap.trim().is_empty() {
@@ -1680,10 +1743,14 @@ impl NapCat {
         api_tx: mpsc::Sender<String>,
         pending: PendingMap,
         msg: BusMessage,
+        media_started: Arc<AtomicBool>,
     ) -> OutboundSend {
         let chat_id = msg.chat_id.clone();
         Box::pin(async move {
-            if let Err(e) = self.send_outbound(&api_tx, &pending, msg).await {
+            if let Err(e) = self
+                .send_outbound(&api_tx, &pending, msg, &media_started)
+                .await
+            {
                 warn!("NapCat 发送失败: {e}");
             }
             chat_id
@@ -1880,7 +1947,7 @@ impl Channel for NapCat {
         let dedup: DedupSet = Arc::new(Mutex::new(HashSet::new()));
         // 同一会话的后续消息已从 outbound 接收端取出，必须跨重连保留；否则断线会使这些
         // 尚未开始发送的消息永久丢失。
-        let mut queued_outbound: HashMap<String, VecDeque<BusMessage>> = HashMap::new();
+        let mut queued_outbound: HashMap<String, VecDeque<QueuedOutbound>> = HashMap::new();
         let mut reconnect_delay = me.cfg.reconnect_delay_sec.max(1);
 
         loop {
@@ -1902,6 +1969,10 @@ impl Channel for NapCat {
                     let (api_tx, mut api_rx) = mpsc::channel::<String>(64);
                     let mut outbound_sends = FuturesUnordered::<OutboundSend>::new();
                     let mut active_outbound_chats = HashSet::new();
+                    // 发送中的消息副本（chat_id → 消息 + 进度）：连接中断时 outbound_sends 连同
+                    // 其中的 BusMessage 一起被丢弃，每个活动会话正在发的那条回复会静默消失。断开后
+                    // 按进度与重投次数决定放回队首重投还是改投提示（见循环末尾）。
+                    let mut in_flight: HashMap<String, InFlightOutbound> = HashMap::new();
 
                     // 重连后先恢复每个会话的一条队首消息；其余消息在该会话当前发送完成后
                     // 按原顺序继续，且不同会话仍可并发。
@@ -1917,12 +1988,15 @@ impl Channel for NapCat {
                             queued_outbound.remove(&chat_id);
                         }
                         if let Some(next) = next {
-                            active_outbound_chats.insert(chat_id);
+                            active_outbound_chats.insert(chat_id.clone());
+                            let media_started = Arc::new(AtomicBool::new(false));
                             outbound_sends.push(me.clone().outbound_send(
                                 api_tx.clone(),
                                 pending.clone(),
-                                next,
+                                next.msg.clone(),
+                                Arc::clone(&media_started),
                             ));
+                            in_flight.insert(chat_id, InFlightOutbound { item: next, media_started });
                         }
                     }
 
@@ -1930,11 +2004,22 @@ impl Channel for NapCat {
                         me.cfg.heartbeat_interval_sec.max(1),
                     ));
                     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    // 读侧空闲检测：心跳只看「写成功」识别不了半开连接——TCP 仍 ESTABLISHED
+                    // 但数据不再流动（切网 / 息屏后 NAT 映射失效、代理后端失联、对端黑洞）时，
+                    // 小帧写入只是进内核发送缓冲、永远"成功"，要等内核 RTO 耗尽（15–30 分钟）
+                    // 甚至永不报错；期间入站全收不到、出站每段 30s 超时后被静默跳过。
+                    // 每次心跳 get_status 都应有回包（任意入站帧都算活）：按「已发出但没等到任何
+                    // 入站帧的心跳数」计数，连续 3 个心跳都没回应即判死重连。不能按墙钟时间算
+                    // ——select 循环被一次大帧写入（base64 内联媒体可达 ~133 MB，慢上行要写几分钟）
+                    // 占住期间根本没发过心跳，写完后用「距上次入站帧的时间」判定会把健康连接误判
+                    // 僵死，白白重连并重发。
+                    let mut unanswered_heartbeats: u32 = 0;
 
                     loop {
                         tokio::select! {
                             chat_id = outbound_sends.next(), if !outbound_sends.is_empty() => {
                                 let chat_id = chat_id.expect("非空 FuturesUnordered 必须返回完成的发送任务");
+                                in_flight.remove(&chat_id);
                                 let next = queued_outbound
                                     .get_mut(&chat_id)
                                     .and_then(VecDeque::pop_front);
@@ -1945,16 +2030,22 @@ impl Channel for NapCat {
                                     queued_outbound.remove(&chat_id);
                                 }
                                 if let Some(next) = next {
+                                    let media_started = Arc::new(AtomicBool::new(false));
                                     outbound_sends.push(me.clone().outbound_send(
                                         api_tx.clone(),
                                         pending.clone(),
-                                        next,
+                                        next.msg.clone(),
+                                        Arc::clone(&media_started),
                                     ));
+                                    in_flight.insert(chat_id, InFlightOutbound { item: next, media_started });
                                 } else {
                                     active_outbound_chats.remove(&chat_id);
                                 }
                             }
                             msg = read.next() => {
+                                if msg.is_some() {
+                                    unanswered_heartbeats = 0;
+                                }
                                 match msg {
                                     Some(Ok(WsMessage::Text(text))) => {
                                         let me2 = me.clone();
@@ -1977,7 +2068,7 @@ impl Channel for NapCat {
                                         });
                                     }
                                     Some(Ok(WsMessage::Ping(data))) => {
-                                        if let Err(e) = write.send(WsMessage::Pong(data)).await {
+                                        if let Err(e) = ws_send_with_timeout(&mut write, WsMessage::Pong(data)).await {
                                             error!("NapCat 回 Pong 失败: {e}");
                                             break;
                                         }
@@ -2001,7 +2092,7 @@ impl Channel for NapCat {
                             req_text = api_rx.recv() => {
                                 match req_text {
                                     Some(t) => {
-                                        if let Err(e) = write.send(WsMessage::Text(t)).await {
+                                        if let Err(e) = ws_send_with_timeout(&mut write, WsMessage::Text(t)).await {
                                             error!("NapCat WS 写失败: {e}");
                                             break;
                                         }
@@ -2014,15 +2105,24 @@ impl Channel for NapCat {
                                     Some(bus) => {
                                         let chat_id = bus.chat_id.clone();
                                         if active_outbound_chats.insert(chat_id.clone()) {
+                                            let media_started = Arc::new(AtomicBool::new(false));
                                             outbound_sends.push(me.clone().outbound_send(
                                                 api_tx.clone(),
                                                 pending.clone(),
-                                                bus,
+                                                bus.clone(),
+                                                Arc::clone(&media_started),
                                             ));
+                                            in_flight.insert(
+                                                chat_id,
+                                                InFlightOutbound {
+                                                    item: QueuedOutbound { msg: bus, requeues: 0 },
+                                                    media_started,
+                                                },
+                                            );
                                         } else {
                                             let queue = queued_outbound.entry(chat_id.clone()).or_default();
                                             if queue.len() < OUTBOUND_CHAT_QUEUE_CAP {
-                                                queue.push_back(bus);
+                                                queue.push_back(QueuedOutbound { msg: bus, requeues: 0 });
                                             } else {
                                                 tracing::error!(
                                                     chat_id = %chat_id,
@@ -2041,15 +2141,65 @@ impl Channel for NapCat {
                             }
                             _ = heartbeat.tick() => {
                                 // 周期探活：发送失败即认定连接已死，跳出重连。
+                                if unanswered_heartbeats >= HEARTBEAT_MAX_UNANSWERED {
+                                    error!(
+                                        "NapCat WS 连续 {unanswered_heartbeats} 次心跳无任何入站帧回应，判定连接僵死，重连"
+                                    );
+                                    break;
+                                }
                                 let hb = json!({ "action": "get_status", "echo": me.next_echo() });
                                 if let Ok(t) = serde_json::to_string(&hb) {
-                                    if let Err(e) = write.send(WsMessage::Text(t)).await {
+                                    if let Err(e) = ws_send_with_timeout(&mut write, WsMessage::Text(t)).await {
                                         error!("NapCat 心跳发送失败: {e}");
                                         break;
                                     }
+                                    unanswered_heartbeats += 1;
                                 }
                             }
                         }
+                    }
+                    // 连接中断：发送中的消息按进度处置——
+                    // - 还没进入附件阶段且重投次数未耗尽：整条放回队首，重连后优先继续
+                    //   （文本已送达时可能重复，本模块接受）；
+                    // - 附件阶段已开始：附件没有幂等键，不能整条重发（会制造重复附件），改投
+                    //   一条提示让用户按需要求重发；
+                    // - 重投次数耗尽（如超出上行能力的大帧每次都写超时）：不再重投，改投同一提示，
+                    //   否则通道会在「断开 → 重连 → 重发 → 再断开」里无限打转。
+                    // 提示消息本身 requeues 置满，再次中断时不会被重投。
+                    for (chat_id, sending) in in_flight.drain() {
+                        let InFlightOutbound { item, media_started } = sending;
+                        let queue = queued_outbound.entry(chat_id.clone()).or_default();
+                        if media_started.load(Ordering::Relaxed) {
+                            warn!(
+                                chat_id = %chat_id,
+                                "NapCat 连接中断时附件正在发送：不自动重发附件，改投提示"
+                            );
+                        } else if item.requeues < OUTBOUND_MAX_REQUEUES {
+                            queue.push_front(QueuedOutbound {
+                                msg: item.msg,
+                                requeues: item.requeues + 1,
+                            });
+                            continue;
+                        } else {
+                            error!(
+                                chat_id = %chat_id,
+                                bytes = item.msg.content.len(),
+                                requeues = item.requeues,
+                                "NapCat 消息重投后仍因连接中断未送达，放弃重投，改投提示"
+                            );
+                        }
+                        if item.msg.content == OUTBOUND_INTERRUPTED_NOTICE {
+                            // 提示本身也发不出去：不再层层叠加提示。
+                            continue;
+                        }
+                        queue.push_front(QueuedOutbound {
+                            msg: BusMessage::new(
+                                item.msg.channel.clone(),
+                                item.msg.chat_id.clone(),
+                                OUTBOUND_INTERRUPTED_NOTICE,
+                            ),
+                            requeues: OUTBOUND_MAX_REQUEUES,
+                        });
                     }
                 }
                 Err(e) => {
@@ -2066,6 +2216,25 @@ impl Channel for NapCat {
 }
 
 // ---------------------------------------------------------------------------
+/// 带超时的 WS 写（[`WS_WRITE_TIMEOUT`] + 按帧大小追加 [`WS_WRITE_SECS_PER_MIB`]）；
+/// 超时同样视为连接已死，由调用方跳出重连。
+async fn ws_send_with_timeout<S>(write: &mut S, msg: WsMessage) -> Result<(), String>
+where
+    S: futures::Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let mib = (msg.len() as u64) / (1024 * 1024);
+    let budget = WS_WRITE_TIMEOUT + Duration::from_secs(mib.saturating_mul(WS_WRITE_SECS_PER_MIB));
+    match timeout(budget, write.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "写入超过 {}s 未完成，判定连接僵死",
+            budget.as_secs()
+        )),
+    }
+}
+
 mod media;
 use media::*;
 

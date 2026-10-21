@@ -325,25 +325,114 @@ pub fn is_valid_chat_id(chat_id: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 界面偏好（`agent/desktop_prefs.json`）：工具禁能开关、标题栏循环标语等
+// 界面偏好（`home/desktop_prefs.json`）：工具禁能开关、标题栏循环标语等
 // 与 rclaw.toml 无关的桌面 UI 偏好。读-改-写保真其它键。
 // ---------------------------------------------------------------------------
 
 /// 偏好文件路径。
+///
+/// 放在 `home` 根下而非 `home/agent/`：`agent/` 是模型文件工具的工作区根（工作区内写入
+/// 免确认，见 rclaw-tools access.rs），而本文件承载 `permission_mode` / `disabled_tools`——
+/// 沙箱策略若存放在被它约束的目录里，模型（被网页/技能内容提示注入即可）写一句
+/// `{"permission_mode":"full"}` 就能单方面关闭「工作区外需确认」的沙箱。
 pub fn prefs_path(home: &std::path::Path) -> PathBuf {
-    home.join("agent").join("desktop_prefs.json")
+    home.join("desktop_prefs.json")
 }
 
-/// 读取整份偏好（文件缺失 / 损坏按空对象处理）。
+/// 旧版路径 `agent/desktop_prefs.json` 里允许带入新文件的键：只迁界面外观类偏好。
+///
+/// `permission_mode` / `disabled_tools` **绝不**从旧路径带入：旧路径在模型可写的工作区里，
+/// 原样搬运等于把「写一句 `{"permission_mode":"full"}` 关沙箱」的口子原封不动留在迁移这一步
+/// （模型只要抢在新文件生成前写出旧文件即可）。这两项按默认值重新开始，用户在「权限」页重设。
+const LEGACY_PREFS_MIGRATED_KEYS: [&str; 4] = ["theme", "slogans", "slogan_interval_secs", "chat_titles"];
+
+/// 旧版路径 `agent/desktop_prefs.json` 一次性迁移到新路径（best-effort）。
+///
+/// 新文件已存在则不动。否则只拷贝 [`LEGACY_PREFS_MIGRATED_KEYS`]，用 `create_new` 落成新文件
+/// （与并发的 [`update_prefs`] 写入相撞时让位，不覆盖刚写好的真实偏好），然后删除旧文件；
+/// 新文件一经落成旧路径便不再被读取，之后模型在工作区里再写出同名文件也不会被当作偏好。
+fn migrate_legacy_prefs(home: &std::path::Path) {
+    use std::io::Write;
+
+    let current = prefs_path(home);
+    if current.exists() {
+        return;
+    }
+    let legacy = home.join("agent").join("desktop_prefs.json");
+    if !legacy.is_file() {
+        return;
+    }
+    let legacy_value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&legacy).unwrap_or_default())
+            .unwrap_or(serde_json::json!({}));
+    let mut migrated = serde_json::Map::new();
+    if let Some(object) = legacy_value.as_object() {
+        for key in LEGACY_PREFS_MIGRATED_KEYS {
+            if let Some(value) = object.get(key) {
+                migrated.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    let materialized = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&current)
+        .and_then(|mut file| {
+            file.write_all(serde_json::Value::Object(migrated).to_string().as_bytes())
+        });
+    match materialized {
+        Ok(()) => {}
+        // 并发写入方已落成新文件：以它为准。
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            // 新文件没建出来 → 旧文件保留、下次读取重试；建出来但没写完 → 下次按已迁移处理，
+            // 只丢外观偏好（沙箱键本就不迁移），不值得为此再引入覆盖式原子写与并发写入方相撞。
+            tracing::warn!(error = %error, "桌面偏好迁移写入失败（仅影响主题 / 标语 / 会话标题）");
+            return;
+        }
+    }
+    if let Err(error) = std::fs::remove_file(&legacy) {
+        tracing::warn!(error = %error, "删除旧版桌面偏好文件失败");
+    }
+}
+
+/// 读取整份偏好（文件缺失 / 损坏 / 非对象按空对象处理）。
 fn read_prefs(home: &std::path::Path) -> serde_json::Value {
-    serde_json::from_str(&std::fs::read_to_string(prefs_path(home)).unwrap_or_default())
-        .unwrap_or(serde_json::json!({}))
+    migrate_legacy_prefs(home);
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(prefs_path(home)).unwrap_or_default())
+            .unwrap_or(serde_json::json!({}));
+    // 合法但非对象的 JSON（`[]`、`"x"`、`1`）：下游 `value["key"] = ...` 的 IndexMut 对非对象
+    // 直接 panic，所有偏好写入命令会在 tauri 任务里炸掉、IPC 永不 resolve。按空对象重建。
+    if value.is_object() {
+        value
+    } else {
+        serde_json::json!({})
+    }
 }
 
 /// 写回整份偏好（调用方负责先读后改，避免覆盖其它键）。
+/// 原子写：`std::fs::write` 先截断再写，安卓看门狗 / OOM 随时可能杀进程，落在窗口内
+/// 整份偏好（含工具禁用、权限模式）会被清零。
 fn write_prefs(home: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
-    std::fs::create_dir_all(home.join("agent")).map_err(|e| e.to_string())?;
-    std::fs::write(prefs_path(home), value.to_string()).map_err(|e| format!("写入偏好失败: {e}"))
+    rclaw_store::atomic_write(prefs_path(home), value.to_string().as_bytes())
+        .map_err(|e| format!("写入偏好失败: {e}"))
+}
+
+/// 读-改-写串行化：Tauri 命令并发执行，两条命令各自 read → 改一个键 → write 会互相
+/// 覆盖对方刚写入的键（快速连点两个工具开关只剩一个生效）。所有写入方都经此函数。
+static PREFS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn update_prefs(
+    home: &std::path::Path,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) -> Result<(), String> {
+    let _guard = PREFS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut value = read_prefs(home);
+    mutate(&mut value);
+    write_prefs(home, &value)
 }
 
 /// 读取被禁用的工具名列表（文件缺失 / 损坏按空处理）。
@@ -361,9 +450,9 @@ pub fn read_disabled_tools(home: &std::path::Path) -> Vec<String> {
 
 /// 写回被禁用的工具名列表（保留偏好文件中的其它键）。
 pub fn write_disabled_tools(home: &std::path::Path, disabled: &[String]) -> Result<(), String> {
-    let mut value = read_prefs(home);
-    value["disabled_tools"] = serde_json::json!(disabled);
-    write_prefs(home, &value)
+    update_prefs(home, |value| {
+        value["disabled_tools"] = serde_json::json!(disabled);
+    })
 }
 
 /// 读取自定义会话名映射（chat_id -> 标题；文件缺失 / 损坏按空处理）。
@@ -384,22 +473,22 @@ pub fn read_chat_titles(home: &std::path::Path) -> std::collections::BTreeMap<St
 /// 自定义标题天然跟随会话。
 pub fn write_chat_title(home: &std::path::Path, chat_id: &str, title: &str) -> Result<(), String> {
     let title = title.trim();
-    let mut value = read_prefs(home);
-    if title.is_empty() {
-        if let Some(map) = value.get_mut("chat_titles").and_then(|t| t.as_object_mut()) {
-            map.remove(chat_id);
+    update_prefs(home, |value| {
+        if title.is_empty() {
+            if let Some(map) = value.get_mut("chat_titles").and_then(|t| t.as_object_mut()) {
+                map.remove(chat_id);
+            }
+        } else {
+            if value
+                .get("chat_titles")
+                .and_then(|t| t.as_object())
+                .is_none()
+            {
+                value["chat_titles"] = serde_json::json!({});
+            }
+            value["chat_titles"][chat_id] = serde_json::json!(title);
         }
-    } else {
-        if value
-            .get("chat_titles")
-            .and_then(|t| t.as_object())
-            .is_none()
-        {
-            value["chat_titles"] = serde_json::json!({});
-        }
-        value["chat_titles"][chat_id] = serde_json::json!(title);
-    }
-    write_prefs(home, &value)
+    })
 }
 
 /// 标题栏标语默认文案（`slogans` 未配置 / 被清空时使用）。
@@ -480,10 +569,10 @@ pub fn write_slogan_prefs(
             "轮播周期须在 {SLOGAN_INTERVAL_MIN_SECS}-{SLOGAN_INTERVAL_MAX_SECS} 秒之间: {interval_secs}"
         ));
     }
-    let mut value = read_prefs(home);
-    value["slogans"] = serde_json::json!(cleaned);
-    value["slogan_interval_secs"] = serde_json::json!(interval_secs);
-    write_prefs(home, &value)
+    update_prefs(home, |value| {
+        value["slogans"] = serde_json::json!(cleaned);
+        value["slogan_interval_secs"] = serde_json::json!(interval_secs);
+    })
 }
 
 /// 读取界面主题；未配置 / 非法值回退 `dark`。
@@ -504,9 +593,9 @@ pub fn write_theme(home: &std::path::Path, theme: &str) -> Result<(), String> {
     if !THEMES.contains(&theme) {
         return Err(format!("未知主题: {theme}（支持 {}）", THEMES.join(" / ")));
     }
-    let mut value = read_prefs(home);
-    value["theme"] = serde_json::json!(theme);
-    write_prefs(home, &value)
+    update_prefs(home, |value| {
+        value["theme"] = serde_json::json!(theme);
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -537,9 +626,9 @@ pub fn write_permission_mode(home: &std::path::Path, mode: &str) -> Result<(), S
             "未知权限模式: {mode}（仅支持 {PERMISSION_MODE_DEFAULT} / {PERMISSION_MODE_FULL}）"
         ));
     }
-    let mut value = read_prefs(home);
-    value["permission_mode"] = serde_json::json!(mode);
-    write_prefs(home, &value)
+    update_prefs(home, |value| {
+        value["permission_mode"] = serde_json::json!(mode);
+    })
 }
 
 
@@ -994,6 +1083,36 @@ mod prefs_tests {
         // 切回 dark 照常。
         write_theme(dir.path(), "dark").unwrap();
         assert_eq!(read_theme(dir.path()), "dark");
+    }
+
+    #[test]
+    fn legacy_prefs_migration_drops_sandbox_keys_and_is_one_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("agent").join("desktop_prefs.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        // 模型在工作区里写出的「旧偏好」：带沙箱键 + 外观键。
+        std::fs::write(
+            &legacy,
+            r#"{"permission_mode":"full","disabled_tools":["shell"],"theme":"light","chat_titles":{"main":"t"}}"#,
+        )
+        .unwrap();
+
+        // 外观键迁入；沙箱键回到默认；旧文件被删除、新文件落成。
+        assert_eq!(read_theme(dir.path()), "light");
+        assert_eq!(
+            read_chat_titles(dir.path()).get("main").map(String::as_str),
+            Some("t")
+        );
+        assert_eq!(read_permission_mode(dir.path()), PERMISSION_MODE_DEFAULT);
+        assert!(read_disabled_tools(dir.path()).is_empty());
+        assert!(!legacy.exists());
+        assert!(prefs_path(dir.path()).is_file());
+
+        // 新文件已存在后，工作区里再出现同名文件不再被读取。
+        std::fs::write(&legacy, r#"{"permission_mode":"full","theme":"dark"}"#).unwrap();
+        assert_eq!(read_permission_mode(dir.path()), PERMISSION_MODE_DEFAULT);
+        assert_eq!(read_theme(dir.path()), "light");
+        assert!(legacy.exists());
     }
 
     #[test]

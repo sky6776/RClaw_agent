@@ -14,8 +14,9 @@ use crate::{Tool, ToolResult};
 use super::control::WebSearchControl;
 use super::render::limit_output;
 use super::types::{
-    normalize_api_key, normalize_base_url, validate_public_http_url, BackendError, BackendId,
-    ReadResponse, ReaderBackend, SearchBackend, SearchHit, SearchRequest, SearchResponse,
+    normalize_api_key, normalize_base_url, read_response_capped, validate_public_http_url,
+    BackendError, BackendId, ReadResponse, ReaderBackend, SearchBackend, SearchHit,
+    SearchRequest, SearchResponse,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.tavily.com";
@@ -139,19 +140,15 @@ impl TavilyClient {
             .await
             .map_err(|error| BackendError::transient(format!("Tavily 请求失败: {error}")))?;
         let status = response.status();
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(BackendError::permanent("Tavily 响应过大"));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| BackendError::transient(format!("Tavily 响应读取失败: {error}")))?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(BackendError::permanent("Tavily 响应过大"));
-        }
+        let bytes = match read_response_capped(response, MAX_RESPONSE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(None) => return Err(BackendError::permanent("Tavily 响应过大")),
+            Err(Some(error)) => {
+                return Err(BackendError::transient(format!(
+                    "Tavily 响应读取失败: {error}"
+                )))
+            }
+        };
         let text = String::from_utf8_lossy(&bytes);
         if !status.is_success() {
             let message = format!(
@@ -316,6 +313,9 @@ impl Tool for TavilyExtract {
                     ToolResult::ok(limit_output(output))
                 }
                 Err(error) => {
+                    // HTTP 已 2xx，这里是逐 URL 的提取失败（failed_results 文案来自目标网页），
+                    // 不能据此把 Tavily 置为 QuotaBlocked。
+                    let error = error.demote_for_reader();
                     self.control.record_error(BackendId::Tavily, &error);
                     ToolResult::err(rclaw_store::redact_sensitive_text(&error.concise()))
                 }

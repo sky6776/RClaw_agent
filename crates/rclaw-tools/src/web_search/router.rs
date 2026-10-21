@@ -391,6 +391,8 @@ impl WebSearch {
                     notices.push(format!("{}：{}", id.label(), error.concise()));
                 }
                 Ok(Err(error)) => {
+                    // 读取失败不按鉴权 / 额度归类（见 BackendError::demote_for_reader）。
+                    let error = error.demote_for_reader();
                     self.control.record_error(id, &error);
                     notices.push(format!("{}：{}", id.label(), safe_error(&error)));
                 }

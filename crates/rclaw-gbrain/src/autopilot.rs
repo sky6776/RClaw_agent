@@ -131,6 +131,15 @@ impl<'a> Autopilot<'a> {
                 std::collections::HashMap::new();
             for (row, embedding) in batch.iter().zip(embeddings) {
                 let existing = self.engine.get_chunk_by_id(row.chunk_id)?;
+                // TOCTOU：快照与网络 embedding 之间页面可能已被重写，upsert 会用快照里的
+                // 旧 chunk_text 覆盖新文本并把 embedded_at 置为 now，导致索引静默回退且
+                // 不再被视为 stale。文本不一致就跳过，等下一轮按新文本重新嵌入。
+                if existing
+                    .as_ref()
+                    .is_none_or(|c| c.chunk_text != row.chunk_text)
+                {
+                    continue;
+                }
                 by_slug
                     .entry(row.slug.clone())
                     .or_default()

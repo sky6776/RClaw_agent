@@ -103,6 +103,54 @@ impl TempOcrDir {
     }
 }
 
+/// 清扫其它（已死）进程遗留的 OCR 临时目录。
+///
+/// 目录只靠 `Drop` 删除，进程被 Android LMK / 用户强杀时 Drop 不会执行，拆分出的子 PDF
+/// （每次最多数百 MB）就永久残留在 APP 私有 tmp 目录里，跨重启无界增长。目录名形如
+/// `{prefix}_{pid}_{id}`，取倒数第二段作为 pid：不等于当前进程且该进程已不存在（Linux /
+/// Android 查 `/proc/{pid}`，其它平台退化为 mtime 超过 1 小时）的目录整体删除。
+pub(crate) fn sweep_orphaned_dirs(prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let self_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(prefix) || !entry.path().is_dir() {
+            continue;
+        }
+        let mut segs = name.rsplit('_');
+        let (Some(_id), Some(pid)) = (segs.next(), segs.next()) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid || !process_is_gone(pid, &entry.path()) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => tracing::info!(dir = %name, "已清扫上次进程遗留的 OCR 临时目录"),
+            Err(e) => tracing::warn!(dir = %name, error = %e, "清扫遗留 OCR 临时目录失败"),
+        }
+    }
+}
+
+fn process_is_gone(pid: u32, dir: &std::path::Path) -> bool {
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        return !std::path::Path::new(&format!("/proc/{pid}")).exists();
+    }
+    // 无法判断进程存活的平台：只清理 1 小时以上没有写入的目录
+    dir.metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age >= std::time::Duration::from_secs(3600))
+}
+
 impl Drop for TempOcrDir {
     fn drop(&mut self) {
         // 仅在目录删除成功后释放已占用预算。
