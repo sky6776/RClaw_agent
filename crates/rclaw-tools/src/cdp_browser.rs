@@ -1453,18 +1453,20 @@ impl CdpBrowser {
             .await?;
         let value = evaluate_string(&reply)?;
         let parsed: Value = serde_json::from_str(&value).map_err(|e| format!("{e}"))?;
-        if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(parsed
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("页面快照失败")
-                .to_string());
-        }
-        Ok(parsed
+        let text = parsed
             .get("text")
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_string())
+            .to_string();
+        if parsed.get("ok").and_then(Value::as_bool) != Some(true) && text.is_empty() {
+            return Err("页面快照失败".to_string());
+        }
+        // ok=false（无可交互元素）不是故障：把 JS 侧的页面说明如实带给模型，
+        // 笼统的「页面快照失败」会把它推向误判；盲区提示两种形态都附。
+        Ok(append_snapshot_hint(
+            text,
+            parsed.get("non_interactive").and_then(Value::as_u64),
+        ))
     }
 
     /// 结构化提取（browser_extract）：只读 DOM 采集原语——按选择器枚举元素，
@@ -2752,7 +2754,30 @@ const PAGE_INFO_JS: &str = "(function(){var href=location.href||'';var text=(doc
 
 /// 紧凑可交互元素清单：给每个可交互/标题元素盖 data-rclaw-ref 章，输出
 /// `[ref] 角色: 文本 → 链接` 扁平列表（模型按 ref 定位操作）。
-const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+text.slice(0,120);if(href)line+=' → '+String(href).slice(0,150);out.push(line);}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素'});})()";
+/// 盲区提示触发阈值：含 ≥30 字文本的非交互元素达到该数量才提示。表单页/
+/// 空白加载页不触发；2026-10-21 华为真机京东结果页 12 张商品卡实测命中。
+const SNAPSHOT_HINT_MIN_NON_INTERACTIVE: u64 = 5;
+
+/// 快照盲区提示：快照只收录可交互元素，「快照看不见」与「页面没有」在返回
+/// 值里无法区分——2026-10-21 京东真机实踩：手机结果页商品卡是无 href 的
+/// div，模型拿快照 0 商品链接当「商品接口软返空」证据收尾，页面实有 12 张
+/// 可提取卡片。在快照尾部如实标注这批内容的存在与出路，让误判在工具返回
+/// 值内部就被反驳，而不是依赖技能文本里的远处规则。
+fn append_snapshot_hint(text: String, non_interactive: Option<u64>) -> String {
+    let Some(n) = non_interactive else {
+        return text;
+    };
+    if n < SNAPSHOT_HINT_MIN_NON_INTERACTIVE {
+        return text;
+    }
+    format!(
+        "{text}\n\n提示：本页另有 {n} 处含文本的非交互内容（图文卡片/数据行/文章段落等），\
+         本快照只收录可交互元素、看不到它们——判定「页面是否为空、有没有目标内容」\
+         请用 browser_extract 按 CSS 选择器提取，不要以本快照为准。"
+    )
+}
+
+const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+text.slice(0,120);if(href)line+=' → '+String(href).slice(0,150);out.push(line);}var ni=0;try{var skip={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1};var all=document.body?document.body.querySelectorAll('*'):[];for(var j=0;j<all.length;j++){var e=all[j];if(skip[e.tagName]||e.childElementCount>0)continue;if(e.closest&&e.closest('a,button,input,textarea,select,[role],[onclick]'))continue;if(clean(e.textContent||'').length>=30)ni++;}}catch(e2){}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素',non_interactive:ni});})()";
 
 /// 媒体资源提取（browser_media）：img + video（含 source 子元素）+ og 元信息，
 /// 按 DOM 顺序统一遍历后再限量 40 条（分开遍历会让图片先耗尽配额、视频整页
@@ -3109,7 +3134,7 @@ pub struct BrowserSnapshotTool {
 browser_tool_impl!(
     BrowserSnapshotTool,
     "browser_snapshot",
-    "CDP 浏览器：列出当前页面可交互元素（链接/按钮/输入框/标题），每项带 [ref] 编号。browser_click / browser_type 按 ref 定位。页面跳转后 ref 失效，需重新快照。",
+    "CDP 浏览器：列出当前页面可交互元素（链接/按钮/输入框/标题），每项带 [ref] 编号。browser_click / browser_type 按 ref 定位。页面跳转后 ref 失效，需重新快照。页面存在大量非交互内容（图文卡片/数据行等）时快照尾部附盲区提示：判定页面是否为空、有没有目标内容，以 browser_extract 的提取结果为准。",
     async fn execute(&self, _input: Value) -> ToolResult {
         match self.browser.snapshot().await {
             Ok(text) => ToolResult::ok(text),
@@ -3747,6 +3772,20 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await;
         assert!(result.is_error);
         assert!(result.content.contains("unreachable"));
+    }
+
+    #[test]
+    fn snapshot_hint_appended_only_above_threshold() {
+        let base = "共 3 项\n[1] link: 示例".to_string();
+        // 字段缺失（旧内核返回体不含 non_interactive）与阈值下：原文返回。
+        assert_eq!(append_snapshot_hint(base.clone(), None), base);
+        assert_eq!(append_snapshot_hint(base.clone(), Some(0)), base);
+        assert_eq!(append_snapshot_hint(base.clone(), Some(4)), base);
+        // 阈值上：保留原文、附提示，提示点名 browser_extract 与数量。
+        let above = append_snapshot_hint(base.clone(), Some(12));
+        assert!(above.starts_with(&base));
+        assert!(above.contains("browser_extract"), "{above}");
+        assert!(above.contains("12"), "{above}");
     }
 }
 
