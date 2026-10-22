@@ -143,44 +143,56 @@ pub fn extract_markdown_metadata(content: &str, _raw_data: &[u8]) -> DocumentMet
 pub fn extract_pdf_metadata(_content: &str, raw_data: &[u8]) -> DocumentMetadata {
     let mut meta = DocumentMetadata::default();
 
-    // 尝试解析 PDF Info dictionary（先做嵌套深度预扫描，避免 lopdf 递归栈溢出）
-    if crate::kb::parser::pdf::check_pdf_nesting_depth(raw_data).is_err() {
+    // 与 PdfParser 同一加载策略（整份加载；不用 lopdf 的 metadata-only 读取——其 Pages 树计数是
+    // 无深度上限的递归，恶意长链 Kids 可把栈打爆）；解析失败一律返回空元数据，由上层回退到文件名等信息。
+    let Ok(doc) = crate::kb::parser::pdf::load_document(raw_data) else {
         return meta;
-    }
-    if let Ok(doc) = lopdf::Document::load_mem(raw_data) {
-        // 读取 PDF Info 字典
-        if let Ok(lopdf::Object::Dictionary(info_dict)) = doc.trailer.get(b"Info").cloned() {
-            if let Some(title) = get_pdf_str(&info_dict, b"Title") {
-                meta.title = Some(title);
-            }
-            if let Some(author) = get_pdf_str(&info_dict, b"Author") {
-                meta.author = Some(author);
-            }
-            if let Some(subject) = get_pdf_str(&info_dict, b"Subject") {
-                if meta.keywords.is_none() {
-                    meta.keywords = Some(subject);
-                }
-            }
-            if let Some(kw) = get_pdf_str(&info_dict, b"Keywords") {
-                meta.keywords = Some(kw);
-            }
-            if let Some(date) = get_pdf_str(&info_dict, b"CreationDate") {
-                meta.document_date = Some(date);
+    };
+    // Info 字典可为 trailer 内直接字典，更常见的是间接引用
+    let info_dict = doc
+        .trailer
+        .get(b"Info")
+        .ok()
+        .and_then(|info| match info {
+            lopdf::Object::Dictionary(dict) => Some(dict),
+            lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok(),
+            _ => None,
+        });
+    if let Some(info_dict) = info_dict {
+        if let Some(title) = get_pdf_str(info_dict, b"Title") {
+            meta.title = Some(title);
+        }
+        if let Some(author) = get_pdf_str(info_dict, b"Author") {
+            meta.author = Some(author);
+        }
+        if let Some(subject) = get_pdf_str(info_dict, b"Subject") {
+            if meta.keywords.is_none() {
+                meta.keywords = Some(subject);
             }
         }
-        // 总页数
-        meta.page_count = doc.page_iter().count() as i32;
+        if let Some(kw) = get_pdf_str(info_dict, b"Keywords") {
+            meta.keywords = Some(kw);
+        }
+        if let Some(date) = get_pdf_str(info_dict, b"CreationDate") {
+            meta.document_date = Some(date);
+        }
     }
+    // 总页数：get_pages() 走迭代式、带深度上限的 Pages 树遍历
+    meta.page_count = doc.get_pages().len() as i32;
 
     meta
 }
 
+/// 读取 Info 字典的文本串：按 PDF 文本串规则解码（PDFDocEncoding / UTF-16BE / UTF-8 BOM），
+/// 名字对象按 UTF-8 兜底；空串视为缺失
 fn get_pdf_str(dict: &lopdf::Dictionary, key: &[u8]) -> Option<String> {
-    dict.get(key).ok().and_then(|obj| match obj {
-        lopdf::Object::String(s, _) => String::from_utf8(s.clone()).ok(),
+    let value = dict.get(key).ok().and_then(|obj| match obj {
+        lopdf::Object::String(..) => lopdf::decode_text_string(obj).ok(),
         lopdf::Object::Name(name) => String::from_utf8(name.clone()).ok(),
         _ => None,
-    })
+    })?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// 从 DOCX 原始数据提取元数据（core.xml properties）

@@ -67,9 +67,8 @@ fn generate_split_bytes(
     source_start_page: i32,
     source_end_page: i32,
 ) -> Result<(Vec<u8>, i32)> {
-    crate::kb::parser::pdf::check_pdf_nesting_depth(source_pdf)?;
-    let mut doc = lopdf::Document::load_mem(source_pdf)
-        .map_err(|e| GBrainError::FileError(format!("PDF 加载失败: {}", e)))?;
+    // 与 PdfParser 同一加载策略（lopdf 0.42 内置嵌套深度等防护，加密文档空口令重试）
+    let mut doc = crate::kb::parser::pdf::load_document(source_pdf)?;
 
     let pages = doc.get_pages();
     let total_pages = pages.len() as i32;

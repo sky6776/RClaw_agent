@@ -21,14 +21,16 @@ tracing-subscriber = { workspace = true }
 calamine = { version = "0.26", features = ["picture"] }
 csv = "1"
 dirs = "6"
-# PDF 预扫描按 lopdf 的解码路径限额解压流内容（二者本就是 lopdf 的传递依赖）
-flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 html2text = "0.13"
 infer = "0.16"
 jieba-rs = "0.7"
-lopdf = "0.34"
+# PDF：与 rclaw-tools 的 read 工具同一引擎——pdf-inspector 负责加载/提取/OCR 路由信号，
+# lopdf（pdf-inspector 的同版底层库）只用于字典级页几何统计、元数据读取和 OCR 拆分保存。
+# 只用默认 features（纯 Rust）；绝不开 pdf-inspector 的 ocr feature——拉 PDFium/ONNX C 依赖。
+lopdf = "0.42"
+pdf-inspector = { workspace = true }
 pinyin = "0.10"
 pulldown-cmark = "0.12"
 quick-xml = "0.37"
@@ -49,7 +51,6 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
 unicode-normalization = "0.1"
-weezl = "0.1"
 zip = "2"
 
 [dev-dependencies]
