@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rclaw_core::{ChatRequest, Message, Role};
+use rclaw_core::{ChatRequest, ContentBlock, Message, Role};
 use rclaw_llm::Provider;
 use rclaw_store::fs::Layout;
 use rclaw_store::memory::MemoryStore;
@@ -446,6 +446,7 @@ impl HistoryLoader {
                 self.opts.max_history_bytes,
             )
             .map(fold_compaction_view)
+            .map(expand_workflow_history)
             .map(|messages| HistoryLoad::Messages(LoadedHistory::unverified(messages)))
             .map_err(|e| e.to_string())
     }
@@ -470,6 +471,22 @@ impl HistoryLoader {
     }
 }
 
+/// 历史里的 `/workflow` 原文在请求视图里展开成模型 prompt（持久化与展示仍是原文）。
+pub(crate) fn expand_workflow_history(mut messages: Vec<Message>) -> Vec<Message> {
+    for message in &mut messages {
+        if message.role != Role::User || message.content.len() != 1 {
+            continue;
+        }
+        let ContentBlock::Text { text } = &message.content[0] else {
+            continue;
+        };
+        if let Some(expanded) = super::expand_persisted_workflow_message(text) {
+            message.content[0] = ContentBlock::Text { text: expanded };
+        }
+    }
+    messages
+}
+
 /// 完整活动视图 → 请求视图的裁剪规则（[`HistoryLoader::load`] 不压缩时的返回形态，
 /// `/context` 用量估算同一口径）。
 pub(crate) fn trim_request_view(full: Vec<Message>, opts: &AgentOptions) -> LoadedHistory {
@@ -488,6 +505,7 @@ pub(crate) fn trim_request_view(full: Vec<Message>, opts: &AgentOptions) -> Load
     } else {
         trim_history_for_request(full, opts.max_history, opts.max_history_bytes)
     };
+    let messages = expand_workflow_history(messages);
     // 裁剪只从前面丢（条数上限 / 字节上限 / 开头的 tool_result 载体），丢掉的条数即前缀长度。
     let dropped = full_len.saturating_sub(messages.len());
     let trimmed_summary = latest_summary
@@ -527,7 +545,6 @@ pub(crate) fn load_request_view_uncompressed(
 }
 
 impl HistoryLoader {
-
     /// 压缩尾窗策略（加载期 / 轮内 / `/compact` 共用一份口径；轮内按视图来源可再覆盖
     /// `protect_first`）。
     pub(super) fn tail_policy(&self, keep_recent: usize) -> TailPolicy {
@@ -1052,9 +1069,8 @@ impl HistoryLoader {
             .lock()
             .expect("compression_state 锁未被毒化");
         let st = map.entry(key.clone()).or_default();
-        st.cooldown_until = Some(
-            Instant::now() + Duration::from_secs(self.opts.compression_failure_cooldown_secs),
-        );
+        st.cooldown_until =
+            Some(Instant::now() + Duration::from_secs(self.opts.compression_failure_cooldown_secs));
         st.cooldown_cause = cause;
     }
 
@@ -1177,7 +1193,11 @@ mod anchor_checkpoint_tests {
         }
         for id in 5..=14 {
             let mut message = Message::plain(
-                if id % 2 == 1 { Role::User } else { Role::Assistant },
+                if id % 2 == 1 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
                 format!("消息 {id}"),
             );
             message.id = id;
@@ -1204,11 +1224,15 @@ mod anchor_checkpoint_tests {
         let pruned = super::super::in_turn::microcompact_view(&full, &opts(0, true));
         let raw_bytes = history_serialized_bytes(&full);
         let pruned_bytes = history_serialized_bytes(&pruned);
-        assert!(pruned_bytes * 2 < raw_bytes, "剪枝应显著缩小请求体量：{pruned_bytes} vs {raw_bytes}");
+        assert!(
+            pruned_bytes * 2 < raw_bytes,
+            "剪枝应显著缩小请求体量：{pruned_bytes} vs {raw_bytes}"
+        );
 
         // 上限介于两者之间：按剪枝视图量 → 完整；关掉 microcompact 按原始字节量 → 裁成后缀。
         let limit = (raw_bytes + pruned_bytes) / 2;
-        let HistoryLoad::Messages(view) = loader_with(&opts(limit, true)).trim_full_view(full.clone())
+        let HistoryLoad::Messages(view) =
+            loader_with(&opts(limit, true)).trim_full_view(full.clone())
         else {
             panic!("trim 不会取消");
         };
@@ -1226,7 +1250,8 @@ mod anchor_checkpoint_tests {
         let limit = history_serialized_bytes(&pruned[8..]);
         let expected_kept = trim_history_for_request(pruned.clone(), 100, limit).len();
         assert!(expected_kept >= 1 && expected_kept < full.len());
-        let HistoryLoad::Messages(view) = loader_with(&opts(limit, true)).trim_full_view(full.clone())
+        let HistoryLoad::Messages(view) =
+            loader_with(&opts(limit, true)).trim_full_view(full.clone())
         else {
             panic!("trim 不会取消");
         };
@@ -1234,10 +1259,14 @@ mod anchor_checkpoint_tests {
         assert_eq!(view.messages.len(), expected_kept);
         assert_eq!(
             view.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
-            full[full.len() - expected_kept..].iter().map(|m| m.id).collect::<Vec<_>>()
+            full[full.len() - expected_kept..]
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
-            view.messages, full[full.len() - expected_kept..],
+            view.messages,
+            full[full.len() - expected_kept..],
             "保留的是原始正文，不是剪枝后的"
         );
 
@@ -1247,15 +1276,23 @@ mod anchor_checkpoint_tests {
             session.append("cli", "console", message).unwrap();
         }
         let limit = (raw_bytes + pruned_bytes) / 2;
-        let view = load_request_view_uncompressed(&session, &opts(limit, true), "cli", "console")
-            .unwrap();
-        assert_eq!(view.len(), full.len(), "/context 不该把 turn 实际会带上的历史估少");
+        let view =
+            load_request_view_uncompressed(&session, &opts(limit, true), "cli", "console").unwrap();
+        assert_eq!(
+            view.len(),
+            full.len(),
+            "/context 不该把 turn 实际会带上的历史估少"
+        );
         let disabled = AgentOptions {
             session_compression_enabled: false,
             ..opts(limit, true)
         };
-        let raw_view = load_request_view_uncompressed(&session, &disabled, "cli", "console").unwrap();
-        assert!(raw_view.len() < full.len(), "压缩关闭时与 load_trimmed 同口径（原始字节）");
+        let raw_view =
+            load_request_view_uncompressed(&session, &disabled, "cli", "console").unwrap();
+        assert!(
+            raw_view.len() < full.len(),
+            "压缩关闭时与 load_trimmed 同口径（原始字节）"
+        );
     }
 
     /// Layer 5 主 turn 检查点：usage 锚点落库后，【新构造的 loader】（模拟进程重启、
@@ -1271,9 +1308,7 @@ mod anchor_checkpoint_tests {
             cron_job_id: None,
         };
         let mut anchor_message = Message::plain(Role::User, "anchor message");
-        anchor_message.id = session
-            .append("cli", "console", &anchor_message)
-            .unwrap();
+        anchor_message.id = session.append("cli", "console", &anchor_message).unwrap();
         let follow_up = Message::plain(Role::Assistant, "ok");
 
         let loader_a = loader(&session, &layout);

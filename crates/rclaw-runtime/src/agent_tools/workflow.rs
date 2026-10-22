@@ -21,16 +21,23 @@
 //! 提交期 facade 检查：QuickJS 语法探针 + 禁用模式扫描（只扫代码，跳过字符串与注释）+
 //! 可选 tsc 类型级检查（与引擎同一包装；宿主无 node/tsc 时静默降级）。
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use rquickjs::{AsyncContext, AsyncRuntime, Context, Function, Runtime};
+use rclaw_core::ToolAccess;
+
 use rquickjs::prelude::Async as AsyncFn;
+use rquickjs::{AsyncContext, AsyncRuntime, Context, Function, Runtime};
 use serde_json::{json, Value};
 
-use super::subagent::get_str;
+use super::workflow_effects::{BeginEffect, EffectTracker};
+use super::workflow_paths::{self, resolve_under, WorkflowPaths};
+use super::workflow_snapshot;
+use super::workflow_store::{WorkflowStore, STOP_PERMISSION_REVOKED};
+use super::workflow_world;
 use super::*;
 
 /// 引擎沙箱的内存上限（QuickJS 级，防脚本失控）。
@@ -39,42 +46,98 @@ const ENGINE_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 /// 结算、顺序门放行时重置）。整个 run 的时长另由墙钟预算 `max_run_secs` 约束。
 const ENGINE_SLICE_BUDGET: Duration = Duration::from_secs(120);
 /// 整体墙钟预算：默认 1h，入参 `max_run_secs` 可调（硬顶 24h），超时按 run_failed 收尾。
-const DEFAULT_MAX_RUN_SECS: u64 = 60 * 60;
-const MAX_MAX_RUN_SECS: u64 = 24 * 60 * 60;
-/// 取消 / 超时后给子代理优雅收尾（经 cancel token 退出）的宽限期，到期放弃引擎。
+pub(crate) const DEFAULT_MAX_RUN_SECS: u64 = 60 * 60;
+pub(crate) const MAX_MAX_RUN_SECS: u64 = 24 * 60 * 60;
+/// 取消 / 超时后给子代理优雅收尾（经 cancel token 退出）的宽限期，到期置 halt 终止 JS。
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
+/// 片预算中断后留给包装层 reject 回调上报的宽限：之后不再发新片，引擎在下一个 job 边界停下
+/// （否则脚本 `.catch` 掉中断错误再起一条紧循环，每条都能拿到整片预算，直到墙钟耗尽）。
+const INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+/// 置 halt 后等中断处理器在下一个轮询点终止 JS 的上限。
+const HALT_GRACE: Duration = Duration::from_secs(2);
 /// 并行 ask 上限（`Promise.all` 扇出的信号量许可数；default 8，硬顶 16——第十二轮
 /// 4/8 → 8/16：与 PlanRun 波次上限同一轮提升，大规模并行的直接闸门；ask 的子代理
 /// 模型请求仍由 `subagent_request_stagger` 错峰）。
-const DEFAULT_MAX_PARALLEL_ASKS: u32 = 8;
-const MAX_MAX_PARALLEL_ASKS: u32 = 16;
+pub(crate) const DEFAULT_MAX_PARALLEL_ASKS: u32 = 8;
+pub(crate) const MAX_MAX_PARALLEL_ASKS: u32 = 16;
 /// 单次 ask 的子代理工具迭代上限（对齐计划步骤的收敛口径）。
 const WORKFLOW_ASK_MAX_TOOL_ITER: usize = 64;
-const MAX_SCRIPT_CHARS: usize = 100_000;
+pub(crate) const MAX_SCRIPT_CHARS: usize = 100_000;
 const MAX_QUESTION_CHARS: usize = 4_000;
+/// `agent(name)` 的 actor 名上限（进每条 ask/answer 事件与调用点身份；与 hole 名同口径）。
+const MAX_ACTOR_CHARS: usize = 100;
+/// `agent(name, {system})` 的 persona 上限（与问题一起拼进子代理 task）。
+const MAX_PERSONA_CHARS: usize = 8_000;
+/// `agent(name, {model})` 的模型名上限。
+const MAX_MODEL_CHARS: usize = 200;
+/// 脚本返回值 / 抛错文本的上限（进 run_completed 与工具结果）。
+const MAX_SCRIPT_RESULT_CHARS: usize = 256 * 1024;
+/// 同时执行的 effect（files / git / world / artifact）上限：单个结果最大 2MiB，一次扇出
+/// 1024 个 `files.read` 会把 2GiB 内容同时压在内存里。超出的在宿主侧排队等许可（引擎停驻，
+/// 不计入片预算），不是报错。
+const MAX_INFLIGHT_EFFECTS: usize = 32;
 const MAX_ANSWER_CHARS: usize = 4_000;
+/// 宿主回调入参（files/git/world/artifact 的 JSON payload、askJson 的 schema）上限：
+/// 脚本把 2e7 字符的字符串塞进 payload，宿主侧 `from_str` + clone 会先把内存撑爆。
+const MAX_HOST_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// 同一引擎在途（已发起、未结算）的 async 宿主调用上限。rquickjs 的 `Async` 包装在 JS 调用
+/// 当场构造 future 排进 spawner，要到当前 job 结束后的扫描才首次 poll：不 `await` 的 `for`
+/// 循环能在一片之内排出无界的 future 队列（每个都带一份入参）。超限的调用在同步段就被拒绝、
+/// 不捕获入参；入参本身到首次 poll 才拷到 Rust 堆（排队期间只持 QuickJS 句柄，受 64MiB 限额）。
+const MAX_PENDING_HOST_CALLS: usize = 1_024;
+/// 单次执行里 `ask` 的发起次数上限：每次发起都是一条 journal 事件（≤4K 字符的问题），
+/// `log` / `phase` / effect 都有同类上限；在占调用点编号之前拒绝，不影响重放编号。
+const MAX_ASKS_PER_EXEC: u64 = 10_000;
 
 /// facade 声明（.d.ts 语义的文本形态）：脚本契约一览，随诊断一并回给模型。
 pub(crate) const FACADE_DTS: &str = r#"
-// WorkflowRun 脚本可用的全局 facade（确定性沙箱，无模块加载）。
+// workflow 脚本可用的全局 facade（确定性沙箱，无模块加载）。
 // 可用：await / Promise.all / while / try-catch（脚本被包进 async IIFE）。
-// 禁用：Date() 取当前时间 / Math.random 赋值 / import / eval / Function 构造 / require /
-//       setTimeout / setInterval / process —— 提交前静态检查（只扫代码，不扫字符串与注释）直接拒绝。
-declare function agent(name: string): {
-  /** 向子代理提问并等待回答（promise）。问题文本即输入指纹（inputHash）。 */
-  ask(question: string): Promise<string>;
-  /**
-   * 类型化 ask：内联类型注解编译成 JSON Schema 校验答案（答案按 JSON 解析后返回对象；
-   * ask<string> 与 ask(question) 同义，答案原文返回）。
-   * 支持 string / number / boolean / null / 字面量 / 联合 / 数组（T[] 或 Array<T>）/
-   * 对象字面量 / 脚本顶层 type 别名（可带泛型参数，引用处实例化）；恰好一个类型参数；
-   * any 不允许（用具体类型或 unknown）。
-   */
+// 禁用：Date.now / Math.random 赋值 / import / eval / Function / require /
+//       setTimeout / setInterval / process（提交前静态检查 + 沙箱双层拒绝）。
+
+declare const args: Readonly<Record<string, unknown>>;
+
+declare function agent(name: string, persona?: { model?: string; system?: string }): {
   ask<T = string>(question: string): Promise<T>;
-  /** 同 ask<T>，但 schema 以 JSON Schema 子集作为第二参数显式传入。 */
   askJson<T = any>(question: string, schema: object): Promise<T>;
 };
+
+declare function log(message: string): void;
+declare function phase(name: string): void;
+declare function report(item: unknown): void;
 declare function result(text: string): void;
+
+declare const files: {
+  glob(pattern: string): Promise<string[]>;
+  read(path: string): Promise<string>;
+  grep(pattern: string, glob?: string): Promise<Array<{ path: string; line: number; text: string }>>;
+};
+
+declare const git: {
+  status(): Promise<{ branch?: string; clean: boolean; staged: string[]; modified: string[]; untracked: string[] }>;
+  diff(path?: string): Promise<string>;
+};
+
+declare const world: {
+  run(command: string, opts?: { cwd?: string; idempotency_key?: string }): Promise<{
+    exit_code: number; stdout: string; stderr: string; timed_out?: boolean;
+  }>;
+};
+
+interface ArtifactOptions { title?: string; description?: string; primary?: boolean; contentType?: string }
+interface ArtifactRef { id: string; version: number }
+
+declare const artifact: {
+  file(id: string, path: string, opts?: ArtifactOptions): Promise<ArtifactRef>;
+  markdown(id: string, content: string, opts?: ArtifactOptions): Promise<ArtifactRef>;
+  table(id: string, rows: unknown, opts?: ArtifactOptions): Promise<ArtifactRef>;
+  chart(id: string, spec: { type?: "bar" | "line"; title?: string; data: Array<{ label?: string; value: number }> }, opts?: ArtifactOptions): Promise<ArtifactRef>;
+  metrics(id: string, metrics: unknown, opts?: ArtifactOptions): Promise<ArtifactRef>;
+  board(id: string, columns: Array<{ title: string; items: unknown[] }>, opts?: ArtifactOptions): Promise<ArtifactRef>;
+};
+
+declare function hole<T = string>(name: string, prompt?: string): Promise<T>;
 "#;
 
 /// 一条 facade 诊断（行/列从 1 计）。
@@ -89,9 +152,15 @@ pub(crate) struct FacadeDiagnostic {
 /// 提交期的二道防线）。只在代码上匹配（字符串/注释已遮蔽），且要求模式前（以及以标识符
 /// 结尾的模式后）不是标识符字符——`formatDate(` / `myeval(` 不会误报。
 const BANNED_PATTERNS: &[(&str, &str)] = &[
-    ("Date.now", "时间必须确定：脚本内禁用 Date.now（沙箱已钉死为固定纪元）"),
+    (
+        "Date.now",
+        "时间必须确定：脚本内禁用 Date.now（沙箱已钉死为固定纪元）",
+    ),
     ("Date.prototype", "禁用 Date.prototype（沙箱已钉死时间源）"),
-    ("Date(", "时间必须确定：脚本内禁用 Date() / new Date()（沙箱已钉死为固定纪元）"),
+    (
+        "Date(",
+        "时间必须确定：脚本内禁用 Date() / new Date()（沙箱已钉死为固定纪元）",
+    ),
     ("Math.random =", "禁用改写 Math.random（沙箱已钉死并冻结）"),
     ("eval", "禁用 eval（动态求值，沙箱已拆除）"),
     ("Function(", "禁用 Function 构造（动态求值，沙箱已拆除）"),
@@ -274,12 +343,15 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
 }
 
 /// 带超时地运行外部命令；超时 kill 子进程并返回 None。
-fn run_with_timeout(
+pub(crate) fn run_with_timeout(
     mut command: std::process::Command,
     timeout: Duration,
 ) -> Option<std::process::Output> {
     use std::process::Stdio;
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn().ok()?;
     let stdout = drain_pipe(child.stdout.take());
     let stderr = drain_pipe(child.stderr.take());
@@ -485,16 +557,15 @@ fn json_schema_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Object(left), Value::Object(right)) => {
             left.len() == right.len()
-                && left
-                    .iter()
-                    .all(|(key, value)| right.get(key).is_some_and(|other| json_schema_equal(value, other)))
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| json_schema_equal(value, other))
+                })
         }
         (Value::Array(left), Value::Array(right)) => {
             left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(m, n)| json_schema_equal(m, n))
+                && left.iter().zip(right).all(|(m, n)| json_schema_equal(m, n))
         }
         _ => scalar_numeric_equal(a, b),
     }
@@ -577,7 +648,10 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
         }
     }
     if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
-        if !variants.iter().any(|variant| json_schema_equal(variant, value)) {
+        if !variants
+            .iter()
+            .any(|variant| json_schema_equal(variant, value))
+        {
             return Err(format!(
                 "枚举不符：期望 {} 之一，实际 {value}",
                 serde_json::to_string(variants).unwrap_or_default()
@@ -604,7 +678,10 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
             };
         }
         if !matched {
-            return Err(format!("类型不符：期望 {}，实际 {value}", expected.join("|")));
+            return Err(format!(
+                "类型不符：期望 {}，实际 {value}",
+                expected.join("|")
+            ));
         }
     }
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
@@ -631,9 +708,7 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
     if let Some(prefix_items) = schema.get("prefixItems").and_then(Value::as_array) {
         if let Some(array) = value.as_array() {
             // 定长元组：前缀按位校验；min/maxItems 约束长度。
-            for (index, (item, subschema)) in
-                array.iter().zip(prefix_items.iter()).enumerate()
-            {
+            for (index, (item, subschema)) in array.iter().zip(prefix_items.iter()).enumerate() {
                 validate_json_schema(item, subschema, depth + 1)
                     .map_err(|error| format!("[{index}]: {error}"))?;
             }
@@ -655,14 +730,20 @@ fn validate_json_schema(value: &Value, schema: &Value, depth: usize) -> Result<(
     if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64) {
         if let Some(array) = value.as_array() {
             if array.len() < min_items as usize {
-                return Err(format!("数组长度不足：期望 ≥ {min_items}，实际 {}", array.len()));
+                return Err(format!(
+                    "数组长度不足：期望 ≥ {min_items}，实际 {}",
+                    array.len()
+                ));
             }
         }
     }
     if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64) {
         if let Some(array) = value.as_array() {
             if array.len() > max_items as usize {
-                return Err(format!("数组超长：期望 ≤ {max_items}，实际 {}", array.len()));
+                return Err(format!(
+                    "数组超长：期望 ≤ {max_items}，实际 {}",
+                    array.len()
+                ));
             }
         }
     }
@@ -752,6 +833,27 @@ pub(crate) struct DependencyGraph {
     pub(crate) edges: Vec<(String, String)>,
     /// 拓扑波次：同一波内的节点可并行（无内部边）。
     pub(crate) waves: Vec<Vec<String>>,
+    /// 节点 / 边超过上限被截断（相邻两波全连是 |prev|×|next| 条边，100k 字符的脚本能
+    /// 造出上亿条；洞察随 run_started 入 journal，必须有界）。截断后只保留前若干节点、不连边。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) truncated: bool,
+}
+
+/// 依赖图节点 / 边上限（观测用洞察，超限截断而不是拒绝脚本）。
+pub(crate) const MAX_GRAPH_NODES: usize = 512;
+pub(crate) const MAX_GRAPH_EDGES: usize = 8_192;
+
+impl DependencyGraph {
+    /// 节点超限：只保留前 `MAX_GRAPH_NODES` 个节点，不连边、不分层，标记截断。
+    pub(crate) fn truncated(mut nodes: Vec<DependencyNode>) -> Self {
+        nodes.truncate(MAX_GRAPH_NODES);
+        DependencyGraph {
+            nodes,
+            edges: Vec::new(),
+            waves: Vec::new(),
+            truncated: true,
+        }
+    }
 }
 
 /// 依赖图静态分析（第十二轮起 AST 优先，文本解析降级）：
@@ -795,8 +897,8 @@ fn text_parse_dependency_graph(script: &str) -> DependencyGraph {
             }
         }
         if in_wave {
-            wave_depth += depth_scope.matches('(').count() as i32
-                - depth_scope.matches(')').count() as i32;
+            wave_depth +=
+                depth_scope.matches('(').count() as i32 - depth_scope.matches(')').count() as i32;
             wave_depth = wave_depth.max(0);
         }
         for mut node in asks_on_line(line, &bindings, line_no) {
@@ -808,11 +910,15 @@ fn text_parse_dependency_graph(script: &str) -> DependencyGraph {
         }
     }
 
+    if nodes.len() > MAX_GRAPH_NODES {
+        return DependencyGraph::truncated(nodes);
+    }
     // 边：相邻 ask/wave 之间按行序连边（前一波每个出口 → 后一波每个入口）。
     let mut edges: Vec<(String, String)> = Vec::new();
+    let mut truncated = false;
     let mut last_boundary: Vec<String> = Vec::new(); // 上一个「波/节点」的全部出口
     let mut i = 0usize;
-    while i < nodes.len() {
+    'edges: while i < nodes.len() {
         let wave: Vec<usize> = if nodes[i].parallel {
             // 收集同一波的连续并行节点。
             let mut group = vec![i];
@@ -827,10 +933,17 @@ fn text_parse_dependency_graph(script: &str) -> DependencyGraph {
         };
         for &member in &wave {
             for prev in &last_boundary {
+                if edges.len() >= MAX_GRAPH_EDGES {
+                    truncated = true;
+                    break 'edges;
+                }
                 edges.push((prev.clone(), nodes[member].id.clone()));
             }
         }
-        last_boundary = wave.iter().map(|&member| nodes[member].id.clone()).collect();
+        last_boundary = wave
+            .iter()
+            .map(|&member| nodes[member].id.clone())
+            .collect();
         i = wave.last().copied().unwrap_or(i) + 1;
     }
 
@@ -841,6 +954,7 @@ fn text_parse_dependency_graph(script: &str) -> DependencyGraph {
         nodes,
         edges,
         waves,
+        truncated,
     }
 }
 
@@ -864,11 +978,7 @@ fn parse_agent_binding(rest: &str) -> Option<(String, String)> {
 
 /// 解析一行内的 ask 调用点（`<handle>.ask(...)` / `<handle>.askJson(...)`，可多个，
 /// 逗号/括号分隔均可——只提取句柄与行号，不解析参数）。
-fn asks_on_line(
-    line: &str,
-    bindings: &[(String, String)],
-    line_no: usize,
-) -> Vec<DependencyNode> {
+fn asks_on_line(line: &str, bindings: &[(String, String)], line_no: usize) -> Vec<DependencyNode> {
     let mut nodes = Vec::new();
     let mut search_from = 0usize;
     while let Some(found) = line[search_from..].find(".ask") {
@@ -966,23 +1076,23 @@ fn fnv1a64(data: &str) -> u64 {
 /// 由事务串行化，不会交错）。`answer` / `ask_replayed` / `run_completed` 丢失的后果是下次
 /// resume 多问一次——安全方向。`run_started` / `run_resumed` / `ask` 决定 resume 语义，
 /// 直接用 [`EventLog::append`] 并处理错误。
-fn append_workflow_event(journal: &EventLog, event: &Value) {
+pub(crate) fn append_workflow_event(journal: &EventLog, event: &Value) {
     journal.append_lossy(event);
 }
 
 /// 重放表条目：答案 + 原完成序（journal 中首见该调用点答案的全局位次，0 起；
 /// amend 导入不经顺序门 → None）。
 #[derive(Debug, Clone)]
-struct ReplayAnswer {
-    answer: String,
-    order: Option<u64>,
+pub(crate) struct ReplayAnswer {
+    pub(crate) answer: String,
+    pub(crate) order: Option<u64>,
 }
 
 /// 调用点键：(actor, inputHash, 本 run 内同键第几次提问)。
 type ReplayKey = (String, u64, u32);
 
 /// journal 里的问答重放表：调用点 → 答案。
-type ReplayTable = HashMap<ReplayKey, ReplayAnswer>;
+pub(crate) type ReplayTable = HashMap<ReplayKey, ReplayAnswer>;
 
 /// 只收每个调用点**首见**的答案（order 跨代稳定：重放一代按门序再发一遍，取首次）。
 fn record_answer(table: &mut ReplayTable, order_next: &mut u64, key: ReplayKey, answer: &str) {
@@ -1005,7 +1115,7 @@ fn record_answer(table: &mut ReplayTable, order_next: &mut u64, key: ReplayKey, 
 /// （第几次），`answer` 经 `ask_seq`（= 发起事件在 journal 里的 seq，库内分配、跨进程唯一）
 /// 指回发起事件精确配对；没有 `ask_seq` 或指不到本代未配对 ask 的 answer 跳过（宁可
 /// 重问，不错配）。`ask_replayed` 自带答案（重放也是调用点）。字段残缺的事件跳过。
-fn load_workflow_journal(journal: &EventLog) -> Result<(u64, ReplayTable), String> {
+pub(crate) fn load_workflow_journal(journal: &EventLog) -> Result<(u64, ReplayTable), String> {
     let events = journal.load().map_err(|error| {
         format!("{error}。resume 需要已存在的 run_id（见先前 WorkflowRun 结果）。")
     })?;
@@ -1034,7 +1144,9 @@ fn load_workflow_journal(journal: &EventLog) -> Result<(u64, ReplayTable), Strin
                     .and_then(Value::as_str)
                     .and_then(|hash| u64::from_str_radix(hash, 16).ok())
                 {
-                    script_hash.get_or_insert(hash);
+                    // 取【最新】一代的 hash：hole fill / resume 后 run_started 的旧 hash
+                    // 不应覆盖当前快照。
+                    script_hash = Some(hash);
                 }
                 // 新一代：调用点编号与未配对 ask 重置（上一代未答的 ask 本代会重新发起）。
                 occurrences.clear();
@@ -1131,44 +1243,53 @@ const PRELUDE: &str = r#"
     // 待释放的 order；逐级微任务泵送：order N 的下游回调先于 order N+1 的解析入队（保序
     // 的关键）。迟到的旧序（< next）直接放行；新执行（非重放）与 amend 导入（无 order）
     // 的 ask 不经门。
-    var __orderNext = 0;
-    var __orderWaiters = {};
-    function __gate_pump() {
-        var waiters = __orderWaiters[__orderNext];
-        if (!waiters) { return; }
-        delete __orderWaiters[__orderNext];
-        __orderNext += 1;
-        Promise.resolve().then(function () {
-            waiters.forEach(function (release) { release(); });
-            __gate_pump();
-        });
-    }
-    function __gate_wait(index) {
-        if (index < __orderNext) {
-            return Promise.resolve();
-        }
-        if (index === __orderNext) {
+    // 门的状态与函数封在闭包里、只以不可写不可配置的全局暴露：宿主每轮静止后会 eval
+    // `__gate_open()` 决定是否再驱动一轮，脚本若能改写它（或 __orderWaiters）就能让宿主
+    // 无限放行。
+    (function () {
+        var __orderNext = 0;
+        var __orderWaiters = {};
+        function __gate_pump() {
+            var waiters = __orderWaiters[__orderNext];
+            if (!waiters) { return; }
+            delete __orderWaiters[__orderNext];
             __orderNext += 1;
-            __gate_pump();
-            return Promise.resolve();
+            Promise.resolve().then(function () {
+                waiters.forEach(function (release) { release(); });
+                __gate_pump();
+            });
         }
-        return new Promise(function (release) {
-            (__orderWaiters[index] = __orderWaiters[index] || []).push(release);
-        });
-    }
-    // release-on-settle（ZCode ReplaySettleOrder.open 同源）：引擎静止而脚本未结算时由宿主
-    // 调用——门里等待者所等的位次已不可能被认领，按位次放行全部等待者并把游标推过它们。
-    function __gate_open() {
-        var indexes = Object.keys(__orderWaiters).map(Number).sort(function (a, b) { return a - b; });
-        if (indexes.length === 0) { return false; }
-        indexes.forEach(function (index) {
-            var waiters = __orderWaiters[index];
-            delete __orderWaiters[index];
-            waiters.forEach(function (release) { release(); });
-        });
-        __orderNext = indexes[indexes.length - 1] + 1;
-        return true;
-    }
+        function __gate_wait(index) {
+            if (index < __orderNext) {
+                return Promise.resolve();
+            }
+            if (index === __orderNext) {
+                __orderNext += 1;
+                __gate_pump();
+                return Promise.resolve();
+            }
+            return new Promise(function (release) {
+                (__orderWaiters[index] = __orderWaiters[index] || []).push(release);
+            });
+        }
+        // release-on-settle（ZCode ReplaySettleOrder.open 同源）：引擎静止而脚本未结算时由宿主
+        // 调用——门里等待者所等的位次已不可能被认领，按位次放行全部等待者并把游标推过它们。
+        function __gate_open() {
+            var indexes = Object.keys(__orderWaiters).map(Number).sort(function (a, b) { return a - b; });
+            if (indexes.length === 0) { return false; }
+            indexes.forEach(function (index) {
+                var waiters = __orderWaiters[index];
+                delete __orderWaiters[index];
+                waiters.forEach(function (release) { release(); });
+            });
+            __orderNext = indexes[indexes.length - 1] + 1;
+            return true;
+        }
+        Object.defineProperty(globalThis, "__gate_wait",
+            { value: __gate_wait, writable: false, configurable: false, enumerable: false });
+        Object.defineProperty(globalThis, "__gate_open",
+            { value: __gate_open, writable: false, configurable: false, enumerable: false });
+    })();
     // facade：宿主 envelope 结算（错误在 JS 侧抛出；重放命中且带 order 的经顺序门）。
     function __settle(raw, label) {
         var parsed = JSON.parse(raw);
@@ -1178,28 +1299,129 @@ const PRELUDE: &str = r#"
         }
         return parsed.answer;
     }
-    function agent(name) {
+    // 通用信封结算（files/git/world/artifact/hole）：replay 不进顺序门。
+    function __settle_value(raw, label) {
+        var parsed = JSON.parse(raw);
+        if (!parsed.ok) { throw new Error(parsed.error || (label + " 失败")); }
+        return parsed.value;
+    }
+    function agent(name, persona) {
         name = String(name);
         if (!name) { throw new Error("agent() 需要 actor 名"); }
+        var model = null;
+        var system = null;
+        if (persona != null) {
+            if (typeof persona !== "object") {
+                throw new Error("persona_unsupported: agent 的 persona 只接受 {model, system}");
+            }
+            if (persona.model != null) { model = String(persona.model); }
+            if (persona.system != null) { system = String(persona.system); }
+        }
         return {
             name: name,
             ask: function (question) {
-                return __ask_raw(name, String(question)).then(function (raw) {
+                return __ask_raw(name, String(question), model, system).then(function (raw) {
                     return __settle(raw, "ask");
                 });
             },
             askJson: function (question, schema) {
-                return __ask_json_raw(name, String(question), JSON.stringify(schema)).then(function (raw) {
+                return __ask_json_raw(name, String(question), JSON.stringify(schema), model, system).then(function (raw) {
                     return __settle(raw, "askJson");
                 });
             }
         };
     }
+    function log(message) { __wf_log(String(message)); }
+    function report(item) { __wf_report(JSON.stringify(item === undefined ? null : item)); }
+    function phase(name) { __wf_phase(String(name)); }
+    function hole(name, prompt, site) {
+        // 同步宿主：登记 hole 后返回错误信封 → 当前 async 链在这里中止（引擎把
+        // shared.hole 存在解释为 HoleWaiting，而不是失败）。tail / 分支级 hole 同一路径。
+        var raw = __wf_hole(
+            String(name),
+            prompt == null ? "" : String(prompt),
+            site == null ? null : Number(site)
+        );
+        var parsed = JSON.parse(raw);
+        if (!parsed.ok) { throw new Error(parsed.error || "hole 等待填充"); }
+        return parsed.value;
+    }
+    var files = {
+        glob: function (pattern) {
+            return __wf_files("glob", JSON.stringify({pattern: String(pattern)})).then(function (raw) {
+                return __settle_value(raw, "files.glob");
+            });
+        },
+        read: function (path) {
+            return __wf_files("read", JSON.stringify({path: String(path)})).then(function (raw) {
+                return __settle_value(raw, "files.read");
+            });
+        },
+        grep: function (pattern, glob) {
+            return __wf_files("grep", JSON.stringify({pattern: String(pattern), glob: glob == null ? null : String(glob)})).then(function (raw) {
+                return __settle_value(raw, "files.grep");
+            });
+        }
+    };
+    var git = {
+        status: function () {
+            return __wf_git("status", "{}").then(function (raw) {
+                return __settle_value(raw, "git.status");
+            });
+        },
+        diff: function (path) {
+            return __wf_git("diff", JSON.stringify({path: path == null ? null : String(path)})).then(function (raw) {
+                return __settle_value(raw, "git.diff");
+            });
+        }
+    };
+    var world = {
+        run: function (command, opts) {
+            return __wf_world(JSON.stringify({command: String(command), opts: opts || {}})).then(function (raw) {
+                return __settle_value(raw, "world.run");
+            });
+        }
+    };
+    var artifact = {
+        file: function (id, path, opts) {
+            return __wf_artifact("file", JSON.stringify({id: String(id), path: String(path), opts: opts || {}})).then(function (raw) {
+                return __settle_value(raw, "artifact.file");
+            });
+        },
+        markdown: function (id, content, opts) {
+            return __wf_artifact("markdown", JSON.stringify({id: String(id), content: String(content), opts: opts || {}})).then(function (raw) {
+                return __settle_value(raw, "artifact.markdown");
+            });
+        },
+        table: function (id, rows, opts) {
+            return __wf_artifact("table", JSON.stringify({id: String(id), rows: rows, opts: opts || {}})).then(function (raw) {
+                return __settle_value(raw, "artifact.table");
+            });
+        },
+        chart: function (id, spec, opts) {
+            return __wf_artifact("chart", JSON.stringify({id: String(id), spec: spec, opts: opts || {}})).then(function (raw) {
+                return __settle_value(raw, "artifact.chart");
+            });
+        },
+        metrics: function (id, metrics, opts) {
+            return __wf_artifact("metrics", JSON.stringify({id: String(id), metrics: metrics, opts: opts || {}})).then(function (raw) {
+                return __settle_value(raw, "artifact.metrics");
+            });
+        },
+        board: function (id, columns, opts) {
+            return __wf_artifact("board", JSON.stringify({id: String(id), columns: columns, opts: opts || {}})).then(function (raw) {
+                return __settle_value(raw, "artifact.board");
+            });
+        }
+    };
     function result(text) { __result(String(text)); }
+    // args 在 register_hosts 阶段以 JSON.parse 注入并冻结（见 eval_deterministic）。
 "#;
 
 /// 单片 JS CPU 预算（中断处理器轮询）：宿主 future 结算 / 顺序门放行时 `reset`，JS 续体获得
-/// 新的一片；超预算时记录中断并重置（让包装层的 reject 回调能跑完上报），返回 true 终止当前片。
+/// 新的一片；超预算时记录中断并只留 `INTERRUPT_GRACE`（让包装层的 reject 回调能跑完上报），
+/// 返回 true 终止当前片。中断是粘滞的：之后 `reset` 不再发新片，宽限一过第二次轮询再次
+/// 返回 true，`drive_to_quiescence` 据此停下——run 结果此时已判失败，没必要再烧 CPU。
 struct SliceBudget {
     started: Instant,
     slice: Duration,
@@ -1228,6 +1450,10 @@ impl SliceBudget {
     }
 
     fn reset(&self) {
+        // 已中断：不再发新片（宿主 future 结算 / 顺序门放行也只剩宽限期）。
+        if self.interrupted() {
+            return;
+        }
         self.deadline_ms.store(
             self.elapsed_ms() + self.slice.as_millis() as u64,
             Ordering::Relaxed,
@@ -1238,8 +1464,13 @@ impl SliceBudget {
         if self.elapsed_ms() < self.deadline_ms.load(Ordering::Relaxed) {
             return false;
         }
-        self.interrupted.store(true, Ordering::Relaxed);
-        self.reset();
+        if !self.interrupted.swap(true, Ordering::Relaxed) {
+            self.deadline_ms.store(
+                self.elapsed_ms() + INTERRUPT_GRACE.as_millis() as u64,
+                Ordering::Relaxed,
+            );
+        }
+        // 宽限也用完：deadline 不再后推，之后每次轮询都返回 true——JS 再也跑不起来。
         true
     }
 
@@ -1275,20 +1506,27 @@ impl std::future::Future for WakeOnce {
 /// 一条不含循环、自我重排的 microtask 链（`then(loop)` 递归、`await` 递归）既不会触发中断
 /// 处理器，也不会让 idle 返回：墙钟预算、取消令牌乃至外层硬超时后的收尾全部失效，阻塞线程
 /// 被永久占满。这里逐个 job 驱动，job 之间按同一份片预算检查；没有 job 时等宿主 future 唤醒。
-async fn drive_to_quiescence(runtime: &AsyncRuntime, budget: &SliceBudget) {
+async fn drive_to_quiescence(runtime: &AsyncRuntime, budget: &SliceBudget, halt: &AtomicBool) {
+    // 连续有进展（job / 立即结算的宿主 future）时周期性让出：否则这个 future 永不返回
+    // Pending，外层 drive_engine 的 timeout / select!（max_run、取消宽限）得不到轮询。
+    const YIELD_EVERY: u32 = 64;
+    let mut since_yield: u32 = 0;
     loop {
+        if halt.load(Ordering::SeqCst) {
+            return;
+        }
         match runtime.execute_pending_job().await {
             // 跑了一个 job（或宿主 future 有进展）：超出片预算即中断，与中断处理器同一判定。
-            Ok(true) => {
+            // job 抛出未捕获异常：与 idle 一致，丢弃后继续驱动（脚本主链的异常由 IIFE 的
+            // reject 分支经 __script_done 上报，不会丢）。
+            Ok(true) | Err(_) => {
                 if budget.poll_interrupt() {
                     return;
                 }
-            }
-            // job 抛出未捕获异常：与 idle 一致，丢弃后继续驱动（脚本主链的异常由 IIFE 的
-            // reject 分支经 __script_done 上报，不会丢）。
-            Err(_) => {
-                if budget.poll_interrupt() {
-                    return;
+                since_yield += 1;
+                if since_yield >= YIELD_EVERY {
+                    since_yield = 0;
+                    tokio::task::yield_now().await;
                 }
             }
             Ok(false) => {
@@ -1297,12 +1535,17 @@ async fn drive_to_quiescence(runtime: &AsyncRuntime, budget: &SliceBudget) {
                     return;
                 }
                 WakeOnce::default().await;
+                // 从空闲被叫醒：期间没有 JS 在跑（在等 ask 许可 / world.run / files 这类宿主
+                // future），这段墙钟不能算进 JS 片预算——否则并行 ask 超过 max_parallel_asks
+                // 时排队 >120s、或一条命令跑 >120s，都会被当成“CPU 预算耗尽”把整个 run 判失败。
+                // 自我重排的 microtask 链永远到不了这里，仍会被片预算中断。
+                budget.reset();
             }
         }
     }
 }
 
-/// 脚本结算形态：async IIFE 正常返回（`undefined` → None，否则 `String(value)`）或抛错。
+/// 脚本结算形态：async IIFE 正常返回（`undefined` → None，字符串原样，其余 JSON 化）或抛错。
 #[derive(Debug)]
 enum ScriptOutcome {
     Returned(Option<String>),
@@ -1333,6 +1576,8 @@ fn js_error(ctx: &rquickjs::Ctx, error: rquickjs::Error) -> String {
 async fn eval_deterministic(
     script: String,
     budget: Arc<SliceBudget>,
+    halt: Arc<AtomicBool>,
+    args: Value,
     register_hosts: impl FnOnce(&rquickjs::Ctx) + Send + 'static,
 ) -> Result<Option<ScriptOutcome>, String> {
     let runtime =
@@ -1340,8 +1585,12 @@ async fn eval_deterministic(
     runtime.set_memory_limit(ENGINE_MEMORY_LIMIT).await;
     runtime.set_max_stack_size(1024 * 1024).await;
     let interrupt_budget = Arc::clone(&budget);
+    let interrupt_halt = Arc::clone(&halt);
+    // halt（取消 / 超时宽限期已过）优先：紧循环在下一个轮询点就被终止，不必等整片预算耗尽。
     runtime
-        .set_interrupt_handler(Some(Box::new(move || interrupt_budget.poll_interrupt())))
+        .set_interrupt_handler(Some(Box::new(move || {
+            interrupt_halt.load(Ordering::SeqCst) || interrupt_budget.poll_interrupt()
+        })))
         .await;
     let context = AsyncContext::full(&runtime)
         .await
@@ -1352,10 +1601,20 @@ async fn eval_deterministic(
         .async_with(|ctx| Box::pin(async move {
             ctx.eval::<(), _>(PRELUDE)
                 .map_err(|error| format!("prelude 执行失败: {}", js_error(&ctx, error)))?;
+            // args：保存/路径参数，冻结后脚本只读；无参数时为 {}。
+            let args_json = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+            let args_literal = serde_json::to_string(&args_json).unwrap_or_else(|_| "\"{}\"".to_string());
+            ctx.eval::<(), _>(format!(
+                "globalThis.args = Object.freeze(JSON.parse({args_literal}));"
+            ))
+            .map_err(|error| format!("args 注入失败: {}", js_error(&ctx, error)))?;
             register_hosts(&ctx);
             let done_fn = Function::new(
                 ctx.clone(),
                 move |ok: bool, text: Option<String>| -> String {
+                    // 返回值 / 抛错文本进 run_completed（journal + DB）并回给模型：与 Eval 的
+                    // result 同一 256K 字符上限，`return "x".repeat(6e7)` 不能一次写进 60MB。
+                    let text = text.map(|text| truncate_chars(&text, MAX_SCRIPT_RESULT_CHARS));
                     *settled_sink.lock().unwrap_or_else(|poison| poison.into_inner()) =
                         Some(if ok {
                             ScriptOutcome::Returned(text)
@@ -1371,9 +1630,17 @@ async fn eval_deterministic(
                 .expect("set __script_done");
             // async IIFE：顶层 await / Promise.all 可用；返回值 / 抛错经 __script_done 回传
             //（未捕获异常不会丢：reject 分支上报；中断等不可捕获错误同样落到这里）。
+            // 返回值字符串化：字符串原样，其余走 JSON（ZCode 把顶层返回值按 JSON 值落库；
+            // `return {ok: true}` 不能变成 "[object Object]"），JSON 化不了的再退回 String()。
             let wrapped = format!(
                 "(async () => {{\n{script}\n}})().then(\n\
-                 function (value) {{ __script_done(true, value === undefined ? undefined : String(value)); }},\n\
+                 function (value) {{\n\
+                   if (value === undefined) {{ __script_done(true, undefined); return; }}\n\
+                   var text;\n\
+                   if (typeof value === 'string') {{ text = value; }}\n\
+                   else {{ try {{ text = JSON.stringify(value); }} catch (e) {{ text = undefined; }} }}\n\
+                   __script_done(true, text === undefined ? String(value) : text);\n\
+                 }},\n\
                  function (error) {{ __script_done(false, String(error)); }}\n);"
             );
             ctx.eval::<rquickjs::Value, _>(wrapped)
@@ -1385,15 +1652,25 @@ async fn eval_deterministic(
     // 驱动全部 JS 任务与宿主 future（ask 子代理、Promise 链）到静止。引擎静止而脚本未结算
     // 时，若顺序门里还有等待者，其位次已不可能被认领（ZCode release-on-settle 同源）→
     // 放行后再驱动一轮；没有等待者则脚本确实挂在永不 resolve 的 promise 上，交调用方判失败。
+    // 放行轮数有上限、且不刷新片预算：放行是即时的、没有等待任何宿主 future，脚本若用
+    // `__gate_wait(i++)` 自续等待者让每轮都"有放行"，只会在这里耗尽上限 / 片预算后结束，
+    // 不能把阻塞线程变成无预算的自旋。
+    const MAX_GATE_RELEASE_ROUNDS: u32 = 4_096;
+    let mut release_rounds: u32 = 0;
     loop {
-        drive_to_quiescence(&runtime, &budget).await;
+        drive_to_quiescence(&runtime, &budget, &halt).await;
         let is_settled = settled
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .is_some();
-        if is_settled || budget.interrupted() {
+        if is_settled
+            || budget.interrupted()
+            || halt.load(Ordering::SeqCst)
+            || release_rounds >= MAX_GATE_RELEASE_ROUNDS
+        {
             break;
         }
+        release_rounds += 1;
         let released = context
             .async_with(|ctx| {
                 Box::pin(async move { ctx.eval::<bool, _>("__gate_open()").unwrap_or(false) })
@@ -1402,7 +1679,6 @@ async fn eval_deterministic(
         if !released {
             break;
         }
-        budget.reset();
     }
     let outcome = settled
         .lock()
@@ -1423,9 +1699,20 @@ async fn ask_host(
     shared: &EngineShared,
     actor: String,
     question: String,
+    model: Option<String>,
+    persona: Option<String>,
 ) -> String {
     if question.is_empty() {
         return json!({"ok": false, "error": "ask 的问题为空"}).to_string();
+    }
+    // actor 名进每条 ask / answer / ask_replayed 事件与调用点身份：`agent("x".repeat(1e6))`
+    // 会让 journal 每条事件都带上整段名字，与 hole 名同一上限。
+    if actor.chars().count() > MAX_ACTOR_CHARS {
+        return json!({
+            "ok": false,
+            "error": format!("agent 的 actor 名超过 {MAX_ACTOR_CHARS} 字符"),
+        })
+        .to_string();
     }
     // 与计划步骤的 MAX_STEP_TASK_CHARS 同口径：问题全文会成为子代理的 spec.task，并随每次
     // 执行状态变更整份克隆进 exec_log 事件（内存 + SQLite）。脚本里一句
@@ -1438,18 +1725,85 @@ async fn ask_host(
         })
         .to_string();
     }
+    // persona.system 与问题一起进子代理的 task：同样受长度约束，否则 `agent(n, {system:
+    // "x".repeat(2e7)})` 绕过上面的问题上限。
+    if persona
+        .as_deref()
+        .is_some_and(|text| text.chars().count() > MAX_PERSONA_CHARS)
+    {
+        return json!({
+            "ok": false,
+            "error": format!("agent persona.system 超过 {MAX_PERSONA_CHARS} 字符"),
+        })
+        .to_string();
+    }
+    // 片预算：本函数的任何快速失败 / 重放命中路径都不 reset——预算只在引擎真正停驻等宿主
+    // future 被唤醒时（drive_to_quiescence）刷新。否则 `while (true) { try { await
+    // agent("a", {model: "x"}).ask("q") } catch (e) {} }` 每圈都刷新一片，120s CPU 预算形同虚设。
+    //
     // 取消后（父 turn /cancel、工具调用被放弃、墙钟超时）引擎还会在宽限期内跑一会儿：
     // 脚本若 try/catch 住失败的 ask 再补问，这里直接拒绝——不占调用点编号、不写 ask 事件、
     // 不登记转瞬即被取消的子代理执行。
     if shared.cancel.is_cancelled() {
-        shared.budget.reset();
         return json!({"ok": false, "error": "workflow 已取消"}).to_string();
+    }
+    // §3.7 运行中权限变化：每次派发 ask 前重查发起会话此刻的权限，撤权立即停止派发。
+    if let Err(error) = check_session_permission(shared) {
+        return json!({"ok": false, "error": error}).to_string();
+    }
+    // 模型名进错误文案 / allowed_models 查找：`agent(n, {model: "x".repeat(2e7)})` 同样要在
+    // 这里拦住。
+    if model
+        .as_deref()
+        .is_some_and(|model| model.chars().count() > MAX_MODEL_CHARS)
+    {
+        return json!({
+            "ok": false,
+            "error": format!("agent 的 model 名超过 {MAX_MODEL_CHARS} 字符"),
+        })
+        .to_string();
+    }
+    // 模型优先级：agent(name,{model}) > execution_config.subagent_model > 会话模型。
+    // 三者都必须落在 allowed_models 内（retune 只增不减）。在写 ask 事件 / 占调用点编号之前
+    // 校验：不合法的模型名循环补问不能把 journal 刷成 GB 级的无答案 ask 事件。
+    let model = model.or_else(|| {
+        shared
+            .subagent_model
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    });
+    if let Some(model) = &model {
+        let allowed = shared
+            .allowed_models
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !allowed.contains(model) {
+            return json!({
+                "ok": false,
+                "error": format!("model_not_allowed: '{model}' 不在 execution_config.allowed_models 内"),
+            })
+            .to_string();
+        }
     }
     let input_hash = fnv1a64(&format!("{actor}\u{0}{question}"));
     let hash_hex = format!("{input_hash:016x}");
+    let ask_occurrence: u32;
     let ask_seq = {
-        let mut engine = shared.engine.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut engine = shared
+            .engine
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // 单次执行的发起次数上限：在占调用点编号 / 写 ask 事件之前拒绝（见 MAX_ASKS_PER_EXEC）。
+        if engine.asks_total >= MAX_ASKS_PER_EXEC {
+            return json!({
+                "ok": false,
+                "error": format!("ask 超过单次执行 {MAX_ASKS_PER_EXEC} 次上限"),
+            })
+            .to_string();
+        }
         engine.asks_total += 1;
+        shared.progress.asks_total.fetch_add(1, Ordering::SeqCst);
         // 调用点身份 = (actor, inputHash, 本 run 内第几次)：同一问题问两次是两个调用点，
         // 重放按它精确配对；本 run 内不做去重（ZCode 亦无——缓存答案没有可认领的门序）。
         let occurrence = engine
@@ -1458,22 +1812,25 @@ async fn ask_host(
             .or_insert(0);
         let index = *occurrence;
         *occurrence += 1;
-        if let Some(replayed) = engine
-            .replay
-            .remove(&(actor.clone(), input_hash, index))
-        {
-            engine.asks_replayed += 1;
+        ask_occurrence = index;
+        if let Some(replayed) = engine.replay.remove(&(actor.clone(), input_hash, index)) {
             // 答案一并落本 run 的 journal：再次 resume 时本 journal 自足（不必追 amended_from）。
-            append_workflow_event(
-                &shared.journal,
-                &json!({
-                    "event": "ask_replayed",
-                    "actor": actor,
-                    "input_hash": hash_hex,
-                    "answer": replayed.answer,
-                }),
-            );
-            shared.budget.reset();
+            // 重放也是调用点，装载器按它给后续同 (actor, inputHash) 编号：写不进去就按失败交给
+            // 脚本（与下面的 ask 同口径），不能让脚本拿着答案继续、journal 里却少一个调用点。
+            if let Err(error) = shared.journal.append(&json!({
+                "event": "ask_replayed",
+                "actor": actor,
+                "input_hash": hash_hex,
+                "answer": replayed.answer,
+            })) {
+                return json!({
+                    "ok": false,
+                    "error": truncate_chars(&format!("ask 未能写入 journal：{error}"), 500),
+                })
+                .to_string();
+            }
+            engine.asks_replayed += 1;
+            shared.progress.asks_done.fetch_add(1, Ordering::SeqCst);
             // set-order：order = 原完成序（amend 导入为 null → 不经门）。JS 侧顺序门按它
             // 延迟 resolve，使 Promise.race / 交错 await 的解析顺序与原完成顺序一致。
             return json!({
@@ -1495,7 +1852,6 @@ async fn ask_host(
         })) {
             Ok(seq) => seq,
             Err(error) => {
-                shared.budget.reset();
                 return json!({
                     "ok": false,
                     "error": truncate_chars(&format!("ask 未能写入 journal：{error}"), 500),
@@ -1509,14 +1865,33 @@ async fn ask_host(
         _ = shared.cancel.cancelled() => {
             // 排队等许可期间被取消：ask 事件已写（resume 时该调用点只会重问），但不再
             // 启动子代理。
-            shared.budget.reset();
             return json!({"ok": false, "error": "workflow 已取消"}).to_string();
         }
-        permit = shared.permits.acquire() => permit.expect("workflow 信号量不会关闭"),
+        permit = shared.permits.acquire(&shared.cancel) => match permit {
+            Some(permit) => permit,
+            // acquire 在轮询间隙看到取消先于上面的分支返回 None：同样按取消处理，不 panic。
+            None => {
+                return json!({"ok": false, "error": "workflow 已取消"}).to_string();
+            }
+        },
     };
-    let answer = run_workflow_ask(runtime, shared, &actor, &question).await;
-    // 宿主 future 结算 → JS 续体获得新的一片 CPU 预算。
-    shared.budget.reset();
+    let question = match persona.filter(|text| !text.trim().is_empty()) {
+        Some(persona) => format!("[persona]\n{persona}\n\n[task]\n{question}"),
+        None => question,
+    };
+    let answer = run_workflow_ask(
+        runtime,
+        shared,
+        &actor,
+        &question,
+        model.as_deref(),
+        ask_occurrence,
+        input_hash,
+    )
+    .await;
+    // 子代理执行期间引擎停驻在 drive_to_quiescence 的 WakeOnce 上，被唤醒时那里已刷新片预算；
+    // 这里不再 reset（见函数开头）。
+    shared.progress.asks_done.fetch_add(1, Ordering::SeqCst);
     match answer {
         Ok(answer) => {
             append_workflow_event(
@@ -1547,7 +1922,11 @@ async fn run_workflow_ask(
     shared: &EngineShared,
     actor: &str,
     question: &str,
+    model: Option<&str>,
+    ask_occurrence: u32,
+    input_hash: u64,
 ) -> Result<String, String> {
+    let _active_ask = ActiveAskGuard::new(Arc::clone(&shared.progress));
     let run_id = &shared.run_id;
     let spec = AgentTaskSpec {
         name: sanitize_agent_name(&format!("{run_id}-{actor}")),
@@ -1559,29 +1938,45 @@ async fn run_workflow_ask(
         split_reason: Some("independent_evidence".to_string()),
         source_channel: String::new(),
         origin_chat_id: String::new(),
-        model: None,
+        model: model.map(str::to_string),
         plan_id: None,
         step_id: None,
-        isolation: if looks_like_complex_coding_task(question) {
-            "candidate_patch".to_string()
-        } else {
-            "shared_cas".to_string()
-        },
+        // 固定 shared_cas：candidate_patch 模式下子代理被禁止改共享工作区、只把补丁放进
+        // handoff.artifacts，而 ask 只把 summary 交还脚本——"看起来像编码任务"的 ask 会拿到
+        // 一句"已完成"却什么都没落盘。zcode 的 workflow 子代理同样直接在工作区干活；写操作
+        // 的审计归 run 自身的 effects / 世界边界。
+        isolation: "shared_cas".to_string(),
         max_tool_iter: WORKFLOW_ASK_MAX_TOOL_ITER,
         max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
     };
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<AgentTaskResult>(1);
     let done = CancellationToken::new();
-    // 本 future 被丢弃（引擎中止 / 超时后放弃）时也触发 done，watcher 不泄漏；
-    // 中止路径上 shared.cancel 先于丢弃触发，子代理已被 watcher 联动取消。
-    let _done_guard = done.clone().drop_guard();
+    // 本 ask 自己的取消令牌（run 令牌的子令牌）：run 取消它随之取消；本 future 被丢弃
+    // （引擎片预算中断 / 硬超时后放弃 / 运行时拆除）时由 drop guard 触发——子代理不能脱离
+    // workflow 独立续跑：答案没人接收，还可能重复副作用。结果正常回来后 disarm，不误伤。
+    let ask_cancel = shared.cancel.child_token();
+    let ask_cancel_guard = ask_cancel.clone().drop_guard();
     // 子代理的后台执行与取消 watcher 都要落在外层 runtime 上（见 EngineShared::outer），
     // 并带上发起方 turn 的 task-local 上下文；结果经 mpsc 跨 runtime 取回。
     let launch = {
         let runtime = runtime.clone();
         let description = format!("workflow {run_id} · {actor}");
-        let linkage = Some((shared.cancel.clone(), done.clone()));
-        shared.outer.spawn(shared.inherited.clone().run(async move {
+        let linkage = Some((ask_cancel.clone(), done.clone()));
+        let mut inherited = shared.inherited.clone();
+        inherited.workflow = Some(Arc::new(super::workflow_service::WorkflowAskContext {
+            run_id: run_id.clone(),
+            exec_generation: shared.exec_generation,
+            actor: actor.to_string(),
+            ask_identity: format!("{actor}:{input_hash:016x}:{ask_occurrence}"),
+            store: shared.store.clone(),
+            journal: shared.journal.clone(),
+            cancel: shared.cancel.clone(),
+            runtime: runtime.clone(),
+            effects: Arc::clone(&shared.effects),
+            next_seq: Arc::clone(&shared.question_seq),
+            question_occurrence: Arc::new(AtomicU64::new(0)),
+        }));
+        shared.outer.spawn(inherited.run(async move {
             runtime
                 .launch_background_task_impl(spec, description, Some(result_tx), linkage)
                 .await
@@ -1591,8 +1986,9 @@ async fn run_workflow_ask(
         .await
         .map_err(|error| format!("子代理启动任务失败: {error}"))??;
     let result = result_rx.recv().await;
-    // 结果已回：解除取消联动，watcher 退出（不泄漏）。
+    // 结果已回：解除取消联动，watcher 退出（不泄漏）；本 ask 的令牌不再需要触发。
     done.cancel();
+    let _ = ask_cancel_guard.disarm();
     let Some(result) = result else {
         return Err("子代理执行通道关闭，无结果返回".to_string());
     };
@@ -1615,8 +2011,10 @@ async fn ask_json_host(
     actor: String,
     question: String,
     schema: Value,
+    model: Option<String>,
+    persona: Option<String>,
 ) -> String {
-    let raw = ask_host(runtime, shared, actor, question).await;
+    let raw = ask_host(runtime, shared, actor, question, model, persona).await;
     let envelope: Value = match serde_json::from_str(&raw) {
         Ok(envelope) => envelope,
         Err(_) => return raw,
@@ -1656,17 +2054,186 @@ async fn ask_json_host(
     .to_string()
 }
 
+/// 运行中 retune 句柄（模式 A）：driver 注册到 service，Amend 直接改共享原子。
+#[derive(Clone)]
+pub(crate) struct RetuneHandle {
+    permits: Arc<DynamicSemaphore>,
+    subagent_model: Arc<StdMutex<Option<String>>>,
+    allowed_models: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl RetuneHandle {
+    pub(crate) fn apply(
+        &self,
+        max_parallel_asks: Option<usize>,
+        subagent_model: Option<Option<String>>,
+        add_model: Option<&str>,
+    ) {
+        if let Some(limit) = max_parallel_asks {
+            self.permits
+                .set_limit(limit.clamp(1, MAX_MAX_PARALLEL_ASKS as usize));
+        }
+        if let Some(model) = subagent_model {
+            *self
+                .subagent_model
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = model;
+        }
+        if let Some(model) = add_model {
+            self.allowed_models
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(model.to_string());
+        }
+    }
+}
+
+/// 心跳 `run_progress` 的实时计数（§3.4.1：asks_done / asks_total / active_agents）：
+/// 引擎侧更新，driver 每 15s 读一次写进 journal。
+#[derive(Debug, Default)]
+pub(crate) struct ProgressCounters {
+    /// 已发起的 ask（含重放命中）。
+    pub asks_total: AtomicU64,
+    /// 已结算的 ask（答案回来 / 失败 / 重放命中）。
+    pub asks_done: AtomicU64,
+    /// 在途子代理数。
+    pub active_agents: AtomicUsize,
+}
+
+/// 运行中的 hole：脚本已停在 tail/branch hole，等待 FillWorkflowHole（名称 / 提示已在
+/// 登记事务里落 `workflow_hole`，这里只带 id）。
+#[derive(Debug, Clone)]
+pub(crate) struct HoleWaiting {
+    pub hole_id: String,
+}
+
+/// 动态并发闸门：`max_parallel_asks` 可在运行中被 retune 调整（只影响尚未开始的 ask）。
+struct DynamicSemaphore {
+    limit: AtomicUsize,
+    used: StdMutex<usize>,
+}
+
+struct SemaphorePermit {
+    semaphore: Arc<DynamicSemaphore>,
+}
+
+impl DynamicSemaphore {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(DynamicSemaphore {
+            limit: AtomicUsize::new(limit.clamp(1, MAX_MAX_PARALLEL_ASKS as usize)),
+            used: StdMutex::new(0),
+        })
+    }
+
+    fn set_limit(&self, limit: usize) {
+        self.limit.store(
+            limit.clamp(1, MAX_MAX_PARALLEL_ASKS as usize),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn limit(&self) -> usize {
+        self.limit.load(Ordering::SeqCst)
+    }
+
+    async fn acquire(self: &Arc<Self>, cancel: &CancellationToken) -> Option<SemaphorePermit> {
+        loop {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            {
+                let mut used = self
+                    .used
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if *used < self.limit() {
+                    *used += 1;
+                    return Some(SemaphorePermit {
+                        semaphore: Arc::clone(self),
+                    });
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return None,
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+    }
+}
+
+impl Drop for SemaphorePermit {
+    fn drop(&mut self) {
+        let mut used = self
+            .semaphore
+            .used
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *used = used.saturating_sub(1);
+    }
+}
+
+/// §3.7「运行中权限变化」：派发 ask / 实际写操作前重查发起会话此刻的 [`ToolAccess`]。
+/// 宿主答得出（桌面按权限模式）且低于 run 启动时的快照 → run 转 `stopping(permission_revoked)`
+/// 并取消执行令牌（引擎退出后 driver 写 `stopped`，§13.3 顺带作废未决问题 / hole）；宿主不认识
+/// 该会话（None）沿用快照，不触发撤权。返回 Err 时调用方应立即拒绝本次操作。
+fn check_session_permission(shared: &EngineShared) -> Result<(), String> {
+    let Some((channel, chat_id)) = shared.inherited.chat() else {
+        return Ok(());
+    };
+    let Some(current) = rclaw_tools::access::session_access(channel, chat_id) else {
+        return Ok(());
+    };
+    if current >= shared.tool_access {
+        return Ok(());
+    }
+    tracing::warn!(
+        "工作流 {} 的发起会话权限已从 {:?} 降为 {:?}，撤销执行（permission_revoked）",
+        shared.run_id,
+        shared.tool_access,
+        current
+    );
+    match shared.store.begin_stopping(
+        &shared.run_id,
+        shared.exec_generation,
+        STOP_PERMISSION_REVOKED,
+        STOP_PERMISSION_REVOKED,
+    ) {
+        Ok(_) => {}
+        Err(error) => tracing::warn!("工作流撤权转 stopping 失败: {error}"),
+    }
+    shared.cancel.cancel();
+    Err("permission_revoked: 发起会话的权限已被收回，workflow 已停止派发".to_string())
+}
+
+struct ActiveAskGuard(Arc<ProgressCounters>);
+
+impl ActiveAskGuard {
+    fn new(progress: Arc<ProgressCounters>) -> Self {
+        progress.active_agents.fetch_add(1, Ordering::SeqCst);
+        ActiveAskGuard(progress)
+    }
+}
+
+impl Drop for ActiveAskGuard {
+    fn drop(&mut self) {
+        self.0.active_agents.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// 引擎共享态：宿主回调（并行 promise）、引擎驱动与收尾读取共用。
 struct EngineShared {
     engine: StdMutex<EngineState>,
-    /// 并行 ask 许可（`max_parallel_asks`）。
-    permits: tokio::sync::Semaphore,
+    /// 并行 ask 许可（`max_parallel_asks`，运行中可 retune）。
+    permits: Arc<DynamicSemaphore>,
     /// 单片 JS CPU 预算（中断处理器与宿主回调共享）。
     budget: Arc<SliceBudget>,
+    /// hole 等待 / 取消等宿主侧提前结束驱动的信号。
+    halt: Arc<AtomicBool>,
     run_id: String,
     /// 本 run 的 journal 事件流（`workflow/<run_id>`）。
     journal: EventLog,
-    /// 本 run 的取消令牌：工具 future 丢弃 / 父 turn 取消 / 墙钟超时触发，联动全部 ask 子代理。
+    /// 本 run 的取消令牌（run 自有；后台模式不继承 turn_cancel、不挂 drop_guard）。
     cancel: CancellationToken,
     /// 外层（多线程）runtime 句柄：ask 子代理的后台执行在它上面 spawn。引擎自己跑在
     /// spawn_blocking 里的内嵌 current_thread runtime 上，中止 / 超时后内嵌 runtime 随即
@@ -1675,9 +2242,90 @@ struct EngineShared {
     /// 发起方 turn 的 task-local 上下文（沙箱权限 / 会话键 / bot 身份），跨 runtime 带给子代理。
     inherited: super::InheritedTurnContext,
     /// 同 run 互斥守卫：挂在共享态上，随最后一个持有者（引擎线程 / 宿主回调）一起释放。
-    /// 工具 future 被丢弃后引擎还要跑完取消宽限期，这段时间同一 run 仍不能被 resume——
-    /// 否则宽限期内脚本补发的 ask 会落在新一代 run_resumed 之后、打乱调用点编号。
     _active_run: ActiveRunGuard,
+    // ---- P2-P5 facade ----
+    store: WorkflowStore,
+    effects: Arc<EffectTracker>,
+    paths: WorkflowPaths,
+    args: Value,
+    project_root: PathBuf,
+    tool_access: ToolAccess,
+    allowed_models: Arc<StdMutex<HashSet<String>>>,
+    subagent_model: Arc<StdMutex<Option<String>>>,
+    script_generation: u32,
+    exec_generation: u32,
+    hole: StdMutex<Option<HoleWaiting>>,
+    hole_seq: AtomicU64,
+    hole_name_seq: StdMutex<HashMap<String, u32>>,
+    /// 本 exec 已登记过的 hole_id：同一调用点循环到达不重复写 `hole_opened` / 通知。
+    holes_opened: StdMutex<HashSet<String>>,
+    question_seq: Arc<AtomicU64>,
+    /// 心跳计数（在途 ask 子代理数也在这里：hole 暂停前等它们结算）。
+    progress: Arc<ProgressCounters>,
+    holes_allowed: bool,
+    log_ring: StdMutex<VecDeque<Value>>,
+    log_count: AtomicU64,
+    log_bytes: AtomicU64,
+    log_truncated: AtomicBool,
+    report_bytes: AtomicU64,
+    report_count: AtomicU64,
+    phase: StdMutex<Option<String>>,
+    phase_count: AtomicU64,
+    phase_truncated: AtomicBool,
+    artifact_versions: StdMutex<HashMap<String, u32>>,
+    /// 在途 async 宿主调用计数（见 [`MAX_PENDING_HOST_CALLS`]）。
+    pending_hosts: Arc<AtomicUsize>,
+    /// 同时执行的 effect 闸门（见 [`MAX_INFLIGHT_EFFECTS`]）。
+    effect_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// 领取一个 effect 执行名额：排队期间引擎停驻在宿主 future 上；取消时放弃（返回 None）。
+async fn acquire_effect_permit<'a>(
+    permits: &'a tokio::sync::Semaphore,
+    cancel: &CancellationToken,
+) -> Option<tokio::sync::SemaphorePermit<'a>> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        permit = permits.acquire() => permit.ok(),
+    }
+}
+
+/// 在途 async 宿主调用的名额：在 JS 调用的同步段领取，随 future 结算 / 丢弃归还。
+struct HostSlot(Arc<AtomicUsize>);
+
+impl HostSlot {
+    fn acquire(pending: &Arc<AtomicUsize>) -> Option<Self> {
+        if pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_HOST_CALLS {
+            pending.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(HostSlot(Arc::clone(pending)))
+    }
+}
+
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn host_backlog_error() -> String {
+    err_envelope(format!(
+        "在途宿主调用超过 {MAX_PENDING_HOST_CALLS} 个上限；请分批 await 后再发起"
+    ))
+}
+
+/// JS 字符串入参到 future 首次被 poll 时才拷到 Rust 堆（见 [`MAX_PENDING_HOST_CALLS`]）；
+/// 各自的长度 / 字节上限随后在宿主函数里照常检查。
+fn js_string(value: &rquickjs::String<'_>) -> Result<String, String> {
+    value
+        .to_string()
+        .map_err(|error| format!("宿主入参不是合法字符串: {error}"))
+}
+
+fn js_string_opt(value: Option<&rquickjs::String<'_>>) -> Result<Option<String>, String> {
+    value.map(js_string).transpose()
 }
 
 #[derive(Default)]
@@ -1746,22 +2394,54 @@ impl Drop for ActiveRunGuard {
     }
 }
 
-/// 注册 facade 的宿主函数：`__ask_raw` / `__ask_json_raw`（async → promise）与 `__result`。
-fn register_workflow_hosts(
-    ctx: &rquickjs::Ctx,
+/// 注册 facade 的宿主函数：ask / result / log / report / phase / files / git / world /
+/// artifact / hole。所有返回值都是 JSON 信封字符串（`{ok, value|error}`）。
+///
+/// async 宿主的字符串入参一律取 `rquickjs::String` 句柄、在 future 里再转 Rust 字符串，并在
+/// 同步段领取 [`HostSlot`]：被拒的调用不捕获入参（见 [`MAX_PENDING_HOST_CALLS`]）。
+fn register_workflow_hosts<'js>(
+    ctx: &rquickjs::Ctx<'js>,
     runtime: AgentToolRuntime,
     shared: Arc<EngineShared>,
 ) {
     let (ask_runtime, ask_shared) = (runtime.clone(), Arc::clone(&shared));
     let ask_fn = Function::new(
         ctx.clone(),
-        AsyncFn(move |actor: String, question: String| {
-            let (runtime, shared) = (ask_runtime.clone(), Arc::clone(&ask_shared));
-            async move { ask_host(&runtime, &shared, actor, question).await }
-        }),
+        AsyncFn(
+            move |actor: rquickjs::String<'js>,
+                  question: rquickjs::String<'js>,
+                  model: Option<rquickjs::String<'js>>,
+                  system: Option<rquickjs::String<'js>>| {
+                let (runtime, shared) = (ask_runtime.clone(), Arc::clone(&ask_shared));
+                let admitted = HostSlot::acquire(&shared.pending_hosts)
+                    .map(|slot| (slot, actor, question, model, system));
+                async move {
+                    let Some((_slot, actor, question, model, system)) = admitted else {
+                        return host_backlog_error();
+                    };
+                    let (actor, question, model, system) = match (
+                        js_string(&actor),
+                        js_string(&question),
+                        js_string_opt(model.as_ref()),
+                        js_string_opt(system.as_ref()),
+                    ) {
+                        (Ok(actor), Ok(question), Ok(model), Ok(system)) => {
+                            (actor, question, model, system)
+                        }
+                        (Err(error), _, _, _)
+                        | (_, Err(error), _, _)
+                        | (_, _, Err(error), _)
+                        | (_, _, _, Err(error)) => return err_envelope(error),
+                    };
+                    ask_host(&runtime, &shared, actor, question, model, system).await
+                }
+            },
+        ),
     )
     .expect("注册 __ask_raw");
-    ctx.globals().set("__ask_raw", ask_fn).expect("set __ask_raw");
+    ctx.globals()
+        .set("__ask_raw", ask_fn)
+        .expect("set __ask_raw");
     let result_shared = Arc::clone(&shared);
     let result_fn = Function::new(ctx.clone(), move |text: String| -> String {
         result_shared
@@ -1772,402 +2452,1710 @@ fn register_workflow_hosts(
         "ok".to_string()
     })
     .expect("注册 __result");
-    ctx.globals().set("__result", result_fn).expect("set __result");
+    ctx.globals()
+        .set("__result", result_fn)
+        .expect("set __result");
+    let json_shared = Arc::clone(&shared);
     let json_fn = Function::new(
         ctx.clone(),
-        AsyncFn(move |actor: String, question: String, schema: String| {
-            let (runtime, shared) = (runtime.clone(), Arc::clone(&shared));
-            async move {
-                let schema: Value = serde_json::from_str(&schema).unwrap_or(Value::Null);
-                ask_json_host(&runtime, &shared, actor, question, schema).await
-            }
-        }),
+        AsyncFn(
+            move |actor: rquickjs::String<'js>,
+                  question: rquickjs::String<'js>,
+                  schema: rquickjs::String<'js>,
+                  model: Option<rquickjs::String<'js>>,
+                  system: Option<rquickjs::String<'js>>| {
+                let (runtime, shared) = (runtime.clone(), Arc::clone(&json_shared));
+                let admitted = HostSlot::acquire(&shared.pending_hosts)
+                    .map(|slot| (slot, actor, question, schema, model, system));
+                async move {
+                    let Some((_slot, actor, question, schema, model, system)) = admitted else {
+                        return host_backlog_error();
+                    };
+                    let (actor, question, schema, model, system) = match (
+                        js_string(&actor),
+                        js_string(&question),
+                        js_string(&schema),
+                        js_string_opt(model.as_ref()),
+                        js_string_opt(system.as_ref()),
+                    ) {
+                        (Ok(actor), Ok(question), Ok(schema), Ok(model), Ok(system)) => {
+                            (actor, question, schema, model, system)
+                        }
+                        (Err(error), _, _, _, _)
+                        | (_, Err(error), _, _, _)
+                        | (_, _, Err(error), _, _)
+                        | (_, _, _, Err(error), _)
+                        | (_, _, _, _, Err(error)) => return err_envelope(error),
+                    };
+                    let schema = match parse_host_payload(&schema) {
+                        Ok(schema) => schema,
+                        Err(error) => return err_envelope(format!("askJson schema {error}")),
+                    };
+                    ask_json_host(&runtime, &shared, actor, question, schema, model, system).await
+                }
+            },
+        ),
     )
     .expect("注册 __ask_json_raw");
     ctx.globals()
         .set("__ask_json_raw", json_fn)
         .expect("set __ask_json_raw");
+
+    // ---- log / report / phase / hole（同步宿主）----
+    let log_shared = Arc::clone(&shared);
+    let log_fn = Function::new(ctx.clone(), move |message: String| -> String {
+        host_log(&log_shared, message);
+        "ok".to_string()
+    })
+    .expect("注册 __wf_log");
+    ctx.globals().set("__wf_log", log_fn).expect("set __wf_log");
+
+    let report_shared = Arc::clone(&shared);
+    let report_fn = Function::new(ctx.clone(), move |item: String| -> String {
+        match host_report(&report_shared, &item) {
+            Ok(()) => "ok".to_string(),
+            Err(error) => json!({"ok": false, "error": error}).to_string(),
+        }
+    })
+    .expect("注册 __wf_report");
+    ctx.globals()
+        .set("__wf_report", report_fn)
+        .expect("set __wf_report");
+
+    let phase_shared = Arc::clone(&shared);
+    let phase_fn = Function::new(ctx.clone(), move |name: String| -> String {
+        host_phase(&phase_shared, name);
+        "ok".to_string()
+    })
+    .expect("注册 __wf_phase");
+    ctx.globals()
+        .set("__wf_phase", phase_fn)
+        .expect("set __wf_phase");
+
+    let hole_shared = Arc::clone(&shared);
+    let hole_fn = Function::new(
+        ctx.clone(),
+        move |name: String, prompt: String, site: Option<u32>| -> String {
+            host_hole(&hole_shared, name, prompt, site)
+        },
+    )
+    .expect("注册 __wf_hole");
+    ctx.globals()
+        .set("__wf_hole", hole_fn)
+        .expect("set __wf_hole");
+
+    // ---- files / git / world / artifact（async 宿主）----
+    let files_shared = Arc::clone(&shared);
+    let files_fn = Function::new(
+        ctx.clone(),
+        AsyncFn(
+            move |op: rquickjs::String<'js>, payload: rquickjs::String<'js>| {
+                let shared = Arc::clone(&files_shared);
+                let admitted =
+                    HostSlot::acquire(&shared.pending_hosts).map(|slot| (slot, op, payload));
+                async move {
+                    let Some((_slot, op, payload)) = admitted else {
+                        return host_backlog_error();
+                    };
+                    match (js_string(&op), js_string(&payload)) {
+                        (Ok(op), Ok(payload)) => host_files(&shared, op, payload).await,
+                        (Err(error), _) | (_, Err(error)) => err_envelope(error),
+                    }
+                }
+            },
+        ),
+    )
+    .expect("注册 __wf_files");
+    ctx.globals()
+        .set("__wf_files", files_fn)
+        .expect("set __wf_files");
+
+    let git_shared = Arc::clone(&shared);
+    let git_fn = Function::new(
+        ctx.clone(),
+        AsyncFn(
+            move |op: rquickjs::String<'js>, payload: rquickjs::String<'js>| {
+                let shared = Arc::clone(&git_shared);
+                let admitted =
+                    HostSlot::acquire(&shared.pending_hosts).map(|slot| (slot, op, payload));
+                async move {
+                    let Some((_slot, op, payload)) = admitted else {
+                        return host_backlog_error();
+                    };
+                    match (js_string(&op), js_string(&payload)) {
+                        (Ok(op), Ok(payload)) => host_git(&shared, op, payload).await,
+                        (Err(error), _) | (_, Err(error)) => err_envelope(error),
+                    }
+                }
+            },
+        ),
+    )
+    .expect("注册 __wf_git");
+    ctx.globals().set("__wf_git", git_fn).expect("set __wf_git");
+
+    let world_shared = Arc::clone(&shared);
+    let world_fn = Function::new(
+        ctx.clone(),
+        AsyncFn(move |payload: rquickjs::String<'js>| {
+            let shared = Arc::clone(&world_shared);
+            let admitted = HostSlot::acquire(&shared.pending_hosts).map(|slot| (slot, payload));
+            async move {
+                let Some((_slot, payload)) = admitted else {
+                    return host_backlog_error();
+                };
+                match js_string(&payload) {
+                    Ok(payload) => host_world(&shared, payload).await,
+                    Err(error) => err_envelope(error),
+                }
+            }
+        }),
+    )
+    .expect("注册 __wf_world");
+    ctx.globals()
+        .set("__wf_world", world_fn)
+        .expect("set __wf_world");
+
+    let artifact_shared = Arc::clone(&shared);
+    let artifact_fn = Function::new(
+        ctx.clone(),
+        AsyncFn(
+            move |kind: rquickjs::String<'js>, payload: rquickjs::String<'js>| {
+                let shared = Arc::clone(&artifact_shared);
+                let admitted =
+                    HostSlot::acquire(&shared.pending_hosts).map(|slot| (slot, kind, payload));
+                async move {
+                    let Some((_slot, kind, payload)) = admitted else {
+                        return host_backlog_error();
+                    };
+                    match (js_string(&kind), js_string(&payload)) {
+                        (Ok(kind), Ok(payload)) => host_artifact(&shared, kind, payload).await,
+                        (Err(error), _) | (_, Err(error)) => err_envelope(error),
+                    }
+                }
+            },
+        ),
+    )
+    .expect("注册 __wf_artifact");
+    ctx.globals()
+        .set("__wf_artifact", artifact_fn)
+        .expect("set __wf_artifact");
+}
+
+fn ok_envelope(value: Value) -> String {
+    json!({"ok": true, "value": value}).to_string()
+}
+
+fn err_envelope(error: impl Into<String>) -> String {
+    json!({"ok": false, "error": error.into()}).to_string()
+}
+
+/// 宿主回调的 JSON 入参：先卡字节上限再解析（非法 JSON 按 null 处理，各宿主自行报缺参）。
+fn parse_host_payload(payload: &str) -> Result<Value, String> {
+    if payload.len() > MAX_HOST_PAYLOAD_BYTES {
+        return Err(format!("入参超过 {MAX_HOST_PAYLOAD_BYTES} 字节上限"));
+    }
+    Ok(serde_json::from_str(payload).unwrap_or(Value::Null))
+}
+
+/// 单代 journal 里 `log` 事件的条数 / 字节上限：超过后只进内存环（log_tail 仍能看到最新的），
+/// 并记一条 `log_truncated`。journal 是全量 load 的，一个 `for` 里狂 `log()` 的脚本不能把
+/// GetWorkflowRun / resume 的加载时间和内存一起撑爆。
+const MAX_JOURNAL_LOGS: u64 = 2_000;
+const MAX_JOURNAL_LOG_BYTES: u64 = 1024 * 1024;
+
+fn host_log(shared: &EngineShared, message: String) {
+    let message = truncate_chars(&message, 4_000);
+    let event =
+        json!({"event": "log", "message": message, "exec_generation": shared.exec_generation});
+    let count = shared.log_count.fetch_add(1, Ordering::SeqCst) + 1;
+    let bytes = shared
+        .log_bytes
+        .fetch_add(message.len() as u64, Ordering::SeqCst)
+        + message.len() as u64;
+    if count <= MAX_JOURNAL_LOGS && bytes <= MAX_JOURNAL_LOG_BYTES {
+        append_workflow_event(&shared.journal, &event);
+    } else if !shared.log_truncated.swap(true, Ordering::SeqCst) {
+        append_workflow_event(
+            &shared.journal,
+            &json!({
+                "event": "log_truncated",
+                "exec_generation": shared.exec_generation,
+                "message": format!(
+                    "[workflow] 本代 log 超过 {MAX_JOURNAL_LOGS} 条 / {MAX_JOURNAL_LOG_BYTES} 字节，后续只保留在内存尾部"
+                ),
+            }),
+        );
+    }
+    let mut ring = shared
+        .log_ring
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if ring.len() >= 500 {
+        ring.pop_front();
+    }
+    ring.push_back(event);
+}
+
+fn host_report(shared: &EngineShared, item: &str) -> Result<(), String> {
+    if item.len() > 1024 * 1024 {
+        return Err("report 单条超过 1MiB 上限".to_string());
+    }
+    let count = shared.report_count.fetch_add(1, Ordering::SeqCst) + 1;
+    if count > 65_536 {
+        shared.report_count.fetch_sub(1, Ordering::SeqCst);
+        return Err("report 超过 65536 条上限".to_string());
+    }
+    let total = shared
+        .report_bytes
+        .fetch_add(item.len() as u64, Ordering::SeqCst)
+        + item.len() as u64;
+    if total > 64 * 1024 * 1024 {
+        shared
+            .report_bytes
+            .fetch_sub(item.len() as u64, Ordering::SeqCst);
+        shared.report_count.fetch_sub(1, Ordering::SeqCst);
+        return Err("report 累计超过 64MiB 上限".to_string());
+    }
+    let parsed: Value = serde_json::from_str(item).unwrap_or(Value::Null);
+    append_workflow_event(
+        &shared.journal,
+        &json!({
+            "event": "report",
+            "seq": count,
+            "item": parsed,
+            "exec_generation": shared.exec_generation,
+        }),
+    );
+    Ok(())
+}
+
+/// 单代 journal 里 `phase` 事件的条数上限：规范里 phase 是顶层字面量语句（静态有界），但
+/// 没有谁强制——`for (;;) { phase("a"); phase("b"); }` 是同步宿主、每条一笔事务，与 log 同样
+/// 会把全量 load 的 journal 撑爆。超限后只更新内存里的当前阶段，并记一条 `phase_truncated`。
+const MAX_JOURNAL_PHASES: u64 = 200;
+
+fn host_phase(shared: &EngineShared, name: String) {
+    let name = truncate_chars(name.trim(), 100);
+    if name.is_empty() {
+        return;
+    }
+    let mut current = shared
+        .phase
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if current.as_deref() == Some(name.as_str()) {
+        return;
+    }
+    *current = Some(name.clone());
+    let count = shared.phase_count.fetch_add(1, Ordering::SeqCst) + 1;
+    if count > MAX_JOURNAL_PHASES {
+        if !shared.phase_truncated.swap(true, Ordering::SeqCst) {
+            append_workflow_event(
+                &shared.journal,
+                &json!({
+                    "event": "phase_truncated",
+                    "exec_generation": shared.exec_generation,
+                    "message": format!("[workflow] 本代 phase 超过 {MAX_JOURNAL_PHASES} 条，后续不再记录"),
+                }),
+            );
+        }
+        return;
+    }
+    append_workflow_event(
+        &shared.journal,
+        &json!({
+            "event": "phase",
+            "name": name,
+            "at": chrono::Utc::now().timestamp_millis(),
+            "exec_generation": shared.exec_generation,
+        }),
+    );
+}
+
+/// 单次执行内可登记的不同 hole 数上限（并行分支各自留白是正常用法，循环造新名字不是）。
+const MAX_HOLES_PER_EXEC: usize = 64;
+
+/// hole 名字进入 `hole_id` 的安全形态（trim、≤100 字符、只保留 `[A-Za-z0-9._-]`）。
+/// `host_hole` 造 id 与 `FillWorkflowHole` 核对调用点都用它，保证两边同一口径。
+pub(crate) fn safe_hole_name(name: &str) -> String {
+    truncate_chars(name.trim(), 100)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn host_hole(shared: &EngineShared, name: String, prompt: String, site: Option<u32>) -> String {
+    if !shared.holes_allowed {
+        return err_envelope("hole 不可用：当前阶段未启用 / 同步模式返回 background_required");
+    }
+    // 取消 / 超时宽限期内脚本仍可能走到 hole：不再登记留白、不再给主代理发通知。
+    if shared.cancel.is_cancelled() {
+        return err_envelope("workflow 已取消");
+    }
+    let name = truncate_chars(name.trim(), 100);
+    // hole_id 末段 = prepare_script 注入的全局源码序号（0 起）；没有注入（扫描器没识别的
+    // 写法）才退回“同名第几个”（1 起）。Fill 按同一规则定位调用点。
+    let safe_name = safe_hole_name(&name);
+    let seq = match site {
+        Some(site) => site,
+        None => {
+            let mut counters = shared
+                .hole_name_seq
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            // 别名调用（`const h = hole; h("n" + i)`）拿不到注入的调用点序号，每个新名字都会
+            // 在这里留一项：同样受 MAX_HOLES_PER_EXEC 约束，否则 120s 一片能塞进千万个名字。
+            if !counters.contains_key(&safe_name) && counters.len() >= MAX_HOLES_PER_EXEC {
+                return err_envelope(format!("hole 超过单次执行 {MAX_HOLES_PER_EXEC} 个上限"));
+            }
+            let counter = counters.entry(safe_name.clone()).or_insert(0);
+            *counter += 1;
+            *counter
+        }
+    };
+    let hole_id = format!("hole#{}-{}-{}", safe_name, shared.script_generation, seq);
+    // 同一 exec 内同一 hole_id 只登记一次（同一调用点被 `for (;;) { try { hole() } catch {} }`
+    // 反复到达）；不同 hole_id 也有上限——每次登记都是一笔事务 + 一条通知，不能无界。
+    {
+        let opened = shared
+            .holes_opened
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if opened.contains(&hole_id) {
+            return err_envelope(format!("__hole_pending__: {hole_id} 等待填充"));
+        }
+        if opened.len() >= MAX_HOLES_PER_EXEC {
+            return err_envelope(format!("hole 超过单次执行 {MAX_HOLES_PER_EXEC} 个上限"));
+        }
+    }
+    let _ = shared.hole_seq.fetch_add(1, Ordering::SeqCst);
+    let prompt = truncate_chars(prompt.trim(), 2_000);
+    // 通知在 hole 登记的同一事务入队（事务内不能再取连接锁，行先读出来）：主代理立刻
+    // 得知留白，不必等旧 exec 的其它分支 / 在途 ask 结算后 driver 退出。id 带 exec 代次：
+    // resume 后重新到达同一 hole 要再通知一次，同一 exec 内重复到达则去重。
+    let notify_row = match shared.store.get_run(&shared.run_id) {
+        Ok(row) => row,
+        Err(error) => return err_envelope(error),
+    };
+    let event = json!({
+        "event": "hole_opened",
+        "hole_id": hole_id,
+        "script_generation": shared.script_generation,
+        "name": name,
+        "prompt": prompt,
+        "exec_generation": shared.exec_generation,
+    });
+    let outcome = shared.store.transaction(|tx| {
+        shared
+            .journal
+            .append_tx(tx, &event)
+            .map_err(|error| format!("journal hole 写入失败: {error}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO workflow_hole (run_id, hole_id, script_generation, name, prompt, \
+             state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'waiting', ?6, ?6)",
+            rusqlite::params![
+                &shared.run_id,
+                &hole_id,
+                shared.script_generation as i64,
+                &name,
+                &prompt,
+                rclaw_store::db::now_ms()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(row) = &notify_row {
+            let (channel, chat_id) =
+                super::workflow_service::split_session_key(&row.session_key);
+            super::workflow_store::enqueue_notification_tx(
+                tx,
+                &format!(
+                    "wf-note-{}-{}-hole-{}",
+                    shared.run_id, shared.exec_generation, hole_id
+                ),
+                &shared.run_id,
+                &row.session_key,
+                &channel,
+                &chat_id,
+                &json!({
+                    "kind": "hole",
+                    "run_id": shared.run_id,
+                    "label": row.label,
+                    "hole_id": hole_id,
+                    "name": name,
+                }),
+            )?;
+        }
+        Ok(())
+    });
+    if let Err(error) = outcome {
+        return err_envelope(error);
+    }
+    shared
+        .holes_opened
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(hole_id.clone());
+    // 不置 halt：留白只中止当前 async 链（下面的错误信封）。其它分支与在途 ask 继续跑到
+    // 静止（答案照常落 journal，fill 后的新 exec 零成本重放）；FillWorkflowHole 需要停旧
+    // exec 时取消 run 令牌即可（新 ask 被拒、在途 ask 联动取消）。规范 §3.5「旧 exec 继续跑」。
+    *shared
+        .hole
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(HoleWaiting {
+        hole_id: hole_id.clone(),
+    });
+    err_envelope(format!("__hole_pending__: {hole_id} 等待填充"))
+}
+
+async fn host_files(shared: &Arc<EngineShared>, op: String, payload: String) -> String {
+    let args = match parse_host_payload(&payload) {
+        Ok(args) => args,
+        Err(error) => return err_envelope(format!("files.{op} {error}")),
+    };
+    let op_name = format!("files.{op}");
+    let Some(_effect_permit) = acquire_effect_permit(&shared.effect_permits, &shared.cancel).await
+    else {
+        return err_envelope("workflow 已取消");
+    };
+    let begin = match shared.effects.begin(&op_name, false, &args, None) {
+        Ok(begin) => begin,
+        Err(error) => return err_envelope(error),
+    };
+    let key = match begin {
+        BeginEffect::Replay { value } => return ok_envelope(value),
+        BeginEffect::Execute { key, .. } => key,
+    };
+    // 同步文件系统工作放到外层 runtime 的阻塞线程：引擎线程空转等待时 `drive_to_quiescence`
+    // 会把这段墙钟从 JS 片预算里扣掉（见 WakeOnce 后的 reset）；在引擎线程上直接跑一次
+    // 100s 的 grep 会被当成“CPU 预算耗尽”判失败。
+    let root = shared.project_root.clone();
+    let worker_op = op.clone();
+    let result = shared
+        .outer
+        .spawn_blocking(move || match worker_op.as_str() {
+            "glob" => {
+                let pattern = args
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                workflow_world::files_glob(&root, pattern)
+            }
+            "read" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+                workflow_world::files_read(&root, path)
+            }
+            "grep" => {
+                let pattern = args
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let glob = args.get("glob").and_then(Value::as_str);
+                workflow_world::files_grep(&root, pattern, glob)
+            }
+            other => Err(format!("未知 files 操作: {other}")),
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("files.{op} 工作线程失败: {error}")));
+    settle_effect(shared, &key, result)
+}
+
+/// effect 终态落账并转成信封：结果累计超上限时 finish 不保留结果并返回 Err，脚本拿到的
+/// 也必须是错误（不能一边记 failed 一边把值交给脚本，resume 重放会对不上）。
+fn settle_effect(shared: &EngineShared, key: &str, result: Result<Value, String>) -> String {
+    match result {
+        Ok(value) => match shared.effects.finish(key, "completed", &value) {
+            Ok(()) => ok_envelope(value),
+            Err(error) => err_envelope(error),
+        },
+        Err(error) => {
+            let _ = shared
+                .effects
+                .finish(key, "failed", &json!({"error": error}));
+            err_envelope(error)
+        }
+    }
+}
+
+async fn host_git(shared: &Arc<EngineShared>, op: String, payload: String) -> String {
+    let args = match parse_host_payload(&payload) {
+        Ok(args) => args,
+        Err(error) => return err_envelope(format!("git.{op} {error}")),
+    };
+    let op_name = format!("git.{op}");
+    let Some(_effect_permit) = acquire_effect_permit(&shared.effect_permits, &shared.cancel).await
+    else {
+        return err_envelope("workflow 已取消");
+    };
+    let begin = match shared.effects.begin(&op_name, false, &args, None) {
+        Ok(begin) => begin,
+        Err(error) => return err_envelope(error),
+    };
+    let key = match begin {
+        BeginEffect::Replay { value } => return ok_envelope(value),
+        BeginEffect::Execute { key, .. } => key,
+    };
+    // 同步等 git 子进程（最长 60s）：与 files 同理放到外层阻塞线程，不占引擎片预算。
+    let root = shared.project_root.clone();
+    let worker_op = op.clone();
+    let result = shared
+        .outer
+        .spawn_blocking(move || match worker_op.as_str() {
+            "status" => workflow_world::git_status(&root),
+            "diff" => {
+                let path = args.get("path").and_then(Value::as_str);
+                workflow_world::git_diff(&root, path)
+            }
+            other => Err(format!("未知 git 操作: {other}")),
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("git.{op} 工作线程失败: {error}")));
+    settle_effect(shared, &key, result)
+}
+
+async fn host_world(shared: &Arc<EngineShared>, payload: String) -> String {
+    let args = match parse_host_payload(&payload) {
+        Ok(args) => args,
+        Err(error) => return err_envelope(format!("world.run {error}")),
+    };
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if command.trim().is_empty() {
+        return err_envelope("world.run 需要 command");
+    }
+    // 权限不够的调用在登记 effect 之前就拒绝（world_run 内部还会再查一次）：否则 Sandboxed
+    // 会话经别名绕过静态扫描的 world.run 会留下一条 failed 写 effect，关掉 amend 缓存、
+    // 把 Amend 挡在 UI 确认之后。
+    if shared.tool_access != ToolAccess::Unrestricted {
+        return err_envelope("forbidden_world: world.run 仅 Unrestricted 会话可用");
+    }
+    let opts = args.get("opts").cloned().unwrap_or_else(|| json!({}));
+    let idempotency_key = opts
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(_effect_permit) = acquire_effect_permit(&shared.effect_permits, &shared.cancel).await
+    else {
+        return err_envelope("workflow 已取消");
+    };
+    // §3.7：实际写操作前重查发起会话权限（撤权后不再登记 effect、不再起进程）——放在拿到
+    // 执行名额之后，排队几分钟的调用不会带着过期的检查结果开跑。
+    if let Err(error) = check_session_permission(shared) {
+        return err_envelope(error);
+    }
+    let begin = match shared.effects.begin(
+        "world.run",
+        true,
+        &json!({"command": command, "opts": opts}),
+        idempotency_key.as_deref(),
+    ) {
+        Ok(begin) => begin,
+        Err(error) => return err_envelope(error),
+    };
+    let key = match begin {
+        BeginEffect::Replay { value } => return ok_envelope(value),
+        BeginEffect::Execute { key, .. } => key,
+    };
+    let store = shared.store.clone();
+    let run_id = shared.run_id.clone();
+    let exec_generation = shared.exec_generation;
+    let outcome = workflow_world::world_run(
+        &shared.project_root,
+        shared.tool_access,
+        &command,
+        &opts,
+        &shared.cancel,
+        Duration::from_secs(300),
+        move |process_id, root_pid| {
+            if let Err(error) = store.record_process(&run_id, exec_generation, process_id, root_pid)
+            {
+                tracing::warn!("记录 world.run 进程树失败: {error}");
+            }
+        },
+    )
+    .await;
+    match outcome {
+        Ok(world) => {
+            if let Err(error) = shared.store.mark_process_exited(
+                &shared.run_id,
+                shared.exec_generation,
+                &world.process_id,
+            ) {
+                tracing::warn!("更新 world.run 进程状态失败: {error}");
+            }
+            // 超时无法证明命令没有写入：按 unknown 处理，阻止自动 resume。
+            if world
+                .value
+                .get("timed_out")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                shared
+                    .effects
+                    .mark_unknown(&key, "world.run timed out after process tree exit");
+                return err_envelope("world_run_unknown: world.run 超时（需逐项裁决）");
+            }
+            settle_effect(shared, &key, Ok(world.value))
+        }
+        Err(error) => {
+            if error.starts_with("world_run_unknown") {
+                shared.effects.mark_unknown(&key, &error);
+                return err_envelope(error);
+            }
+            settle_effect(shared, &key, Err(error))
+        }
+    }
+}
+
+async fn host_artifact(shared: &Arc<EngineShared>, kind: String, payload: String) -> String {
+    let args = match parse_host_payload(&payload) {
+        Ok(args) => args,
+        Err(error) => return err_envelope(format!("artifact.{kind} {error}")),
+    };
+    let op_name = format!("artifact.{kind}");
+    let Some(_effect_permit) = acquire_effect_permit(&shared.effect_permits, &shared.cancel).await
+    else {
+        return err_envelope("workflow 已取消");
+    };
+    // §3.7：artifact 也是落盘写操作，拿到执行名额后、登记 effect 前重查发起会话此刻的权限。
+    if let Err(error) = check_session_permission(shared) {
+        return err_envelope(error);
+    }
+    let begin = match shared.effects.begin(&op_name, true, &args, None) {
+        Ok(begin) => begin,
+        Err(error) => return err_envelope(error),
+    };
+    let key = match begin {
+        BeginEffect::Replay { value } => return ok_envelope(value),
+        BeginEffect::Execute { key, .. } => key,
+    };
+    // 最多 20MiB 的文件复制 + 原子写：同样放到外层阻塞线程。
+    let worker_shared = Arc::clone(shared);
+    let worker_kind = kind.clone();
+    let written = shared
+        .outer
+        .spawn_blocking(move || write_artifact(&worker_shared, &worker_kind, &args))
+        .await
+        .unwrap_or_else(|error| Err(format!("artifact.{kind} 工作线程失败: {error}")));
+    settle_effect(shared, &key, written)
+}
+
+fn write_artifact(shared: &EngineShared, kind: &str, args: &Value) -> Result<Value, String> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "artifact 需要 id".to_string())?;
+    let opts = args.get("opts").cloned().unwrap_or_else(|| json!({}));
+    let title = opts
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|text| truncate_chars(text, 200))
+        .unwrap_or_else(|| id.to_string());
+    let primary = opts
+        .get("primary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let dir = workflow_world::artifact_target(&shared.project_root, &shared.run_id, id)?;
+    std::fs::create_dir_all(&dir).map_err(|error| format!("创建 artifact 目录失败: {error}"))?;
+    let mut version = {
+        let mut versions = shared
+            .artifact_versions
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let version = versions.entry(id.to_string()).or_insert(0);
+        *version += 1;
+        *version
+    };
+    let (extension, bytes) = match kind {
+        "file" => {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "artifact.file 需要 path".to_string())?;
+            let resolved = resolve_under(&shared.project_root, path, true)?;
+            let metadata = std::fs::metadata(&resolved)
+                .map_err(|error| format!("artifact.file 无法访问: {error}"))?;
+            if !metadata.is_file() {
+                return Err("artifact.file 目标不是文件".to_string());
+            }
+            if metadata.len() > 20 * 1024 * 1024 {
+                return Err("artifact.file 超过 20MiB 上限".to_string());
+            }
+            let bytes = std::fs::read(&resolved)
+                .map_err(|error| format!("artifact.file 读取失败: {error}"))?;
+            let extension = resolved
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .filter(|ext| ext.len() <= 16)
+                .unwrap_or("bin")
+                .to_ascii_lowercase();
+            (extension, bytes)
+        }
+        "markdown" => {
+            let content = args
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "artifact.markdown 需要 content".to_string())?;
+            if content.len() > 256 * 1024 {
+                return Err("artifact.markdown 超过 256KB 上限".to_string());
+            }
+            ("md".to_string(), content.as_bytes().to_vec())
+        }
+        "table" => {
+            let rows = args.get("rows").cloned().unwrap_or_else(|| json!([]));
+            ("md".to_string(), render_table_markdown(&rows).into_bytes())
+        }
+        "metrics" => {
+            let metrics = args.get("metrics").cloned().unwrap_or_else(|| json!({}));
+            (
+                "md".to_string(),
+                render_metrics_markdown(&metrics).into_bytes(),
+            )
+        }
+        "board" => {
+            let columns = args.get("columns").cloned().unwrap_or_else(|| json!([]));
+            (
+                "md".to_string(),
+                render_board_markdown(&columns).into_bytes(),
+            )
+        }
+        "chart" => {
+            let spec = args.get("spec").cloned().unwrap_or_else(|| json!({}));
+            ("svg".to_string(), render_chart_svg(&spec).into_bytes())
+        }
+        other => return Err(format!("未知 artifact 类型: {other}")),
+    };
+    let mut path = dir.join(format!("v{version}.{extension}"));
+    while path.exists() {
+        version += 1;
+        path = dir.join(format!("v{version}.{extension}"));
+    }
+    workflow_paths::write_atomic(&path, &bytes)?;
+    if let Ok(mut versions) = shared.artifact_versions.lock() {
+        let entry = versions.entry(id.to_string()).or_insert(0);
+        *entry = (*entry).max(version);
+    }
+    let display = workflow_snapshot::display_path(&shared.paths, &path);
+    append_workflow_event(
+        &shared.journal,
+        &json!({
+            "event": "artifact",
+            "id": id,
+            "kind": kind,
+            "title": title,
+            "version": version,
+            "primary": primary,
+            "path": display,
+            "content_type": opts
+                .get("contentType")
+                .and_then(Value::as_str)
+                .map(|text| truncate_chars(text, 100)),
+            "run_id": shared.run_id,
+            "exec_generation": shared.exec_generation,
+        }),
+    );
+    Ok(json!({
+        "id": id,
+        "version": version,
+        "kind": kind,
+        "title": title,
+        "primary": primary,
+        "path": display,
+    }))
+}
+
+fn render_table_markdown(rows: &Value) -> String {
+    let Some(rows) = rows.as_array() else {
+        return "_(no rows)_\n".to_string();
+    };
+    if rows.is_empty() {
+        return "_(no rows)_\n".to_string();
+    }
+    let escape = |value: &Value| -> String {
+        let text = match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        text.replace('|', "\\|").replace('\n', " ")
+    };
+    let headers: Vec<String> = match &rows[0] {
+        Value::Object(map) => map.keys().cloned().collect(),
+        _ => (0..rows[0].as_array().map(Vec::len).unwrap_or(0))
+            .map(|index| format!("col{index}"))
+            .collect(),
+    };
+    let mut out = String::new();
+    out.push_str(&format!("| {} |\n", headers.join(" | ")));
+    out.push_str(&format!(
+        "| {} |\n",
+        headers
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | ")
+    ));
+    for row in rows {
+        let cells: Vec<String> = match row {
+            Value::Object(map) => headers
+                .iter()
+                .map(|header| escape(map.get(header).unwrap_or(&Value::Null)))
+                .collect(),
+            Value::Array(values) => values.iter().map(escape).collect(),
+            other => vec![escape(other)],
+        };
+        out.push_str(&format!("| {} |\n", cells.join(" | ")));
+    }
+    out
+}
+
+fn render_metrics_markdown(metrics: &Value) -> String {
+    match metrics {
+        Value::Object(map) => {
+            let mut out = String::from("| metric | value |\n| --- | --- |\n");
+            for (key, value) in map {
+                out.push_str(&format!(
+                    "| {} | {} |\n",
+                    key.replace('|', "\\|"),
+                    value.to_string().replace('|', "\\|")
+                ));
+            }
+            out
+        }
+        other => render_table_markdown(other),
+    }
+}
+
+fn render_board_markdown(columns: &Value) -> String {
+    let Some(columns) = columns.as_array() else {
+        return "_(no columns)_\n".to_string();
+    };
+    let mut out = String::new();
+    for column in columns {
+        let title = column
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Column");
+        out.push_str(&format!("## {title}\n\n"));
+        if let Some(items) = column.get("items").and_then(Value::as_array) {
+            for item in items {
+                match item {
+                    Value::String(text) => out.push_str(&format!("- {text}\n")),
+                    other => out.push_str(&format!("- {}\n", other)),
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn render_chart_svg(spec: &Value) -> String {
+    let title = spec.get("title").and_then(Value::as_str).unwrap_or("chart");
+    let kind = spec.get("type").and_then(Value::as_str).unwrap_or("bar");
+    let data = spec
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let values: Vec<f64> = data
+        .iter()
+        .filter_map(|point| match point {
+            Value::Number(number) => number.as_f64(),
+            Value::Object(map) => map.get("value").and_then(Value::as_f64),
+            _ => None,
+        })
+        .collect();
+    let max = values.iter().cloned().fold(0.0f64, f64::max).max(1.0);
+    let (width, height, padding) = (640.0f64, 360.0f64, 32.0f64);
+    let plot_width = width - padding * 2.0;
+    let plot_height = height - padding * 2.0;
+    let mut body = String::new();
+    if kind == "line" {
+        let step = if values.len() > 1 {
+            plot_width / (values.len() - 1) as f64
+        } else {
+            0.0
+        };
+        let points: Vec<String> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                format!(
+                    "{:.1},{:.1}",
+                    padding + index as f64 * step,
+                    padding + plot_height - (value / max) * plot_height
+                )
+            })
+            .collect();
+        if !points.is_empty() {
+            body.push_str(&format!(
+                "<polyline fill=\"none\" stroke=\"#4a7\" stroke-width=\"2\" points=\"{}\"/>",
+                points.join(" ")
+            ));
+        }
+    } else {
+        let slot = plot_width / values.len().max(1) as f64;
+        for (index, value) in values.iter().enumerate() {
+            let bar_height = (value / max) * plot_height;
+            body.push_str(&format!(
+                "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"#4a7\"/>",
+                padding + index as f64 * slot + slot * 0.1,
+                padding + plot_height - bar_height,
+                slot * 0.8,
+                bar_height
+            ));
+        }
+    }
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" \
+         viewBox=\"0 0 {width} {height}\"><rect width=\"100%\" height=\"100%\" fill=\"#fff\"/>\
+         <text x=\"{padding}\" y=\"20\" font-family=\"sans-serif\" font-size=\"14\">{}</text>\
+         <line x1=\"{padding}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#ccc\"/>\
+         {body}</svg>",
+        title.replace('<', "&lt;").replace('>', "&gt;"),
+        padding + plot_height,
+        width - padding,
+        padding + plot_height
+    )
+}
+
+/// 引擎没有正常结算的原因：driver 据此区分 stopped（取消）与 errored(budget_exhausted)
+/// （墙钟耗尽）——两者都会取消引擎自己的令牌，不能靠令牌状态倒推。
+enum EngineAbort {
+    /// 外部取消（Cancel / amend 取代 / 同步模式父 turn）。
+    Cancelled(String),
+    /// 墙钟预算 `max_run_secs` 耗尽。
+    Budget(String),
+    /// 脚本 / 引擎自身错误。
+    Script(String),
 }
 
 /// 在内嵌 runtime 上驱动引擎到结算，并与取消令牌、墙钟预算竞速：取消 / 超时先经 token 让
-/// 子代理优雅收尾（宽限期），再放弃引擎。
+/// 子代理优雅收尾（宽限期），再置 halt 终止 JS。
 async fn drive_engine(
     script: String,
     max_run: Duration,
     runtime: AgentToolRuntime,
     shared: Arc<EngineShared>,
-) -> Result<Option<ScriptOutcome>, String> {
+) -> Result<Option<ScriptOutcome>, EngineAbort> {
     let host_shared = Arc::clone(&shared);
-    let drive = eval_deterministic(script, Arc::clone(&shared.budget), move |ctx| {
-        register_workflow_hosts(ctx, runtime, host_shared)
-    });
+    let drive = eval_deterministic(
+        script,
+        Arc::clone(&shared.budget),
+        Arc::clone(&shared.halt),
+        shared.args.clone(),
+        move |ctx| register_workflow_hosts(ctx, runtime, host_shared),
+    );
     tokio::pin!(drive);
-    let abort_reason = tokio::select! {
+    let abort = tokio::select! {
         biased;
-        _ = shared.cancel.cancelled() => "workflow 已取消（父 turn 取消或工具调用被放弃）".to_string(),
+        _ = shared.cancel.cancelled() => EngineAbort::Cancelled(
+            "workflow 已取消（父 turn 取消或工具调用被放弃）".to_string(),
+        ),
         driven = tokio::time::timeout(max_run, &mut drive) => match driven {
-            Ok(outcome) => return outcome,
-            Err(_) => format!("workflow 超过墙钟预算 {}s（max_run_secs）", max_run.as_secs()),
+            Ok(outcome) => return outcome.map_err(EngineAbort::Script),
+            Err(_) => EngineAbort::Budget(format!(
+                "workflow 超过墙钟预算 {}s（max_run_secs）",
+                max_run.as_secs()
+            )),
         },
     };
+    // 引擎令牌是 run 令牌的子令牌（见 driver）：这里取消只波及引擎内部（在途 ask / world.run），
+    // driver 看到的 run 令牌不变，墙钟耗尽才能被正确记成 errored 而不是 stopped。
     shared.cancel.cancel();
-    let _ = tokio::time::timeout(CANCEL_GRACE, &mut drive).await;
-    Err(abort_reason)
+    if tokio::time::timeout(CANCEL_GRACE, &mut drive)
+        .await
+        .is_err()
+    {
+        shared.halt.store(true, Ordering::SeqCst);
+        let _ = tokio::time::timeout(HALT_GRACE, &mut drive).await;
+    }
+    Err(abort)
 }
 
 // ---------------------------------------------------------------------------
-// WorkflowRun 工具
+// 引擎入口（后台 driver / 同步模式 / EvalSnippet 共用）
 // ---------------------------------------------------------------------------
 
-pub struct WorkflowRunTool {
-    runtime: AgentToolRuntime,
+/// 一次执行的完整上下文（由 service/driver 从快照 + execution_config 构建）。
+pub(crate) struct EngineRequest {
+    pub run_id: String,
+    /// 已编译的 exec script（`.ask<T>` 已重写）。
+    pub script: String,
+    /// 作者原文的 FNV hash（journal / snapshot 校验用）。
+    pub script_hash: u64,
+    pub script_generation: u32,
+    pub exec_generation: u32,
+    pub journal: EventLog,
+    pub cancel: CancellationToken,
+    pub max_run: Duration,
+    pub max_parallel_asks: usize,
+    pub subagent_model: Option<String>,
+    pub allowed_models: HashSet<String>,
+    pub args: Value,
+    pub project_root: PathBuf,
+    pub tool_access: ToolAccess,
+    pub store: WorkflowStore,
+    pub paths: WorkflowPaths,
+    pub effects: Arc<EffectTracker>,
+    pub replay: ReplayTable,
+    pub holes_allowed: bool,
+    pub inherited: super::InheritedTurnContext,
+    /// driver 在引擎就绪后写入 retune 句柄（Amend 模式 A 用）。
+    pub retune_slot: Arc<StdMutex<Option<RetuneHandle>>>,
+    /// 心跳计数（driver 创建并持有，引擎侧更新）。
+    pub progress: Arc<ProgressCounters>,
 }
 
-impl WorkflowRunTool {
-    pub fn new(runtime: AgentToolRuntime) -> Self {
-        WorkflowRunTool { runtime }
-    }
+/// 引擎执行结果。
+pub(crate) enum EngineOutcome {
+    Completed {
+        result: Option<String>,
+        asks_total: u64,
+        asks_replayed: u64,
+    },
+    HoleWaiting {
+        hole: HoleWaiting,
+    },
+    Failed {
+        error: String,
+        /// 墙钟预算（max_run_secs）耗尽：driver 记 `errored(budget_exhausted)`。
+        budget_exhausted: bool,
+    },
 }
 
-#[async_trait]
-impl Tool for WorkflowRunTool {
-    fn name(&self) -> &str {
-        "WorkflowRun"
-    }
+/// 提交期脚本准备：typed ask 编译 + 语法/lint/tsc。
+pub(crate) struct PreparedScript {
+    /// 作者原文（规范化为 LF）——hash 与快照都按它。
+    pub script: String,
+    /// 编译后的 exec script（`.ask<T>` 已重写为 askJson）。
+    pub exec_script: String,
+    pub script_hash: u64,
+    pub typed_asks: usize,
+    pub insight: WorkflowInsight,
+}
 
-    fn description(&self) -> &str {
-        "Run a DETERMINISTIC JS script that orchestrates sub-agents (Layer 3 engine). \
-         Sandbox: QuickJS with Date.now/Math.random pinned and Date/Math frozen, no \
-         module loading. Facade: agent(name).ask(question) returns a PROMISE (use await \
-         or Promise.all for parallel fan-out; up to max_parallel_asks sub-agents run \
-         concurrently); result(text) records the final output. Every ask runs a bounded \
-         sub-agent and is journaled with an FNV-1a inputHash. Resume: pass resume_run_id \
-         — answered asks replay from the run journal (agent/state.sqlite, workflow/<run_id>) at zero provider \
-         cost; the script must be byte-identical (script hash checked). AMEND: pass          amend_run_id with a REVISED script — completed asks import by actor name +          question hash (zero cost), changed/new questions run fresh."
+pub(crate) async fn prepare_script(
+    script: &str,
+    type_check: bool,
+) -> Result<PreparedScript, String> {
+    let script = workflow_snapshot::normalize_script(script);
+    // 注入静态 hole 调用点序号（快照/hash 基于注入后的文本）。注入是幂等的：已有序号原位
+    // 改写，所以 resume 重新 prepare 同一快照 hash 不变；fill 后正文里新出现的 hole 会让
+    // 后续调用点重新编号（hole_id 带 script_generation，旧代序号不会被误用）。
+    let (mut script, _) = super::workflow_saved::annotate_hole_sites(&script);
+    if !script.contains("/* rclaw-hole-sites */") {
+        script.push_str("\n/* rclaw-hole-sites */\n");
     }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Short run name for logs (default 'workflow')."},
-                "script": {"type": "string", "description": "Deterministic JS orchestration script (<=100k chars), wrapped in an async IIFE (top-level await and Promise.all allowed). Globals: agent(name).ask(question) (Promise), result(text). No Date.now/Math.random/import (pinned/blocked)."},
-                "resume_run_id": {"type": "string", "description": "Resume a previous run: answered asks are replayed from the journal at zero cost; the script must be identical (hash checked)."},
-                "amend_run_id": {"type": "string", "description": "AMEND a previous run with a REVISED script: completed asks are imported from the predecessor journal by actor name + question hash (identical question text = zero-cost answer; changed/new questions run fresh). Mutually exclusive with resume_run_id; creates a new run id with lineage recorded."},
-                "max_parallel_asks": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Concurrency cap for parallel asks (default 8)."},
-                "max_run_secs": {"type": "integer", "minimum": 1, "maximum": 86400, "description": "Overall wall-clock budget for the run in seconds (default 3600). Exceeding it fails the run; the journal is kept for resume."},
-                "type_check": {"type": "boolean", "description": "Run tsc type-level check against facade.d.ts when the host has node+tsc (auto-downgrades to syntax+lint when unavailable). Default true."}
-            },
-            "required": ["script"]
-        })
+    if script.chars().count() > MAX_SCRIPT_CHARS {
+        return Err(format!("script 超过 {MAX_SCRIPT_CHARS} 字符"));
     }
-
-    async fn execute(&self, input: Value) -> ToolResult {
-        let Some(script) = get_str(&input, "script")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            // CRLF → LF：hash 与执行都用规范化文本，跨平台重提同一脚本 resume 不被拒。
-            .map(|s| s.replace("\r\n", "\n"))
-        else {
-            return ToolResult::err("script is required for WorkflowRun".to_string());
-        };
-        if script.chars().count() > MAX_SCRIPT_CHARS {
-            return ToolResult::err(format!("script 超过 {MAX_SCRIPT_CHARS} 字符"));
+    let compile_input = script.clone();
+    let compiled = tokio::task::spawn_blocking(move || {
+        super::workflow_ast::compile_typed_asks(&compile_input)
+            .map(|transform| (transform.exec_script, transform.typed_asks))
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!("typed ask 编译线程失败，按未重写脚本继续: {error}");
+        Ok((script.clone(), Vec::new()))
+    });
+    let (exec_script, typed_asks) = match compiled {
+        Ok(compiled) => compiled,
+        Err(diagnostics) => return Err(format_diagnostics(&diagnostics)),
+    };
+    let tsc_input = if typed_asks.is_empty() {
+        exec_script.clone()
+    } else {
+        script.clone()
+    };
+    let lint_script = exec_script.clone();
+    // 静态洞察（依赖图）与 lint 同在阻塞线程上算：解析 + 分组对大脚本是实打实的 CPU 工作，
+    // 不占 async 工作线程。
+    let (diagnostics, insight) = tokio::task::spawn_blocking(move || {
+        let mut diagnostics = check_script(&lint_script, false);
+        if type_check && diagnostics.is_empty() {
+            if let Some(mut tsc_diagnostics) = type_check_with_tsc(&tsc_input) {
+                diagnostics.append(&mut tsc_diagnostics);
+            }
         }
-        // Layer 3 `.ask<T>` 泛型编译（第十二轮）：内联类型注解编译成 JSON schema，调用点
-        // 重写为 askJson(question, schema)。script hash 仍按【作者原文】计算（resume 的
-        // 逐字节一致语义不变）；语法 / lint 检查与引擎执行都走重写后的 exec_script。
-        // 编译在 blocking 线程（oxc 解析是纯 CPU）。**始终编译**（无 typed ask 时原样
-        // 返回）——typed ask 的判定必须走 AST：`.ask <T>`（空格）与模板串插值里的调用
-        // 都不含 `.ask<` 字节序列，文本预判会漏，漏掉的 TS 语法会一路漏到 QuickJS。
-        let compile_input = script.clone();
-        let compiled = tokio::task::spawn_blocking(move || {
-            super::workflow_ast::compile_typed_asks(&compile_input)
-                .map(|transform| (transform.exec_script, transform.typed_asks))
-        })
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!("typed ask 编译线程失败，按未重写脚本继续: {error}");
-            Ok((script.clone(), Vec::new()))
-        });
-        let (exec_script, typed_asks) = match compiled {
-            Ok(compiled) => compiled,
-            Err(diagnostics) => {
-                return ToolResult::err(format_diagnostics(&diagnostics));
-            }
+        let insight = diagnostics
+            .is_empty()
+            .then(|| analyze_workflow_script(&lint_script));
+        (diagnostics, insight)
+    })
+    .await
+    .unwrap_or_default();
+    if !diagnostics.is_empty() {
+        return Err(format_diagnostics(&diagnostics));
+    }
+    let script_hash = fnv1a64(&script);
+    let insight = insight.unwrap_or_else(|| analyze_workflow_script(&exec_script));
+    Ok(PreparedScript {
+        script,
+        exec_script,
+        script_hash,
+        typed_asks: typed_asks.len(),
+        insight,
+    })
+}
+
+/// 从 journal 恢复 artifact 最新版本（resume / fill 后不覆盖旧版本）。
+fn load_artifact_versions(journal: &EventLog) -> HashMap<String, u32> {
+    let mut versions: HashMap<String, u32> = HashMap::new();
+    let Ok(events) = journal.load() else {
+        return versions;
+    };
+    for (_, event) in events {
+        if event.get("event").and_then(Value::as_str) != Some("artifact") {
+            continue;
+        }
+        let Some(id) = event.get("id").and_then(Value::as_str) else {
+            continue;
         };
-        // Layer 3 类型/facade 检查：带诊断的脚本拒绝提交，诊断只回给模型不落用户。
-        // tsc 类型级检查耗时（秒级）且为阻塞调用：放 blocking 线程。
-        // 默认启用（不可用自动降级），显式 false 才跳过。
-        let type_check = input
-            .get("type_check")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        // tsc 类型级检查优先对【作者原文】跑（facade.d.ts 已声明 ask<T> 泛型，原文可
-        // 直接检查出类型错误；重写后的 exec script 只剩 askJson，丢掉 ask<T> 的类型
-        // 语境）。无 typed ask 时两者一致，仍用 exec script。语法探针与 lint 始终跑
-        // exec script（QuickJS 只认重写后的纯 JS）。
-        let tsc_input = if typed_asks.is_empty() {
-            exec_script.clone()
-        } else {
-            script.clone()
+        let version = event.get("version").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let entry = versions.entry(id.to_string()).or_insert(0);
+        *entry = (*entry).max(version);
+    }
+    versions
+}
+
+/// 执行一段脚本，返回结构化结果（不写 run 终态；driver 负责事务收尾）。
+pub(crate) async fn run_engine(request: EngineRequest, runtime: AgentToolRuntime) -> EngineOutcome {
+    let EngineRequest {
+        run_id,
+        script,
+        script_hash,
+        script_generation,
+        exec_generation,
+        journal,
+        cancel,
+        max_run,
+        max_parallel_asks,
+        subagent_model,
+        allowed_models,
+        args,
+        project_root,
+        tool_access,
+        store,
+        paths,
+        effects,
+        replay,
+        holes_allowed,
+        inherited,
+        retune_slot,
+        progress,
+    } = request;
+    let Some(active_run) = ActiveRunGuard::acquire(&run_id) else {
+        return EngineOutcome::Failed {
+            error: format!("run '{run_id}' 正在执行中，不能并发执行同一个 run"),
+            budget_exhausted: false,
         };
-        let lint_script = exec_script.clone();
-        let diagnostics = tokio::task::spawn_blocking(move || {
-            let mut diagnostics = check_script(&lint_script, false);
-            if type_check && diagnostics.is_empty() {
-                if let Some(mut tsc_diagnostics) = type_check_with_tsc(&tsc_input) {
-                    diagnostics.append(&mut tsc_diagnostics);
-                }
-            }
-            diagnostics
+    };
+    let permit_limit = max_parallel_asks.clamp(1, MAX_MAX_PARALLEL_ASKS as usize);
+    let artifact_versions = load_artifact_versions(&journal);
+    let _ = script_hash;
+    let shared = Arc::new(EngineShared {
+        engine: StdMutex::new(EngineState {
+            replay,
+            ..EngineState::default()
+        }),
+        permits: DynamicSemaphore::new(permit_limit),
+        budget: Arc::new(SliceBudget::new()),
+        halt: Arc::new(AtomicBool::new(false)),
+        run_id: run_id.clone(),
+        journal,
+        cancel,
+        outer: tokio::runtime::Handle::current(),
+        inherited,
+        _active_run: active_run,
+        store,
+        effects,
+        paths,
+        args,
+        project_root,
+        tool_access,
+        allowed_models: Arc::new(StdMutex::new(allowed_models)),
+        subagent_model: Arc::new(StdMutex::new(subagent_model)),
+        script_generation,
+        exec_generation,
+        hole: StdMutex::new(None),
+        hole_seq: AtomicU64::new(0),
+        hole_name_seq: StdMutex::new(HashMap::new()),
+        holes_opened: StdMutex::new(HashSet::new()),
+        question_seq: Arc::new(AtomicU64::new(0)),
+        progress,
+        holes_allowed,
+        log_ring: StdMutex::new(VecDeque::new()),
+        log_count: AtomicU64::new(0),
+        log_bytes: AtomicU64::new(0),
+        log_truncated: AtomicBool::new(false),
+        report_bytes: AtomicU64::new(0),
+        report_count: AtomicU64::new(0),
+        phase: StdMutex::new(None),
+        phase_count: AtomicU64::new(0),
+        phase_truncated: AtomicBool::new(false),
+        artifact_versions: StdMutex::new(artifact_versions),
+        pending_hosts: Arc::new(AtomicUsize::new(0)),
+        effect_permits: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_EFFECTS)),
+    });
+    *retune_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(RetuneHandle {
+        permits: Arc::clone(&shared.permits),
+        subagent_model: Arc::clone(&shared.subagent_model),
+        allowed_models: Arc::clone(&shared.allowed_models),
+    });
+    let engine_runtime = runtime.clone();
+    let engine_shared = Arc::clone(&shared);
+    let engine_task = tokio::task::spawn_blocking(move || {
+        let inner = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                EngineAbort::Script(format!("workflow 内嵌 runtime 创建失败: {error}"))
+            })?;
+        inner.block_on(drive_engine(script, max_run, engine_runtime, engine_shared))
+    });
+    // 外层取消（Cancel / amend 取代 / 同步模式父 turn）到达引擎令牌后：宽限期让在途子代理经
+    // 令牌收尾、让 try/catch 住失败 ask 的脚本走完；到期置 halt，中断处理器在下一个轮询点
+    // 终止 JS——内嵌 runtime 里的 select 在紧循环期间得不到 poll，这个看门狗必须在外层。
+    let halt_watch = {
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            shared.cancel.cancelled().await;
+            tokio::time::sleep(CANCEL_GRACE).await;
+            shared.halt.store(true, Ordering::SeqCst);
         })
-        .await
+    };
+    let hard_deadline = max_run + ENGINE_SLICE_BUDGET + CANCEL_GRACE;
+    let executed = match tokio::time::timeout(hard_deadline, engine_task).await {
+        Ok(executed) => executed,
+        Err(_elapsed) => {
+            shared.cancel.cancel();
+            shared.halt.store(true, Ordering::SeqCst);
+            Ok(Err(EngineAbort::Budget(format!(
+                "workflow 引擎超过墙钟预算 {}s 后仍未返回（脚本可能卡在不可中断的同步操作，\
+                 如灾难性回溯的正则），已放弃等待",
+                max_run.as_secs()
+            ))))
+        }
+    };
+    halt_watch.abort();
+    let outcome = match executed {
+        Ok(outcome) => outcome,
+        Err(error) => Err(EngineAbort::Script(format!(
+            "workflow 引擎线程失败: {error}"
+        ))),
+    };
+    let (asks_total, asks_replayed, final_result, hole) = {
+        let engine = shared.engine.lock().unwrap_or_else(|p| p.into_inner());
+        let hole = shared
+            .hole
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        (
+            engine.asks_total,
+            engine.asks_replayed,
+            engine.result.clone(),
+            hole,
+        )
+    };
+    // 墙钟耗尽压过 hole：预算已用完的 run 不能停在 hole 上装作还能续（Fill 后新代次一启动
+    // 就 budget_exhausted）。取消则仍按 HoleWaiting 交给 driver——Fill 回退旧 exec 就是靠
+    // 取消令牌让它退出，run 要继续停在 hole 上。
+    let budget_exhausted = matches!(outcome, Err(EngineAbort::Budget(_)));
+    if let (Some(hole), false) = (hole, budget_exhausted) {
+        // hole 暂停前等在途 ask 结算（子代理不能跨 exec 代次继续跑）。
+        for _ in 0..200 {
+            if shared.progress.active_agents.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        return EngineOutcome::HoleWaiting { hole };
+    }
+    let returned = match outcome {
+        Err(
+            EngineAbort::Cancelled(error) | EngineAbort::Budget(error) | EngineAbort::Script(error),
+        ) => Err(error),
+        Ok(_) if shared.budget.interrupted() => Err(format!(
+            "脚本单片 CPU 预算（{}s）耗尽被中断",
+            ENGINE_SLICE_BUDGET.as_secs()
+        )),
+        Ok(None) => Err("脚本未结算（挂在永不 resolve 的 promise 上）".to_string()),
+        Ok(Some(ScriptOutcome::Threw(error))) => Err(format!("ERROR: {error}")),
+        Ok(Some(ScriptOutcome::Returned(value))) => Ok(value),
+    };
+    match returned {
+        Ok(value) => EngineOutcome::Completed {
+            result: final_result.or(value),
+            asks_total,
+            asks_replayed,
+        },
+        Err(error) => EngineOutcome::Failed {
+            error: format!(
+                "{error}\n（journal 已保留已完成问答：{}；同一脚本配 resume_run_id 重提可续跑）",
+                shared.journal.locator()
+            ),
+            budget_exhausted,
+        },
+    }
+}
+
+/// 从 journal 读取某 run 的脚本 hash 与重放表（driver 启动前调用）。
+pub(crate) fn journal_replay(journal: &EventLog) -> Result<(u64, ReplayTable), String> {
+    load_workflow_journal(journal)
+}
+
+/// `EvalWorkflowSnippet`：与真实 run 同一编译器 / 沙箱，但无 agent/report/artifact/hole/phase，
+/// 不落 journal、不建 run。`world.run` 仅 Unrestricted。
+pub(crate) async fn eval_snippet(
+    code: String,
+    timeout: Duration,
+    tool_access: ToolAccess,
+    project_root: PathBuf,
+) -> Result<Value, String> {
+    // 取消令牌挂在父 turn 上：`/cancel` 要能停掉片段里的 world.run；外层再加硬超时——内嵌
+    // runtime 里不可中断的同步操作（灾难性回溯的正则、挂住的 git）会让里面的 timeout 永远
+    // 得不到 poll，没有外层超时这个工具调用就永久挂起（线程泄漏与 run_engine 同口径）。
+    let cancel = rclaw_tools::turn_state::turn_cancel()
+        .map(|parent| parent.child_token())
         .unwrap_or_default();
-        if !diagnostics.is_empty() {
-            return ToolResult::err(format_diagnostics(&diagnostics));
+    let worker_cancel = cancel.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let inner = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("片段内嵌 runtime 创建失败: {error}"))?;
+        inner.block_on(eval_snippet_inner(
+            code,
+            timeout,
+            tool_access,
+            project_root,
+            worker_cancel,
+        ))
+    });
+    match tokio::time::timeout(timeout + CANCEL_GRACE + Duration::from_secs(5), worker).await {
+        Ok(joined) => joined.map_err(|error| format!("片段执行线程失败: {error}"))?,
+        Err(_elapsed) => {
+            cancel.cancel();
+            Err(format!(
+                "片段超过 {}ms 仍未结算（可能卡在不可中断的同步操作上），已放弃",
+                timeout.as_millis()
+            ))
         }
-        let script_hash = fnv1a64(&script);
-        let run_name = sanitize_agent_name(
-            get_str(&input, "name")
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or("workflow"),
-        );
-        let max_parallel_asks = input
-            .get("max_parallel_asks")
-            .and_then(Value::as_u64)
-            .map(|value| value.clamp(1, MAX_MAX_PARALLEL_ASKS as u64) as usize)
-            .unwrap_or(DEFAULT_MAX_PARALLEL_ASKS as usize);
-        let max_run = Duration::from_secs(
-            input
-                .get("max_run_secs")
-                .and_then(Value::as_u64)
-                .map(|secs| secs.clamp(1, MAX_MAX_RUN_SECS))
-                .unwrap_or(DEFAULT_MAX_RUN_SECS),
-        );
-        let resume_request = get_str(&input, "resume_run_id")
-            .map(str::trim)
-            .filter(|id| !id.is_empty());
-        let amend_request = get_str(&input, "amend_run_id")
-            .map(str::trim)
-            .filter(|id| !id.is_empty());
-        if resume_request.is_some() && amend_request.is_some() {
-            return ToolResult::err("resume_run_id 与 amend_run_id 互斥：前者续跑同一 run（脚本须逐字节一致），后者按 actor 导入前驱已完成 ask 的修订热修（脚本可改）。".to_string());
-        }
-        // resume/amend 的 run_id 由调用方给出、将用于定位 journal 流：必须与 sanitize 结果
-        // 逐字一致（`sanitize_agent_name` 对纯符号输入会回落成 "agent"，`is_empty()` 判不出来；
-        // 大小写 / 空白变体也会悄悄指向另一条流）。与 ResolveWorkflowQuestion 同一准入口径。
-        if let Some(raw_id) = resume_request.or(amend_request) {
-            if sanitize_agent_name(raw_id) != raw_id {
-                return ToolResult::err(format!(
-                    "run_id '{raw_id}' 不合法（须与先前 WorkflowRun 结果里的 run_id 逐字一致）"
-                ));
-            }
-        }
-        let run_id = match (resume_request, amend_request) {
-            (Some(raw_id), _) => raw_id.to_string(),
-            (None, Some(_)) => next_execution_id(&format!("{run_name}-amend")),
-            (None, None) => next_execution_id(&run_name),
-        };
-        // 同一 run_id 不允许并发执行（只有 resume 会复用 id）：两个引擎往同一条 journal
-        // 交错写 ask / answer，重放配对与调用点编号都会错乱。守卫随后移交给 EngineShared，
-        // 与引擎同寿命（见其字段说明）。
-        let Some(active_run) = ActiveRunGuard::acquire(&run_id) else {
-            return ToolResult::err(format!(
-                "run '{run_id}' 正在执行中，不能并发 resume 同一个 run；等它结束后再续跑"
-            ));
-        };
-        let journal = EventLog::workflow(&self.runtime.journal, &run_id);
-        // Layer 3 静态洞察（AST 优先，文本降级）：actor/ask 数/并行/依赖图，
-        // 入 run_started 与报告；typed ask 计数一并入事件。
-        let insight = analyze_workflow_script(&exec_script);
-        let mut replay: ReplayTable = HashMap::new();
-        let mut amended_from: Option<String> = None;
-        let mut imported_asks = 0usize;
-        // run_started / run_resumed 是 resume 的锚点（script_hash 校验、新一代调用点编号的
-        // 起点）：写不进 journal 就不能开跑——否则 run 结束后报告里的 resume 提示必然失败，
-        // 而且已付费的 ask 答案没有任何一代能认领。
-        let lifecycle_event: Value;
-        if resume_request.is_some() {
-            match load_workflow_journal(&journal) {
-                Ok((journal_script_hash, table)) => {
-                    if journal_script_hash != script_hash {
-                        return ToolResult::err(format!(
-                            "脚本与 run '{run_id}' 的 journal 不一致（script hash {script_hash:016x} ≠ {journal_script_hash:016x}）。\
-                             续跑（resume_run_id）要求脚本逐字节一致；如需修改编排，请改用 amend_run_id 热修：\
-                             按 actor 名导入前驱已完成 ask，只重跑未完成的部分。"
-                        ));
-                    }
-                    replay = table;
-                }
-                Err(error) => return ToolResult::err(error),
-            }
-            lifecycle_event =
-                json!({"event": "run_resumed", "script_hash": format!("{script_hash:016x}")});
-        } else if let Some(predecessor) = amend_request {
-            // Layer 3 Amend 热修（ZCode「按子代理名字导入前驱已完成工作」同源）：
-            // 修订脚本按 actor 名 + inputHash 匹配前驱 journal——问答文本未变的 ask
-            // 零调用继承答案；改写/新增的问题照常执行；脚本可以任意修改。
-            let predecessor_journal = EventLog::workflow(&self.runtime.journal, predecessor);
-            match load_workflow_journal(&predecessor_journal) {
-                Ok((_predecessor_hash, mut table)) => {
-                    // 导入不经顺序门：修订脚本可能改写/删除了前驱的某些 ask，原完成序里会出现
-                    // 永不被认领的位次——保留 order 会让后面的重放 ask 在门里等到引擎静止。
-                    for entry in table.values_mut() {
-                        entry.order = None;
-                    }
-                    imported_asks = table.len();
-                    replay = table;
-                    amended_from = Some(predecessor.to_string());
-                }
-                Err(error) => {
-                    return ToolResult::err(format!("amend 前驱加载失败: {error}"));
-                }
-            }
-            lifecycle_event = json!({
-                "event": "run_started",
-                "script_hash": format!("{script_hash:016x}"),
-                "amended_from": predecessor,
-                "imported_asks": imported_asks,
-            });
-        } else {
-            lifecycle_event = json!({
-                "event": "run_started",
-                "script_hash": format!("{script_hash:016x}"),
-                "typed_asks": typed_asks.iter().map(|(line, _)| line).collect::<Vec<_>>(),
-                "insight": insight,
-            });
-        }
-        if let Err(error) = journal.append(&lifecycle_event) {
-            return ToolResult::err(format!(
-                "workflow 未启动：{error}。journal 写不进去的 run 无法 resume，拒绝执行以免白付 ask 费用"
-            ));
-        }
-
-        // 取消：工具 future 被丢弃（父 turn /cancel、调用被放弃）→ 守卫触发 token → 引擎线程
-        // 退出、全部 ask 子代理联动终止；顶层 turn 的取消令牌（在作用域内时）作为父令牌链入。
-        let cancel = rclaw_tools::turn_state::turn_cancel()
-            .map(|parent| parent.child_token())
-            .unwrap_or_default();
-        let _cancel_guard = cancel.clone().drop_guard();
-        // 此处仍在外层 runtime、发起方 turn 的 task 里：句柄与 task-local 快照都在这里取。
-        // 所有宿主（CLI / 桌面 / 安卓）都在 tokio 上跑 turn；万一不是，报错而不是 panic。
-        let outer = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle,
-            Err(error) => {
-                return ToolResult::err(format!("WorkflowRun 需要在 tokio 运行时内执行: {error}"));
-            }
-        };
-        let shared = Arc::new(EngineShared {
-            engine: StdMutex::new(EngineState {
-                replay,
-                ..EngineState::default()
-            }),
-            permits: tokio::sync::Semaphore::new(max_parallel_asks),
-            budget: Arc::new(SliceBudget::new()),
-            run_id: run_id.clone(),
-            journal: journal.clone(),
-            cancel,
-            outer,
-            inherited: super::InheritedTurnContext::capture(),
-            _active_run: active_run,
-        });
-        let engine_runtime = self.runtime.clone();
-        let engine_shared = Arc::clone(&shared);
-        // rquickjs 的 async future 非 Send（持裸 JS 指针）：整段引擎放进
-        // spawn_blocking + 内嵌 current_thread runtime 驱动——future 不跨线程，
-        // JoinHandle（快照结果）是 Send。ask 的子代理执行 spawn 在外层 runtime 上
-        //（EngineShared::outer），结果经 mpsc 回到内嵌 runtime 里的宿主回调。
-        let engine_task = tokio::task::spawn_blocking(move || {
-            let inner = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("workflow 内嵌 runtime 创建失败: {error}"))?;
-            inner.block_on(drive_engine(exec_script, max_run, engine_runtime, engine_shared))
-        });
-        // 外层硬超时：引擎内的取消 / 墙钟竞速都要内嵌 runtime 被轮询才生效，而同步 JS 只有
-        // 经中断处理器才会让出；quickjs-ng 的正则回溯不轮询中断处理器，一条灾难性回溯的
-        // 正则（`/(a+)+$/` 之类）就能把阻塞线程永久占死——没有这道上限，这次工具调用连同
-        // 整个 turn（及其执行槽位）会永久挂起。到期放弃等待（线程无法回收，是已知代价）。
-        let hard_deadline = max_run + ENGINE_SLICE_BUDGET + CANCEL_GRACE;
-        let executed = match tokio::time::timeout(hard_deadline, engine_task).await {
-            Ok(executed) => executed,
-            Err(_elapsed) => {
-                shared.cancel.cancel();
-                Ok(Err(format!(
-                    "workflow 引擎超过墙钟预算 {}s 后仍未返回（脚本可能卡在不可中断的同步操作，\
-                     如灾难性回溯的正则），已放弃等待",
-                    max_run.as_secs()
-                )))
-            }
-        };
-        let outcome = match executed {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return ToolResult::err(format!("workflow 引擎线程失败: {error}"));
-            }
-        };
-        let (asks_total, asks_replayed, final_result) = {
-            let engine = shared.engine.lock().unwrap_or_else(|p| p.into_inner());
-            (engine.asks_total, engine.asks_replayed, engine.result.clone())
-        };
-        // 结算判定：引擎错误 / 取消 / 超时 / CPU 片中断 / 脚本抛错 / 未结算 → run_failed
-        //（journal 保留已完成问答，可 resume）；只有 IIFE 正常返回才算 completed。
-        let returned = match outcome {
-            Err(error) => Err(error),
-            Ok(_) if shared.budget.interrupted() => Err(format!(
-                "脚本单片 CPU 预算（{}s）耗尽被中断",
-                ENGINE_SLICE_BUDGET.as_secs()
-            )),
-            Ok(None) => Err("脚本未结算（挂在永不 resolve 的 promise 上）".to_string()),
-            Ok(Some(ScriptOutcome::Threw(error))) => Err(format!("ERROR: {error}")),
-            Ok(Some(ScriptOutcome::Returned(value))) => Ok(value),
-        };
-        let returned = match returned {
-            Ok(value) => value,
-            Err(error) => {
-                append_workflow_event(
-                    &journal,
-                    &json!({"event": "run_failed", "error": truncate_chars(&error, 500)}),
-                );
-                return ToolResult::err(format!(
-                    "{error}\n（journal 已保留已完成问答：{}；同一脚本配 resume_run_id 重提可续跑）",
-                    journal.locator()
-                ));
-            }
-        };
-        // result() 未调用而 IIFE 返回了非 undefined 值 → 以 String(返回值) 作为结果。
-        let final_result = final_result.or(returned);
-        append_workflow_event(
-            &journal,
-            &json!({"event": "run_completed", "asks_total": asks_total, "asks_replayed": asks_replayed}),
-        );
-        let mut report = json!({
-            "status": "completed",
-            "run_id": run_id,
-            "script_hash": format!("{script_hash:016x}"),
-            "asks_total": asks_total,
-            "asks_replayed": asks_replayed,
-            "result": final_result,
-            "journal": journal.locator(),
-            "note": "断点续跑：把同一脚本配 resume_run_id 重提，已回答的 ask 零调用重放；                     修订编排请配 amend_run_id（按 actor 导入已完成 ask，只重跑未完成部分）。"
-        });
-        if let Some(predecessor) = &amended_from {
-            report["amended_from"] = json!(predecessor);
-            report["imported_asks"] = json!(imported_asks);
-        }
-        report["insight"] = json!({
-            "actors": insight.actors,
-            "ask_count": insight.ask_count,
-            "parallel": insight.parallel,
-            "dependency_graph": {
-                "nodes": insight.dependency_graph.nodes,
-                "edges": insight.dependency_graph.edges,
-                "waves": insight.dependency_graph.waves,
-            },
-        });
-        ToolResult::ok(report.to_string())
     }
+}
+
+async fn eval_snippet_inner(
+    code: String,
+    timeout: Duration,
+    tool_access: ToolAccess,
+    project_root: PathBuf,
+    cancel: CancellationToken,
+) -> Result<Value, String> {
+    if code.chars().count() > MAX_SCRIPT_CHARS {
+        return Err(format!("code 超过 {MAX_SCRIPT_CHARS} 字符"));
+    }
+    // §5.10：与真实 run 同一编译器——语法 / 禁用模式诊断按 `{result:null, logs:[], diagnostics}`
+    // 结构化回给模型（不是一段错误文本），不进入执行。
+    let diagnostics = check_script(&code, false);
+    if !diagnostics.is_empty() {
+        return Ok(json!({
+            "result": Value::Null,
+            "logs": [],
+            "diagnostics": diagnostics
+                .iter()
+                .map(|diagnostic| json!({
+                    "line": diagnostic.line,
+                    "col": diagnostic.col,
+                    "message": diagnostic.message,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    // `world.run` 仅 Unrestricted：静态可见的调用直接 `forbidden_world`，不跑片段；经别名绕过
+    // 静态扫描的在运行期被 world_run 拒绝，脚本抛出的错误同样映射成该码（见 Threw 分支）。
+    if tool_access != ToolAccess::Unrestricted
+        && mask_strings_and_comments(&code).contains("world.run")
+    {
+        return Err("forbidden_world: world.run 仅 Unrestricted 会话可用".to_string());
+    }
+    let budget = Arc::new(SliceBudget::with_slice(timeout.max(Duration::from_secs(1))));
+    let halt = Arc::new(AtomicBool::new(false));
+    let result_slot: Arc<StdMutex<Option<String>>> = Arc::default();
+    let logs: Arc<StdMutex<Vec<String>>> = Arc::default();
+    let outer_cancel = cancel.clone();
+    let hosts = EvalHosts {
+        result: Arc::clone(&result_slot),
+        logs: Arc::clone(&logs),
+        root: project_root.clone(),
+        cancel: cancel.clone(),
+        tool_access,
+        world_timeout: timeout.min(Duration::from_secs(300)),
+        pending: Arc::new(AtomicUsize::new(0)),
+        effect_permits: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_EFFECTS)),
+    };
+    let drive = eval_deterministic(code, Arc::clone(&budget), halt, json!({}), move |ctx| {
+        register_eval_hosts(ctx, hosts)
+    });
+    let outcome = tokio::select! {
+        biased;
+        _ = outer_cancel.cancelled() => return Err("片段已随 turn 取消".to_string()),
+        driven = tokio::time::timeout(timeout + CANCEL_GRACE, drive) => driven
+            .map_err(|_| format!("片段超过 {}ms 未结算", timeout.as_millis()))??,
+    };
+    if let Some(ScriptOutcome::Threw(error)) = &outcome {
+        if error.contains("forbidden_world") {
+            return Err(format!("forbidden_world: {error}"));
+        }
+    }
+    let result = result_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+        .or_else(|| match outcome {
+            Some(ScriptOutcome::Returned(value)) => value,
+            Some(ScriptOutcome::Threw(error)) => Some(format!("ERROR: {error}")),
+            None => None,
+        });
+    let result = result
+        .map(|text| Value::String(truncate_chars(&text, 256 * 1024)))
+        .unwrap_or(Value::Null);
+    let logs = logs
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    Ok(json!({
+        "result": result,
+        "logs": logs,
+        "diagnostics": [],
+    }))
+}
+
+/// `EvalWorkflowSnippet` 的宿主面：result / log / files / git / world，其余 facade 返回不支持。
+struct EvalHosts {
+    result: Arc<StdMutex<Option<String>>>,
+    logs: Arc<StdMutex<Vec<String>>>,
+    root: PathBuf,
+    cancel: CancellationToken,
+    tool_access: ToolAccess,
+    world_timeout: Duration,
+    /// 在途 async 宿主调用计数（与正式引擎同一上限，见 [`MAX_PENDING_HOST_CALLS`]）。
+    pending: Arc<AtomicUsize>,
+    /// 同时执行的 files / git / world 上限（与正式引擎同一上限，见 [`MAX_INFLIGHT_EFFECTS`]）。
+    effect_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// 与 [`register_workflow_hosts`] 同一套入参纪律：字符串句柄到 future 里再转、同步段领名额。
+fn register_eval_hosts<'js>(ctx: &rquickjs::Ctx<'js>, hosts: EvalHosts) {
+    let EvalHosts {
+        result,
+        logs,
+        root,
+        cancel,
+        tool_access,
+        world_timeout,
+        pending,
+        effect_permits,
+    } = hosts;
+    let result_fn = Function::new(ctx.clone(), move |text: String| -> String {
+        *result.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(text);
+        "ok".to_string()
+    })
+    .expect("注册 __result");
+    ctx.globals()
+        .set("__result", result_fn)
+        .expect("set __result");
+    let log_fn = Function::new(ctx.clone(), move |message: String| -> String {
+        let mut logs = logs.lock().unwrap_or_else(|poison| poison.into_inner());
+        if logs.len() < 500 {
+            logs.push(truncate_chars(&message, 4_000));
+        }
+        "ok".to_string()
+    })
+    .expect("注册 __wf_log");
+    ctx.globals().set("__wf_log", log_fn).expect("set __wf_log");
+    let unsupported = Function::new(ctx.clone(), move || -> String {
+        json!({"ok": false, "error": "EvalWorkflowSnippet 不支持该 facade"}).to_string()
+    })
+    .expect("注册 unsupported");
+    for name in [
+        "__ask_raw",
+        "__ask_json_raw",
+        "__wf_report",
+        "__wf_phase",
+        "__wf_artifact",
+        "__wf_hole",
+    ] {
+        ctx.globals()
+            .set(name, unsupported.clone())
+            .expect("set unsupported");
+    }
+    let files_root = root.clone();
+    let files_pending = Arc::clone(&pending);
+    let files_permits = Arc::clone(&effect_permits);
+    let files_cancel = cancel.clone();
+    let files_fn = Function::new(
+        ctx.clone(),
+        AsyncFn(
+            move |op: rquickjs::String<'js>, payload: rquickjs::String<'js>| {
+                let root = files_root.clone();
+                let permits = Arc::clone(&files_permits);
+                let cancel = files_cancel.clone();
+                let admitted = HostSlot::acquire(&files_pending).map(|slot| (slot, op, payload));
+                async move {
+                    let Some((_slot, op, payload)) = admitted else {
+                        return host_backlog_error();
+                    };
+                    let (op, payload) = match (js_string(&op), js_string(&payload)) {
+                        (Ok(op), Ok(payload)) => (op, payload),
+                        (Err(error), _) | (_, Err(error)) => return err_envelope(error),
+                    };
+                    let args = match parse_host_payload(&payload) {
+                        Ok(args) => args,
+                        Err(error) => return err_envelope(format!("files.{op} {error}")),
+                    };
+                    let Some(_permit) = acquire_effect_permit(&permits, &cancel).await else {
+                        return err_envelope("片段已随 turn 取消");
+                    };
+                    let result = match op.as_str() {
+                        "glob" => workflow_world::files_glob(
+                            &root,
+                            args.get("pattern")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ),
+                        "read" => workflow_world::files_read(
+                            &root,
+                            args.get("path").and_then(Value::as_str).unwrap_or_default(),
+                        ),
+                        "grep" => workflow_world::files_grep(
+                            &root,
+                            args.get("pattern")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            args.get("glob").and_then(Value::as_str),
+                        ),
+                        other => Err(format!("未知 files 操作: {other}")),
+                    };
+                    match result {
+                        Ok(value) => ok_envelope(value),
+                        Err(error) => err_envelope(error),
+                    }
+                }
+            },
+        ),
+    )
+    .expect("注册 __wf_files");
+    ctx.globals()
+        .set("__wf_files", files_fn)
+        .expect("set __wf_files");
+    let git_root = root.clone();
+    let git_pending = Arc::clone(&pending);
+    let git_permits = Arc::clone(&effect_permits);
+    let git_cancel = cancel.clone();
+    let git_fn = Function::new(
+        ctx.clone(),
+        AsyncFn(
+            move |op: rquickjs::String<'js>, payload: rquickjs::String<'js>| {
+                let root = git_root.clone();
+                let permits = Arc::clone(&git_permits);
+                let cancel = git_cancel.clone();
+                let admitted = HostSlot::acquire(&git_pending).map(|slot| (slot, op, payload));
+                async move {
+                    let Some((_slot, op, payload)) = admitted else {
+                        return host_backlog_error();
+                    };
+                    let (op, payload) = match (js_string(&op), js_string(&payload)) {
+                        (Ok(op), Ok(payload)) => (op, payload),
+                        (Err(error), _) | (_, Err(error)) => return err_envelope(error),
+                    };
+                    let args = match parse_host_payload(&payload) {
+                        Ok(args) => args,
+                        Err(error) => return err_envelope(format!("git.{op} {error}")),
+                    };
+                    let Some(_permit) = acquire_effect_permit(&permits, &cancel).await else {
+                        return err_envelope("片段已随 turn 取消");
+                    };
+                    let result = match op.as_str() {
+                        "status" => workflow_world::git_status(&root),
+                        "diff" => workflow_world::git_diff(
+                            &root,
+                            args.get("path").and_then(Value::as_str),
+                        ),
+                        other => Err(format!("未知 git 操作: {other}")),
+                    };
+                    match result {
+                        Ok(value) => ok_envelope(value),
+                        Err(error) => err_envelope(error),
+                    }
+                }
+            },
+        ),
+    )
+    .expect("注册 __wf_git");
+    ctx.globals().set("__wf_git", git_fn).expect("set __wf_git");
+    let world_fn = Function::new(
+        ctx.clone(),
+        AsyncFn(move |payload: rquickjs::String<'js>| {
+            let root = root.clone();
+            let cancel = cancel.clone();
+            let permits = Arc::clone(&effect_permits);
+            let admitted = HostSlot::acquire(&pending).map(|slot| (slot, payload));
+            async move {
+                let Some((_slot, payload)) = admitted else {
+                    return host_backlog_error();
+                };
+                let payload = match js_string(&payload) {
+                    Ok(payload) => payload,
+                    Err(error) => return err_envelope(error),
+                };
+                let args = match parse_host_payload(&payload) {
+                    Ok(args) => args,
+                    Err(error) => return err_envelope(format!("world.run {error}")),
+                };
+                let command = args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let opts = args.get("opts").cloned().unwrap_or_else(|| json!({}));
+                let Some(_permit) = acquire_effect_permit(&permits, &cancel).await else {
+                    return err_envelope("片段已随 turn 取消");
+                };
+                match workflow_world::world_run(
+                    &root,
+                    tool_access,
+                    &command,
+                    &opts,
+                    &cancel,
+                    world_timeout,
+                    |_, _| {},
+                )
+                .await
+                {
+                    Ok(outcome) => ok_envelope(outcome.value),
+                    Err(error) => err_envelope(error),
+                }
+            }
+        }),
+    )
+    .expect("注册 __wf_world");
+    ctx.globals()
+        .set("__wf_world", world_fn)
+        .expect("set __wf_world");
 }
 
 #[cfg(test)]
@@ -2236,7 +4224,10 @@ mod tests {
         assert_eq!(graph.nodes.len(), 3);
         // 波 → fixer 的边。
         assert!(
-            graph.edges.iter().any(|(from, to)| from == "ask-3" && to == "ask-5"),
+            graph
+                .edges
+                .iter()
+                .any(|(from, to)| from == "ask-3" && to == "ask-5"),
             "并行波末节点 → 后续 ask 应有边: {:?}",
             graph.edges
         );
@@ -2260,11 +4251,19 @@ mod tests {
         let graph = analyze_dependency_graph(script);
         let ids: Vec<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, vec!["ask-4", "ask-4-2", "ask-5", "ask-7"], "{ids:?}");
-        assert!(graph.nodes[..3].iter().all(|n| n.parallel), "跨行波内节点应并行");
+        assert!(
+            graph.nodes[..3].iter().all(|n| n.parallel),
+            "跨行波内节点应并行"
+        );
         assert!(!graph.nodes[3].parallel);
         assert_eq!(graph.waves.len(), 2, "{:?}", graph.waves);
         assert_eq!(graph.waves[0].len(), 3);
-        assert_eq!(graph.edges.len(), 3, "波内每个节点 → 后续 ask: {:?}", graph.edges);
+        assert_eq!(
+            graph.edges.len(),
+            3,
+            "波内每个节点 → 后续 ask: {:?}",
+            graph.edges
+        );
         assert_eq!(analyze_workflow_script(script).ask_count, 4);
     }
 
@@ -2275,6 +4274,8 @@ mod tests {
         let outcome = eval_deterministic(
             script.to_string(),
             Arc::new(SliceBudget::new()),
+            Arc::new(AtomicBool::new(false)),
+            json!({}),
             move |ctx| {
                 let sink = Arc::clone(&sink);
                 let result_fn = Function::new(ctx.clone(), move |text: String| -> String {
@@ -2282,7 +4283,9 @@ mod tests {
                     "ok".to_string()
                 })
                 .expect("注册 __result");
-                ctx.globals().set("__result", result_fn).expect("set __result");
+                ctx.globals()
+                    .set("__result", result_fn)
+                    .expect("set __result");
             },
         )
         .await;
@@ -2303,10 +4306,12 @@ mod tests {
             "__result(v);"
         ))
         .await;
-        assert!(matches!(outcome, Ok(Some(ScriptOutcome::Returned(None)))), "{outcome:?}");
+        assert!(
+            matches!(outcome, Ok(Some(ScriptOutcome::Returned(None)))),
+            "{outcome:?}"
+        );
         assert_eq!(
-            observed,
-            "[0,0.5,0,\"1970-01-01T00:00:00.000Z\",true,0,0,0,0,5,true]",
+            observed, "[0,0.5,0,\"1970-01-01T00:00:00.000Z\",true,0,0,0,0,5,true]",
             "确定性钉死值必须生效"
         );
     }
@@ -2321,7 +4326,10 @@ mod tests {
             "var g; try { g = (async function () {}).constructor(\"return 2\"); } catch (err) { g = \"blocked\"; }\n",
             "__result(JSON.stringify([typeof e, f, g]));"
         );
-        assert!(check_script(script, false).is_empty(), "lint 不应命中字符串内的 eval");
+        assert!(
+            check_script(script, false).is_empty(),
+            "lint 不应命中字符串内的 eval"
+        );
         let (outcome, observed) = observe(script).await;
         assert!(outcome.is_ok(), "{outcome:?}");
         assert_eq!(observed, "[\"undefined\",\"blocked\",\"blocked\"]");
@@ -2351,6 +4359,8 @@ mod tests {
         let outcome = eval_deterministic(
             "while (true) {}".to_string(),
             Arc::clone(&budget),
+            Arc::new(AtomicBool::new(false)),
+            json!({}),
             |_ctx| {},
         )
         .await;
@@ -2371,6 +4381,8 @@ mod tests {
                 "function tick() { Promise.resolve().then(tick); } tick(); await new Promise(function () {});"
                     .to_string(),
                 Arc::clone(&budget),
+                Arc::new(AtomicBool::new(false)),
+                json!({}),
                 |_ctx| {},
             ),
         )
@@ -2394,6 +4406,26 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(observed, "released");
+    }
+
+    #[tokio::test]
+    async fn top_level_return_value_is_json_for_objects_and_raw_for_strings() {
+        // 顶层 `return {..}` 以 JSON 落库（ZCode 同源），而不是 "[object Object]"；字符串原样。
+        let (outcome, _) = observe("return { ok: true, answer: 42 };").await;
+        assert!(
+            matches!(&outcome, Ok(Some(ScriptOutcome::Returned(Some(value)))) if value == r#"{"ok":true,"answer":42}"#),
+            "{outcome:?}"
+        );
+        let (outcome, _) = observe("return 'plain text';").await;
+        assert!(
+            matches!(&outcome, Ok(Some(ScriptOutcome::Returned(Some(value)))) if value == "plain text"),
+            "{outcome:?}"
+        );
+        let (outcome, _) = observe("return;").await;
+        assert!(
+            matches!(&outcome, Ok(Some(ScriptOutcome::Returned(None)))),
+            "{outcome:?}"
+        );
     }
 
     #[test]
@@ -2423,7 +4455,9 @@ mod tests {
         let key = |occurrence: u32| ("coder".to_string(), fnv1a64("coder\u{0}same"), occurrence);
         // 不存在的 run：明确报错而不是当空 journal。
         let missing = EventLog::workflow(&store, "nope");
-        assert!(load_workflow_journal(&missing).unwrap_err().contains("不存在"));
+        assert!(load_workflow_journal(&missing)
+            .unwrap_err()
+            .contains("不存在"));
         // 同问两次（Promise.all），完成顺序相反；answer 经 ask_seq（= 发起事件的库内 seq）
         // 精确配对，不按 hash 猜。
         let path = EventLog::workflow(&store, "run");
@@ -2482,17 +4516,27 @@ mod tests {
         );
         let _other = ActiveRunGuard::acquire("guard-test-run-2").expect("不同 run 互不影响");
         // plan 与 workflow 的 id 空间互不干扰：同名 plan 可与 workflow run 并存。
-        let _plan = ActiveRunGuard::acquire_plan("guard-test-run").expect("plan 键带前缀，不与 workflow 冲突");
-        assert!(ActiveRunGuard::acquire_plan("guard-test-run").is_none(), "同一 plan_id 不能并发持有");
+        let _plan = ActiveRunGuard::acquire_plan("guard-test-run")
+            .expect("plan 键带前缀，不与 workflow 冲突");
+        assert!(
+            ActiveRunGuard::acquire_plan("guard-test-run").is_none(),
+            "同一 plan_id 不能并发持有"
+        );
         drop(first);
-        assert!(ActiveRunGuard::acquire("guard-test-run").is_some(), "Drop 即释放");
+        assert!(
+            ActiveRunGuard::acquire("guard-test-run").is_some(),
+            "Drop 即释放"
+        );
     }
 
     // ---- 端到端（最小 runtime + 计数 provider）----
 
     /// 计数 provider：第 n 次调用答 "#n"——同问两次得到不同答案，可验证重放按调用点精确配对。
+    /// `hang_once` 给定时，问题含「挂起」的首次调用不计数、挂住直到被取消并置位该标记
+    /// （用来制造 stopped run）。
     struct CountingProvider {
         calls: Arc<AtomicU64>,
+        hang_once: Option<(Arc<AtomicBool>, AtomicBool)>,
     }
 
     #[async_trait]
@@ -2501,7 +4545,24 @@ mod tests {
             "counting"
         }
 
-        async fn chat(&self, _req: ChatRequest) -> rclaw_llm::Result<rclaw_core::ChatOutcome> {
+        async fn chat(&self, req: ChatRequest) -> rclaw_llm::Result<rclaw_core::ChatOutcome> {
+            if let Some((hung, armed)) = &self.hang_once {
+                let question = req
+                    .messages
+                    .iter()
+                    .find(|message| message.role == rclaw_core::Role::User)
+                    .and_then(|message| {
+                        message.content.iter().find_map(|block| match block {
+                            rclaw_core::ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_default();
+                if question.contains("挂起") && armed.swap(false, Ordering::SeqCst) {
+                    hung.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+            }
             let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(rclaw_core::ChatOutcome {
                 text: format!("#{n}"),
@@ -2556,6 +4617,10 @@ mod tests {
     }
 
     fn tool_with_provider(provider: Arc<dyn Provider>) -> WorkflowRunTool {
+        WorkflowRunTool::new(service_with_provider(provider))
+    }
+
+    fn service_with_provider(provider: Arc<dyn Provider>) -> super::super::WorkflowService {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = Layout::new(dir.path().join("agent"));
         std::mem::forget(dir);
@@ -2563,7 +4628,7 @@ mod tests {
         registry
             .set(Arc::new(ToolRegistry::new()))
             .unwrap_or_else(|_| panic!("registry 只初始化一次"));
-        WorkflowRunTool::new(AgentToolRuntime::new(
+        let runtime = AgentToolRuntime::new(
             provider,
             MemoryStore::new(layout.clone()),
             layout.clone(),
@@ -2572,13 +4637,43 @@ mod tests {
             registry,
             rclaw_core::RuntimeChannelInfo::default(),
             None,
-        ))
+        );
+        // 同步模式 + 替 `cli/console` 测试会话预登记技能门（等价于完整读过 SKILL.md）。
+        let project_root = super::super::workflow_paths::canonical_project_root(&layout.base);
+        super::super::workflow_skill::ensure_skill_file(&project_root).expect("安装技能文件");
+        let hash = super::super::workflow_skill::file_hash(
+            &super::super::workflow_skill::skill_path(&project_root),
+        )
+        .expect("技能文件 hash");
+        runtime
+            .journal_store()
+            .kv_set(
+                "workflow-skill/cli/console",
+                &json!({
+                    "content_sha256": hash,
+                    "contract_version": super::super::workflow_skill::CONTRACT_VERSION,
+                    "session_key": "cli/console",
+                    "read_at": rclaw_store::db::now_ms(),
+                }),
+            )
+            .expect("登记技能门");
+        super::super::WorkflowService::new(
+            runtime,
+            &layout,
+            super::super::WorkflowOptions {
+                background: false,
+                legacy_tool: true,
+                max_active: 4,
+                command_confirm: false,
+            },
+        )
     }
 
     fn counting_tool() -> (WorkflowRunTool, Arc<AtomicU64>) {
         let calls = Arc::new(AtomicU64::new(0));
         let tool = tool_with_provider(Arc::new(CountingProvider {
             calls: Arc::clone(&calls),
+            hang_once: None,
         }));
         (tool, calls)
     }
@@ -2638,17 +4733,44 @@ mod tests {
         let first = run_bounded(&tool, json!({"script": script, "type_check": false})).await;
         assert_eq!(first["asks_total"], 2);
         assert_eq!(first["asks_replayed"], 0);
-        assert_eq!(first["result"], "#1|#2", "同问两次是两个调用点，各自真实执行");
+        assert_eq!(
+            first["result"], "#1|#2",
+            "同问两次是两个调用点，各自真实执行"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let run_id = first["run_id"].as_str().unwrap().to_string();
-        let second = run_bounded(
-            &tool,
-            json!({"script": script, "resume_run_id": run_id, "type_check": false}),
+
+        // 重放按调用点配对：同问两次真实执行（#1、#2）后在第三问挂住时取消 → stopped；
+        // resume 时 a=#1、b=#2 不互换，第三问真实执行（#3）。
+        let calls = Arc::new(AtomicU64::new(0));
+        let hung = Arc::new(AtomicBool::new(false));
+        let service = service_with_provider(Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+            hang_once: Some((Arc::clone(&hung), AtomicBool::new(true))),
+        }));
+        let script = concat!(
+            "const coder = agent(\"coder\");\n",
+            "const a = await coder.ask(\"同一个问题\");\n",
+            "const b = await coder.ask(\"同一个问题\");\n",
+            "const c = await coder.ask(\"挂起\");\n",
+            "result(a + \"|\" + b + \"|\" + c);\n"
+        );
+        let run_id = super::super::tests::stop_run_at_hang(
+            &service,
+            json!({"script": script, "type_check": false}),
+            &hung,
         )
         .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let tool = WorkflowRunTool::new(service);
+        let second =
+            run_bounded(&tool, json!({"resume_run_id": run_id, "type_check": false})).await;
         assert_eq!(second["asks_replayed"], 2);
-        assert_eq!(second["result"], "#1|#2", "重放按调用点配对，答案不互换");
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "重放零 provider 调用");
+        assert_eq!(second["result"], "#1|#2|#3", "重放按调用点配对，答案不互换");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "重放的问答零 provider 调用"
+        );
     }
 
     #[tokio::test]
@@ -2677,7 +4799,6 @@ mod tests {
         )
         .await;
         assert_eq!(second["asks_replayed"], 1, "q2 应零调用导入");
-        assert_eq!(second["imported_asks"], 2);
         assert_eq!(second["result"], "#3|#2");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
@@ -2717,7 +4838,10 @@ mod check_tests {
     fn banned_patterns_reported_with_line_and_col() {
         let script = "const t = Date.now();\nconst r = eval('1');";
         let diagnostics = diagnose(script);
-        assert!(diagnostics.iter().any(|d| d.message.contains("Date.now")), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("Date.now")),
+            "{diagnostics:?}"
+        );
         let eval_diag = diagnostics
             .iter()
             .find(|d| d.message.contains("eval"))
@@ -2742,13 +4866,26 @@ mod check_tests {
             "const d = formatDate(1); function formatDate(x) { return x; }\n",
             "result(r + 'process.exit' + d);\n"
         );
-        assert!(diagnose(prompt_text).is_empty(), "{:?}", diagnose(prompt_text));
+        assert!(
+            diagnose(prompt_text).is_empty(),
+            "{:?}",
+            diagnose(prompt_text)
+        );
         // 间接 eval / 函数式 Date() / Function 构造 / 字符串转义不打断遮蔽。
         let indirect = "const s = \"a\\\"b\"; const e = (0, eval)(s); const t = Date(); const f = new Function(\"x\");";
         let diagnostics = diagnose(indirect);
-        assert!(diagnostics.iter().any(|d| d.message.contains("eval")), "{diagnostics:?}");
-        assert!(diagnostics.iter().any(|d| d.message.contains("Date()")), "{diagnostics:?}");
-        assert!(diagnostics.iter().any(|d| d.message.contains("Function")), "{diagnostics:?}");
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("eval")),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("Date()")),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("Function")),
+            "{diagnostics:?}"
+        );
     }
 }
 
@@ -2789,7 +4926,10 @@ mod schema_and_insight_tests {
         assert!(validate_json_schema(&Value::Null, &nullable, 0).is_ok());
         assert!(validate_json_schema(&json!(1), &nullable, 0).is_err());
         let unknown = json!({"type": "strng"});
-        assert!(validate_json_schema(&json!("x"), &unknown, 0).is_err(), "未知类型名必须报错");
+        assert!(
+            validate_json_schema(&json!("x"), &unknown, 0).is_err(),
+            "未知类型名必须报错"
+        );
         // 超过深度上限：报错而不是静默放行。
         let mut deep_schema = json!({"type": "number"});
         let mut deep_value = json!(1);
@@ -2810,11 +4950,13 @@ mod schema_and_insight_tests {
             "result(a + b);\n"
         );
         let insight = analyze_workflow_script(script);
-        assert_eq!(insight.actors, vec!["coder".to_string(), "reviewer".to_string()]);
+        assert_eq!(
+            insight.actors,
+            vec!["coder".to_string(), "reviewer".to_string()]
+        );
         assert_eq!(insight.ask_count, 2);
         assert!(insight.parallel);
     }
-
 }
 
 #[cfg(test)]
@@ -2846,8 +4988,9 @@ mod validator_tests {
             },
             "required": ["zone"]
         });
-        assert!(validate_json_schema(&json!({"zone": "a", "tags": ["x", "x"]}), &compiled, 0)
-        .is_ok());
+        assert!(
+            validate_json_schema(&json!({"zone": "a", "tags": ["x", "x"]}), &compiled, 0).is_ok()
+        );
         assert!(validate_json_schema(&json!({"zone": "c"}), &compiled, 0).is_err());
         assert!(validate_json_schema(&json!({"zone": "a", "tags": ["y"]}), &compiled, 0).is_err());
     }
@@ -2953,19 +5096,19 @@ mod validator_tests {
             0
         )
         .is_ok());
-        assert!(
-            validate_json_schema(&json!({"result": {"score": 2, "tags": ["a", 2]}}), &schema, 0)
-                .is_err()
-        );
+        assert!(validate_json_schema(
+            &json!({"result": {"score": 2, "tags": ["a", 2]}}),
+            &schema,
+            0
+        )
+        .is_err());
         assert!(
             validate_json_schema(&json!({"result": {"score": 1, "tags": ["a"]}}), &schema, 0)
                 .is_err(),
             "数组长度不同不得相等"
         );
         // 键集合不同不得相等。
-        assert!(
-            validate_json_schema(&json!({"result": {"score": 1}}), &schema, 0).is_err()
-        );
+        assert!(validate_json_schema(&json!({"result": {"score": 1}}), &schema, 0).is_err());
     }
 }
 

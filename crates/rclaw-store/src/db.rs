@@ -17,12 +17,159 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Result;
 
 /// 当前 schema 版本（`PRAGMA user_version`）。
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// v1 → v2：`file_checkpoint` 加 `anchor_message_id` 列（checkpoint 与同事务写入的
 /// tool_result 消息行的关联；「fork + 文件回滚到锚点」按它切回滚集。旧行 NULL =
 /// 迁移前的记录，归属未知，按消息锚点回滚时不参与）。
-const SCHEMA_V2_MIGRATION: &str = "ALTER TABLE file_checkpoint ADD COLUMN anchor_message_id INTEGER;";
+const SCHEMA_V2_MIGRATION: &str =
+    "ALTER TABLE file_checkpoint ADD COLUMN anchor_message_id INTEGER;";
+
+/// v2 → v3：工作流运行态（8 张表一次建全，避免多次 user_version 迁移）。
+///
+/// P1 实现前五张（run / script_version / effect / notification / request），
+/// `workflow_process` 在 P3 启用，`workflow_hole` / `workflow_question` 在 P4 启用；
+/// 后三张在更低阶段空置不影响读写。
+const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS workflow_run (
+  run_id              TEXT PRIMARY KEY,
+  cwd                 TEXT NOT NULL DEFAULT '',
+  session_key         TEXT NOT NULL DEFAULT '',
+  label               TEXT NOT NULL,
+  source_path         TEXT,
+  snapshot_path       TEXT NOT NULL DEFAULT '',
+  snapshot_hash       TEXT NOT NULL DEFAULT '',
+  script_generation   INTEGER NOT NULL DEFAULT 1,
+  exec_generation     INTEGER NOT NULL DEFAULT 0,
+  legacy              INTEGER NOT NULL DEFAULT 0,
+  resumable           INTEGER NOT NULL DEFAULT 1,
+  status              TEXT NOT NULL,
+  queued_reason       TEXT,
+  stop_reason         TEXT,
+  stop_origin         TEXT,
+  requires_fresh_auth INTEGER NOT NULL DEFAULT 0,
+  capacity_owner      TEXT,
+  capacity_claim_for  TEXT,
+  resumed_from        TEXT,
+  superseded_by       TEXT,
+  started_by          TEXT NOT NULL DEFAULT 'main',
+  execution_config    TEXT NOT NULL DEFAULT '{}',
+  owner_instance      TEXT,
+  lease_until         INTEGER,
+  last_event_id       INTEGER NOT NULL DEFAULT 0,
+  elapsed_runtime_ms  INTEGER NOT NULL DEFAULT 0,
+  cache_closed        INTEGER NOT NULL DEFAULT 0,
+  created_at          INTEGER NOT NULL,
+  updated_at          INTEGER NOT NULL,
+  heartbeat_at        INTEGER NOT NULL DEFAULT 0,
+  spent_tokens        INTEGER NOT NULL DEFAULT 0,
+  result_json         TEXT,
+  result_handle       TEXT,
+  error               TEXT
+);
+CREATE INDEX IF NOT EXISTS workflow_run_cwd_updated ON workflow_run(cwd, updated_at DESC);
+CREATE INDEX IF NOT EXISTS workflow_run_status ON workflow_run(status);
+
+CREATE TABLE IF NOT EXISTS workflow_script_version (
+  run_id            TEXT NOT NULL,
+  script_generation INTEGER NOT NULL,
+  path              TEXT NOT NULL,
+  hash              TEXT NOT NULL,
+  parent_hash       TEXT,
+  reason            TEXT NOT NULL,
+  replay_prefix     INTEGER NOT NULL DEFAULT 0,
+  created_at        INTEGER NOT NULL,
+  PRIMARY KEY (run_id, script_generation)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_effect (
+  run_id                  TEXT NOT NULL,
+  effect_key              TEXT NOT NULL,
+  first_script_generation INTEGER NOT NULL,
+  last_exec_generation    INTEGER NOT NULL,
+  call_index              INTEGER NOT NULL,
+  op                      TEXT NOT NULL,
+  is_write                INTEGER NOT NULL DEFAULT 0,
+  args_hash               TEXT NOT NULL,
+  args_preview            TEXT,
+  status                  TEXT NOT NULL,
+  result                  TEXT,
+  decision                TEXT,
+  decision_exec_generation INTEGER,
+  substitute_result       TEXT,
+  decided_by              TEXT,
+  created_at              INTEGER NOT NULL,
+  updated_at              INTEGER NOT NULL,
+  PRIMARY KEY (run_id, effect_key)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_process (
+  run_id          TEXT NOT NULL,
+  exec_generation INTEGER NOT NULL,
+  process_id      TEXT NOT NULL,
+  root_pid        INTEGER NOT NULL,
+  state           TEXT NOT NULL,
+  created_at      INTEGER NOT NULL,
+  exited_at       INTEGER,
+  PRIMARY KEY (run_id, exec_generation, process_id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_hole (
+  run_id             TEXT NOT NULL,
+  hole_id            TEXT NOT NULL,
+  script_generation  INTEGER NOT NULL,
+  name               TEXT NOT NULL,
+  prompt             TEXT,
+  state              TEXT NOT NULL,
+  last_rejected_hash TEXT,
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL,
+  PRIMARY KEY (run_id, hole_id)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_question (
+  question_id     TEXT PRIMARY KEY,
+  run_id          TEXT NOT NULL,
+  exec_generation INTEGER NOT NULL,
+  actor           TEXT NOT NULL,
+  question        TEXT NOT NULL,
+  state           TEXT NOT NULL,
+  answer          TEXT,
+  created_at      INTEGER NOT NULL,
+  answered_at     INTEGER,
+  question_key    TEXT
+);
+CREATE INDEX IF NOT EXISTS workflow_question_run ON workflow_question(run_id, state);
+
+CREATE TABLE IF NOT EXISTS workflow_notification (
+  id           TEXT PRIMARY KEY,
+  run_id       TEXT NOT NULL,
+  session_key  TEXT NOT NULL,
+  channel      TEXT NOT NULL,
+  chat_id      TEXT NOT NULL,
+  payload      TEXT NOT NULL,
+  state        TEXT NOT NULL,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  last_error   TEXT,
+  next_at       INTEGER NOT NULL,
+  scheduled_at INTEGER,
+  consumed_at  INTEGER,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS workflow_notification_state ON workflow_notification(state, next_at);
+
+CREATE TABLE IF NOT EXISTS workflow_request (
+  scope      TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  digest     TEXT NOT NULL,
+  state      TEXT NOT NULL,
+  run_id     TEXT,
+  response   TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (scope, request_id)
+);
+"#;
 
 /// v1 schema。字段语义见 `docs/superpowers/specs/2026-10-12-sqlite-state-store-design.md`。
 const SCHEMA_V1: &str = r#"
@@ -118,7 +265,7 @@ impl Db {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags)?;
         configure(&conn)?;
-        migrate(&conn)?;
+        migrate(&conn, path)?;
         Ok(Db {
             inner: Arc::new(Mutex::new(conn)),
             path: path.to_path_buf(),
@@ -137,7 +284,7 @@ impl Db {
     }
 
     /// 在连接上执行只读 / 单语句操作。
-    pub(crate) fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.lock();
         f(&conn)
     }
@@ -156,7 +303,7 @@ impl Db {
     }
 
     /// 在 `BEGIN IMMEDIATE` 写事务里执行一组操作；闭包返回 `Err` 自动回滚。
-    pub(crate) fn transaction<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+    pub fn transaction<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let out = f(&tx)?;
@@ -175,7 +322,9 @@ impl Db {
         let conn = self.lock();
         conn.execute_batch("VACUUM")?;
         if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
-            tracing::warn!("state.sqlite WAL checkpoint 失败（主库已回收，WAL 残留待下次 checkpoint）: {e}");
+            tracing::warn!(
+                "state.sqlite WAL checkpoint 失败（主库已回收，WAL 残留待下次 checkpoint）: {e}"
+            );
         }
         Ok(())
     }
@@ -235,9 +384,14 @@ fn supported_schema_version(conn: &Connection) -> Result<i64> {
 }
 
 /// 按 `user_version` 执行迁移。v1 之后的版本在此追加 `if version < N { ... }` 分支。
-fn migrate(conn: &Connection) -> Result<()> {
+fn migrate(conn: &Connection, path: &Path) -> Result<()> {
     if supported_schema_version(conn)? == SCHEMA_VERSION {
         return Ok(());
+    }
+    let before = supported_schema_version(conn)?;
+    if (1..3).contains(&before) {
+        // 停库一致性备份：VACUUM INTO 生成快照（WAL 下直接复制会漏数据）。
+        backup_before_migration(conn, path, before)?;
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let applied = (|| -> Result<()> {
@@ -252,6 +406,9 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
         if version < 2 {
             conn.execute_batch(SCHEMA_V2_MIGRATION)?;
+        }
+        if version < 3 {
+            conn.execute_batch(SCHEMA_V3)?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -268,8 +425,73 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
 }
 
+/// 迁移前一致性备份：`<db>.bak-v<version>`。
+///
+/// `VACUUM INTO` 生成的是单文件快照（WAL 下直接复制主库会漏掉尚未 checkpoint 的页）。
+/// 生成后以只读连接做 `integrity_check` 并核对 `user_version`，验证通过才原子落位；
+/// 任一步失败拒绝启动（宁可打不开，也不要带着不可回滚的库升级）。
+fn backup_before_migration(conn: &Connection, path: &Path, version: i64) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let final_path = path.with_file_name(format!(
+        "{}.bak-v{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state.sqlite"),
+        version
+    ));
+    let stamp: u64 = rand::random();
+    let tmp_path = dir.join(format!(
+        "{}.{stamp:016x}.tmp",
+        final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state.sqlite.bak")
+    ));
+    // 先把 WAL 回写主库，VACUUM INTO 才看得到全部已提交数据。
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let escaped = tmp_path.to_string_lossy().replace('\'', "''");
+    if let Err(error) = conn.execute_batch(&format!("VACUUM INTO '{escaped}';")) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(crate::StoreError::Other(format!(
+            "迁移前备份失败（VACUUM INTO {}）：{error}",
+            tmp_path.display()
+        )));
+    }
+    let verified = (|| -> Result<()> {
+        let backup = Connection::open_with_flags(&tmp_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let integrity: String = backup.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if !integrity.eq_ignore_ascii_case("ok") {
+            return Err(crate::StoreError::Other(format!(
+                "迁移前备份完整性校验失败：{integrity}"
+            )));
+        }
+        let backup_version: i64 = backup.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if backup_version != version {
+            return Err(crate::StoreError::Other(format!(
+                "迁移前备份 schema 版本不符：期望 v{version}，实际 v{backup_version}"
+            )));
+        }
+        Ok(())
+    })();
+    if let Err(error) = verified {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    // Windows 的 rename 不覆盖已存在文件：先移除旧备份。
+    if final_path.exists() {
+        std::fs::remove_file(&final_path)?;
+    }
+    std::fs::rename(&tmp_path, &final_path)?;
+    tracing::info!(
+        backup = %final_path.display(),
+        version,
+        "state.sqlite 迁移前备份完成"
+    );
+    Ok(())
+}
+
 /// 当前 Unix 毫秒时间戳（`created_at` / `updated_at` / journal `ts`）。
-pub(crate) fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -347,7 +569,10 @@ mod tests {
 
         let res: Result<()> = db.read_snapshot(|_| Err(crate::StoreError::Other("boom".into())));
         assert!(res.is_err());
-        assert!(db.with(|c| Ok(c.is_autocommit())).unwrap(), "Err 路径也不留事务");
+        assert!(
+            db.with(|c| Ok(c.is_autocommit())).unwrap(),
+            "Err 路径也不留事务"
+        );
 
         db.transaction(|tx| {
             tx.execute(
@@ -396,7 +621,10 @@ mod tests {
         let builtin: String = db
             .with(|c| Ok(c.query_row("SELECT lower('ПРИВЕТ')", [], |r| r.get(0))?))
             .unwrap();
-        assert_eq!(builtin, "ПРИВЕТ", "内建 lower() 只折 ASCII，正是需要自定义函数的原因");
+        assert_eq!(
+            builtin, "ПРИВЕТ",
+            "内建 lower() 只折 ASCII，正是需要自定义函数的原因"
+        );
         let null: Option<String> = db
             .with(|c| Ok(c.query_row("SELECT rclaw_lower(NULL)", [], |r| r.get(0))?))
             .unwrap();
@@ -421,7 +649,9 @@ mod v2_migration_tests {
                 [],
             )
             .unwrap();
-            let sid: i64 = conn.query_row("SELECT id FROM session", [], |r| r.get(0)).unwrap();
+            let sid: i64 = conn
+                .query_row("SELECT id FROM session", [], |r| r.get(0))
+                .unwrap();
             conn.execute(
                 "INSERT INTO file_checkpoint(session_id, group_id, path, before, before_hash, \
                  after_hash, is_rewind) VALUES (?1, 100, 'a.txt', 'v1', 'h1', 'h2', 0)",
@@ -441,7 +671,10 @@ mod v2_migration_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             assert_eq!(count, 1, "迁移不丢数据");
-            assert_eq!(anchor, None, "旧行 anchor 为 NULL（归属未知，不参与按消息回滚）");
+            assert_eq!(
+                anchor, None,
+                "旧行 anchor 为 NULL（归属未知，不参与按消息回滚）"
+            );
             Ok(())
         })
         .unwrap();

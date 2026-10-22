@@ -126,6 +126,14 @@ pub struct AgentOptions {
     /// 后台完成通知的唤醒防抖窗口。窗口内的多个完成合并为一条唤醒消息，
     /// 避免大规模并行时按完成数线性放大请求数。
     pub background_wake_debounce: std::time::Duration,
+    /// 工作流是否后台执行（默认 true）。false = 同步契约，但仍写 v3 投影表。
+    pub workflow_background: bool,
+    /// 是否注册 `WorkflowRun` 旧工具别名（默认 false，仅回滚用）。
+    pub workflow_legacy_tool: bool,
+    /// 同时持有执行许可的工作流 run 上限（桌面默认 4、Android 默认 2）。
+    pub max_active_workflow_runs: usize,
+    /// `world.run` 是否逐命令向前端确认（P5；默认 false = 仅 ToolAccess）。
+    pub workflow_command_confirm: bool,
     /// 是否启用后台自动记忆 review。
     pub auto_memory_enabled: bool,
     /// 是否启用后台自动自进化 review。
@@ -217,6 +225,10 @@ impl Default for AgentOptions {
             in_turn_compression_enabled: true,
             background_wake_enabled: true,
             background_wake_debounce: Duration::from_secs(3),
+            workflow_background: true,
+            workflow_legacy_tool: false,
+            max_active_workflow_runs: 4,
+            workflow_command_confirm: false,
             auto_memory_enabled: false,
             auto_evolve_enabled: false,
             auto_review_tooled: false,

@@ -5,6 +5,7 @@ import { api, parseToolStatusLine, type PermissionMode, type PlanStatus } from "
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { parseMediaItems } from "./MediaPreviews";
+import WorkflowCard from "./WorkflowCard";
 import MediaGallery, { type GalleryItem, type GallerySeed } from "./MediaGallery";
 import {
   CheckIcon,
@@ -1691,6 +1692,9 @@ export default function Chat({
 
       {/* 输入区（移动端贴底并让出手势条/安全区；桌面 p-4 不变）。 */}
       <div className="border-t border-[#2a2f3a] p-4 max-md:px-2.5 max-md:pt-2 max-md:pb-[calc(env(safe-area-inset-bottom)+0.5rem)]">
+
+        {/* 工作流运行卡片（status/进度/问题/hole/副作用裁决）。 */}
+        <WorkflowCard onError={onError} />
 
         {/* PlanRun 流程步骤卡片：全部【未收尾】计划各一张（随 plan_status 轮询刷新）
             ——只展示最新的会把被顶到后面的暂停计划藏没：暂停中的执行器在等恢复

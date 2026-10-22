@@ -31,6 +31,13 @@ tokio-util = { workspace = true }
 rquickjs = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }     # rewind checkpoint 的文件内容 hash（持久化身份需跨 Rust 版本稳定）
+rusqlite = { workspace = true }  # 工作流投影表与 journal 同库（workflow_store 直接用事务）
+fs2 = "0.4"                      # 工作流 driver 单实例锁（跨进程）
+globset = "0.4"                  # files.glob（项目根相对、拒绝越界）
+walkdir = "2"                    # files.glob/grep 目录遍历
+regex = "1"                      # files.grep / 代码扫描
+serde_yaml = "0.9"               # 存档工作流元数据块（/* rclaw-workflow ... */）
+rand = { workspace = true }      # 工作流 run / 请求 / 临时名
 oxc_parser = "0.116.0"
 oxc_allocator = "0.116.0"
 oxc_ast = "0.116.0"
@@ -44,6 +51,19 @@ oxc_ast_visit = "0.116.0"
 # bindings，不受影响。
 [target.'cfg(target_os = "android")'.dependencies]
 rquickjs = { workspace = true, features = ["bindgen"] }
+
+# world.run 的进程树回收：Windows 用 Job Object（KILL_ON_JOB_CLOSE），Unix 用进程组。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

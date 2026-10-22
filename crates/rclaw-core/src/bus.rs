@@ -45,6 +45,9 @@ pub enum MessageSource {
     /// heartbeat 周期自检消息（读 `HEARTBEAT.md` 后注入的固定提示）。
     /// 它是内部消息但【不是 cron 任务】：正常加载历史、正常持久化、不注入 cron 专用提示。
     Heartbeat,
+    /// 工作流后台完成 / 阻塞通知（WorkflowDriver outbox 投递）。
+    /// 语义同 Heartbeat 的「内部但非 cron」：正常加载/持久化历史；不触发自进化评审。
+    Workflow,
     /// Bot Mode 交接消息（message_agent 工具投递到目标 bot 的收件箱会话）。
     /// 语义同 Heartbeat 的「内部但非 cron」：正常加载/持久化历史；但作为队友消息，
     /// 若目标 turn 正在进行则延迟为下一轮（不插话）；不触发自进化评审与 curator。
@@ -58,7 +61,7 @@ pub enum MessageSource {
 /// napcat 通道对 `max_from` 命中的 QQ 私聊消息设为 [`ToolAccess::Unrestricted`]，
 /// 放开 agent 目录沙箱。与 `source` 同为【私有字段 + 构造/访问器】范式：只有可信通道层
 /// 能设置（用户无法从消息正文伪造——QQ 判定基于 napcat 上报的 user_id）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ToolAccess {
     /// 仅 agent 目录（默认）。
     #[default]
@@ -77,8 +80,15 @@ pub struct BusMessage {
     pub channel: String,
     /// 会话标识（如 weixin 用户 id、cli 的 "console" 等）。
     pub chat_id: String,
-    /// 消息正文（已是自有 String，无需借用）。
+    /// 消息正文（已是自有 String，无需借用）。LLM 请求与工具可见文本以它为准；
+    /// `/workflow` 展开后这里是展开文本，`display_content` 保留用户原文。
     pub content: String,
+    /// 历史 / UI / 回放展示文本（默认等于 `content`）。
+    pub display_content: String,
+    /// LLM 请求与工具可见文本（默认等于 `content`）。
+    pub model_content: String,
+    /// 工作流 outbox 通知 id（接收端持久化后回执 consumed；普通消息为 None）。
+    workflow_notification_id: Option<String>,
     /// 消息来源（[`MessageSource`]），【私有字段】。
     ///
     /// **修复 P2「source 字段公开破坏来源不可伪造约束」**：旧实现把 `source` 设为 `pub`，
@@ -131,6 +141,9 @@ impl BusMessage {
             channel: channel.into(),
             chat_id: chat_id.into(),
             content: content.into(),
+            display_content: String::new(),
+            model_content: String::new(),
+            workflow_notification_id: None,
             source: MessageSource::User,
             cron_job_id: None,
             cron_job_name: None,
@@ -153,6 +166,9 @@ impl BusMessage {
             channel: channel.into(),
             chat_id: chat_id.into(),
             content: content.into(),
+            display_content: String::new(),
+            model_content: String::new(),
+            workflow_notification_id: None,
             source: MessageSource::Cron,
             cron_job_id: None,
             cron_job_name: None,
@@ -177,6 +193,9 @@ impl BusMessage {
             channel: channel.into(),
             chat_id: chat_id.into(),
             content: content.into(),
+            display_content: String::new(),
+            model_content: String::new(),
+            workflow_notification_id: None,
             source: MessageSource::Cron,
             cron_job_id: Some(job_id.into()),
             cron_job_name: Some(job_name.into()),
@@ -198,6 +217,9 @@ impl BusMessage {
             channel: channel.into(),
             chat_id: chat_id.into(),
             content: content.into(),
+            display_content: String::new(),
+            model_content: String::new(),
+            workflow_notification_id: None,
             source: MessageSource::Heartbeat,
             cron_job_id: None,
             cron_job_name: None,
@@ -224,6 +246,9 @@ impl BusMessage {
             channel: channel.into(),
             chat_id: chat_id.into(),
             content: content.into(),
+            display_content: String::new(),
+            model_content: String::new(),
+            workflow_notification_id: None,
             source: MessageSource::Agent,
             cron_job_id: None,
             cron_job_name: None,
@@ -232,6 +257,73 @@ impl BusMessage {
             tool_access: ToolAccess::Sandboxed,
             intermediate: false,
         }
+    }
+
+    /// 构造【工作流后台通知】消息（`source = Workflow`）。
+    /// 仅 [`rclaw_runtime`] 的 outbox dispatcher 调用；外部通道无法伪造。
+    pub fn new_workflow(
+        channel: impl Into<String>,
+        chat_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        BusMessage {
+            channel: channel.into(),
+            chat_id: chat_id.into(),
+            content: content.into(),
+            display_content: String::new(),
+            model_content: String::new(),
+            workflow_notification_id: None,
+            source: MessageSource::Workflow,
+            cron_job_id: None,
+            cron_job_name: None,
+            agent_chain: Vec::new(),
+            handoff_id: None,
+            tool_access: ToolAccess::Sandboxed,
+            intermediate: false,
+        }
+    }
+
+    /// 工作流通知（携带 outbox id，接收端落库后回执）。
+    pub fn new_workflow_with_id(
+        channel: impl Into<String>,
+        chat_id: impl Into<String>,
+        content: impl Into<String>,
+        notification_id: impl Into<String>,
+    ) -> Self {
+        let mut message = BusMessage::new_workflow(channel, chat_id, content);
+        message.workflow_notification_id = Some(notification_id.into());
+        message
+    }
+
+    /// 工作流 outbox 通知 id（普通消息 None）。
+    pub fn workflow_notification_id(&self) -> Option<&str> {
+        self.workflow_notification_id.as_deref()
+    }
+
+    /// 历史 / UI / 回放展示文本；未单独设置时回落正文。
+    pub fn display_content(&self) -> &str {
+        if self.display_content.is_empty() {
+            &self.content
+        } else {
+            &self.display_content
+        }
+    }
+
+    /// LLM 请求与工具可见文本；未单独设置时回落正文。
+    pub fn model_content(&self) -> &str {
+        if self.model_content.is_empty() {
+            &self.content
+        } else {
+            &self.model_content
+        }
+    }
+
+    /// `/workflow` 展开：保留原文到 display，把展开文本写进 content/model。
+    pub fn expand_model_content(mut self, model: String) -> Self {
+        self.display_content = self.content.clone();
+        self.model_content = model.clone();
+        self.content = model;
+        self
     }
 
     /// 消息来源（User / Cron / Heartbeat）。
@@ -363,7 +455,10 @@ mod tests {
         assert!(!m.is_cron_task());
         assert_eq!(m.agent_chain(), ["RClaw".to_string()].as_slice());
         assert_eq!(m.handoff_id(), Some(7));
-        assert_eq!(BusMessage::new(CHANNEL_CLI, "console", "hi").handoff_id(), None);
+        assert_eq!(
+            BusMessage::new(CHANNEL_CLI, "console", "hi").handoff_id(),
+            None
+        );
 
         // 普通消息与 cron/heartbeat 交接链均为空。
         assert!(BusMessage::new(CHANNEL_CLI, "console", "hi")

@@ -5,8 +5,10 @@
 //! 在完成闸门通过前不外发，GUI 只展示 outbound 已有的状态消息（工作中 / 工具
 //! 调用进度），不暴露未过闸门的原始片段。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -104,6 +106,8 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     // 工具工作区外访问的弹窗确认钩子（进程级只装一次；完全访问模式下消息直接
     // 带 Unrestricted，不会走到该钩子）。
     install_permission_hook(app.clone());
+    install_command_confirm_hook(app.clone());
+    install_session_access_hook(app.clone());
 
     // 配置：从用户数据目录加载；agent 存储固定在数据目录下（与 CWD 解耦）。
     let mut cfg = rclaw_cli::config::Config::load_from_dir(&home)
@@ -135,8 +139,7 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     // rclaw_tools::cdp_browser；CLI/Termux 不注册，无浏览器工具）。截图落工作区 browser/。
     // transport 经 commands::browser_transport_or_init 单源获取：装配重试时
     // 命令层（「打开浏览器」）与工具注册始终同一实例。
-    let browser_transport =
-        crate::commands::browser_transport_or_init(layout.base.join("browser"));
+    let browser_transport = crate::commands::browser_transport_or_init(layout.base.join("browser"));
     let core = rclaw_cli::bootstrap::assemble_core_with(
         &cfg,
         &layout,
@@ -281,12 +284,93 @@ async fn outbound_bridge(app: tauri::AppHandle, mut rx: mpsc::Receiver<BusMessag
 /// 之外的路径时，经 [`permissions::ask`] 弹窗询问用户；允许才放行（每次授权按
 /// （操作, 物理落点）缓存在工具层）。完全访问模式的消息直接带 `Unrestricted`，不经过此钩子。
 fn install_permission_hook(app: tauri::AppHandle) {
-    let hook: rclaw_tools::access::PathConfirmHook = Arc::new(move |request| {
-        Box::pin(crate::permissions::ask(app.clone(), request))
-    });
+    let hook: rclaw_tools::access::PathConfirmHook =
+        Arc::new(move |request| Box::pin(crate::permissions::ask(app.clone(), request)));
     if !rclaw_tools::access::set_path_confirm_hook(hook) {
         tracing::debug!("工具权限确认钩子已注册过，跳过");
     }
+}
+
+static COMMAND_CONFIRM_WAITERS: OnceLock<
+    StdMutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+> = OnceLock::new();
+static COMMAND_CONFIRM_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn command_confirm_waiters(
+) -> &'static StdMutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>> {
+    COMMAND_CONFIRM_WAITERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// 前端回答逐命令确认（`workflow_command_confirm` 事件的回执）。
+pub fn answer_command_confirm(id: &str, allowed: bool) -> bool {
+    command_confirm_waiters()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(id)
+        .map(|sender| sender.send(allowed).is_ok())
+        .unwrap_or(false)
+}
+
+/// 注册会话权限解析钩子：后台 workflow 在派发 ask / 写操作前据此重查桌面会话此刻的权限
+/// （用户把权限模式从 full 切回 default 后，以 Unrestricted 启动的 run 转 `permission_revoked`）。
+/// 非桌面通道返回 None（本宿主不知道，沿用 run 快照）。
+fn install_session_access_hook(app: tauri::AppHandle) {
+    let hook: Arc<rclaw_tools::access::SessionAccessHook> =
+        Arc::new(move |channel: &str, _chat_id: &str| {
+            if channel != CHANNEL_DESKTOP {
+                return None;
+            }
+            let home = app.try_state::<AppState>()?.home.clone();
+            Some(if read_permission_mode(&home) == PERMISSION_MODE_FULL {
+                ToolAccess::Unrestricted
+            } else {
+                ToolAccess::Sandboxed
+            })
+        });
+    rclaw_tools::access::set_session_access_hook(hook);
+}
+
+/// 注册 `world.run` 逐命令确认钩子（[agent] workflow_command_confirm=true 时生效）。
+fn install_command_confirm_hook(app: tauri::AppHandle) {
+    let hook: Arc<rclaw_tools::access::CommandConfirmHook> =
+        Arc::new(move |command: String, cwd: PathBuf| {
+            let app = app.clone();
+            Box::pin(async move {
+                let id = format!(
+                    "cmd-{:016x}",
+                    COMMAND_CONFIRM_SEQ.fetch_add(1, Ordering::SeqCst)
+                );
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                command_confirm_waiters()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(id.clone(), tx);
+                let payload = serde_json::json!({
+                    "id": id,
+                    "command": command,
+                    "cwd": cwd.to_string_lossy(),
+                });
+                if let Err(error) = app.emit("workflow_command_confirm", payload) {
+                    tracing::warn!("命令确认事件推送失败: {error}");
+                    command_confirm_waiters()
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&id);
+                    return false;
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+                    Ok(Ok(allowed)) => allowed,
+                    _ => {
+                        command_confirm_waiters()
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .remove(&id);
+                        false
+                    }
+                }
+            })
+        });
+    rclaw_tools::access::set_command_confirm_hook(hook);
 }
 
 /// 向 inbound 总线投递一条用户消息 / 斜杠命令（chat_id 决定所属会话）。
@@ -344,7 +428,8 @@ pub fn prefs_path(home: &std::path::Path) -> PathBuf {
 /// `permission_mode` / `disabled_tools` **绝不**从旧路径带入：旧路径在模型可写的工作区里，
 /// 原样搬运等于把「写一句 `{"permission_mode":"full"}` 关沙箱」的口子原封不动留在迁移这一步
 /// （模型只要抢在新文件生成前写出旧文件即可）。这两项按默认值重新开始，用户在「权限」页重设。
-const LEGACY_PREFS_MIGRATED_KEYS: [&str; 4] = ["theme", "slogans", "slogan_interval_secs", "chat_titles"];
+const LEGACY_PREFS_MIGRATED_KEYS: [&str; 4] =
+    ["theme", "slogans", "slogan_interval_secs", "chat_titles"];
 
 /// 旧版路径 `agent/desktop_prefs.json` 一次性迁移到新路径（best-effort）。
 ///
@@ -631,7 +716,6 @@ pub fn write_permission_mode(home: &std::path::Path, mode: &str) -> Result<(), S
     })
 }
 
-
 // ---------------------------------------------------------------------------
 // APK 宿主（android + apk-host）：GUI 与前台服务共享单运行时。
 //
@@ -644,21 +728,20 @@ pub fn write_permission_mode(home: &std::path::Path, mode: &str) -> Result<(), S
 #[cfg(all(target_os = "android", feature = "apk-host"))]
 async fn start_agent_inner(app: &tauri::AppHandle, _home: PathBuf) -> Result<(), String> {
     install_permission_hook(app.clone());
-    let context = rclaw_android::host_context()
-        .ok_or("Android 宿主上下文未初始化（nativeInit 未调用）")?;
+    install_command_confirm_hook(app.clone());
+    install_session_access_hook(app.clone());
+    let context =
+        rclaw_android::host_context().ok_or("Android 宿主上下文未初始化（nativeInit 未调用）")?;
     let mut slot = crate::android_host::apk_runtime_slot().lock().await;
     let pending_outbound = match slot.as_mut() {
         Some(runtime) => runtime.pending_outbound.take(),
         None => {
             // GUI 可能早于服务装配：启动 JSON 只是 nativeInit 的最小上下文，
             // toml 由 resolve_android_config 从 filesDir/rclaw.toml 回读。
-            let launch = rclaw_android::AndroidConfig::minimal(
-                &context.files_dir.to_string_lossy(),
-            );
-            let config_json =
-                serde_json::to_string(&launch).map_err(|e| e.to_string())?;
-            let (running, _gui_attached) = match assemble_apk_agent(&config_json, Some(app)).await
-            {
+            let launch =
+                rclaw_android::AndroidConfig::minimal(&context.files_dir.to_string_lossy());
+            let config_json = serde_json::to_string(&launch).map_err(|e| e.to_string())?;
+            let (running, _gui_attached) = match assemble_apk_agent(&config_json, Some(app)).await {
                 Ok(result) => result,
                 Err(error) => {
                     #[cfg(all(target_os = "android", feature = "apk-host"))]
@@ -895,9 +978,7 @@ pub(crate) async fn assemble_apk_agent(
         )
         .run(),
     );
-    tokio::spawn(
-        Heartbeat::new(layout, inbound_tx.clone(), cfg.heartbeat.interval_sec).run(),
-    );
+    tokio::spawn(Heartbeat::new(layout, inbound_tx.clone(), cfg.heartbeat.interval_sec).run());
 
     // 喂 watchdog 的健康信号：装配成功置位 + 30s 心跳（v0.2.0 服务
     // checkNativeRuntime 每 60s 查 is_healthy；不喂则进程被周期性杀掉重启）。

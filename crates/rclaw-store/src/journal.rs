@@ -6,7 +6,7 @@
 //! （对应 ZCode `workflow_event(run_id, sequence)` 的唯一约束），追加与读取天然有序，
 //! 不再依赖文件追加的原子性与目录扫描。
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 
 use crate::db::{now_ms, Db};
@@ -109,6 +109,89 @@ impl JournalStore {
         self.db.with(|conn| load_events(conn, kind, stream))
     }
 
+    /// 读取整个事件流，附带 journal 全局 id（投影折叠按它严格升序）。
+    pub fn load_with_ids(&self, kind: &str, stream: &str) -> Result<Vec<(i64, u64, Value)>> {
+        self.db.with(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, seq, payload FROM journal_event WHERE kind = ?1 AND stream = ?2 \
+                 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map(params![kind, stream], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, seq, text) = row?;
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => out.push((id, seq.max(0) as u64, value)),
+                    Err(error) => tracing::warn!(
+                        "journal 事件解析失败，已跳过: kind={kind} stream={stream} seq={seq} err={error}"
+                    ),
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// 某类事件的全部流（带全局 id，按 id 升序）——启动投影重建 / 旧数据回填用。
+    pub fn all_events(&self, kind: &str) -> Result<Vec<(i64, String, u64, Value)>> {
+        self.db.with(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, stream, seq, payload FROM journal_event WHERE kind = ?1 ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map(params![kind], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, stream, seq, text) = row?;
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => out.push((id, stream, seq.max(0) as u64, value)),
+                    Err(error) => tracing::warn!(
+                        "journal 事件解析失败，已跳过: kind={kind} stream={stream} seq={seq} err={error}"
+                    ),
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// 在调用方已有的写事务里追加一条事件，返回 `seq`（投影/终态与 outbox 必须同事务）。
+    pub fn append_tx(
+        &self,
+        tx: &Transaction<'_>,
+        kind: &str,
+        stream: &str,
+        payload: &Value,
+    ) -> Result<u64> {
+        insert_event(tx, kind, stream, payload)
+    }
+
+    /// 共享底层连接（工作流投影表与 journal 同库，事务必须落在同一条连接上）。
+    pub fn db(&self) -> Db {
+        self.db.clone()
+    }
+
+    /// journal 全局 id 的当前最大值（无事件时为 0）。
+    pub fn max_event_id(&self) -> Result<i64> {
+        self.db.with(|conn| {
+            Ok(conn.query_row(
+                "SELECT coalesce(max(id), 0) FROM journal_event",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     /// 读取事件流的最后 `limit` 条（`seq` 升序）。只关心尾部的调用方（启动恢复、状态面板）
     /// 用它代替 [`Self::load`]，避免把长流整条读进内存。不可解析的事件跳过（同 `load`）。
     pub fn load_tail(&self, kind: &str, stream: &str, limit: usize) -> Result<Vec<(u64, Value)>> {
@@ -189,11 +272,9 @@ impl JournalStore {
     pub fn kv_get(&self, key: &str) -> Result<Option<Value>> {
         self.db.with(|conn| {
             let text: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM kv WHERE key = ?1",
-                    params![key],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |row| {
+                    row.get(0)
+                })
                 .optional()?;
             Ok(text.and_then(|t| match serde_json::from_str(&t) {
                 Ok(v) => Some(v),
@@ -215,6 +296,17 @@ impl JournalStore {
             )?;
             Ok(())
         })
+    }
+
+    /// 在调用方已有的写事务里写 kv（投影游标与折叠必须同事务）。
+    pub fn kv_set_tx(&self, tx: &Transaction<'_>, key: &str, value: &Value) -> Result<()> {
+        let text = serde_json::to_string(value)?;
+        tx.execute(
+            "INSERT INTO kv(key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, text, now_ms()],
+        )?;
+        Ok(())
     }
 
     pub fn kv_delete(&self, key: &str) -> Result<()> {
@@ -297,7 +389,10 @@ mod tests {
         assert_eq!(j.append(JOURNAL_PLAN, "p1", &json!({"e": 1})).unwrap(), 1);
         assert_eq!(j.append(JOURNAL_PLAN, "p1", &json!({"e": 2})).unwrap(), 2);
         assert_eq!(j.append(JOURNAL_PLAN, "p2", &json!({"e": 1})).unwrap(), 1);
-        assert_eq!(j.append(JOURNAL_WORKFLOW, "p1", &json!({"w": 1})).unwrap(), 1);
+        assert_eq!(
+            j.append(JOURNAL_WORKFLOW, "p1", &json!({"w": 1})).unwrap(),
+            1
+        );
 
         let p1 = j.load(JOURNAL_PLAN, "p1").unwrap();
         assert_eq!(p1.len(), 2);
@@ -316,7 +411,10 @@ mod tests {
             j.load_tail(JOURNAL_PLAN, "p1", 2).unwrap(),
             vec![(2, json!({"e": 2})), (3, json!({"e": 3}))]
         );
-        assert_eq!(j.load_tail(JOURNAL_PLAN, "p1", 10).unwrap(), j.load(JOURNAL_PLAN, "p1").unwrap());
+        assert_eq!(
+            j.load_tail(JOURNAL_PLAN, "p1", 10).unwrap(),
+            j.load(JOURNAL_PLAN, "p1").unwrap()
+        );
         assert!(j.load_tail(JOURNAL_PLAN, "nope", 5).unwrap().is_empty());
     }
 
@@ -335,9 +433,12 @@ mod tests {
     #[test]
     fn kv_delete_if_only_removes_the_expected_value() {
         let (_dir, j) = store();
-        j.kv_set("k", &json!({"created_at": 1, "objective": "A"})).unwrap();
+        j.kv_set("k", &json!({"created_at": 1, "objective": "A"}))
+            .unwrap();
         // 值不符（目标已被 /goal 换掉）：不删，返回 false。
-        assert!(!j.kv_delete_if("k", &json!({"created_at": 0, "objective": "A"})).unwrap());
+        assert!(!j
+            .kv_delete_if("k", &json!({"created_at": 0, "objective": "A"}))
+            .unwrap());
         assert!(j.kv_get("k").unwrap().is_some());
         // 值一致（读回的 Value 再序列化与库内文本逐字节一致）：原子删除。
         let current = j.kv_get("k").unwrap().unwrap();
@@ -353,7 +454,8 @@ mod tests {
         let layout = Layout::new(dir.path().join("agent"));
         let session = crate::SessionStore::open(layout).unwrap();
         let j = session.journal();
-        j.append(JOURNAL_TEAM_STATE, "", &json!({"teams": {}})).unwrap();
+        j.append(JOURNAL_TEAM_STATE, "", &json!({"teams": {}}))
+            .unwrap();
         // 第二个连接打开同一 state.sqlite：事务已提交，立即可见。
         let again = JournalStore::open(session.layout()).unwrap();
         assert_eq!(again.load(JOURNAL_TEAM_STATE, "").unwrap().len(), 1);
@@ -365,13 +467,12 @@ mod tests {
         j.append(JOURNAL_PLAN, "p", &json!({"ok": 1})).unwrap();
         j.kv_set("k", &json!({"ok": 1})).unwrap();
         // 直接篡改落库内容，模拟损坏。
-        j.db
-            .with(|conn| {
-                conn.execute("UPDATE journal_event SET payload = '{not json'", [])?;
-                conn.execute("UPDATE kv SET value = '{not json'", [])?;
-                Ok(())
-            })
-            .unwrap();
+        j.db.with(|conn| {
+            conn.execute("UPDATE journal_event SET payload = '{not json'", [])?;
+            conn.execute("UPDATE kv SET value = '{not json'", [])?;
+            Ok(())
+        })
+        .unwrap();
         assert!(j.load(JOURNAL_PLAN, "p").unwrap().is_empty());
         assert_eq!(j.latest(JOURNAL_PLAN, "p").unwrap(), None);
         assert!(j.exists(JOURNAL_PLAN, "p").unwrap(), "行仍在，只是不可解析");
@@ -399,14 +500,18 @@ mod tests {
             (Some(2), "resolved")
         );
         // 另一条连接（另一进程的等价物）再试：读到的是已提交的应答 → 不写。
-        let other = JournalStore::open(&Layout::new(j.db.path().parent().unwrap().to_path_buf()))
-            .unwrap();
+        let other =
+            JournalStore::open(&Layout::new(j.db.path().parent().unwrap().to_path_buf())).unwrap();
         assert_eq!(
             other.append_guarded(JOURNAL_PLAN, "p", resolve).unwrap(),
             (None, "already_resolved")
         );
         assert_eq!(j.load(JOURNAL_PLAN, "p").unwrap().len(), 2, "只有一条应答");
         // 不写的分支不会占用 seq。
-        assert_eq!(j.append(JOURNAL_PLAN, "p", &json!({"event": "done"})).unwrap(), 3);
+        assert_eq!(
+            j.append(JOURNAL_PLAN, "p", &json!({"event": "done"}))
+                .unwrap(),
+            3
+        );
     }
 }

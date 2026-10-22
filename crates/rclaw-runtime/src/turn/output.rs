@@ -40,8 +40,18 @@ pub(super) async fn persist_and_push_user(
     messages: &mut Vec<Message>,
     msg: &BusMessage,
 ) {
-    let mut m = Message::plain(Role::User, msg.content.clone());
-    match session.append(&msg.channel, &msg.chat_id, &m) {
+    let persisted = Message::plain(Role::User, msg.display_content().to_string());
+    let mut m = Message::plain(Role::User, msg.model_content().to_string());
+    // 工作流通知先认领（CAS，与 run_turn_inner 同口径）：重发副本直接丢弃，不进上下文。
+    if let Some(notification_id) = msg.workflow_notification_id() {
+        if let Some(service) = crate::agent_tools::global_workflow_service() {
+            if !service.mark_notification_consumed(notification_id) {
+                tracing::info!(notification_id, "插队的工作流通知已被消费过，丢弃重发副本");
+                return;
+            }
+        }
+    }
+    match session.append(&msg.channel, &msg.chat_id, &persisted) {
         Ok(id) => m.id = id,
         Err(e) => tracing::warn!("插队补充消息持久化失败（仍注入内存）: {e}"),
     }

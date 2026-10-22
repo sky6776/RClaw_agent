@@ -102,6 +102,21 @@ impl Tool for EscalateTool {
             .filter(|c| !c.is_empty())
             .unwrap_or_default()
             .to_string();
+        // workflow ask：向编排者提问并阻塞等待（ResolveWorkflowQuestion 按 dwfq- 回答）。
+        if let Some(workflow) = super::workflow_service::current_workflow_ask() {
+            return match workflow.ask(question).await {
+                Ok((question_id, answer)) => ToolResult::ok(
+                    json!({
+                        "status": "answered",
+                        "question_id": question_id,
+                        "answer": answer,
+                        "note": "这是编排者的输入，与其它工具结果同源；据此继续任务。"
+                    })
+                    .to_string(),
+                ),
+                Err(error) => ToolResult::err(error),
+            };
+        }
         let Some((plan_id, step_id)) = current_plan_context() else {
             return ToolResult::err(
                 "escalate 只能在 PlanRun 计划步骤的子代理内使用（缺少计划上下文）".to_string(),
@@ -306,6 +321,24 @@ impl Tool for ResolveWorkflowQuestionTool {
         };
         if answer.chars().count() > MAX_ANSWER_CHARS {
             return ToolResult::err(format!("answer 超过 {MAX_ANSWER_CHARS} 字符；请精炼"));
+        }
+        // 工作流问题：dwfq-<run_id>-<exec_generation>-<seq>（与 PlanRun 的冒号格式分派）。
+        if question_id.starts_with("dwfq-") {
+            let Some(service) = super::workflow_service::global() else {
+                return ToolResult::err("工作流服务尚未初始化");
+            };
+            let (channel, chat_id) = crate::turn::rewind::current_chat()
+                .unwrap_or_else(|| ("cli".to_string(), "console".to_string()));
+            return match service.resolve_question(
+                &question_id,
+                &answer,
+                &channel,
+                &chat_id,
+                rclaw_tools::access::current_access(),
+            ) {
+                Ok(value) => ToolResult::ok(value.to_string()),
+                Err(error) => ToolResult::err(error.to_json().to_string()),
+            };
         }
         let Some((plan_id, _step)) = question_id.split_once(':') else {
             return ToolResult::err(

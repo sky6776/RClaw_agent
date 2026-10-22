@@ -282,6 +282,10 @@ pub async fn assemble_core_with(
         verify_candidate_patches: cfg.agent.verify_candidate_patches,
         tool_result_artifact_enabled: cfg.agent.tool_result_artifact_enabled,
         tool_result_artifact_bytes: cfg.agent.tool_result_artifact_bytes,
+        workflow_background: cfg.agent.workflow_background,
+        workflow_legacy_tool: cfg.agent.workflow_legacy_tool,
+        max_active_workflow_runs: cfg.agent.max_active_workflow_runs.max(1),
+        workflow_command_confirm: cfg.agent.workflow_command_confirm,
         ..AgentOptions::default()
     };
 
@@ -339,10 +343,58 @@ pub async fn assemble_core_with(
     tools.register(Box::new(rclaw_runtime::turn::rewind::RewindFilesTool::new(
         session.clone(),
     )));
-    // Layer 3 引擎最小执行器：确定性 JS 脚本编排（主代理专属，子代理被屏蔽表拒绝）。
-    tools.register(Box::new(rclaw_runtime::agent_tools::WorkflowRunTool::new(
+    // Layer 3 引擎：动态工作流工具面（主代理专属，子代理被屏蔽表拒绝）。
+    // 技能文件首次安装 + 完整读取观察者（技能门 hash 登记）。
+    let _ = rclaw_runtime::agent_tools::ensure_skill_file(&layout.base);
+    rclaw_runtime::agent_tools::install_workflow_skill_observer(
+        session.journal(),
+        layout.base.clone(),
+    );
+    let workflow_service = rclaw_runtime::agent_tools::WorkflowService::new(
         agent_runtime.clone(),
+        layout,
+        rclaw_runtime::agent_tools::WorkflowOptions {
+            background: cfg.agent.workflow_background,
+            legacy_tool: cfg.agent.workflow_legacy_tool,
+            max_active: cfg.agent.max_active_workflow_runs.max(1),
+            command_confirm: cfg.agent.workflow_command_confirm,
+        },
+    );
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::CreateWorkflowTool::new(workflow_service.clone()),
+    ));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::AmendWorkflowTool::new(workflow_service.clone()),
+    ));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::ResumeWorkflowRunTool::new(workflow_service.clone()),
+    ));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::ListWorkflowRunsTool::new(workflow_service.clone()),
+    ));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::GetWorkflowRunTool::new(workflow_service.clone()),
+    ));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::CancelWorkflowRunTool::new(workflow_service.clone()),
+    ));
+    tools.register(Box::new(rclaw_runtime::agent_tools::SaveWorkflowTool::new(
+        workflow_service.clone(),
     )));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::ListSavedWorkflowsTool::new(workflow_service.clone()),
+    ));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::EvalWorkflowSnippetTool::new(workflow_service.clone()),
+    ));
+    tools.register(Box::new(
+        rclaw_runtime::agent_tools::FillWorkflowHoleTool::new(workflow_service.clone()),
+    ));
+    if cfg.agent.workflow_legacy_tool {
+        tools.register(Box::new(rclaw_runtime::agent_tools::WorkflowRunTool::new(
+            workflow_service.clone(),
+        )));
+    }
     // Bot Mode（ADR-0006）：bot 注册表 + message_agent 交接工具。registry 在
     // web_search_control 之后构建（bot 提示需要搜索工具面状态）；此时 Agent/Task
     // 等多 agent 工具还没注册，装配完成后由 set_tool_schemas 回填终态注册快照并

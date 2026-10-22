@@ -491,12 +491,11 @@ fn clear_agent_state(
     session
         .clear_all_sessions()
         .map_err(|e| before_delete(e.to_string()))?;
-    let memory = rclaw_store::fs::clear_dir_contents(&layout.memory_dir).map_err(|e| {
-        ClearFailure {
+    let memory =
+        rclaw_store::fs::clear_dir_contents(&layout.memory_dir).map_err(|e| ClearFailure {
             sessions_cleared: true,
             message: e.to_string(),
-        }
-    })?;
+        })?;
     Ok(format!(
         "• state.sqlite：删除 {sessions} 个会话（含当前会话）及其文件 checkpoint、用量锚点、会话目标与分叉血缘\n\
          • artifacts/：删除各会话的工具结果落盘目录（转录里的落盘句柄随之失效）\n\
@@ -747,6 +746,53 @@ pub struct ForkChatOutcome {
     pub restore_failed: bool,
 }
 
+/// `/workflow` 展开结果。
+enum WorkflowExpansion {
+    NotWorkflow,
+    Usage,
+    Expanded(String),
+}
+
+/// `Use the dynamic-workflows skill ...` 的展开正文（与 ZCode builtin-workflow-command 对齐）。
+fn workflow_command_expansion(msg: &BusMessage) -> WorkflowExpansion {
+    if msg.source() != MessageSource::User {
+        return WorkflowExpansion::NotWorkflow;
+    }
+    let trimmed = msg.content.trim();
+    // 文档 §4.2：`/workflow` 大小写不敏感（`/Workflow` 也算）。
+    const COMMAND: &str = "/workflow";
+    let Some(rest) = trimmed
+        .get(..COMMAND.len())
+        .filter(|head| head.eq_ignore_ascii_case(COMMAND))
+        .map(|_| &trimmed[COMMAND.len()..])
+    else {
+        return WorkflowExpansion::NotWorkflow;
+    };
+    // `/workflow-foo` 不是本命令。
+    if rest.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+        return WorkflowExpansion::NotWorkflow;
+    }
+    let arguments = rest.trim();
+    if arguments.is_empty() {
+        return WorkflowExpansion::Usage;
+    }
+    WorkflowExpansion::Expanded(format!(
+        "Use the `dynamic-workflows` skill to design and launch a dynamic workflow for this request:\n\n\
+         {arguments}\n\n\
+         Decide the subagent topology before writing any code: how many subagents, which of them\n\
+         share a context, what result each one returns. Then write the script and call the\n\
+         `CreateWorkflow` tool. Do not substitute the `Agent` tool and do not do the work inline."
+    ))
+}
+
+/// 历史里持久化的 `/workflow` 原文在构造 LLM 请求时展开（保证后续轮次模型也看到展开文本）。
+pub(crate) fn expand_persisted_workflow_message(text: &str) -> Option<String> {
+    match workflow_command_expansion(&BusMessage::new("history", "history", text)) {
+        WorkflowExpansion::Expanded(model) => Some(model),
+        _ => None,
+    }
+}
+
 pub struct TurnManager {
     /// `(channel, chat_id, cron_job_id) → 活动 turn`。普通消息同一会话至多一个活动 turn；
     /// 不同 Cron job 即使回复目标相同，也使用独立活动 turn。
@@ -894,11 +940,7 @@ impl TurnManager {
     /// 身份校验条目——旧 turn 主体结束到外壳清理之间，路由层可能已用同 key 换上
     /// 新 turn，无条件按 key 标记会把新 turn 误标成「已投递」（其命令回复会提前
     /// 解除忙碌态、放行排队消息）。
-    fn mark_final_delivered_if_same(
-        &self,
-        key: &TurnKey,
-        event_tx: &mpsc::Sender<Interjection>,
-    ) {
+    fn mark_final_delivered_if_same(&self, key: &TurnKey, event_tx: &mpsc::Sender<Interjection>) {
         let mut active = self.active.lock().expect("active map 锁未被毒化");
         if let Some(turn) = active.get_mut(key) {
             if turn.event_tx.same_channel(event_tx) {
@@ -984,6 +1026,24 @@ impl TurnManager {
                 "用户原始输入"
             );
         }
+
+        // `/workflow <请求>`：不拦截为运行时命令，而是展开成 prompt 再走正常 turn。
+        // 历史 / UI 保留原文（display_content），模型读展开文本（model_content）。
+        let msg = match workflow_command_expansion(&msg) {
+            WorkflowExpansion::NotWorkflow => msg,
+            WorkflowExpansion::Usage => {
+                let _ = self
+                    .outbound_tx
+                    .send(BusMessage::new(
+                        msg.channel.clone(),
+                        msg.chat_id.clone(),
+                        "用法：/workflow <请求>  —— 设计并运行一个动态工作流。",
+                    ))
+                    .await;
+                return;
+            }
+            WorkflowExpansion::Expanded(model) => msg.expand_model_content(model),
+        };
 
         if commands::dispatch(self, &msg).await {
             return;
@@ -1282,9 +1342,9 @@ impl TurnManager {
                             &self.request_tool_schemas(persona.as_deref()),
                         );
                         self.history.record_compression_floor(&key, post_estimate);
-                        if let Err(e) =
-                            sink.memory
-                                .write_session_summary(channel, chat_id, &summary)
+                        if let Err(e) = sink
+                            .memory
+                            .write_session_summary(channel, chat_id, &summary)
                         {
                             tracing::warn!("/compact 摘要文件写入失败（不影响 session）: {e}");
                         }
@@ -1636,8 +1696,11 @@ impl TurnManager {
         }
         let fork = {
             let session = self.session.clone();
-            let (channel2, chat2, target) =
-                (channel.to_string(), chat_id.to_string(), fork_target.clone());
+            let (channel2, chat2, target) = (
+                channel.to_string(),
+                chat_id.to_string(),
+                fork_target.clone(),
+            );
             tokio::task::spawn_blocking(move || {
                 session
                     .fork_session(&channel2, &chat2, anchor_message_id, &target)
@@ -1663,9 +1726,7 @@ impl TurnManager {
                 Ok(Ok((false, _, note))) => (0, Some(note), false),
                 Ok(Err(error)) => (
                     0,
-                    Some(format!(
-                        "⚠️ 文件回滚未执行（新会话历史不受影响）：{error}"
-                    )),
+                    Some(format!("⚠️ 文件回滚未执行（新会话历史不受影响）：{error}")),
                     true,
                 ),
                 Err(error) => (0, Some(format!("⚠️ 文件回滚任务异常: {error}")), true),
@@ -1830,43 +1891,44 @@ impl TurnManager {
         let layout = self.layout.clone();
         let channel = channel.to_string();
         let chat_id = chat_id.to_string();
-        let exported = tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
-            let targets: Vec<(String, String)> = if all {
-                session
-                    .list_sessions(None)
-                    .map_err(|e| format!("读取会话列表失败：{e}"))?
-                    .into_iter()
-                    .map(|summary| (summary.channel, summary.chat_id))
-                    .collect()
-            } else {
-                vec![(channel, chat_id)]
-            };
-            if targets.is_empty() {
-                return Ok("没有可导出的会话。".to_string());
-            }
-            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-            let mut lines = Vec::with_capacity(targets.len());
-            for (channel, chat_id) in &targets {
-                let jsonl = session
-                    .export_transcript_jsonl(channel, chat_id)
-                    .map_err(|e| format!("读取会话 {channel}:{chat_id} 失败：{e}"))?;
-                let count = jsonl.lines().count();
-                let path = layout.export_path(channel, chat_id, &stamp);
-                rclaw_store::fs::ensure_parent_dir(&path).map_err(|e| e.to_string())?;
-                std::fs::write(&path, jsonl)
-                    .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
-                lines.push(format!(
-                    "- {channel}:{chat_id} → {}（{count} 条）",
-                    path.display()
-                ));
-            }
-            Ok(format!(
-                "✅ 已导出 {} 个会话的完整记录（含已被压缩的消息）：\n{}",
-                targets.len(),
-                lines.join("\n")
-            ))
-        })
-        .await;
+        let exported =
+            tokio::task::spawn_blocking(move || -> std::result::Result<String, String> {
+                let targets: Vec<(String, String)> = if all {
+                    session
+                        .list_sessions(None)
+                        .map_err(|e| format!("读取会话列表失败：{e}"))?
+                        .into_iter()
+                        .map(|summary| (summary.channel, summary.chat_id))
+                        .collect()
+                } else {
+                    vec![(channel, chat_id)]
+                };
+                if targets.is_empty() {
+                    return Ok("没有可导出的会话。".to_string());
+                }
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+                let mut lines = Vec::with_capacity(targets.len());
+                for (channel, chat_id) in &targets {
+                    let jsonl = session
+                        .export_transcript_jsonl(channel, chat_id)
+                        .map_err(|e| format!("读取会话 {channel}:{chat_id} 失败：{e}"))?;
+                    let count = jsonl.lines().count();
+                    let path = layout.export_path(channel, chat_id, &stamp);
+                    rclaw_store::fs::ensure_parent_dir(&path).map_err(|e| e.to_string())?;
+                    std::fs::write(&path, jsonl)
+                        .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+                    lines.push(format!(
+                        "- {channel}:{chat_id} → {}（{count} 条）",
+                        path.display()
+                    ));
+                }
+                Ok(format!(
+                    "✅ 已导出 {} 个会话的完整记录（含已被压缩的消息）：\n{}",
+                    targets.len(),
+                    lines.join("\n")
+                ))
+            })
+            .await;
         match exported {
             Ok(Ok(report)) => report,
             Ok(Err(error)) => format!("⚠️ 导出失败：{error}"),
@@ -2489,7 +2551,10 @@ impl TurnManager {
         // Layer 2a（ZCode 移植）：顶层 turn 的取消令牌进 task-local，供前台子代理
         // 自动转后台建立「父取消 → 子取消」联动（detach 后由调用方解除）。
         let cancel_for_scope = cancel.clone();
-        let chat_scope = Some((panic_report_target.channel.clone(), panic_report_target.chat_id.clone()));
+        let chat_scope = Some((
+            panic_report_target.channel.clone(),
+            panic_report_target.chat_id.clone(),
+        ));
         // 内层也要事件通道发送端：终局投递标记按它校验 active 条目身份（防误标换代
         // 后的新 turn）；外壳自身在清理时还要用，克隆一份随闭包 move。
         let event_tx_for_inner = event_tx.clone();
@@ -2743,12 +2808,36 @@ impl TurnManager {
         // 3) 当前 user 消息：先持久化（cron 不持久化），再追加进本轮内存 messages。
         //    user 落盘失败必须中止本轮：否则后续 assistant / tool 记录仍可能被保存，
         //    历史会变成「只有回答没有问题」。
-        let mut user_msg = Message::plain(Role::User, msg.content.clone());
+        // 持久化原文（历史 / UI 显示用户真正输入的 `/workflow ...`）；本轮请求用
+        // model_content（展开后的 prompt）。后续轮次加载历史时由 HistoryLoader 再次展开。
+        let persisted_msg = Message::plain(Role::User, msg.display_content().to_string());
+        let mut user_msg = Message::plain(Role::User, msg.model_content().to_string());
+        // 工作流通知先认领（CAS）再落库：outbox 对 60s 未确认的 scheduled 会重发，同一条通知
+        // 可能两次进到这里；认领失败的是重发副本，整条丢弃，模型不会收到两遍「run 已完成」。
+        if let Some(notification_id) = msg.workflow_notification_id() {
+            if let Some(service) = crate::agent_tools::global_workflow_service() {
+                if !service.mark_notification_consumed(notification_id) {
+                    tracing::info!(notification_id, "工作流通知已被消费过，丢弃重发副本");
+                    return drain_leftovers(&mut event_rx);
+                }
+            }
+        }
         if !is_cron {
-            match self.session.append(&msg.channel, &msg.chat_id, &user_msg) {
-                Ok(id) => user_msg.id = id,
+            match self
+                .session
+                .append(&msg.channel, &msg.chat_id, &persisted_msg)
+            {
+                Ok(id) => {
+                    user_msg.id = id;
+                }
                 Err(e) => {
                     tracing::error!("user 消息持久化失败，中止本轮以避免历史残缺: {e}");
+                    // 开头已认领的工作流通知退回 pending：这一轮没能把它交到模型手里。
+                    if let Some(notification_id) = msg.workflow_notification_id() {
+                        if let Some(service) = crate::agent_tools::global_workflow_service() {
+                            service.release_notification(notification_id, &e.to_string());
+                        }
+                    }
                     let _ = self
                         .outbound_tx
                         .send(BusMessage::new(

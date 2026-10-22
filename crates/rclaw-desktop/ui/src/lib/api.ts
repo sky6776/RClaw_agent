@@ -132,6 +132,59 @@ export interface PlanStatus {
   steps: PlanStep[];
 }
 
+/** 工作流 run 摘要（workflow_status 轮询）。 */
+export interface WorkflowRunSummary {
+  run_id: string;
+  label: string;
+  status: string;
+  stop_reason?: string | null;
+  resumed_from?: string | null;
+  superseded_by?: string | null;
+  owned_by_this_session?: boolean;
+  possibly_interrupted?: boolean;
+  legacy?: boolean;
+  resumable?: boolean;
+  created_at: number;
+  updated_at: number;
+  spent_tokens: number;
+}
+
+/** 工作流详情（workflow_detail / GetWorkflowRun 同形）。 */
+export interface WorkflowDetail {
+  run_id: string;
+  label: string;
+  status: string;
+  stop_reason?: string | null;
+  exec_generation?: number;
+  progress?: { asks_done: number; asks_total: number; active_agents: number };
+  log_tail?: Array<{ message: string }>;
+  pending_questions?: Array<{ question_id: string; actor: string; question: string }>;
+  holes?: Array<{ hole_id: string; name: string; prompt?: string; state: string; script_generation: number }>;
+  phases?: Array<{
+    name: string;
+    status: string;
+    started_at: number;
+    finished_at: number;
+    duration_ms?: number;
+  }>;
+  reports?: Array<{ seq: number; item_preview: unknown }>;
+  artifacts?: Array<{ id: string; kind: string; title: string; version: number; primary: boolean; uri: string }>;
+  effects?: Array<{ effect_key: string; op: string; is_write: boolean; status: string; args_preview?: string; decision?: string | null }>;
+  result?: unknown;
+  /** result 超过 48k 字符时只回句柄：全文落盘路径 + 头尾预览。 */
+  result_handle?: { path?: string | null; bytes: number; chars: number; preview: string; hint: string } | null;
+  /** 分页游标（null = 没有更多）。 */
+  reports_cursor?: number | null;
+  effects_cursor?: number | null;
+  artifacts_cursor?: number | null;
+  log_cursor?: number | null;
+  error?: unknown;
+  recovery?: string | null;
+  notifications?: Array<{ id: string; state: string; attempts: number; last_error?: string | null }>;
+  /** 当前 exec 的 world.run 进程树记录；`stopping` 下 running/unknown 的要人工确认已退出。 */
+  processes?: Array<{ process_id: string; root_pid: number; state: string }>;
+}
+
 export interface WizardInput {
   provider: string;
   baseUrl: string;
@@ -416,6 +469,49 @@ export const api = {
 
   /** 最近若干个 PlanRun 计划的状态（流程步骤 / todo 轮询）。 */
   planStatus: () => invoke<PlanStatus[]>("plan_status"),
+
+  /** 回答 world.run 的逐命令确认弹窗。 */
+  workflowAnswerCommandConfirm: (id: string, allowed: boolean) =>
+    invoke<void>("workflow_answer_command_confirm", { id, allowed }),
+
+  /** 工作流运行列表（卡片）。 */
+  workflowStatus: () => invoke<{ runs: WorkflowRunSummary[]; truncated: boolean; filtered?: number }>("workflow_status"),
+
+  /** 工作流运行详情。 */
+  workflowDetail: (runId: string, includeEffects = false) =>
+    invoke<WorkflowDetail>("workflow_detail", { runId, includeEffects }),
+
+  /** 取消 running/queued 工作流。 */
+  workflowCancel: (runId: string) => invoke<unknown>("workflow_cancel", { runId }),
+
+  /** 续跑 stopped 工作流（用户来源；用户取消过的 run 由 UI 代签一次性授权）。 */
+  workflowResume: (runId: string) => invoke<unknown>("workflow_resume", { runId }),
+
+  /** 未知副作用逐项裁决。 */
+  workflowConfirmEffects: (
+    runId: string,
+    execGeneration: number,
+    decisions: Array<{ effect_key: string; action: "skip" | "rerun"; substitute_result?: unknown }>,
+  ) => invoke<unknown>("workflow_confirm_effects", { runId, execGeneration, decisions }),
+
+  /** 进程树人工确认。 */
+  workflowConfirmProcessGone: (runId: string, execGeneration: number, processIds: string[]) =>
+    invoke<unknown>("workflow_confirm_process_gone", { runId, execGeneration, processIds }),
+
+  /** dead 通知重投。 */
+  workflowResendNotification: (notificationId: string) =>
+    invoke<unknown>("workflow_resend_notification", { notificationId }),
+
+  /** 确认 amend 可重建（前驱有写 effect 时）。 */
+  workflowConfirmAmend: (runId: string) => invoke<unknown>("workflow_confirm_amend", { runId }),
+
+  /** 填充等待中的 hole（函数体语句）。 */
+  workflowFillHole: (runId: string, holeId: string, scriptGeneration: number, script: string) =>
+    invoke<unknown>("workflow_fill_hole", { runId, holeId, scriptGeneration, script }),
+
+  /** 回答运行中 actor 的问题。 */
+  workflowResolveQuestion: (questionId: string, answer: string) =>
+    invoke<unknown>("workflow_resolve_question", { questionId, answer }),
 
   /** 暂停 / 继续一个计划（波次边界生效；当前在飞的步骤跑完后等待恢复）。 */
   planPause: (planId: string, paused: boolean) =>

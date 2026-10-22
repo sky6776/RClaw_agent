@@ -6,7 +6,7 @@
 //! conversation session.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -35,14 +35,34 @@ use crate::turn::{
     ToolExecutionPolicy, TurnState,
 };
 
+mod amend_workflow;
+mod cancel_workflow_run;
+mod create_workflow;
+mod eval_workflow_snippet;
+mod fill_workflow_hole;
+mod get_workflow_run;
+mod list_saved_workflows;
+mod list_workflow_runs;
 mod plan;
-mod workflow;
-/// AST 级工作流脚本分析（oxc：依赖图 + .ask<T>→schema 编译，第十二轮）。
-pub(crate) mod workflow_ast;
+mod resume_workflow_run;
+mod save_workflow;
 mod subagent;
 mod team;
 mod tools;
 mod verify;
+mod workflow;
+pub mod workflow_api;
+/// AST 级工作流脚本分析（oxc：依赖图 + .ask<T>→schema 编译，第十二轮）。
+pub(crate) mod workflow_ast;
+mod workflow_driver;
+mod workflow_effects;
+mod workflow_paths;
+mod workflow_saved;
+mod workflow_service;
+mod workflow_skill;
+mod workflow_snapshot;
+mod workflow_store;
+mod workflow_world;
 
 /// 子 Agent 循环的适配器：唯一的结构差异是完成后的团队任务闸门。
 struct SubagentRunAdapter<'a> {
@@ -70,9 +90,23 @@ impl RunAdapter for SubagentRunAdapter<'_> {
 const MAX_ACTIVE_EXECUTIONS: usize = 32;
 
 mod escalate;
+pub use amend_workflow::AmendWorkflowTool;
+pub use cancel_workflow_run::CancelWorkflowRunTool;
+pub use create_workflow::{CreateWorkflowTool, WorkflowRunTool};
 pub use escalate::{EscalateTool, ResolveWorkflowQuestionTool};
-pub use workflow::WorkflowRunTool;
+pub use eval_workflow_snippet::EvalWorkflowSnippetTool;
+pub use fill_workflow_hole::FillWorkflowHoleTool;
+pub use get_workflow_run::GetWorkflowRunTool;
+pub use list_saved_workflows::ListSavedWorkflowsTool;
+pub use list_workflow_runs::ListWorkflowRunsTool;
 pub use plan::{plan_pause_key, PlanRunTool};
+pub use resume_workflow_run::ResumeWorkflowRunTool;
+pub use save_workflow::SaveWorkflowTool;
+pub(crate) use workflow_effects::{BeginEffect, EffectTracker};
+pub(crate) use workflow_service::{current_workflow_ask, global as global_workflow_service};
+pub use workflow_service::{WorkflowOptions, WorkflowService};
+pub use workflow_skill::ensure_skill_file;
+pub use workflow_skill::install_observer as install_workflow_skill_observer;
 
 /// 某 PlanRun 计划是否正在【本进程】执行（宿主 UI 的 plan_status / plan_pause 用：
 /// journal 停在进行中但执行者已不在的计划投影成已中止，不在执行的计划拒绝落暂停）。
@@ -155,7 +189,11 @@ pub(crate) struct EventLog {
 }
 
 impl EventLog {
-    pub(crate) fn new(journal: &JournalStore, kind: &'static str, stream: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        journal: &JournalStore,
+        kind: &'static str,
+        stream: impl Into<String>,
+    ) -> Self {
         EventLog {
             journal: journal.clone(),
             kind,
@@ -215,6 +253,17 @@ impl EventLog {
             .map_err(|error| format!("{} 读取或写入失败: {error}", self.locator()))
     }
 
+    /// 在调用方已有的事务里追加事件（终态 / outbox / effect 必须与投影同事务）。
+    pub(crate) fn append_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        payload: &Value,
+    ) -> Result<u64, String> {
+        self.journal
+            .append_tx(tx, self.kind, &self.stream, payload)
+            .map_err(|error| format!("{} 事件写入失败: {error}", self.locator()))
+    }
+
     /// 读取整个事件流（seq 升序）；读失败返回 Err（调用方决定是否当「不存在」处理）。
     pub(crate) fn load(&self) -> Result<Vec<(u64, Value)>, String> {
         self.journal
@@ -236,10 +285,12 @@ impl EventLog {
 /// `source_channel` / `origin_chat_id` 重建，权限按快照持久化的 `ToolAccess` 还原——
 /// 见 [`InheritedTurnContext::for_recovered`]，不继承「谁来 resume 谁的权限」。
 #[derive(Clone)]
-struct InheritedTurnContext {
+pub(crate) struct InheritedTurnContext {
     access: rclaw_core::ToolAccess,
     chat: Option<(String, String)>,
     bot_ctx: Option<crate::bots::BotTurnCtx>,
+    /// workflow ask 的提问上下文（只有 workflow 子代理有；其它为 None）。
+    workflow: Option<Arc<workflow_service::WorkflowAskContext>>,
 }
 
 impl InheritedTurnContext {
@@ -248,6 +299,7 @@ impl InheritedTurnContext {
             access: rclaw_tools::access::current_access(),
             chat: crate::turn::rewind::current_chat(),
             bot_ctx: crate::bots::current_bot_ctx(),
+            workflow: workflow_service::current_workflow_ask(),
         }
     }
 
@@ -261,7 +313,15 @@ impl InheritedTurnContext {
             access,
             chat,
             bot_ctx: None,
+            workflow: None,
         }
+    }
+
+    /// 发起方会话 `(channel, chat_id)`（后台 workflow 据此重查会话权限）。
+    pub(crate) fn chat(&self) -> Option<(&str, &str)> {
+        self.chat
+            .as_ref()
+            .map(|(channel, chat_id)| (channel.as_str(), chat_id.as_str()))
     }
 
     async fn run<F: std::future::Future>(self, fut: F) -> F::Output {
@@ -269,9 +329,17 @@ impl InheritedTurnContext {
             self.chat,
             rclaw_tools::access::scope_access(self.access, fut),
         );
-        match self.bot_ctx {
-            Some(ctx) => crate::bots::scope_bot_ctx(ctx, fut).await,
-            None => fut.await,
+        let workflow = self.workflow;
+        let bot_ctx = self.bot_ctx;
+        let inner = async move {
+            match bot_ctx {
+                Some(ctx) => crate::bots::scope_bot_ctx(ctx, fut).await,
+                None => fut.await,
+            }
+        };
+        match workflow {
+            Some(ctx) => workflow_service::scope_workflow_ask(ctx, inner).await,
+            None => inner.await,
         }
     }
 }
@@ -437,11 +505,41 @@ impl AgentToolRuntime {
         &self.background_wake
     }
 
+    /// 工作流服务用的 journal 句柄（与 PlanRun / WorkflowRun 同库）。
+    pub(crate) fn journal_store(&self) -> &JournalStore {
+        &self.journal
+    }
+
+    /// 主 provider 名（execution_config.allowed_models 的默认项）。
+    pub(crate) fn provider_name(&self) -> String {
+        self.provider.name().to_string()
+    }
+
+    /// 后台 driver 的发起方上下文：权限 + 会话键（来自 execution_config 的持久化快照）。
+    pub(crate) fn inherited_for(
+        &self,
+        access: rclaw_core::ToolAccess,
+        chat: Option<(String, String)>,
+    ) -> InheritedTurnContext {
+        InheritedTurnContext {
+            access,
+            chat,
+            bot_ctx: None,
+            workflow: None,
+        }
+    }
+
     fn registry(&self) -> Result<Arc<ToolRegistry>, String> {
         self.registry
             .get()
             .cloned()
             .ok_or_else(|| "agent tools registry 尚未初始化".to_string())
+    }
+
+    /// 工具注册表是否已回填（装配结束才 set）：重启恢复期启动的 workflow driver 据此等待，
+    /// 否则第一个 ask 就撞上「尚未初始化」。
+    pub(crate) fn registry_ready(&self) -> bool {
+        self.registry.get().is_some()
     }
 
     async fn wait_for_inference_slot(
@@ -1215,41 +1313,43 @@ impl AgentToolRuntime {
                     .plan_id
                     .clone()
                     .map(|plan_id| (plan_id, spec.step_id.clone().unwrap_or_default()));
-                let result = team::CURRENT_PLAN.scope(plan_context, rclaw_tools::turn_state::scope(
-                    async {
-                        if let Some(error) = registration_failure {
-                            return Err(RunTaskFailure::Failed {
-                                error: format!("团队成员注册失败: {error}"),
-                                completed_steps: 0,
-                                media_publish_attempted: false,
-                            });
-                        }
-                        if let Some(identity) = identity.clone() {
-                            CURRENT_AGENT
-                                .scope(
-                                    identity.clone(),
-                                    self.run_task_inner(
-                                        &spec,
-                                        control.as_ref(),
-                                        &registry,
-                                        &static_schema,
-                                        &mut state,
-                                    ),
+                let result = team::CURRENT_PLAN
+                    .scope(
+                        plan_context,
+                        rclaw_tools::turn_state::scope(async {
+                            if let Some(error) = registration_failure {
+                                return Err(RunTaskFailure::Failed {
+                                    error: format!("团队成员注册失败: {error}"),
+                                    completed_steps: 0,
+                                    media_publish_attempted: false,
+                                });
+                            }
+                            if let Some(identity) = identity.clone() {
+                                CURRENT_AGENT
+                                    .scope(
+                                        identity.clone(),
+                                        self.run_task_inner(
+                                            &spec,
+                                            control.as_ref(),
+                                            &registry,
+                                            &static_schema,
+                                            &mut state,
+                                        ),
+                                    )
+                                    .await
+                            } else {
+                                self.run_task_inner(
+                                    &spec,
+                                    control.as_ref(),
+                                    &registry,
+                                    &static_schema,
+                                    &mut state,
                                 )
                                 .await
-                        } else {
-                            self.run_task_inner(
-                                &spec,
-                                control.as_ref(),
-                                &registry,
-                                &static_schema,
-                                &mut state,
-                            )
-                            .await
-                        }
-                    },
-                ))
-                .await;
+                            }
+                        }),
+                    )
+                    .await;
                 turn_state = Some(state);
                 result
             }

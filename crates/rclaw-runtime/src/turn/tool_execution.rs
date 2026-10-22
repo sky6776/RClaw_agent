@@ -470,6 +470,8 @@ async fn execute_tool_batch_serial(
         tracing::debug!(tool = %tc.name, "执行工具");
         // 写形状判定须在执行链 move input 之前完成。
         let memory_write_shape = tc.name == "memory" && is_memory_write_call(&input);
+        // workflow ask 内的写工具也记 effect：写前关闭 amend 缓存，重放时返回原结果。
+        let workflow_write = workflow_write_effect(&tc.name, &input);
         // Layer 5 选点回滚：前台 write/edit/delete 在执行前捕获 before 内容
         // （input 随后会被执行链 move，先解析出需要的字段）。
         let rewind_capture = if policy.is_foreground() {
@@ -479,7 +481,12 @@ async fn execute_tool_batch_serial(
         };
         // memory 失败上限：同一 turn 内连续失败 ≥3 次后不再执行，返回终态拒绝，
         // 防止记忆触顶/反复未命中把整个回复循环卡到预算耗尽。
-        let mut result = if tc.name == "memory" && state.memory_failures >= 3 {
+        let mut result = if let Some(replay) = workflow_write
+            .as_ref()
+            .and_then(|effect| effect.replay.clone())
+        {
+            replay
+        } else if tc.name == "memory" && state.memory_failures >= 3 {
             ToolResult::err(
                 "memory tool is disabled for the rest of this turn after repeated failures \
                  (3 consecutive errors). Skip memory operations and continue with your reply \
@@ -500,6 +507,9 @@ async fn execute_tool_batch_serial(
         } else {
             registry.execute(&tc.name, input).await
         };
+        if let Some(effect) = &workflow_write {
+            effect.finish(&result);
+        }
         tracing::debug!(tool = %tc.name, is_error = result.is_error, "工具返回");
         // Layer 5：执行成功且文件确有变化 → 入账待落盘（turn 循环持久化后 flush）。
         if let Some(mut checkpoint) = rewind_capture {
@@ -792,6 +802,78 @@ pub(crate) async fn announce_skill_invocations(
     invocations
 }
 
+/// workflow ask 内的写工具 effect（write / edit / delete / shell，保守按写处理）。
+struct WorkflowWriteEffect {
+    tracker: std::sync::Arc<crate::agent_tools::EffectTracker>,
+    key: Option<String>,
+    replay: Option<ToolResult>,
+}
+
+impl WorkflowWriteEffect {
+    fn finish(&self, result: &ToolResult) {
+        if let Some(key) = &self.key {
+            let payload = serde_json::json!({
+                "content": rclaw_store::redact_sensitive_text(&result.content),
+                "is_error": result.is_error,
+            });
+            // 结果累计超上限：写已经发生、结果没留住，台账记 unknown（resume 需裁决）；
+            // 工具结果照常交给子代理。
+            if let Err(error) = self.tracker.finish(
+                key,
+                if result.is_error {
+                    "failed"
+                } else {
+                    "completed"
+                },
+                &payload,
+            ) {
+                tracing::warn!(effect_key = %key, "workflow ask 写工具 effect 结果未保留: {error}");
+            }
+        }
+    }
+}
+
+fn workflow_write_effect(name: &str, input: &Value) -> Option<WorkflowWriteEffect> {
+    if !matches!(name, "write" | "edit" | "delete" | "shell") {
+        return None;
+    }
+    let context = crate::agent_tools::current_workflow_ask()?;
+    let args = serde_json::json!({"tool": name, "input": input});
+    let op = format!("ask.{}:{name}", context.ask_identity);
+    match context.effects.begin(&op, true, &args, None) {
+        Ok(crate::agent_tools::BeginEffect::Replay { value }) => {
+            let content = value
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let is_error = value
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(WorkflowWriteEffect {
+                tracker: std::sync::Arc::clone(&context.effects),
+                key: None,
+                replay: Some(if is_error {
+                    ToolResult::err(content)
+                } else {
+                    ToolResult::ok(content)
+                }),
+            })
+        }
+        Ok(crate::agent_tools::BeginEffect::Execute { key, .. }) => Some(WorkflowWriteEffect {
+            tracker: std::sync::Arc::clone(&context.effects),
+            key: Some(key),
+            replay: None,
+        }),
+        Err(error) => Some(WorkflowWriteEffect {
+            tracker: std::sync::Arc::clone(&context.effects),
+            key: None,
+            replay: Some(ToolResult::err(error)),
+        }),
+    }
+}
+
 pub(crate) fn is_subagent_blocked_tool(name: &str) -> bool {
     matches!(
         name,
@@ -811,6 +893,16 @@ pub(crate) fn is_subagent_blocked_tool(name: &str) -> bool {
             // Layer 3：应答与引擎入口都是编排者（主代理）专属；子代理只能 escalate 提问。
             | "ResolveWorkflowQuestion"
             | "WorkflowRun"
+            | "CreateWorkflow"
+            | "AmendWorkflow"
+            | "ResumeWorkflowRun"
+            | "ListWorkflowRuns"
+            | "GetWorkflowRun"
+            | "CancelWorkflowRun"
+            | "SaveWorkflow"
+            | "ListSavedWorkflows"
+            | "EvalWorkflowSnippet"
+            | "FillWorkflowHole"
     )
 }
 

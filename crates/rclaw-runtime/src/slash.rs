@@ -365,6 +365,7 @@ impl SlashRegistry {
              /export [all]      把当前会话（或全部会话）的完整记录导出为 JSONL（agent/exports/，含已压缩的消息）\n\
              /clear [confirm]   清空全部会话状态（agent/state.sqlite）、会话 artifact 落盘目录并删除 agent/memory 全部文件（需 /clear confirm）\n\
              /log [子命令]      查看 / 发送 / 删除 agent/logs 日志文件（list / get / del）\n\
+             /workflow <请求>   设计并运行一个动态工作流（展开为 prompt，历史保留原文）\n\
              /cancel            停止当前会话正在运行的任务（路由层即时生效，不进入 LLM）\n\
              /help              显示本帮助\n\
              \n已知模型：glm-5.3、glm-5.3-flash"

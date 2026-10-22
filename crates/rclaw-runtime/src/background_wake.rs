@@ -67,6 +67,16 @@ impl BackgroundWaker {
         let _ = self.inner.tx.set(tx);
     }
 
+    /// 直接投递一条系统消息（工作流 outbox 用；不做防抖合批 / 未读计数）。
+    pub async fn send_message(&self, message: BusMessage) -> bool {
+        let inner = &*self.inner;
+        // 工作流通知不走防抖合批：enabled 只控制后台子 Agent 的唤醒，不抑制通知投递。
+        let Some(tx) = inner.tx.get() else {
+            return false;
+        };
+        tx.send(message).await.is_ok()
+    }
+
     /// 一个后台子 Agent 终态落盘后调用（幂等：同会话窗口内去重）。
     ///
     /// 未启用 / 未 attach / 缺会话路由时零开销返回。

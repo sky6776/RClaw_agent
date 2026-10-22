@@ -954,3 +954,65 @@ plan_status 是 journal 的只读投影，不与执行器写路径竞争。
    会话尾部或产物清单（成本换召回）。
 3. **按消息锚点的 /rewind by message**：v2 的 anchor 列让 /rewind 也能按消息选点
    （当前只有 fork files 用到）。
+
+
+## 第十四轮：动态工作流工具面（P0-P5）
+
+按 `docs/workflow-tool-surface-port.md` 落地 ZCode 对齐的完整工具面：
+
+- **入口**：`/workflow <请求>` 在 `TurnManager::route` 展开为 prompt（历史 / UI 保留原文，
+  模型读展开文本）；`skills/dynamic-workflows/SKILL.md` 首次启动安装，完整读取后登记
+  会话级 hash 作为提交闸门。
+- **工具**：`CreateWorkflow` / `AmendWorkflow` / `ResumeWorkflowRun` /
+  `ListWorkflowRuns` / `GetWorkflowRun` / `CancelWorkflowRun` / `SaveWorkflow` /
+  `ListSavedWorkflows` / `EvalWorkflowSnippet` / `FillWorkflowHole` /
+  `ResolveWorkflowQuestion`（`dwfq-` qid）；`WorkflowRun` 旧名保留为
+  `workflow_legacy_tool` 开关控制的别名。
+- **运行模型**：schema v3 八张投影表 + 不可变快照 + script/exec 双代次 +
+  execution_config；`WorkflowService`（状态机 / 配额 / 幂等 / 单实例锁 / 恢复）+
+  `WorkflowDriver`（run 自有取消令牌 / 心跳 / effect / outbox）。后台 run 不随父 turn
+  取消；Create 立即返回 `backgrounded`。
+- **脚本能力**：`args` / `agent(name,{model,system})` / `log` / `phase` / `report` /
+  `result` / `files.glob|read|grep` / `git.status|diff` / `world.run`（仅 Unrestricted，
+  无逐命令审批）/ `artifact.file|markdown|table|chart|metrics|board` / `hole`（tail、
+  分支级与嵌套）。
+- **展示**：桌面 `workflow_status` / `workflow_detail` / `workflow_cancel` /
+  `workflow_confirm_effects` / `workflow_confirm_process_gone` /
+  `workflow_resend_notification` / `workflow_confirm_amend` /
+  `workflow_resolve_question` / `workflow_fill_hole`；`WorkflowCard.tsx` 轮询展示
+  状态 / 进度 / 问题 / hole / 副作用裁决 / 产物。
+
+### 审计收敛（对照 ZCode 源码的多轮 review）
+
+按生命周期 / 工具面与桌面 / 引擎三条线并行 review，每轮只报新出现的严重问题，
+lifecycle 第 5 轮、tools 第 4 轮、engine 第 6 轮均无新严重问题后收口。修复项：
+
+- **生命周期**：同步模式 amend 后继在前驱终态时回滚（`rollback_sync_successor`
+  改写 `superseded` → `interrupted` 并补 `run_stopped`，幂等请求回 `failed`）；
+  `confirm_process_gone` 后台 / 同步两种后继处置；queued → cancel 用 CAS；
+  §5.2 Amend：模式 A（运行中只调设置）仅限 running 前驱，改名 / 改脚本 / 前驱终态
+  一律走后继，未改脚本按 hash 报 `script_unchanged`；`wait_question` 单次
+  `select!`（取消时问题保持 pending）。
+- **引擎上限与背压**：在途宿主调用 ≤ 1024（`HostSlot` 同步准入，超限直接报错）、
+  单次执行 ask ≤ 10000、hole ≤ 64（同时约束名字序号表）、`agent.model` ≤ 200 字符、
+  脚本返回值 ≤ 256K 字符、在途 effect ≤ 32（信号量排队而非失败）；异步宿主入参改为
+  `rquickjs::String<'js>` 句柄，进 future 后再拷贝（避免急切拷贝大参数）；
+  重放命中的 ask 也必须写入 `ask_replayed` journal 后才计数。
+- **effect 台账**：`EffectTracker::finish` 可失败——结果累计超过 64 MiB 时不落
+  journal / DB，读 effect 记 `failed`、写 effect 记 `unknown`（阻止自动 resume），
+  调用方（含子代理写工具 `WorkflowWriteEffect`）统一经 `settle_effect` 结算；
+  `world.run` 的 `timed_out` / `world_run_unknown` 一律 `mark_unknown`。
+- **§3.7 撤权重查**：`world.run` / `artifact.*` 在拿到 effect 许可之后、真正执行之前
+  再查一次会话权限；`forbidden_world` 判定前置于一切副作用。
+- **其它**：artifact id 禁止全点号；`WorkflowService` 单实例锁文件 `truncate(false)`；
+  删除未被调用的投影门面包装（`set_running` / `insert_question` / `open_hole` /
+  `enqueue_notification` 等——登记与终态都在各自事务里直接写）。
+
+刻意不处理（设计使然或迁移项）：模型拿不到 `auth_token`（fail-closed）；技能门可被子代理读
+`SKILL.md` 满足；`GLOBAL_SERVICE` OnceLock 不随重建刷新；`write_atomic` 的 Windows 备份
+换名；被拒宿主调用仍分配 Task 状态机；32 个未答 `confirm_command` 可占满 effect 许可；
+降级演练文档与投影回填游标（新软件无旧数据）。
+
+收口后 `cargo fmt` / `cargo clippy --tests`（显式 `-p` 六个 crate）对改动文件 0 warning
+/ 0 error；受影响测试 `rclaw-runtime --lib workflow` 80 / `rclaw-store` 178 /
+`rclaw-tools access` 10 全部通过，`rclaw-desktop` check 与 UI `tsc --noEmit` 通过。

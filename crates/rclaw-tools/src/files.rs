@@ -39,6 +39,31 @@ use crate::{Tool, ToolResult};
 /// 峰值）。调大可编辑更大的文件，但请在目标设备（如 Termux/手机）的可用内存内取舍。
 const MAX_FILE_SIZE: usize = 128 * 1024 * 1024;
 
+/// 完整读取观察者：宿主（rclaw-runtime）注册，用于技能门等「读完整文件才算数」的登记。
+/// 只在 `read` 从 0 起、读到末尾、未触扫描上限时调用。
+type FullReadObserver = dyn Fn(&Path, &str) + Send + Sync;
+
+static FULL_READ_OBSERVER: OnceLock<StdMutex<Option<Arc<FullReadObserver>>>> = OnceLock::new();
+
+/// 注册完整读取观察者（重复注册以最后一次为准）。
+pub fn set_full_read_observer(observer: Arc<FullReadObserver>) {
+    let slot = FULL_READ_OBSERVER.get_or_init(|| StdMutex::new(None));
+    *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(observer);
+}
+
+fn notify_full_read(path: &Path, content: &str) {
+    let Some(slot) = FULL_READ_OBSERVER.get() else {
+        return;
+    };
+    let observer = slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(observer) = observer {
+        observer(path, content);
+    }
+}
+
 /// `list` 递归深度上限：防御 symlink 环 / 异常深的目录结构导致栈溢出或超长耗时。
 const MAX_WALK_DEPTH: usize = 32;
 /// `list` 输出条目上限：避免把海量小文件的清单灌进上下文。
@@ -169,6 +194,7 @@ impl Tool for Read {
         };
         // 整文件（从 0 起、读到末尾、未触扫描上限）→ 原样返回，与旧行为一致。
         if offset == 0 && win.reached_end && !win.scan_truncated {
+            notify_full_read(Path::new(&path), &win.content);
             return ToolResult::ok(match metadata {
                 Some(metadata) => format!("{metadata}\n{}", win.content),
                 None => win.content,

@@ -64,7 +64,10 @@ pub fn android_boot_log(_step: &str) {}
 
 /// 桌面 / APK 共用入口：Tauri Builder 装配（command 面 + agent 启动 + 窗口语义）。
 /// Android 上由 tauri 的 mobile entry point（gen/android MainActivity）触发。
-#[cfg_attr(all(target_os = "android", feature = "apk-host"), tauri::mobile_entry_point)]
+#[cfg_attr(
+    all(target_os = "android", feature = "apk-host"),
+    tauri::mobile_entry_point
+)]
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 pub fn run() {
     // 真机取证：vivo 裁剪 logcat，panic/abort 无从可读；把启动阶段写进应用私有
@@ -72,15 +75,25 @@ pub fn run() {
     #[cfg(all(target_os = "android", feature = "apk-host"))]
     {
         std::panic::set_hook(Box::new(|info| {
-            let msg = format!("PANIC at {}: {}\n", std::thread::current().name().unwrap_or("?"), info);
-            let path = rclaw_android::host_context().map(|c| c.files_dir.join("boot_debug.log")).unwrap_or_default();
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let msg = format!(
+                "PANIC at {}: {}\n",
+                std::thread::current().name().unwrap_or("?"),
+                info
+            );
+            let path = rclaw_android::host_context()
+                .map(|c| c.files_dir.join("boot_debug.log"))
+                .unwrap_or_default();
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 use std::io::Write;
                 let _ = f.write_all(msg.as_bytes());
             }
             eprintln!("RClaw PANIC: {info}");
         }));
-        }
+    }
     let home = home::resolve_home();
     #[cfg(all(target_os = "android", feature = "apk-host"))]
     #[cfg(all(target_os = "android", feature = "apk-host"))]
@@ -140,6 +153,17 @@ pub fn run() {
             commands::chat_history_since,
             commands::plan_status,
             commands::plan_pause,
+            commands::workflow_status,
+            commands::workflow_answer_command_confirm,
+            commands::workflow_detail,
+            commands::workflow_cancel,
+            commands::workflow_resume,
+            commands::workflow_confirm_effects,
+            commands::workflow_confirm_process_gone,
+            commands::workflow_resend_notification,
+            commands::workflow_confirm_amend,
+            commands::workflow_resolve_question,
+            commands::workflow_fill_hole,
             commands::chat_archive,
             commands::chat_restore,
             commands::chat_delete,

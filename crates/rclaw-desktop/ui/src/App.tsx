@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { flushSync } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
 import {
   api,
   isStatusLine,
@@ -202,6 +203,35 @@ export default function App() {
         setSloganInterval(p.interval_secs);
       })
       .catch(() => {});
+  }, []);
+  // world.run 逐命令确认（[agent] workflow_command_confirm=true 时后端弹窗）。
+  useEffect(() => {
+    // cleanup 可能先于 listen 的 promise 完成（StrictMode 双挂载）：那时直接在 then 里解除，
+    // 否则监听器泄漏、同一确认弹两次。
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ id: string; command: string; cwd: string }>(
+      "workflow_command_confirm",
+      (event) => {
+        const allowed = window.confirm(
+          `允许执行命令？
+${event.payload.command}
+
+工作目录：${event.payload.cwd}`,
+        );
+        api.workflowAnswerCommandConfirm(event.payload.id, allowed).catch(() => {});
+      },
+    ).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
   useEffect(() => {
     if (slogans.length <= 1) return;

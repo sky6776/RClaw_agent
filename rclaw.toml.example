@@ -10,6 +10,17 @@
 # 改这个值相当于切换一套独立的记忆、会话、技能和定时任务数据。
 base_dir = "agent"
 
+# 动态工作流（/workflow）：
+#   workflow_background = true  后台执行，CreateWorkflow 立即返回 backgrounded；
+#                               false = 同步契约（调用返回时已终态），仍写 state.sqlite 投影表。
+#   workflow_legacy_tool = false 是否注册 deprecated 的 WorkflowRun 旧工具（仅回滚用）。
+#   max_active_workflow_runs = 4 同时持有执行许可的工作流 run 上限（Android 默认 2）。
+#   workflow_command_confirm = false  world.run 是否逐命令确认（默认只按 ToolAccess）。
+workflow_background = true
+workflow_legacy_tool = false
+max_active_workflow_runs = 4
+workflow_command_confirm = false
+
 # 会话语义压缩开关。开启后，每个新 turn 加载历史前会先读取完整 session，
 # 并估算“完整请求压力”（system prompt + 工具 schema + 会话历史）。这个估算值
 # 超过 compression_threshold_tokens 时，RClaw 会：

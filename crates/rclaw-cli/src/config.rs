@@ -131,6 +131,19 @@ pub struct AgentSection {
     /// 工具结果落盘阈值（字节）：超过即落盘。缺省 32768（32 KiB）。
     #[serde(default = "default_tool_result_artifact_bytes")]
     pub tool_result_artifact_bytes: usize,
+    /// 工作流后台执行（默认 true）。false = 同步契约（Create 等调用返回时已终态），
+    /// 但仍写 v3 投影表与快照。
+    #[serde(default = "default_true")]
+    pub workflow_background: bool,
+    /// 是否注册 deprecated 的 `WorkflowRun` 旧工具（默认 false；仅工具面回滚用）。
+    #[serde(default = "default_false")]
+    pub workflow_legacy_tool: bool,
+    /// 同时持有执行许可的工作流 run 上限（桌面默认 4、Android 默认 2）。
+    #[serde(default = "default_max_active_workflow_runs")]
+    pub max_active_workflow_runs: usize,
+    /// `world.run` 是否逐命令确认（P5；默认 false = 仅 ToolAccess，与 shell 同权）。
+    #[serde(default = "default_false")]
+    pub workflow_command_confirm: bool,
 }
 impl Default for AgentSection {
     fn default() -> Self {
@@ -161,6 +174,10 @@ impl Default for AgentSection {
             goal_audit_enabled: true,
             tool_result_artifact_enabled: true,
             tool_result_artifact_bytes: default_tool_result_artifact_bytes(),
+            workflow_background: true,
+            workflow_legacy_tool: false,
+            max_active_workflow_runs: default_max_active_workflow_runs(),
+            workflow_command_confirm: false,
         }
     }
 }
@@ -172,6 +189,13 @@ fn default_max_concurrent_turns() -> usize {
 }
 fn default_tool_result_artifact_bytes() -> usize {
     32 * 1024
+}
+fn default_max_active_workflow_runs() -> usize {
+    if cfg!(target_os = "android") {
+        2
+    } else {
+        4
+    }
 }
 fn default_compression_protect_first() -> usize {
     3

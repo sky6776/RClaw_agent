@@ -27,6 +27,7 @@ pub mod redact;
 pub mod session;
 pub mod skills;
 pub mod toml_file;
+pub mod workflow_home;
 
 pub use bots::{
     is_valid_bot_name, is_valid_group_id, BotDef, BotStore, GroupActivity, GroupLine, GroupRoom,
@@ -45,11 +46,11 @@ pub use redact::{redact_sensitive_shell_command, redact_sensitive_text};
 pub use session::{
     append_message, append_tool_chain, clear_session, load_history, repair_tool_chains,
     synthesize_aborted_tool_results, tool_use_counts, FileCheckpointRecord, SearchRow,
-    SessionStats, SessionStore, SessionSummary, UsageAnchorRecord,
-    ABORTED_TOOL_RESULT_PLACEHOLDER,
+    SessionStats, SessionStore, SessionSummary, UsageAnchorRecord, ABORTED_TOOL_RESULT_PLACEHOLDER,
 };
 pub use skills::SkillSummary;
 pub use toml_file::{EditValue, RclawToml};
+pub use workflow_home::{workflow_home, workflows_dir};
 
 use thiserror::Error;
 
