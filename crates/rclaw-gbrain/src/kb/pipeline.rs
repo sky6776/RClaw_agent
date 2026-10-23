@@ -267,7 +267,9 @@ fn media_refs_for_chunk(
                 return false;
             }
             let chunk_lower = chunk_lower.get_or_insert_with(|| chunk.to_lowercase());
-            probes.iter().any(|probe| chunk_lower.contains(probe.as_str()))
+            probes
+                .iter()
+                .any(|probe| chunk_lower.contains(probe.as_str()))
         })
         .map(|(media, _)| media.clone())
         .collect()
@@ -614,6 +616,7 @@ fn apply_embedded_image_ocr(
 /// - 例：full_text="abcdef"、chunks ["abcd","cdef"]
 ///   若第一块后 cursor=4，第二块从 4 开始 find("cdef") 找不到，fallback 记录 4..8
 ///   正确做法：搜索第二块前回退 cursor 到 2，从 2 开始 find("cdef") 精确匹配 2..6
+///
 /// 精确定位块时的搜索窗口：块字节长的倍数，与最小窗口字节数取大者。
 const CHUNK_LOCATE_WINDOW_FACTOR: usize = 8;
 const CHUNK_LOCATE_WINDOW_MIN_BYTES: usize = 64 * 1024;
@@ -4248,11 +4251,10 @@ mod tests {
         assert_eq!(blob.len(), original.len() * 4);
 
         let decoded: Vec<f32> = blob
-            .chunks_exact(4)
-            .filter_map(|chunk| {
-                let bytes: [u8; 4] = chunk.try_into().ok()?;
-                Some(f32::from_le_bytes(bytes))
-            })
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
 
         assert_eq!(decoded.len(), original.len());

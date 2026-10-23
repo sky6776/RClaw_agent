@@ -149,9 +149,7 @@ fn reject_oversized_xlsx_entries(data: &[u8]) -> Result<(), GBrainError> {
             )));
         }
         inflate_budget = inflate_budget.checked_sub(sink.0).ok_or_else(|| {
-            GBrainError::InvalidInput(
-                "spreadsheet 全部条目解压总量超过上限，拒绝解析".to_string(),
-            )
+            GBrainError::InvalidInput("spreadsheet 全部条目解压总量超过上限，拒绝解析".to_string())
         })?;
         if is_calamine_picture_entry(&name) {
             media_total = media_total.saturating_add(sink.0);
@@ -374,7 +372,10 @@ mod tests {
     fn container_check_rejects_non_ooxml_zip() {
         // ODS 结构的 zip：calamine 会退到 Ods::new 按 number-columns-repeated 逐个分配单元格
         let data = build_zip(&[
-            ("mimetype", b"application/vnd.oasis.opendocument.spreadsheet"),
+            (
+                "mimetype",
+                b"application/vnd.oasis.opendocument.spreadsheet",
+            ),
             ("content.xml", b"<office:document-content/>"),
         ]);
         assert!(err_text(reject_oversized_xlsx_entries(&data)).contains("容器"));
@@ -395,15 +396,22 @@ mod tests {
     #[test]
     fn container_check_rejects_entry_inflating_past_cap() {
         let bomb = vec![0u8; (MAX_XLSX_ENTRY_BYTES + 1024 * 1024) as usize];
-        let data = build_zip(&[("xl/workbook.xml", b"<workbook/>"), ("xl/sharedStrings.xml", &bomb)]);
+        let data = build_zip(&[
+            ("xl/workbook.xml", b"<workbook/>"),
+            ("xl/sharedStrings.xml", &bomb),
+        ]);
         assert!(err_text(reject_oversized_xlsx_entries(&data)).contains("解压后过大"));
     }
 
     #[test]
     fn parse_rejects_cfb_legacy_xls_by_magic() {
         let mut data = CFB_MAGIC.to_vec();
-        data.extend(std::iter::repeat(0u8).take(4096));
-        let err = XlsxParser::new().parse(&data).err().map(|e| e.to_string()).unwrap_or_default();
+        data.extend(std::iter::repeat_n(0u8, 4096));
+        let err = XlsxParser::new()
+            .parse(&data)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(err.contains("legacy .xls"), "{err}");
     }
 }

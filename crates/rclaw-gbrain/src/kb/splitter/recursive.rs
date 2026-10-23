@@ -71,10 +71,7 @@ fn recursive_split(
     // 惰性借用切片，不把全文复制成 Vec<String>：按单字符兜底切分时原实现给每个字符分配
     // 一个 String（10MB 无分隔符文本 ≈ 千万次堆分配、数百 MB），安卓上直接被 LMK 杀掉。
     let parts: Box<dyn Iterator<Item = &str> + '_> = if separator.is_empty() {
-        Box::new(
-            text.char_indices()
-                .map(|(i, c)| &text[i..i + c.len_utf8()]),
-        )
+        Box::new(text.char_indices().map(|(i, c)| &text[i..i + c.len_utf8()]))
     } else {
         Box::new(text.split(separator.as_str()))
     };

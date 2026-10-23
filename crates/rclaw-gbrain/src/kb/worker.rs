@@ -3323,11 +3323,10 @@ fn rebuild_raptor_after_reembed(
             let embedding_blob: Option<Vec<u8>> = row.get(11)?;
 
             let vector = embedding_blob.map(|blob| {
-                blob.chunks_exact(4)
-                    .filter_map(|chunk| {
-                        let bytes: [u8; 4] = chunk.try_into().ok()?;
-                        Some(f32::from_le_bytes(bytes))
-                    })
+                blob.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes(*chunk))
                     .collect::<Vec<f32>>()
             });
 

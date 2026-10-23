@@ -43,7 +43,6 @@ impl RuntimeCommand {
     /// `/export`、只读 `/skills list|status|help` 仍对所有用户开放。
     fn requires_privilege(self, content: &str) -> bool {
         let second = content
-            .trim()
             .split_whitespace()
             .nth(1)
             .map(str::to_ascii_lowercase)

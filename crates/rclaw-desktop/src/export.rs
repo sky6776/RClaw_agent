@@ -138,7 +138,7 @@ fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
         return Some((w, h));
     }
-    if bytes.len() >= 10 && (bytes[..3] == [b'G', b'I', b'F']) {
+    if bytes.len() >= 10 && (bytes[..3] == *b"GIF") {
         let w = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
         let h = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
         return Some((w, h));

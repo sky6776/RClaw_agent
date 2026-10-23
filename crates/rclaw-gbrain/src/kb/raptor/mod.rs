@@ -12,9 +12,8 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn get_http_client() -> &'static reqwest::Client {
     // 带超时：摘要请求在唯一的 KB worker 线程上等待，挂起即所有 KB 作业停摆
-    HTTP_CLIENT.get_or_init(|| {
-        crate::llm::http_client_with_timeout(std::time::Duration::from_secs(120))
-    })
+    HTTP_CLIENT
+        .get_or_init(|| crate::llm::http_client_with_timeout(std::time::Duration::from_secs(120)))
 }
 
 /// RAPTOR configuration

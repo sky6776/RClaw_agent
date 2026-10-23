@@ -1908,7 +1908,7 @@ fn query_focused_excerpt_details(
         text: format!(
             "{}{}{}",
             if has_prefix { "..." } else { "" },
-            &excerpt,
+            excerpt,
             if has_suffix { "..." } else { "" }
         ),
         raw_text: excerpt,
@@ -2174,7 +2174,7 @@ fn query_centered_snippet_ex(content: &str, query: &str, terms: &[String]) -> Fo
         text: format!(
             "{}{}{}",
             if has_prefix { "..." } else { "" },
-            &excerpt,
+            excerpt,
             if has_suffix { "..." } else { "" }
         ),
         raw_text: excerpt,

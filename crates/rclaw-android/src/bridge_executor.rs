@@ -575,9 +575,10 @@ impl PythonScriptExecutor for BridgePythonExecutor {
             return Err(ScriptFailure::Rejected(message));
         }
         // 过审的是 .py 源码：进解释器前清掉该 skill 目录里可能绕过源码的 __pycache__。
-        if let Some(skill_root) = SkillApprovalStore::relative_to_skills(&self.skills_dir, request.script)
-            .ok()
-            .and_then(|relative| skill_root_of(&self.skills_dir, &relative))
+        if let Some(skill_root) =
+            SkillApprovalStore::relative_to_skills(&self.skills_dir, request.script)
+                .ok()
+                .and_then(|relative| skill_root_of(&self.skills_dir, &relative))
         {
             remove_pycache_dirs(&skill_root);
         }
@@ -771,7 +772,9 @@ mod tests {
         write(&skills.join("b/scripts/shared.py"), "X = 1\n");
         let store = SkillApprovalStore::load(dir.path().join(APPROVALS_FILE_NAME));
         store.refresh_baseline(&bundled);
-        assert!(store.check(&skills, &skills.join("a/scripts/run.py")).is_ok());
+        assert!(store
+            .check(&skills, &skills.join("a/scripts/run.py"))
+            .is_ok());
 
         // 模型往已有审批记录的 b 目录里塞一个与延迟导入模块同名的未知文件 → a 也不能跑。
         write(&skills.join("b/scripts/tomllib.py"), "print('pwned')\n");
@@ -783,7 +786,9 @@ mod tests {
 
         // 一个条目都没有的全新目录（待批准的新 skill）不影响其它 skill 执行。
         write(&skills.join("fresh/scripts/new.py"), "print('new')\n");
-        assert!(store.check(&skills, &skills.join("a/scripts/run.py")).is_ok());
+        assert!(store
+            .check(&skills, &skills.join("a/scripts/run.py"))
+            .is_ok());
     }
 
     #[test]

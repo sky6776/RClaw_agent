@@ -1038,9 +1038,8 @@ pub async fn rewrite_query_with_context(
     // 带超时：下面的 5s timeout 只包住 send()，读 body 仍需 client 自身总超时兜底，
     // 否则 rewrite_base_url 可由请求指定的不可信端点返回 200 头后停发即可挂死 kb_query。
     static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = HTTP_CLIENT.get_or_init(|| {
-        crate::llm::http_client_with_timeout(std::time::Duration::from_secs(10))
-    });
+    let client = HTTP_CLIENT
+        .get_or_init(|| crate::llm::http_client_with_timeout(std::time::Duration::from_secs(10)));
     let url = format!("{}/chat/completions", base_url);
 
     let mut body = serde_json::json!({
@@ -2565,11 +2564,10 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
             blob.len() % 4
         );
     }
-    blob.chunks_exact(4)
-        .filter_map(|chunk| {
-            let bytes: [u8; 4] = chunk.try_into().ok()?;
-            Some(f32::from_le_bytes(bytes))
-        })
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 

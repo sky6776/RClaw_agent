@@ -27,13 +27,20 @@ pub(crate) fn ocr_temp_dir_try_reserve(bytes: u64, max_bytes: u64) -> bool {
     }
 }
 
-/// 释放临时目录字节预算。
+/// 释放临时目录字节预算（饱和减法，不会下溢）。
 pub(crate) fn ocr_temp_dir_release(bytes: u64) {
-    OCR_TEMP_DIR_BYTES
-        .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
-            Some(current.saturating_sub(bytes))
-        })
-        .ok();
+    // 与 `ocr_temp_dir_try_reserve` 同款 CAS 循环：`fetch_update` 自 1.99 起弃用，
+    // 替代的 `try_update` 要到 1.95 才稳定，MSRV 1.91 下两者都不宜直接用。
+    loop {
+        let current = OCR_TEMP_DIR_BYTES.load(Ordering::Relaxed);
+        let next = current.saturating_sub(bytes);
+        if OCR_TEMP_DIR_BYTES
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
 }
 
 /// OCR 临时目录的 RAII 清理守卫。

@@ -998,8 +998,8 @@ fn rollback_shadow_page_update(conn: &Connection, candidate: &PromotionCandidate
     // 避免批量 apply 同秒多候选时 rollback 拿到同页其它候选的快照。
     // snapshot_version_id 存储在 review_notes 的最后一行，格式: snapshot_version_id:{id}
     // 按行解析取最后一行
-    let snapshot_version_id: i64 = parse_snapshot_version_id(&candidate.review_notes)
-        .ok_or_else(|| {
+    let snapshot_version_id: i64 =
+        parse_snapshot_version_id(&candidate.review_notes).ok_or_else(|| {
             GBrainError::Database(format!(
                 "候选 {} 缺少 snapshot_version_id，无法安全回滚",
                 candidate.id

@@ -1996,7 +1996,13 @@ impl Channel for NapCat {
                                 next.msg.clone(),
                                 Arc::clone(&media_started),
                             ));
-                            in_flight.insert(chat_id, InFlightOutbound { item: next, media_started });
+                            in_flight.insert(
+                                chat_id,
+                                InFlightOutbound {
+                                    item: next,
+                                    media_started,
+                                },
+                            );
                         }
                     }
 
@@ -2167,7 +2173,10 @@ impl Channel for NapCat {
                     //   否则通道会在「断开 → 重连 → 重发 → 再断开」里无限打转。
                     // 提示消息本身 requeues 置满，再次中断时不会被重投。
                     for (chat_id, sending) in in_flight.drain() {
-                        let InFlightOutbound { item, media_started } = sending;
+                        let InFlightOutbound {
+                            item,
+                            media_started,
+                        } = sending;
                         let queue = queued_outbound.entry(chat_id.clone()).or_default();
                         if media_started.load(Ordering::Relaxed) {
                             warn!(

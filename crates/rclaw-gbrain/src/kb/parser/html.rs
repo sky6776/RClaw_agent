@@ -470,7 +470,11 @@ impl TagMatchIndex {
             .find_iter(html)
             .map(|m| (m.start(), m.end(), true))
             .collect();
-        events.extend(close_re.find_iter(html).map(|m| (m.start(), m.end(), false)));
+        events.extend(
+            close_re
+                .find_iter(html)
+                .map(|m| (m.start(), m.end(), false)),
+        );
         Some(Self::from_events(events))
     }
 

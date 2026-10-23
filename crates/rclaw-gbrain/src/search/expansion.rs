@@ -21,9 +21,8 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn get_http_client() -> &'static reqwest::Client {
     // 带超时：调用方在搜索线程上 block_on，挂起即搜索永不返回
-    HTTP_CLIENT.get_or_init(|| {
-        crate::llm::http_client_with_timeout(std::time::Duration::from_secs(20))
-    })
+    HTTP_CLIENT
+        .get_or_init(|| crate::llm::http_client_with_timeout(std::time::Duration::from_secs(20)))
 }
 
 // ---------------------------------------------------------------------------

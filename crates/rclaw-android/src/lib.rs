@@ -616,11 +616,7 @@ pub fn is_healthy() -> bool {
 fn unix_time_millis() -> u64 {
     static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
     let origin = ORIGIN.get_or_init(std::time::Instant::now);
-    origin
-        .elapsed()
-        .as_millis()
-        .min(u64::MAX as u128 - 1) as u64
-        + 1
+    origin.elapsed().as_millis().min(u64::MAX as u128 - 1) as u64 + 1
 }
 
 fn heartbeat_is_fresh(now_ms: u64, last_ms: u64) -> bool {
@@ -2303,8 +2299,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .with_context(|| format!("附加 {name} 线程到 JavaVM 失败"))?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let value = env
             .call_static_method(class, name, "()Z", &[])
             .map_err(|error| {
@@ -2320,8 +2316,8 @@ pub mod jni_bridge {
         let mut env = vm
             .attach_current_thread()
             .context("附加保活查询线程到 JavaVM 失败")?;
-        let class = native_bridge_class(&mut env)
-            .map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
         let value = env
             .call_static_method(class, "keepAliveStatus", "()Ljava/lang/String;", &[])
             .map_err(|error| {

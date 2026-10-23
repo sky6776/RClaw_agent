@@ -18,9 +18,8 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn get_http_client() -> &'static reqwest::Client {
     // 带超时：该调用在持有 gbrain service 互斥锁的线程上 block_on，挂起即整个工具面不可用
-    HTTP_CLIENT.get_or_init(|| {
-        crate::llm::http_client_with_timeout(std::time::Duration::from_secs(90))
-    })
+    HTTP_CLIENT
+        .get_or_init(|| crate::llm::http_client_with_timeout(std::time::Duration::from_secs(90)))
 }
 
 /// Strip control characters from LLM heading output (preserve printable chars only)

@@ -32,11 +32,10 @@ fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
 }
 
 fn blob_to_embedding(blob: Vec<u8>) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .filter_map(|chunk| {
-            let bytes: [u8; 4] = chunk.try_into().ok()?;
-            Some(f32::from_le_bytes(bytes))
-        })
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -269,7 +268,7 @@ impl SqliteEngine {
             };
         }
         let tx: Transaction = conn.unchecked_transaction()?;
-        let result = f(&*tx);
+        let result = f(&tx);
         match result {
             Ok(value) => {
                 tx.commit()?;

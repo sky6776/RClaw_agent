@@ -116,7 +116,10 @@ const MAX_EXTRACTION_RETRY_CALLS: usize = 16;
 fn extract_pages_isolating_failures(
     data: &[u8],
     total_pages: usize,
-) -> (Vec<pdf_inspector::PageMarkdown>, Vec<pdf_inspector::PageOcrReasons>) {
+) -> (
+    Vec<pdf_inspector::PageMarkdown>,
+    Vec<pdf_inspector::PageOcrReasons>,
+) {
     let mut pages = Vec::new();
     let mut reasons = Vec::new();
     let total = total_pages as u32;
@@ -221,7 +224,8 @@ impl DocumentParser for PdfParser {
                         return Err(GBrainError::FileError(format!("PDF load failed: {}", e)));
                     }
                     tracing::warn!(error = %e, "pdf-inspector 整篇提取失败，按页区间二分重试以隔离坏页");
-                    let (pages, reasons) = extract_pages_isolating_failures(data, lopdf_page_ids.len());
+                    let (pages, reasons) =
+                        extract_pages_isolating_failures(data, lopdf_page_ids.len());
                     (lopdf_page_ids.len(), pages, reasons)
                 }
             };
@@ -278,7 +282,8 @@ impl DocumentParser for PdfParser {
             let has_vector_drawing_ops = signals.iter().any(|s| s == OCR_SIGNAL_VECTOR_TEXT);
             // 字体解码失败 / 乱码（pdf-inspector 的文本质量分析，替代旧的私有区字符占比启发式）
             let font_encoding_suspected = signals.iter().any(|s| s == OCR_SIGNAL_GARBLED_TEXT);
-            let has_vector_or_unknown_objects = geometry.has_unknown_objects || geometry.has_annotations;
+            let has_vector_or_unknown_objects =
+                geometry.has_unknown_objects || geometry.has_annotations;
 
             if geometry.image_area_ratio >= 0.08 || geometry.image_count >= 1 {
                 image_rich_pages.push(page_num_i32);
@@ -646,7 +651,9 @@ fn analyze_page_geometry(pdf: &lopdf::Document, page_obj_id: lopdf::ObjectId) ->
     if let Ok(annots_obj) = page_dict.get(b"Annots") {
         let annots: Option<&Vec<lopdf::Object>> = match annots_obj {
             lopdf::Object::Array(arr) => Some(arr),
-            lopdf::Object::Reference(id) => pdf.get_object(*id).ok().and_then(|o| o.as_array().ok()),
+            lopdf::Object::Reference(id) => {
+                pdf.get_object(*id).ok().and_then(|o| o.as_array().ok())
+            }
             _ => None,
         };
         geometry.has_annotations = match annots {
@@ -714,8 +721,16 @@ fn count_xobject_images(
             Ok(lopdf::Object::Name(name)) if name == b"Image" => {
                 geometry.image_count += 1;
                 // 估算图片面积（像素尺寸，缺失时按 100×100）
-                let img_w = xobj.get(b"Width").ok().and_then(object_to_f64).unwrap_or(100.0);
-                let img_h = xobj.get(b"Height").ok().and_then(object_to_f64).unwrap_or(100.0);
+                let img_w = xobj
+                    .get(b"Width")
+                    .ok()
+                    .and_then(object_to_f64)
+                    .unwrap_or(100.0);
+                let img_h = xobj
+                    .get(b"Height")
+                    .ok()
+                    .and_then(object_to_f64)
+                    .unwrap_or(100.0);
                 *total_image_area += img_w * img_h;
             }
             Ok(lopdf::Object::Name(name)) if name == b"Form" => {
@@ -862,7 +877,8 @@ mod tests {
             "Subtype" => "Type1",
             "BaseFont" => "Courier",
         });
-        let resources_id = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+        let resources_id =
+            doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
         let content = Content {
             operations: vec![
                 Operation::new("BT", vec![]),
@@ -897,15 +913,25 @@ mod tests {
         assert_eq!(count_pdf_pages(&bytes).unwrap(), 1);
 
         let parsed = PdfParser::new().parse(&bytes).unwrap();
-        assert_eq!(parsed.metadata.get("total_pages").map(String::as_str), Some("1"));
+        assert_eq!(
+            parsed.metadata.get("total_pages").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(parsed.blocks.as_ref().map(Vec::len), Some(1));
-        assert!(parsed.content.contains("Hello gbrain reader"), "实际: {}", parsed.content);
+        assert!(
+            parsed.content.contains("Hello gbrain reader"),
+            "实际: {}",
+            parsed.content
+        );
 
         // 继承自 Pages 节点的 MediaBox 必须被解析到，否则每页都会被判成 GeometryUncertain
         let analyses: Vec<serde_json::Value> =
             serde_json::from_str(parsed.metadata.get("page_analyses").unwrap()).unwrap();
         assert_eq!(analyses[0]["width"], serde_json::json!(595));
         assert_eq!(analyses[0]["height"], serde_json::json!(842));
-        assert_eq!(analyses[0]["has_vector_or_unknown_objects"], serde_json::json!(false));
+        assert_eq!(
+            analyses[0]["has_vector_or_unknown_objects"],
+            serde_json::json!(false)
+        );
     }
 }

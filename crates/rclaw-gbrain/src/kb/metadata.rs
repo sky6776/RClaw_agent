@@ -149,15 +149,11 @@ pub fn extract_pdf_metadata(_content: &str, raw_data: &[u8]) -> DocumentMetadata
         return meta;
     };
     // Info 字典可为 trailer 内直接字典，更常见的是间接引用
-    let info_dict = doc
-        .trailer
-        .get(b"Info")
-        .ok()
-        .and_then(|info| match info {
-            lopdf::Object::Dictionary(dict) => Some(dict),
-            lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok(),
-            _ => None,
-        });
+    let info_dict = doc.trailer.get(b"Info").ok().and_then(|info| match info {
+        lopdf::Object::Dictionary(dict) => Some(dict),
+        lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok(),
+        _ => None,
+    });
     if let Some(info_dict) = info_dict {
         if let Some(title) = get_pdf_str(info_dict, b"Title") {
             meta.title = Some(title);

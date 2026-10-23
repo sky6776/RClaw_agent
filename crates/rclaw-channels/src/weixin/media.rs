@@ -278,7 +278,7 @@ pub(super) fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(plain.len() + pad);
     buf.extend_from_slice(plain);
     buf.extend(std::iter::repeat_n(pad as u8, pad));
-    for chunk in buf.chunks_exact_mut(16) {
+    for chunk in buf.as_chunks_mut::<16>().0 {
         let block = GenericArray::from_mut_slice(chunk);
         cipher.encrypt_block(block);
     }
@@ -302,7 +302,7 @@ pub(super) fn aes_ecb_decrypt_in_place(mut buf: Vec<u8>, key: &[u8; 16]) -> Opti
         return None;
     }
     let cipher = aes::Aes128::new(GenericArray::from_slice(key));
-    for chunk in buf.chunks_exact_mut(16) {
+    for chunk in buf.as_chunks_mut::<16>().0 {
         let block = GenericArray::from_mut_slice(chunk);
         cipher.decrypt_block(block);
     }

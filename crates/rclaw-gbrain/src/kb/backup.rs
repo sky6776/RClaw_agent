@@ -1119,11 +1119,10 @@ fn import_embeddings(
 
         // blob → f32 向量（用于统一写入函数）
         let embedding_vec: Vec<f32> = blob
-            .chunks_exact(4)
-            .map(|chunk| {
-                let bytes: [u8; 4] = chunk.try_into().expect("chunks_exact(4) 保证 4 字节");
-                f32::from_le_bytes(bytes)
-            })
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         if embedding_vec.is_empty() {
             return Err(GBrainError::FileError("embedding blob 解码后为空".into()));
