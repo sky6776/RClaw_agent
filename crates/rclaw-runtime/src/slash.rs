@@ -159,12 +159,15 @@ impl SlashRegistry {
                 Err(e) => return format!("读取当前模型失败：{e}"),
             };
             return format!(
-                "当前模型：{model}\nbase_url：{base_url}\n\n可用模型：glm-5.3、glm-5.3-flash\n用法：/llmodel <模型名>"
+                "- 当前模型：{model}\n\
+                 - base_url：{base_url}\n\
+                 - 可用模型：glm-5.3、glm-5.3-flash\n\
+                 - 用法：/llmodel <模型名>"
             );
         }
         let Some(spec) = resolve_model_spec(input) else {
             return format!(
-                "未知模型「{input}」。可用模型：glm-5.3、glm-5.3-flash\n用法：/llmodel <模型名>"
+                "未知模型「{input}」。可用模型：glm-5.3、glm-5.3-flash\n\n用法：/llmodel <模型名>"
             );
         };
         let model = spec.model.to_string();
@@ -192,7 +195,10 @@ impl SlashRegistry {
             context_length,
         ) {
             Ok(()) => format!(
-                "✅ 已切换模型：{model}\nbase_url：{base_url}\ncontext_length：{context_length}"
+                "✅ 已切换模型：{model}\n\
+                 \n\
+                 - base_url：{base_url}\n\
+                 - context_length：{context_length}"
             ),
             Err(e) => {
                 format!("⚠️ 运行时已切换为 {model}，但写入 rclaw.toml 失败（下次启动会回退）：{e}")
@@ -248,7 +254,7 @@ impl SlashRegistry {
                 "用户通过 /search 修改搜索方式启用状态"
             );
             return format!(
-                "✅ {} 已{}。\n{}",
+                "✅ {} 已{}。\n\n{}",
                 id.label(),
                 if enabled {
                     "启用并清除阻塞状态"
@@ -290,7 +296,7 @@ impl SlashRegistry {
             "用户通过 /search 切换主搜索方式"
         );
         format!(
-            "✅ 已将 {} 设为首选搜索方式。\n{}",
+            "✅ 已将 {} 设为首选搜索方式。\n\n{}",
             id.label(),
             self.search_status(control)
         )
@@ -306,7 +312,7 @@ impl SlashRegistry {
         let input = args.split_whitespace().next().unwrap_or("");
         if input.is_empty() {
             return format!(
-                "web_search fallback 当前：{}\n用法：/searchfallback <on|off>",
+                "web_search fallback 当前：{}\n\n用法：/searchfallback <on|off>",
                 self.search_fallback_status(control)
             );
         }
@@ -315,7 +321,7 @@ impl SlashRegistry {
             "off" | "false" | "0" | "关" | "关闭" => false,
             _ => {
                 return format!(
-                    "未知参数「{input}」。支持：on / off\n用法：/searchfallback <on|off>"
+                    "未知参数「{input}」。支持：on / off\n\n用法：/searchfallback <on|off>"
                 );
             }
         };
@@ -336,38 +342,48 @@ impl SlashRegistry {
         )
     }
 
-    /// `/help`：列出可用命令。`/search` 行附带当前 web_search 顺序与 fallback 开关状态，
+    /// `/help`：列出可用命令。`/search` 行附带当前首选搜索方式与 fallback 开关状态，
     /// 让用户一眼看出当前主搜索方式及自动降级是否开启。
+    ///
+    /// 聊天窗按 Markdown 渲染（桌面 / APK 的 `.md-body`），段落内的单换行会被折叠成空格，
+    /// 所以每条命令都写成列表项：Markdown 下逐行成条，纯文本通道（微信 / QQ）也照旧逐行可读。
     fn help_text(&self) -> String {
         let search_status = match self.web_search_control.as_ref() {
             None => "（web_search 未启用）".to_string(),
-            Some(control) => format!(
-                "（{}）",
-                self.search_status(control)
-                    .lines()
-                    .next()
-                    .unwrap_or("状态未知")
-            ),
+            Some(control) => {
+                let fallback = if control.fallback_enabled() {
+                    "开启"
+                } else {
+                    "关闭"
+                };
+                match control.statuses().into_iter().find(|status| status.primary) {
+                    Some(status) => {
+                        format!("（当前首选 {}，fallback {fallback}）", status.id.as_str())
+                    }
+                    None => format!("（当前没有可用搜索源，fallback {fallback}）"),
+                }
+            }
         };
         format!(
             "可用斜杠命令：\n\
-             /llmodel <模型名>  切换 LLM 模型（热切换，同步更新 rclaw.toml）\n\
-             /search [方式]       显示状态或把指定方式移到首位 {search_status}\n\
-             /search dis|en <方式>  禁用/启用 zhipu、tavily、doubao-custom、doubao-global\n\
-             /searchfallback <on|off>  开关 web_search fallback（关闭后只用主搜索源，失败也不回退）；状态见上方 /search 行\n\
-             /skills            显示当前支持的所有 skill 名称、所属技能包及功能\n\
-             /tools             显示当前支持的所有工具名称及说明\n\
-             /context           显示当前会话上下文用量（窗口/已用/剩余/使用率）\n\
-             /compact           立即压缩当前会话历史（忽略阈值；有任务运行时拒绝）\n\
-             /rewind [回滚点 id]  列出可回滚的文件 checkpoint，或按列表给出的回滚点 id 回滚文件（hash 校验，外部改动整组拒绝）\n\
-             /fork [消息 id]  列出可作锚点的用户消息，或从该消息分叉出新会话（并自动把锚点之后的文件改动回滚到该时刻；full / files 旗标已移除）\n\
-             /goal [目标文本|clear]  设定 / 查看 / 清除本会话的长期目标（每轮注入提醒，成功收尾后小审计确认达成即自动清除）\n\
-             /export [all]      把当前会话（或全部会话）的完整记录导出为 JSONL（agent/exports/，含已压缩的消息）\n\
-             /clear [confirm]   清空全部会话状态（agent/state.sqlite）、会话 artifact 落盘目录并删除 agent/memory 全部文件（需 /clear confirm）\n\
-             /log [子命令]      查看 / 发送 / 删除 agent/logs 日志文件（list / get / del）\n\
-             /workflow <请求>   设计并运行一个动态工作流（展开为 prompt，历史保留原文）\n\
-             /cancel            停止当前会话正在运行的任务（路由层即时生效，不进入 LLM）\n\
-             /help              显示本帮助\n\
+             \n\
+             - /llmodel <模型名> — 切换 LLM 模型（热切换，同步更新 rclaw.toml）\n\
+             - /search [方式] — 显示状态或把指定方式移到首位{search_status}\n\
+             - /search dis|en <方式> — 禁用/启用 zhipu、tavily、doubao-custom、doubao-global\n\
+             - /searchfallback <on|off> — 开关 web_search fallback（关闭后只用主搜索源，失败也不回退）；状态见上方 /search 行\n\
+             - /skills — 显示当前支持的所有 skill 名称、所属技能包及功能\n\
+             - /tools — 显示当前支持的所有工具名称及说明\n\
+             - /context — 显示当前会话上下文用量（窗口/已用/剩余/使用率）\n\
+             - /compact — 立即压缩当前会话历史（忽略阈值；有任务运行时拒绝）\n\
+             - /rewind [回滚点 id] — 列出可回滚的文件 checkpoint，或按列表给出的回滚点 id 回滚文件（hash 校验，外部改动整组拒绝）\n\
+             - /fork [消息 id] — 列出可作锚点的用户消息，或从该消息分叉出新会话（并自动把锚点之后的文件改动回滚到该时刻；full / files 旗标已移除）\n\
+             - /goal [目标文本|clear] — 设定 / 查看 / 清除本会话的长期目标（每轮注入提醒，成功收尾后小审计确认达成即自动清除）\n\
+             - /export [all] — 把当前会话（或全部会话）的完整记录导出为 JSONL（agent/exports/，含已压缩的消息）\n\
+             - /clear [confirm] — 清空全部会话状态（agent/state.sqlite）、会话 artifact 落盘目录并删除 agent/memory 全部文件（需 /clear confirm）\n\
+             - /log [子命令] — 查看 / 发送 / 删除 agent/logs 日志文件（list / get / del）\n\
+             - /workflow <请求> — 设计并运行一个动态工作流（展开为 prompt，历史保留原文）\n\
+             - /cancel — 停止当前会话正在运行的任务（路由层即时生效，不进入 LLM）\n\
+             - /help — 显示本帮助\n\
              \n已知模型：glm-5.3、glm-5.3-flash"
         )
     }
@@ -401,7 +417,7 @@ impl SlashRegistry {
                 primary
             ));
         }
-        output.push_str("\n用法：/search <方式>；/search dis|en <方式>；/searchfallback on|off");
+        output.push_str("\n\n用法：/search <方式>；/search dis|en <方式>；/searchfallback on|off");
         output
     }
 }

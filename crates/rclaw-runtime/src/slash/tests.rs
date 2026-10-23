@@ -77,6 +77,34 @@ fn help_command_lists_available_commands() {
     assert!(resp.contains("/llmodel"));
     assert!(resp.contains("/skills"));
     assert!(resp.contains("/help"));
+    // 排版回归：每条命令独占一个列表项。聊天窗按 Markdown 渲染，段落内的单换行会被
+    // 折成空格——写成「每行一条命令」的纯文本会在手机上糊成一整段。
+    let bullets: Vec<&str> = resp.lines().filter(|line| line.starts_with("- ")).collect();
+    for command in [
+        "/llmodel",
+        "/search",
+        "/searchfallback",
+        "/skills",
+        "/tools",
+        "/context",
+        "/compact",
+        "/rewind",
+        "/fork",
+        "/goal",
+        "/export",
+        "/clear",
+        "/log",
+        "/workflow",
+        "/cancel",
+        "/help",
+    ] {
+        assert!(
+            bullets.iter().any(|line| line.contains(command)),
+            "{command} 必须独占一个列表项：\n{resp}"
+        );
+    }
+    // 16 条命令 + `/search dis|en` 一行 = 17 个列表项；合并成一行会让总数变少。
+    assert!(bullets.len() >= 17, "命令清单应一条一行：\n{resp}");
 }
 
 #[test]

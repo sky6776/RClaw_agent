@@ -222,10 +222,14 @@ fn render_skills(layout: &Layout) -> String {
         return "当前没有可用的 skill。".to_string();
     }
 
-    let mut output = format!("当前支持的 skill（共 {} 个）：\n", skills.len());
+    // 一条 skill 一行有序列表项：聊天窗按 Markdown 渲染，段落里的单换行会被折成空格，
+    // 原先「标题 + 缩进两行」的写法在手机上会糊成一整段。
+    let mut lines: Vec<String> = Vec::with_capacity(skills.len());
     for (index, skill) in skills.iter().enumerate() {
         let title = skill.title.split_whitespace().collect::<Vec<_>>().join(" ");
-        let package = skill_package_label(layout, &skill.path, &title);
+        let package = skill_package_label(layout, &skill.path, &title)
+            .map(|package| format!("（所属技能包：{package}）"))
+            .unwrap_or_default();
         let description = skill
             .description
             .split_whitespace()
@@ -236,13 +240,16 @@ fn render_skills(layout: &Layout) -> String {
         } else {
             &description
         };
-        output.push_str(&format!("\n{}. {}\n", index + 1, title));
-        if let Some(package) = package {
-            output.push_str(&format!("   所属技能包：{package}\n"));
-        }
-        output.push_str(&format!("   功能：{description}\n"));
+        lines.push(format!(
+            "{}. {title}{package} — 功能：{description}",
+            index + 1
+        ));
     }
-    output.trim_end().to_string()
+    format!(
+        "当前支持的 skill（共 {} 个）：\n\n{}",
+        skills.len(),
+        lines.join("\n")
+    )
 }
 
 /// 渲染当前注册的全部工具名称与说明（`/tools` 命令用）。
@@ -255,22 +262,44 @@ fn render_tools(schemas: &[ToolSchema]) -> String {
     }
     let mut sorted: Vec<&ToolSchema> = schemas.iter().collect();
     sorted.sort_by_key(|schema| schema.name.to_lowercase());
-    let mut output = format!("当前支持的工具（共 {} 个）：\n", sorted.len());
-    for (index, schema) in sorted.iter().enumerate() {
-        let description = schema.description.trim();
-        let description = if description.is_empty() {
-            "未提供说明"
+    // 一个工具一行有序列表项（同 render_skills）：条目内换行在 Markdown 里会折成空格，
+    // 说明文本先压成单行，避免把列表冲散。
+    let lines: Vec<String> = sorted
+        .iter()
+        .enumerate()
+        .map(|(index, schema)| {
+            let description = schema.description.split_whitespace().collect::<Vec<_>>().join(" ");
+            let description = if description.is_empty() {
+                "未提供说明".to_string()
+            } else {
+                description
+            };
+            format!("{}. {} — {description}", index + 1, schema.name)
+        })
+        .collect();
+    format!(
+        "当前支持的工具（共 {} 个）：\n\n{}",
+        lines.len(),
+        lines.join("\n")
+    )
+}
+
+/// 把任意文本包成 Markdown 围栏代码块：聊天窗按 Markdown 渲染，裸文本的单换行会被折成
+/// 空格、行首的 `#` / `-` / `1.` 会被当成标题或列表，代码块则逐行原样保留。围栏长度取
+/// 正文里最长连续反引号 + 1（至少 3），正文自带的 ``` 不会提前闭合围栏。
+fn fenced_block(body: &str) -> String {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for ch in body.chars() {
+        if ch == '`' {
+            run += 1;
+            longest = longest.max(run);
         } else {
-            description
-        };
-        output.push_str(&format!(
-            "\n{}. {}\n   {}\n",
-            index + 1,
-            schema.name,
-            description
-        ));
+            run = 0;
+        }
     }
-    output.trim_end().to_string()
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}text\n{body}\n{fence}")
 }
 
 /// 把字节数格式化为人类可读的 B / KB / MB。
@@ -361,10 +390,11 @@ fn tool_call_brief(name: &str, input: &str) -> String {
 /// `/log` 的用法提示。
 fn log_usage() -> String {
     "/log 子命令：\n\
-     /log                  列出日志文件（数量、名称、大小）\n\
-     /log get <名称>       查看日志内容（超过 20KB 仅显示末尾）\n\
-     /log del <名称>       删除单个日志\n\
-     /log del all confirm  删除全部日志（需确认）"
+     \n\
+     - /log — 列出日志文件（数量、名称、大小）\n\
+     - /log get <名称> — 查看日志内容（超过 20KB 仅显示末尾）\n\
+     - /log del <名称> — 删除单个日志\n\
+     - /log del all confirm — 删除全部日志（需确认）"
         .to_string()
 }
 
@@ -497,9 +527,9 @@ fn clear_agent_state(
             message: e.to_string(),
         })?;
     Ok(format!(
-        "• state.sqlite：删除 {sessions} 个会话（含当前会话）及其文件 checkpoint、用量锚点、会话目标与分叉血缘\n\
-         • artifacts/：删除各会话的工具结果落盘目录（转录里的落盘句柄随之失效）\n\
-         • memory/：删除 {memory} 个顶层条目（MEMORY.md、daily/、session_summaries/）\n\
+        "- state.sqlite：删除 {sessions} 个会话（含当前会话）及其文件 checkpoint、用量锚点、会话目标与分叉血缘\n\
+         - artifacts/：删除各会话的工具结果落盘目录（转录里的落盘句柄随之失效）\n\
+         - memory/：删除 {memory} 个顶层条目（MEMORY.md、daily/、session_summaries/）\n\
          \n记忆与历史已重置；下一次写入会自动重建所需记录与文件。"
     ))
 }
@@ -532,12 +562,13 @@ fn render_context_usage(history_used: usize, request_used: usize, opts: &AgentOp
         0
     };
     format!(
-        "上下文窗口：{capacity} token\n\
-         已用（历史估算）：{history_used} token\n\
-         请求压力估算（历史 + system prompt + tools）：{request_used} token（{pct}%）\n\
-         剩余：{remaining} token\n\
+        "- 上下文窗口：{capacity} token\n\
+         - 已用（历史估算）：{history_used} token\n\
+         - 请求压力估算（历史 + system prompt + tools）：{request_used} token（{pct}%）\n\
+         - 剩余：{remaining} token\n\
          \n\
          注：自动压缩按“请求压力估算”触发；历史估算单独展示，便于判断旧会话本身的体量。\n\
+         \n\
          {footer}",
         footer = context_footer(opts)
     )
@@ -1815,7 +1846,7 @@ impl TurnManager {
                 if anchors.is_empty() {
                     return "当前会话没有可分叉的真实用户消息。".to_string();
                 }
-                let mut out = format!("可分叉锚点（最近 {} 条用户消息，新在前）：", anchors.len());
+                let mut out = format!("可分叉锚点（最近 {} 条用户消息，新在前）：\n", anchors.len());
                 // message.ts 是 Unix【秒】（Message.ts 落库原样写入；SessionSummary.updated_at
                 // 才是毫秒），按毫秒解释会把所有锚点显示成 1970-01-21。
                 for (id, ts_secs, preview) in &anchors {
@@ -1826,6 +1857,8 @@ impl TurnManager {
                                 .to_string()
                         })
                         .unwrap_or_else(|| "?".to_string());
+                    // 预览是列表项正文：多行消息里的换行会把列表冲散，先压成单行。
+                    let preview = preview.split_whitespace().collect::<Vec<_>>().join(" ");
                     out.push_str(&format!("\n- #{id}（{time}）{preview}"));
                 }
                 out.push_str(
@@ -1861,10 +1894,10 @@ impl TurnManager {
                             }
                             Some(detail) => report.push_str(&format!(
                                 "\n\n📁 文件已一并回滚到锚点时刻（影响全局工作区，\
-                                 原会话与新分支共享同一工作区）：\n{detail}"
+                                 原会话与新分支共享同一工作区）：\n\n{detail}"
                             )),
                             None => report.push_str(
-                                "\n锚点之后没有文件改动，工作区未动；在桌面端会话列表里打开新分支继续。",
+                                "\n\n锚点之后没有文件改动，工作区未动；在桌面端会话列表里打开新分支继续。",
                             ),
                         }
                         report
@@ -1923,7 +1956,7 @@ impl TurnManager {
                     ));
                 }
                 Ok(format!(
-                    "✅ 已导出 {} 个会话的完整记录（含已被压缩的消息）：\n{}",
+                    "✅ 已导出 {} 个会话的完整记录（含已被压缩的消息）：\n\n{}",
                     targets.len(),
                     lines.join("\n")
                 ))
@@ -2031,14 +2064,15 @@ impl TurnManager {
         let store = curator.store();
         match action.as_str() {
             "list" => render_skills(&self.layout),
-            "help" => "用法：/skills [list|status [name]|pin <name>|unpin <name>|adopt <name>|restore <name>|curate]。\nadopt 会把 user-owned Skill 明确转为 agent-owned；只有 agent-owned 且未 pinned 的 Skill 会被后台自动维护。".to_string(),
+            "help" => "用法：/skills [list|status [name]|pin <name>|unpin <name>|adopt <name>|restore <name>|curate]。\n\nadopt 会把 user-owned Skill 明确转为 agent-owned；只有 agent-owned 且未 pinned 的 Skill 会被后台自动维护。".to_string(),
             "status" => match store.records() {
                 Ok(records) if records.is_empty() => name.map_or_else(
                     || "当前没有 Skill 生命周期记录。".to_string(),
                     |name| format!("没有名为 '{name}' 的 Skill 生命周期记录。"),
                 ),
                 Ok(records) => {
-                    let mut lines = vec!["Skill 生命周期状态：".to_string()];
+                    // 标题行后留空行：列表项要独立成段，避免被 Markdown 并进标题段落。
+                    let mut lines = vec!["Skill 生命周期状态：\n".to_string()];
                     for (skill_name, record) in records {
                         if name.is_some_and(|requested| requested != skill_name) {
                             continue;
@@ -2133,8 +2167,9 @@ impl TurnManager {
     async fn handle_clear(&self, content: &str) -> String {
         if !clear_confirmed(content) {
             return "⚠️ /clear 会【永久删除】以下内容，不可恢复：\n\
-                    • 全部会话历史（agent/state.sqlite：所有会话的消息、文件 checkpoint 与用量锚点，含当前会话）\n\
-                    • 全部长期记忆（agent/memory/：MEMORY.md、daily/、session_summaries/）\n\
+                    \n\
+                    - 全部会话历史（agent/state.sqlite：所有会话的消息、文件 checkpoint 与用量锚点，含当前会话）\n\
+                    - 全部长期记忆（agent/memory/：MEMORY.md、daily/、session_summaries/）\n\
                     \n确认请输入：/clear confirm"
                 .to_string();
         }
@@ -2144,11 +2179,11 @@ impl TurnManager {
             let (turns, reviews) = self.gate.running();
             if turns > 0 {
                 return "⏳ 有任务正在运行，/clear 已中止：清空后该 turn 会把旧历史 / 记忆写回，\
-                        导致「已清空但状态复活」。\n请先 /cancel 或等其结束后重试：/clear confirm"
+                        导致「已清空但状态复活」。\n\n请先 /cancel 或等其结束后重试：/clear confirm"
                     .to_string();
             }
             if reviews > 0 {
-                return "⏳ 后台记忆 / 自进化 review 仍在运行，/clear 已中止：它会基于清空前的对话把记忆写回。\n\
+                return "⏳ 后台记忆 / 自进化 review 仍在运行，/clear 已中止：它会基于清空前的对话把记忆写回。\n\n\
                         请稍后重试：/clear confirm"
                     .to_string();
             }
@@ -2169,7 +2204,7 @@ impl TurnManager {
             self.history.reset_runtime_state();
         }
         match cleared {
-            Ok(Ok(summary)) => format!("✅ 已清空 agent 本地状态：\n{summary}"),
+            Ok(Ok(summary)) => format!("✅ 已清空 agent 本地状态：\n\n{summary}"),
             Ok(Err(failure)) => {
                 format!(
                     "⚠️ 清空失败（可能部分文件被占用，可重试 /clear confirm）：{}",
@@ -2209,7 +2244,7 @@ impl TurnManager {
                     if extra.eq_ignore_ascii_case("confirm") || extra.eq_ignore_ascii_case("yes") {
                         self.log_delete_all()
                     } else {
-                        "⚠️ 将删除 agent/logs 下【全部】日志文件，不可恢复。\n确认请输入：/log del all confirm"
+                        "⚠️ 将删除 agent/logs 下【全部】日志文件，不可恢复。\n\n确认请输入：/log del all confirm"
                             .to_string()
                     }
                 } else {
@@ -2248,9 +2283,9 @@ impl TurnManager {
             format_bytes(total)
         );
         for (name, size) in &files {
-            out.push_str(&format!("• {name} ({})\n", format_bytes(*size)));
+            out.push_str(&format!("\n- {name}（{}）", format_bytes(*size)));
         }
-        out.push_str("\n用法：/log get <名称> 查看；/log del <名称> 删除单个；/log del all confirm 删除全部。");
+        out.push_str("\n\n用法：/log get <名称> 查看；/log del <名称> 删除单个；/log del all confirm 删除全部。");
         out
     }
 
@@ -2303,18 +2338,25 @@ impl TurnManager {
             }
             buf
         };
-        if size <= MAX_BYTES as u64 {
-            let body = String::from_utf8_lossy(&bytes);
-            format!("📄 {file_name}（{}）：\n\n{}", format_bytes(size), body)
-        } else {
-            let body = String::from_utf8_lossy(&bytes);
-            format!(
-                "📄 {file_name}（{}，仅显示末尾 {}）：\n\n…(前略)…\n{}",
-                format_bytes(size),
-                format_bytes(MAX_BYTES as u64),
-                body
+        // 聊天窗按 Markdown 渲染：裸日志的单换行会被折成空格（整段糊在一起），行首的
+        // `#` / `-` / `1.` 还会被当成标题或列表。围栏代码块原样保留行与缩进。
+        let body = String::from_utf8_lossy(&bytes);
+        let (header, body) = if size <= MAX_BYTES as u64 {
+            (
+                format!("📄 {file_name}（{}）：", format_bytes(size)),
+                body.to_string(),
             )
-        }
+        } else {
+            (
+                format!(
+                    "📄 {file_name}（{}，仅显示末尾 {}）：",
+                    format_bytes(size),
+                    format_bytes(MAX_BYTES as u64)
+                ),
+                format!("…(前略)…\n{body}"),
+            )
+        };
+        format!("{header}\n\n{}", fenced_block(&body))
     }
 
     fn log_delete_one(&self, name: &str) -> String {

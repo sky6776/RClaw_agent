@@ -1424,6 +1424,18 @@ fn render_tools_lists_names_and_descriptions() {
     // 描述做 trim；空描述回退为占位文案。
     assert!(out.contains("写文件"));
     assert!(out.contains("未提供说明"));
+    // 排版回归：一个工具一行（说明里的换行压成空格），Markdown 下不会把列表冲散。
+    assert_eq!(out.lines().count(), 2 + 2, "{out}");
+}
+
+#[test]
+fn fenced_block_keeps_lines_and_outruns_embedded_backticks() {
+    let body = "# 日志行\n1. 不是列表\n```\ncode\n```";
+    let out = fenced_block(body);
+    // 正文自带 ``` → 围栏加长到 4 个反引号，不会被提前闭合。
+    assert!(out.starts_with("````text\n"), "{out}");
+    assert!(out.ends_with("\n````"), "{out}");
+    assert!(out.contains(body), "{out}");
 }
 
 #[test]
@@ -1453,9 +1465,15 @@ fn render_skills_lists_names_packages_and_functions_in_stable_order() {
 
     let rendered = render_skills(&layout);
     assert!(rendered.contains("当前支持的 skill（共 3 个）"));
-    assert!(rendered.contains("alpha-skill\n   功能：分析图片并生成摘要。"));
-    assert!(rendered.contains("news-pulse\n   所属技能包：ai-berkshire\n   功能：分析公司新闻。"));
-    assert!(rendered.contains("zeta-skill\n   功能：生成项目报告。"));
+    assert!(rendered.contains("1. alpha-skill — 功能：分析图片并生成摘要。"));
+    assert!(rendered.contains("news-pulse（所属技能包：ai-berkshire） — 功能：分析公司新闻。"));
+    assert!(rendered.contains("zeta-skill — 功能：生成项目报告。"));
+    // 排版回归：每条 skill 独占一行列表项——聊天窗按 Markdown 渲染，条目内换行会被折成空格。
+    assert_eq!(
+        rendered.lines().count(),
+        2 + 3,
+        "header + 空行 + 每条一行：{rendered}"
+    );
     assert!(!rendered.contains("所在目录："));
     assert!(
         rendered.find("alpha-skill").unwrap() < rendered.find("zeta-skill").unwrap(),
@@ -2493,7 +2511,8 @@ fn render_context_usage_saturates_remaining_at_zero() {
     let s = render_context_usage(120_000, 250_000, &opts);
     assert!(s.contains("剩余：0 token"));
     assert!(s.contains("（125%）")); // 250000/200000 = 125%
-    assert!(!s.contains("-"));
+    // 剩余不为负：只查数值前的负号（每行开头的列表项 "- " 不算）。
+    assert!(!s.contains("剩余：-"));
 }
 
 #[test]
