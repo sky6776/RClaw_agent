@@ -109,14 +109,14 @@ fn tokenize_query(query: &str) -> Vec<String> {
     let mut runs: Vec<(bool, Vec<char>)> = Vec::new();
     let mut current: Option<(bool, Vec<char>)> = None;
     for c in lowered.chars() {
-        let class = if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '/' | '-')
-        {
-            Some(false)
-        } else if is_han(c) {
-            Some(true)
-        } else {
-            None
-        };
+        let class =
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '/' | '-') {
+                Some(false)
+            } else if is_han(c) {
+                Some(true)
+            } else {
+                None
+            };
         let same_run = matches!((&current, class), (Some((han, _)), Some(next)) if *han == next);
         if same_run {
             if let Some((_, chars)) = current.as_mut() {
@@ -165,7 +165,10 @@ fn score_message(message: &Message, terms: &[String]) -> usize {
         .collect::<Vec<_>>()
         .join("\n")
         .to_lowercase();
-    terms.iter().filter(|term| text.contains(term.as_str())).count()
+    terms
+        .iter()
+        .filter(|term| text.contains(term.as_str()))
+        .count()
 }
 
 /// 单条消息渲染上限：剩余预算在「尾部 + 预留相关槽位」间均摊，夹在安全区间内——
@@ -288,9 +291,7 @@ impl Tool for SessionHandoffTool {
             Err(error) => return ToolResult::err(format!("读取源会话任务执行异常: {error}")),
         };
         if history.is_empty() {
-            return ToolResult::err(format!(
-                "源会话 {channel}:{chat_id} 没有历史记录。"
-            ));
+            return ToolResult::err(format!("源会话 {channel}:{chat_id} 没有历史记录。"));
         }
 
         let terms = tokenize_query(&query);
@@ -305,8 +306,7 @@ impl Tool for SessionHandoffTool {
             if archived { "（归档会话）" } else { "" }
         ));
         // 预算：扣掉头部与分区标题预留后，单条上限按剩余预算均摊；尾部原文优先占用。
-        let mut remaining =
-            max_chars.saturating_sub(out.chars().count() + SECTION_OVERHEAD_CHARS);
+        let mut remaining = max_chars.saturating_sub(out.chars().count() + SECTION_OVERHEAD_CHARS);
         let cap = per_message_cap(remaining);
         let mut tail = String::new();
         for (offset, message) in history[tail_start..].iter().enumerate() {
@@ -376,7 +376,9 @@ impl Tool for SessionHandoffTool {
         let total_chars = out.chars().count();
         if total_chars > max_chars {
             let mut capped: String = out.chars().take(max_chars).collect();
-            capped.push_str("\n…[交接素材超出预算，已截断；可用更聚焦的 query 或更小的 max_chars 重试]");
+            capped.push_str(
+                "\n…[交接素材超出预算，已截断；可用更聚焦的 query 或更小的 max_chars 重试]",
+            );
             return ToolResult::ok(capped);
         }
         ToolResult::ok(out)
@@ -409,7 +411,11 @@ mod tests {
             .unwrap();
         for i in 0..6 {
             session
-                .append("cli", "console", &Message::plain(Role::User, format!("旧消息 {i}")))
+                .append(
+                    "cli",
+                    "console",
+                    &Message::plain(Role::User, format!("旧消息 {i}")),
+                )
                 .unwrap();
             session
                 .append(
@@ -419,19 +425,14 @@ mod tests {
                 )
                 .unwrap();
         }
-        (
-            SessionHandoffTool::new(session),
-            layout,
-        )
+        (SessionHandoffTool::new(session), layout)
     }
 
     #[tokio::test]
     async fn handoff_requires_chat_id_and_query() {
         let dir = tempfile::tempdir().unwrap();
         let (tool, _layout) = tool_with_history(dir.path());
-        let missing_query = tool
-            .execute(json!({"chat_id": "console"}))
-            .await;
+        let missing_query = tool.execute(json!({"chat_id": "console"})).await;
         assert!(missing_query.is_error, "缺 query 应报错");
         let missing_chat = tool.execute(json!({"query": "nginx"})).await;
         assert!(missing_chat.is_error, "缺 chat_id 应报错");
@@ -500,16 +501,25 @@ mod tests {
         let layout = Layout::new(dir.path().join("agent"));
         let session = SessionStore::new(layout);
         session
-            .append("desktop", "main", &Message::plain(Role::User, "nginx 在桌面会话里"))
+            .append(
+                "desktop",
+                "main",
+                &Message::plain(Role::User, "nginx 在桌面会话里"),
+            )
             .unwrap();
         let tool = SessionHandoffTool::new(session);
         let result = crate::turn::rewind::CURRENT_CHAT
             .scope(Some(("desktop".to_string(), "other".to_string())), async {
-                tool.execute(json!({"chat_id": "main", "query": "nginx"})).await
+                tool.execute(json!({"chat_id": "main", "query": "nginx"}))
+                    .await
             })
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("desktop:main"), "{}", result.content);
+        assert!(
+            result.content.contains("desktop:main"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -518,7 +528,11 @@ mod tests {
         let layout = Layout::new(dir.path().join("agent"));
         let session = SessionStore::new(layout);
         session
-            .append("desktop", "old", &Message::plain(Role::User, "nginx 归档会话"))
+            .append(
+                "desktop",
+                "old",
+                &Message::plain(Role::User, "nginx 归档会话"),
+            )
             .unwrap();
         assert!(session.set_archived("desktop", "old", true).unwrap());
         let tool = SessionHandoffTool::new(session);
@@ -526,8 +540,16 @@ mod tests {
             .execute(json!({"channel": "desktop", "chat_id": "old", "query": "nginx"}))
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("（归档会话）"), "{}", result.content);
-        assert!(result.content.contains("nginx 归档会话"), "{}", result.content);
+        assert!(
+            result.content.contains("（归档会话）"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("nginx 归档会话"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -536,10 +558,18 @@ mod tests {
         let layout = Layout::new(dir.path().join("agent"));
         let session = SessionStore::new(layout);
         let first = session
-            .append("cli", "console", &Message::plain(Role::User, "nginx 最早的问题"))
+            .append(
+                "cli",
+                "console",
+                &Message::plain(Role::User, "nginx 最早的问题"),
+            )
             .unwrap();
         session
-            .append("cli", "console", &Message::plain(Role::Assistant, "早期回复"))
+            .append(
+                "cli",
+                "console",
+                &Message::plain(Role::Assistant, "早期回复"),
+            )
             .unwrap();
         let kept = session
             .append("cli", "console", &Message::plain(Role::User, "后续追问"))
@@ -562,7 +592,11 @@ mod tests {
             .execute(json!({"channel": "cli", "chat_id": "console", "query": "nginx"}))
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("nginx 最早的问题"), "{}", result.content);
+        assert!(
+            result.content.contains("nginx 最早的问题"),
+            "{}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -573,12 +607,20 @@ mod tests {
         let long = "nginx 502 排查记录 ".repeat(40);
         for i in 0..30 {
             session
-                .append("cli", "console", &Message::plain(Role::User, format!("{long}#{i}")))
+                .append(
+                    "cli",
+                    "console",
+                    &Message::plain(Role::User, format!("{long}#{i}")),
+                )
                 .unwrap();
         }
         for i in 0..TAIL_MESSAGES {
             session
-                .append("cli", "console", &Message::plain(Role::Assistant, format!("尾部 {i}")))
+                .append(
+                    "cli",
+                    "console",
+                    &Message::plain(Role::Assistant, format!("尾部 {i}")),
+                )
                 .unwrap();
         }
         let tool = SessionHandoffTool::new(session);
@@ -588,7 +630,12 @@ mod tests {
         let large = tool
             .execute(json!({"chat_id": "console", "query": "nginx 502", "max_chars": 48000}))
             .await;
-        assert!(!small.is_error && !large.is_error, "{} / {}", small.content, large.content);
+        assert!(
+            !small.is_error && !large.is_error,
+            "{} / {}",
+            small.content,
+            large.content
+        );
         let count = |content: &str| content.matches("[user] nginx 502").count();
         assert!(count(&small.content) >= 1, "{}", small.content);
         assert!(
@@ -596,7 +643,12 @@ mod tests {
             "4K 预算应被遵守: {}",
             small.content.chars().count()
         );
-        assert_eq!(count(&large.content), 30, "48K 预算应带回全部命中: {}", large.content);
+        assert_eq!(
+            count(&large.content),
+            30,
+            "48K 预算应带回全部命中: {}",
+            large.content
+        );
         assert!(
             count(&large.content) > count(&small.content),
             "更大预算应带回更多相关消息"

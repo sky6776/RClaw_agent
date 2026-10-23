@@ -868,24 +868,77 @@ mod tests {
     /// 传入 tools 也不改变输出）。含 CDP 浏览器工具面（桌面 GUI 独有）。
     fn desktop_tool_names() -> Vec<&'static str> {
         vec![
-            "read", "write", "edit", "list", "delete", "grep", "shell", "memory", "cron_add",
-            "cron_list", "cron_remove", "skill_manage", "web_search", "zhipu_search",
-            "tavily_search", "tavily_extract", "browser_navigate", "browser_snapshot",
-            "browser_click", "browser_type", "browser_scroll", "browser_screenshot",
-            "browser_close", "TeamCreate", "TeamDelete", "TaskCreate", "TaskUpdate", "TaskList",
-            "TaskGet", "SendMessage", "Agent", "Task",
+            "read",
+            "write",
+            "edit",
+            "list",
+            "delete",
+            "grep",
+            "shell",
+            "memory",
+            "cron_add",
+            "cron_list",
+            "cron_remove",
+            "skill_manage",
+            "web_search",
+            "zhipu_search",
+            "tavily_search",
+            "tavily_extract",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_scroll",
+            "browser_screenshot",
+            "browser_close",
+            "TeamCreate",
+            "TeamDelete",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
+            "SendMessage",
+            "Agent",
+            "Task",
         ]
     }
 
     /// APK 宿主工具集：没有 shell，多出进程内 gbrain 工具。浏览器工具面与桌面一致。
     fn apk_tool_names() -> Vec<&'static str> {
         vec![
-            "read", "write", "edit", "list", "delete", "grep", "memory", "cron_add", "cron_list",
-            "cron_remove", "skill_manage", "web_search", "zhipu_search", "tavily_search",
-            "tavily_extract", "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_screenshot", "browser_close",
-            "TeamCreate", "TeamDelete", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
-            "SendMessage", "Agent", "Task", "gbrain__search", "gbrain__artifact_put",
+            "read",
+            "write",
+            "edit",
+            "list",
+            "delete",
+            "grep",
+            "memory",
+            "cron_add",
+            "cron_list",
+            "cron_remove",
+            "skill_manage",
+            "web_search",
+            "zhipu_search",
+            "tavily_search",
+            "tavily_extract",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_scroll",
+            "browser_screenshot",
+            "browser_close",
+            "TeamCreate",
+            "TeamDelete",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
+            "SendMessage",
+            "Agent",
+            "Task",
+            "gbrain__search",
+            "gbrain__artifact_put",
         ]
     }
 
@@ -938,13 +991,15 @@ mod tests {
     fn cli_no_browser_registry_leaves_no_browser_line() {
         // CLI/Termux 无浏览器工具：提示词不宣称任何浏览器能力（不区分宿主，
         // 注册表里没有 browser_navigate 就不留行）。
-        for base in ["/srv/rclaw-cli/agent", "/data/data/com.termux/files/home/.rclaw/agent"] {
+        for base in [
+            "/srv/rclaw-cli/agent",
+            "/data/data/com.termux/files/home/.rclaw/agent",
+        ] {
             let layout = Layout::new(base);
             let memory = MemoryStore::new(layout.clone());
             let mut names = desktop_tool_names();
             names.retain(|name| !name.starts_with("browser_"));
-            let prompt =
-                build_system_prompt_for_tools(&layout, &memory, 0, None, &schemas(&names));
+            let prompt = build_system_prompt_for_tools(&layout, &memory, 0, None, &schemas(&names));
             assert!(!prompt.contains("- browser_*:"), "{base}: {prompt}");
             assert!(!prompt.contains("web_browser"), "{base}: {prompt}");
         }
@@ -983,7 +1038,10 @@ mod tests {
         assert_golden(&prompt, "apk");
         assert!(prompt.contains("running on a native Android APK"));
         assert!(!prompt.contains("- shell:"), "{prompt}");
-        assert!(!prompt.contains("绝对路径传给 shell 时原样复用"), "{prompt}");
+        assert!(
+            !prompt.contains("绝对路径传给 shell 时原样复用"),
+            "{prompt}"
+        );
         assert!(prompt.contains("- gbrain__*:"));
         assert!(prompt.contains("skill__<skill>__<entrypoint>"));
         assert!(prompt.contains("不得生成或尝试执行 Python/Node/bash 命令"));

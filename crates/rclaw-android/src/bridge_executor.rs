@@ -16,9 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rclaw_tools::{
-    PythonScriptExecutor, PythonScriptRequest, ScriptFailure, ScriptOutcome,
-};
+use rclaw_tools::{PythonScriptExecutor, PythonScriptRequest, ScriptFailure, ScriptOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -256,13 +254,16 @@ impl SkillApprovalStore {
         let skills_canon = skills_dir
             .canonicalize()
             .map_err(|_| format!("skill 脚本必须位于 skills/ 内: {}", script.display()))?;
-        script_canon.strip_prefix(&skills_canon).map(Path::to_path_buf).map_err(|_| {
-            format!(
-                "skill 脚本必须位于 skills/ 内: {}（解析为 {}）",
-                script.display(),
-                script_canon.display()
-            )
-        })
+        script_canon
+            .strip_prefix(&skills_canon)
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                format!(
+                    "skill 脚本必须位于 skills/ 内: {}（解析为 {}）",
+                    script.display(),
+                    script_canon.display()
+                )
+            })
     }
 
     /// 写路径钩子入口：脚本被 write/edit/delete/patch 修改后摘除其 `user` 批准，
@@ -335,8 +336,7 @@ impl SkillApprovalStore {
             let approved = match entry {
                 Some(entry) => {
                     entry.user.as_deref() == Some(sha.as_str())
-                        || (entry.user.is_none()
-                            && entry.baseline.as_deref() == Some(sha.as_str()))
+                        || (entry.user.is_none() && entry.baseline.as_deref() == Some(sha.as_str()))
                 }
                 None => false,
             };
@@ -555,7 +555,10 @@ struct BridgeExecution {
 
 #[async_trait]
 impl PythonScriptExecutor for BridgePythonExecutor {
-    async fn execute(&self, request: PythonScriptRequest<'_>) -> Result<ScriptOutcome, ScriptFailure> {
+    async fn execute(
+        &self,
+        request: PythonScriptRequest<'_>,
+    ) -> Result<ScriptOutcome, ScriptFailure> {
         if self.is_poisoned() {
             return Err(ScriptFailure::Unavailable(
                 "Python 运行时已标记为不可用（此前一次执行超时未返回）；请重启 RClaw 服务恢复技能执行"
@@ -563,10 +566,7 @@ impl PythonScriptExecutor for BridgePythonExecutor {
             ));
         }
         // 层 1：严格串行化（进程内共享解释器的必然约束）。
-        let _serial = self
-            .execute_lock
-            .lock()
-            .await;
+        let _serial = self.execute_lock.lock().await;
 
         // 执行闸门：审批通过才进解释器（改码必须过人）。放在拿到串行锁之后：排队等待
         // 前一个脚本（可长达其超时）期间脚本若被改写，锁前算好的哈希就成了过期凭证，
@@ -618,8 +618,7 @@ impl PythonScriptExecutor for BridgePythonExecutor {
         let mut done_rx = done_rx;
         match tokio::time::timeout(total_budget, &mut done_rx).await {
             Ok(Ok(result)) => {
-                let raw =
-                    result.map_err(|error| ScriptFailure::Spawn(error.to_string()))?;
+                let raw = result.map_err(|error| ScriptFailure::Spawn(error.to_string()))?;
                 let execution: BridgeExecution = serde_json::from_str(&raw).map_err(|error| {
                     ScriptFailure::Wait(format!("解析 Python 运行结果失败: {error}"))
                 })?;
@@ -639,11 +638,12 @@ impl PythonScriptExecutor for BridgePythonExecutor {
                 interrupt_python_bridge();
                 match tokio::time::timeout(COOPERATIVE_CANCEL_GRACE, &mut done_rx).await {
                     Ok(Ok(result)) => {
-                        let raw = result
-                            .map_err(|error| ScriptFailure::Spawn(error.to_string()))?;
-                        let execution: BridgeExecution = serde_json::from_str(&raw).map_err(
-                            |error| ScriptFailure::Wait(format!("解析 Python 运行结果失败: {error}")),
-                        )?;
+                        let raw =
+                            result.map_err(|error| ScriptFailure::Spawn(error.to_string()))?;
+                        let execution: BridgeExecution =
+                            serde_json::from_str(&raw).map_err(|error| {
+                                ScriptFailure::Wait(format!("解析 Python 运行结果失败: {error}"))
+                            })?;
                         tracing::warn!("skill 脚本经协作中断终止（超时 {} ms）", watchdog_ms);
                         Ok(execution.into_outcome())
                     }
@@ -699,7 +699,9 @@ mod tests {
 
         // baseline 刷新：内置副本哈希入表，基线内容可直接执行。
         store.refresh_baseline(&bundled);
-        assert!(store.check(&skills, &skills.join("demo/scripts/run.py")).is_ok());
+        assert!(store
+            .check(&skills, &skills.join("demo/scripts/run.py"))
+            .is_ok());
 
         // user 播种不覆盖既有；落盘后重载仍生效。
         let mut legacy = HashMap::new();
@@ -735,14 +737,18 @@ mod tests {
 
         // 回滚到基线内容 → 恢复可执行。
         write(&skills.join("demo/scripts/run.py"), "print('v1')\n");
-        assert!(store.check(&skills, &skills.join("demo/scripts/run.py")).is_ok());
+        assert!(store
+            .check(&skills, &skills.join("demo/scripts/run.py"))
+            .is_ok());
 
         // 用户批准自定义版本 → user 哈希生效。
         write(&skills.join("demo/scripts/run.py"), "print('custom')\n");
         store
             .approve_user_version(&skills, &skills.join("demo/scripts/run.py"))
             .unwrap();
-        assert!(store.check(&skills, &skills.join("demo/scripts/run.py")).is_ok());
+        assert!(store
+            .check(&skills, &skills.join("demo/scripts/run.py"))
+            .is_ok());
 
         // 再被修改（钩子摘除 user）→ 拒绝（自定义内容失配基线，按无批准处理）。
         store.revoke_user_approval(&skills.join("demo/scripts/run.py"));
@@ -804,7 +810,9 @@ mod tests {
         let skills = dir.path().join("skills");
         write(&bundled.join("demo/scripts/run.py"), "print('v1')\n");
         write(&skills.join("demo/scripts/run.py"), "print('v1')\n");
-        let store = Arc::new(SkillApprovalStore::load(dir.path().join(APPROVALS_FILE_NAME)));
+        let store = Arc::new(SkillApprovalStore::load(
+            dir.path().join(APPROVALS_FILE_NAME),
+        ));
         store.refresh_baseline(&bundled);
         let executor = BridgePythonExecutor::new(dir.path().to_path_buf(), skills.clone(), store);
 

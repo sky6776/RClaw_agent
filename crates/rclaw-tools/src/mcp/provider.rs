@@ -260,7 +260,10 @@ fn canonical_path_string(path: &Path) -> Option<String> {
         if let Some(Component::Prefix(prefix)) = path.components().next() {
             if matches!(
                 prefix.kind(),
-                Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..) | Prefix::Verbatim(..)
+                Prefix::UNC(..)
+                    | Prefix::VerbatimUNC(..)
+                    | Prefix::DeviceNS(..)
+                    | Prefix::Verbatim(..)
             ) {
                 return None;
             }

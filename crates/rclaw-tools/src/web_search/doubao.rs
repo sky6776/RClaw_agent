@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 
 use super::types::{
     normalize_api_key, normalize_base_url, read_response_capped, safe_endpoint_label,
-    validate_public_http_url, BackendError, BackendErrorKind, BackendId, SearchBackend,
-    SearchHit, SearchRequest, SearchResponse,
+    validate_public_http_url, BackendError, BackendErrorKind, BackendId, SearchBackend, SearchHit,
+    SearchRequest, SearchResponse,
 };
 
 const DEFAULT_CUSTOM_URL: &str = "https://open.feedcoopapi.com/search_api/web_search";

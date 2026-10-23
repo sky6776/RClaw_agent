@@ -200,9 +200,7 @@ pub(crate) fn spill_if_over_budget(
          取回中段：用 read 工具按 offset/limit 分页读取该文件（建议每页 limit ≤ {page_lines} 行，\n\
          超长行已折行，任意段都能按行取回；读取该文件的结果不会再次落盘）。\n\n\
          预览（头尾合计 {} 字节，中段已省略）：\n{}",
-        spill.threshold_bytes,
-        PREVIEW_BYTES,
-        preview.text,
+        spill.threshold_bytes, PREVIEW_BYTES, preview.text,
     );
     Some(path)
 }
@@ -233,7 +231,10 @@ mod tests {
         // 只差尾字符的两个长 chat_id 不得共享目录（纯截断曾会）。
         let long_a = format!("{}A", "x".repeat(56));
         let long_b = format!("{}B", "x".repeat(56));
-        assert_ne!(sanitize_chat_key("desktop", &long_a), sanitize_chat_key("desktop", &long_b));
+        assert_ne!(
+            sanitize_chat_key("desktop", &long_a),
+            sanitize_chat_key("desktop", &long_b)
+        );
     }
 
     #[test]
@@ -260,7 +261,8 @@ mod tests {
         let spill = spill_on(1024);
         let mut content = "short".to_string();
         assert!(
-            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", "{}", &mut content).is_none()
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", "{}", &mut content)
+                .is_none()
         );
         assert_eq!(content, "short");
         // 关闭时超预算也不动。
@@ -269,7 +271,9 @@ mod tests {
             threshold_bytes: 4,
         };
         let mut big = "x".repeat(100);
-        assert!(spill_if_over_budget(&off, dir.path(), "cli", "c", "read", "{}", &mut big).is_none());
+        assert!(
+            spill_if_over_budget(&off, dir.path(), "cli", "c", "read", "{}", &mut big).is_none()
+        );
         assert_eq!(big.len(), 100);
     }
 
@@ -287,36 +291,60 @@ mod tests {
         let display_path = path.to_string_lossy().replace('\\', "/");
         let input = serde_json::json!({"path": display_path, "offset": 0, "limit": 50}).to_string();
         let mut page = "line\n".repeat(50);
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &input, &mut page).is_none());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &input, &mut page)
+                .is_none()
+        );
         assert_eq!(page, "line\n".repeat(50));
         // 反斜杠形态 / 大小写差异同样识别。
         let windows_style = display_path.replace('/', "\\").to_ascii_uppercase();
         let input = serde_json::json!({"path": windows_style}).to_string();
         let mut page = "line\n".repeat(50);
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &input, &mut page).is_none());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &input, &mut page)
+                .is_none()
+        );
         // 读别的大文件照常落盘；非 read 工具带 artifacts 路径也照常落盘。
-        let other = serde_json::json!({"path": dir.path().join("src/big.rs").to_string_lossy()}).to_string();
+        let other = serde_json::json!({"path": dir.path().join("src/big.rs").to_string_lossy()})
+            .to_string();
         let mut big = "x".repeat(500);
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &other, &mut big).is_some());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &other, &mut big)
+                .is_some()
+        );
         let shell = serde_json::json!({"command": format!("cat {display_path}")}).to_string();
         let mut out = "x".repeat(500);
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "shell", &shell, &mut out).is_some());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "shell", &shell, &mut out)
+                .is_some()
+        );
         // 入参不是 JSON（或缺 path）按普通调用处理。
         let mut odd = "x".repeat(500);
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", "not json", &mut odd).is_some());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", "not json", &mut odd)
+                .is_some()
+        );
         // 回归：前缀长度落在中文分量内部时字符串切片会 panic（整条 turn 被打崩）——
         // 非 artifact 的中文路径大文件照常落盘、不 panic。agent 根 + "docs/" 恰好与
         // 根 + "artifacts/" 同长，让 prefix.len() 切进「说明.md」的多字节字符里。
         let cjk = serde_json::json!({"path": dir.path().join("docs/说明说明说明说明.md").to_string_lossy()}).to_string();
         let mut big = "x".repeat(500);
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &cjk, &mut big).is_some());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &cjk, &mut big).is_some()
+        );
         let short = serde_json::json!({"path": "说明"}).to_string();
         let mut big = "x".repeat(500);
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &short, &mut big).is_some());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &short, &mut big)
+                .is_some()
+        );
         // 相对 agent 根的句柄写法（read 同样拼到 base 下）也认作取回。
         let relative = serde_json::json!({"path": format!("artifacts/{}", path.file_name().unwrap().to_string_lossy())}).to_string();
         let mut page = "line\n".repeat(50);
-        assert!(spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &relative, &mut page).is_none());
+        assert!(
+            spill_if_over_budget(&spill, dir.path(), "cli", "c", "read", &relative, &mut page)
+                .is_none()
+        );
     }
 
     #[test]
@@ -347,9 +375,16 @@ mod tests {
         let tail = "\nTAIL LINE\n".repeat(20);
         let mut content = format!("{head}{middle}{tail}");
         let original = content.clone();
-        let path =
-            spill_if_over_budget(&spill, dir.path(), "cli", "console", "grep", "{}", &mut content)
-                .expect("超预算应落盘");
+        let path = spill_if_over_budget(
+            &spill,
+            dir.path(),
+            "cli",
+            "console",
+            "grep",
+            "{}",
+            &mut content,
+        )
+        .expect("超预算应落盘");
         // 落盘的是【全文】（折叠形态：原始行结构保留，仅超长行折行）。
         let disk = std::fs::read_to_string(&path).unwrap();
         assert!(disk.starts_with("HEAD LINE\n"));
@@ -392,8 +427,10 @@ mod tests {
         let spill = spill_on(16);
         let mut a = "a".repeat(100);
         let mut b = "b".repeat(100);
-        let pa = spill_if_over_budget(&spill, dir.path(), "cli", "chat-a", "read", "{}", &mut a).unwrap();
-        let pb = spill_if_over_budget(&spill, dir.path(), "cli", "chat-b", "read", "{}", &mut b).unwrap();
+        let pa = spill_if_over_budget(&spill, dir.path(), "cli", "chat-a", "read", "{}", &mut a)
+            .unwrap();
+        let pb = spill_if_over_budget(&spill, dir.path(), "cli", "chat-b", "read", "{}", &mut b)
+            .unwrap();
         let key_a = dir
             .path()
             .join("artifacts")

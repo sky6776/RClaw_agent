@@ -12,9 +12,12 @@ use rclaw_core::ChannelCaps;
 use rclaw_core::RuntimeChannelInfo;
 use rclaw_store::fs::{init_layout, Layout};
 
-use crate::bridge_executor::{BridgePythonExecutor, SkillApprovalStore};
 use crate::bridge_executor::APPROVALS_FILE_NAME;
-use crate::{apply_skill_configs, install_bundled_skills, reject_symlink, reject_symlink_ancestors, remove_managed_node, ResolvedAndroidConfig};
+use crate::bridge_executor::{BridgePythonExecutor, SkillApprovalStore};
+use crate::{
+    apply_skill_configs, install_bundled_skills, reject_symlink, reject_symlink_ancestors,
+    remove_managed_node, ResolvedAndroidConfig,
+};
 
 /// 技能闸门句柄（进程级）：审批存储 + 其枚举根，供 GUI 审批命令访问。
 #[derive(Clone)]
@@ -102,7 +105,11 @@ pub fn prepare_environment(resolved: &mut ResolvedAndroidConfig) -> Result<Prepa
     // 恢复数据后的首启装配抢在解包前失败且错误滞留到重启。有界等待解包
     // 完成标记（目录树先拷、版本标记最后写），就绪时零等待。
     wait_for_bundled_skills_ready(&resolved.bundled_skills_dir);
-    reject_symlink_ancestors(&files_dir, &resolved.bundled_skills_dir, "APK 内置 skill 目录")?;
+    reject_symlink_ancestors(
+        &files_dir,
+        &resolved.bundled_skills_dir,
+        "APK 内置 skill 目录",
+    )?;
     reject_symlink_ancestors(&files_dir, &skill_baseline_dir, "skill 基线目录")?;
     install_bundled_skills(
         &resolved.bundled_skills_dir,
@@ -114,7 +121,8 @@ pub fn prepare_environment(resolved: &mut ResolvedAndroidConfig) -> Result<Prepa
     // keys. Skill credentials live in their independent app-managed config files.
     let exposed_toml = layout.base.join("rclaw.toml");
     if exposed_toml.is_file() {
-        std::fs::remove_file(&exposed_toml).context("清理旧版暴露在 agent 目录中的 rclaw.toml 失败")?;
+        std::fs::remove_file(&exposed_toml)
+            .context("清理旧版暴露在 agent 目录中的 rclaw.toml 失败")?;
     }
     let media_dir = layout.base.join("media");
     std::fs::create_dir_all(&media_dir)?;
@@ -152,8 +160,7 @@ fn wait_for_bundled_skills_ready(source: &Path) {
     if source.is_dir() && marker.is_file() {
         return;
     }
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     // 此刻 tracing 订阅器尚未初始化（init_tracing 在 prepare_environment 之后），
     // 走 boot_debug.log 保证可观测。
     crate::log_boot("等待 APK 内置 skill 解包（GUI 装配抢跑兜底，上限 180s）");
@@ -243,7 +250,10 @@ pub fn install_skill_gate(
 /// 全程保持，进程退出时随进程消亡）。
 pub fn prepare_gbrain(
     resolved: &mut ResolvedAndroidConfig,
-) -> Result<(Option<rclaw_gbrain::GBrainTools>, Option<std::time::Duration>)> {
+) -> Result<(
+    Option<rclaw_gbrain::GBrainTools>,
+    Option<std::time::Duration>,
+)> {
     let gbrain_call_timeout = crate::configured_gbrain_call_timeout(resolved);
     let _guard = crate::GBrainEnvGuardForProcess;
     for (name, server) in &resolved.config.mcp.servers {

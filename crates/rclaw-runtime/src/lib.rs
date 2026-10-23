@@ -22,9 +22,9 @@ pub mod turn;
 
 pub use agent_loop::{AgentLoop, ForkHandle, SessionLifecycle};
 pub use agent_tools::{
-    plan_is_active, plan_pause_key, AgentCancelTool, AgentResumeTool, AgentStatusTool, AgentToolRuntime,
-    AgentWaitTool, ClaudeAgentTool, PlanRunTool, SendMessageTool, TaskCreateTool, TaskGetTool,
-    TaskListTool, TaskUpdateTool, TeamCreateTool, TeamDeleteTool,
+    plan_is_active, plan_pause_key, AgentCancelTool, AgentResumeTool, AgentStatusTool,
+    AgentToolRuntime, AgentWaitTool, ClaudeAgentTool, PlanRunTool, SendMessageTool, TaskCreateTool,
+    TaskGetTool, TaskListTool, TaskUpdateTool, TeamCreateTool, TeamDeleteTool,
 };
 pub use bots::{
     bot_inbox_chat_id, chat_key, group_member_chat_id, sanitize_control_frames, BotRegistry,

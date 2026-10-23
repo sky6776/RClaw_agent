@@ -131,10 +131,7 @@ fn match_redaction_at(text: &str, bytes: &[u8], i: usize) -> Option<(usize, Stri
         let ws = run_len(bytes, after, is_ws);
         let tok_start = after + ws;
         let tok_len = run_len(bytes, tok_start, |b| !is_ws(b) && !is_quote(b));
-        let is_var_ref = matches!(
-            bytes.get(tok_start),
-            Some(b'$') | Some(b'%') | Some(b'{')
-        );
+        let is_var_ref = matches!(bytes.get(tok_start), Some(b'$') | Some(b'%') | Some(b'{'));
         if ws > 0 && tok_len >= 4 && !is_var_ref {
             let prefix = &text[i..tok_start];
             return Some((tok_start + tok_len - i, format!("{prefix}[REDACTED]")));
@@ -213,7 +210,11 @@ fn match_redaction_at(text: &str, bytes: &[u8], i: usize) -> Option<(usize, Stri
                         j += 1;
                     }
                     let val_len = run_len(bytes, j, |b| {
-                        if quoted { !is_quote(b) } else { !is_ws(b) && !is_quote(b) }
+                        if quoted {
+                            !is_quote(b)
+                        } else {
+                            !is_ws(b) && !is_quote(b)
+                        }
                     });
                     if val_len >= 8 && !looks_like_reference(&bytes[j..j + val_len]) {
                         let prefix = &text[i..j];

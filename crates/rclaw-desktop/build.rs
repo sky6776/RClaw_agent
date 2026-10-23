@@ -4,8 +4,7 @@ fn main() {
 
     // 目标平台必须读 CARGO_CFG_TARGET_OS：build script 里的 cfg!/#[cfg] 评估的是
     // 构建宿主（Windows 上交叉编译 aarch64-linux-android 时两者相反）。
-    let target_is_android =
-        std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android");
+    let target_is_android = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android");
     let apk_host = std::env::var_os("CARGO_FEATURE_APK_HOST").is_some();
     if target_is_android && !apk_host {
         // Termux：目标为 android 且未开 apk-host，不跑 tauri-build。
@@ -27,7 +26,10 @@ fn capture_build_info() {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     // git 短提交：HEAD 变化（新提交/切分支）触发本 crate 重编译刷新。
-    println!("cargo:rerun-if-changed={}/../../.git/HEAD", manifest.display());
+    println!(
+        "cargo:rerun-if-changed={}/../../.git/HEAD",
+        manifest.display()
+    );
     let git = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(&manifest)

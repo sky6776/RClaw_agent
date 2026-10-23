@@ -18,8 +18,7 @@ pub(crate) struct ApkRuntime {
 
 /// 进程级共享运行时槽：服务（nativeStart，无 GUI）与 GUI（tauri setup）都经
 /// `crate::agent::assemble_apk_agent` 装配；先装配的一方占槽，另一方采用。
-pub(crate) static APK_RUNTIME: OnceLock<tokio::sync::Mutex<Option<ApkRuntime>>> =
-    OnceLock::new();
+pub(crate) static APK_RUNTIME: OnceLock<tokio::sync::Mutex<Option<ApkRuntime>>> = OnceLock::new();
 
 pub(crate) fn apk_runtime_slot() -> &'static tokio::sync::Mutex<Option<ApkRuntime>> {
     APK_RUNTIME.get_or_init(|| tokio::sync::Mutex::new(None))
@@ -57,10 +56,7 @@ pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeInit(
             "files_dir": dir.trim(),
         })
         .to_string();
-        rclaw_android::record_host_context(
-            std::path::PathBuf::from(dir.trim()),
-            minimal,
-        );
+        rclaw_android::record_host_context(std::path::PathBuf::from(dir.trim()), minimal);
         Ok(())
     })();
     result_string(env, result)
@@ -108,15 +104,13 @@ pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeStart(
                     // 若被 drop，agent/心跳/cron 等全部 tokio 任务随之取消——
                     // 心跳停喂，Java 看门狗 150s 后判死杀进程（偶发前台退出的
                     // 真因）。该 runtime 本就是进程级全局运行时，随进程共存亡。
-                    let runtime: &'static tokio::runtime::Runtime = Box::leak(
-                        Box::new(
-                            tokio::runtime::Builder::new_multi_thread()
-                                .worker_threads(2)
-                                .enable_all()
-                                .build()
-                                .expect("构建 APK 无头 tokio runtime 失败"),
-                        ),
-                    );
+                    let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+                        tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(2)
+                            .enable_all()
+                            .build()
+                            .expect("构建 APK 无头 tokio runtime 失败"),
+                    ));
                     runtime.block_on(async move {
                         let mut slot = apk_runtime_slot().lock().await;
                         if slot.is_some() {

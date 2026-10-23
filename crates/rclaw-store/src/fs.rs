@@ -265,7 +265,10 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     // 孤儿 sidecar，cron / memory 等周期性写入会反复失败、反复残留，磁盘越写越满，
     // 永远恢复不了。两处 rename 成功后解除守卫（tmp 已不在）。守卫在 create_new 成功之后
     // 才武装：open 以 AlreadyExists 失败时该文件属于别的写入方，不能替它删。
-    let mut tmp_guard = TmpGuard { path: &tmp, armed: false };
+    let mut tmp_guard = TmpGuard {
+        path: &tmp,
+        armed: false,
+    };
     {
         let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         tmp_guard.armed = true;

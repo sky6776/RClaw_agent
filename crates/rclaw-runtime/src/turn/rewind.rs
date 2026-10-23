@@ -84,7 +84,10 @@ tokio::task_local! {
 
 /// 当前会话键；作用域外（嵌入方直调工具）返回 None。
 pub(crate) fn current_chat() -> Option<(String, String)> {
-    CURRENT_CHAT.try_with(std::clone::Clone::clone).ok().flatten()
+    CURRENT_CHAT
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
 }
 
 /// 生成 rewind 分组 id（回滚点 id）：纳秒时间戳 + 原子单调保障（同一进程内严格递增）。
@@ -94,9 +97,7 @@ pub(crate) fn current_chat() -> Option<(String, String)> {
 pub(crate) fn next_rewind_id() -> i64 {
     static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     use std::sync::atomic::Ordering;
-    let mut now = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or_default();
+    let mut now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     loop {
         let last = LAST.load(Ordering::Relaxed);
         if now <= last {
@@ -317,10 +318,7 @@ pub(crate) fn capture_before(
                 Ok(Some(bytes)) => match String::from_utf8(bytes) {
                     Ok(text) => Some(text),
                     Err(_) => {
-                        tracing::debug!(
-                            "rewind：{} 不是 UTF-8 文本，不记录",
-                            resolved.display()
-                        );
+                        tracing::debug!("rewind：{} 不是 UTF-8 文本，不记录", resolved.display());
                         return None;
                     }
                 },
@@ -365,7 +363,8 @@ fn read_bounded(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read as _;
     let file = rclaw_tools::files::open_regular_file(path)?;
     let mut bytes = Vec::new();
-    file.take(MAX_CHECKPOINT_BYTES + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_CHECKPOINT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= MAX_CHECKPOINT_BYTES).then_some(bytes))
 }
 
@@ -417,7 +416,13 @@ fn flush(
     group_id: i64,
     checkpoints: Vec<FileCheckpoint>,
 ) {
-    flush_records(session, channel, chat_id, group_id, &into_records(checkpoints));
+    flush_records(
+        session,
+        channel,
+        chat_id,
+        group_id,
+        &into_records(checkpoints),
+    );
 }
 
 /// `rewind_files` 工具：按回滚点 id 选点恢复文件（无 `rewind_id` 时列出最近分组）。
@@ -497,14 +502,14 @@ impl rclaw_tools::Tool for RewindFilesTool {
                 }
             }
             _ => {
-                let groups = tokio::task::spawn_blocking(move || {
-                    list_groups(&session, &channel, &chat_id)
-                })
-                .await
-                .unwrap_or_default();
+                let groups =
+                    tokio::task::spawn_blocking(move || list_groups(&session, &channel, &chat_id))
+                        .await
+                        .unwrap_or_default();
                 if groups.is_empty() {
                     return rclaw_tools::ToolResult::ok(
-                        "本会话还没有可回滚点（仅 write/edit/delete 会被 checkpoint）。".to_string(),
+                        "本会话还没有可回滚点（仅 write/edit/delete 会被 checkpoint）。"
+                            .to_string(),
                     );
                 }
                 let mut out = format!("可回滚点（最近 {} 组，新在前）：", groups.len());
@@ -583,7 +588,9 @@ fn broken_chains(records: &[FileCheckpointMeta]) -> Vec<String> {
 /// 把文件置为目标状态：Some = 写入内容；None = 删除（已不存在视为成功）。
 fn apply_state(path: &Path, desired: Option<&[u8]>) -> Result<(), String> {
     match desired {
-        Some(bytes) => rclaw_store::fs::atomic_write(path, bytes).map_err(|error| error.to_string()),
+        Some(bytes) => {
+            rclaw_store::fs::atomic_write(path, bytes).map_err(|error| error.to_string())
+        }
         None => match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -896,7 +903,8 @@ fn restore_meta_window(
             anchor_message_id: None,
         })
         .collect();
-    if let Err(error) = session.append_file_checkpoints(channel, chat_id, marker_group_id, &markers) {
+    if let Err(error) = session.append_file_checkpoints(channel, chat_id, marker_group_id, &markers)
+    {
         tracing::warn!("rewind 重锚标记写入失败（后续更早选点的回滚可能被判为外部改动）: {error}");
     }
 
@@ -1006,7 +1014,9 @@ mod tests {
             "沙箱下未放行的工作区外路径不读"
         );
         // Unrestricted 下同一路径照常捕获。
-        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let captured = runtime.block_on(rclaw_tools::access::scope_access(
             rclaw_core::ToolAccess::Unrestricted,
             async { capture_before("write", &json!({"path": outside.to_string_lossy()}), &base) },
@@ -1051,7 +1061,9 @@ mod tests {
         let link = base.join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         // Unrestricted：沙箱门不会先拦下指向工作区外的链接，走到条目判断这一步。
-        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let captured = runtime.block_on(rclaw_tools::access::scope_access(
             rclaw_core::ToolAccess::Unrestricted,
             async {
@@ -1072,8 +1084,14 @@ mod tests {
         let error = current_file_hash(&base.join("a.txt")).unwrap_err();
         assert!(error.to_string().contains("符号链接"), "{error}");
         let error = restore_to_point(&session, "cli", "console", 100).unwrap_err();
-        assert!(error.contains("无法读取") && error.contains("符号链接"), "{error}");
-        assert!(std::fs::symlink_metadata(base.join("a.txt")).unwrap().file_type().is_symlink());
+        assert!(
+            error.contains("无法读取") && error.contains("符号链接"),
+            "{error}"
+        );
+        assert!(std::fs::symlink_metadata(base.join("a.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "secret");
     }
 
@@ -1128,7 +1146,10 @@ mod tests {
         write_file(&file_a, "keep me");
         // 消息 100：删除 a。
         let c1 = checkpointed_write(&base, "a.txt", None);
-        assert!(c1.after_hash.is_none(), "删除后 after_hash 必须是 None 而非 0");
+        assert!(
+            c1.after_hash.is_none(),
+            "删除后 after_hash 必须是 None 而非 0"
+        );
         flush(&session, "cli", "console", 100, vec![c1]);
         // 消息 200：新建 b。
         let c2 = checkpointed_write(&base, "b.txt", Some("later"));
@@ -1175,7 +1196,11 @@ mod tests {
         write_file(&file_a, "externally edited");
         let error = restore_to_point(&session, "cli", "console", 300).unwrap_err();
         assert!(error.contains("外部改动"), "{error}");
-        assert_eq!(std::fs::read_to_string(&file_b).unwrap(), "v2b", "all-or-nothing");
+        assert_eq!(
+            std::fs::read_to_string(&file_b).unwrap(),
+            "v2b",
+            "all-or-nothing"
+        );
     }
 
     #[test]
@@ -1198,7 +1223,11 @@ mod tests {
         // 回滚到 100：回滚集 = c1, c2（+ 刚才的回滚标记），c2.before != c1.after → 拒绝。
         let error = restore_to_point(&session, "cli", "console", 100).unwrap_err();
         assert!(error.contains("未记录的改动"), "{error}");
-        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "shell edit", "拒绝时不动文件");
+        assert_eq!(
+            std::fs::read_to_string(&file_a).unwrap(),
+            "shell edit",
+            "拒绝时不动文件"
+        );
 
         // 回滚标记重锚：标记之后的新写入以标记的 after_hash 为起点，不算断链——
         // 再次回滚到 200 的窗口 = [c2, 标记, c3, 标记]，c3.before 接上标记的 after。
@@ -1266,7 +1295,10 @@ mod tests {
     fn rewind_ids_are_unique_and_monotonic() {
         let first = next_rewind_id();
         let second = next_rewind_id();
-        assert!(second > first, "回滚点 id 必须严格递增: {first} vs {second}");
+        assert!(
+            second > first,
+            "回滚点 id 必须严格递增: {first} vs {second}"
+        );
         let ids: Vec<i64> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| scope.spawn(|| (0..64).map(|_| next_rewind_id()).collect::<Vec<_>>()))
@@ -1388,7 +1420,11 @@ mod message_rollback_tests {
         assert!(changed);
         assert_eq!(count, 2, "目标是 m3 的 a.txt 写入与新建的 b.txt");
         assert!(report.contains("1 个文件恢复原内容"), "{report}");
-        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v3", "m3 的 v4 被撤销");
+        assert_eq!(
+            std::fs::read_to_string(&file_a).unwrap(),
+            "v3",
+            "m3 的 v4 被撤销"
+        );
         assert!(!file_b.exists(), "锚点之后新建的 b 随回滚删除");
 
         // 回滚到 m1（撤销 > m1 全部）：a 目标 = m2 的 before = v2。
@@ -1413,7 +1449,11 @@ mod message_rollback_tests {
         toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
         let err = restore_to_message_lenient(&session, "cli", "console", m1).unwrap_err();
         assert!(err.contains("未记录的改动"), "{err}");
-        assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v3", "拒绝时不动文件");
+        assert_eq!(
+            std::fs::read_to_string(&file_a).unwrap(),
+            "v3",
+            "拒绝时不动文件"
+        );
 
         // 无锚点后的写入：宽松语义不算错（changed=false + 说明，不是静默成功）。
         let (changed, count, note) =
@@ -1565,17 +1605,25 @@ mod message_rollback_tests {
 
         let (_m1, _) = toolchain_write(&session, &base, "a.txt", Some("v2"), 0);
         // /rewind 回到 m1 之前：a = v1，落重锚标记（after = v1）。
-        let group = load_meta(&session, "cli", "console").last().unwrap().group_id;
+        let group = load_meta(&session, "cli", "console")
+            .last()
+            .unwrap()
+            .group_id;
         restore_to_point(&session, "cli", "console", group).expect("/rewind 应成功");
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v1");
 
         let anchor = session
-            .append("cli", "console", &Message::plain(Role::User, "回滚后的新消息"))
+            .append(
+                "cli",
+                "console",
+                &Message::plain(Role::User, "回滚后的新消息"),
+            )
             .unwrap();
         let (_m2, _) = toolchain_write(&session, &base, "a.txt", Some("v3"), 1);
 
-        let (changed, _count, report) = restore_to_message_lenient(&session, "cli", "console", anchor)
-            .expect("重锚标记是真实前驱，不得误判断链");
+        let (changed, _count, report) =
+            restore_to_message_lenient(&session, "cli", "console", anchor)
+                .expect("重锚标记是真实前驱，不得误判断链");
         assert!(changed);
         assert_eq!(std::fs::read_to_string(&file_a).unwrap(), "v1", "{report}");
         // 标记之前没有外部改动的事实不变：真有未记录改动仍能检出。

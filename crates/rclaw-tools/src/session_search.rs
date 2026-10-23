@@ -277,8 +277,16 @@ mod tests {
             .execute(json!({"query": "nginx 502", "limit": 5}))
             .await;
         assert!(!hit.is_error, "{}", hit.content);
-        assert!(hit.content.contains("\"chat_id\":\"main\""), "{}", hit.content);
-        assert!(hit.content.contains("\"channel\":\"desktop\""), "{}", hit.content);
+        assert!(
+            hit.content.contains("\"chat_id\":\"main\""),
+            "{}",
+            hit.content
+        );
+        assert!(
+            hit.content.contains("\"channel\":\"desktop\""),
+            "{}",
+            hit.content
+        );
         // assistant 回复不含查询词，AND 语义下不命中——召回的是 user 消息本身。
         assert!(
             hit.content.contains("deploy nginx got 502"),
@@ -342,10 +350,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = store(dir.path());
         let first = session
-            .append("cli", "console", &Message::plain(Role::User, "nginx earliest question"))
+            .append(
+                "cli",
+                "console",
+                &Message::plain(Role::User, "nginx earliest question"),
+            )
             .unwrap();
         session
-            .append("cli", "console", &Message::plain(Role::Assistant, "early reply"))
+            .append(
+                "cli",
+                "console",
+                &Message::plain(Role::Assistant, "early reply"),
+            )
             .unwrap();
         let kept = session
             .append("cli", "console", &Message::plain(Role::User, "follow up"))
@@ -366,7 +382,11 @@ mod tests {
             .all(|m| m.id != first));
         let tool = SessionSearchTool::new(session);
         let hit = tool.execute(json!({"query": "earliest"})).await;
-        assert!(hit.content.contains("nginx earliest question"), "{}", hit.content);
+        assert!(
+            hit.content.contains("nginx earliest question"),
+            "{}",
+            hit.content
+        );
     }
 
     #[tokio::test]
@@ -375,11 +395,19 @@ mod tests {
         let session = store(dir.path());
         for i in 0..(MAX_MATCHES_PER_SESSION + 5) {
             session
-                .append("cli", "noisy", &Message::plain(Role::User, format!("token {i}")))
+                .append(
+                    "cli",
+                    "noisy",
+                    &Message::plain(Role::User, format!("token {i}")),
+                )
                 .unwrap();
         }
         session
-            .append("cli", "dense", &Message::plain(Role::User, "token token token"))
+            .append(
+                "cli",
+                "dense",
+                &Message::plain(Role::User, "token token token"),
+            )
             .unwrap();
         let tool = SessionSearchTool::new(session);
         let hit = tool.execute(json!({"query": "token", "limit": 1})).await;

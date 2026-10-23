@@ -10,7 +10,10 @@
 
 // 通知状态机的调用方都在 cfg(android+apk-host) 的装配/事件桥里（agent.rs 的
 // status tap、装配闭包等）；桌面与 bin target 编译时无调用方，压掉 dead_code。
-#![cfg_attr(not(all(target_os = "android", feature = "apk-host")), allow(dead_code))]
+#![cfg_attr(
+    not(all(target_os = "android", feature = "apk-host")),
+    allow(dead_code)
+)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -144,7 +147,9 @@ pub fn turn_finished(chat_id: &str, reply: &str) {
         s.last_chat = Some(chat_id.to_string());
         (was_busy, s.busy.is_empty())
     };
-    tracing::debug!("[status] turn_finished chat={chat_id} was_busy={was_busy} now_idle={now_idle}");
+    tracing::debug!(
+        "[status] turn_finished chat={chat_id} was_busy={was_busy} now_idle={now_idle}"
+    );
     if now_idle {
         refresh_idle();
     }
@@ -310,7 +315,8 @@ pub fn spawn_idle_refresher() {
             let idle = {
                 let now = Instant::now();
                 let mut s = state().lock().unwrap();
-                s.busy.retain(|_, at| now.duration_since(*at) < BUSY_TIMEOUT);
+                s.busy
+                    .retain(|_, at| now.duration_since(*at) < BUSY_TIMEOUT);
                 s.busy.is_empty()
             };
             if idle {

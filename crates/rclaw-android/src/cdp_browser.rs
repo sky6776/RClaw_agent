@@ -100,7 +100,8 @@ impl DevtoolsTransport for AndroidTransport {
             height = info.height,
             dpr = info.dpr,
             "WebView 会话就绪（离屏布局物理像素；CSS 视口 = 物理/dpr）"
-        );        let socket_name = format!("webview_devtools_remote_{}", info.pid);
+        );
+        let socket_name = format!("webview_devtools_remote_{}", info.pid);
         // WebView 创建后调试 socket 就绪有延迟：整体带重试。
         let mut last = String::new();
         for _ in 0..12 {
@@ -112,7 +113,9 @@ impl DevtoolsTransport for AndroidTransport {
                 }
             }
         }
-        Err(format!("连接 WebView DevTools 失败（连续重试超限）: {last}"))
+        Err(format!(
+            "连接 WebView DevTools 失败（连续重试超限）: {last}"
+        ))
     }
 
     async fn shutdown(&self) -> Result<(), String> {
@@ -202,11 +205,11 @@ mod socket_layer {
     pub(super) async fn connect_abstract_socket(
         socket_name: &str,
     ) -> anyhow::Result<tokio::net::UnixStream> {
-        use std::os::unix::net::SocketAddr as StdSocketAddr;
-        #[cfg(target_os = "linux")]
-        use std::os::linux::net::SocketAddrExt as _;
         #[cfg(target_os = "android")]
         use std::os::android::net::SocketAddrExt as _;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt as _;
+        use std::os::unix::net::SocketAddr as StdSocketAddr;
         let addr = StdSocketAddr::from_abstract_name(socket_name.as_bytes())?;
         // tokio 的 UnixStream 没有暴露 connect_addr：std 连接（本地套接字，
         // 毫秒级）后转 tokio。

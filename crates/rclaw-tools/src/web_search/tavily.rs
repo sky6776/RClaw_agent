@@ -15,8 +15,8 @@ use super::control::WebSearchControl;
 use super::render::limit_output;
 use super::types::{
     normalize_api_key, normalize_base_url, read_response_capped, validate_public_http_url,
-    BackendError, BackendId, ReadResponse, ReaderBackend, SearchBackend, SearchHit,
-    SearchRequest, SearchResponse,
+    BackendError, BackendId, ReadResponse, ReaderBackend, SearchBackend, SearchHit, SearchRequest,
+    SearchResponse,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.tavily.com";

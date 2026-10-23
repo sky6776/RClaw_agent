@@ -487,7 +487,10 @@ fn skills_section_is_optional_and_parses() {
 
     // deny_unknown_fields：拼错键名必须在启动期暴露。
     let res = parse_config_text("[skills]\nmax_output = 131072\n");
-    assert!(res.is_err(), "deny_unknown_fields 应拒绝未声明的 [skills] 字段");
+    assert!(
+        res.is_err(),
+        "deny_unknown_fields 应拒绝未声明的 [skills] 字段"
+    );
 }
 
 #[test]
@@ -508,10 +511,10 @@ fn legacy_section_with_windows_path_still_loads() {
     // 归一化必须先行——`\U` 会让 toml_edit 解析失败、遗留节剥不掉，带病解析
     // 仍然失败。回归用例（codex review 第 3 轮）：load_from_dir 曾先剥离后
     // 归一化，这种配置启动即「解析 rclaw.toml 失败」。
-    let text = "[web_browser]\nengine = \"baidu\"\n\n[agent]\nbase_dir = \"C:\\Users\\alice\\rclaw\"\n";
+    let text =
+        "[web_browser]\nengine = \"baidu\"\n\n[agent]\nbase_dir = \"C:\\Users\\alice\\rclaw\"\n";
     assert!(text.contains("\\U"), "用例应含非法转义 \\U");
-    let cfg = parse_config_text(text)
-        .unwrap_or_else(|e| panic!("parse failed: {e:#}"));
+    let cfg = parse_config_text(text).unwrap_or_else(|e| panic!("parse failed: {e:#}"));
     // 遗留节已剥离、其余配置正常生效（agent.base_dir 归一化为合法 TOML 转义）。
     assert!(cfg.agent.base_dir.starts_with("C:\\Users\\alice\\rclaw"));
 }

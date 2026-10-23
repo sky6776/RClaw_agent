@@ -124,7 +124,9 @@ fn is_artifact_chat_dir_name(name: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         && hash.len() == 16
-        && hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// 删除某会话的 artifact 目录（工具结果落盘句柄的实体；会话删除时级联清理）。
@@ -264,8 +266,7 @@ impl SessionStore {
     /// 测试 / 原型便捷构造：打开失败直接 panic。生产路径请用 [`Self::open`]。
     pub fn new(layout: Layout) -> Self {
         let path = layout.db_file.clone();
-        Self::open(layout)
-            .unwrap_or_else(|e| panic!("打开状态库失败（{}）: {e}", path.display()))
+        Self::open(layout).unwrap_or_else(|e| panic!("打开状态库失败（{}）: {e}", path.display()))
     }
 
     /// 由已打开的库构造（与 [`JournalStore`] 共享同一连接）。
@@ -879,7 +880,10 @@ impl SessionStore {
                 continue;
             }
             if let Err(error) = std::fs::copy(entry.path(), target.join(entry.file_name())) {
-                tracing::warn!("artifact 文件复制失败（{}）: {error}", entry.path().display());
+                tracing::warn!(
+                    "artifact 文件复制失败（{}）: {error}",
+                    entry.path().display()
+                );
             }
         }
     }
@@ -1038,7 +1042,10 @@ impl SessionStore {
                 continue;
             }
             if let Err(error) = std::fs::remove_dir_all(entry.path()) {
-                tracing::warn!("artifact 目录清理失败（{}）: {error}", entry.path().display());
+                tracing::warn!(
+                    "artifact 目录清理失败（{}）: {error}",
+                    entry.path().display()
+                );
             }
         }
         Ok(())
@@ -1092,7 +1099,10 @@ impl SessionStore {
         let mut out = String::new();
         for (msg, meta) in self.load_transcript_with_meta(channel, chat_id)? {
             let mut value = serde_json::to_value(&msg)?;
-            if let Some(meta) = meta.as_deref().and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()) {
+            if let Some(meta) = meta
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            {
                 if let Some(object) = value.as_object_mut() {
                     object.insert("meta".to_string(), meta);
                 }
@@ -1323,7 +1333,12 @@ impl SessionStore {
         })
     }
 
-    pub fn delete_usage_anchor(&self, channel: &str, chat_id: &str, cron_job_id: &str) -> Result<()> {
+    pub fn delete_usage_anchor(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        cron_job_id: &str,
+    ) -> Result<()> {
         self.db.with(|conn| {
             conn.execute(
                 "DELETE FROM usage_anchor WHERE channel = ?1 AND chat_id = ?2 AND cron_job_id = ?3",
@@ -1381,9 +1396,8 @@ fn ensure_session(conn: &Connection, channel: &str, chat_id: &str) -> Result<i64
          updated_at = max(session.updated_at, excluded.updated_at)",
         params![channel, chat_id, now],
     )?;
-    session_id(conn, channel, chat_id)?.ok_or_else(|| {
-        StoreError::Other(format!("会话行创建后不可见: {channel}/{chat_id}"))
-    })
+    session_id(conn, channel, chat_id)?
+        .ok_or_else(|| StoreError::Other(format!("会话行创建后不可见: {channel}/{chat_id}")))
 }
 
 /// 取（或创建）会话行但不刷新 `updated_at`（纯 checkpoint 写入等非对话活动）。
@@ -1397,9 +1411,8 @@ fn ensure_session_untouched(conn: &Connection, channel: &str, chat_id: &str) -> 
          ON CONFLICT(channel, chat_id) DO NOTHING",
         params![channel, chat_id, now],
     )?;
-    session_id(conn, channel, chat_id)?.ok_or_else(|| {
-        StoreError::Other(format!("会话行创建后不可见: {channel}/{chat_id}"))
-    })
+    session_id(conn, channel, chat_id)?
+        .ok_or_else(|| StoreError::Other(format!("会话行创建后不可见: {channel}/{chat_id}")))
 }
 
 /// 最后一个 compaction boundary 行:`(id, 已解析 meta)`。
@@ -1412,10 +1425,10 @@ fn latest_boundary(conn: &Connection, sid: i64) -> Result<Option<(i64, Compactio
         "SELECT id, meta FROM message WHERE session_id = ?1 AND meta IS NOT NULL \
          ORDER BY id DESC LIMIT 32",
     )?;
-    let mut rows = stmt.query_map(params![sid], |row| {
+    let rows = stmt.query_map(params![sid], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
-    while let Some(row) = rows.next() {
+    for row in rows {
         let (id, raw): (i64, String) = row?;
         if let Some(meta) = CompactionMeta::parse(&raw) {
             return Ok(Some((id, meta)));
@@ -1471,7 +1484,10 @@ fn validate_compaction_anchors(
             )));
         }
         if let Some(head_until) = head_until {
-            if prev.head_until.is_none_or(|prev_head| head_until > prev_head) {
+            if prev
+                .head_until
+                .is_none_or(|prev_head| head_until > prev_head)
+            {
                 return Err(StoreError::Other(format!(
                     "compaction 锚点非法：head_until={head_until} 超出上一 boundary（id={prev_id}）\
                      的受保护头部 {:?}",
@@ -1637,7 +1653,9 @@ fn query_raw<P: rusqlite::Params>(
     params: P,
 ) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare_cached(sql)?;
-    let rows = stmt.query_map(params, |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map(params, |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -1672,7 +1690,11 @@ fn parse_rows(rows: Vec<(i64, String)>) -> Vec<Message> {
 /// `limit = Some(n)`：调用方只要视图末尾 n 行（`load_history` 的条数裁剪）——没有 boundary
 /// 时直接 `ORDER BY id DESC LIMIT n`；有 boundary 时先取 `after` 段末尾 n 行，够数就不再
 /// 读前面三段。结果与读全量再截尾一致。
-fn load_active_raw(conn: &Connection, sid: i64, limit: Option<usize>) -> Result<Vec<(i64, String)>> {
+fn load_active_raw(
+    conn: &Connection,
+    sid: i64,
+    limit: Option<usize>,
+) -> Result<Vec<(i64, String)>> {
     let boundary = latest_boundary(conn, sid)?;
     let full_history = |conn: &Connection| -> Result<Vec<(i64, String)>> {
         match limit {

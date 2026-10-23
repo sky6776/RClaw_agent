@@ -105,7 +105,11 @@ pub(super) fn render_transcript(messages: &[Message], max_chars: usize) -> Rende
         tail_start -= 1;
     }
     let clip_last = tail_start == blocks.len() && tail_start > head_end;
-    let elided_end = if clip_last { tail_start - 1 } else { tail_start };
+    let elided_end = if clip_last {
+        tail_start - 1
+    } else {
+        tail_start
+    };
     let elided = head_end..elided_end;
     let mut text = String::with_capacity(max_chars.min(head_used + marker_reserve + tail_budget));
     for block in &blocks[..head_end] {
@@ -128,7 +132,11 @@ pub(super) fn render_transcript(messages: &[Message], max_chars: usize) -> Rende
     RenderedTranscript {
         text,
         elided,
-        clipped_last: if clip_last { Some(tail_start - 1) } else { None },
+        clipped_last: if clip_last {
+            Some(tail_start - 1)
+        } else {
+            None
+        },
     }
 }
 
@@ -155,7 +163,9 @@ pub(super) fn render_message_content(message: &Message) -> String {
     }
     for block in &message.content {
         match block {
-            ContentBlock::Text { text } => parts.push(truncate_chars(text, TRANSCRIPT_TEXT_MAX_CHARS)),
+            ContentBlock::Text { text } => {
+                parts.push(truncate_chars(text, TRANSCRIPT_TEXT_MAX_CHARS))
+            }
             ContentBlock::MediaUrl { kind, url } => parts.push(format!(
                 "[{kind:?} attachment: {}]",
                 truncate_chars(url, 200)

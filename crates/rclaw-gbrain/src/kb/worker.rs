@@ -3615,19 +3615,18 @@ fn run_priority_workers(engine: &SqliteEngine, config: &Config) -> bool {
         // catch_unwind，reembed / ocr 等其余 worker 的 rt::block_on 一旦 panic
         // 会直接杀死 kb-worker 线程且不留日志，job 永久卡 running（孤儿回收
         // 只在进程启动时跑）。统一在调用层把 panic 转成 Err 走可恢复告警路径。
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            worker_fn(engine, config)
-        }))
-        .unwrap_or_else(|panic_payload| {
-            let detail = panic_payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| panic_payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown panic".to_string());
-            Err(crate::error::GBrainError::Internal(format!(
-                "{name} worker panic: {detail}"
-            )))
-        });
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker_fn(engine, config)))
+                .unwrap_or_else(|panic_payload| {
+                    let detail = panic_payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic_payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    Err(crate::error::GBrainError::Internal(format!(
+                        "{name} worker panic: {detail}"
+                    )))
+                });
         match outcome {
             Ok(true) => return true, // 有作业被处理，立即返回重新轮询
             Ok(false) => continue,   // 无作业，尝试下一个

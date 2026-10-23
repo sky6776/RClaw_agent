@@ -87,8 +87,8 @@ fn is_banned_ip(ip: std::net::IpAddr) -> bool {
 /// `resolve_to_addrs` 钉死连接目标（防 DNS rebinding），多地址保留连接
 /// 回退（如 IPv6 不通走 IPv4），不再只取首选。
 async fn validate_url(raw: &str) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
-    let parsed: reqwest::Url = reqwest::Url::parse(raw.trim())
-        .map_err(|e| format!("URL 无效：{e}"))?;
+    let parsed: reqwest::Url =
+        reqwest::Url::parse(raw.trim()).map_err(|e| format!("URL 无效：{e}"))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(format!("仅支持 http/https，收到 {}", parsed.scheme()));
     }
@@ -127,7 +127,12 @@ async fn validate_url(raw: &str) -> Result<(String, String, Vec<std::net::Socket
 
 /// 从 Content-Type 推断扩展名（无或通用类型返回空串，保持原文件名）。
 fn ext_from_content_type(ct: &str) -> &'static str {
-    let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let mime = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     match mime.as_str() {
         "image/jpeg" | "image/jpg" => ".jpg",
         "image/png" => ".png",
@@ -154,8 +159,8 @@ fn ext_from_content_type(ct: &str) -> &'static str {
 fn sanitize_file_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
-        let banned = matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
-            || ch.is_control();
+        let banned =
+            matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control();
         let allowed = ch.is_ascii_alphanumeric()
             || matches!(ch, '_' | '-' | '.')
             || matches!(ch, '\u{4E00}'..='\u{9FFF}');
@@ -183,8 +188,8 @@ const CHAT_CARD_EXTS: &[&str] = &[
 /// 系统查看器/播放器（NativeBridge.openMedia 按扩展名定 MIME）可接受的
 /// 媒体扩展名 = 卡片白名单 + 音频等。保留这些后缀不剥离。
 const PLAYER_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "mp4", "webm", "m4v", "mov", "mkv",
-    "mp3", "m4a", "aac", "wav", "ogg", "flac",
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "mp4", "webm", "m4v", "mov", "mkv", "mp3",
+    "m4a", "aac", "wav", "ogg", "flac",
 ];
 
 /// 目标文件名原子预留：用户指定优先（清洗），否则取 URL 末段；后缀不是已知
@@ -285,12 +290,11 @@ impl Tool for DownloadMedia {
         // 避免「头阶段耗光后再给正文一整轮」的隐性翻倍。
         let deadline = tokio::time::Instant::now() + TOTAL_TIMEOUT;
         let (url, host, pinned_addrs) =
-            match tokio::time::timeout_at(deadline, validate_url(url_raw)).await
-            {
-            Ok(Ok(ok)) => ok,
-            Ok(Err(error)) => return ToolResult::err(error),
-            Err(_) => return ToolResult::err("整体超时：主机解析耗时超过总时限"),
-        };
+            match tokio::time::timeout_at(deadline, validate_url(url_raw)).await {
+                Ok(Ok(ok)) => ok,
+                Ok(Err(error)) => return ToolResult::err(error),
+                Err(_) => return ToolResult::err("整体超时：主机解析耗时超过总时限"),
+            };
 
         // 沙箱包含性校验先于任何文件系统写入（fail-closed）：media 或 media/
         // download 若是链出工作区的符号链接/junction，在这里就拒绝，而不是
@@ -299,10 +303,7 @@ impl Tool for DownloadMedia {
         let base_canonical = match self.base.canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                return ToolResult::err(format!(
-                    "工作区根不可达（{}）: {e}",
-                    self.base.display()
-                ))
+                return ToolResult::err(format!("工作区根不可达（{}）: {e}", self.base.display()))
             }
         };
         {
@@ -345,9 +346,7 @@ impl Tool for DownloadMedia {
             Err(e) => return ToolResult::err(format!("media/download 不可达: {e}")),
         };
         if !dir_canonical.starts_with(&base_canonical) {
-            return ToolResult::err(
-                "media/download 物理指向工作区之外——拒绝下载（防越区写入）",
-            );
+            return ToolResult::err("media/download 物理指向工作区之外——拒绝下载（防越区写入）");
         }
 
         // resolve 钉死已验证地址（DNS rebinding 防线）；重定向只跟同主机
@@ -379,8 +378,7 @@ impl Tool for DownloadMedia {
             let response = client.get(&url).send().await?;
             response.error_for_status()
         };
-        let response = match tokio::time::timeout_at(deadline, request).await
-        {
+        let response = match tokio::time::timeout_at(deadline, request).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return ToolResult::err(format!("下载请求失败: {error}")),
             Err(_) => {
@@ -486,9 +484,7 @@ impl Tool for DownloadMedia {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
-                    return ToolResult::err(format!(
-                        "创建临时文件失败: {error}（清理由守卫完成）"
-                    ));
+                    return ToolResult::err(format!("创建临时文件失败: {error}（清理由守卫完成）"));
                 }
             };
             break (temp, tokio::fs::File::from_std(std_file));
@@ -566,7 +562,11 @@ impl Tool for DownloadMedia {
         ToolResult::ok(format!(
             "已下载：{rel}（{}，{:.1} MB）。
 {card_note}",
-            if content_type.is_empty() { "未知类型" } else { content_type.as_str() },
+            if content_type.is_empty() {
+                "未知类型"
+            } else {
+                content_type.as_str()
+            },
             written as f64 / 1024.0 / 1024.0
         ))
     }
