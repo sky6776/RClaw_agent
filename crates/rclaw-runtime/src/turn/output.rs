@@ -9,24 +9,26 @@ use super::*;
 /// 注入位置永远是「当前 session tail 之后」（已闭合：要么 [当前 user]、要么 […完整 tool chain]），
 /// 因此不会插进 `assistant(tool_calls)` 与 `tool_result` 中间，满足 OpenAI 兼容协议的邻接约束。
 ///
-/// 返回值表示是否注入了至少一条真实用户消息。调用方在 tool_calls 执行前用它决定是否
-/// 跳过旧 tool_calls 并重新请求 LLM。
+/// 追加的用户消息原文（`display_content`）按序返回，供调用方把补充并入 turn 目标
+/// （完成闸门「目标点名的动作必须本 turn 回执证明」据此覆盖补充内容）；空 vec 表示
+/// 没有真实用户补充。调用方在 tool_calls 执行前用它决定是否跳过旧 tool_calls 并重新
+/// 请求 LLM。
 pub(super) async fn drain_append_interjections(
     session: &SessionStore,
     messages: &mut Vec<Message>,
     event_rx: &mut mpsc::Receiver<Interjection>,
     deferred: &mut Vec<BusMessage>,
-) -> bool {
-    let mut appended_user = false;
+) -> Vec<String> {
+    let mut appended = Vec::new();
     while let Ok(Interjection::AppendMessage(extra)) = event_rx.try_recv() {
         if extra.source() == MessageSource::User {
             persist_and_push_user(session, messages, &extra).await;
-            appended_user = true;
+            appended.push(extra.display_content().to_string());
         } else {
             deferred.push(extra);
         }
     }
-    appended_user
+    appended
 }
 
 /// 把一条补充文本作为 user 消息：先持久化到 session 安全位置（tail），再追加进内存 messages。

@@ -24,8 +24,8 @@ use super::effect::{
     tool_call_is_effectful, tool_effect_key, truncate_status_text,
 };
 use super::external_action::{
-    claimed_external_actions, contains_generic_completion_claim, requested_external_actions,
-    tool_receipt_matches_action,
+    cited_receipt_ids, claimed_external_actions, contains_generic_completion_claim,
+    requested_external_actions, tool_receipt_matches_action, ExternalAction,
 };
 use super::media::{
     finalize_media_reply, is_media_control_line, media_channel_available,
@@ -60,6 +60,17 @@ pub(crate) struct ToolReceipt {
     pub(crate) summary: String,
 }
 
+/// 跨 turn 账本条目：成功副作用回执 + 归档时按【完整输入】判定的动作类别集合。
+///
+/// 类别必须在入账时冻结：账本里的 input 是缩减后的（防内存膨胀），截断可能丢掉
+/// `--dry-run` 这类安全限定词或动作本身，用缩减值重新判定会改变回执能证明什么
+/// （codex r3：`git commit … --dry-run && mkdir` 截断后被误当成提交凭据）。
+#[derive(Debug, Clone)]
+pub(crate) struct ArchivedEffect {
+    pub(crate) receipt: ToolReceipt,
+    pub(crate) actions: HashSet<ExternalAction>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionGateReport {
     pub(crate) result_ok: bool,
@@ -88,19 +99,93 @@ pub(crate) enum LoopDecision {
     },
 }
 
+/// 从文本粗提取「名字.后缀」形文件名 token（小写化，ASCII 范围）。
+///
+/// 跨 turn 对账的守卫信号：目标文本点名了文件（「写入 new.csv」「Append another
+/// row to report.md」）时，本 turn 很可能被要求对该文件做新动作，历史回执不得
+/// 代为作证。后缀要求纯字母且 ≤10 字符（「report.markdown」也要命中，codex r5；
+/// 纯数字后缀是版本号「v2.8.12」不是文件名），尾部句点剥掉（「report.md.」，r5）。
+/// URL 先整段摘除——主机名（example.com）不是文件点名，否则「总结发到 example.com
+/// 的部署」会误禁历史对账（codex r6）。已知边界：纯中文文件名（无 ASCII「名字.
+/// 后缀」形态）提取不到——守卫 fail-open（codex r4 #3），此时退化为类别级对账。
+fn filename_tokens(text: &str) -> Vec<String> {
+    fn push_if_filename(tokens: &mut Vec<String>, token: &str) {
+        let trimmed = token.trim_matches('-').trim_end_matches('.');
+        if let Some((name, ext)) = trimmed.rsplit_once('.') {
+            let ext_len = ext.len();
+            // dotfile（.env/.gitignore）：点前名字为空也算文件点名（codex r20）。
+            let is_dotfile = name.is_empty() && trimmed.len() > 1;
+            if (!name.is_empty() || is_dotfile)
+                && (1..=10).contains(&ext_len)
+                && ext.chars().all(|c| c.is_ascii_alphabetic())
+            {
+                tokens.push(trimmed.to_string());
+            }
+        }
+    }
+    /// 摘掉 http(s):// 起、到空白 / 引号 / 括号 / 非 ASCII 为止的 URL 跨度。
+    fn strip_urls(lower: &str) -> String {
+        fn url_start(rest: &str) -> Option<usize> {
+            match (rest.find("http://"), rest.find("https://")) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            }
+        }
+        let mut out = String::with_capacity(lower.len());
+        let mut rest = lower;
+        while let Some(start) = url_start(rest) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start..];
+            let end = after
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(c, '(' | ')' | '<' | '>' | '"' | '\'')
+                        || !c.is_ascii()
+                })
+                .unwrap_or(after.len());
+            rest = &after[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+    let stripped = strip_urls(&text.to_ascii_lowercase());
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for c in stripped.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+            current.push(c);
+        } else {
+            push_if_filename(&mut tokens, &current);
+            current.clear();
+        }
+    }
+    push_if_filename(&mut tokens, &current);
+    tokens
+}
+
 /// 仅存在于当前 turn 内、每次推理前重新渲染的 Harness 状态。
 ///
 /// 它不写入 canonical session；上下文压缩与后续会话都不会把旧状态栏当成用户消息。
 /// 内核私有：循环只能经 [`Run`] 的意图方法读写。
 #[derive(Debug, Clone)]
 struct AgentStatus {
+    /// 完整目标原文（含 turn 中插队补充）。目标要求的动作判定以此为源——截断版会
+    /// 漏掉靠后的动作请求（codex r2：600 字符外的「写入 new.csv」逃过守卫）。
+    goal_source: String,
+    /// 状态栏渲染用的截断目标。
     goal: String,
+    /// 目标点名要求的外部动作（随 [`Self::extend_goal`] 重算）。
+    requested_actions: HashSet<ExternalAction>,
     effect_base: PathBuf,
     iteration: usize,
     max_iterations: usize,
     total_tool_calls: u32,
     fingerprints: HashMap<String, ToolFingerprintState>,
     receipts: Vec<ToolReceipt>,
+    /// 上一批 turn 末尾归档的成功副作用回执（见 [`Run::seed_effect_receipts`]）。
+    seeded_receipts: Vec<ArchivedEffect>,
     unresolved_effect_errors: HashMap<String, ToolReceipt>,
     last_error: Option<StatusError>,
     circuit_trips: u32,
@@ -112,13 +197,16 @@ struct AgentStatus {
 impl AgentStatus {
     fn new_with_base(goal: &str, max_iterations: usize, effect_base: &Path) -> Self {
         AgentStatus {
+            goal_source: goal.to_string(),
             goal: truncate_status_text(goal, 600),
+            requested_actions: requested_external_actions(goal),
             effect_base: effect_base.to_path_buf(),
             iteration: 0,
             max_iterations,
             total_tool_calls: 0,
             fingerprints: HashMap::new(),
             receipts: Vec::new(),
+            seeded_receipts: Vec::new(),
             unresolved_effect_errors: HashMap::new(),
             last_error: None,
             circuit_trips: 0,
@@ -135,6 +223,17 @@ impl AgentStatus {
 
     fn begin_iteration(&mut self, iteration: usize) {
         self.iteration = iteration;
+    }
+
+    /// 并入 turn 中到达的用户补充（插队消息），目标要求的动作集合随之重算——
+    /// 否则补充里点名的动作（「写入 new.csv」）逃过完成闸门的目标约束（codex r2）。
+    fn extend_goal(&mut self, extras: &[String]) {
+        for extra in extras {
+            self.goal_source.push('\n');
+            self.goal_source.push_str(extra);
+        }
+        self.requested_actions = requested_external_actions(&self.goal_source);
+        self.goal = truncate_status_text(&self.goal_source, 600);
     }
 
     fn record_llm_error(&mut self, error: &LlmError) {
@@ -292,18 +391,25 @@ impl AgentStatus {
             Some(reasoning) => format!("{final_text}\n{reasoning}"),
             None => final_text.to_string(),
         };
-        let explicitly_claimed_actions = claimed_external_actions(&verification_text);
-        let generic_completion_claimed = contains_generic_completion_claim(&verification_text);
-        let requested_actions = if generic_completion_claimed {
-            requested_external_actions(&self.goal)
-        } else {
-            HashSet::new()
-        };
+        // 方案 A：声明只认【交付文本】。reasoning 不作为正式回复出站，其中的历史
+        // 复述（错误复盘轮引用「CSV 已写入」「异常记录已更新」）不构成对用户的
+        // 声明——真机实测误拒正是被思考文本引爆的。质量检查（内部帧泄漏）仍看
+        // reasoning：它会以 💭 过程视图流到桌面端。
+        let explicitly_claimed_actions = claimed_external_actions(final_text);
+        let generic_completion_claimed = contains_generic_completion_claim(final_text);
+        let requested_actions = self.requested_actions.clone();
+        let goal_names_file = !filename_tokens(&self.goal_source).is_empty();
         let mut claimed_actions = explicitly_claimed_actions;
         if generic_completion_claimed {
-            claimed_actions.extend(requested_actions);
+            claimed_actions.extend(requested_actions.iter().copied());
         }
         let claims_external_completion = !claimed_actions.is_empty();
+        // 结构化 Evidence 试点（write/edit 先行）：回复中显式引用回执号 =
+        // ReportedFact——按 id 精确绑定到真实回执，不经关键词类别猜测。引用只
+        // 加宽「回执匹配」通道（见下方过滤器与目标文件守卫的豁免口），不放宽
+        // requested 守卫、也不产生新的声明；长期方向是 Evidence 协议替代整个
+        // 关键词匹配器（codex 设计评审 Fix6/7）。
+        let cited_ids = cited_receipt_ids(final_text);
         let mut successful_effects = HashSet::new();
         let mut unverified_actions = Vec::new();
         for action in &claimed_actions {
@@ -311,14 +417,69 @@ impl AgentStatus {
                 .receipts
                 .iter()
                 .filter(|receipt| {
+                    // 引用通道不放宽类别核对：write 回执不得为 已部署 类声明背书
+                    // （codex r30）。回复中出现回执号引用时，只有被引用的回执参与
+                    // 对账——伪造/张冠李戴的引用号不通宽匹配（codex r36，与归档
+                    // 回退的引用契约一致）。
                     receipt.succeeded
                         && receipt.effectful
                         && tool_receipt_matches_action(receipt, *action)
+                        && (cited_ids.is_empty()
+                            || cited_ids.iter().any(|cited| cited == &receipt.id))
                 })
                 .map(|receipt| receipt.id.clone())
                 .collect::<Vec<_>>();
             if matching.is_empty() {
-                unverified_actions.push(action.label());
+                // 本 turn 目标点名要求的动作不得回退：历史回执不能替新活买单（上一 turn
+                // 写过 report.md 不证明这一 turn「new.csv 已写入」）。
+                if requested_actions.contains(action) {
+                    unverified_actions.push(action.label());
+                    continue;
+                }
+                // 目标点名了任何文件时也不回退：点名对象 ⇒ 本 turn 很可能被要求对它
+                // 做新动作（写 / 改 / 追加），声明必须由本 turn 回执证明——目标措辞
+                // 千变万化，requested 关键词判定有漏网，点名文件是更硬的信号
+                // （codex r3/r4：「Write a report to new.csv」「Append another row
+                // to report.md」都无需走历史账本）。纯讨论型目标（真机误拒现场
+                // 「请将你遇到的错误信息详细发给我」）不含文件名，回退照常生效。
+                if goal_names_file {
+                    // 目标点名文件时账本回退整体关闭（codex r32：引用豁免可被
+                    // 「参考 report.md，回执 old-id」式措辞绕过——path 出现在回复
+                    // 任何位置都算命中，故引用通道不豁免本守卫；引用只在当前
+                    // turn 的回执匹配中生效，见上方 filter）。
+                    unverified_actions.push(action.label());
+                    continue;
+                }
+                // 本 turn 没有对应回执时回退上一批归档：纯报告型回复（零工具调用）如实
+                // 引用先前 turn 完成的动作（「报告已写入」「代码已提交」）同样成立——
+                // 回执表每 turn 清空，没有这道回退它们会被误判为无凭据声明。
+                // 已知边界：按归档时冻结的动作【类别】对账，不核对声明里的对象——
+                // 「A.md 已写入，B.csv 已写入」在目标未点名文件时，B.csv 会借 A.md
+                // 的历史写入通过对账（codex r4 #2）；自由文本里区分「提交对象」与
+                // 「顺带提及」不可判定，按误拒成本选择放行。
+                let archived = self
+                    .seeded_receipts
+                    .iter()
+                    .filter(|archived| {
+                        archived.receipt.succeeded
+                            && archived.receipt.effectful
+                            && archived.actions.contains(action)
+                            // 引用通道（结构化 Evidence 试点）：回复中出现回执号
+                            // 引用时只认被引用的那条——按 id 精确绑定，类别宽匹配
+                            // 的 r4-#2 残余在引用场景下被消除；未引用任何回执号 →
+                            // 维持类别宽匹配（既有语义，codex 设计评审 Fix6/7）。
+                            && (cited_ids.is_empty()
+                                || cited_ids
+                                    .iter()
+                                    .any(|cited| cited == &archived.receipt.id))
+                    })
+                    .map(|archived| format!("prev-{}", archived.receipt.id))
+                    .collect::<Vec<_>>();
+                if archived.is_empty() {
+                    unverified_actions.push(action.label());
+                } else {
+                    successful_effects.extend(archived);
+                }
             } else {
                 successful_effects.extend(matching);
             }
@@ -465,11 +626,12 @@ impl AgentStatus {
             if receipts.is_empty() {
                 "- none".to_string()
             } else {
-                receipts
-                    .into_iter()
-                    .map(|line| format!("- {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                // 结构化 Evidence 试点（write/edit 先行）：模型可在最终回复中引用
+                // 回执号，完成闸门据此精确核对声明（回执存在且成功 = 事实受支持）。
+                format!(
+                    "- {}\n- 可在最终回复中引用回执号（如 r2-1-abc）核实对应声明",
+                    receipts.join("\n- ")
+                )
             }
         )
     }
@@ -555,9 +717,51 @@ impl<A: RunAdapter> Run<A> {
         self.status.record_tool_results(outcome, message);
     }
 
+    /// 注入上一批 turn 归档的成功副作用回执，供完成闸门在本 turn 无对应回执时
+    /// 核对历史动作声明（跨 turn 对账）。只影响验证，不影响重复熔断等本 turn 状态。
+    pub(crate) fn seed_effect_receipts(&mut self, receipts: Vec<ArchivedEffect>) {
+        self.status.seeded_receipts = receipts;
+    }
+
+    /// 并入 turn 中到达的用户补充消息（插队）：目标要求的动作集合随之重算，
+    /// 完成闸门对「目标点名的动作必须本 turn 回执证明」的约束覆盖补充内容。
+    pub(crate) fn extend_goal(&mut self, extras: &[String]) {
+        self.status.extend_goal(extras);
+    }
+
+    /// 本 turn 已记录的成功副作用回执（turn 末尾归档进跨 turn 账本的原料）。
+    /// 动作类别按【完整输入】逐一判定后随条目冻结——账本入账会缩减 input，用
+    /// 缩减值重新判定会改变回执能证明什么（见 [`ArchivedEffect`]）。
+    pub(crate) fn effect_receipt_ledger(&self) -> Vec<ArchivedEffect> {
+        self.status
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.succeeded && receipt.effectful)
+            .map(|receipt| ArchivedEffect {
+                actions: ExternalAction::ALL
+                    .iter()
+                    .copied()
+                    .filter(|action| tool_receipt_matches_action(receipt, *action))
+                    .collect(),
+                receipt: receipt.clone(),
+            })
+            .collect()
+    }
+
     /// 三层完成验证（不带媒体认领闸门；review / 压缩等非交付路径直接使用）。
     pub(crate) fn evaluate_completion(&mut self, text: &str) -> CompletionGateReport {
         self.status.evaluate_completion(text)
+    }
+
+    /// 带 reasoning 的完成验证（生产路径经 [`Self::evaluate_final_gate`]；测试直用）。
+    #[cfg(test)]
+    pub(crate) fn evaluate_completion_with_reasoning(
+        &mut self,
+        text: &str,
+        reasoning: &str,
+    ) -> CompletionGateReport {
+        self.status
+            .evaluate_reply_completion_with_reasoning(text, Some(reasoning))
     }
 
     pub(crate) fn render(&self, environment_version: &str) -> String {

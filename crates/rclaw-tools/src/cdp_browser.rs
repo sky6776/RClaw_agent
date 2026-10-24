@@ -1263,6 +1263,16 @@ enum ParkOutcome {
     Cancelled,
 }
 
+/// sweep 结局（换链兜底的自动选取裁决，codex 设计评审 Fix3）。
+enum SweepOutcome {
+    /// 唯一胜者（或胜者包含次者），已完成换链登记。
+    Adopted,
+    /// 多个互不包含、面积相当的合格容器——歧义，不自动选取。
+    Ambiguous,
+    /// 无合格容器。
+    None,
+}
+
 impl CdpBrowser {
     pub fn new(transport: Arc<dyn DevtoolsTransport>) -> Self {
         CdpBrowser {
@@ -1699,7 +1709,51 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
     pub async fn click(&self, r: u32) -> Result<String, String> {
         let _op = self.op.lock().await;
         let session = self.session().await?;
-        let (x, y) = self.element_center(&session, r).await?;
+        // 单次 evaluate 同时完成「定位 + 零尺寸判定 + （零尺寸时）页内点击」：
+        // 两次查询之间页面可能重渲染导致目标变化（codex 设计评审 Fix1）。
+        // 返回分流：coords = 可见元素中心（走坐标注入）；js_click = 零尺寸已按
+        // 引用触发页内点击；missing = 引用失效。
+        let resolution_js = format!(
+            "(function(ref){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');\
+             if(!el)return JSON.stringify({{mode:'missing'}});\
+             el.scrollIntoView({{block:'center'}});\
+             var box=el.getBoundingClientRect();\
+             if(box.width===0&&box.height===0){{\
+             if(typeof el.click==='function'){{el.click();}}\
+             else{{el.dispatchEvent(new MouseEvent('click',{{bubbles:true,cancelable:true}}));}}\
+             return JSON.stringify({{mode:'js_click'}});}}\
+             return JSON.stringify({{mode:'coords',x:Math.round(box.left+box.width/2),y:Math.round(box.top+box.height/2)}});}})({r})"
+        );
+        let resolution_reply = session
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": resolution_js, "returnByValue": true }),
+                Duration::from_secs(10),
+            )
+            .await?;
+        let resolution: Value = serde_json::from_str(&evaluate_string(&resolution_reply)?)
+            .map_err(|e| format!("{e}"))?;
+        let (x, y) = match resolution.get("mode").and_then(Value::as_str) {
+            Some("js_click") => {
+                // 零尺寸元素：坐标注入无法命中（无坐标可注入、可能误触别处），已按
+                // 元素身份直接触发页内点击。是否真正生效（如触发懒加载楼层渲染）
+                // 由调用方快照核实——不作为硬错误，避免把「元素折叠了」变成死路。
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let info = self.page_info(&session).await?;
+                return Ok(format!(
+                    "已尝试页内点击 [ref {r}]（元素零尺寸：坐标注入无法命中，已按引用直接触发；\
+                     效果待快照核实）。\n{}",
+                    format_report(&info)
+                ));
+            }
+            Some("missing") => {
+                return Err("引用不存在（页面可能已跳转，请重新 browser_snapshot）".to_string());
+            }
+            _ => (
+                resolution.get("x").and_then(Value::as_i64).unwrap_or(0),
+                resolution.get("y").and_then(Value::as_i64).unwrap_or(0),
+            ),
+        };
         let mobile = self.mobile_input.load(std::sync::atomic::Ordering::Relaxed);
         let mut note = String::new();
         if mobile {
@@ -1729,23 +1783,7 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                 note = "（面板收起：本机离屏态注入点击无效果，已用页内点击）".to_string();
             }
             if !clicked {
-                let js = format!(
-                    "(function(){{var el=document.querySelector('[data-rclaw-ref=\"{r}\"]');\
-                     if(!el)return 'MISSING';\
-                     if(typeof el.click==='function'){{el.click();}}\
-                     else{{el.dispatchEvent(new MouseEvent('click',{{bubbles:true,cancelable:true}}));}}\
-                     return 'OK';}})()"
-                );
-                let reply = session
-                    .call(
-                        "Runtime.evaluate",
-                        json!({ "expression": js, "returnByValue": true }),
-                        Duration::from_secs(10),
-                    )
-                    .await?;
-                if evaluate_string(&reply)? != "OK" {
-                    return Err("元素不存在（页面可能已跳转，请重新 browser_snapshot）".to_string());
-                }
+                self.js_click(&session, r).await?;
             }
         } else {
             for (mx, my) in [(x + jitter(-24, 24), y + jitter(-18, 18)), (x, y)] {
@@ -1976,6 +2014,10 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
             let mut ambiguous = false;
             let mut attempted = false;
             let mut js_ran = false;
+            // 最近一次登记链是否被 overscroll-contain 截断：被截断的链到界后禁止
+            // sweep 换链——边界面板（弹层/抽屉）声明了「手势到此为止」，换链滚它
+            // 背后的背景容器会绕过页面声明的滚动边界（codex r9）。
+            let mut chain_bounded = false;
             if attached {
                 // 逐段手势、逐段登记测量：600px 手势之间视口内容会移动（落点
                 // 命中的容器可能变化），每段都对当前内容重新登记滚动链、实测
@@ -1986,7 +2028,8 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                     let chunk = (total_px - actual_px).min(600);
                     let gx = x + jitter(-6, 6);
                     let gy = y + jitter(-6, 6);
-                    let before = self.scroll_target_begin(&session, gx, gy).await?;
+                    let (before, bounded) = self.scroll_target_begin(&session, gx, gy).await?;
+                    chain_bounded = bounded;
                     // 登记即算「手势阶段已在此链上执行」：手势显式失败（事件
                     // 确定未送达）时补滚沿用这条链，而不是换落点重登记——抖动
                     // 落点可能命中 contain 边界面板，换中心点会绕过边界。
@@ -2032,13 +2075,45 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
                 // 绕过手势被正确拦下的边界）。仅当手势阶段未执行（面板收起）
                 // 时才按 (x,y) 新登记。
                 if !attempted {
-                    let _ = self.scroll_target_begin(&session, x, y).await?;
+                    let (_, bounded) = self.scroll_target_begin(&session, x, y).await?;
+                    chain_bounded = bounded;
                 }
                 let moved = self
                     .js_scroll(&session, sign * (total_px - actual_px))
                     .await?;
                 js_ran = true;
                 actual_px += moved;
+                if actual_px < total_px {
+                    // 主滚动链到界：全页扫一遍可视的内部滚动容器换链重试一轮——
+                    // JD 移动详情页形态（2026-10-23 华为真机实测 0px 卡死）：主文档
+                    // 已到底、详情主体（keyParametersFloor 等楼层）在自己的内部滚动
+                    // 容器里，elementFromPoint 落点的祖先链登记不到它（落点在别处，
+                    // 或容器内容尚未渲染暂无溢出入不了链）。链被 overscroll-contain
+                    // 截断时禁止换链：边界面板声明了滚动边界，不得滚它背后的背景
+                    // 容器（codex r9）。
+                    if !chain_bounded {
+                        match self
+                            .adopt_inner_scroll_container(&session, notches > 0)
+                            .await?
+                        {
+                            SweepOutcome::Adopted => {
+                                let inner_moved = self
+                                    .js_scroll(&session, sign * (total_px - actual_px))
+                                    .await?;
+                                if inner_moved > 0 {
+                                    actual_px += inner_moved;
+                                    note.push_str(
+                                        "（主滚动链已到界，已切换内部可视滚动容器继续滚动）",
+                                    );
+                                }
+                            }
+                            SweepOutcome::Ambiguous => {
+                                note.push_str("（检测到多个并列的可滚动容器，无法自动选择——请用 browser_snapshot 确认目标容器）");
+                            }
+                            SweepOutcome::None => {}
+                        }
+                    }
+                }
                 if actual_px < total_px {
                     note.push_str(&format!(
                         "（仍有 {}px 未能滚动：已到页面边界或滚动容器特殊）",
@@ -2135,10 +2210,15 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
     /// 与 reverse；row-reverse / 非 flex 元素的纵向 scrollTop 仍是常规
     /// [0,max]）。链节点与标志存 `window.__rclawSc`，后续读数与补滚全部引用
     /// 同一登记：前后两次 elementFromPoint 会因滚动把原容器移出落点，跨登记
-    /// 读数会错账。返回链上 scrollTop 基线之和（是否截断保存在登记状态里，
-    /// js_scroll 的 END 语义天然尊重它）。
+    /// 读数会错账。返回 (链上 scrollTop 基线之和, 链是否被 contain 截断)——
+    /// 截断标志供换链兜底判断：截断链到界禁止 sweep（codex r9）。
     /// 表达式必须返回字符串（[`evaluate_string`] 契约）。
-    async fn scroll_target_begin(&self, session: &Session, x: i64, y: i64) -> Result<i64, String> {
+    async fn scroll_target_begin(
+        &self,
+        session: &Session,
+        x: i64,
+        y: i64,
+    ) -> Result<(i64, bool), String> {
         let js = format!(
             "(function(){{var se=document.scrollingElement||document.documentElement;\
              var chain=[],rev=[],el=document.elementFromPoint({x},{y}),bounded=false;\
@@ -2165,11 +2245,13 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
             )
             .await?;
         let value = evaluate_string(&reply)?;
-        value
-            .split('|')
+        let mut parts = value.split('|');
+        let sum = parts
             .next()
             .and_then(|v| v.parse::<i64>().ok())
-            .ok_or_else(|| format!("解析滚动进度失败: {value}"))
+            .ok_or_else(|| format!("解析滚动进度失败: {value}"))?;
+        let bounded = parts.next() == Some("1");
+        Ok((sum, bounded))
     }
 
     /// 读登记滚动链（[`Self::scroll_target_begin`]）全部节点 scrollTop 之和。
@@ -2253,6 +2335,131 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
         Ok(moved_total)
     }
 
+    /// 主滚动链到界后的兜底：全页扫一遍「可视的最大内部滚动容器」完成换链登记
+    /// （候选 = overflowY auto/scroll/overlay 且内容超高、请求方向有剩余容量；
+    /// 按可见交叠面积取最大，column-reverse 容量口径同 js_scroll）。
+    ///
+    /// 可见性判据 = **命中测试采样**（codex 设计评审 Fix3 终版）：在候选的视口
+    /// 交叠区取 5 点（中心 + 四象限），elementFromPoint 返回候选子树即计命中，
+    /// ≥2 点命中才算可见。浏览器代为处理一切裁剪/变换/包含块逃逸——祖先裁剪
+    /// 走查曾连续 5 轮被 codex 找出 CSS 边缘反例（r30-r34），已整体移除。残余
+    /// 边界：被裁剪到采样点之外的候选会漏检 → 如实上报缺口，不虚报位移。
+    /// **歧义裁决**：次大候选面积 ≥ 胜者 1/2 且互不嵌套时不自动选取。遍历用
+    /// TreeWalker 惰性推进并在 4000 节点处提前终止。换链只影响本次调用。
+    async fn adopt_inner_scroll_container(
+        &self,
+        session: &Session,
+        down: bool,
+    ) -> Result<SweepOutcome, String> {
+        let js = r#"(function(){
+            var se=document.scrollingElement||document.documentElement;
+            var best=null,bestRev=false,bestScore=0,second=null,secondScore=0;
+            var vh=window.innerHeight||600,vw=window.innerWidth||800;
+            var dirSign=__DIR_SIGN__;
+            var walker=document.createTreeWalker(document.documentElement||document.body,NodeFilter.SHOW_ELEMENT,null,false);
+            var count=0,node;
+            while((node=walker.nextNode())){
+                if(++count>4000)break;
+                var el=node;if(el===se)continue;
+                var cs=null;try{cs=window.getComputedStyle(el);}catch(e){continue;}
+                if(!cs)continue;
+                if(cs.visibility==='hidden'||cs.visibility==='collapse')continue;
+                if(parseFloat(cs.opacity||'1')===0)continue;
+                // filter:opacity(0) 的 computed opacity 仍为 1（codex r41：候选
+                // 自身同样检查，不只祖先）。
+                var cfilt=cs.filter||'';
+                if(cfilt.indexOf('opacity(0)')>=0||cfilt.indexOf('opacity(0%)')>=0)continue;
+                // 透明祖先（codex r35/r39）：opacity 作用于整棵子树且不抑制
+                // hit-test——逐祖先预扫描，任一 0 即整棵不可见；filter:opacity(0)
+                // 的 computed opacity 仍为 1，一并检查（codex r39）。
+                var o=el.parentElement;
+                var transparent=false;
+                while(o&&!transparent){
+                    var ost=null;try{ost=window.getComputedStyle(o);}catch(e){ost=null;}
+                    var ofilt=ost?(ost.filter||''):'';
+                    if(ost
+                        &&(parseFloat(ost.opacity||'1')===0
+                            ||ofilt.indexOf('opacity(0)')>=0
+                            ||ofilt.indexOf('opacity(0%)')>=0))
+                    {
+                        transparent=true;
+                    }
+                    o=o.parentElement;
+                }
+                if(transparent)continue;
+                var oy=cs.overflowY;
+                if(oy!=='auto'&&oy!=='scroll'&&oy!=='overlay')continue;
+                if(el.scrollHeight<=el.clientHeight+1)continue;
+                var rev=(cs.display||'').indexOf('flex')>=0&&(cs.flexDirection||'').indexOf('column')>=0&&(cs.flexDirection||'').indexOf('reverse')>=0;
+                var rem;
+                if(rev){rem=(dirSign>0)?(-el.scrollTop):(el.scrollHeight-el.clientHeight+el.scrollTop);}
+                else{rem=(dirSign>0)?(el.scrollHeight-el.clientHeight-el.scrollTop):el.scrollTop;}
+                if(rem<=1)continue;
+                var box=el.getBoundingClientRect();
+                if(box.width<40||box.height<40)continue;
+                var vx1=Math.max(box.left,0),vy1=Math.max(box.top,0);
+                var vx2=Math.min(box.right,vw),vy2=Math.min(box.bottom,vh);
+                if(vx2-vx1<40||vy2-vy1<40)continue;
+                // 命中测试采样（5 个互异点，≥4 命中才采纳）：elementFromPoint
+                // 天然反映浏览器的裁剪/变换/包含块逃逸结果，无需自行解析——
+                // 祖先裁剪走查在 r30-r34 连续产生 CSS 边缘反例后已整体移除，
+                // 命中测试是浏览器代答的 ground truth。中心 + 四象限中点。
+                // 已知残余（刻意保守）：fixed/absolute 后代与部分遮挡的命中
+                // 语义不做精细区分——阈值调高后拿不准的候选一律不采纳，宁可
+                // 如实上报缺口也不虚报位移。
+                var hits=0;
+                var pxs=[(vx1+vx2)/2,vx1+(vx2-vx1)*0.25,vx1+(vx2-vx1)*0.75,(vx1+vx2)/2,(vx1+vx2)/2];
+                var pys=[(vy1+vy2)/2,(vy1+vy2)/2,(vy1+vy2)/2,vy1+(vy2-vy1)*0.25,vy1+(vy2-vy1)*0.75];
+                for(var k=0;k<pxs.length;k++){
+                    var t=document.elementFromPoint(pxs[k],pys[k]);
+                    if(!(t&&(t===el||el.contains(t))))continue;
+                    // fixed 后代不随祖先滚动（codex r35/r36/r42）：命中元素
+                    // 自身（t!==el 时）或其与候选之间的 fixed 中间层使命中无效；
+                    // absolute 中间层随面板滚动，不算逃逸（codex r37）。
+                    var bad=false;
+                    var a=t;
+                    while(a&&a!==el){
+                        var ast=null;try{ast=window.getComputedStyle(a);}catch(e){ast=null;}
+                        if(ast&&ast.position==='fixed'){bad=true;break;}
+                        a=a.parentElement;
+                    }
+                    if(!bad)hits++;
+                }
+                if(hits<4)continue;
+                var ix=vx2-vx1,iy=vy2-vy1;
+                var score=ix*iy;
+                if(best===null){best=el;bestRev=rev;bestScore=score;continue;}
+                var nested=best.contains(el)||el.contains(best);
+                if(nested){
+                    if(score>bestScore){best=el;bestRev=rev;bestScore=score;}
+                    continue;
+                }
+                if(score>bestScore){second=best;secondScore=bestScore;best=el;bestRev=rev;bestScore=score;}
+                else if(score>secondScore){second=el;secondScore=score;}
+            }
+            if(!best)return JSON.stringify({outcome:'none'});
+            if(second&&secondScore*2>=bestScore&&!(best.contains(second)||second.contains(best)))
+                return JSON.stringify({outcome:'ambiguous'});
+            window.__rclawSc={c:[best],r:[bestRev]};
+            return JSON.stringify({outcome:'adopted'});
+        })()"#;
+        let js = js.replace("__DIR_SIGN__", if down { "1" } else { "-1" });
+        let reply = session
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": js, "returnByValue": true }),
+                Duration::from_secs(10),
+            )
+            .await?;
+        let value = evaluate_string(&reply)?;
+        let parsed: Value = serde_json::from_str(&value).map_err(|e| format!("{e}"))?;
+        match parsed.get("outcome").and_then(Value::as_str) {
+            Some("adopted") => Ok(SweepOutcome::Adopted),
+            Some("ambiguous") => Ok(SweepOutcome::Ambiguous),
+            _ => Ok(SweepOutcome::None),
+        }
+    }
+
     /// 事件坐标基准视口（双口径）：桌面滚轮用窗口 innerWidth/innerHeight
     /// （滚轮坐标必须落在窗口视口内，screen 是整个显示器）；移动触摸用可视
     /// 视口——页面被缩小适配时（无 viewport meta 的桌面页，Chrome 手机版按
@@ -2318,6 +2525,9 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
         Ok("浏览器会话已关闭（资源已释放，下次使用自动重建）。".to_string())
     }
 
+    /// 定位 ref 元素中心（type_text 等坐标通路用）：零尺寸元素返回硬错误——
+    /// 输入无法通过坐标命中；点按的零尺寸降级在 [`Self::click`] 内单次 evaluate
+    /// 完成（codex 设计评审 Fix1）。
     async fn element_center(&self, session: &Session, r: u32) -> Result<(i64, i64), String> {
         let js = format!(
             "(function(ref){{var el=document.querySelector('[data-rclaw-ref=\"'+ref+'\"]');if(!el)return JSON.stringify({{ok:false,error:'引用 #'+ref+' 不存在（页面可能已跳转，请重新 browser_snapshot）'}});el.scrollIntoView({{block:'center'}});var box=el.getBoundingClientRect();if(box.width===0&&box.height===0)return JSON.stringify({{ok:false,error:'元素无尺寸（不可见）'}});return JSON.stringify({{ok:true,x:Math.round(box.left+box.width/2),y:Math.round(box.top+box.height/2)}});}})({r})"
@@ -2342,6 +2552,29 @@ return JSON.stringify({{count:out.length,total:els.length,skip:{skip},items:out}
             parsed.get("x").and_then(Value::as_i64).unwrap_or(0),
             parsed.get("y").and_then(Value::as_i64).unwrap_or(0),
         ))
+    }
+
+    /// 页内 JS 点击：不依赖坐标与手势管线，按 ref 直接对元素触发 click 事件。
+    /// 离屏态（面板收起）与不可见元素（无坐标可注入）的可靠通路。
+    async fn js_click(&self, session: &Session, r: u32) -> Result<(), String> {
+        let js = format!(
+            "(function(){{var el=document.querySelector('[data-rclaw-ref=\"{r}\"]');\
+             if(!el)return 'MISSING';\
+             if(typeof el.click==='function'){{el.click();}}\
+             else{{el.dispatchEvent(new MouseEvent('click',{{bubbles:true,cancelable:true}}));}}\
+             return 'OK';}})()"
+        );
+        let reply = session
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": js, "returnByValue": true }),
+                Duration::from_secs(10),
+            )
+            .await?;
+        if evaluate_string(&reply)? != "OK" {
+            return Err("元素不存在（页面可能已跳转，请重新 browser_snapshot）".to_string());
+        }
+        Ok(())
     }
 
     async fn page_info(&self, session: &Session) -> Result<PageInfo, String> {
@@ -2821,6 +3054,13 @@ const PAGE_INFO_JS: &str = "(function(){var href=location.href||'';var text=(doc
 
 /// 紧凑可交互元素清单：给每个可交互/标题元素盖 data-rclaw-ref 章，输出
 /// `[ref] 角色: 文本 → 链接` 扁平列表（模型按 ref 定位操作）。
+///
+/// 可见性标注（与点击的口径一致，2026-10-23 华为真机京东详情页实踩）：宽高均为
+/// 0 的折叠/未渲染元素照常收录但标〔零尺寸〕——不过滤（按引用的页内点击仍可
+/// 触发其处理器，如懒加载楼层的 tab），只让 agent 在快照阶段就知道该 ref 坐标
+/// 点击无效；此前快照与 click 各说各话，agent 拿着必败的 ref 去点、失败还成了
+/// 卡死完成闸门的 effectful 错误。
+///
 /// 盲区提示触发阈值：含 ≥30 字文本的非交互元素达到该数量才提示。表单页/
 /// 空白加载页不触发；2026-10-21 华为真机京东结果页 12 张商品卡实测命中。
 const SNAPSHOT_HINT_MIN_NON_INTERACTIVE: u64 = 5;
@@ -2851,7 +3091,7 @@ fn append_snapshot_hint(text: String, non_interactive: Option<u64>) -> String {
 ///    公共容器一次吞掉全部卡片的计数（codex r2 P2）；③ 不做祖先去重——按直接文本
 ///    计数天然无父子重复。已知边界：标题拆成多个 <30 字短 span 的卡片不计（阈值
 ///    信号，不求精确）；计数是「≥5 触发提示」的信号，不求精确 inventory。
-const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}function cut(s,n){var a=Array.from(String(s||''));return a.length>n?a.slice(0,n).join(''):String(s||'');}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var line='['+ref+'] '+role+': '+cut(text,120);if(href)line+=' → '+cut(href,150);out.push(line);}var ni=0;try{var skip={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1};var all=document.body?document.body.querySelectorAll('*'):[];for(var j=0;j<all.length;j++){var e=all[j];if(skip[e.tagName])continue;if(e.closest&&e.closest('a,button,input,textarea,select,[role],[onclick],h1,h2,h3'))continue;var t='';for(var c=e.firstChild;c;c=c.nextSibling){if(c.nodeType===3)t+=c.nodeValue||'';}if(clean(t).length>=30)ni++;}}catch(e2){}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250）\\n'+out.join('\\n')):'页面无可交互元素',non_interactive:ni});})()";
+const SNAPSHOT_JS: &str = "(function(){function clean(s){return (s||'').replace(/\\s+/g,' ').trim();}function cut(s,n){var a=Array.from(String(s||''));return a.length>n?a.slice(0,n).join(''):String(s||'');}var out=[];var n=0;var roles={a:'link',button:'button',input:'textbox',textarea:'textbox',select:'combobox',h1:'heading',h2:'heading',h3:'heading',img:'img'};var nodes=document.querySelectorAll('a,button,input,textarea,select,[role],[onclick],h1,h2,h3');for(var i=0;i<nodes.length&&out.length<250;i++){var el=nodes[i];var tag=el.tagName.toLowerCase();var role=el.getAttribute('role')||roles[tag]||'';var text=tag==='input'||tag==='textarea'?(el.value||el.placeholder||''):(tag==='select'?(el.selectedIndex>=0?clean(el.options[el.selectedIndex].text||''):'')||('[下拉·共'+el.options.length+'项]'):clean(el.innerText||''));var href=el.href||'';if(!text&&!href)continue;var ref=++n;try{el.setAttribute('data-rclaw-ref',ref);}catch(e){}var inv=false;try{var b=el.getBoundingClientRect();inv=(b.width===0&&b.height===0);}catch(e){}var line='['+ref+'] '+role+': '+cut(text,120);if(inv)line+='〔零尺寸〕';if(href)line+=' → '+cut(href,150);out.push(line);}var ni=0;try{var skip={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1};var all=document.body?document.body.querySelectorAll('*'):[];for(var j=0;j<all.length;j++){var e=all[j];if(skip[e.tagName])continue;if(e.closest&&e.closest('a,button,input,textarea,select,[role],[onclick],h1,h2,h3'))continue;var t='';for(var c=e.firstChild;c;c=c.nextSibling){if(c.nodeType===3)t+=c.nodeValue||'';}if(clean(t).length>=30)ni++;}}catch(e2){}return JSON.stringify({ok:out.length>0,text:out.length?('共 '+out.length+' 项（截前 250；〔零尺寸〕=快照时宽高均为 0 的元素，坐标点击无效、按引用可尝试页内点击；未标注不保证可见）\\n'+out.join('\\n')):'页面无可交互元素',non_interactive:ni});})()";
 
 /// 媒体资源提取（browser_media）：img + video（含 source 子元素）+ og 元信息，
 /// 按 DOM 顺序统一遍历后再限量 40 条（分开遍历会让图片先耗尽配额、视频整页
@@ -3950,6 +4190,14 @@ impl CdpBrowser {
         }
         self.snapshot().await
     }
+
+    /// 测试助手：仅导航（滚动测试用——滚动自身取 op 锁）。
+    async fn navigate_only(&self, url: &str) -> Result<(), String> {
+        let _op = self.op.lock().await;
+        self.navigate_wait(url, None, Duration::from_secs(20))
+            .await
+            .map(|_| ())
+    }
 }
 
 /// data: URL 编码（页面内嵌 HTML，免起本地服务；中文按 UTF-8 百分号编码）。
@@ -4070,6 +4318,429 @@ fn headless_snapshot_hint_jd_cards_vs_form_page() {
         assert!(
             !snapshot.contains("非交互内容"),
             "已可见 button 文本不得经父容器计入盲区: {snapshot}"
+        );
+
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+/// 快照可见性标注双向无头验证（与 click 的 0×0 口径一致，2026-10-23 华为真机
+/// 京东详情页实踩）：折叠/未渲染元素照常收录但标〔零尺寸〕，可见元素不带标注
+/// ——agent 在快照阶段就知道哪些 ref 坐标点击无效，不必拿必败 ref 去点。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_snapshot_annotates_invisible_elements() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+
+        let page = "<html><body>\
+                    <button>可见按钮</button>\
+                    <button style=\"display:none\">隐藏按钮</button>\
+                    <a href=\"https://example.com/hidden\" style=\"display:none\">隐藏链接</a>\
+                    </body></html>";
+        let snapshot = browser.snapshot_after_load(&data_url(page)).await?;
+
+        assert!(
+            snapshot.contains("隐藏按钮〔零尺寸〕"),
+            "折叠元素必须带〔零尺寸〕标注: {snapshot}"
+        );
+        assert!(
+            snapshot.contains("隐藏链接〔零尺寸〕"),
+            "折叠链接必须带〔零尺寸〕标注: {snapshot}"
+        );
+        assert!(
+            snapshot.contains("[1] button: 可见按钮"),
+            "可见元素行存在: {snapshot}"
+        );
+        assert!(
+            !snapshot.contains("可见按钮〔零尺寸〕"),
+            "可见元素不得误标: {snapshot}"
+        );
+        assert!(
+            snapshot.contains("〔零尺寸〕=快照时宽高均为 0 的元素"),
+            "快照头必须带标注图例: {snapshot}"
+        );
+
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+/// 主滚动链到界后的内部容器换链无头验证（2026-10-23 华为真机 JD 详情页 0px 卡死
+/// 形态）：主文档无溢出、可视内部滚动容器在落点祖先链之外——旧实现整链 END
+/// 0px 收场；现实现 sweep 换链后继续滚满请求位移。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_scroll_adopts_inner_container_when_root_capped() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+        let page = "<html><body style=\"margin:0\">\
+                    <div style=\"height:60vh\">首屏占位（主文档无溢出，落点祖先链无滚动容器）</div>\
+                    <div style=\"height:0;overflow:hidden\">\
+                    <div style=\"height:500px;overflow-y:auto\">\
+                    <div style=\"height:3000px\">被裁剪的幽灵（在有效容器之前——\
+                    clipped 残留毒化回归钉，codex r22）</div></div></div>\
+                    <div id=\"inner\" style=\"height:200px;overflow-y:auto\">\
+                    <div style=\"height:3000px\">内部超长内容</div></div>\
+                    </body></html>";
+        browser.navigate_only(&data_url(page)).await?;
+        // 离屏移动通路（agent 自主驱动形态）：跳过手势、直接页内程序化滚动。
+        // 必须在导航后置位——session() 建连时会按会话 UA 重写该标志（无头 = 桌面
+        // UA 会把它翻回 false）。
+        browser
+            .mobile_input
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let report = browser.scroll(3).await?;
+        assert!(
+            report.contains("主滚动链已到界，已切换内部可视滚动容器"),
+            "必须换链到内部容器: {report}"
+        );
+        assert!(!report.contains("仍有"), "换链后应滚满请求位移: {report}");
+        assert!(report.contains("实际位移 360px/请求 360px"), "{report}");
+
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+/// overscroll-contain 边界不换链（codex r9）：contain 面板到界后 sweep 被禁止
+/// ——不得滚它背后的背景滚动容器（链截断标志 = 页面声明的滚动边界）。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_scroll_respects_overscroll_contain_boundary() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+
+        let page = "<html><body style=\"margin:0\">\
+                    <div style=\"height:100vh;overflow-y:auto\">\
+                    <div style=\"height:3000px\">背景长内容（无 contain 的可滚背景）</div></div>\
+                    <div style=\"position:fixed;left:25%;top:40%;width:50%;height:200px;\
+                    overflow-y:auto;overscroll-behavior-y:contain\">\
+                    <div style=\"height:100px\">边界面板（内容不超高，已到界）</div></div>\
+                    </body></html>";
+        browser.navigate_only(&data_url(page)).await?;
+        browser
+            .mobile_input
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let report = browser.scroll(3).await?;
+        assert!(
+            !report.contains("已切换内部可视滚动容器"),
+            "contain 边界后不得 sweep 换链: {report}"
+        );
+        assert!(
+            report.contains("仍有"),
+            "contain 链到界应如实上报缺口: {report}"
+        );
+
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+/// 被祖先裁剪的容器不得入选换链（codex r12）：height:0 + overflow:hidden 父级里
+/// 的大滚动器 rect 仍在视口内、visibility 仍 visible，但内容完全不可见——sweep
+/// 必须跳过它，宁可如实上报缺口也不虚报位移。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_scroll_sweep_skips_clipped_containers() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+
+        let page = "<html><body style=\"margin:0\">\
+                    <div style=\"height:60vh\">首屏占位（主文档无溢出）</div>\
+                    <div style=\"height:0;overflow:hidden\">\
+                    <div id=\"ghost\" style=\"height:500px;overflow-y:auto\">\
+                    <div style=\"height:3000px\">被裁剪的幽灵滚动容器</div></div></div>\
+                    <div style=\"height:0;contain:strict\">\
+                    <div style=\"height:500px;overflow-y:auto\">\
+                    <div style=\"height:3000px\">contain:strict 裁剪的幽灵容器</div></div></div>\
+                    <div style=\"height:200px;overflow-y:auto;opacity:0\">\
+                    <div style=\"height:3000px\">全透明幽灵容器（codex r19）</div></div>\
+                    </body></html>";
+        browser.navigate_only(&data_url(page)).await?;
+        browser
+            .mobile_input
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let report = browser.scroll(3).await?;
+        assert!(
+            !report.contains("已切换内部可视滚动容器"),
+            "被裁剪容器不得入选换链: {report}"
+        );
+        assert!(
+            report.contains("仍有"),
+            "无合格容器应如实上报缺口: {report}"
+        );
+
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+/// 方向容量过滤（codex r14）：已在请求方向到底的大容器不得压过还能滚的可见
+/// 小容器——sweep 必须选中后者并滚满请求位移。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_scroll_sweep_prefers_directional_capacity() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+
+        let page = "<html><body style=\"margin:0\">\
+                    <div style=\"height:60vh\">首屏占位（主文档无溢出）</div>\
+                    <div id=\"big\" style=\"height:200px;overflow-y:auto\">\
+                    <div style=\"height:3000px\">大容器（脚本把它滚到底，方向容量 0）</div></div>\
+                    <div id=\"small\" style=\"height:100px;overflow-y:auto\">\
+                    <div style=\"height:900px\">小容器（方向容量充足）</div></div>\
+                    <script>document.getElementById('big').scrollTop=9999;</script>\
+                    </body></html>";
+        browser.navigate_only(&data_url(page)).await?;
+        browser
+            .mobile_input
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let report = browser.scroll(3).await?;
+        assert!(
+            report.contains("已切换内部可视滚动容器"),
+            "必须换链到有方向容量的容器: {report}"
+        );
+        assert!(report.contains("实际位移 360px/请求 360px"), "{report}");
+
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+/// 被裁剪滚动器的 fixed 直接子命中不计数（codex r38）：滚动器被 0 高祖先
+/// 完全裁剪，其内一个覆盖采样点的 viewport-fixed 子元素逃逸裁剪——若 fixed
+/// 命中不排除，sweep 会采纳不可见滚动器并虚报位移。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_scroll_sweep_skips_clipped_scroller_with_fixed_child() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+
+        let page = "<html><body style=\"margin:0\">                    <div style=\"height:60vh\">首屏占位（主文档无溢出）</div>                    <div style=\"height:0;overflow:hidden\">                    <div style=\"height:500px;overflow-y:auto\">                    <div style=\"height:2000px;position:fixed;top:250px;left:0;width:100%;height:300px\">                    逃逸裁剪的 fixed 内容（盖住采样点）</div></div></div>                    </body></html>";
+        browser.navigate_only(&data_url(page)).await?;
+        browser
+            .mobile_input
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let report = browser.scroll(3).await?;
+        assert!(
+            !report.contains("已切换内部可视滚动容器"),
+            "fixed 子命中不得为被裁剪滚动器背书: {report}"
+        );
+        assert!(report.contains("仍有"), "{report}");
+
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+/// fixed 候选的包含块裁剪（codex r16）：transform 祖先（height:0 + overflow:
+/// hidden）是 fixed 滚动器的包含块——其裁剪必须命中，sweep 不得采纳被裁剪的
+/// fixed 幽灵容器。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_scroll_sweep_skips_cb_clipped_fixed_containers() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+
+        let page = "<html><body style=\"margin:0\">\
+                    <div style=\"height:60vh\">首屏占位（主文档无溢出）</div>\
+                    <div style=\"height:0;overflow:hidden;transform:translateZ(0)\">\
+                    <div id=\"ghost\" style=\"position:fixed;height:500px;overflow-y:auto\">\
+                    <div style=\"height:3000px\">fixed 幽灵滚动容器（包含块已裁剪）</div></div></div>\
+                    </body></html>";
+        browser.navigate_only(&data_url(page)).await?;
+        browser
+            .mobile_input
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let report = browser.scroll(3).await?;
+        assert!(
+            !report.contains("已切换内部可视滚动容器"),
+            "包含块裁剪的 fixed 容器不得入选: {report}"
+        );
+        assert!(report.contains("仍有"), "{report}");
+
+        browser.close().await?;
+        Ok(())
+    });
+    rt.shutdown_timeout(Duration::from_millis(500));
+    if let Err(error) = outcome {
+        panic!("{error}");
+    }
+}
+
+/// 歧义裁决（codex 设计评审 Fix3 / r30）：三个互不包含、面积相当的独立可滚
+/// 容器并列时，sweep 不得自动选取——如实报告歧义并保持现状。
+#[test]
+#[ignore = "需要本机 Chrome/Edge（会拉起真实无头进程）"]
+fn headless_scroll_sweep_reports_ambiguous_panes() {
+    struct KillBrowserOnDrop;
+    impl Drop for KillBrowserOnDrop {
+        fn drop(&mut self) {
+            kill_headless_processes();
+        }
+    }
+    let _serial = HEADLESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome: Result<(), String> = rt.block_on(async {
+        let _guard = KillBrowserOnDrop;
+        let transport = HeadlessChromiumTransport::new(std::env::temp_dir());
+        let browser = CdpBrowser::new(Arc::new(transport) as Arc<dyn DevtoolsTransport>);
+
+        let pane = |n: &str| {
+            format!(
+                "<div style=\"width:30%;height:300px;overflow-y:auto\">\
+                 <div style=\"height:400px\">{n} 的内容（容量仅 100px）</div></div>"
+            )
+        };
+        let page = format!(
+            "<html><body style=\"margin:0;display:flex\">{}{}{}</body></html>",
+            pane("甲"),
+            pane("乙"),
+            pane("丙")
+        );
+        browser.navigate_only(&data_url(&page)).await?;
+        browser
+            .mobile_input
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let report = browser.scroll(3).await?;
+        assert!(
+            report.contains("检测到多个并列的可滚动容器"),
+            "三并列容器应报歧义: {report}"
+        );
+        assert!(
+            report.contains("仍有"),
+            "歧义时不自动选取、如实上报缺口: {report}"
         );
 
         browser.close().await?;

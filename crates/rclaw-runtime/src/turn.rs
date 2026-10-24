@@ -28,7 +28,7 @@
 //! 这样既满足文档「可取消」，又不波及 llm / tools 两个 crate。
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{Read as IoRead, Write};
 use std::path::{Path, PathBuf};
@@ -68,7 +68,8 @@ mod run;
 mod tool_execution;
 use media::*;
 pub(crate) use run::{
-    LoopDecision, Run, RunAdapter, MAX_COMPLETION_GATE_REJECTIONS, REPEATED_TOOL_CALL_LIMIT,
+    ArchivedEffect, LoopDecision, Run, RunAdapter, MAX_COMPLETION_GATE_REJECTIONS,
+    REPEATED_TOOL_CALL_LIMIT,
 };
 
 mod state;
@@ -268,7 +269,11 @@ fn render_tools(schemas: &[ToolSchema]) -> String {
         .iter()
         .enumerate()
         .map(|(index, schema)| {
-            let description = schema.description.split_whitespace().collect::<Vec<_>>().join(" ");
+            let description = schema
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             let description = if description.is_empty() {
                 "未提供说明".to_string()
             } else {
@@ -488,6 +493,141 @@ fn ensure_dir_is_real(
         ));
     }
     Ok(())
+}
+
+/// 跨 turn 回执账本的字符串字段截断界（字符字节）。
+const EFFECT_LEDGER_INPUT_MAX: usize = 2000;
+
+/// 终局形态（codex 设计评审 Fix5）：交付与记账的单一事实来源，由出站前的
+/// final_text / warned_delivery 派生——cron 状态符、goal 审计、技能记账一律 match
+/// 本枚举，不再各自解读三变量组合。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TerminalKind {
+    /// 完成闸门全过，内容受支持地交付。
+    Supported,
+    /// 完成闸门拒绝耗尽，内容已随警告交付但未获验证。
+    Unverified,
+    /// 无内容交付（错误文案出站）。
+    Rejected,
+}
+
+/// 完成闸门拒绝预算耗尽时的收尾形态（方案 B）。
+///
+/// 有非空候选回复 → 「顶部验证警告 + 回复原文」投递（first = final_text，second =
+/// llm_error，两者并存：内容走出站、记账走失败）；候选为空/纯空白（如质量闸门
+/// 拒绝的空回复）→ 维持纯错误路径。抽成纯函数便于单测。
+fn gate_exhausted_outcome(
+    finalized_reply: &str,
+    reason: &str,
+    quality_ok: bool,
+) -> (Option<String>, Option<String>) {
+    // 内部状态帧泄露独立复查：媒体认领闸门经 reject_completion 早退时 quality_ok
+    // 恒为 true（未跑质量校验），不能只信它——警告前缀抵消不了泄露，凡候选带
+    // 状态帧一律维持终局拒绝（codex r9/r10）。
+    let leaked_frame = {
+        let lower = finalized_reply.to_ascii_lowercase();
+        lower.contains("<agent-status>") || lower.contains("<rclaw-runtime-context")
+    };
+    if !quality_ok || leaked_frame || finalized_reply.trim().is_empty() {
+        (None, Some(format!("完成验证未通过：{reason}")))
+    } else {
+        (
+            Some(format!("⚠️ 完成验证未通过：{reason}\n\n{finalized_reply}")),
+            Some(format!("完成验证未通过：{reason}")),
+        )
+    }
+}
+/// 动作字段（memory 操作 / skill_manage action）截断界：对账只比较字面量
+/// （add/replace/remove/create/…），超出纯属噪声。
+const EFFECT_LEDGER_ACTION_MAX: usize = 64;
+/// memory 批量操作的归档上限（去重后的动作种类数）。
+const EFFECT_LEDGER_OPERATIONS_MAX: usize = 8;
+
+/// 入账前把回执 input 缩减为动作与对象核对所需的最小【有效】JSON（动作类别保持
+/// 归档时冻结值，不重判）。
+///
+/// shell 要 command、memory 要操作 action（去重限量，r5 #6：巨批重复 add 不得
+/// 原样入账）、skill_manage 要 action 与 name/path（「guide.md 已写入」类声明按
+/// 名字对账，codex r4 #5）、文件类工具留 path，其余工具连工具名就够了。两个约束：
+/// ① 截断必须落在字符串值内部——直接按字节截序列化 JSON 通常把它截成非法 JSON，
+/// 历史对账会整体失配（codex r2）；② 必须换新串——`String::truncate` 不还容量，
+/// 16 条大文件内容照样驻留内存。动作类别已在归档时按完整输入冻结
+/// （[`ArchivedEffect`]），不依赖缩减值重新判定。
+fn reduce_ledger_receipt_input(mut archived: ArchivedEffect) -> ArchivedEffect {
+    let parsed: Value = serde_json::from_str(&archived.receipt.input).unwrap_or(Value::Null);
+    let string_at = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(Value::as_str)
+            .map(truncate_ledger_string)
+            .unwrap_or_default()
+    };
+    let truncated_action_at = |value: &Value| {
+        value
+            .get("action")
+            .and_then(Value::as_str)
+            .map(truncate_ledger_action)
+            .unwrap_or_default()
+    };
+    let reduced = match archived.receipt.tool.as_str() {
+        "shell" => json!({ "command": string_at("command") }),
+        "memory" => match parsed.get("operations").and_then(Value::as_array) {
+            Some(operations) => {
+                let mut actions: Vec<Value> = Vec::new();
+                for operation in operations {
+                    let entry = json!({ "action": truncated_action_at(operation) });
+                    if !actions.contains(&entry) {
+                        actions.push(entry);
+                    }
+                    if actions.len() >= EFFECT_LEDGER_OPERATIONS_MAX {
+                        break;
+                    }
+                }
+                json!({ "operations": actions })
+            }
+            None => json!({ "action": truncated_action_at(&parsed) }),
+        },
+        "skill_manage" => match parsed.get("name").and_then(Value::as_str) {
+            Some(name) => {
+                json!({ "action": truncated_action_at(&parsed), "name": truncate_ledger_string(name) })
+            }
+            None => match parsed.get("path").and_then(Value::as_str) {
+                Some(path) => json!({
+                    "action": truncated_action_at(&parsed),
+                    "path": truncate_ledger_string(path)
+                }),
+                None => json!({ "action": truncated_action_at(&parsed) }),
+            },
+        },
+        _ => match parsed.get("path").and_then(Value::as_str) {
+            Some(path) => json!({ "path": truncate_ledger_string(path) }),
+            None => json!({}),
+        },
+    };
+    archived.receipt.input = reduced.to_string();
+    archived
+}
+
+fn truncate_ledger_string(value: &str) -> String {
+    if value.len() <= EFFECT_LEDGER_INPUT_MAX {
+        return value.to_string();
+    }
+    let mut end = EFFECT_LEDGER_INPUT_MAX;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn truncate_ledger_action(value: &str) -> String {
+    if value.len() <= EFFECT_LEDGER_ACTION_MAX {
+        return value.to_string();
+    }
+    let mut end = EFFECT_LEDGER_ACTION_MAX;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 /// 清空 state.sqlite 的会话状态与 memory/ 目录下的全部内容，返回人可读的清理摘要。
@@ -860,7 +1000,16 @@ pub struct TurnManager {
     reviews: Arc<ReviewLifecycle>,
     /// 静默门：互斥生命周期操作与新 turn / review 启动（C7）。
     gate: Arc<QuiescenceGate>,
+
+    /// 跨 turn 的成功副作用回执账本（`(channel, chat_id) → 最近 N 条`）。回执表每
+    /// turn 清空，完成闸门核对「报告已写入」这类对先前 turn 动作的声明时无从对账
+    /// （真机误拒实测：纯报告型回复被判「write_or_update 无回执」后整条回复被丢）。
+    /// 本 turn 匹配失败时回退此账本。
+    effect_ledger: Mutex<HashMap<(String, String), VecDeque<ArchivedEffect>>>,
 }
+
+/// 会话账本只回溯最近的成功副作用，防长会话无界增长。
+const EFFECT_LEDGER_CAP: usize = 16;
 
 impl TurnManager {
     #[allow(clippy::too_many_arguments)]
@@ -925,6 +1074,7 @@ impl TurnManager {
             history,
             reviews,
             gate,
+            effect_ledger: Mutex::new(HashMap::new()),
         }
     }
 
@@ -936,6 +1086,55 @@ impl TurnManager {
     // 跨线程执行（agent loop 的 run / 各 turn 任务都是 spawned）。把锁操作收进【同步】辅助函数，
     // guard 只活在同步调用栈上、绝不进入任何 async future 的状态，于是 future 仍是 `Send`。
     // 这些临界段都是纯同步操作（无 await），用 `std::sync::Mutex` 即可。
+
+    /// 同步：取该会话的跨 turn 回执账本快照（turn 开始时注入新 [`Run`]）。
+    fn ledger_seed(&self, channel: &str, chat_id: &str) -> Vec<ArchivedEffect> {
+        self.effect_ledger
+            .lock()
+            .expect("effect ledger 锁未被毒化")
+            .get(&(channel.to_string(), chat_id.to_string()))
+            .map(|receipts| receipts.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 同步：把本 turn 的成功副作用回执追加进会话账本（容量 [`EFFECT_LEDGER_CAP`]，
+    /// 超出淘汰最旧）。成功 / 拒绝 / 取消收尾都调用——副作用已真实发生。
+    ///
+    /// 入账时截断 input：账本只用于动作类别核对（shell 命令 / memory 操作 / 技能
+    /// 动作），文件内容等大字段没有对账价值，不截断则 write 型回执会把整个文件
+    /// 内容长期留在内存里。
+    fn ledger_extend(&self, channel: &str, chat_id: &str, receipts: Vec<ArchivedEffect>) {
+        if receipts.is_empty() {
+            return;
+        }
+        let mut ledger = self.effect_ledger.lock().expect("effect ledger 锁未被毒化");
+        let entry = ledger
+            .entry((channel.to_string(), chat_id.to_string()))
+            .or_default();
+        for receipt in receipts {
+            entry.push_back(reduce_ledger_receipt_input(receipt));
+        }
+        while entry.len() > EFFECT_LEDGER_CAP {
+            entry.pop_front();
+        }
+    }
+
+    /// 同步：删除单个会话的账本（[`Self::forget_session`] 调用）。被删会话的历史
+    /// 回执不能再给新会话的动作声明作证；同时防止聊天 id 反复增删把账本撑大。
+    fn ledger_forget(&self, channel: &str, chat_id: &str) {
+        self.effect_ledger
+            .lock()
+            .expect("effect ledger 锁未被毒化")
+            .remove(&(channel.to_string(), chat_id.to_string()));
+    }
+
+    /// 同步：清空全部会话的账本（`/clear confirm` 删除事务提交后调用）。
+    fn ledger_clear_all(&self) {
+        self.effect_ledger
+            .lock()
+            .expect("effect ledger 锁未被毒化")
+            .clear();
+    }
 
     /// 同步：某会话（含其 cron 分键）此刻是否还有活动 turn。宿主删除会话前用它拒绝
     /// 「边跑边删」——否则 turn 收尾时会把消息 / 检查点写回刚清空的 chat。事件通道已关闭
@@ -1846,7 +2045,10 @@ impl TurnManager {
                 if anchors.is_empty() {
                     return "当前会话没有可分叉的真实用户消息。".to_string();
                 }
-                let mut out = format!("可分叉锚点（最近 {} 条用户消息，新在前）：\n", anchors.len());
+                let mut out = format!(
+                    "可分叉锚点（最近 {} 条用户消息，新在前）：\n",
+                    anchors.len()
+                );
                 // message.ts 是 Unix【秒】（Message.ts 落库原样写入；SessionSummary.updated_at
                 // 才是毫秒），按毫秒解释会把所有锚点显示成 1970-01-21。
                 for (id, ts_secs, preview) in &anchors {
@@ -2202,6 +2404,7 @@ impl TurnManager {
         };
         if sessions_cleared {
             self.history.reset_runtime_state();
+            self.ledger_clear_all();
         }
         match cleared {
             Ok(Ok(summary)) => format!("✅ 已清空 agent 本地状态：\n\n{summary}"),
@@ -2532,6 +2735,7 @@ impl TurnManager {
     /// 归零同源。只动内存缓存，不读写库；活动 turn 下调用也安全（状态按需重建）。
     pub fn forget_session(&self, channel: &str, chat_id: &str) {
         self.history.forget_session(channel, chat_id);
+        self.ledger_forget(channel, chat_id);
     }
 
     /// 测试 / 观测用：是否所有会话都没有活动 turn（review 不计入——它不阻塞下一轮 turn）。
@@ -2755,6 +2959,7 @@ impl TurnManager {
             None => (*self.base_system_prompt).clone(),
         };
         let mut run = Run::new_with_base(&msg.content, self.opts.max_tool_iter, &self.layout.base);
+        run.seed_effect_receipts(self.ledger_seed(&msg.channel, &msg.chat_id));
         let preflight_message = context::inference_tail_message(
             &self.layout,
             &turn_memory,
@@ -2926,6 +3131,9 @@ impl TurnManager {
         // LLM 调用最终失败时携带的详细错误文案（重试耗尽 / 流式中途异常终止）。
         // None 表示没有 LLM 错误（成功，或成功但返回空文本）。
         let mut llm_error: Option<String> = None;
+        // 方案 B：完成闸门拒绝耗尽后「警告 + 候选回复」一并投递的轮。投递走成功
+        // 分支（内容要出去），记账按失败（completed_successfully 在收尾处降级）。
+        let mut warned_delivery = false;
         // B1：工具执行期间被 /cancel 打断时，记录尚未持久化的 assistant(tool_calls)，
         // 清理阶段连同 aborted 占位结果一起落盘（ADR-0004），让模型下轮知道上次
         // 干到哪、哪些调用没有结果。
@@ -2960,20 +3168,25 @@ impl TurnManager {
                 // 此时 session tail 处于已闭合位置（[当前 user] 或 […完整 tool chain]），
                 // 把补充作为独立 user 消息追加是协议安全的。
                 if !is_cron {
-                    let received_new_input = drain_append_interjections(
+                    let interjections = drain_append_interjections(
                         &self.session,
                         &mut messages,
                         &mut event_rx,
                         &mut deferred_messages,
                     )
                     .await;
-                    if received_new_input && !state.validated_media_markers.is_empty() {
-                        // marker 只是待随最终回复交给 channel 的发送意图，发布脚本成功并不
-                        // 等于已经发送。用户在此期间可能取消、改名或改变交付范围，因此旧
-                        // marker 必须失效。保留 seen 集合，避免 AgentStatus/AgentWait 重放
-                        // 已完成快照时把旧 marker 复活；真实重发由发布器生成新 delivery id。
-                        state.validated_media_markers.clear();
-                        tracing::info!("收到发布后的用户补充，已废弃尚未出站的旧媒体 marker");
+                    if !interjections.is_empty() {
+                        // 补充并入 turn 目标：完成闸门对「目标点名的动作必须本 turn
+                        // 回执证明」的约束要覆盖 turn 中新到达的请求。
+                        run.extend_goal(&interjections);
+                        if !state.validated_media_markers.is_empty() {
+                            // marker 只是待随最终回复交给 channel 的发送意图，发布脚本成功并不
+                            // 等于已经发送。用户在此期间可能取消、改名或改变交付范围，因此旧
+                            // marker 必须失效。保留 seen 集合，避免 AgentStatus/AgentWait 重放
+                            // 已完成快照时把旧 marker 复活；真实重发由发布器生成新 delivery id。
+                            state.validated_media_markers.clear();
+                            tracing::info!("收到发布后的用户补充，已废弃尚未出站的旧媒体 marker");
+                        }
                     }
                     if cancel.is_cancelled() {
                         cancelled = true;
@@ -3261,21 +3474,23 @@ impl TurnManager {
                     // 安全点 C：最终候选在 LLM 生成期间也可能收到用户补充。此时候选尚未
                     // 持久化或出站，可以安全丢弃并用最新输入重算；尤其不能让“不要发了”
                     // 到达后，仍把上一轮已暂存但尚未发送的媒体 marker 交给 channel。
-                    if !is_cron
-                        && drain_append_interjections(
+                    if !is_cron {
+                        let interjections = drain_append_interjections(
                             &self.session,
                             &mut messages,
                             &mut event_rx,
                             &mut deferred_messages,
                         )
-                        .await
-                    {
-                        state.validated_media_markers.clear();
-                        if cancel.is_cancelled() {
-                            cancelled = true;
-                            break 'react;
+                        .await;
+                        if !interjections.is_empty() {
+                            run.extend_goal(&interjections);
+                            state.validated_media_markers.clear();
+                            if cancel.is_cancelled() {
+                                cancelled = true;
+                                break 'react;
+                            }
+                            continue 'react;
                         }
-                        continue 'react;
                     }
                     // 媒体认领闸门 + 完成闸门的统一策略由内核裁决；pending marker
                     // 原地复核（丢弃失效项），返回剥离 marker 后的最终回复。
@@ -3316,7 +3531,21 @@ impl TurnManager {
                         );
                         continue 'react;
                     }
-                    llm_error = Some(format!("完成验证未通过：{}", gate.reason_text()));
+                    // 方案 B：拒绝预算耗尽不再丢弃候选回复——「回复原文 + 顶部验证
+                    // 警告」一起投递。闸门的底线是不静默撒谎（警告列明未证实的声明
+                    // 与未解决的错误），不是让用户零交付（真机实测：纯汇报轮被误拒
+                    // 后用户只收到错误文案，完整回答全丢）。final_text 与 llm_error
+                    // 并存：内容走成功分支出站，记账走失败（技能信号照常记）。
+                    let (delivered, reason) = gate_exhausted_outcome(
+                        &finalized_reply,
+                        &gate.reason_text(),
+                        gate.quality_ok,
+                    );
+                    if delivered.is_some() {
+                        warned_delivery = true;
+                    }
+                    final_text = delivered;
+                    llm_error = reason;
                     break 'react;
                 }
 
@@ -3419,20 +3648,22 @@ impl TurnManager {
                 //   - 把补充加入 messages 后 `continue` 重新请求 LLM。
                 // 这正是文档「tool_calls 返回后、工具执行前发送补充消息 → 不执行旧 tool_calls、
                 // 重新请求 LLM」的要求。
-                if !is_cron
-                    && drain_append_interjections(
+                if !is_cron {
+                    let interjections = drain_append_interjections(
                         &self.session,
                         &mut messages,
                         &mut event_rx,
                         &mut deferred_messages,
                     )
-                    .await
-                {
-                    // 这里已经消费了补充消息，下一轮顶部不会再次看到它；因此必须在
-                    // 本安全点同步废弃此前工具留下的待发送 marker。否则用户此时说
-                    // “不要发了”，旧 marker 仍会在新回复收尾时被自动附加并真正外发。
-                    state.validated_media_markers.clear();
-                    continue 'react;
+                    .await;
+                    if !interjections.is_empty() {
+                        run.extend_goal(&interjections);
+                        // 这里已经消费了补充消息，下一轮顶部不会再次看到它；因此必须在
+                        // 本安全点同步废弃此前工具留下的待发送 marker。否则用户此时说
+                        // “不要发了”，旧 marker 仍会在新回复收尾时被自动附加并真正外发。
+                        state.validated_media_markers.clear();
+                        continue 'react;
+                    }
                 }
 
                 // 构造 assistant(tool_calls)。若任一 tool_use 入参非法，放弃本轮、不持久化。
@@ -3578,12 +3809,25 @@ impl TurnManager {
             }
         }
 
+        // turn 收尾：本 turn 的成功副作用回执归档进会话账本。成功 / 拒绝 / 取消都
+        // 归档——副作用已真实发生，下一 turn 的完成闸门核对历史动作声明要用。
+        self.ledger_extend(&msg.channel, &msg.chat_id, run.effect_receipt_ledger());
+
         if !cancelled && final_text.is_none() && llm_error.is_none() {
             llm_error = Some(format!(
                 "达到 ReAct 迭代上限 {}，任务未通过完成验证。",
                 self.opts.max_tool_iter
             ));
         }
+
+        // 终局形态派生（codex 设计评审 Fix5）：交付与记账的单一事实来源。
+        let terminal_kind = if final_text.is_some() && !warned_delivery {
+            TerminalKind::Supported
+        } else if final_text.is_some() {
+            TerminalKind::Unverified
+        } else {
+            TerminalKind::Rejected
+        };
 
         // ---- 统一清理：取消 / 正常 / 异常在此分叉 ----
         if cancelled {
@@ -3652,7 +3896,8 @@ impl TurnManager {
         } else if let Some(text) = final_text.filter(|t| !t.is_empty()) {
             // 正常结束：持久化最终 assistant + 推送 outbound（与旧 handle_turn 一致）。
             let reply_text = if is_cron {
-                cron_report(&msg, &text, true)
+                // Unverified（警告投递）轮不打 ✅ 成功符（codex r9）。
+                cron_report(&msg, &text, terminal_kind == TerminalKind::Supported)
             } else {
                 text.clone()
             };
@@ -3679,7 +3924,9 @@ impl TurnManager {
                 }
                 messages.push(final_msg);
             }
-            completed_successfully = true;
+            completed_successfully = terminal_kind == TerminalKind::Supported;
+            // Unverified（警告投递）与 Rejected 同样按失败记账：技能结果与失败
+            // 信号（llm_error 仍携带原因）不做成功记功。
 
             // /goal 完成审计（第十二轮后续项，ZCode completion verifier 的轻量对位）：
             // 本会话有活动目标时，成功收尾后用一次无工具的小推理审计「本轮汇报是否以
@@ -3688,10 +3935,13 @@ impl TurnManager {
             // created_at 随目标一并带进审计：异步窗口里 /goal 换目标时审计不得误清新目标。
             // 只审计用户 turn 的汇报：cron 任务 / Agent 交接等非用户来源的 turn 不是在
             // 回应目标，它们的回复里偶然出现的「已完成」会把目标误清。
+            // 警告投递轮不审计：被拒绝的完成文案不得作为目标达成的证据去清 goal
+            // （codex r9：降级 completed_successfully 不影响这里的判定，须显式排除）。
             let audit_this_turn = self.opts.goal_audit_enabled
                 && msg.source() == MessageSource::User
                 && !is_cron
-                && !text.is_empty();
+                && !text.is_empty()
+                && terminal_kind == TerminalKind::Supported;
             let active_goal = if audit_this_turn {
                 self.session
                     .journal()

@@ -405,6 +405,328 @@ fn completion_gate_requires_corresponding_success_receipt() {
 }
 
 #[test]
+fn completion_gate_falls_back_to_seeded_receipts_from_previous_turn() {
+    // 真机误拒回归：纯报告型回复（零工具调用）如实引用上一 turn 完成的写入
+    // （「CSV 已写入」「异常记录已更新」）——回执表每 turn 清空，没有跨 turn
+    // 账本时会被判「write_or_update 没有对应的成功工具回执」，整条回复被丢弃。
+    let mut previous = Run::new("write a report", 8);
+    previous.record_tool_results(
+        &tool_outcome("write", json!({"path":"report.md","content":"x"})),
+        &tool_result_message("call-1", "file written", false),
+    );
+    let ledger = previous.effect_receipt_ledger();
+    assert_eq!(ledger.len(), 1);
+
+    let mut status = Run::new("report the errors", 8);
+    status.seed_effect_receipts(ledger);
+    let verified = status.evaluate_completion("CSV 已写入。");
+    assert!(verified.accepted(), "{:?}", verified.reasons);
+    assert!(
+        verified
+            .receipt_ids
+            .iter()
+            .all(|id| id.starts_with("prev-")),
+        "{:?}",
+        verified.receipt_ids
+    );
+
+    // 归档里只有失败回执时，声明依旧无凭据。
+    let mut failed_previous = Run::new("write a report", 8);
+    failed_previous.record_tool_results(
+        &tool_outcome("write", json!({"path":"report.md","content":"x"})),
+        &tool_result_message("call-1", "disk full", true),
+    );
+    let mut unreconciled = Run::new("report the errors", 8);
+    unreconciled.seed_effect_receipts(failed_previous.effect_receipt_ledger());
+    assert!(!unreconciled.evaluate_completion("CSV 已写入。").result_ok);
+
+    // 本 turn 目标点名要求的动作（写入）不得拿上一 turn 的历史回执充数——历史回执
+    // 不能证明新活已做（写完 report.md 的新 turn 谎称「new.csv 已写入」不得靠旧
+    // 账本通过）。
+    let mut hallucinated = Run::new("写入 new.csv 后汇报", 8);
+    hallucinated.seed_effect_receipts(ledger_snapshot());
+    assert!(
+        !hallucinated
+            .evaluate_completion("new.csv 已写入。")
+            .result_ok
+    );
+    // 同样的账本，目标是纯汇报时回退依旧生效（正例不因 requested 收紧而回归）。
+    let mut reporting = Run::new("report the errors", 8);
+    reporting.seed_effect_receipts(ledger_snapshot());
+    assert!(reporting.evaluate_completion("CSV 已写入。").accepted());
+
+    // turn 中插队补充并入目标后，补充点名的动作同样受守卫约束（codex r2：插队
+    // 「写入 new.csv」不得逃过目标约束靠旧账本通过）。
+    let mut extended = Run::new("report the errors", 8);
+    extended.seed_effect_receipts(ledger_snapshot());
+    extended.extend_goal(&["写入 new.csv".to_string()]);
+    assert!(!extended.evaluate_completion("new.csv 已写入。").result_ok);
+
+    // 目标点名了文件（无论措辞是否被识别为「要求写入」）时不回退：点名对象 ⇒
+    // 本 turn 很可能被要求对它做新动作，声明必须由本 turn 回执证明（codex r3/r4：
+    // 「Write a report to new.csv」「Append another row to report.md」都不得走
+    // 历史账本；requested 关键词判定覆盖不了这些措辞）。
+    let mut foreign_object = Run::new("Write a report to new.csv", 8);
+    foreign_object.seed_effect_receipts(ledger_snapshot());
+    assert!(
+        !foreign_object
+            .evaluate_completion("new.csv 已写入。")
+            .result_ok
+    );
+    let mut same_object = Run::new("Append another row to report.md", 8);
+    same_object.seed_effect_receipts(ledger_snapshot());
+    assert!(
+        !same_object
+            .evaluate_completion("report.md 已写入。")
+            .result_ok
+    );
+    // 纯讨论型目标不含文件名，回退照常生效（真机现场形态，上面已断言）。
+}
+
+/// 上一 turn 写入成功的归档回执（多断言共用的最小账本快照）。
+fn ledger_snapshot() -> Vec<crate::turn::run::ArchivedEffect> {
+    let mut previous = Run::new("write a report", 8);
+    previous.record_tool_results(
+        &tool_outcome("write", json!({"path":"report.md","content":"x"})),
+        &tool_result_message("call-1", "file written", false),
+    );
+    previous.effect_receipt_ledger()
+}
+
+/// 上一 turn 真实提交的归档回执（shell git commit 成功）。
+fn commit_ledger_snapshot() -> Vec<crate::turn::run::ArchivedEffect> {
+    let mut previous = Run::new("commit the changes", 8);
+    previous.record_tool_results(
+        &tool_outcome("shell", json!({"command":"git commit -m fix"})),
+        &tool_result_message("call-1", "committed", false),
+    );
+    previous.effect_receipt_ledger()
+}
+
+#[test]
+fn retrospective_goals_do_not_block_ledger_reconciliation() {
+    // codex r5：「总结上次 commit」点名的是既成事实，不是新工单——requested
+    // 关键词不得命中，如实的历史汇报靠账本对账通过。
+    assert!(requested_external_actions("Summarize your last commit").is_empty());
+    assert!(requested_external_actions("总结一下上次推送的结果").is_empty());
+    // 真实的新工单不受影响。
+    assert!(
+        requested_external_actions("commit the changes").contains(&ExternalAction::SourceControl)
+    );
+    assert!(requested_external_actions("推送代码").contains(&ExternalAction::SourceControl));
+
+    let mut summary = Run::new("Summarize your last commit", 8);
+    summary.seed_effect_receipts(commit_ledger_snapshot());
+    assert!(
+        summary.evaluate_completion("代码已提交。").accepted(),
+        "{:?}",
+        summary.evaluate_completion("代码已提交。").reasons
+    );
+    // 措辞不含回顾标记的同一动作依旧要求本 turn 回执。
+    let mut fresh = Run::new("commit the changes", 8);
+    fresh.seed_effect_receipts(commit_ledger_snapshot());
+    assert!(!fresh.evaluate_completion("代码已提交。").result_ok);
+}
+
+#[test]
+fn filename_guard_covers_trailing_period_and_long_extensions() {
+    // codex r5：尾部句点（report.md.）与长后缀（report.markdown）都是文件点名，
+    // 守卫必须命中；版本号（v2.8.12，纯数字尾段）不是文件名，不得误触。
+    for goal in [
+        "Append another row to report.md.",
+        "review report.markdown",
+        "再往 report.md 里加一行",
+    ] {
+        let mut guarded = Run::new(goal, 8);
+        guarded.seed_effect_receipts(ledger_snapshot());
+        assert!(
+            !guarded.evaluate_completion("report.md 已写入。").result_ok,
+            "goal {goal} 应禁用历史回退"
+        );
+    }
+    let mut versioned = Run::new("分析 v2.8.12 的变更", 8);
+    versioned.seed_effect_receipts(ledger_snapshot());
+    assert!(versioned.evaluate_completion("CSV 已写入。").accepted());
+}
+
+#[test]
+fn retrospective_markers_do_not_leak_across_clauses() {
+    // codex r6：分句边界隔离——前句回顾、后句新工单，commit 不得被 last 压制。
+    let mixed = "Summarize your last change; commit the changes";
+    assert!(requested_external_actions(mixed).contains(&ExternalAction::SourceControl));
+    let mut mixed_run = Run::new(mixed, 8);
+    mixed_run.seed_effect_receipts(commit_ledger_snapshot());
+    assert!(!mixed_run.evaluate_completion("代码已提交。").result_ok);
+    // 泛化完成声明同样不得借回顾措辞逃过 requested 约束。
+    let mut generic = Run::new(mixed, 8);
+    generic.seed_effect_receipts(commit_ledger_snapshot());
+    assert!(!generic.evaluate_completion("已完成。").result_ok);
+}
+
+#[test]
+fn retrospective_scope_ends_at_sentence_punctuation_and_fresh_phrasing() {
+    // codex r7：ASCII 句读同样开新子句；「Make one last commit」的 last 是
+    // 「最后一次」而非回顾，二者都不得压制新工单。
+    for goal in [
+        "Summarize your last change. Commit the changes.",
+        "Make one last commit",
+    ] {
+        assert!(
+            requested_external_actions(goal).contains(&ExternalAction::SourceControl),
+            "goal {goal} 应识别为提交请求"
+        );
+        let mut fresh = Run::new(goal, 8);
+        fresh.seed_effect_receipts(commit_ledger_snapshot());
+        assert!(
+            !fresh.evaluate_completion("代码已提交。").result_ok,
+            "goal {goal} 不得拿历史提交充数"
+        );
+    }
+}
+
+#[test]
+fn retrospective_scope_handles_unspaced_cjk_and_possessive_questions() {
+    // codex r8：不带空格的中文连词同样切开回顾作用域。
+    let unspaced = "总结上次修改然后提交代码";
+    assert!(requested_external_actions(unspaced).contains(&ExternalAction::SourceControl));
+    let mut fresh = Run::new(unspaced, 8);
+    fresh.seed_effect_receipts(commit_ledger_snapshot());
+    assert!(!fresh.evaluate_completion("代码已提交。").result_ok);
+
+    // 物主代词 + 时间词（不限固定搭配）指向既成事实——如实历史汇报靠账本通过。
+    let question = "What was their previous commit?";
+    assert!(requested_external_actions(question).is_empty());
+    let mut historical = Run::new(question, 8);
+    historical.seed_effect_receipts(commit_ledger_snapshot());
+    assert!(historical.evaluate_completion("代码已提交。").accepted());
+
+    // 时间词与动作关键词隔着实词时不算回顾：「把已经写好的报告推送出去」仍是
+    // 新工单（推送动作现在才要做），不得被 已经 压制。
+    let intervening = "把已经写好的报告推送出去";
+    assert!(requested_external_actions(intervening).contains(&ExternalAction::SourceControl));
+}
+
+#[test]
+fn url_hostnames_are_not_filename_mentions() {
+    // codex r6：URL 主机名不是文件点名——「总结发到 example.com 的部署」的如实
+    // 汇报不得被守卫误禁。
+    let goal = "Summarize the last deploy to https://example.com";
+    assert!(requested_external_actions(goal).is_empty());
+
+    let mut previous = Run::new("deploy the service", 8);
+    previous.record_tool_results(
+        &tool_outcome("shell", json!({"command":"vercel deploy --prod"})),
+        &tool_result_message("call-1", "deployed", false),
+    );
+    let mut summary = Run::new(goal, 8);
+    summary.seed_effect_receipts(previous.effect_receipt_ledger());
+    assert!(summary.evaluate_completion("已部署。").accepted());
+}
+
+#[test]
+fn ledger_reduction_bounds_memory_batches() {
+    fn memory_receipt(operations: Value) -> crate::turn::run::ArchivedEffect {
+        crate::turn::run::ArchivedEffect {
+            receipt: crate::turn::run::ToolReceipt {
+                id: "r1-1-abc".to_string(),
+                tool: "memory".to_string(),
+                input: operations.to_string(),
+                succeeded: true,
+                effectful: true,
+                error_category: None,
+                summary: String::new(),
+            },
+            actions: [crate::turn::external_action::ExternalAction::WriteUpdate]
+                .into_iter()
+                .collect(),
+        }
+    }
+    // 巨批重复 add 去重成一条（codex r5 #6）。
+    let duplicate_adds =
+        json!({ "operations": (0..50).map(|_| json!({"action":"add"})).collect::<Vec<_>>() });
+    let reduced = reduce_ledger_receipt_input(memory_receipt(duplicate_adds));
+    let parsed: Value = serde_json::from_str(&reduced.receipt.input).unwrap();
+    assert_eq!(parsed["operations"].as_array().unwrap().len(), 1);
+
+    // 动作种类超上限时截断到 8 条。
+    let many_kinds = json!({ "operations": (0..20).map(|i| json!({"action": format!("op{i}")})).collect::<Vec<_>>() });
+    let reduced = reduce_ledger_receipt_input(memory_receipt(many_kinds));
+    let parsed: Value = serde_json::from_str(&reduced.receipt.input).unwrap();
+    assert_eq!(
+        parsed["operations"].as_array().unwrap().len(),
+        EFFECT_LEDGER_OPERATIONS_MAX
+    );
+
+    // 超长动作串按 64 字节界截断且保持合法 JSON。
+    let long_action = json!({ "operations": [{"action": "x".repeat(500)}] });
+    let reduced = reduce_ledger_receipt_input(memory_receipt(long_action));
+    let parsed: Value = serde_json::from_str(&reduced.receipt.input).unwrap();
+    let action = parsed["operations"][0]["action"].as_str().unwrap();
+    assert_eq!(action.len(), EFFECT_LEDGER_ACTION_MAX);
+}
+
+#[test]
+fn completion_gate_does_not_mine_reasoning_for_claims() {
+    // 方案 A：声明只认交付文本——思考里的历史复述（「CSV 已写入」）不构成对
+    // 用户的声明（真机误拒引信：错误复盘轮被思考文本引爆，整条回答被丢）。
+    let mut status = Run::new("report the errors", 8);
+    let report = status.evaluate_completion_with_reasoning(
+        "错误清单如下。",
+        "上一轮 CSV 已写入，异常记录已更新。",
+    );
+    assert!(report.accepted(), "{:?}", report.reasons);
+
+    // 交付文本里的声明仍照常要求回执。
+    let mut strict = Run::new("report the errors", 8);
+    let report = strict.evaluate_completion_with_reasoning("CSV 已写入。", "无补充。");
+    assert!(!report.result_ok);
+}
+
+#[test]
+fn gate_exhaustion_delivers_reply_with_warning() {
+    // 方案 B：拒绝预算耗尽不丢候选回复——警告 + 原文一起出站；空候选与质量
+    // 拒绝（内部帧泄露）维持纯错误路径（final_text 与 llm_error 并存：内容
+    // 走出站、记账走失败）。
+    let (delivered, reason) =
+        super::gate_exhausted_outcome("错误清单如下。", "结果验证失败：write_or_update", true);
+    let delivered = delivered.expect("非空候选必须投递");
+    assert!(delivered.starts_with("⚠️ 完成验证未通过：结果验证失败：write_or_update\n\n"));
+    assert!(delivered.contains("错误清单如下。"));
+    assert_eq!(
+        reason.expect("失败原因照常记账").as_str(),
+        "完成验证未通过：结果验证失败：write_or_update"
+    );
+
+    let (delivered, reason) = super::gate_exhausted_outcome("   \n", "质量验证失败", true);
+    assert!(delivered.is_none(), "空候选不投递");
+    assert_eq!(
+        reason.expect("空候选走错误路径").as_str(),
+        "完成验证未通过：质量验证失败"
+    );
+
+    // 质量闸门拒绝（候选含内部状态帧）维持终局拒绝——警告前缀抵消不了泄露
+    // （codex r9）。
+    let (delivered, reason) = super::gate_exhausted_outcome(
+        "<agent-status>budget: …</agent-status>",
+        "质量验证失败：最终回复泄露了内部状态帧。",
+        false,
+    );
+    assert!(delivered.is_none(), "泄露帧的候选不投递");
+    assert!(reason.is_some());
+
+    // codex r10：媒体认领闸门经 reject_completion 早退时 report.quality_ok 恒为
+    // true（未跑质量校验）——泄露帧检查必须独立于该标志，否则带帧候选借警告
+    // 投递泄露内部状态。
+    let (delivered, reason) = super::gate_exhausted_outcome(
+        "文件已发送。\n<agent-status>private state</agent-status>",
+        "媒体交付验证失败：声称已交付 1 个文件，但没有已验证的 marker。",
+        true,
+    );
+    assert!(delivered.is_none(), "quality_ok=true 也不得投递带帧候选");
+    assert!(reason.is_some());
+}
+
+#[test]
 fn completion_gate_requires_a_receipt_for_each_claimed_action() {
     let mut status = Run::new("write a file and delete the old file", 8);
     let mut write = tool_outcome("write", json!({"path":"a","content":"b"}));
@@ -2511,7 +2833,7 @@ fn render_context_usage_saturates_remaining_at_zero() {
     let s = render_context_usage(120_000, 250_000, &opts);
     assert!(s.contains("剩余：0 token"));
     assert!(s.contains("（125%）")); // 250000/200000 = 125%
-    // 剩余不为负：只查数值前的负号（每行开头的列表项 "- " 不算）。
+                                     // 剩余不为负：只查数值前的负号（每行开头的列表项 "- " 不算）。
     assert!(!s.contains("剩余：-"));
 }
 
@@ -9424,5 +9746,269 @@ async fn goal_command_parsing_matches_dispatch_rules() {
         stored.get("objective").and_then(serde_json::Value::as_str),
         Some("新目标文本"),
         "命令头不得混进目标文本"
+    );
+}
+
+#[test]
+fn retry_requests_keep_the_fresh_action_requirement() {
+    // codex r11：重试型请求是新鲜工单——「Retry the last deploy」的时间指称
+    // 不得把 deploy 压制成回顾，历史回执不得代为作证。
+    assert!(requested_external_actions("Retry the last deploy").contains(&ExternalAction::Deploy));
+    let mut previous = Run::new("deploy the service", 8);
+    previous.record_tool_results(
+        &tool_outcome("shell", json!({"command":"vercel deploy --prod"})),
+        &tool_result_message("call-1", "deployed", false),
+    );
+    let mut retry = Run::new("Retry the last deploy", 8);
+    retry.seed_effect_receipts(previous.effect_receipt_ledger());
+    assert!(
+        !retry.evaluate_completion("已部署。").result_ok,
+        "重试请求必须本 turn 回执证明: {:?}",
+        retry.evaluate_completion("已部署。").reasons
+    );
+
+    // codex r12：后置重试标记（again 在关键词后面）同样豁免回顾压制。
+    assert!(
+        requested_external_actions("Run the last deploy again").contains(&ExternalAction::Deploy)
+    );
+
+    // codex r13：后缀边界含 ASCII 句读——下一句的 again 不得豁免上一句的回顾。
+    assert!(
+        requested_external_actions("Summarize the last deploy. Run the tests again.").is_empty()
+    );
+
+    // codex r19：后缀「后」字边界——之后 重新运行测试 的重新属于后半句新工单，
+    // 不得把上一句的历史部署翻成新鲜请求（否则如实总结被误拒）。
+    assert!(requested_external_actions("总结上次部署之后重新运行测试").is_empty());
+
+    // codex r14：软连词同样切开後缀——「and」之后的 again 属于后半句的新工单。
+    assert!(
+        requested_external_actions("Summarize the last deploy and run the tests again").is_empty()
+    );
+
+    // codex r15/r18：CJK 报告动词与时间词都紧邻判定——「按查看到的步骤部署」
+    // 的 查看 是修饰语、deadline 型「今晚之前部署」的 之前 是截止修饰，
+    // deploy 仍是新工单。
+    assert!(requested_external_actions("按查看到的步骤部署服务").contains(&ExternalAction::Deploy));
+    assert!(requested_external_actions("请在今晚之前部署服务").contains(&ExternalAction::Deploy));
+    // 真邻接的 CJK 报告动词仍构成回顾。
+    assert!(requested_external_actions("总结提交记录").is_empty());
+
+    // codex r16：不定冠词 a last 是「最后一次」的新工单，不得当回顾。
+    assert!(
+        requested_external_actions("Make a last commit before release")
+            .contains(&ExternalAction::SourceControl)
+    );
+
+    // codex r20：「放到后台重新执行」的后台 不得吞掉重试标记——部署仍是新工单。
+    assert!(
+        requested_external_actions("请把上次部署任务放到后台重新执行")
+            .contains(&ExternalAction::Deploy)
+    );
+
+    // codex r21：「再」不切后缀——再重新执行 的 重新 仍可豁免回顾压制。
+    assert!(requested_external_actions("请把上次部署任务再重新执行一次")
+        .contains(&ExternalAction::Deploy));
+
+    // codex r42：前缀重试扫描整词匹配——「against the last deploy」的
+    // again 不压制回顾，真实历史汇报不被误拒。
+    assert!(requested_external_actions("Compare this release against the last deploy").is_empty());
+    assert!(
+        requested_external_actions("deploy service\nDo not deploy. Deploy it now.")
+            .contains(&ExternalAction::Deploy)
+    );
+
+    // 最后一次出现是重新下达的肯定请求。
+    assert!(
+        requested_external_actions("deploy service\nDo not deploy. Deploy it now.")
+            .contains(&ExternalAction::Deploy)
+    );
+    // 语义边界（r23→r28 回退后定格）：插话撤销超出关键词判定能力（r23/r25/r26/
+    // r27/r28 的撤销模型互相矛盾，已回退为「任一肯定出现即要求回执」）——此措辞
+    // 仍要求当轮部署回执；纯汇报场景由「goal 无动作词提及 → 账本回退」覆盖。
+    assert!(requested_external_actions(
+        "deploy service\nDo not deploy; summarize the last deploy instead"
+    )
+    .contains(&ExternalAction::Deploy));
+
+    // codex r25：带宾语的否定是范围限定——「Deploy staging. Do not deploy
+    // production.」不撤销 staging 的部署工单（「Done.」不得靠旧回执蒙混）；
+    // 中文异宾语同理。
+    assert!(
+        requested_external_actions("Deploy staging. Do not deploy production.")
+            .contains(&ExternalAction::Deploy)
+    );
+
+    // codex r41：redeploy/reinstall 整词变体也是新工单。
+    assert!(requested_external_actions("Redeploy the service").contains(&ExternalAction::Deploy));
+    assert!(requested_external_actions("Reinstall numpy").contains(&ExternalAction::Install));
+
+    // codex r43：屈折形式 retrying/rerunning 同样是新工单。
+    assert!(
+        requested_external_actions("Keep retrying the last deploy until it succeeds")
+            .contains(&ExternalAction::Deploy)
+    );
+
+    // codex r32：引用通道的 id 精确绑定——回复引用了归档回执号时，
+    // 只有被引用的那条回执参与对账（借 A.md 回执蒙混 B.csv 的 r4-#2 残余
+    // 在引用场景下被消除）。
+    assert!(
+        requested_external_actions("部署服务，不要部署别的东西").contains(&ExternalAction::Deploy)
+    );
+
+    // codex r26：同类别多肯定取一个被否定——另一个仍然存活；虚词 to 不算共享宾语。
+    assert!(
+        requested_external_actions("Deploy alpha. Deploy beta. Do not deploy beta.")
+            .contains(&ExternalAction::Deploy)
+    );
+    assert!(
+        requested_external_actions("Deploy to staging. Do not deploy to production.")
+            .contains(&ExternalAction::Deploy)
+    );
+
+    // codex r44：屈折容差（deploying/committing）仍算命中——整词
+    // 检查不得误杀动词变体。
+    assert!(
+        requested_external_actions("Keep deploying the service until it is healthy")
+            .contains(&ExternalAction::Deploy)
+    );
+
+    // codex r45b：名词派生（deployment/installation）也算动作域提及；
+    // codex r46：复合派生（deployments = deploy + ment + s）同样算。
+    assert!(requested_external_actions("Finish the deployment").contains(&ExternalAction::Deploy));
+    assert!(
+        requested_external_actions("Complete the installation").contains(&ExternalAction::Install)
+    );
+    assert!(requested_external_actions("Finish the deployments").contains(&ExternalAction::Deploy));
+    assert!(requested_external_actions("Finish committing the changes")
+        .contains(&ExternalAction::SourceControl));
+
+    // codex r49：无分隔符的 CJK 长后缀（>200 字节）不得把重试扫描窗口切进
+    // 多字节字符中间——panic 即回归。
+    let long_cjk_suffix = format!("deploy{}", "啊".repeat(70));
+    assert!(
+        requested_external_actions(&long_cjk_suffix).contains(&ExternalAction::Deploy),
+        "CJK 长后缀目标仍是新工单"
+    );
+
+    // codex r27：空宾语泛化请求不被带宾语的范围否定撤销；软连词切分多动作宾语，
+    // alpha 不被 beta 的否定连坐。
+    assert!(
+        requested_external_actions("Deploy. Do not deploy production.")
+            .contains(&ExternalAction::Deploy)
+    );
+    assert!(
+        requested_external_actions("Deploy alpha and deploy beta. Do not deploy beta.")
+            .contains(&ExternalAction::Deploy)
+    );
+
+    // codex r20：dotfile（.env）也是文件点名——目标点名它时历史回执不得代为作证。
+    // codex r31：单字符 dotfile（.a）同样点名。
+    let mut dotfile_short = Run::new("Append FOO=bar to .a", 8);
+    dotfile_short.seed_effect_receipts(ledger_snapshot());
+    assert!(!dotfile_short.evaluate_completion("已写入 .a。").result_ok);
+    let mut dotfile = Run::new("Append FOO=bar to .env", 8);
+    dotfile.seed_effect_receipts(ledger_snapshot());
+    assert!(
+        !dotfile.evaluate_completion("已写入 .env。").result_ok,
+        "{:?}",
+        dotfile.evaluate_completion("已写入 .env。").reasons
+    );
+}
+
+#[test]
+fn evidence_citation_requires_goal_file_guard_strictness() {
+    // 结构化 Evidence 试点（write/edit 先行）——r32 收敛后的最终语义：
+    // goal 点名文件（new.csv）时账本回退整体关闭，引用归档回执号也不豁免
+    // （「参考 report.md，回执 old-id」式措辞可绕过 path-in-reply 检查，
+    // codex r32）——涉及点名文件的动作必须由本 turn 回执证明。
+    let ledger = ledger_snapshot();
+
+    let mut status = Run::new("Write a report to new.csv", 8);
+    status.seed_effect_receipts(ledger.clone());
+    let reply = format!("report.md 已写入（回执 {}）。", ledger[0].receipt.id);
+    assert!(
+        !status.evaluate_completion(&reply).result_ok,
+        "{:?}",
+        status.evaluate_completion(&reply).reasons
+    );
+
+    // 纯汇报型 goal（无动作词、无文件点名）时账本回退照常生效。
+    let mut reporting = Run::new("report the errors", 8);
+    reporting.seed_effect_receipts(ledger_snapshot());
+    assert!(reporting
+        .evaluate_completion("report.md 已写入。")
+        .accepted());
+}
+
+#[test]
+fn citation_contract_applies_to_current_turn_receipts() {
+    // codex r36：引用契约对当前 turn 回执同样生效——伪造引用号不通宽匹配；
+    // 真实引用号精确获证。
+    let mut status = Run::new("report the errors", 8);
+    status.record_tool_results(
+        &tool_outcome("write", json!({"path":"report.md","content":"x"})),
+        &tool_result_message("call-1", "file written", false),
+    );
+    let receipt_id = status.effect_receipt_ledger()[0].receipt.id.clone();
+
+    // 伪造引用号格式不合法（指纹段须 8 位十六进制），等价于无引用——
+    // 改用格式合法但不存在的回执号验证契约。
+    let fabricated = "report.md 已写入（回执 r1-2-deadbeef）。";
+    assert!(!status.evaluate_completion(fabricated).result_ok);
+
+    let genuine = format!("report.md 已写入（回执 {receipt_id}）。");
+    assert!(
+        status.evaluate_completion(&genuine).accepted(),
+        "{:?}",
+        status.evaluate_completion(&genuine).reasons
+    );
+}
+
+#[test]
+fn en_reporting_words_do_not_suppress_fresh_requests() {
+    // codex r9/r10：英文报告词不参与回顾判定——「Follow the review checklist to
+    // deploy」的 deploy 是新工单（review 与 deploy 的修饰关系无法用子串判定，
+    // 整词匹配也不够）；英文回顾一律靠「限定词 + 时间词」邻接判定。
+    assert!(
+        requested_external_actions("Follow the checklist to deploy the app")
+            .contains(&ExternalAction::Deploy)
+    );
+    assert!(
+        requested_external_actions("Follow the review checklist to deploy the app")
+            .contains(&ExternalAction::Deploy)
+    );
+    // 真·回顾提问（限定词 + 时间词邻接）仍不构成新工单。
+    assert!(requested_external_actions("List the last deploys").is_empty());
+}
+
+#[test]
+fn tmp_debug_pattern() {
+    std::env::set_var("RCLAW_PAT_DEBUG", "1");
+    let requested = requested_external_actions("Deploy staging. Do not deploy production.");
+    println!("requested={requested:?}");
+    std::env::remove_var("RCLAW_PAT_DEBUG");
+}
+
+#[test]
+fn tmp_debug_r39() {
+    let r1 = requested_external_actions("已部署版本 r2026-10-24。");
+    println!("r2026: {:?}", r1);
+    let r2 = requested_external_actions("Summarize your last uninstall");
+    println!("uninstall: {:?}", r2);
+}
+
+#[test]
+fn tmp_debug_deployment() {
+    println!(
+        "dep={:?}",
+        requested_external_actions("Finish the deployment")
+    );
+    println!(
+        "dep-hay={:?}",
+        "finish the deployment"
+            .match_indices("deploy")
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>()
     );
 }

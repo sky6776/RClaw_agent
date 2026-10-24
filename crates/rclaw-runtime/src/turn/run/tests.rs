@@ -45,16 +45,35 @@ fn media_control_line_without_validated_marker_is_rejected() {
     assert!(reason.contains("声称已交付"), "不得夸大发送数量：{reason}");
 }
 
-/// reasoning 参与验证文本：text 本身无声明但 reasoning 声称了外部动作（写入）且无回执，
-/// 应被结果验证拒绝——与拆分前 evaluate_reply_completion_with_reasoning 语义一致。
+/// 方案 A（2026-10-23 真机误拒复盘）：声明只认交付文本——reasoning 里的历史复述
+/// 不构成对用户的声明（错误复盘轮的思考必然引用既往动作，旧实现把它判成无凭据
+/// 声明后整条回答被丢弃）；交付文本自身的声明仍照常要求回执。
 #[test]
-fn reasoning_claim_without_receipt_is_rejected() {
+fn reasoning_claim_without_receipt_is_not_mined() {
     let mut run = Run::new("写入报告文件", 8);
     let mut markers = Vec::new();
 
     let (_, gate) = run.evaluate_final_gate(
-        "完成。",
+        "上一轮的情况如下。",
         Some("报告已写入文件。"),
+        &mut markers,
+        "cli",
+        &rclaw_core::RuntimeChannelInfo::default(),
+        false,
+    );
+
+    assert!(
+        gate.accepted(),
+        "reasoning 里的声明不得触发拒绝: {}",
+        gate.reason_text()
+    );
+
+    // 交付文本自身的声明无回执仍被拒（闸门本体语义不变）。
+    let mut run = Run::new("写入报告文件", 8);
+    let mut markers = Vec::new();
+    let (_, gate) = run.evaluate_final_gate(
+        "报告已写入文件。",
+        Some("无补充。"),
         &mut markers,
         "cli",
         &rclaw_core::RuntimeChannelInfo::default(),
