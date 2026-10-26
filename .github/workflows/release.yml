@@ -211,6 +211,14 @@ jobs:
         with:
           node-version: 22
 
+      # Chaquopy buildPython 必须与目标 Python 同版本（gradle chaquopy.version=3.12）。
+      # v2.8.16 实证：runner 轮换到 ubuntu-26.04 后自带 python3=3.14，
+      # installArm64ReleasePythonRequirements 直接拒绝构建——在此 pin 3.12 置于
+      # PATH 最前，RCLAW_BUILD_PYTHON=python3 即解析到它，镜像再漂移不受影响。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
