@@ -424,6 +424,9 @@ pub(super) struct PlanJournal {
     /// 被验证步骤最后一次 step_finished 里的产出简报（`verification_brief`，见
     /// [`verification_brief`]）：resume 补跑验证者时注入，与首跑看到的是同一份。
     pub(super) briefs: HashMap<String, String>,
+    /// 步骤的未解决错误运行时披露（step_finished 事件独立字段，最新一次为准）：
+    /// resume 时继承，消费出口在最后一次截断后追加（codex 第 5 轮 P1）。
+    pub(super) disclosures: HashMap<String, String>,
 }
 
 /// 正文的 JSON 对象扫描结果（见 `scan_json_objects`）。
@@ -984,7 +987,11 @@ fn bound_verdict_reasons(reasons: Vec<String>) -> Vec<String> {
 /// 复核什么（跑哪条验证命令、看哪个产物）——光有一段摘要时它只能对着文字猜。
 /// 按 [`VERIFICATION_BRIEF_MAX_CHARS`] 裁好后写进 awaiting_verdict 记录并注入验证者任务，
 /// 首跑与 resume 看到的是同一份。
-fn verification_brief(summary: &str, handoff: &StructuredHandoff) -> String {
+fn verification_brief(
+    summary: &str,
+    unresolved_disclosure: Option<&str>,
+    handoff: &StructuredHandoff,
+) -> String {
     // 摘要单独中和：handoff 解析失败时它就是整段原始输出，里面的残骸再多也只影响摘要
     // 自身（最坏退回裁切摘要），不波及下面的自报列表。
     let mut brief = neutralize_unclosed_json(summary.trim());
@@ -1011,9 +1018,16 @@ fn verification_brief(summary: &str, handoff: &StructuredHandoff) -> String {
             ));
         }
     }
-    // 各段都已干净、拼接用的标题 / `- ` 前缀不含花括号：这一遍只为总量截断点可能切开的
-    // 那一个对象。
-    neutralize_unclosed_json(&truncate_text(&brief, VERIFICATION_BRIEF_MAX_CHARS))
+    // 中和与总量截断都只作用于正文——运行时披露在两者全部结束之后追加：neutralize
+    // 的残缺 JSON 裁尾会把尾部披露一起切掉，总量截断同理会切（codex 第 5 轮 P1）。
+    let mut out = neutralize_unclosed_json(&truncate_text(&brief, VERIFICATION_BRIEF_MAX_CHARS));
+    if let Some(disclosure) = unresolved_disclosure.filter(|value| !value.trim().is_empty()) {
+        if !out.trim().is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(disclosure);
+    }
+    out
 }
 
 /// 中和文本里未闭合的 JSON 样式 `{`（截断点落在对象中间；或原文本就带残缺 JSON）。
@@ -1116,6 +1130,8 @@ pub(super) fn load_plan_journal(plan_log: &EventLog) -> Result<PlanJournal, Stri
     // step → 最后一次 step_finished 带的产出简报（没带就是 None：以最新记录为准，
     // 旧记录的简报不能配给新产出）。
     let mut briefs: HashMap<String, Option<String>> = HashMap::new();
+    // step → 最后一次 step_finished 带的未解决错误披露（空/缺失 = 清除：以最新记录为准）。
+    let mut disclosures: HashMap<String, String> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     // 升级问答：question_id → 记录；escalation_resolved 事后补答案（按 id 匹配）。
     let mut escalations: HashMap<String, Asked> = HashMap::new();
@@ -1144,6 +1160,19 @@ pub(super) fn load_plan_journal(plan_log: &EventLog) -> Result<PlanJournal, Stri
                         .and_then(Value::as_str)
                         .map(str::to_string),
                 );
+                // 披露以最新一次 step_finished 为准：新记录没带或为空 = 清除。
+                match event
+                    .get("unresolved_disclosure")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(disclosure) => {
+                        disclosures.insert(step.to_string(), disclosure.to_string());
+                    }
+                    None => {
+                        disclosures.remove(step);
+                    }
+                }
                 // 验证者的终态事件自带 verdict / target / round / reasons：`verdict_*` 与它都是
                 // 宽松写入，任一条丢了另一条就是备份——否则耗尽轮次的 `verdict_failed` 一旦
                 // 没写进去，resume 只看到上一轮，会在预算之外多跑一轮。同轮已有 verdict
@@ -1176,6 +1205,23 @@ pub(super) fn load_plan_journal(plan_log: &EventLog) -> Result<PlanJournal, Stri
                             line_no,
                         ));
                     }
+                }
+            }
+            Some("step_skipped") => {
+                // 等待应答的步骤本波可能真实跑过：显式空字段 = 清除（结果循环总是
+                // 写该字段）；缺字段（seeding 期 step_skipped）= 保留既有披露。区分
+                // 两种缺省，否则显式清空的披露会在下次 resume 复活（codex 第 7 轮 P2）。
+                let Some(step) = event.get("step").and_then(Value::as_str) else {
+                    continue;
+                };
+                match event.get("unresolved_disclosure").and_then(Value::as_str) {
+                    Some(disclosure) if !disclosure.is_empty() => {
+                        disclosures.insert(step.to_string(), disclosure.to_string());
+                    }
+                    Some(_) => {
+                        disclosures.remove(step);
+                    }
+                    None => {}
                 }
             }
             Some("step_escalated") => {
@@ -1290,6 +1336,7 @@ pub(super) fn load_plan_journal(plan_log: &EventLog) -> Result<PlanJournal, Stri
             .into_iter()
             .filter_map(|(step, brief)| brief.map(|brief| (step, brief)))
             .collect(),
+        disclosures,
     })
 }
 
@@ -1732,6 +1779,7 @@ impl Tool for PlanRunTool {
                 consumed_answers: Vec::new(),
                 verdicts: Vec::new(),
                 briefs: HashMap::new(),
+                disclosures: HashMap::new(),
             },
         };
         let PlanJournal {
@@ -1740,6 +1788,7 @@ impl Tool for PlanRunTool {
             consumed_answers,
             verdicts: journal_verdicts,
             briefs: journal_briefs,
+            disclosures: journal_disclosures,
         } = journal;
         // 装载时注入步骤任务文本的应答（已解答未消费 + 已消费）：收尾判定按已送达处理。
         let injected: HashSet<String> = escalations
@@ -1760,6 +1809,10 @@ impl Tool for PlanRunTool {
                 summaries.insert(step_id.clone(), summary.clone());
             }
         }
+        // 步骤披露：resume 从 journal 全量继承——披露独立于逻辑成功状态：验证者带
+        // 披露返回 fail（outcome=failed）后轮次耗尽、resume 不再重跑，披露仍须随
+        // 最终报告可见（codex 第 6 轮 P2）。本波由真实结果更新/清空。
+        let mut step_disclosures: HashMap<String, String> = journal_disclosures;
         // 被验证步骤的产出简报（见 `verification_brief`）：继承的产出带回它首跑时的简报，
         // 本次执行里目标每次成功收尾都会刷新。
         let mut target_briefs: HashMap<String, String> = journal_briefs
@@ -2018,6 +2071,7 @@ impl Tool for PlanRunTool {
                     plan_id.clone(),
                     step,
                     &dep_summaries,
+                    &step_disclosures,
                     &step_escalations,
                     verifier_of.is_some(),
                 );
@@ -2164,6 +2218,11 @@ impl Tool for PlanRunTool {
                             "step": target_id,
                             "outcome": "failed",
                             "summary": truncate_text(&format!("{diagnostic}\n{previous}"), DEP_SUMMARY_MAX_CHARS),
+                            // 合成终态必须保留目标当前的披露：缺字段会被 loader 按
+                            // 最新记录清除，resume 后真实产出的未解决错误就丢了
+                            // （codex 第 7 轮 P2）。
+                            "unresolved_disclosure": step_disclosures
+                                .get(&target_id).cloned().unwrap_or_default(),
                         }),
                     );
                     append_plan_event(
@@ -2205,6 +2264,18 @@ impl Tool for PlanRunTool {
                     );
                     for (step_id, result, _) in results {
                         status.insert(step_id.clone(), StepStatus::Skipped);
+                        // journal 不可读不等于副作用错误没发生：披露照常登记；失败/
+                        // 取消与空披露同清除，与结果循环同语义（codex 第 7 轮）。
+                        let disclosure = if result.is_error || result.cancelled {
+                            String::new()
+                        } else {
+                            result.unresolved_disclosure.clone()
+                        };
+                        if disclosure.is_empty() {
+                            step_disclosures.remove(&step_id);
+                        } else {
+                            step_disclosures.insert(step_id.clone(), disclosure);
+                        }
                         summaries.insert(
                             step_id,
                             format!(
@@ -2223,6 +2294,19 @@ impl Tool for PlanRunTool {
             };
             for (step_id, result, verifier_inputs) in results {
                 let failed_run = result.is_error || result.cancelled;
+                // 披露独立字段只在接收真实 AgentTaskResult 时更新/清空（codex 第 5 轮
+                // P1 定案）：后续对摘要的一切改写（诊断前缀、验证反馈注入）都不动它，
+                // 各消费出口在最后一次截断后单独追加。
+                let step_disclosure = if failed_run {
+                    String::new()
+                } else {
+                    result.unresolved_disclosure.clone()
+                };
+                if step_disclosure.is_empty() {
+                    step_disclosures.remove(&step_id);
+                } else {
+                    step_disclosures.insert(step_id.clone(), step_disclosure.clone());
+                }
                 let summary = if failed_run {
                     result.content.clone()
                 } else {
@@ -2250,6 +2334,9 @@ impl Tool for PlanRunTool {
                             "question_ids": open_questions.iter().map(|open| &open.question_id).collect::<Vec<_>>(),
                             "answered_late": open_questions.iter().filter(|open| open.answered_late).map(|open| &open.question_id).collect::<Vec<_>>(),
                             "summary": journal_summary,
+                            // 等待应答的步骤本波真实跑过：披露随事件持久化，resume 装载
+                            // 恢复（codex 第 6 轮 P2）。
+                            "unresolved_disclosure": step_disclosure,
                         }),
                     );
                     awaiting_input.push((step_id.clone(), first_question));
@@ -2327,7 +2414,7 @@ impl Tool for PlanRunTool {
                                 append_plan_event(
                                     &plan_log,
                                     "step_finished",
-                                    json!({"step": step_id, "outcome": "failed", "target": target_id, "summary": journal_summary}),
+                                    json!({"step": step_id, "outcome": "failed", "target": target_id, "summary": journal_summary, "unresolved_disclosure": step_disclosure}),
                                 );
                             }
                             continue;
@@ -2390,6 +2477,7 @@ impl Tool for PlanRunTool {
                             "exhausted": exhausted,
                             "reasons": reasons,
                             "summary": journal_summary,
+                            "unresolved_disclosure": step_disclosure,
                         }),
                     );
                     continue;
@@ -2405,7 +2493,11 @@ impl Tool for PlanRunTool {
                     summaries.insert(step_id.clone(), summary.clone());
                     // 产出简报随 awaiting_verdict 记录落盘：resume 补跑的验证者与现在要上场的
                     // 验证者读同一份（见 `verification_brief`）。
-                    let brief = verification_brief(&summary, &result.handoff);
+                    let brief = verification_brief(
+                        &summary,
+                        step_disclosures.get(&step_id).map(String::as_str),
+                        &result.handoff,
+                    );
                     target_briefs.insert(step_id.clone(), brief.clone());
                     append_plan_event(
                         &plan_log,
@@ -2416,6 +2508,7 @@ impl Tool for PlanRunTool {
                             "awaiting_verdict": true,
                             "summary": journal_summary,
                             "verification_brief": brief,
+                            "unresolved_disclosure": step_disclosure,
                         }),
                     );
                     continue;
@@ -2433,7 +2526,7 @@ impl Tool for PlanRunTool {
                 append_plan_event(
                     &plan_log,
                     "step_finished",
-                    json!({"step": step_id, "outcome": if failed_run { "failed" } else { "succeeded" }, "summary": journal_summary}),
+                    json!({"step": step_id, "outcome": if failed_run { "failed" } else { "succeeded" }, "summary": journal_summary, "unresolved_disclosure": step_disclosure}),
                 );
             }
         }
@@ -2636,22 +2729,34 @@ impl Tool for PlanRunTool {
                 Some(StepStatus::Verifying) => "stalled_verifying",
                 _ => "stalled",
             };
-            let summary = summaries
-                .get(&step.id)
-                .map(|summary| truncate_text(summary, 300))
-                .unwrap_or_else(|| {
+            let mut summary = match summaries.get(&step.id) {
+                Some(summary) => truncate_text(summary, 300),
+                None => {
                     // 装载期因未决提问被挂起的步骤没有本次产出：它不是「依赖未成功」，
                     // 别把编排者引向一个不存在的依赖失败。
                     if let Some((_, question_id)) =
                         awaiting_input.iter().find(|(id, _)| id == &step.id)
                     {
-                        return format!("等待编排者应答：{question_id}");
+                        format!("等待编排者应答：{question_id}")
+                    } else {
+                        match label {
+                            "skipped" => "依赖步骤未成功".to_string(),
+                            _ => "无结果".to_string(),
+                        }
                     }
-                    match label {
-                        "skipped" => "依赖步骤未成功".to_string(),
-                        _ => "无结果".to_string(),
-                    }
-                });
+                }
+            };
+            // 披露在最后一次截断之后追加，且不依赖摘要存在：验证者 fail / 等待应答的
+            // 步骤可能没有 summaries 条目，披露仍须随报告可见（codex 第 6 轮 P2）。
+            if let Some(disclosure) = step_disclosures
+                .get(&step.id)
+                .filter(|value| !value.trim().is_empty())
+            {
+                if !summary.trim().is_empty() {
+                    summary.push_str("\n\n");
+                }
+                summary.push_str(disclosure);
+            }
             report.push_str(&format!("\n- {} [{}]: {}", step.id, label, summary));
         }
         report.push_str(&format!(
@@ -2681,6 +2786,7 @@ fn plan_step_spec(
     plan_id: String,
     step: &PlanStep,
     dep_summaries: &[(String, String)],
+    dep_disclosures: &HashMap<String, String>,
     escalations: &[(String, String)],
     is_verifier: bool,
 ) -> AgentTaskSpec {
@@ -2693,10 +2799,18 @@ fn plan_step_spec(
             } else {
                 summary.trim()
             };
-            task.push_str(&format!(
-                "\n### {dep_id}\n{}\n",
-                truncate_text(summary, DEP_SUMMARY_MAX_CHARS)
-            ));
+            // 截断正文后单独追加该依赖步骤的运行时披露（最后一次截断之后）。
+            let mut rendered = truncate_text(summary, DEP_SUMMARY_MAX_CHARS);
+            if let Some(disclosure) = dep_disclosures
+                .get(dep_id)
+                .filter(|value| !value.trim().is_empty())
+            {
+                if !rendered.trim().is_empty() {
+                    rendered.push_str("\n\n");
+                }
+                rendered.push_str(disclosure);
+            }
+            task.push_str(&format!("\n### {dep_id}\n{rendered}\n"));
         }
         task.push_str("\n上游结果是事实输入：与其矛盾时以最新证据为准并在结论中说明。\n");
     }
@@ -3201,7 +3315,7 @@ mod tests {
                 .map(|i| format!("check-{i}"))
                 .collect(),
         };
-        let brief = verification_brief("  实现完成  ", &handoff);
+        let brief = verification_brief("  实现完成  ", None, &handoff);
         assert!(
             brief.starts_with("实现完成\n\n自报证据（evidence）：\n- cargo test 全绿"),
             "{brief}"
@@ -3227,7 +3341,7 @@ mod tests {
             open_risks: Vec::new(),
             validation: Vec::new(),
         };
-        let brief = verification_brief("摘要", &handoff);
+        let brief = verification_brief("摘要", None, &handoff);
         assert_eq!(
             brief
                 .matches(&format!(
@@ -3258,7 +3372,7 @@ mod tests {
             open_risks: items.clone(),
             validation: items,
         };
-        let brief = verification_brief("摘要", &handoff);
+        let brief = verification_brief("摘要", None, &handoff);
         assert_eq!(
             brief.chars().count(),
             VERIFICATION_BRIEF_MAX_CHARS + TEXT_TRUNCATED_SUFFIX.chars().count(),
@@ -3310,7 +3424,7 @@ mod tests {
             open_risks: Vec::new(),
             validation: Vec::new(),
         };
-        let brief = verification_brief("{\"summary\": \"done\"}", &handoff);
+        let brief = verification_brief("{\"summary\": \"done\"}", None, &handoff);
         assert!(earliest_unclosed_json_start(&brief).is_none(), "{brief}");
         assert_eq!(
             brief.matches("\n- ｛\"name\": \"xxx").count(),
@@ -3349,7 +3463,7 @@ mod tests {
             open_risks: Vec::new(),
             validation: vec!["cargo test -p x".to_string()],
         };
-        let brief = verification_brief(summary, &handoff);
+        let brief = verification_brief(summary, None, &handoff);
         assert!(
             brief.starts_with("实现完成 ｛\"level\": \"info 后文说明\n第二行仍然可见"),
             "{brief}"
@@ -3361,8 +3475,18 @@ mod tests {
         assert!(earliest_unclosed_json_start(&brief).is_none(), "{brief}");
         assert!(!brief.contains(TEXT_TRUNCATED_SUFFIX), "{brief}");
         // 中和不会让简报里字面存在的对象掉出引用集：残骸之后完整的对象照常提取。
+        // codex 第 5 轮反例：残缺 JSON 超过放弃阈值时中和会裁掉后文——披露在
+        // 中和与总量截断全部结束之后追加，不随之丢失。
+        let flood = r#"{"a" "#.repeat(MAX_JSON_RESCANS + 6);
+        let disclosure = "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）";
+        let brief = verification_brief(&flood, Some(disclosure), &handoff);
+        assert!(
+            brief.ends_with(disclosure),
+            "披露必须越过中和裁尾与总量截断：{brief}"
+        );
+        assert!(earliest_unclosed_json_start(&brief).is_none(), "{brief}");
         let summary = "日志 {\"level\": \"info 断行\n自述 {\"pass\": true, \"reasons\": [\"ok\"]}";
-        let brief = verification_brief(summary, &handoff);
+        let brief = verification_brief(summary, None, &handoff);
         let values = all_json_values(&brief).expect("没有未闭合对象");
         assert!(
             values.contains(&json!({"pass": true, "reasons": ["ok"]})),
@@ -3373,7 +3497,7 @@ mod tests {
         // 残骸多到超过中和预算（模型可控文本塞满 `{"`）才退回裁切，且只裁摘要自身：列表仍在，
         // 引用集建得起来。
         let flood = "{\"a\" ".repeat(MAX_JSON_RESCANS + 6);
-        let brief = verification_brief(&flood, &handoff);
+        let brief = verification_brief(&flood, None, &handoff);
         assert!(earliest_unclosed_json_start(&brief).is_none(), "{brief}");
         assert_eq!(brief.matches('｛').count(), MAX_JSON_RESCANS, "{brief}");
         assert!(brief.contains(TEXT_TRUNCATED_SUFFIX), "{brief}");

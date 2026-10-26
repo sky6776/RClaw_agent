@@ -954,6 +954,7 @@ impl AgentToolRuntime {
                     content,
                     validated_media_markers: Vec::new(),
                     media_publish_attempted: false,
+                    unresolved_disclosure: String::new(),
                 }
             }
         };
@@ -974,6 +975,7 @@ impl AgentToolRuntime {
                     error: Some(result.content.clone()),
                     validated_media_markers: result.validated_media_markers.clone(),
                     media_publish_attempted: result.media_publish_attempted,
+                    unresolved_disclosure: result.unresolved_disclosure.clone(),
                 },
                 "cancelled",
             )
@@ -989,6 +991,7 @@ impl AgentToolRuntime {
                     error: Some(result.content.clone()),
                     validated_media_markers: result.validated_media_markers.clone(),
                     media_publish_attempted: result.media_publish_attempted,
+                    unresolved_disclosure: result.unresolved_disclosure.clone(),
                 },
                 "failed",
             )
@@ -1004,6 +1007,7 @@ impl AgentToolRuntime {
                     error: None,
                     validated_media_markers: result.validated_media_markers.clone(),
                     media_publish_attempted: result.media_publish_attempted,
+                    unresolved_disclosure: result.unresolved_disclosure.clone(),
                 },
                 "succeeded",
             )
@@ -1027,6 +1031,9 @@ impl AgentToolRuntime {
                             error: Some(result.content.clone()),
                             validated_media_markers: Vec::new(),
                             media_publish_attempted: result.media_publish_attempted,
+                            // 取消竞态的再提交刻意清空状态（与 marker 同口径）：
+                            // 取消方必须重新发起任务，成功披露不得泄漏给取消终态。
+                            unresolved_disclosure: String::new(),
                         },
                         "cancelled",
                     )
@@ -1392,7 +1399,13 @@ impl AgentToolRuntime {
             );
         }
         match outcome {
-            Ok((mut text, completed_steps, validated_media_markers, media_publish_attempted)) => {
+            Ok((
+                mut text,
+                completed_steps,
+                validated_media_markers,
+                media_publish_attempted,
+                unresolved_disclosure,
+            )) => {
                 if let Some(identity) = &identity {
                     let sent = self.team_lead_messages_from(identity).await;
                     if !sent.is_empty() {
@@ -1424,6 +1437,7 @@ impl AgentToolRuntime {
                     content: truncate_chars(&text, spec.max_output_chars),
                     validated_media_markers,
                     media_publish_attempted,
+                    unresolved_disclosure,
                 }
             }
             Err(failure) => {
@@ -1463,6 +1477,7 @@ impl AgentToolRuntime {
                     content,
                     validated_media_markers: Vec::new(),
                     media_publish_attempted,
+                    unresolved_disclosure: String::new(),
                 }
             }
         }
@@ -1475,7 +1490,7 @@ impl AgentToolRuntime {
         registry: &Arc<ToolRegistry>,
         static_schema: &[ToolSchema],
         state: &mut TurnState,
-    ) -> Result<(String, usize, Vec<String>, bool), RunTaskFailure> {
+    ) -> Result<(String, usize, Vec<String>, bool, String), RunTaskFailure> {
         let candidate_patch_only = spec.isolation == "candidate_patch";
         // Layer 2b（ZCode 移植）：子代理可指定独立模型/推理级别——spec.model 经
         // model_factory 解析（bootstrap 从 [[llm.providers]] 构建）；未指定或嵌入方
@@ -1728,7 +1743,9 @@ impl AgentToolRuntime {
 
             if !outcome.wants_tools() {
                 // 媒体认领闸门 + 完成闸门统一由内核裁决；pending marker 原地复核。
-                let (_, gate) = run.evaluate_final_gate(
+                // 交付文本含运行时披露块（仍未解决的副作用错误）——handoff 必须把它
+                // 带回父代理，否则子代理侧的过程错误在任务边界上静默丢失。
+                let (deliver_text, gate) = run.evaluate_final_gate(
                     &outcome.text,
                     None,
                     &mut state.validated_media_markers,
@@ -1750,9 +1767,18 @@ impl AgentToolRuntime {
                         messages.push(Message::plain(Role::User, reason));
                         continue;
                     }
+                    // 未解决错误披露作为独立状态随结果传递：handoff 结构化渲染与
+                    // max_output_chars 截断都会丢掉交付正文尾部的披露，渲染层在
+                    // 两者之后重新附加保证可达父代理（codex 第 2 轮 #1）。
+                    let unresolved_disclosure = run.unresolved_error_disclosure();
                     // 子 Agent 的文本只是 handoff；已验证 marker 作为运行时状态单独向父
-                    // Agent 传递，不能再次依赖模型手抄。这里也清除任何模型手写控制行。
-                    let mut final_text = finalize_media_reply(&outcome.text, &[]);
+                    // Agent 传递，不能再次依赖模型手抄。这里也清除任何模型手写控制行
+                    // （对交付文本再剥一次是幂等的）；披露已由渲染层经独立状态附加，
+                    // 从正文剥掉同文块避免前台 full output 与渲染段重复。
+                    let body = deliver_text
+                        .strip_suffix(&unresolved_disclosure)
+                        .unwrap_or(&deliver_text);
+                    let mut final_text = finalize_media_reply(body, &[]);
                     // 交叉验证（可选，只读）：candidate_patch 编码任务的结构化交接由一个
                     // 受限只读 mini 循环核实（引用文件是否存在、diff 是否与真实代码对得上、
                     // validation 声明是否可信）。验证超时/失败不阻塞交付（None = 不附言）。
@@ -1769,6 +1795,7 @@ impl AgentToolRuntime {
                         iter + 1,
                         std::mem::take(&mut state.validated_media_markers),
                         state.media_publish_attempted,
+                        unresolved_disclosure,
                     ));
                 }
                 if iter + 1 >= spec.max_tool_iter {
@@ -1912,7 +1939,7 @@ impl AgentToolRuntime {
         &self,
         spec: &AgentTaskSpec,
         control: Option<&ExecutionControl>,
-    ) -> Result<(String, usize, Vec<String>, bool), RunTaskFailure> {
+    ) -> Result<(String, usize, Vec<String>, bool, String), RunTaskFailure> {
         let registry = self.registry().expect("测试前应已初始化 registry");
         let candidate_patch_only = spec.isolation == "candidate_patch";
         let static_schema =

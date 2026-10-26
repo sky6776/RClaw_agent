@@ -29,11 +29,32 @@ use super::external_action::{
 };
 use super::media::{
     finalize_media_reply, is_media_control_line, media_channel_available,
-    required_media_markers_for_claim, revalidated_pending_media_markers,
+    required_media_markers_for_claim, revalidated_pending_media_markers, strip_media_control_lines,
 };
 
 pub(crate) const REPEATED_TOOL_CALL_LIMIT: u32 = 3;
 pub(crate) const MAX_COMPLETION_GATE_REJECTIONS: u32 = 2;
+
+/// 运行时披露块的固定首行（见 [`AgentStatus::render_unresolved_error_disclosure`]）。
+/// spill 预览据此识别并保留披露块（codex 第 7 轮 P1）。
+pub(crate) const RUNTIME_DISCLOSURE_HEADER: &str =
+    "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：";
+
+/// 披露条目里的工具名净化：工具名来自模型侧 ToolCall（兼容接口只校验非空，未知
+/// 工具失败也会进入账本），原样输出可注入换行把媒体控制行（`[:weixin-media …]`）
+/// 夹带进交付文本。只保留安全字符集（不含 `:`，杜绝 `[:media` 序列），其余折叠为
+/// `_`（codex 第 9 轮 P1）。
+fn sanitize_disclosure_tool_name(tool: &str) -> String {
+    tool.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 struct StatusError {
@@ -354,15 +375,7 @@ impl AgentStatus {
     }
 
     fn evaluate_completion(&mut self, text: &str) -> CompletionGateReport {
-        self.evaluate_completion_impl(text, None)
-    }
-
-    fn evaluate_reply_completion_with_reasoning(
-        &mut self,
-        final_text: &str,
-        reasoning: Option<&str>,
-    ) -> CompletionGateReport {
-        self.evaluate_completion_impl(final_text, reasoning)
+        self.evaluate_completion_impl(text, None, false, true)
     }
 
     fn reject_completion(&mut self, reason: String) -> CompletionGateReport {
@@ -386,6 +399,8 @@ impl AgentStatus {
         &mut self,
         final_text: &str,
         reasoning: Option<&str>,
+        unresolved_auto_disclosed: bool,
+        quality_requires_nonempty_body: bool,
     ) -> CompletionGateReport {
         let verification_text = match reasoning.filter(|value| !value.trim().is_empty()) {
             Some(reasoning) => format!("{final_text}\n{reasoning}"),
@@ -496,10 +511,24 @@ impl AgentStatus {
                 unverified_actions.join(", ")
             ));
         }
-        let process_ok = !claims_external_completion || self.unresolved_effect_errors.is_empty();
+        // 过程验证：声明完成时，未解决的副作用工具错误必须已被后续成功调用清除，
+        // 或由运行时披露块随交付正文公开（unresolved_auto_disclosed 只能由
+        // evaluate_final_gate 在确实附加披露后置真，见 render_unresolved_error_disclosure）。
+        // 披露由运行时生成而非解析模型正文（codex 方案评审）：回执号引用通道不区分
+        // 报告与掩饰语境——「提示已写入 MEMORY.md（失败回执 E）；配置已保存（成功
+        // 回执 S）」两句都归 write_or_update，S 满足 result、引用 E 又满足 process，
+        // 谎言放行；且引用错误编号会令 cited_ids 非空、result 通道收窄为只认被引用
+        // 回执，「报告已写入；memory 保存失败（E）」反而制造新误拒。无完成声明时
+        // 未解决错误本就不阻塞（!claims_external_completion 旁路）；本缺陷的真实范围
+        // 是「成功声明与未解决错误混合报告」缺少合法出口——安全拦截等确定性错误无法
+        // 靠重试清除，模型如实说明后仍被逐次拒绝，整份报告顶着「验证未通过」出站
+        // （真机海澜之家会话实证）。
+        let process_ok = !claims_external_completion
+            || self.unresolved_effect_errors.is_empty()
+            || unresolved_auto_disclosed;
         if !process_ok {
             reasons.push(format!(
-                "过程验证失败：仍有未解决的副作用工具错误：{}。",
+                "过程验证失败：仍有未解决的副作用工具错误：{}。修正可恢复的问题；被安全策略拦截时不要重复或绕过，交付时运行时会列明未解决项。",
                 self.unresolved_effect_errors
                     .values()
                     .map(|receipt| format!("{}:{}", receipt.tool, receipt.id))
@@ -508,7 +537,10 @@ impl AgentStatus {
             ));
         }
         let verification_lower = verification_text.to_ascii_lowercase();
-        let quality_ok = !final_text.trim().is_empty()
+        // 交付路径（quality_requires_nonempty_body=false）的空正文已在
+        // evaluate_final_gate 第 3 步对最终交付物（含回填 marker）核过——这里不再用
+        // 模型正文否决「纯媒体交付」（正文只有控制行、媒体由 marker 承载的合法形态）。
+        let quality_ok = (!quality_requires_nonempty_body || !final_text.trim().is_empty())
             && !verification_lower.contains("<agent-status>")
             && !verification_lower.contains("<rclaw-runtime-context");
         if !quality_ok {
@@ -533,11 +565,40 @@ impl AgentStatus {
         report
     }
 
+    /// 运行时自动披露块：仍未解决的副作用工具错误的固定说明，由
+    /// [`Run::evaluate_final_gate`] 附加到实际交付正文末尾。只含工具名、回执号与
+    /// 错误类别，不含工具结果原文——错误摘要可能带敏感内容，不投递到用户通道。
+    /// 「已披露」不等于「已解决」：条目保留在 [`Self::unresolved_effect_errors`]
+    /// 中，后续成功调用仍按原语义清除。无未解决错误时返回空串（交付正文原样）。
+    fn render_unresolved_error_disclosure(&self) -> String {
+        if self.unresolved_effect_errors.is_empty() {
+            return String::new();
+        }
+        let mut entries: Vec<&ToolReceipt> = self.unresolved_effect_errors.values().collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        let items = entries
+            .iter()
+            .map(|receipt| {
+                format!(
+                    "- {}（回执 {}，类别 {}）",
+                    sanitize_disclosure_tool_name(&receipt.tool),
+                    receipt.id,
+                    receipt.error_category.unwrap_or("tool_execution")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{RUNTIME_DISCLOSURE_HEADER}\n{items}")
+    }
+
     fn render(&self, environment_version: &str) -> String {
         let remaining = self.max_iterations.saturating_sub(self.iteration);
         let mut todo = vec!["完成当前用户目标，并只在验证通过后结束".to_string()];
         if !self.unresolved_effect_errors.is_empty() {
-            todo.push("解决或明确报告尚未解决的工具错误".to_string());
+            todo.push(
+                "解决尚未解决的工具错误；被安全策略等拦截时不要重复或绕过，如实说明即可（交付时运行时会列明未解决项）"
+                    .to_string(),
+            );
         }
         if self.circuit_trips > 0 {
             todo.push("停止重复调用，改用不同策略或请求必要信息".to_string());
@@ -629,7 +690,7 @@ impl AgentStatus {
                 // 结构化 Evidence 试点（write/edit 先行）：模型可在最终回复中引用
                 // 回执号，完成闸门据此精确核对声明（回执存在且成功 = 事实受支持）。
                 format!(
-                    "- {}\n- 可在最终回复中引用回执号（如 r2-1-abc）核实对应声明",
+                    "- {}\n- 可在最终回复中引用回执号（如 r2-1-1a2b3c4d）核实对应声明",
                     receipts.join("\n- ")
                 )
             }
@@ -753,7 +814,7 @@ impl<A: RunAdapter> Run<A> {
         self.status.evaluate_completion(text)
     }
 
-    /// 带 reasoning 的完成验证（生产路径经 [`Self::evaluate_final_gate`]；测试直用）。
+    /// 带 reasoning 的完成验证（严格模式：无运行时披露、空正文拒绝；测试直用）。
     #[cfg(test)]
     pub(crate) fn evaluate_completion_with_reasoning(
         &mut self,
@@ -761,7 +822,7 @@ impl<A: RunAdapter> Run<A> {
         reasoning: &str,
     ) -> CompletionGateReport {
         self.status
-            .evaluate_reply_completion_with_reasoning(text, Some(reasoning))
+            .evaluate_completion_impl(text, Some(reasoning), false, true)
     }
 
     pub(crate) fn render(&self, environment_version: &str) -> String {
@@ -777,6 +838,13 @@ impl<A: RunAdapter> Run<A> {
     #[cfg(test)]
     pub(crate) fn has_unresolved_effect_errors(&self) -> bool {
         !self.status.unresolved_effect_errors.is_empty()
+    }
+
+    /// 仍未解决的副作用工具错误的运行时披露块（空串 = 无未解决错误）。子代理
+    /// 交付路径把它作为独立状态带回父代理：handoff 的结构化渲染与截断都可能丢掉
+    /// 交付正文尾部的披露，渲染层在两者之后重新附加保证可达（codex 第 2 轮 #1）。
+    pub(crate) fn unresolved_error_disclosure(&self) -> String {
+        self.status.render_unresolved_error_disclosure()
     }
 
     /// 完成闸门接受后的附加检查（委托适配器）。
@@ -813,7 +881,8 @@ impl<A: RunAdapter> Run<A> {
             );
         }
         *pending_markers = current_markers;
-        // 2) 从文本剥离已验证 marker 得到最终回复。
+        // 2) 剥离媒体控制行得到【模型正文】；已验证 marker 由 finalize 回填到交付文本。
+        let model_body = strip_media_control_lines(text);
         let finalized_reply = finalize_media_reply(text, pending_markers);
         // 3) 剥离后为空 → 拒绝：marker 之外没有任何真实内容可交付。
         if finalized_reply.trim().is_empty() {
@@ -826,15 +895,24 @@ impl<A: RunAdapter> Run<A> {
             );
         }
         // 4) 声称交付数 > 已验证数，且媒体参与可判定（通道支持 / 本 turn 发起过发布 /
-        //    文本含媒体控制行）→ 拒绝：不得夸大发送数量。
+        //    文本含媒体控制行）→ 拒绝：不得夸大发送数量。预算耗尽时该候选会随警告
+        //    交付（turn.rs 方案 B），未解决错误披露必须随行——媒体失败不得掩盖过程
+        //    错误（codex 第 2 轮 #3）。第 3 步的空正文早退不带披露：其耗尽终局是纯
+        //    错误路径，不投递正文。
         let required_media_markers = required_media_markers_for_claim(text);
         let unverified_media_claim = required_media_markers > pending_markers.len()
             && (media_channel_available(channel, info)
                 || media_attempted
                 || text.lines().any(is_media_control_line));
         if unverified_media_claim {
+            let disclosure = self.status.render_unresolved_error_disclosure();
+            let deliver_text = if disclosure.is_empty() {
+                finalized_reply
+            } else {
+                format!("{finalized_reply}\n\n{disclosure}")
+            };
             return (
-                finalized_reply,
+                deliver_text,
                 self.status.reject_completion(format!(
                     "媒体交付验证失败：回复声称已交付至少 {required_media_markers} 个媒体文件，\
 但发布工具只返回 {} 个当前通道可用、且指向共享媒体沙箱非空真实文件的 MEDIA_MARKER；\
@@ -843,14 +921,33 @@ impl<A: RunAdapter> Run<A> {
                 )),
             );
         }
-        // 5) 三层完成验证（reasoning 参与验证文本）。
+        // 5) 三层完成验证。运行时自动披露：仍未解决的副作用错误由运行时生成固定
+        //    脱敏说明并附加到【实际交付正文】，过程验证据此放行——「不静默撒谎」
+        //    由运行时保证，不依赖模型复述（codex 方案评审定案，替代「模型引用错误
+        //    回执号」方案）。声明、回执号引用与泄露帧检查只看【模型正文】：
+        //    finalized_reply 回填的已验证 marker 是运行时交付物，其内容（如文件名
+        //    r9-1-….md）不得参与回执号解析——cited_ids 非空会收窄 result 通道为只认
+        //    被引用回执，制造误拒（codex 第 2 轮 #2）；空正文不因披露块变「非空」，
+        //    纯媒体交付（正文只有控制行）的空检查已由第 3 步对交付物核过。
+        let disclosure = self.status.render_unresolved_error_disclosure();
+        let auto_disclosed = !disclosure.is_empty();
         let gate = match reasoning {
-            Some(reasoning) if !reasoning.trim().is_empty() => self
+            Some(reasoning) if !reasoning.trim().is_empty() => self.status.evaluate_completion_impl(
+                &model_body,
+                Some(reasoning),
+                auto_disclosed,
+                false,
+            ),
+            _ => self
                 .status
-                .evaluate_reply_completion_with_reasoning(text, Some(reasoning)),
-            _ => self.status.evaluate_completion(text),
+                .evaluate_completion_impl(&model_body, None, auto_disclosed, false),
         };
-        (finalized_reply, gate)
+        let deliver_text = if auto_disclosed {
+            format!("{finalized_reply}\n\n{disclosure}")
+        } else {
+            finalized_reply
+        };
+        (deliver_text, gate)
     }
 }
 

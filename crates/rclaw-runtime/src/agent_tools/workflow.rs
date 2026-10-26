@@ -1081,11 +1081,13 @@ pub(crate) fn append_workflow_event(journal: &EventLog, event: &Value) {
 }
 
 /// 重放表条目：答案 + 原完成序（journal 中首见该调用点答案的全局位次，0 起；
-/// amend 导入不经顺序门 → None）。
+/// amend 导入不经顺序门 → None）。unresolved_disclosure 是答案子代理仍未解决的
+/// 副作用工具错误的运行时披露块——与答案一起原样重放，resume 不丢披露。
 #[derive(Debug, Clone)]
 pub(crate) struct ReplayAnswer {
     pub(crate) answer: String,
     pub(crate) order: Option<u64>,
+    pub(crate) unresolved_disclosure: String,
 }
 
 /// 调用点键：(actor, inputHash, 本 run 内同键第几次提问)。
@@ -1095,7 +1097,13 @@ type ReplayKey = (String, u64, u32);
 pub(crate) type ReplayTable = HashMap<ReplayKey, ReplayAnswer>;
 
 /// 只收每个调用点**首见**的答案（order 跨代稳定：重放一代按门序再发一遍，取首次）。
-fn record_answer(table: &mut ReplayTable, order_next: &mut u64, key: ReplayKey, answer: &str) {
+fn record_answer(
+    table: &mut ReplayTable,
+    order_next: &mut u64,
+    key: ReplayKey,
+    answer: &str,
+    unresolved_disclosure: &str,
+) {
     if table.contains_key(&key) {
         return;
     }
@@ -1104,6 +1112,7 @@ fn record_answer(table: &mut ReplayTable, order_next: &mut u64, key: ReplayKey, 
         ReplayAnswer {
             answer: answer.to_string(),
             order: Some(*order_next),
+            unresolved_disclosure: unresolved_disclosure.to_string(),
         },
     );
     *order_next += 1;
@@ -1162,7 +1171,11 @@ pub(crate) fn load_workflow_journal(journal: &EventLog) -> Result<(u64, ReplayTa
                 if kind == "ask" {
                     pending.push((journal_seq, key));
                 } else if let Some(answer) = event.get("answer").and_then(Value::as_str) {
-                    record_answer(&mut table, &mut order_next, key, answer);
+                    let disclosure = event
+                        .get("unresolved_disclosure")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    record_answer(&mut table, &mut order_next, key, answer, disclosure);
                 }
             }
             Some("answer") => {
@@ -1179,7 +1192,11 @@ pub(crate) fn load_workflow_journal(journal: &EventLog) -> Result<(u64, ReplayTa
                     continue;
                 };
                 let (_, key) = pending.remove(position);
-                record_answer(&mut table, &mut order_next, key, answer);
+                let disclosure = event
+                    .get("unresolved_disclosure")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                record_answer(&mut table, &mut order_next, key, answer, disclosure);
             }
             _ => {}
         }
@@ -1291,9 +1308,17 @@ const PRELUDE: &str = r#"
             { value: __gate_open, writable: false, configurable: false, enumerable: false });
     })();
     // facade：宿主 envelope 结算（错误在 JS 侧抛出；重放命中且带 order 的经顺序门）。
+    // 失败信封带 replayed/order 时同样先进顺序门再抛：重放代里慢调用的失败不得绕过
+    // 顺序门抢先拒绝，否则 Promise.race 的赢家会随代次漂移（codex 第 6 轮 P1）。
     function __settle(raw, label) {
         var parsed = JSON.parse(raw);
-        if (!parsed.ok) { throw new Error(parsed.error || (label + " 失败")); }
+        if (!parsed.ok) {
+            var fail = function () { throw new Error(parsed.error || (label + " 失败")); };
+            if (parsed.replayed && typeof parsed.order === "number") {
+                return __gate_wait(parsed.order).then(fail);
+            }
+            return fail();
+        }
         if (parsed.replayed && typeof parsed.order === "number") {
             return __gate_wait(parsed.order).then(function () { return parsed.answer; });
         }
@@ -1822,6 +1847,7 @@ async fn ask_host(
                 "actor": actor,
                 "input_hash": hash_hex,
                 "answer": replayed.answer,
+                "unresolved_disclosure": replayed.unresolved_disclosure,
             })) {
                 return json!({
                     "ok": false,
@@ -1831,11 +1857,22 @@ async fn ask_host(
             }
             engine.asks_replayed += 1;
             shared.progress.asks_done.fetch_add(1, Ordering::SeqCst);
+            // 重放路径同样累计（resume 代的披露重新进 run_completed 事件与投影）。
+            if !replayed.unresolved_disclosure.is_empty() {
+                let mut disclosures = shared
+                    .unresolved_disclosures
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if !disclosures.contains(&replayed.unresolved_disclosure) {
+                    disclosures.push(replayed.unresolved_disclosure.clone());
+                }
+            }
             // set-order：order = 原完成序（amend 导入为 null → 不经门）。JS 侧顺序门按它
             // 延迟 resolve，使 Promise.race / 交错 await 的解析顺序与原完成顺序一致。
             return json!({
                 "ok": true,
                 "answer": replayed.answer,
+                "unresolved_disclosure": replayed.unresolved_disclosure,
                 "replayed": true,
                 "order": replayed.order,
             })
@@ -1893,7 +1930,18 @@ async fn ask_host(
     // 这里不再 reset（见函数开头）。
     shared.progress.asks_done.fetch_add(1, Ordering::SeqCst);
     match answer {
-        Ok(answer) => {
+        Ok((answer, unresolved_disclosure)) => {
+            // 披露在宿主侧统一累计（先于 askJson 的 JSON/schema 校验）：校验失败被
+            // 脚本 catch 后 run_completed 仍带披露（codex 第 5 轮 P1）。
+            if !unresolved_disclosure.is_empty() {
+                let mut disclosures = shared
+                    .unresolved_disclosures
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if !disclosures.contains(&unresolved_disclosure) {
+                    disclosures.push(unresolved_disclosure.clone());
+                }
+            }
             append_workflow_event(
                 &shared.journal,
                 &json!({
@@ -1902,9 +1950,17 @@ async fn ask_host(
                     "actor": actor,
                     "input_hash": hash_hex,
                     "answer": truncate_chars(&answer, MAX_ANSWER_CHARS),
+                    // 披露独立字段随 journal 落盘：resume 重放时原样还原（见重放信封）。
+                    "unresolved_disclosure": unresolved_disclosure,
                 }),
             );
-            json!({"ok": true, "answer": answer, "replayed": false}).to_string()
+            json!({
+                "ok": true,
+                "answer": answer,
+                "unresolved_disclosure": unresolved_disclosure,
+                "replayed": false
+            })
+            .to_string()
         }
         Err(error) => json!({
             "ok": false,
@@ -1925,7 +1981,7 @@ async fn run_workflow_ask(
     model: Option<&str>,
     ask_occurrence: u32,
     input_hash: u64,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let _active_ask = ActiveAskGuard::new(Arc::clone(&shared.progress));
     let run_id = &shared.run_id;
     let spec = AgentTaskSpec {
@@ -1996,11 +2052,14 @@ async fn run_workflow_ask(
         return Err(truncate_chars(&result.content, 500));
     }
     let summary = result.handoff.summary;
-    Ok(if summary.trim().is_empty() {
+    let answer = if summary.trim().is_empty() {
         truncate_chars(&result.content, MAX_ANSWER_CHARS)
     } else {
         truncate_chars(&summary, MAX_ANSWER_CHARS)
-    })
+    };
+    // 披露独立于答案返回：askJson 要把答案再过 JSON 解析，披露混进答案文本会让
+    // 合法 JSON 答案解析失败；经信封独立字段承载（codex 第 3 轮 P1）。
+    Ok((answer, result.unresolved_disclosure))
 }
 
 /// askJson 的宿主回调：答案 JSON 解析 + schema（子集）校验后返回对象。
@@ -2022,17 +2081,32 @@ async fn ask_json_host(
     if envelope.get("ok").and_then(Value::as_bool) != Some(true) {
         return raw;
     }
+    // 披露经信封独立字段透传：答案本身要过 JSON 解析，披露混进答案文本会把合法
+    // JSON 答案误判为非法（codex 第 3 轮 P1）。
+    let unresolved_disclosure = envelope
+        .get("unresolved_disclosure")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let answer = envelope
         .get("answer")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // 校验失败信封保留 replayed/order：__settle 在顺序门放行后才抛错——否则重放代里
+    // 先到的非法答案会绕过顺序门抢先拒绝，改变脚本的 race 分支（codex 第 6 轮 P1，
+    // 既有缺陷顺带修复）。
+    let order_gate = json!({
+        "replayed": envelope["replayed"],
+        "order": envelope["order"],
+    });
     let parsed: Value = match serde_json::from_str(&answer) {
         Ok(parsed) => parsed,
         Err(error) => {
             return json!({
                 "ok": false,
-                "error": format!("askJson 答案不是合法 JSON: {error}；请重新 ask 并要求子代理只输出 JSON")
+                "error": format!("askJson 答案不是合法 JSON: {error}；请重新 ask 并要求子代理只输出 JSON"),
+                "replayed": order_gate["replayed"],
+                "order": order_gate["order"],
             })
             .to_string()
         }
@@ -2040,7 +2114,9 @@ async fn ask_json_host(
     if let Err(error) = validate_json_schema(&parsed, &schema, 0) {
         return json!({
             "ok": false,
-            "error": format!("askJson 答案未通过 schema 校验: {error}")
+            "error": format!("askJson 答案未通过 schema 校验: {error}"),
+            "replayed": order_gate["replayed"],
+            "order": order_gate["order"],
         })
         .to_string();
     }
@@ -2048,6 +2124,7 @@ async fn ask_json_host(
     json!({
         "ok": true,
         "answer": parsed,
+        "unresolved_disclosure": unresolved_disclosure,
         "replayed": envelope["replayed"],
         "order": envelope["order"],
     })
@@ -2277,6 +2354,11 @@ struct EngineShared {
     pending_hosts: Arc<AtomicUsize>,
     /// 同时执行的 effect 闸门（见 [`MAX_INFLIGHT_EFFECTS`]）。
     effect_permits: Arc<tokio::sync::Semaphore>,
+    /// 本 run 各 ask 子代理的未解决错误披露（首次出现顺序，去重）。宿主在 ask /
+    /// askJson 结算时从信封独立字段累计；随 EngineOutcome::Completed 交给
+    /// run_completed 事件与 WorkflowRun 投影——脚本只拿 answer（JSON 契约不变），
+    /// 披露走宿主侧旁路（codex 第 4 轮 P1）。
+    unresolved_disclosures: StdMutex<Vec<String>>,
 }
 
 /// 领取一个 effect 执行名额：排队期间引擎停驻在宿主 future 上；取消时放弃（返回 None）。
@@ -3522,6 +3604,9 @@ pub(crate) enum EngineOutcome {
         result: Option<String>,
         asks_total: u64,
         asks_replayed: u64,
+        /// 本 run 各 ask 子代理的未解决错误披露（宿主累计，见
+        /// [`EngineShared::unresolved_disclosures`]）。
+        unresolved_disclosures: Vec<String>,
     },
     HoleWaiting {
         hole: HoleWaiting,
@@ -3707,6 +3792,7 @@ pub(crate) async fn run_engine(request: EngineRequest, runtime: AgentToolRuntime
         artifact_versions: StdMutex::new(artifact_versions),
         pending_hosts: Arc::new(AtomicUsize::new(0)),
         effect_permits: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_EFFECTS)),
+        unresolved_disclosures: StdMutex::new(Vec::new()),
     });
     *retune_slot
         .lock()
@@ -3802,6 +3888,11 @@ pub(crate) async fn run_engine(request: EngineRequest, runtime: AgentToolRuntime
             result: final_result.or(value),
             asks_total,
             asks_replayed,
+            unresolved_disclosures: shared
+                .unresolved_disclosures
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
         },
         Err(error) => EngineOutcome::Failed {
             error: format!(

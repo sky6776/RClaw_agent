@@ -443,6 +443,7 @@ pub(crate) async fn drive(
             result,
             asks_total,
             asks_replayed,
+            unresolved_disclosures,
         } => {
             let result_json = result.clone();
             let event = json!({
@@ -452,6 +453,8 @@ pub(crate) async fn drive(
                 "asks_total": asks_total,
                 "asks_replayed": asks_replayed,
                 "result_json": result_json,
+                // 未解决错误披露落 journal：WorkflowRun 投影按事件还原（跨 resume 可见）。
+                "unresolved_disclosures": unresolved_disclosures,
             });
             let terminal = service.terminal_transaction(
                 &row,
@@ -774,7 +777,9 @@ pub(crate) async fn run_sync(
                 });
             match row.status.as_str() {
                 // §6.0 同步契约：`{status, run_id, result, asks_total, asks_replayed}`——
-                // 问答计数取自终态事件 run_completed。
+                // 问答计数取自终态事件 run_completed。披露同样取自该事件的独立字段：
+                // 同步回执不经过 service.get，父代理不另调 GetWorkflowRun 也要能看到
+                // （codex 第 5 轮 P1）。
                 STATUS_COMPLETED => json!({
                     "status": "completed",
                     "run_id": run_id,
@@ -789,6 +794,11 @@ pub(crate) async fn run_sync(
                         .and_then(|event| event.get("asks_replayed"))
                         .cloned()
                         .unwrap_or(json!(0)),
+                    "unresolved_disclosures": event
+                        .as_ref()
+                        .and_then(|event| event.get("unresolved_disclosures"))
+                        .cloned()
+                        .unwrap_or(json!([])),
                     "script_generation": row.script_generation,
                     "exec_generation": row.exec_generation,
                 }),
@@ -805,7 +815,13 @@ pub(crate) async fn run_sync(
                 _ => json!({
                     "status": "completed",
                     "run_id": run_id,
-                    "result": event.and_then(|event| event.get("result_json").cloned()),
+                    "result": event
+                        .as_ref()
+                        .and_then(|event| event.get("result_json").cloned()),
+                    "unresolved_disclosures": event
+                        .as_ref()
+                        .and_then(|event| event.get("unresolved_disclosures").cloned())
+                        .unwrap_or(json!([])),
                 }),
             }
         }

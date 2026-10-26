@@ -2412,6 +2412,17 @@ impl WorkflowService {
         Ok(json!({"runs": runs, "truncated": filtered > 0, "filtered": filtered}))
     }
 
+/// 从 answer / ask_replayed 事件收集未解决错误披露（去重、保序）。
+fn collect_unresolved_disclosure(event: &Value, out: &mut Vec<String>) {
+    let disclosure = event
+        .get("unresolved_disclosure")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !disclosure.is_empty() && !out.iter().any(|seen| seen == disclosure) {
+        out.push(disclosure.to_string());
+    }
+}
+
     pub(crate) fn get(
         &self,
         run_id: &str,
@@ -2451,6 +2462,8 @@ impl WorkflowService {
         let mut active_agents = 0usize;
         let mut completed_result: Option<Value> = None;
         let mut failure: Option<Value> = None;
+        // ask 子代理的未解决错误披露（answer / ask_replayed 事件带独立字段，去重保序）。
+        let mut unresolved_disclosures: Vec<String> = Vec::new();
         for (_, event) in &events {
             match event.get("event").and_then(Value::as_str) {
                 // 每次执行（首跑 / resume / fill）都以生命周期事件开头，脚本从头重跑：ask 计数
@@ -2469,11 +2482,13 @@ impl WorkflowService {
                 Some("answer") => {
                     ask_done += 1;
                     active_agents = active_agents.saturating_sub(1);
+                    Self::collect_unresolved_disclosure(event, &mut unresolved_disclosures);
                 }
                 Some("ask_replayed") => {
                     ask_total += 1;
                     ask_done += 1;
                     ask_replayed += 1;
+                    Self::collect_unresolved_disclosure(event, &mut unresolved_disclosures);
                 }
                 Some("log") | Some("log_truncated") | Some("phase_truncated") => {
                     logs.push(json!({
@@ -2523,6 +2538,23 @@ impl WorkflowService {
                 }
                 Some("run_completed") => {
                     completed_result = event.get("result_json").cloned();
+                    // 完成事件里的披露数组是兜底账本：answer 事件经 append_lossy 写入
+                    // 失败时脚本仍可成功完成，投影必须合并这里已持久化的披露
+                    // （codex 第 8 轮 P2）。
+                    if let Some(items) = event
+                        .get("unresolved_disclosures")
+                        .and_then(Value::as_array)
+                    {
+                        for disclosure in items.iter().filter_map(Value::as_str) {
+                            if !disclosure.is_empty()
+                                && !unresolved_disclosures
+                                    .iter()
+                                    .any(|seen| seen == disclosure)
+                            {
+                                unresolved_disclosures.push(disclosure.to_string());
+                            }
+                        }
+                    }
                 }
                 Some("run_failed") => {
                     failure = event.get("error").cloned();
@@ -2708,6 +2740,9 @@ impl WorkflowService {
                 "effects_cursor": effects_next,
                 "result": result,
                 "result_handle": result_handle,
+                // ask 子代理的未解决错误披露（answer / ask_replayed 事件独立字段，
+                // 去重保序）——父代理经 WorkflowRun 投影必然可见。
+                "unresolved_disclosures": unresolved_disclosures,
                 "error": error,
                 "recovery": recovery_actions(&row),
                 "notifications": notifications,

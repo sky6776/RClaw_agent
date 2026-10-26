@@ -71,6 +71,11 @@ pub(super) struct ExecutionSnapshot {
     /// 按它还原沙箱，而不是继承恢复者所在会话的权限；缺省 false = 沙箱（安全方向）。
     #[serde(default)]
     pub(super) unrestricted: bool,
+    /// 子代理仍未解决的副作用工具错误的运行时披露块（空串 = 无）。随快照走
+    /// AgentStatus／AgentWait——无团队的后台任务不发团队邮箱，这是父代理看到披露
+    /// 的唯一通道（codex 第 3 轮 P1）。
+    #[serde(default)]
+    pub(super) unresolved_disclosure: String,
     pub(super) created_at: String,
     pub(super) updated_at: String,
     pub(super) recovered: bool,
@@ -102,6 +107,7 @@ pub(super) struct ExecutionOutcomeUpdate {
     pub(super) error: Option<String>,
     pub(super) validated_media_markers: Vec<String>,
     pub(super) media_publish_attempted: bool,
+    pub(super) unresolved_disclosure: String,
 }
 
 pub(super) fn controlled_transition_failure(
@@ -779,6 +785,7 @@ impl CollaborationState {
             snapshot.error = outcome.error;
             snapshot.validated_media_markers = outcome.validated_media_markers;
             snapshot.media_publish_attempted = outcome.media_publish_attempted;
+            snapshot.unresolved_disclosure = outcome.unresolved_disclosure;
             snapshot.updated_at = chrono::Utc::now().to_rfc3339();
             let entry = ExecutionLogEntry {
                 event: event.to_string(),
@@ -858,6 +865,7 @@ impl CollaborationState {
             validated_media_markers: Vec::new(),
             media_publish_attempted: false,
             unrestricted: access == rclaw_core::ToolAccess::Unrestricted,
+            unresolved_disclosure: String::new(),
             created_at: now.clone(),
             updated_at: now.clone(),
             recovered: false,

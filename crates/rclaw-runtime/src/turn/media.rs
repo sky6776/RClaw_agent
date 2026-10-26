@@ -287,16 +287,23 @@ pub(crate) fn is_media_control_line(line: &str) -> bool {
         .is_some_and(|name| name.contains("-media"))
 }
 
+/// 只剥离媒体控制行，不回填 marker：完成闸门对【模型正文】做声明、回执号引用与
+/// 泄露帧检查时用——已验证 marker 是运行时附加的交付物，其内容（如文件名
+/// `r9-1-….md`）不得参与回执号解析，否则 cited_ids 非空会把 result 通道收窄为
+/// 只认被引用回执，类回执 token 会过滤掉真实成功凭据，制造误拒（codex 第 2 轮）。
+pub(crate) fn strip_media_control_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| !is_media_control_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 只保留运行时从真实成功工具结果中验证过的 marker，并自动补到最终回复。
 ///
 /// 这既消除了模型漏抄回执的问题，也让模型手写、从历史复制或写错 channel 的 marker
 /// 无法绕过当前 turn 的工具结果与沙箱校验。
 pub(crate) fn finalize_media_reply(text: &str, markers: &[String]) -> String {
-    let mut reply = text
-        .lines()
-        .filter(|line| !is_media_control_line(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut reply = strip_media_control_lines(text);
     let mut seen = HashSet::new();
     for marker in markers {
         if !seen.insert(marker) {

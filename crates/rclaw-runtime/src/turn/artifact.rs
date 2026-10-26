@@ -186,6 +186,17 @@ pub(crate) fn spill_if_over_budget(
     }
     let preview = head_tail_truncate(content, PREVIEW_BYTES);
     let total = content.len();
+    // 运行时披露随预览保留（codex 第 7 轮 P1）：披露块落在被省略的中段时，父代理
+    // 就看不到子代理的未解决副作用错误。聚合输出（TaskList 排空邮箱等）把多条结果
+    // 拼在一起，仅靠「披露放尾部」保证不了——从原文提取全部披露块，附在预览之后；
+    // 尾窗已完整保留的块去重跳过。
+    let disclosure_blocks = extract_runtime_disclosure_blocks(content);
+    let disclosure_suffix = disclosure_blocks
+        .iter()
+        .filter(|block| !preview.text.contains(block.as_str()))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
     // 路径统一正斜杠：跨平台一致（Windows 侧 API 与 read 工具都接受），
     // 句柄进 transcript 后也不因平台不同而形态漂移。
     let display_path = path.to_string_lossy().replace('\\', "/");
@@ -202,7 +213,97 @@ pub(crate) fn spill_if_over_budget(
          预览（头尾合计 {} 字节，中段已省略）：\n{}",
         spill.threshold_bytes, PREVIEW_BYTES, preview.text,
     );
+    if !disclosure_suffix.is_empty() {
+        content.push_str(
+            "\n\n未解决工具错误的运行时披露（原文位于被省略的中段，随预览保留）：\n\n",
+        );
+        content.push_str(&disclosure_suffix);
+    }
     Some(path)
+}
+
+/// 从工具结果文本提取全部运行时披露块，去重保序。两种形态：
+///
+/// 1. 【行首明文块】披露标题在行首（允许空格缩进）；
+/// 2. 【JSON 字符串字段内的转义块】标题紧随已知披露字段（`unresolved_disclosure`
+///    / `unresolved_disclosures` 数组）的序列化锚点，取到该字符串的收束引号为止、
+///    `\n` 还原为换行。披露内容不含引号（工具名已净化、回执号/类别是安全字符），
+///    解析安全；任意其它非行首标题（普通 read 输出正文等）一律忽略。
+///
+/// 两形态都经 [`disclosure_block_from_text`] 只保留「标题 + 连续 `- ` 条目（含
+/// 「（回执 」标记）」的运行时格式前缀——转义字符串里条目之后的大段普通正文、
+/// 计划报告相邻的普通 `- ` 行都不会被并入或回填，spill 预算不被打破
+/// （codex 第 8-12 轮 P1）。
+fn extract_runtime_disclosure_blocks(content: &str) -> Vec<String> {
+    let header = super::run::RUNTIME_DISCLOSURE_HEADER;
+    let mut blocks: Vec<String> = Vec::new();
+    for (index, _) in content.match_indices(header) {
+        let line_start = content[..index].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let at_line_start = content[line_start..index].chars().all(|ch| ch == ' ');
+        let block = if at_line_start {
+            disclosure_block_from_text(&content[line_start..])
+        } else {
+            let before = &content[..index];
+            // 已知字段的两种序列化形态：对象字符串字段（ask 信封/执行快照/计划事件）
+            // 与披露数组（run_completed 事件/GetWorkflowRun 投影）。数组后续元素
+            // 前面是 `","`——必须落在未闭合的已知数组内才算数，任意 `","` 不认
+            // （codex 第 11 轮 P1）。
+            let object_field = "\"unresolved_disclosure\":\"";
+            let array_field = "\"unresolved_disclosures\":[\"";
+            let known = if before.ends_with(object_field) || before.ends_with(array_field) {
+                true
+            } else if before.ends_with("\",\"") {
+                match before.rfind(array_field) {
+                    Some(pos) => {
+                        // `[` 在锚点内倒数第二字符：从它到标题之间不得出现数组的
+                        // 收括号或任何对象边界（数组仍开启、内容只有字符串与逗号）。
+                        let open = pos + array_field.len() - 2;
+                        content[open..index]
+                            .chars()
+                            .all(|ch| !matches!(ch, ']' | '{' | '}'))
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !known {
+                continue;
+            }
+            let rest = &content[index..];
+            // 转义字符串必须有收束引号：真实序列化必有；未闭合 = 普通正文噪声，
+            // 拒绝提取，否则无引号大段正会被吞到 EOF（codex 第 11 轮 P1 遗留）。
+            let Some(end_rel) = rest[header.len()..].find('"') else {
+                continue;
+            };
+            let block = rest[..end_rel + header.len()].replace("\\n", "\n");
+            disclosure_block_from_text(&block)
+        };
+        if let Some(block) = block {
+            if !blocks.contains(&block) {
+                blocks.push(block);
+            }
+        }
+    }
+    blocks
+}
+
+/// 从以披露标题开头（允许行首空白）的文本提取「标题 + 连续 `- ` 条目」块：条目行
+/// 必须含「（回执 」标记（渲染不变量），遇首个其它行即停——转义字符串里条目之后
+/// 的大段普通正文不会被并入；不足一条条目返回 None（标题孤立 = 文本噪声）。
+fn disclosure_block_from_text(text: &str) -> Option<String> {
+    let mut kept_lines = 1usize;
+    for line in text.lines().skip(1) {
+        if line.starts_with("- ") && line.contains("（回执 ") {
+            kept_lines += 1;
+        } else {
+            break;
+        }
+    }
+    if kept_lines < 2 {
+        return None;
+    }
+    Some(text.lines().take(kept_lines).collect::<Vec<_>>().join("\n"))
 }
 
 #[cfg(test)]
@@ -214,6 +315,91 @@ mod tests {
             enabled: true,
             threshold_bytes: threshold,
         }
+    }
+
+    #[test]
+    fn disclosure_extraction_ignores_json_string_field_but_keeps_real_block() {
+        // codex 第 8/9 轮 P1：单行 JSON 输出（AgentStatus/GetWorkflowRun）里的披露
+        // 标题在字符串字段内部——按转义形态安全解析为披露块（预算不被超长 JSON
+        // 破坏），行首的真实块照常提取。
+        let header = super::super::run::RUNTIME_DISCLOSURE_HEADER;
+        let json_blob = format!(
+            "{{\"execution\":{{\"unresolved_disclosure\":\"{}{}- echo（回执 r1-1-d70708db，类别 tool_execution）\"}}}}",
+            header, "\\n"
+        );
+        let real = format!(
+            "{}{}- write（回执 r0-1-11111111，类别 tool_execution）",
+            header,
+            "\n"
+        );
+        let content = format!("{}\n\n{}\n\n{}", "x".repeat(4096), json_blob, real);
+        let blocks = extract_runtime_disclosure_blocks(&content);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert!(blocks.contains(&real), "行首真实块应被提取: {blocks:?}");
+        // JSON 字符串字段按转义形态安全解析——块是披露明文而非整条 JSON。
+        let json_block = format!(
+            "{}{}- echo（回执 r1-1-d70708db，类别 tool_execution）",
+            header,
+            "\n"
+        );
+        assert!(blocks.contains(&json_block), "{blocks:?}");
+        assert!(
+            !blocks.iter().any(|block| block.contains("{\"execution\"")),
+            "整条 JSON 不得被当作披露块回填: {blocks:?}"
+        );
+        // 只有标题行没有「（回执 」条目的匹配视为文本噪声跳过。
+        let content_header_only = format!("前缀 {} 无条目", header);
+        assert!(extract_runtime_disclosure_blocks(&content_header_only).is_empty());
+        // 行首标题 + EOF（无条目）同样跳过；相邻的普通 `- ` 报告行（无「（回执 」）
+        // 不会被并入披露块（计划报告行噪声，codex 第 9 轮 nice-to-have）。
+        let content_report = format!(
+            "{}{}- write（回执 r0-1-11111111，类别 timeout）{}- impl [failed]: 摘要行",
+            header,
+            "\n",
+            "\n"
+        );
+        let blocks = extract_runtime_disclosure_blocks(&content_report);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(!blocks[0].contains("impl [failed]"), "{blocks:?}");
+        // codex 第 10 轮反例：普通正文（非 JSON 字段）里的非行首标题 + 条目 + 大段
+        // 无引号正文——不是已知披露字段的序列化，整段忽略（spill 预算不被打破）。
+        let plain = format!(
+            "说明 {}{}- write（回执 r0-1-11111111，类别 timeout）{}{}",
+            header,
+            "\n",
+            "\n",
+            "正文".repeat(50_000)
+        );
+        // codex 第 13 轮防退化断言：闭合 JSON 字符串内「有效条目 + 换行 + 30KB 正文」
+        // ——只保留标题与连续条目，正文不回填。
+        let blob = format!("\"unresolved_disclosure\":\"{}\\n- write（回执 r0-1-1，类别 timeout）\\n{}\"", header, "body".repeat(30_000));
+        let blocks = extract_runtime_disclosure_blocks(&blob);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(blocks[0].ends_with("- write（回执 r0-1-1，类别 timeout）"), "{blocks:?}");
+        assert!(!blocks[0].contains("bodybody"), "{blocks:?}");
+        // 行首仅标题 + EOF（无条目）：直接断言为空。
+        assert!(extract_runtime_disclosure_blocks(&format!(
+            "{}{}- 孤立标题行", header, "\n"
+        )).is_empty());
+
+        // codex 第 11 轮：披露数组的多元素（后续元素前面是 ","）全部提取。
+        let block_a = format!("{}{}- memory（回执 r1-1-027e4bd5，类别 tool_execution）", header, "\n");
+        let block_b = format!("{}{}- shell（回执 r1-2-33334444，类别 timeout）", header, "\n");
+        let array_json = format!(
+            "{{\"run_id\":\"r\",\"unresolved_disclosures\":[\"{}\",\"{}\"]}}",
+            block_a.replace("\n", "\\n"),
+            block_b.replace("\n", "\\n"),
+        );
+        let blocks = extract_runtime_disclosure_blocks(&array_json);
+        assert_eq!(blocks, vec![block_a, block_b], "{blocks:?}");
+        // 转义字符串未闭合（普通正文噪声）：拒绝提取，不吞到 EOF。
+        let unclosed = format!(
+            "{{\"unresolved_disclosure\":\"{}{}- write（回执 r0-1-1，类别 timeout）{}大段无引号正文",
+            header,
+            "\n",
+            "\n",
+        );
+        assert!(extract_runtime_disclosure_blocks(&unclosed).is_empty());
     }
 
     #[test]

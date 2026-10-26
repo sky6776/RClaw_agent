@@ -43,6 +43,10 @@ pub(super) struct AgentTaskResult {
     pub(super) content: String,
     pub(super) validated_media_markers: Vec<String>,
     pub(super) media_publish_attempted: bool,
+    /// 子代理仍未解决的副作用工具错误的运行时披露块（空串 = 无）。独立于 content：
+    /// 结构化 handoff 渲染不输出 content，max_output_chars 截断可能丢尾部——渲染层
+    /// 在两者之后重新附加，保证父代理一定看到（codex 第 2 轮 #1）。
+    pub(super) unresolved_disclosure: String,
 }
 
 pub(super) fn invalidate_result_for_cancellation(result: &mut AgentTaskResult) {
@@ -57,6 +61,8 @@ pub(super) fn invalidate_result_for_cancellation(result: &mut AgentTaskResult) {
     result.handoff.open_risks = vec!["任务在完成提交前被取消".to_string()];
     result.media_publish_attempted |= !result.validated_media_markers.is_empty();
     result.validated_media_markers.clear();
+    // 与 marker 同口径：取消终态不得携带成功路径的披露（取消方须重新发起任务）。
+    result.unresolved_disclosure.clear();
 }
 
 pub(super) enum RunTaskFailure {
@@ -408,10 +414,24 @@ pub(super) fn render_execution_media_payload(payload: Value) -> String {
         .unwrap_or(false);
     let mut output = payload.to_string();
     append_validated_media_state(&mut output, &markers, attempted);
+    // 运行时披露最后附加：父代理经 AgentStatus／AgentWait 轮询无团队后台任务时，
+    // 快照 JSON 里的披露字段可能被截断显示或淹没——渲染层保证可见（codex 第 3 轮 P1）。
+    if let Some(disclosure) = payload
+        .pointer("/execution/unresolved_disclosure")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        output.push_str("\n\n");
+        output.push_str(disclosure);
+    }
     output
 }
 
 pub(super) fn render_single_result(result: &AgentTaskResult) -> String {
+    render_single_result_inner(result, true)
+}
+
+fn render_single_result_inner(result: &AgentTaskResult, with_disclosure: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# {}\n\n",
@@ -455,17 +475,38 @@ pub(super) fn render_single_result(result: &AgentTaskResult) -> String {
         &result.validated_media_markers,
         result.media_publish_attempted,
     );
+    // 运行时披露最后附加（截断、结构化渲染、控制行剥离之后）：子代理仍未解决的
+    // 副作用错误必须越过 handoff 渲染到达父代理——open_risks 由模型自填，不构成
+    // 运行时保证（codex 第 2 轮 #1）。
+    if with_disclosure && !result.unresolved_disclosure.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&result.unresolved_disclosure);
+    }
     out
 }
 
 pub(super) fn render_foreground_result(result: &AgentTaskResult) -> String {
-    let mut out = render_single_result(result);
+    // 披露不在 handoff 渲染段附加，而是放在【整份文本的最末尾】：前台 full output
+    // 可能触发统一 spill（头尾 4KiB 预览、中段省略），披露夹在中段会被预览裁掉
+    // （codex 第 6 轮 P1）。
+    let mut out = render_single_result_inner(result, false);
     let sanitized_content = strip_untrusted_media_control_lines(&result.content);
     let content = sanitized_content.trim();
     if !content.is_empty() && content != result.handoff.summary.trim() {
         out.push_str("\nfull output:\n");
         out.push_str(content);
         out.push('\n');
+    }
+    if !result.unresolved_disclosure.is_empty() {
+        if !out.trim().is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&result.unresolved_disclosure);
     }
     out
 }

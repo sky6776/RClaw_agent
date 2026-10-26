@@ -48,6 +48,7 @@ fn foreground_agent_result_preserves_full_output() {
         content: "# 完整文章\n\n这是编辑后的完整正文。\n\n{\"summary\":\"已完成精修\"}".to_string(),
         validated_media_markers: Vec::new(),
         media_publish_attempted: false,
+        unresolved_disclosure: String::new(),
     };
 
     let rendered = render_foreground_result(&result);
@@ -55,6 +56,82 @@ fn foreground_agent_result_preserves_full_output() {
     assert!(rendered.contains("full output:\n# 完整文章"));
     assert!(rendered.contains("这是编辑后的完整正文"));
     assert!(!render_single_result(&result).contains("# 完整文章"));
+}
+
+#[test]
+fn background_rendering_survives_disclosure_and_content_loss() {
+    // codex 第 2 轮 #1：结构化 handoff 渲染不输出 content、content 可能被截断——
+    // 未解决错误披露作为独立状态在渲染层最后附加，保证父代理一定看到。
+    let disclosure =
+        "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
+            .to_string();
+    let result = AgentTaskResult {
+        name: "analyst".to_string(),
+        role: String::new(),
+        is_error: false,
+        cancelled: false,
+        completed_steps: 2,
+        handoff: StructuredHandoff {
+            goal: "写报告".to_string(),
+            summary: "报告已写入".to_string(),
+            evidence: Vec::new(),
+            artifacts: Vec::new(),
+            open_risks: Vec::new(),
+            validation: Vec::new(),
+        },
+        // 模拟截断：content 里披露块已被切掉。
+        content: "报告已写入（正文被截断）".to_string(),
+        validated_media_markers: Vec::new(),
+        media_publish_attempted: false,
+        unresolved_disclosure: disclosure.clone(),
+    };
+
+    let background = render_single_result(&result);
+    assert!(background.contains("open risks:\n- none"));
+    assert!(background.contains(&disclosure));
+
+    let foreground = render_foreground_result(&result);
+    assert!(foreground.contains(&disclosure));
+}
+
+#[test]
+fn disclosure_survives_content_truncation_in_both_renderers() {
+    // codex 第 3 轮 nice-to-have：真实 truncate_chars 截断切掉尾部披露后，
+    // 前后台渲染仍各恰好出现一次披露（经独立字段补挂）。
+    let disclosure =
+        "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
+            .to_string();
+    let truncated = truncate_chars(&format!("{}\n\n{disclosure}", "x".repeat(4096)), 512);
+    assert!(!truncated.contains(&disclosure), "前置：截断确实切掉了披露");
+
+    let result = AgentTaskResult {
+        name: "analyst".to_string(),
+        role: String::new(),
+        is_error: false,
+        cancelled: false,
+        completed_steps: 1,
+        handoff: StructuredHandoff {
+            goal: "写报告".to_string(),
+            summary: "报告已写入".to_string(),
+            evidence: Vec::new(),
+            artifacts: Vec::new(),
+            open_risks: Vec::new(),
+            validation: Vec::new(),
+        },
+        content: truncated,
+        validated_media_markers: Vec::new(),
+        media_publish_attempted: false,
+        unresolved_disclosure: disclosure.clone(),
+    };
+
+    assert_eq!(
+        render_single_result(&result).matches(&disclosure).count(),
+        1
+    );
+    assert_eq!(
+        render_foreground_result(&result).matches(&disclosure).count(),
+        1
+    );
 }
 
 #[test]
@@ -78,6 +155,7 @@ fn agent_rendering_forwards_only_runtime_owned_media_state() {
             .to_string(),
         validated_media_markers: vec![marker.to_string()],
         media_publish_attempted: true,
+        unresolved_disclosure: String::new(),
     };
 
     let rendered = render_foreground_result(&result);
@@ -122,6 +200,9 @@ fn cancellation_before_terminal_commit_revokes_media_delivery() {
             "[:weixin-media type=file path=\"agent/media/out/report.md\"]".to_string(),
         ],
         media_publish_attempted: false,
+        unresolved_disclosure:
+            "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
+                .to_string(),
     };
 
     invalidate_result_for_cancellation(&mut result);
@@ -133,6 +214,8 @@ fn cancellation_before_terminal_commit_revokes_media_delivery() {
     assert!(result.handoff.artifacts.is_empty());
     assert!(!result.handoff.summary.contains("已发送"));
     assert!(!result.content.contains("已发送"));
+    // 与 marker 同口径：取消终态不得携带成功路径的披露（codex 第 4 轮建议）。
+    assert!(result.unresolved_disclosure.is_empty());
 }
 
 #[async_trait]
@@ -716,6 +799,7 @@ async fn failed_event_persistence_does_not_commit_lifecycle_state() {
                 validated_media_markers: Vec::new(),
                 media_publish_attempted: false,
                 unrestricted: false,
+                unresolved_disclosure: String::new(),
                 created_at: now.clone(),
                 updated_at: now,
                 recovered: true,
@@ -1661,6 +1745,7 @@ fn recovery_replays_nonterminal_log_as_resumable_waiting() {
         validated_media_markers: Vec::new(),
         media_publish_attempted: false,
         unrestricted: true,
+        unresolved_disclosure: String::new(),
         created_at: now.clone(),
         updated_at: now.clone(),
         recovered: false,
@@ -1694,6 +1779,7 @@ fn recovery_replays_nonterminal_log_as_resumable_waiting() {
                 validated_media_markers: Vec::new(),
                 media_publish_attempted: false,
                 unrestricted: false,
+                unresolved_disclosure: String::new(),
                 created_at: cancelling_time.clone(),
                 updated_at: cancelling_time,
                 recovered: false,
@@ -1806,6 +1892,7 @@ async fn background_completion_bumps_unread_and_task_list_resets_it() {
         content: "done".to_string(),
         validated_media_markers: Vec::new(),
         media_publish_attempted: false,
+        unresolved_disclosure: String::new(),
     };
     runtime
         .publish_background_completion(Some("inbox-team".to_string()), &result)
@@ -2020,6 +2107,7 @@ async fn background_launch_inherits_launcher_context_and_resume_restores_snapsho
                 validated_media_markers: Vec::new(),
                 media_publish_attempted: false,
                 unrestricted: true,
+                unresolved_disclosure: String::new(),
                 created_at: now.clone(),
                 updated_at: now,
                 recovered: true,
