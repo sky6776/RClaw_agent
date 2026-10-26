@@ -22,7 +22,8 @@ export interface Entry {
   id: number;
   role: Role;
   content: string;
-  /** 条目到达时间（毫秒）；历史恢复的条目没有，思考块据此显示持续时长。 */
+  /** 条目时间（毫秒）：直播条目 = 到达时间，历史恢复的条目 = 落库时间（秒×1000）；
+   *  仅 ts ≤ 0 的极旧数据为 undefined。时间标签与思考块持续时长都用它。 */
   ts?: number;
   /** 持久化消息行 id：恢复条目自带，直播条目由 turn 收尾的增量回填原位盖章；
    *  「分叉到新会话」的锚点，没有它 = 该条目尚未落库。 */
@@ -243,6 +244,35 @@ function stripMediaMarkers(content: string): string {
         ) && !/^\s*\[:[\w-]+-media\s/.test(line),
     )
     .join("\n");
+}
+
+/** 消息时间标签格式：当天 HH:mm，跨天 MM-DD HH:mm（本地时区）。 */
+function formatEntryTime(d: Date): string {
+  const now = new Date();
+  const two = (n: number) => String(n).padStart(2, "0");
+  const hm = `${two(d.getHours())}:${two(d.getMinutes())}`;
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  return sameDay ? hm : `${two(d.getMonth() + 1)}-${two(d.getDate())} ${hm}`;
+}
+
+/** 消息正文下方的时间标签（小号、低对比度，跟随气泡左右对齐）。
+ *  没有 ts 的条目（极旧数据）不渲染，也不留空行；无法构成有效日期的 ts（损坏
+ *  行）同样不渲染——toISOString 对越界值会抛错，不能让一条坏数据把整个会话渲染打断。 */
+function TimeTag({ ts }: { ts?: number }) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  if (!Number.isFinite(d.getTime())) return null;
+  return (
+    <time
+      dateTime={d.toISOString()}
+      className="mt-1 px-1 text-[10px] leading-none text-gray-500"
+    >
+      {formatEntryTime(d)}
+    </time>
+  );
 }
 
 /** 引用消息 → 发送时拼装的原文块：正文（剥媒体协议行）+ 末尾补媒体文件的工作区
@@ -1510,6 +1540,7 @@ export default function Chat({
                   }
                   onOpenVideo={({ url, path }) => openGallery(path, { path, url })}
                 />
+                <TimeTag ts={e.ts} />
                 {!selectIds && (
                   <div className="flex items-center gap-1 max-md:hidden">
                     <CopyButton text={e.content} onError={onError} />
@@ -1608,6 +1639,7 @@ export default function Chat({
                 }
                 onOpenVideo={({ url, path }) => openGallery(path, { path, url })}
               />
+              <TimeTag ts={e.ts} />
               {!selectIds && (
                 <div className="flex items-center gap-1 max-md:hidden">
                   <CopyButton text={stripMediaMarkers(e.content)} onError={onError} />

@@ -42,6 +42,7 @@ pub use options::AgentOptions;
 pub use slash::{CommandOutcome, SlashRegistry};
 pub use turn::{
     estimate_context_usage, ContextUsageSnapshot, ForkChatOutcome, TurnKey, TurnManager,
+    TurnObserver,
 };
 
 pub use background_wake::BackgroundWaker;

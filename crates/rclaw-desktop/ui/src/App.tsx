@@ -112,6 +112,12 @@ function deriveLocalTitle(content: string): string {
   return [...(content.trim().split("\n")[0] ?? "")].slice(0, 60).join("") || "新对话";
 }
 
+/** 历史行的落库时间（DTO 为 unix 秒）→ Entry.ts（毫秒）；≤0 = 旧数据缺失，
+ *  不填 ts（界面不渲染时间标签）。 */
+function historyEntryTs(secs: number): number | undefined {
+  return secs > 0 ? secs * 1000 : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // 多主题：dark/light 之外的背景风格。base 决定复用哪套文字调色板
 // （浅色系加挂 theme-light），聊天/侧边栏背景由 index.css 的 theme-* 层接管。
@@ -476,7 +482,7 @@ ${event.payload.command}
         } else {
           appended.push({
             id: next_entry_id++,
-            ts: Date.now(),
+            ts: historyEntryTs(m.ts),
             role: m.role,
             content: m.content,
             msgId: m.id,
@@ -651,6 +657,7 @@ ${event.payload.command}
             role: m.role,
             content: m.content,
             msgId: m.id,
+            ts: historyEntryTs(m.ts),
           }));
           // 事件可能先于快照返回：每条快照条目一对一消费一条同角色同文的直播孪生
           // （成员资格判断会误伤重复文本——快照之后新发的乐观「继续」、永远无法从

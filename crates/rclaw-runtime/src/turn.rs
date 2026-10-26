@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{Read as IoRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::future::join_all;
 use serde::Deserialize;
@@ -879,11 +879,17 @@ const COMPACT_ACTIVE_JOB: &str = "/compact";
 ///
 /// `_event_rx` 必须活到 Drop：`active_cancel_session` 把发送端已关闭的条目当僵尸清掉，
 /// 接收端若先 drop，`/cancel` 就看不到这次压缩了。
+///
+/// 生命周期观察者：构造方在登记 active 后上报 `turn_begun`，这里在 Drop 里配对上报
+/// `turn_ended`——与 active 条目同生命周期，panic / 取消 / 任一 early return 都不会
+/// 让宿主的忙碌计数失配。`/compact` 不上报 terminal（它的结果是命令回复）。
 struct CompactRegistration<'a> {
     manager: &'a TurnManager,
     key: TurnKey,
     event_tx: mpsc::Sender<Interjection>,
     _event_rx: mpsc::Receiver<Interjection>,
+    /// 观察者回调用的消息身份（channel / chat_id，来源 User）。
+    observed: BusMessage,
 }
 
 impl Drop for CompactRegistration<'_> {
@@ -891,6 +897,7 @@ impl Drop for CompactRegistration<'_> {
         self.manager
             .active_remove_if_same_event_tx(&self.key, &self.event_tx);
         self.manager.gate.end_turn();
+        self.manager.observe_ended(&self.observed);
     }
 }
 
@@ -964,10 +971,39 @@ pub(crate) fn expand_persisted_workflow_message(text: &str) -> Option<String> {
     }
 }
 
+/// turn 生命周期观察者（宿主侧状态展示用，如安卓前台服务通知的忙碌 / 完成提醒）。
+///
+/// 回调由运行时在**权威点**同步触发，宿主无需再从 outbound 文本或投递动作反推 turn
+/// 是否存在：
+/// - [`turn_begun`](Self::turn_begun)：turn 任务实际启动（active map 登记时；普通 turn
+///   的回调处于 active map 锁内，`/compact` 的在锁外）；
+/// - [`turn_terminal`](Self::turn_terminal)：终局回复**即将**写入 outbound（成功 / 失败
+///   形态，含历史加载 / 消息落盘失败的早期终局；取消轮没有终局，panic 的 cron 轮按失败
+///   形态有终局）；总在 `turn_ended` 之前；正常每个 turn 至多一次——唯一例外是 cron 轮
+///   在终局已交付后 turn 主体才 panic，外壳会再按失败形态补报一次（与 outbound 的补报
+///   一致）；`reply` 是回复正文（CLI 流式模式下该正文可能不再进 outbound，但观察者仍
+///   能收到）；
+/// - [`turn_ended`](Self::turn_ended)：turn 任务已结束（正常 / 取消 / panic 一律触发），
+///   与 `turn_begun` 严格一一配对。
+///
+/// `/compact` 作为会话级 LLM 操作只上报 begun → ended（结果走命令回复，无 terminal），
+/// 上报用的消息是内容为 `/compact`、来源 User 的占位 [`BusMessage`]。
+/// 回调对所有来源（User / Cron / Heartbeat / Workflow / Agent 交接子轮）与所有渠道触发，
+/// 过滤由宿主完成。实现必须轻量、不阻塞、不得回调运行时（begun 可能处于锁内）；实现
+/// 内的 panic 会被运行时捕获并记录，不会影响 turn 本身。
+pub trait TurnObserver: Send + Sync {
+    fn turn_begun(&self, msg: &BusMessage);
+    fn turn_terminal(&self, msg: &BusMessage, reply: &str);
+    fn turn_ended(&self, msg: &BusMessage);
+}
+
 pub struct TurnManager {
     /// `(channel, chat_id, cron_job_id) → 活动 turn`。普通消息同一会话至多一个活动 turn；
     /// 不同 Cron job 即使回复目标相同，也使用独立活动 turn。
     active: Arc<Mutex<HashMap<TurnKey, ActiveTurn>>>,
+
+    /// turn 生命周期观察者（每实例最多安装一次；None = 无宿主关心）。
+    observer: OnceLock<Arc<dyn TurnObserver>>,
 
     provider: Arc<dyn Provider>,
     session: SessionStore,
@@ -1058,6 +1094,7 @@ impl TurnManager {
         ));
         TurnManager {
             active,
+            observer: OnceLock::new(),
             provider,
             session,
             memory,
@@ -1076,6 +1113,39 @@ impl TurnManager {
             gate,
             effect_ledger: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 安装 turn 生命周期观察者（见 [`TurnObserver`]）。每实例只接受一次：重复安装
+    /// 被忽略并返回 false，已安装的观察者不被替换。
+    pub fn set_turn_observer(&self, observer: Arc<dyn TurnObserver>) -> bool {
+        self.observer.set(observer).is_ok()
+    }
+
+    /// 调用观察者回调并吞掉其 panic：观察者是宿主插件，它的缺陷不该毒化 active 锁
+    /// （begun 处于锁内）、打断 turn，或在守卫 Drop 里（ended）引发双重 panic 中止进程。
+    fn observe(&self, what: &'static str, call: impl FnOnce(&dyn TurnObserver)) {
+        let Some(observer) = self.observer.get() else {
+            return;
+        };
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(observer.as_ref())));
+        if outcome.is_err() {
+            tracing::error!("turn 生命周期观察者 {what} 回调 panic，已忽略");
+        }
+    }
+
+    fn observe_begun(&self, msg: &BusMessage) {
+        self.observe("turn_begun", |observer| observer.turn_begun(msg));
+    }
+
+    fn observe_terminal(&self, msg: &BusMessage, reply: &str) {
+        self.observe("turn_terminal", |observer| {
+            observer.turn_terminal(msg, reply)
+        });
+    }
+
+    fn observe_ended(&self, msg: &BusMessage) {
+        self.observe("turn_ended", |observer| observer.turn_ended(msg));
     }
 
     // ---- active map 访问：全部走同步辅助函数 ----
@@ -1454,13 +1524,18 @@ impl TurnManager {
                 },
             );
         }
-        // 任何退出路径（含取消）都移除 active 条目并释放门槽位。
-        let _registration = CompactRegistration {
+        // 任何退出路径（含取消）都移除 active 条目并释放门槽位（守卫活到函数结束）。
+        let registration = CompactRegistration {
             manager: self,
             key: own_key.clone(),
             event_tx,
             _event_rx: event_rx,
+            observed: BusMessage::new(channel.to_string(), chat_id.to_string(), "/compact"),
         };
+        // 生命周期观察者：登记成功即上报「已启动」（宿主显示忙碌）；配对的 ended 由守卫
+        // 的 Drop 上报，覆盖取消 / 失败 / panic 等全部退出路径。先建守卫再上报：观察者
+        // 若 panic，守卫仍会清理 active 条目与门槽位。
+        self.observe_begun(&registration.observed);
         let persona = self.bots.persona_for_chat(channel, chat_id);
         let turn_memory = persona
             .as_ref()
@@ -2710,6 +2785,9 @@ impl TurnManager {
             let event_tx_for_task = event_tx.clone();
             // 与 run_turn_inner 的 `is_cron` 分支同源：cron 轮次不加载也不持久化会话历史。
             let touches_history = !msg.is_cron_task();
+            // 生命周期观察者：在任务 spawn 之前（仍持 active 锁）上报「已启动」，保证
+            // 它先于本 turn 的任何 outbound / terminal / ended 回调发生。
+            self.observe_begun(&msg);
             // turn 任务的真正执行
             // spawn 返回的 JoinHandle 立即 drop：tokio spawned 任务在句柄 drop 时继续运行
             // （detach），取消改由 `cancel` 控制，故无需保存句柄。
@@ -2832,16 +2910,16 @@ impl TurnManager {
                     );
                 }
                 if panic_report_target.is_cron_task() {
+                    let report =
+                        cron_report(&panic_report_target, "任务异常终止：内部执行错误。", false);
+                    // panic 的 cron 轮按失败形态有终局：观察者同样收到 terminal。
+                    self.observe_terminal(&panic_report_target, &report);
                     let _ = self
                         .outbound_tx
                         .send(BusMessage::new(
                             panic_report_target.channel.clone(),
                             panic_report_target.chat_id.clone(),
-                            cron_report(
-                                &panic_report_target,
-                                "任务异常终止：内部执行错误。",
-                                false,
-                            ),
+                            report,
                         ))
                         .await;
                 }
@@ -2866,6 +2944,9 @@ impl TurnManager {
         }
         // 无论 active 条目如何结束，本 turn 的静默门槽位必须释放。
         self.gate.end_turn();
+        // 生命周期观察者：与 spawn_turn 的 begun 一一配对（正常 / 取消 / panic 均到此）；
+        // 放在残留插队重路由之前——它们各自会作为新 turn 再上报 begun。
+        self.observe_ended(&panic_report_target);
 
         // 残留插队输入：按到达顺序重新路由为新 turn，确保用户输入不丢失
         // （例如补充正好在本 turn 收尾时到达、未被安全点处理到）。
@@ -3031,12 +3112,15 @@ impl TurnManager {
                 Err(e) => {
                     // 历史加载失败：回复错误，不进入 ReAct。交接等待方按失败收尾
                     // （Agent 消息的 turn 也会走到这里），而不是挂到超时。
+                    let body = format!("加载会话历史失败: {e}");
+                    // 这是本轮的终局回复：与成功 / 失败终局同样上报观察者。
+                    self.observe_terminal(&msg, &body);
                     let _ = self
                         .outbound_tx
                         .send(BusMessage::new(
                             msg.channel.clone(),
                             msg.chat_id.clone(),
-                            format!("加载会话历史失败: {e}"),
+                            body,
                         ))
                         .await;
                     if let Some(router) = &self.bot_router {
@@ -3085,13 +3169,16 @@ impl TurnManager {
                             service.release_notification(notification_id, &e.to_string());
                         }
                     }
+                    // 详细错误（与「加载会话历史失败」同风格）：含 StoreError 的 IO/超限/路径原因。
+                    let body = format!("保存消息失败: {e}");
+                    // 本轮的终局回复：上报观察者。
+                    self.observe_terminal(&msg, &body);
                     let _ = self
                         .outbound_tx
                         .send(BusMessage::new(
                             msg.channel.clone(),
                             msg.chat_id.clone(),
-                            // 详细错误（与「加载会话历史失败」同风格）：含 StoreError 的 IO/超限/路径原因。
-                            format!("保存消息失败: {e}"),
+                            body,
                         ))
                         .await;
                     if let Some(router) = &self.bot_router {
@@ -3970,6 +4057,9 @@ impl TurnManager {
                 );
             }
 
+            // 生命周期观察者：终局（成功形态）即将交付——CLI 直写 stdout 与 outbound 投递
+            // 两条路都算终局。
+            self.observe_terminal(&msg, &reply_text);
             // CLI 的 streaming provider 输出经过完成门禁缓冲；验证通过后才一次性写 stdout。
             // 非 CLI 通道仍经 outbound 投递。
             let skip_outbound = self.opts.stream_enabled && cli;
@@ -4019,6 +4109,8 @@ impl TurnManager {
             } else {
                 body
             };
+            // 生命周期观察者：终局（失败形态）即将交付。
+            self.observe_terminal(&msg, &body);
             let _ = self
                 .outbound_tx
                 .send(BusMessage::new(

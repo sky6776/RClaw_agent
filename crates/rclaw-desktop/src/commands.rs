@@ -1397,6 +1397,8 @@ pub struct HistoryMsgDto {
     /// user | assistant | status（工具调用轮）。
     pub role: String,
     pub content: String,
+    /// 消息落库时间（unix 秒，与 state.sqlite 的 message.ts / `rclaw_core::Message::ts` 同单位）。
+    pub ts: i64,
 }
 
 /// 行级快照：尾部条目 + 消费游标（前端增量续读的 `last_seen_row_id`）。
@@ -1442,6 +1444,7 @@ fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<Histo
                     id: msg.id,
                     role: "user".into(),
                     content: t.to_string(),
+                    ts: msg.ts,
                 });
             }
             rclaw_core::Role::Assistant => {
@@ -1458,6 +1461,7 @@ fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<Histo
                         id: msg.id,
                         role: "status".into(),
                         content: format!("🔧 调用工具: {}", tools.join(", ")),
+                        ts: msg.ts,
                     });
                 }
                 let text: String = msg
@@ -1471,6 +1475,7 @@ fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<Histo
                         id: msg.id,
                         role: "assistant".into(),
                         content: text,
+                        ts: msg.ts,
                     });
                 }
             }
@@ -6593,7 +6598,8 @@ mod history_entries_tests {
             role,
             content: vec![ContentBlock::text(text)],
             tool_call_id: None,
-            ts: 0,
+            // ts 取 id 同值：断言 DTO 原样带出落库时间，不依赖真实时钟。
+            ts: id,
         }
     }
 
@@ -6607,7 +6613,7 @@ mod history_entries_tests {
                 input: serde_json::json!({"command": "ls"}),
             }],
             tool_call_id: None,
-            ts: 0,
+            ts: id,
         }
     }
 
@@ -6641,17 +6647,20 @@ mod history_entries_tests {
                 HistoryMsgDto {
                     id: 1,
                     role: "user".into(),
-                    content: "hello".into()
+                    content: "hello".into(),
+                    ts: 1,
                 },
                 HistoryMsgDto {
                     id: 3,
                     role: "status".into(),
                     content: "🔧 调用工具: shell".into(),
+                    ts: 3,
                 },
                 HistoryMsgDto {
                     id: 5,
                     role: "assistant".into(),
-                    content: "done".into()
+                    content: "done".into(),
+                    ts: 5,
                 },
             ]
         );
@@ -6666,7 +6675,8 @@ mod history_entries_tests {
             vec![HistoryMsgDto {
                 id: 5,
                 role: "assistant".into(),
-                content: "done".into()
+                content: "done".into(),
+                ts: 5,
             }]
         );
     }

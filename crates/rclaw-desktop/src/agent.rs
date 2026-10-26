@@ -387,11 +387,10 @@ pub async fn send(app: &tauri::AppHandle, chat_id: String, content: String) -> R
     if read_permission_mode(&app.state::<AppState>().home) == PERMISSION_MODE_FULL {
         msg = msg.with_tool_access(ToolAccess::Unrestricted);
     }
-    // 先置忙碌再投递：/cancel 等快回合可能在 send 返回前就跑完全程并发出
-    // 收尾 outbound（运行时任务在另一线程），事后置位会卡忙碌至自愈超时。
-    crate::android_status::turn_started(&chat_id);
+    // 安卓前台通知的忙碌 / 完成状态不在这里登记：运行时在真正启动 turn 时经
+    // `TurnObserver`（android_status::TurnStatusObserver）权威上报，斜杠命令 /
+    // 插队补充消息天然不会被误计为新 turn。
     if let Err(e) = sender.send(msg).await {
-        crate::android_status::turn_aborted(&chat_id);
         return Err(format!("投递消息失败: {e}"));
     }
     Ok(())
@@ -890,9 +889,10 @@ pub(crate) async fn assemble_apk_agent(
     let (inbound_tx, inbound_rx) = mpsc::channel::<BusMessage>(64);
     let (outbound_tx, outbound_rx) = mpsc::channel::<BusMessage>(64);
 
-    // 状态抽头：AgentLoop 的全部出站（desktop/微信/QQ）先过 android_status
-    // （忙碌文案 / 完成提醒 / last_chat——此前只有 desktop 桥喂状态机，无头
-    // 服务模式下的外部通道 turn 完全不产生通知状态），再转发进 dispatcher。
+    // 状态抽头：AgentLoop 的全部出站（desktop/微信/QQ）先过 android_status 取过程
+    // 文案（思考 / 状态行 / intermediate → 前台通知的忙碌态文案；无头服务模式下外部
+    // 通道 turn 的过程同样可见），再转发进 dispatcher。turn 的忙碌计数、完成提醒与
+    // last_chat 不在这里——由下方安装的 TurnObserver 按运行时生命周期权威上报。
     let (status_tx, mut status_rx) = mpsc::channel::<BusMessage>(64);
     let dispatcher_tx = outbound_tx.clone();
     tokio::spawn(async move {
@@ -969,6 +969,12 @@ pub(crate) async fn assemble_apk_agent(
     );
     let session_lifecycle = agent.session_lifecycle();
     let fork_handle = agent.fork_handle();
+    // 前台通知状态机接运行时的 turn 生命周期（begun / terminal / ended）：用户 turn、
+    // cron、workflow 唤醒、bot 交接、/compact 都由 TurnManager 在权威点上报——不再
+    // 依赖 GUI send 预置忙碌、cron 投递钩子或 outbound 文本分类。完成提醒对全部通道
+    // （desktop/微信/QQ）一视同仁：无头服务模式下手机是 bot 宿主，宿主要知道后台替人
+    // 回了消息（过滤规则见 android_status::notifiable）。
+    agent.set_turn_observer(Arc::new(crate::android_status::TurnStatusObserver));
     let agent_task = tokio::spawn(agent.run());
     tokio::spawn(
         CronService::new(

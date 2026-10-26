@@ -28,7 +28,7 @@ use rclaw_tools::ToolRegistry;
 
 use crate::options::AgentOptions;
 use crate::slash::SlashRegistry;
-use crate::turn::{ForkChatOutcome, TurnManager};
+use crate::turn::{ForkChatOutcome, TurnManager, TurnObserver};
 
 /// agent 主循环：持有 [`TurnManager`]，循环把 inbound 消息路由出去。
 pub struct AgentLoop {
@@ -90,6 +90,12 @@ impl AgentLoop {
         ForkHandle {
             turn_mgr: self.turn_mgr.clone(),
         }
+    }
+
+    /// 安装 turn 生命周期观察者（在 `run()` 之前调用；见 [`TurnObserver`]）。
+    /// 每个 loop 只接受一次，重复安装返回 false。
+    pub fn set_turn_observer(&self, observer: Arc<dyn TurnObserver>) -> bool {
+        self.turn_mgr.set_turn_observer(observer)
     }
 
     /// 运行主循环：收到一条 inbound 就交给 [`TurnManager::route`]，直到 inbound 关闭。

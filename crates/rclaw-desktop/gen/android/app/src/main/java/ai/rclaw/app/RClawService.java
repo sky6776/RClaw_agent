@@ -199,6 +199,15 @@ public final class RClawService extends Service {
         try {
             RuntimeAssets.installBundledSkills(this);
             PROCESS_NATIVE_START_ATTEMPTED.set(true);
+            // 无头路径（BootReceiver / 看门狗闹钟直接 startForegroundService）不经过
+            // MainActivity：在这里登记 application context，否则 Rust 侧完成提醒
+            // （NativeBridge.notifyTurnDone）会因 appContext 为 null 静默丢弃。同一个
+            // context 也让 openUrl / 分享 / 剪贴板 / CDP 浏览器等其它 JNI 入口在无头进程
+            // 可用（此前它们返回「无 context」）。放在 nativeStart 的 try 内（本方法在
+            // runtimeExecutor 后台线程、前台通知已提升之后执行）：避免 NativeBridge 类
+            // 初始化（System.loadLibrary）拖慢 Service 主线程的 startForeground 时限，
+            // 加载失败也走既有启动失败兜底。
+            NativeBridge.setContext(getApplicationContext());
             AppConfig.trace(this, "native-start begin recovery=" + recoveryStart);
             String error = NativeBridge.nativeStart(
                     AppConfig.toJson(this),

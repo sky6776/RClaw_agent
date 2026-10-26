@@ -70,6 +70,9 @@ export interface HistoryMsg {
   id: number;
   role: "user" | "assistant" | "status";
   content: string;
+  /** 消息落库时间（unix 秒，与 state.sqlite 的 message.ts 同单位）；
+   *  映射到 Entry.ts（毫秒）时需 ×1000。 */
+  ts: number;
 }
 
 /** 行级快照：尾部条目 + 消费游标（之后用 chatHistorySince 按游标续读）。 */

@@ -5,8 +5,10 @@ public final class NativeBridge {
         System.loadLibrary("rclaw_desktop");
     }
 
-    /** init 时记录的 application context：Rust open_url 经此起 ACTION_VIEW。 */
-    private static android.content.Context appContext;
+    /** setContext 记录的 application context：openUrl / 分享 / 剪贴板 / 保活引导 /
+     *  CDP 浏览器 / 完成通知等全部 Rust→Java 入口经此取系统服务。主线程或服务
+     *  执行线程写入、JNI 附加的原生线程读取，volatile 与 appInForeground 同一纪律。 */
+    private static volatile android.content.Context appContext;
 
     private NativeBridge() {}
 
@@ -659,7 +661,9 @@ public final class NativeBridge {
      * （Rust 侧 home 解析与 GUI 装配依赖它；服务稍后的 nativeStart 会带全量配置覆盖）。 */
     static native String nativeInit(String filesDir);
 
-    /** MainActivity.onCreate 最早期调用：持有 application context 供 openUrl 使用。 */
+    /** 持有 application context（见 appContext）。MainActivity.onCreate 最早期与
+     *  RClawService.startNativeRuntime（无头路径，GUI 从未打开）都调用；两者取到的是
+     *  同一个 Application 对象，先后顺序无关、重复调用幂等。 */
     static void setContext(android.content.Context context) {
         appContext = context.getApplicationContext();
     }
