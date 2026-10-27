@@ -3326,13 +3326,25 @@ impl TurnManager {
                 // LLM 调用（cancel-aware + 失败重试 / 指数退避）：
                 // 连接失败 / 超时 / 错误响应（含 429、5xx）时最多重试 `llm_max_retries` 次，
                 // 退避从 `llm_retry_base_delay` 起、每轮 ×2、上限 `llm_retry_max_delay`；
-                // 调用期与退避期都受 /cancel 中断。
+                // 调用期与退避期都受 /cancel 中断，且整体受 `llm_retry_budget` 硬截止——
+                // 端点挂起时每次尝试要满等 request_timeout（默认 300s）才超时，没有总
+                // 预算时最坏可拖 58 分钟（真机子代理卡 25 分钟的同款根因）。
                 //
-                // 流式安全：SSE 片段只由 provider 组装，不在完成验证前展示；失败尝试不会
-                // 留下用户可见 partial，因此 retryable 错误可以从全新请求安全重试。
+                // 流式安全：SSE 文本片段只由 provider 组装，不在完成验证前展示；失败尝试不会
+                // 留下用户可见的文本 partial，因此 retryable 错误可以从全新请求安全重试。
+                // 但推理增量（on_reasoning）是逐片实时出站的直播视图，被截止/失败的尝试
+                // 可能在思考块留下残影——轮末整段权威快照会覆盖，不在本轮依赖「无残留」假设。
                 let max_retries = self.opts.llm_max_retries;
                 let retry_base_delay = self.opts.llm_retry_base_delay;
                 let retry_max_delay = self.opts.llm_retry_max_delay;
+                // 重试硬截止（按每迭代重置）与实际请求计数：reactive compact 的原地重试
+                // 不消耗 attempt 预算、也不重置截止时间，报「已尝试 k 次」须用它单独计数。
+                let retry_started = tokio::time::Instant::now();
+                let retry_deadline = retry_started + self.opts.llm_retry_budget;
+                // 计「已发出」的请求：在请求 future 首次被轮询、真正调用 provider 前递增
+                // （future 内要改外层计数，用原子计数器）。被预算截断的在途请求也算一次
+                // 尝试；deadline 已就绪、future 从未被轮询时不计（不虚计）。
+                let request_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let mut outcome_opt: Option<rclaw_core::ChatOutcome> = None;
                 // 每迭代一次的 reactive compact 预算：超限压缩后若本迭代再次超限，
                 // 不再重复压缩（由普通错误路径收尾），避免「压缩-超限」循环。
@@ -3446,13 +3458,25 @@ impl TurnManager {
                             cancelled = true;
                             break 'retry;
                         }
-                        r = async move {
-                            if stream_enabled {
-                                provider
-                                    .chat_stream_reasoning(req, on_text, on_reasoning)
-                                    .await
-                            } else {
-                                provider.chat(req).await
+                        _ = tokio::time::sleep_until(retry_deadline) => {
+                            let issued = request_counter.load(std::sync::atomic::Ordering::Relaxed);
+                            llm_error = Some(format!(
+                                "LLM 调用重试总预算（{:?}）耗尽：已尝试 {issued} 次调用、超过预算仍无成功响应",
+                                self.opts.llm_retry_budget
+                            ));
+                            break 'retry;
+                        }
+                        r = {
+                            let issued = request_counter.clone();
+                            async move {
+                                issued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if stream_enabled {
+                                    provider
+                                        .chat_stream_reasoning(req, on_text, on_reasoning)
+                                        .await
+                                } else {
+                                    provider.chat(req).await
+                                }
                             }
                         } => r,
                     };
@@ -3494,9 +3518,28 @@ impl TurnManager {
                                     &view_provenance,
                                     &prefix_unavailable,
                                 );
-                                if in_turn::reactive_compress(&ctx, &mut messages, &mut turn_start)
-                                    .await
-                                {
+                                // 压缩（内部摘要请求可能挂到单次超时）同受硬截止约束：
+                                // 否则「临近预算末尾报上下文超限 → 摘要挂起」仍能拖过预算。
+                                let compressed = tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        cancelled = true;
+                                        break 'retry;
+                                    }
+                                    _ = tokio::time::sleep_until(retry_deadline) => {
+                                        llm_error = Some(format!(
+                                            "LLM 调用重试总预算（{:?}）耗尽：上下文超限后的压缩未能在预算内完成",
+                                            self.opts.llm_retry_budget
+                                        ));
+                                        break 'retry;
+                                    }
+                                    done = in_turn::reactive_compress(
+                                        &ctx,
+                                        &mut messages,
+                                        &mut turn_start,
+                                    ) => done,
+                                };
+                                if compressed {
                                     // 预算中性：不计入 attempt。
                                     continue 'retry;
                                 }
@@ -3509,6 +3552,16 @@ impl TurnManager {
                                     ),
                                     retry_max_delay,
                                 );
+                                // 本次退避会跨过截止时间：不再重试，按预算耗尽收尾（含最后错误）。
+                                if tokio::time::Instant::now() + backoff >= retry_deadline {
+                                    let issued =
+                                        request_counter.load(std::sync::atomic::Ordering::Relaxed);
+                                    llm_error = Some(format!(
+                                        "LLM 调用重试总预算（{:?}）耗尽：已尝试 {issued} 次调用（最后错误: {e}），不再重试",
+                                        self.opts.llm_retry_budget
+                                    ));
+                                    break 'retry;
+                                }
                                 tracing::warn!(
                                     "LLM 调用失败 ({attempt_no}/{}): {e}；{backoff:?} 后重试",
                                     max_retries + 1

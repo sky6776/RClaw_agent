@@ -207,6 +207,83 @@ function formatDuration(secs: number): string {
   return `${Math.floor(secs / 60)} 分 ${secs % 60} 秒`;
 }
 
+/** ReactMarkdown 的 components 配置（模块级常量）。内联字面量会让每次渲染产生
+ *  新的组件类型，React 按类型不同直接重挂载子树——表格横向滚动位置丢失、触摸
+ *  目标被摘除；稳定身份后与普通组件行为一致。 */
+const MD_COMPONENTS = {
+  a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      className="text-indigo-400 underline decoration-indigo-400/40 underline-offset-2 hover:text-indigo-300"
+      onClick={(e) => {
+        // 只放行 http(s)：file:/mailto:/javascript: 等其它协议交给 WebView 默认
+        // 行为会顶掉 GUI 或有安全面。
+        if (!href || !/^https?:\/\//i.test(href)) {
+          e.preventDefault();
+          return;
+        }
+        e.preventDefault();
+        void api.browserOpenUrl(href).catch(() => undefined);
+      }}
+    >
+      {children}
+    </a>
+  ),
+  // 表格放横向滚动容器里（zcode 同款）：宽表不再把单元格挤成一字一行的竖排，
+  // 超出消息列宽度的部分左右滑动查看。
+  table: ({ children }: { children?: React.ReactNode }) => (
+    <div className="table-scroll">
+      <table className="w-max min-w-full">{children}</table>
+    </div>
+  ),
+};
+
+/** 助手消息正文（memo 边界）：props 全为原始类型。流式思考增量会驱动消息列表
+ *  整表重渲，没有这层边界时历史正文的 ReactMarkdown 全量 re-parse 每 chunk 都要
+ *  重跑（真机 WebView 83 上可感知，表现为输出期间滑动卡顿）。stripMediaMarkers
+ *  也放进边界内：内容不变时连清洗都不再重复执行。 */
+const AssistantMarkdown = React.memo(function AssistantMarkdown({
+  content,
+  selected,
+  selectable,
+}: {
+  content: string;
+  selected: boolean;
+  selectable: boolean;
+}) {
+  return (
+    <div
+      className={`md-body w-full text-sm text-gray-200 max-md:text-[15px] max-md:leading-relaxed ${
+        selected ? "rounded-md ring-2 ring-indigo-400" : ""
+      } ${selectable ? "text-selectable" : ""}`}
+    >
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+        {stripMediaMarkers(content)}
+      </ReactMarkdown>
+    </div>
+  );
+});
+
+/** 思考块正文（memo 边界）：展开且内容不变时跳过重渲，流式期间只有正在增长的
+ *  那一个块真正更新。清洗（剥「💭 思考中...」前缀）在边界内完成。 */
+const ThinkingBody = React.memo(function ThinkingBody({
+  content,
+  open,
+}: {
+  content: string;
+  open: boolean;
+}) {
+  if (!open) return null;
+  const body = content.replace(/^💭\s*思考中\.\.\.\n?/, "").trim();
+  return (
+    <div className="md-body border-t border-[#2a2f3a] px-4 py-2 text-xs whitespace-pre-wrap text-gray-400 max-md:px-3">
+      {body}
+    </div>
+  );
+});
+
 /** 把文本写进剪贴板：Android WebView 非安全上下文 / 无焦点时 clipboard API 报
  *  NotAllowedError: Write permission denied，回退隐藏 textarea + execCommand。 */
 async function copyText(text: string): Promise<void> {
@@ -479,7 +556,6 @@ function ThinkingBlock({
   onToggle?: (collapsed: boolean) => void;
 }) {
   const [open, setOpen] = useState(defaultOpen);
-  const body = content.replace(/^💭\s*思考中\.\.\.\n?/, "").trim();
   return (
     <div className="flex justify-start">
       <div className="w-full overflow-hidden rounded-2xl rounded-bl-md border border-dashed border-[#3a4150] bg-[#141821]">
@@ -504,11 +580,7 @@ function ThinkingBlock({
           </span>
           <span className="text-[10px] text-gray-600">{open ? "▾" : "▸"}</span>
         </button>
-        {open && (
-          <div className="md-body border-t border-[#2a2f3a] px-4 py-2 text-xs whitespace-pre-wrap text-gray-400 max-md:px-3">
-            {body}
-          </div>
-        )}
+        <ThinkingBody content={content} open={open} />
       </div>
     </div>
   );
@@ -615,6 +687,9 @@ export default function Chat({
   const [permOpen, setPermOpen] = useState(false);
   // 附件功能菜单（安卓：上传/拍照/拍视频/录音）。
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  // 思考块批量开合的代次：每次一键展开/折叠 +1，强制所有 ThinkingBlock 按新
+  // 默认态重挂载（defaultOpen 只在挂载时生效，仅改 prop 不影响已挂载的块）。
+  const [thinkingGen, setThinkingGen] = useState(0);
   // 移动端无物理键盘：占位文案去掉 Enter/↑↓ 提示。
   const isMobile = useIsMobile();
   useEffect(() => {
@@ -779,6 +854,16 @@ export default function Chat({
   const handleListScroll = () => {
     const el = listRef.current;
     if (!el) return;
+    // 批量开合思考块的布局滚动抑制窗：钳位/结算复位产生的滚动事件（位置等于
+    // 基线）只吞掉不改判——脱离态复原不被 atExactBottom / 无溢出分支翻转；
+    // 位置与基线不同的滚动（键盘翻页 / 滚动条 / 滚轮等真实滚动）立即结束抑制
+    // 并照常参与跟随判定（含回底恢复），不会被窗口吞掉。
+    if (performance.now() < scrollSettleSuppressUntilRef.current) {
+      if (el.scrollTop === lastScrollTopRef.current) {
+        return;
+      }
+      scrollSettleSuppressUntilRef.current = 0;
+    }
     if (touchStateRef.current.active) {
       lastScrollTopRef.current = el.scrollTop;
       return; // 拖动中的位置混着流式拉底，不据它改判跟随
@@ -1034,6 +1119,61 @@ export default function Chat({
   // 队列本体活在 App（按会话分桶）：Chat 随页面切换（工作区/设置面板）会整体卸载，
   // 组件内 state 会把排着队的文本一起丢掉；逐条投递也由 App 的收尾监听统一驱动，
   // 人在哪个页面/会话都不影响排队消息按序发出。这里拿到的是当前会话的队列。
+
+  // 思考块一键开合：按「之后新块的默认态」取反作为本次动作——当前默认展开则全部
+  // 折叠（未来新块也默认折叠），反之全部展开。动作型 title/aria（不声明各块的
+  // aria-expanded：混合开合时该属性既说不准也不必说）。
+  const hasThinkingEntries = useMemo(
+    () => entries.some((entry) => entry.role === "thinking"),
+    [entries],
+  );
+  // 动作前的跟随状态与滚动位置（结算 effect 用）：折叠会让列表变矮，浏览器可能
+  // 把超界的 scrollTop 钳到新底部并派发滚动事件，handleListScroll 的 atExactBottom
+  // /无溢出分支会据此恢复跟随——不保存动作前状态的话，用户的脱离态会被这次布局
+  // 翻转。滚动抑制窗：结算后一小段时间内，位置等于基线的滚动事件（钳位/复位
+  // 布局产物）不改判跟随；真实滚动（位置变化）立即解除抑制并正常判定。
+  const thinkingSettleRef = useRef<{ wasFollowing: boolean; scrollTop: number } | null>(
+    null,
+  );
+  const scrollSettleSuppressUntilRef = useRef(0);
+  const toggleAllThinking = () => {
+    const collapsed = !futureThinkingCollapsed;
+    thinkingSettleRef.current = {
+      wasFollowing: stickToBottomRef.current,
+      scrollTop: listRef.current?.scrollTop ?? 0,
+    };
+    onToggleThinking(collapsed);
+    setThinkingGen((gen) => gen + 1);
+  };
+
+  // 批量开合后的滚动结算：列表高度变了，但现有跟随 effect 只依赖条数/末条长度/
+  // busy，不会因此重跑。动作前脱离 → 复原脱离（把位置钳回保存值 + 开抑制窗，
+  // 后续的钳位滚动事件不再改判跟随）；动作前跟随 → 补拉底（展开可能把最新消息
+  // 顶出视口）。不做无条件拉底。
+  useEffect(() => {
+    if (thinkingGen === 0) return;
+    const settle = thinkingSettleRef.current;
+    thinkingSettleRef.current = null;
+    if (touchStateRef.current.active || touchStateRef.current.zombie) return;
+    const el = listRef.current;
+    if (!el) return;
+    if (settle && !settle.wasFollowing) {
+      const maxTop = el.scrollHeight - el.clientHeight;
+      el.scrollTop = Math.min(settle.scrollTop, maxTop);
+      stickToBottomRef.current = false;
+      lastScrollTopRef.current = el.scrollTop;
+      scrollSettleSuppressUntilRef.current = performance.now() + 600;
+      setShowJumpDown(true);
+      return;
+    }
+    if (stickToBottomRef.current) {
+      el.scrollTo({ top: el.scrollHeight });
+      lastScrollTopRef.current = el.scrollTop;
+    } else {
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      setShowJumpDown(!nearBottom || !stickToBottomRef.current);
+    }
+  }, [thinkingGen]);
 
   const send = () => {
     const content = draft.trim();
@@ -1474,6 +1614,7 @@ export default function Chat({
               )}
               <div className={selectIds ? "min-w-0 flex-1" : undefined}>
                 <ThinkingBlock
+                  key={`${e.id}:${thinkingGen}`}
                   content={e.content}
                   durationSecs={durationSecs}
                   defaultOpen={!futureThinkingCollapsed}
@@ -1584,49 +1725,11 @@ export default function Chat({
               }`}
               {...(selectIds ? { onClick: () => toggleSelected(e.id) } : undefined)}
             >
-              <div
-                className={`md-body w-full text-sm text-gray-200 max-md:text-[15px] max-md:leading-relaxed ${
-                  selectIds && selected ? "rounded-md ring-2 ring-indigo-400" : ""
-                } ${textSelectId === e.id ? "text-selectable" : ""}`}
-              >
-                {/* 外部链接不在 WebView 内导航（会顶掉 GUI）：http(s) 默认交
-                    应用内浏览器（browser_open_url：安卓展开面板导航，桌面走
-                    系统浏览器）。 */}
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  components={{
-                    a: ({ href, children }) => (
-                      <a
-                        href={href}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-indigo-400 underline decoration-indigo-400/40 underline-offset-2 hover:text-indigo-300"
-                        onClick={(e) => {
-                          // 只放行 http(s)：file:/mailto:/javascript: 等其它
-                          // 协议交给 WebView 默认行为会顶掉 GUI 或有安全面。
-                          if (!href || !/^https?:\/\//i.test(href)) {
-                            e.preventDefault();
-                            return;
-                          }
-                          e.preventDefault();
-                          void api.browserOpenUrl(href).catch(() => undefined);
-                        }}
-                      >
-                        {children}
-                      </a>
-                    ),
-                    // 表格放横向滚动容器里（zcode 同款）：宽表不再把单元格挤成
-                    // 一字一行的竖排，超出消息列宽度的部分左右滑动查看。
-                    table: ({ children }) => (
-                      <div className="table-scroll">
-                        <table className="w-max min-w-full">{children}</table>
-                      </div>
-                    ),
-                  }}
-                >
-                  {stripMediaMarkers(e.content)}
-                </ReactMarkdown>
-              </div>
+              <AssistantMarkdown
+                content={e.content}
+                selected={!!(selectIds && selected)}
+                selectable={textSelectId === e.id}
+              />
               <MediaPreviews
                 content={e.content}
                 onError={onError}
@@ -1656,9 +1759,10 @@ export default function Chat({
     // 行内闭包只触达 setState / ref（openMsgMenu、toggleSelected 等），不列入
     // 依赖是刻意的；onError 需要稳定身份（App 侧已 useCallback）；onFork 随会话
     // 变化（依赖 activeId），必须列入——否则分叉闭包捕获旧会话 id，切会话后
-    // 点「分叉」会 fork 到上一个会话。
+    // 点「分叉」会 fork 到上一个会话。thinkingGen 参与 ThinkingBlock 的 key，
+    // 变化时必须重算否则一键开合不会重挂载。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId],
+    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId, thinkingGen],
   );
 
   return (
@@ -2159,6 +2263,31 @@ export default function Chat({
                 </button>
               )}
             </div>
+            {/* 思考块一键开合（附件按钮右边）：会话里有思考条目才出现；动作 =
+                当前新块默认态取反（默认展开 → 全部折叠，默认折叠 → 全部展开），
+                并把默认态一并翻转，之后新到的块跟随。 */}
+            {hasThinkingEntries && (
+              <button
+                onClick={toggleAllThinking}
+                title={futureThinkingCollapsed ? "展开全部思考过程" : "折叠全部思考过程"}
+                aria-label={futureThinkingCollapsed ? "展开全部思考过程" : "折叠全部思考过程"}
+                className="flex h-10 w-10 items-center justify-center rounded-lg text-gray-500 transition hover:bg-[#1a2030] hover:text-indigo-300"
+              >
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="m7 15 5 5 5-5" />
+                  <path d="m7 9 5-5 5 5" />
+                </svg>
+              </button>
+            )}
             <input
               ref={fileRef}
               type="file"

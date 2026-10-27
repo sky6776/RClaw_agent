@@ -14,7 +14,7 @@ const STATE_STYLE: Record<string, string> = {
 const STATE_LABEL: Record<string, string> = {
   queued: "排队中",
   running: "运行中",
-  waiting: "等待输入",
+  waiting: "等待中",
   cancelling: "正在取消",
   succeeded: "已完成",
   failed: "失败",

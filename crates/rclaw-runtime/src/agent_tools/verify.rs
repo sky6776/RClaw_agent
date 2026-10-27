@@ -56,7 +56,7 @@ pub(super) async fn verify_candidate_patch(
     let mut messages = vec![Message::plain(Role::User, user)];
     for iter in 0..VERIFY_MAX_ITERS {
         if runtime
-            .wait_for_inference_slot(None, iter, false)
+            .wait_for_inference_slot(None, iter, false, None)
             .await
             .is_err()
         {

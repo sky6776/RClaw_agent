@@ -175,6 +175,17 @@ fn reset_team_inbox_unread(journal: &JournalStore) {
     store_team_inbox_unread(journal, 0);
 }
 
+/// 可选截止时间等待：`None` = 永不就绪（在 select 里不生效）；`Some(at)` = 到点就绪。
+///
+/// 供模型重试序列把 [`AgentOptions::llm_retry_budget`] 硬截止并入既有 cancel-aware
+/// select——预算耗尽与用户取消都从同一个等待点出口，且取消优先（biased 首位）。
+async fn optional_deadline_wait(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 事件 journal 流句柄（PlanRun / WorkflowRun）：`state.sqlite` 的 `journal_event` 表，
 // 以 (kind, stream) 定位一条追加式事件流，取代旧的 agent/plans|workflows/<id>.jsonl。
@@ -547,6 +558,7 @@ impl AgentToolRuntime {
         control: Option<&ExecutionControl>,
         completed_steps: usize,
         media_publish_attempted: bool,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<(), RunTaskFailure> {
         // 在等待期间持有闸门，只串行化“请求放行”，不串行化模型调用本身。必须在实际
         // 放行后再安排下一时间点；若运行时一度繁忙，预定时刻同时过期也不会形成补偿性突发。
@@ -560,10 +572,28 @@ impl AgentToolRuntime {
                         media_publish_attempted,
                     });
                 }
+                _ = optional_deadline_wait(deadline) => {
+                    return Err(RunTaskFailure::Failed {
+                        error: "模型调用重试总预算在错峰等待期间耗尽".to_string(),
+                        completed_steps,
+                        media_publish_attempted,
+                    });
+                }
                 next = self.next_inference_start.lock() => next,
             }
         } else {
-            self.next_inference_start.lock().await
+            // biased + deadline 首位：与锁就绪同时到期时明确按预算截断。
+            tokio::select! {
+                biased;
+                _ = optional_deadline_wait(deadline) => {
+                    return Err(RunTaskFailure::Failed {
+                        error: "模型调用重试总预算在错峰等待期间耗尽".to_string(),
+                        completed_steps,
+                        media_publish_attempted,
+                    });
+                }
+                lock = self.next_inference_start.lock() => lock,
+            }
         };
         let now = tokio::time::Instant::now();
         let start_at = std::cmp::max(*next, now);
@@ -578,10 +608,27 @@ impl AgentToolRuntime {
                             media_publish_attempted,
                         });
                     }
+                    _ = optional_deadline_wait(deadline) => {
+                        return Err(RunTaskFailure::Failed {
+                            error: "模型调用重试总预算在错峰等待期间耗尽".to_string(),
+                            completed_steps,
+                            media_publish_attempted,
+                        });
+                    }
                     _ = tokio::time::sleep_until(start_at) => {}
                 }
             } else {
-                tokio::time::sleep_until(start_at).await;
+                tokio::select! {
+                    biased;
+                    _ = optional_deadline_wait(deadline) => {
+                        return Err(RunTaskFailure::Failed {
+                            error: "模型调用重试总预算在错峰等待期间耗尽".to_string(),
+                            completed_steps,
+                            media_publish_attempted,
+                        });
+                    }
+                    _ = tokio::time::sleep_until(start_at) => {}
+                }
             }
         }
         *next = tokio::time::Instant::now() + self.opts.subagent_request_stagger;
@@ -1630,10 +1677,81 @@ impl AgentToolRuntime {
                 stream: false,
             };
             let max_retries = self.opts.llm_max_retries;
+            // 重试序列硬截止：约束本 iteration 内的每次请求、退避与错峰等待（按轮重置）。
+            // 端点挂起时每次尝试要满等 request_timeout（默认 300s）才超时，没有总预算时
+            // 11 次尝试最坏可拖 58 分钟（真机 fund-data-B 卡 25 分钟的根因）。
+            let retry_started = tokio::time::Instant::now();
+            let retry_deadline = retry_started + self.opts.llm_retry_budget;
             let mut outcome = None;
             for attempt in 0..=max_retries {
-                self.wait_for_inference_slot(control, iter, state.media_publish_attempted)
-                    .await?;
+                if tokio::time::Instant::now() >= retry_deadline {
+                    return Err(RunTaskFailure::Failed {
+                        error: format!(
+                            "sub-agent 模型调用重试总预算（{:?}）耗尽，不再发起第 {} 次调用",
+                            self.opts.llm_retry_budget,
+                            attempt + 1
+                        ),
+                        completed_steps: iter,
+                        media_publish_attempted: state.media_publish_attempted,
+                    });
+                }
+                if attempt > 0 {
+                    if let Some(control) = control {
+                        // 状态更新内部有异步锁等待，同受硬截止约束（与下方
+                        // model_retry_backoff 的 transition 同款 select）。
+                        let transition = self.transition_execution(
+                            &control.agent_id,
+                            ExecutionState::Waiting,
+                            iter,
+                            format!(
+                                "等待第 {} 次模型推理（正在进行第 {} 次调用尝试，累计 {} 秒）",
+                                iter + 1,
+                                attempt + 1,
+                                retry_started.elapsed().as_secs()
+                            ),
+                            ExecutionOutcomeUpdate::default(),
+                            "waiting_for_model_retry",
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = control.cancel.cancelled() => {
+                                return Err(RunTaskFailure::Cancelled {
+                                    reason: "任务在等待模型时被取消".to_string(),
+                                    completed_steps: iter,
+                                    media_publish_attempted: state.media_publish_attempted,
+                                });
+                            }
+                            _ = tokio::time::sleep_until(retry_deadline) => {
+                                return Err(RunTaskFailure::Failed {
+                                    error: format!(
+                                        "sub-agent 模型调用重试总预算（{:?}）耗尽，不再发起第 {} 次调用",
+                                        self.opts.llm_retry_budget,
+                                        attempt + 1
+                                    ),
+                                    completed_steps: iter,
+                                    media_publish_attempted: state.media_publish_attempted,
+                                });
+                            }
+                            transition_result = transition => {
+                                transition_result.map_err(|error| {
+                                    controlled_transition_failure(
+                                        control,
+                                        error,
+                                        iter,
+                                        state.media_publish_attempted,
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                }
+                self.wait_for_inference_slot(
+                    control,
+                    iter,
+                    state.media_publish_attempted,
+                    Some(retry_deadline),
+                )
+                .await?;
                 let outcome_result = if let Some(control) = control {
                     tokio::select! {
                         biased;
@@ -1644,10 +1762,37 @@ impl AgentToolRuntime {
                                 media_publish_attempted: state.media_publish_attempted,
                             });
                         }
+                        _ = tokio::time::sleep_until(retry_deadline) => {
+                            return Err(RunTaskFailure::Failed {
+                                error: format!(
+                                    "sub-agent 模型调用重试总预算（{:?}）耗尽：第 {} 次调用超过预算仍无成功响应，请求已截断",
+                                    self.opts.llm_retry_budget,
+                                    attempt + 1
+                                ),
+                                completed_steps: iter,
+                                media_publish_attempted: state.media_publish_attempted,
+                            });
+                        }
                         result = provider.chat(req.clone()) => result,
                     }
                 } else {
-                    provider.chat(req.clone()).await
+                    // biased + deadline 首位：与响应同时就绪时明确按预算截断，
+                    // 不接受随机选中过期成功。
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(retry_deadline) => {
+                            return Err(RunTaskFailure::Failed {
+                                error: format!(
+                                    "sub-agent 模型调用重试总预算（{:?}）耗尽：第 {} 次调用超过预算仍无成功响应，请求已截断",
+                                    self.opts.llm_retry_budget,
+                                    attempt + 1
+                                ),
+                                completed_steps: iter,
+                                media_publish_attempted: state.media_publish_attempted,
+                            });
+                        }
+                        result = provider.chat(req.clone()) => result,
+                    }
                 };
                 match outcome_result {
                     Ok(result) => {
@@ -1669,7 +1814,34 @@ impl AgentToolRuntime {
                                 total_attempts = max_retries + 1,
                                 "sub-agent LLM 调用失败: {error}；{backoff:?} 后重试"
                             );
+                            // 退避会跨过截止时间就不睡了：直接按预算耗尽失败（含最后错误）。
+                            if tokio::time::Instant::now() + backoff >= retry_deadline {
+                                return Err(RunTaskFailure::Failed {
+                                    error: format!(
+                                        "sub-agent 模型调用重试总预算（{:?}）耗尽：已尝试 {} 次（最后错误: {error}），不再重试",
+                                        self.opts.llm_retry_budget,
+                                        attempt + 1
+                                    ),
+                                    completed_steps: iter,
+                                    media_publish_attempted: state.media_publish_attempted,
+                                });
+                            }
                             if let Some(control) = control {
+                                // 状态更新（内部有异步锁等待）与退避 sleep 都受硬截止约束：
+                                // 否则预判与实际 sleep 之间的 await 仍能把序列拖过预算。
+                                let transition = self.transition_execution(
+                                    &control.agent_id,
+                                    ExecutionState::Waiting,
+                                    iter,
+                                    format!(
+                                        "等待第 {} 次模型推理（第 {} 次调用失败，{:?} 后重试）",
+                                        iter + 1,
+                                        attempt + 1,
+                                        backoff
+                                    ),
+                                    ExecutionOutcomeUpdate::default(),
+                                    "model_retry_backoff",
+                                );
                                 tokio::select! {
                                     biased;
                                     _ = control.cancel.cancelled() => {
@@ -1679,10 +1851,45 @@ impl AgentToolRuntime {
                                             media_publish_attempted: state.media_publish_attempted,
                                         });
                                     }
+                                    _ = tokio::time::sleep_until(retry_deadline) => {
+                                        return Err(RunTaskFailure::Failed {
+                                            error: format!(
+                                                "sub-agent 模型调用重试总预算（{:?}）耗尽：已尝试 {} 次（最后错误: {error}），不再重试",
+                                                self.opts.llm_retry_budget,
+                                                attempt + 1
+                                            ),
+                                            completed_steps: iter,
+                                            media_publish_attempted: state.media_publish_attempted,
+                                        });
+                                    }
+                                    transition_result = transition => {
+                                        transition_result.map_err(|error| {
+                                            controlled_transition_failure(
+                                                control,
+                                                error,
+                                                iter,
+                                                state.media_publish_attempted,
+                                            )
+                                        })?;
+                                    }
+                                }
+                                tokio::select! {
+                                    biased;
+                                    _ = control.cancel.cancelled() => {
+                                        return Err(RunTaskFailure::Cancelled {
+                                            reason: "任务在模型重试退避期间被取消".to_string(),
+                                            completed_steps: iter,
+                                            media_publish_attempted: state.media_publish_attempted,
+                                        });
+                                    }
+                                    _ = tokio::time::sleep_until(retry_deadline) => {}
                                     _ = tokio::time::sleep(backoff) => {}
                                 }
                             } else {
-                                tokio::time::sleep(backoff).await;
+                                tokio::select! {
+                                    _ = tokio::time::sleep_until(retry_deadline) => {}
+                                    _ = tokio::time::sleep(backoff) => {}
+                                }
                             }
                             continue;
                         }

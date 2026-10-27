@@ -606,6 +606,114 @@ async fn subagent_retries_retryable_llm_errors() {
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
+#[tokio::test]
+async fn subagent_retry_budget_exhaustion_fails_instead_of_endless_retry() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let opts = AgentOptions {
+        // 重试次数上限调得很高，让总预算成为唯一约束：端点持续 429 时不再
+        // 无限重试，而是在预算耗尽后按 Failed 收尾（真机 fund-data-B 卡 25
+        // 分钟的回归防线）。
+        llm_max_retries: 200,
+        llm_retry_base_delay: std::time::Duration::from_millis(10),
+        llm_retry_max_delay: std::time::Duration::from_millis(10),
+        llm_retry_budget: std::time::Duration::from_millis(80),
+        subagent_request_stagger: std::time::Duration::from_millis(1),
+        ..AgentOptions::default()
+    };
+    let (runtime, _layout, _registry) = test_runtime_with_provider_and_options(
+        Arc::new(FailThenSucceedProvider {
+            calls: calls.clone(),
+            retryable_failures: u64::MAX,
+        }),
+        opts,
+    );
+
+    let started = std::time::Instant::now();
+    let result = runtime
+        .run_task_inner_for_test(&test_spec("budget"), None)
+        .await;
+    let elapsed = started.elapsed();
+
+    let error = match result {
+        Err(RunTaskFailure::Failed { error, .. }) => error,
+        Err(RunTaskFailure::Cancelled { .. }) => {
+            panic!("持续 429 不应被误判为取消")
+        }
+        Ok(_) => panic!("持续 429 下不应成功"),
+    };
+    assert!(error.contains("重试总预算"), "错误应说明预算耗尽: {error}");
+    // 预算 80ms + 少量尝试：远小于旧无预算最坏情形（200 次 × 超时时长）。
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "应快速失败: {elapsed:?}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) < 50,
+        "调用次数应被预算夹住: {}",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+/// 慢成功 provider：挂起 delay 后才返回 Ok——验证预算会把在途请求截断，
+/// 而不是等它成功（删掉请求 select 的 deadline 分支后本测试必失败）。
+struct SlowSuccessProvider {
+    delay: std::time::Duration,
+    calls: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl Provider for SlowSuccessProvider {
+    fn name(&self) -> &str {
+        "slow-success"
+    }
+
+    async fn chat(&self, _req: ChatRequest) -> rclaw_llm::Result<rclaw_core::ChatOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        Ok(NoopProvider::outcome())
+    }
+
+    async fn chat_stream(
+        &self,
+        req: ChatRequest,
+        on_text: rclaw_llm::OnText,
+    ) -> rclaw_llm::Result<rclaw_core::ChatOutcome> {
+        let outcome = self.chat(req).await?;
+        on_text(&outcome.text);
+        Ok(outcome)
+    }
+}
+
+#[tokio::test]
+async fn subagent_retry_budget_truncates_inflight_request() {
+    let calls = Arc::new(AtomicU64::new(0));
+    let opts = AgentOptions {
+        llm_max_retries: 0,
+        llm_retry_budget: std::time::Duration::from_millis(50),
+        subagent_request_stagger: std::time::Duration::from_millis(1),
+        ..AgentOptions::default()
+    };
+    let (runtime, _layout, _registry) = test_runtime_with_provider_and_options(
+        Arc::new(SlowSuccessProvider {
+            delay: std::time::Duration::from_millis(500),
+            calls: calls.clone(),
+        }),
+        opts,
+    );
+
+    let result = runtime
+        .run_task_inner_for_test(&test_spec("slow"), None)
+        .await;
+
+    let error = match result {
+        Err(RunTaskFailure::Failed { error, .. }) => error,
+        Err(RunTaskFailure::Cancelled { .. }) => panic!("预算截断不应被误判为取消"),
+        Ok(_) => panic!("挂起 500ms 的请求应在 50ms 预算处被截断，而不是等到成功"),
+    };
+    assert!(error.contains("重试总预算"), "错误应说明预算耗尽: {error}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "请求已发出且被截断");
+}
+
 /// 压测 provider（第十二轮 · 并行波次上限提升）：记录同时在飞的推理数峰值。
 /// chat 内 sleep 一个小窗口，让并发可观测（瞬时完成会把峰值压成 1）。
 struct PeakConcurrencyProvider {

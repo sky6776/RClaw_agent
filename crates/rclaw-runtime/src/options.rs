@@ -32,6 +32,14 @@ pub struct AgentOptions {
     pub llm_retry_base_delay: Duration,
     /// 指数退避单次等待上限。
     pub llm_retry_max_delay: Duration,
+    /// 单轮模型调用重试序列的硬性总预算（自序列首次尝试起算，按轮重置）。
+    ///
+    /// 覆盖每次请求、退避与错峰等待：预算耗尽后不再发起新请求，在途请求被截断并按
+    /// 失败收尾（子代理 → `RunTaskFailure::Failed`；主 turn → 沿 `llm_error` 路径失败），
+    /// 不再出现「端点挂起 × 300s 超时 × 11 次尝试 ≈ 58 分钟无出口」的僵局。用户取消
+    /// 仍优先于预算（终态是 Cancelled 而非 Failed）。应大于 provider 的
+    /// `request_timeout_secs`（默认 300s），否则会截断单次合法长调用。
+    pub llm_retry_budget: Duration,
     /// 相邻子 agent 模型请求的最小起始间隔。只错峰模型请求，不串行化工具执行。
     pub subagent_request_stagger: Duration,
     /// 前台子代理的【自动转后台】预算（ZCode 移植 · Layer 2a，`autoBackgroundMs` 同源）。
@@ -202,6 +210,7 @@ impl Default for AgentOptions {
             llm_max_retries: 10,
             llm_retry_base_delay: Duration::from_secs(1),
             llm_retry_max_delay: Duration::from_secs(30),
+            llm_retry_budget: Duration::from_secs(600),
             subagent_request_stagger: Duration::from_secs(2),
             subagent_auto_background: Duration::from_secs(600),
             plan_escalation_wait_secs: 0,

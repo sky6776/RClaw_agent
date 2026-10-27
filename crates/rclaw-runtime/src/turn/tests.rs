@@ -5827,6 +5827,169 @@ async fn deterministic_llm_error_is_not_retried() {
     assert!(response.content.contains("401"));
 }
 
+/// 永远以可重试错误（503）失败的 provider：验证主 turn 重试总预算的硬截止。
+struct AlwaysRetryableFailProvider {
+    calls: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Provider for AlwaysRetryableFailProvider {
+    fn name(&self) -> &str {
+        "always-retryable-fail"
+    }
+
+    async fn chat(&self, _req: ChatRequest) -> Result<ChatOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(LlmError::BadStatus {
+            status: 503,
+            body: "service unavailable".to_string(),
+        })
+    }
+
+    async fn chat_stream(&self, req: ChatRequest, on_text: OnText) -> Result<ChatOutcome> {
+        self.chat(req).await?;
+        on_text("");
+        unreachable!("chat 总是失败，流式包装不会走到这里")
+    }
+}
+
+#[tokio::test]
+async fn llm_retry_budget_exhaustion_ends_turn_with_budget_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let calls = Arc::new(AtomicU32::new(0));
+    let provider: Arc<dyn Provider> = Arc::new(AlwaysRetryableFailProvider {
+        calls: calls.clone(),
+    });
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            stream_enabled: false,
+            send_working_status: false,
+            // 重试次数上限很高，让总预算成为唯一约束：端点持续 503 时本轮在
+            // 预算耗尽处收尾，而不是按次数无限拖（每次真实耗时 0，这里以退避
+            // 次数近似；生产行为里每次尝试还可能满等 request_timeout）。
+            llm_max_retries: 200,
+            llm_retry_base_delay: Duration::from_millis(10),
+            llm_retry_max_delay: Duration::from_millis(10),
+            llm_retry_budget: Duration::from_millis(80),
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+
+    let started = std::time::Instant::now();
+    mgr.route(BusMessage::new(CHANNEL_WEIXIN, "u1", "继续"))
+        .await;
+    wait_idle(&mgr).await;
+    let response = outbound_rx.recv().await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        response.content.contains("重试总预算"),
+        "应按预算耗尽收尾: {}",
+        response.content
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "应快速收尾: {elapsed:?}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) < 50,
+        "调用次数应被预算夹住: {}",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+/// 慢成功 provider：挂起 delay 后才返回 Ok——验证主 turn 的预算会把在途请求
+/// 截断（删掉请求 select 的 deadline 分支后本测试必失败：turn 会等到成功）。
+struct SlowSuccessTurnProvider {
+    delay: Duration,
+    calls: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Provider for SlowSuccessTurnProvider {
+    fn name(&self) -> &str {
+        "slow-success-turn"
+    }
+
+    async fn chat(&self, _req: ChatRequest) -> Result<ChatOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        Ok(ChatOutcome {
+            text: "迟到的成功".to_string(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            stop: Some(FinishReason::Stop),
+            usage: None,
+        })
+    }
+
+    async fn chat_stream(&self, req: ChatRequest, on_text: OnText) -> Result<ChatOutcome> {
+        let outcome = self.chat(req).await?;
+        on_text(&outcome.text);
+        Ok(outcome)
+    }
+}
+
+#[tokio::test]
+async fn llm_retry_budget_truncates_inflight_turn_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let calls = Arc::new(AtomicU32::new(0));
+    let provider: Arc<dyn Provider> = Arc::new(SlowSuccessTurnProvider {
+        delay: Duration::from_millis(500),
+        calls: calls.clone(),
+    });
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            stream_enabled: false,
+            send_working_status: false,
+            llm_max_retries: 0,
+            llm_retry_budget: Duration::from_millis(50),
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+
+    mgr.route(BusMessage::new(CHANNEL_WEIXIN, "u1", "继续"))
+        .await;
+    wait_idle(&mgr).await;
+    let response = outbound_rx.recv().await.unwrap();
+
+    assert!(
+        response.content.contains("重试总预算"),
+        "在途请求应被预算截断: {}",
+        response.content
+    );
+    // 被截断的在途请求计一次尝试：文案不得虚计（deadline 就绪时未执行的请求），
+    // 也不得漏计（已发出但未返回的请求）。
+    assert!(response.content.contains("已尝试 1 次"), "计数口径: {}", response.content);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "请求已发出且被截断");
+}
+
 #[test]
 fn repeated_compression_updates_latest_summary_only() {
     let first_summary = Message::plain(
