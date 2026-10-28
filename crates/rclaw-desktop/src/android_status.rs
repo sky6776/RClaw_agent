@@ -168,6 +168,11 @@ impl TurnObserver for TurnStatusObserver {
         }
         turn_ended(&msg.chat_id);
     }
+
+    /// 通知状态机不消费工具事件；复合观察者里由工具事件桥决定是否组装载荷。
+    fn wants_tool_events(&self, _msg: &BusMessage) -> bool {
+        false
+    }
 }
 
 /// 该 turn 是否参与忙碌计数：grp- 内部编排会话（与 outbound_bridge / 状态抽头
@@ -255,8 +260,9 @@ pub fn on_outbound(chat_id: &str, content: &str, intermediate: bool) {
     if content == "🟢 Agent工作中..." {
         return;
     }
-    if content.starts_with('💭') {
-        // 思考流是增量片段，内容不能直接展示；固定文案交给节流去重。
+    if intermediate && content.starts_with('💭') {
+        // 思考流是增量片段，内容不能直接展示；固定文案交给节流去重。思考流一定带
+        // intermediate——以 💭 开头的终局回复不是思考（与前端同判定）。
         task_progress(chat_id, "💭 思考中…");
     } else if is_status_line(content) || intermediate {
         task_progress(chat_id, content);

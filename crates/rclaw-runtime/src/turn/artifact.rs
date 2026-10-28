@@ -214,9 +214,8 @@ pub(crate) fn spill_if_over_budget(
         spill.threshold_bytes, PREVIEW_BYTES, preview.text,
     );
     if !disclosure_suffix.is_empty() {
-        content.push_str(
-            "\n\n未解决工具错误的运行时披露（原文位于被省略的中段，随预览保留）：\n\n",
-        );
+        content
+            .push_str("\n\n未解决工具错误的运行时披露（原文位于被省略的中段，随预览保留）：\n\n");
         content.push_str(&disclosure_suffix);
     }
     Some(path)
@@ -289,12 +288,14 @@ fn extract_runtime_disclosure_blocks(content: &str) -> Vec<String> {
 }
 
 /// 从以披露标题开头（允许行首空白）的文本提取「标题 + 连续 `- ` 条目」块：条目行
-/// 必须含「（回执 」标记（渲染不变量），遇首个其它行即停——转义字符串里条目之后
-/// 的大段普通正文不会被并入；不足一条条目返回 None（标题孤立 = 文本噪声）。
+/// 必须是渲染不变量「`- 工具（回执 …，类别 …）`」整行（含「（回执 」与「，类别 」、
+/// 以「）」收尾），遇首个其它行即停——转义字符串里条目之后的大段普通正文、计划报告
+/// 里紧随其后且恰好引用了回执号的普通步骤行（`- next [succeeded]: 已写入（回执 …）`）
+/// 都不会被并入；不足一条条目返回 None（标题孤立 = 文本噪声）。
 fn disclosure_block_from_text(text: &str) -> Option<String> {
     let mut kept_lines = 1usize;
     for line in text.lines().skip(1) {
-        if line.starts_with("- ") && line.contains("（回执 ") {
+        if is_disclosure_entry_line(line) {
             kept_lines += 1;
         } else {
             break;
@@ -304,6 +305,64 @@ fn disclosure_block_from_text(text: &str) -> Option<String> {
         return None;
     }
     Some(text.lines().take(kept_lines).collect::<Vec<_>>().join("\n"))
+}
+
+/// 从交付正文剥掉模型复述的运行时披露块（行首标题 + 连续条目行，形态同
+/// [`disclosure_block_from_text`]）。披露块已随上一轮回复进入历史与父代理的工具结果，
+/// 模型照抄时其回执号指向别的轮、条目可能早已解决；运行时在交付前按当前账本重新附加
+/// 披露，不剥掉照抄块用户就会看到两份互相矛盾的「请勿视为已完成」。只剥行首明文块
+/// （句中引用的标题、孤立标题不动），块两侧的空行只留一组分隔。
+pub(super) fn strip_runtime_disclosure_blocks(text: &str) -> String {
+    let header = super::run::RUNTIME_DISCLOSURE_HEADER;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(header) {
+        let line_start = rest[..index].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let at_line_start = rest[line_start..index].chars().all(|ch| ch == ' ');
+        let block = if at_line_start {
+            disclosure_block_from_text(&rest[line_start..])
+        } else {
+            None
+        };
+        let Some(block) = block else {
+            let next = index + header.len();
+            out.push_str(&rest[..next]);
+            rest = &rest[next..];
+            continue;
+        };
+        out.push_str(&rest[..line_start]);
+        // 按行数跳过块本体（`lines()` 已吃掉 `\r`，不能按块的字节长度切）。
+        let mut after = &rest[line_start..];
+        for _ in 0..block.lines().count() {
+            after = match after.find('\n') {
+                Some(newline) => &after[newline + 1..],
+                None => "",
+            };
+        }
+        let after = after.trim_start_matches(['\r', '\n']);
+        let kept = out.trim_end().len();
+        out.truncate(kept);
+        if !out.is_empty() && !after.is_empty() {
+            out.push_str("\n\n");
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 披露条目行的渲染不变量（`run::render_unresolved_error_disclosure`）：
+/// `- <工具名>（回执 <回执号>，类别 <类别>）`，整行以「）」收尾。
+fn is_disclosure_entry_line(line: &str) -> bool {
+    let line = line.trim_end();
+    let Some(rest) = line.strip_prefix("- ") else {
+        return false;
+    };
+    let Some(open) = rest.find("（回执 ") else {
+        return false;
+    };
+    // 工具名非空且在「（回执 」之前；类别标记在回执号之后；整行以收括号结束。
+    !rest[..open].trim().is_empty() && rest[open..].contains("，类别 ") && line.ends_with('）')
 }
 
 #[cfg(test)]
@@ -329,8 +388,7 @@ mod tests {
         );
         let real = format!(
             "{}{}- write（回执 r0-1-11111111，类别 tool_execution）",
-            header,
-            "\n"
+            header, "\n"
         );
         let content = format!("{}\n\n{}\n\n{}", "x".repeat(4096), json_blob, real);
         let blocks = extract_runtime_disclosure_blocks(&content);
@@ -339,8 +397,7 @@ mod tests {
         // JSON 字符串字段按转义形态安全解析——块是披露明文而非整条 JSON。
         let json_block = format!(
             "{}{}- echo（回执 r1-1-d70708db，类别 tool_execution）",
-            header,
-            "\n"
+            header, "\n"
         );
         assert!(blocks.contains(&json_block), "{blocks:?}");
         assert!(
@@ -354,13 +411,23 @@ mod tests {
         // 不会被并入披露块（计划报告行噪声，codex 第 9 轮 nice-to-have）。
         let content_report = format!(
             "{}{}- write（回执 r0-1-11111111，类别 timeout）{}- impl [failed]: 摘要行",
-            header,
-            "\n",
-            "\n"
+            header, "\n", "\n"
         );
         let blocks = extract_runtime_disclosure_blocks(&content_report);
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         assert!(!blocks[0].contains("impl [failed]"), "{blocks:?}");
+        // 相邻的普通步骤行即使引用了回执号（「（回执 」）也不是披露条目：条目行必须
+        // 带「，类别 」并以「）」收尾（渲染不变量），成功步骤不得被并入「未解决错误」。
+        let content_cited_neighbor = format!(
+            "{}{}- write（回执 0-1-11111111，类别 timeout）{}- next [succeeded]: 报告已写入（回执 r2-1-1a2b3c4d），已完成",
+            header, "\n", "\n"
+        );
+        let blocks = extract_runtime_disclosure_blocks(&content_cited_neighbor);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(
+            blocks[0].ends_with("- write（回执 0-1-11111111，类别 timeout）"),
+            "{blocks:?}"
+        );
         // codex 第 10 轮反例：普通正文（非 JSON 字段）里的非行首标题 + 条目 + 大段
         // 无引号正文——不是已知披露字段的序列化，整段忽略（spill 预算不被打破）。
         let plain = format!(
@@ -370,21 +437,36 @@ mod tests {
             "\n",
             "正文".repeat(50_000)
         );
+        assert!(extract_runtime_disclosure_blocks(&plain).is_empty());
         // codex 第 13 轮防退化断言：闭合 JSON 字符串内「有效条目 + 换行 + 30KB 正文」
         // ——只保留标题与连续条目，正文不回填。
-        let blob = format!("\"unresolved_disclosure\":\"{}\\n- write（回执 r0-1-1，类别 timeout）\\n{}\"", header, "body".repeat(30_000));
+        let blob = format!(
+            "\"unresolved_disclosure\":\"{}\\n- write（回执 r0-1-1，类别 timeout）\\n{}\"",
+            header,
+            "body".repeat(30_000)
+        );
         let blocks = extract_runtime_disclosure_blocks(&blob);
         assert_eq!(blocks.len(), 1, "{blocks:?}");
-        assert!(blocks[0].ends_with("- write（回执 r0-1-1，类别 timeout）"), "{blocks:?}");
+        assert!(
+            blocks[0].ends_with("- write（回执 r0-1-1，类别 timeout）"),
+            "{blocks:?}"
+        );
         assert!(!blocks[0].contains("bodybody"), "{blocks:?}");
         // 行首仅标题 + EOF（无条目）：直接断言为空。
-        assert!(extract_runtime_disclosure_blocks(&format!(
-            "{}{}- 孤立标题行", header, "\n"
-        )).is_empty());
+        assert!(
+            extract_runtime_disclosure_blocks(&format!("{}{}- 孤立标题行", header, "\n"))
+                .is_empty()
+        );
 
         // codex 第 11 轮：披露数组的多元素（后续元素前面是 ","）全部提取。
-        let block_a = format!("{}{}- memory（回执 r1-1-027e4bd5，类别 tool_execution）", header, "\n");
-        let block_b = format!("{}{}- shell（回执 r1-2-33334444，类别 timeout）", header, "\n");
+        let block_a = format!(
+            "{}{}- memory（回执 r1-1-027e4bd5，类别 tool_execution）",
+            header, "\n"
+        );
+        let block_b = format!(
+            "{}{}- shell（回执 r1-2-33334444，类别 timeout）",
+            header, "\n"
+        );
         let array_json = format!(
             "{{\"run_id\":\"r\",\"unresolved_disclosures\":[\"{}\",\"{}\"]}}",
             block_a.replace("\n", "\\n"),
@@ -400,6 +482,51 @@ mod tests {
             "\n",
         );
         assert!(extract_runtime_disclosure_blocks(&unclosed).is_empty());
+    }
+
+    #[test]
+    fn echoed_disclosure_blocks_are_stripped_from_delivery_body() {
+        let header = super::super::run::RUNTIME_DISCLOSURE_HEADER;
+        let echoed = format!(
+            "{}{}- write（回执 0-1-11111111，类别 timeout）{}- shell（回执 0-2-22222222，类别 tool_execution）",
+            header, "\n", "\n"
+        );
+        // 块在正文中间：两侧空行收成一组；块在末尾：尾部不留空行；块在开头：直接去掉。
+        assert_eq!(
+            strip_runtime_disclosure_blocks(&format!("前文\n\n{echoed}\n\n后文")),
+            "前文\n\n后文"
+        );
+        assert_eq!(
+            strip_runtime_disclosure_blocks(&format!("已完成。\n\n{echoed}")),
+            "已完成。"
+        );
+        assert_eq!(
+            strip_runtime_disclosure_blocks(&format!("{echoed}\n\n正文")),
+            "正文"
+        );
+        // 整段只有照抄块 → 空正文；CRLF 文本按行数剥掉，不按字节长度切。
+        assert_eq!(strip_runtime_disclosure_blocks(&echoed), "");
+        assert_eq!(
+            strip_runtime_disclosure_blocks(&format!(
+                "前文\r\n\r\n{}\r\n后文",
+                echoed.replace('\n', "\r\n")
+            )),
+            "前文\n\n后文"
+        );
+        // 句中引用的标题、孤立标题（无条目）、条目后的普通 `- ` 行都不动。
+        let quoted = format!("上一轮提示了「{header}」这句话，但现在已经解决。");
+        assert_eq!(strip_runtime_disclosure_blocks(&quoted), quoted);
+        let lonely = format!("{header}\n- 不是条目格式的普通列表项");
+        assert_eq!(strip_runtime_disclosure_blocks(&lonely), lonely);
+        let with_neighbor = format!("{echoed}\n- next: 普通步骤行");
+        assert_eq!(
+            strip_runtime_disclosure_blocks(&with_neighbor),
+            "- next: 普通步骤行"
+        );
+        assert_eq!(
+            strip_runtime_disclosure_blocks("没有披露的普通回复"),
+            "没有披露的普通回复"
+        );
     }
 
     #[test]

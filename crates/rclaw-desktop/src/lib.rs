@@ -34,6 +34,8 @@ mod permissions;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod state;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
+mod tool_events;
+#[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod wizard;
 
 // APK 宿主面：Java_ai_rclaw_app_NativeBridge_* JNI 导出（单 .so）。
@@ -151,6 +153,7 @@ pub fn run() {
             commands::chat_history,
             commands::chat_fork,
             commands::chat_history_since,
+            commands::chat_tool_detail,
             commands::plan_status,
             commands::plan_pause,
             commands::workflow_status,

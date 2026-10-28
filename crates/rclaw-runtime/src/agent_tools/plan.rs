@@ -2748,13 +2748,18 @@ impl Tool for PlanRunTool {
             };
             // 披露在最后一次截断之后追加，且不依赖摘要存在：验证者 fail / 等待应答的
             // 步骤可能没有 summaries 条目，披露仍须随报告可见（codex 第 6 轮 P2）。
+            // 披露标题必须独占一行：报告超预算落盘时，预览只按行首标题提取披露块
+            // （artifact::extract_runtime_disclosure_blocks），接在 `- step [..]: ` 之后
+            // 的标题会被当成正文噪声丢掉。
             if let Some(disclosure) = step_disclosures
                 .get(&step.id)
                 .filter(|value| !value.trim().is_empty())
             {
-                if !summary.trim().is_empty() {
-                    summary.push_str("\n\n");
-                }
+                summary.push_str(if summary.trim().is_empty() {
+                    "\n"
+                } else {
+                    "\n\n"
+                });
                 summary.push_str(disclosure);
             }
             report.push_str(&format!("\n- {} [{}]: {}", step.id, label, summary));

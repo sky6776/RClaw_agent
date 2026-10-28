@@ -65,6 +65,8 @@ use crate::slash::SlashRegistry;
 mod commands;
 mod media;
 mod run;
+/// 工具调用的结构化观察事件（宿主会话面板「工具调用可展开观察」）。
+pub mod tool_events;
 mod tool_execution;
 use media::*;
 pub(crate) use run::{
@@ -500,7 +502,8 @@ const EFFECT_LEDGER_INPUT_MAX: usize = 2000;
 
 /// 终局形态（codex 设计评审 Fix5）：交付与记账的单一事实来源，由出站前的
 /// final_text / warned_delivery 派生——cron 状态符、goal 审计、技能记账一律 match
-/// 本枚举，不再各自解读三变量组合。
+/// 本枚举，不再各自解读三变量组合。唯一例外：cron ✅ 符还要求交付正文不带
+/// 运行时披露块（`disclosed_delivery`），那是展示层口径，不改变记账形态。
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum TerminalKind {
     /// 完成闸门全过，内容受支持地交付。
@@ -991,10 +994,37 @@ pub(crate) fn expand_persisted_workflow_message(text: &str) -> Option<String> {
 /// 回调对所有来源（User / Cron / Heartbeat / Workflow / Agent 交接子轮）与所有渠道触发，
 /// 过滤由宿主完成。实现必须轻量、不阻塞、不得回调运行时（begun 可能处于锁内）；实现
 /// 内的 panic 会被运行时捕获并记录，不会影响 turn 本身。
+///
+/// 工具调用观察（默认空实现，宿主按需覆盖）：
+/// - [`wants_tool_events`](Self::wants_tool_events)：宿主是否关心这条消息的工具事件
+///   （默认全要）。运行时组装载荷前先问它——桌面宿主同时托管 napcat / 微信等通道，
+///   只看桌面虚拟通道的会话，其余 turn 不必白做入参解析与裁剪；
+/// - [`tool_calls_begun`](Self::tool_calls_begun)：一批 tool_calls 协议合法、即将执行
+///   （熔断硬停 / 入参非法的批次不上报）；
+/// - [`tool_calls_finished`](Self::tool_calls_finished)：该批结果已产生且（前台路径）已
+///   落库，载荷带 assistant(tool_calls) 行 id。被 /cancel 打断的批次在取消清理把中断链
+///   闭合落库后也补报一次（结果全为 aborted 占位）；持久化失败的批次没有 finished，
+///   宿主以 `turn_ended` 收口「仍在进行」的条目。只覆盖主 turn 的工具调用；子代理
+///   （Agent 工具）内部的工具调用不在主会话里，不上报。
+///
+/// 工具事件回调在 turn 任务上同步触发，而本轮的过程文本 / 思考流此前只是投进了 outbound
+/// 队列（尚未送达通道）：宿主若要事件与过程消息保序，必须把事件也投进同一条 outbound
+/// 队列、在消费端再分发，不能在回调里直接推给界面（否则 begun 会抢在本轮随附说明
+/// 之前到达）。
 pub trait TurnObserver: Send + Sync {
     fn turn_begun(&self, msg: &BusMessage);
     fn turn_terminal(&self, msg: &BusMessage, reply: &str);
     fn turn_ended(&self, msg: &BusMessage);
+    fn wants_tool_events(&self, msg: &BusMessage) -> bool {
+        let _ = msg;
+        true
+    }
+    fn tool_calls_begun(&self, msg: &BusMessage, batch: &tool_events::ToolBatchBegun) {
+        let _ = (msg, batch);
+    }
+    fn tool_calls_finished(&self, msg: &BusMessage, batch: &tool_events::ToolBatchFinished) {
+        let _ = (msg, batch);
+    }
 }
 
 pub struct TurnManager {
@@ -1146,6 +1176,81 @@ impl TurnManager {
 
     fn observe_ended(&self, msg: &BusMessage) {
         self.observe("turn_ended", |observer| observer.turn_ended(msg));
+    }
+
+    /// 观察者是否关心这条消息的工具事件：无观察者 / 宿主不看该会话时为 false，调用方
+    /// 据此跳过载荷组装（入参解析、裁剪、结果预览）。谓词 panic 视为不关心。
+    fn tool_events_wanted(&self, msg: &BusMessage) -> bool {
+        let Some(observer) = self.observer.get() else {
+            return false;
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.wants_tool_events(msg)
+        }))
+        .unwrap_or_else(|_| {
+            tracing::error!("turn 生命周期观察者 wants_tool_events 回调 panic，已忽略");
+            false
+        })
+    }
+
+    /// 一批 tool_calls 即将执行：组装列表级载荷（入参裁剪 + Manifest 工具的 skill 归属）
+    /// 并上报。无观察者 / 宿主不看该会话时不做任何序列化工作。
+    fn observe_tool_calls_begun(
+        &self,
+        msg: &BusMessage,
+        iter: u32,
+        outcome: &rclaw_core::ChatOutcome,
+        state: &TurnState,
+    ) {
+        if !self.tool_events_wanted(msg) {
+            return;
+        }
+        let calls = outcome
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                let parsed = serde_json::from_str::<Value>(&tc.input)
+                    .unwrap_or_else(|_| Value::String(tc.input.clone()));
+                let (input, input_truncated) = tool_events::brief_input(&parsed);
+                tool_events::ToolCallBegun {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    input,
+                    input_truncated,
+                    skill: state
+                        .dynamic
+                        .get(&tc.name)
+                        .map(|tool| tool.skill_name().to_string()),
+                }
+            })
+            .collect();
+        let batch = tool_events::ToolBatchBegun { iter, calls };
+        self.observe("tool_calls_begun", |observer| {
+            observer.tool_calls_begun(msg, &batch)
+        });
+    }
+
+    /// 一批 tool_calls 的结果已产生（前台路径：已落库，`assistant_msg_id = Some`）。
+    fn observe_tool_calls_finished(
+        &self,
+        msg: &BusMessage,
+        iter: u32,
+        assistant_msg_id: Option<i64>,
+        tool_result: &Message,
+        metas: &[rclaw_store::ToolCallMetaRecord],
+    ) {
+        if !self.tool_events_wanted(msg) {
+            return;
+        }
+        let batch = tool_events::ToolBatchFinished::from_results(
+            iter,
+            assistant_msg_id,
+            &tool_result.content,
+            metas,
+        );
+        self.observe("tool_calls_finished", |observer| {
+            observer.tool_calls_finished(msg, &batch)
+        });
     }
 
     // ---- active map 访问：全部走同步辅助函数 ----
@@ -3221,10 +3326,14 @@ impl TurnManager {
         // 方案 B：完成闸门拒绝耗尽后「警告 + 候选回复」一并投递的轮。投递走成功
         // 分支（内容要出去），记账按失败（completed_successfully 在收尾处降级）。
         let mut warned_delivery = false;
-        // B1：工具执行期间被 /cancel 打断时，记录尚未持久化的 assistant(tool_calls)，
-        // 清理阶段连同 aborted 占位结果一起落盘（ADR-0004），让模型下轮知道上次
-        // 干到哪、哪些调用没有结果。
-        let mut interrupted_chain: Option<Message> = None;
+        // 闸门接受的交付正文末尾附带了运行时披露块（仍有未解决的副作用工具错误）。
+        // 只影响 cron 状态符：披露块明写「请勿视为已完成」，不能再打 ✅；记账与
+        // 目标审计仍按 Supported（内容已受支持地交付，未解决错误已向用户公开）。
+        let mut disclosed_delivery = false;
+        // B1：工具执行期间被 /cancel 打断时，记录尚未持久化的 assistant(tool_calls)
+        // （连同其迭代号，清理阶段上报面板结束事件要用），清理阶段连同 aborted 占位
+        // 结果一起落盘（ADR-0004），让模型下轮知道上次干到哪、哪些调用没有结果。
+        let mut interrupted_chain: Option<(u32, Message)> = None;
         // Layer 5：当前工具迭代的 rewind 分组 id（本迭代 write/edit/delete 的 checkpoint
         // 以它归属；取消清理阶段也用它落盘未 flush 的 checkpoint）。
         let mut checkpoint_group_id: i64 = 0;
@@ -3333,7 +3442,8 @@ impl TurnManager {
                 // 流式安全：SSE 文本片段只由 provider 组装，不在完成验证前展示；失败尝试不会
                 // 留下用户可见的文本 partial，因此 retryable 错误可以从全新请求安全重试。
                 // 但推理增量（on_reasoning）是逐片实时出站的直播视图，被截止/失败的尝试
-                // 可能在思考块留下残影——轮末整段权威快照会覆盖，不在本轮依赖「无残留」假设。
+                // 可能在思考块留下残影——后续成功尝试的轮末整段权威快照会覆盖；预算耗尽
+                // 走失败终局时只出站错误文案，残影保留（已接受的取舍），不依赖「无残留」假设。
                 let max_retries = self.opts.llm_max_retries;
                 let retry_base_delay = self.opts.llm_retry_base_delay;
                 let retry_max_delay = self.opts.llm_retry_max_delay;
@@ -3460,6 +3570,11 @@ impl TurnManager {
                         }
                         _ = tokio::time::sleep_until(retry_deadline) => {
                             let issued = request_counter.load(std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                issued_requests = issued,
+                                budget = ?self.opts.llm_retry_budget,
+                                "LLM 调用重试总预算耗尽：在途请求已截断，放弃本轮"
+                            );
                             llm_error = Some(format!(
                                 "LLM 调用重试总预算（{:?}）耗尽：已尝试 {issued} 次调用、超过预算仍无成功响应",
                                 self.opts.llm_retry_budget
@@ -3556,6 +3671,12 @@ impl TurnManager {
                                 if tokio::time::Instant::now() + backoff >= retry_deadline {
                                     let issued =
                                         request_counter.load(std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(
+                                        issued_requests = issued,
+                                        budget = ?self.opts.llm_retry_budget,
+                                        "LLM 调用失败 ({attempt_no}/{}): {e}；退避将越过重试总预算，放弃本轮",
+                                        max_retries + 1
+                                    );
                                     llm_error = Some(format!(
                                         "LLM 调用重试总预算（{:?}）耗尽：已尝试 {issued} 次调用（最后错误: {e}），不再重试",
                                         self.opts.llm_retry_budget
@@ -3653,6 +3774,9 @@ impl TurnManager {
                             false,
                             &self.channels,
                         );
+                        // 闸门在确有未解决错误时才附加披露块（evaluate_final_gate 第 5 步），
+                        // 账本非空 ⇔ 本次交付正文带披露。
+                        disclosed_delivery = !run.unresolved_error_disclosure().is_empty();
                         final_text = Some(finalized_reply);
                         if had_tool_iter {
                             if let Some(r) = &outcome.reasoning {
@@ -3701,6 +3825,8 @@ impl TurnManager {
                     &self.channels,
                 );
                 had_tool_iter = true;
+                // 从 1 起的迭代号（面板直播载荷与「正在调用工具(N)」文案同口径）。
+                let iter_no = u32::try_from(iter + 1).unwrap_or(u32::MAX);
                 let tool_names = outcome
                     .tool_calls
                     .iter()
@@ -3836,14 +3962,22 @@ impl TurnManager {
                         ));
                         break 'react;
                     }
+                    // 熔断合成结果也是一次「工具调用」：面板看到调用与改道提示（无耗时，
+                    // 侧表只记成败）。
+                    self.observe_tool_calls_begun(&msg, iter_no, &outcome, &state);
                     let mut tool_result = build_loop_circuit_result(&outcome, &fingerprints);
                     run.record_tool_results(&outcome, &tool_result);
+                    let call_metas =
+                        rclaw_store::ToolCallMetaRecord::from_result_blocks(&tool_result.content);
                     if !is_cron {
-                        match self.session.append_tool_chain(
+                        match self.session.append_tool_chain_full(
                             &msg.channel,
                             &msg.chat_id,
                             &assistant_msg,
                             &tool_result,
+                            0,
+                            &[],
+                            &call_metas,
                         ) {
                             Ok((assistant_id, result_id)) => {
                                 assistant_msg.id = assistant_id;
@@ -3857,17 +3991,27 @@ impl TurnManager {
                             }
                         }
                     }
+                    self.observe_tool_calls_finished(
+                        &msg,
+                        iter_no,
+                        (!is_cron).then_some(assistant_msg.id),
+                        &tool_result,
+                        &call_metas,
+                    );
                     messages.push(assistant_msg);
                     messages.push(tool_result);
                     continue 'react;
                 }
+                // 面板直播：批次即将执行（取消 / 持久化失败的批次没有 finished，宿主以
+                // turn_ended 收口）。
+                self.observe_tool_calls_begun(&msg, iter_no, &outcome, &state);
                 // 工具执行（cancel-aware）：取消时 drop `execute_tools` future，
                 // 内部 `Shell` 子进程靠 `kill_on_drop(true)` 被 kill；此时 assistant(tool_calls)
                 // 尚未落盘，B1 在清理阶段把它与 aborted 占位结果一起补写进历史（ADR-0004）。
                 let mut tool_exec = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
-                        interrupted_chain = Some(assistant_msg);
+                        interrupted_chain = Some((iter_no, assistant_msg));
                         cancelled = true;
                         break 'react;
                     }
@@ -3901,14 +4045,16 @@ impl TurnManager {
                         &checkpoints,
                     );
                 } else {
-                    // 原子持久化 assistant(tool_calls) + tool_result + checkpoint（单事务）。
-                    match self.session.append_tool_chain_with_checkpoints(
+                    // 原子持久化 assistant(tool_calls) + tool_result + checkpoint + 工具调用
+                    // 侧表（单事务）。
+                    match self.session.append_tool_chain_full(
                         &msg.channel,
                         &msg.chat_id,
                         &assistant_msg,
                         &tool_exec.tool_result,
                         checkpoint_group_id,
                         &checkpoints,
+                        &tool_exec.call_metas,
                     ) {
                         Ok((assistant_id, result_id)) => {
                             assistant_msg.id = assistant_id;
@@ -3930,6 +4076,14 @@ impl TurnManager {
                         }
                     }
                 }
+                // 面板直播：批次结束，带落库行 id（cron 不落库 → None）。
+                self.observe_tool_calls_finished(
+                    &msg,
+                    iter_no,
+                    (!is_cron).then_some(assistant_msg.id),
+                    &tool_exec.tool_result,
+                    &tool_exec.call_metas,
+                );
 
                 messages.push(assistant_msg);
                 messages.push(tool_exec.tool_result);
@@ -3983,7 +4137,7 @@ impl TurnManager {
             let mut checkpoints =
                 rewind::into_records(std::mem::take(&mut state.pending_file_checkpoints));
             if !is_cron {
-                if let Some(assistant_msg) = interrupted_chain.take() {
+                if let Some((iter_no, assistant_msg)) = interrupted_chain.take() {
                     let ids = assistant_msg
                         .content
                         .iter()
@@ -3994,15 +4148,33 @@ impl TurnManager {
                         .collect::<Vec<_>>();
                     if !ids.is_empty() {
                         let carrier = rclaw_store::synthesize_aborted_tool_results(&ids);
-                        match self.session.append_tool_chain_with_checkpoints(
+                        // 侧表记 aborted：面板回放时这批显示「已中断」而不是「完成」/「失败」。
+                        let call_metas = ids
+                            .iter()
+                            .map(|id| rclaw_store::ToolCallMetaRecord::aborted(id.clone()))
+                            .collect::<Vec<_>>();
+                        match self.session.append_tool_chain_full(
                             &msg.channel,
                             &msg.chat_id,
                             &assistant_msg,
                             &carrier,
                             checkpoint_group_id,
                             &checkpoints,
+                            &call_metas,
                         ) {
-                            Ok(_) => checkpoints.clear(),
+                            Ok((assistant_id, _)) => {
+                                checkpoints.clear();
+                                // 面板直播：中断批次闭合落库后补一次结束事件（全为 aborted
+                                // 占位），直播条目由此盖上行 id——取消确认先于清理出站、
+                                // 没有这一步该条目要等下一轮增量才能展开懒加载。
+                                self.observe_tool_calls_finished(
+                                    &msg,
+                                    iter_no,
+                                    Some(assistant_id),
+                                    &carrier,
+                                    &call_metas,
+                                );
+                            }
                             Err(e) => tracing::warn!("中断工具链持久化失败: {e}"),
                         }
                     }
@@ -4036,8 +4208,14 @@ impl TurnManager {
         } else if let Some(text) = final_text.filter(|t| !t.is_empty()) {
             // 正常结束：持久化最终 assistant + 推送 outbound（与旧 handle_turn 一致）。
             let reply_text = if is_cron {
-                // Unverified（警告投递）轮不打 ✅ 成功符（codex r9）。
-                cron_report(&msg, &text, terminal_kind == TerminalKind::Supported)
+                // Unverified（警告投递）轮不打 ✅ 成功符（codex r9）；Supported 但正文
+                // 附带运行时披露块（未解决的副作用错误）同样不打 ✅——披露块明写
+                // 「请勿视为已完成」，状态符不能与之相左。
+                cron_report(
+                    &msg,
+                    &text,
+                    terminal_kind == TerminalKind::Supported && !disclosed_delivery,
+                )
             } else {
                 text.clone()
             };

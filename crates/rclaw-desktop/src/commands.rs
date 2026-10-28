@@ -1393,12 +1393,85 @@ pub async fn plan_pause(
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct HistoryMsgDto {
     /// 消息行 id（state.sqlite 的 message.id；消息下方「分叉到新会话」的锚点）。
+    /// 同一行可派生多条（thinking / status / assistant 共享行 id），前端按 (id, role) 去重。
     pub id: i64,
-    /// user | assistant | status（工具调用轮）。
+    /// user | assistant | thinking（推理块）| status（工具调用轮）。
     pub role: String,
     pub content: String,
     /// 消息落库时间（unix 秒，与 state.sqlite 的 message.ts / `rclaw_core::Message::ts` 同单位）。
     pub ts: i64,
+    /// status 条目（工具调用轮）的结构化调用列表：名称 + 列表级入参 + 侧表事实
+    /// （skill / 耗时 / 成败）。前端据此渲染可展开的工具行；展开全文走 `chat_tool_detail`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDto>>,
+}
+
+/// 列表级工具调用条目（快照 / 增量 / 直播同形：入参按运行时 `brief_input` 裁剪）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ToolCallDto {
+    /// `ToolUse.id`（同一行内唯一）。
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+    /// 入参被裁剪过（展开需懒加载全文）。
+    pub input_truncated: bool,
+    /// Skill 归属（Manifest 专用工具所属 skill / `read` 激活的 skill）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// 结果成败；`None` = 侧表无记录（旧行 / 侧表写入失败）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+    /// turn 被取消、该调用没有执行完（链以 aborted 占位结果闭合）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub aborted: bool,
+}
+
+/// 展开面板的工具链详情（一条 assistant(tool_calls) 行）。
+#[derive(Debug, Serialize)]
+pub struct ToolChainDetailDto {
+    pub msg_id: i64,
+    /// 行落库时间（unix 秒）。
+    pub ts: i64,
+    pub calls: Vec<ToolCallDetailDto>,
+}
+
+/// 单条工具调用的全量详情：完整入参 + 结果正文 + 侧表事实 + 文件写入前快照。
+#[derive(Debug, Serialize)]
+pub struct ToolCallDetailDto {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// 结果（载体缺失时 None）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<ToolResultDto>,
+    /// write / edit / delete 的写入前文件快照（同链 checkpoint 按路径配对；
+    /// None = 本次调用没有记录 checkpoint：未改动、失败、超限或工作区外）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<FileCheckpointDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToolResultDto {
+    pub content: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileCheckpointDto {
+    /// checkpoint 记录的归一化绝对路径。
+    pub path: String,
+    /// 写入前内容；`None` = 写入前文件不存在（新建）。
+    pub before: Option<String>,
+    /// 写入后文件不存在（delete）。
+    pub deleted: bool,
 }
 
 /// 行级快照：尾部条目 + 消费游标（前端增量续读的 `last_seen_row_id`）。
@@ -1417,16 +1490,78 @@ pub struct ChatHistoryDelta {
     pub more: bool,
 }
 
+/// 工具调用侧表：行 id → 该行各 tool_use 的执行期事实。
+type ToolCallMetas = std::collections::HashMap<i64, Vec<rclaw_store::ToolCallMetaRecord>>;
+
+/// 该批消息里 assistant(tool_calls) 行的 id 区间（侧表批量读取用）；无工具行为 None。
+fn tool_call_row_range(msgs: &[rclaw_core::Message]) -> Option<(i64, i64)> {
+    msgs.iter()
+        .filter(|m| m.has_tool_calls())
+        .map(|m| m.id)
+        .fold(None, |acc, id| match acc {
+            None => Some((id, id)),
+            Some((lo, hi)) => Some((lo.min(id), hi.max(id))),
+        })
+}
+
+/// 读取该批消息对应的工具调用侧表（连接上同步执行；无工具行时不查库）。
+fn load_tool_call_metas(
+    session: &rclaw_store::SessionStore,
+    chat_id: &str,
+    msgs: &[rclaw_core::Message],
+) -> ToolCallMetas {
+    let Some((lo, hi)) = tool_call_row_range(msgs) else {
+        return ToolCallMetas::new();
+    };
+    match session.load_tool_call_metas(CHANNEL_DESKTOP, chat_id, lo, hi) {
+        Ok(metas) => metas,
+        Err(e) => {
+            // 侧表只是充实（skill / 耗时 / 成败徽标），读不到不该让历史整体失败。
+            tracing::warn!("读取工具调用侧表失败（面板退化为无徽标）: {e}");
+            ToolCallMetas::new()
+        }
+    }
+}
+
+/// assistant(tool_calls) 行 → 列表级工具调用条目（入参按运行时同一规则裁剪，直播与
+/// 回放同形）。
+fn tool_call_dtos(
+    msg: &rclaw_core::Message,
+    metas: &[rclaw_store::ToolCallMetaRecord],
+) -> Vec<ToolCallDto> {
+    msg.content
+        .iter()
+        .filter_map(|b| match b {
+            rclaw_core::ContentBlock::ToolUse { id, name, input } => {
+                let meta = metas.iter().find(|m| &m.tool_use_id == id);
+                let (input, input_truncated) = rclaw_runtime::brief_input(input);
+                Some(ToolCallDto {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input,
+                    input_truncated,
+                    skill: meta.and_then(|m| m.skill.clone()),
+                    duration_ms: meta.and_then(|m| m.duration_ms),
+                    is_error: meta.map(|m| m.is_error),
+                    aborted: meta.is_some_and(|m| m.aborted),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// transcript 行 → 面板条目（快照与增量共用同一映射，两边口径才不会走散）。
 ///
 /// thinking 条目（Reasoning 块）在两条路径都生成：增量路径必须产出它，turn 收尾的
 /// 增量批才能与屏幕上的直播思考块对上并盖章（前端按归一化文本匹配；匹配不上则追加，
 /// 宁可偶有重复也不错盖别的轮）。
 ///
-/// status 条目（工具调用轮）只在快照路径生成（调用方传 `with_status`）：直播视图里
-/// 同一工具轮已有运行时的「正在调用工具(N):…」进度行，增量再合成一份「🔧 调用工具」
-/// 就会双份；重载后的快照没有直播进度行，仍需要它充当工具轮占位。
-fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<HistoryMsgDto> {
+/// status 条目（工具调用轮）同样两条路径都生成，并携带结构化 `tool_calls`：直播视图
+/// 里的工具行由运行时 `tool_calls` 事件产生、文案同为「🔧 调用工具: …」，增量批按
+/// (文案, 角色) 对位盖章而不是双份；结束事件已盖章的行按 (行 id, 角色) 去重。重载后
+/// 的快照没有直播行，它就是工具轮本身。
+fn history_entries(msgs: &[rclaw_core::Message], metas: &ToolCallMetas) -> Vec<HistoryMsgDto> {
     let mut out = Vec::new();
     for msg in msgs {
         if msg.is_tool_result_carrier() {
@@ -1449,6 +1584,7 @@ fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<Histo
                     role: "user".into(),
                     content: t.to_string(),
                     ts: msg.ts,
+                    tool_calls: None,
                 });
             }
             rclaw_core::Role::Assistant => {
@@ -1477,24 +1613,12 @@ fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<Histo
                         role: "thinking".into(),
                         content: reasoning,
                         ts: msg.ts,
+                        tool_calls: None,
                     });
                 }
-                let tools: Vec<&str> = msg
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        rclaw_core::ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if with_status && !tools.is_empty() {
-                    out.push(HistoryMsgDto {
-                        id: msg.id,
-                        role: "status".into(),
-                        content: format!("🔧 调用工具: {}", tools.join(", ")),
-                        ts: msg.ts,
-                    });
-                }
+                // 同行顺序 thinking → 正文 → 工具行，与直播一致：工具轮随附的说明文字
+                // （intermediate）在 tool_calls_begun 事件之前出站，回放不能把工具行排到
+                // 它前面——否则切回会话时同一轮的两种顺序来回跳。前端 `roleRank` 同序。
                 let text: String = msg
                     .content
                     .iter()
@@ -1507,6 +1631,25 @@ fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<Histo
                         role: "assistant".into(),
                         content: text,
                         ts: msg.ts,
+                        tool_calls: None,
+                    });
+                }
+                let tools: Vec<&str> = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        rclaw_core::ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !tools.is_empty() {
+                    let row_metas = metas.get(&msg.id).map(Vec::as_slice).unwrap_or(&[]);
+                    out.push(HistoryMsgDto {
+                        id: msg.id,
+                        role: "status".into(),
+                        content: tool_batch_label(&tools),
+                        ts: msg.ts,
+                        tool_calls: Some(tool_call_dtos(msg, row_metas)),
                     });
                 }
             }
@@ -1514,6 +1657,209 @@ fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<Histo
         }
     }
     out
+}
+
+/// 工具轮 status 条目的文案：直播条目（前端由 `tool_calls` 事件合成）与回放条目必须
+/// 逐字一致，增量批才能按 (文案, 角色) 对位盖章。前端 `toolBatchLabel` 同一规则。
+fn tool_batch_label(tools: &[&str]) -> String {
+    format!("🔧 调用工具: {}", tools.join(", "))
+}
+
+/// 展开面板详情：一条 assistant(tool_calls) 行的完整入参 + 结果 + 侧表 + 写入前快照。
+/// 事实源全在库里，重启 / 重装后同样可得。
+#[tauri::command]
+pub async fn chat_tool_detail(
+    state: State<'_, AppState>,
+    chat_id: String,
+    msg_id: i64,
+) -> Result<ToolChainDetailDto, String> {
+    if !is_valid_chat_id(&chat_id) {
+        return Err(format!("非法会话 id: {chat_id}"));
+    }
+    let session = state.session().ok_or("agent 尚未启动")?;
+    let detail = run_blocking("读取工具调用详情", move || {
+        session
+            .load_tool_chain_detail(CHANNEL_DESKTOP, &chat_id, msg_id)
+            .map_err(|e| e.to_string())
+    })
+    .await?
+    .ok_or_else(|| format!("消息 {msg_id} 不是本会话的工具调用行"))?;
+    Ok(tool_chain_detail_dto(msg_id, &detail))
+}
+
+fn tool_chain_detail_dto(msg_id: i64, detail: &rclaw_store::ToolChainDetail) -> ToolChainDetailDto {
+    let tool_uses: Vec<(&String, &String, &serde_json::Value)> = detail
+        .assistant
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            rclaw_core::ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+            _ => None,
+        })
+        .collect();
+    let checkpoints: Vec<&rclaw_store::FileCheckpointRecord> = detail
+        .checkpoints
+        .iter()
+        .filter(|cp| !cp.is_rewind)
+        .collect();
+    let paired = pair_checkpoints(
+        &tool_uses
+            .iter()
+            .map(|(_, name, input)| (name.as_str(), *input))
+            .collect::<Vec<_>>(),
+        &checkpoints,
+    );
+    let calls = tool_uses
+        .iter()
+        .zip(paired)
+        .map(|((id, name, input), checkpoint)| {
+            let meta = detail.metas.iter().find(|m| &m.tool_use_id == *id);
+            let result = detail
+                .results
+                .iter()
+                .find(|r| &r.tool_use_id == *id)
+                .map(|r| ToolResultDto {
+                    content: r.content.clone(),
+                    is_error: r.is_error,
+                });
+            ToolCallDetailDto {
+                id: (*id).clone(),
+                name: (*name).clone(),
+                input: (*input).clone(),
+                skill: meta.and_then(|m| m.skill.clone()),
+                started_ms: meta.and_then(|m| m.started_ms),
+                duration_ms: meta.and_then(|m| m.duration_ms),
+                result,
+                checkpoint: checkpoint.map(|cp| FileCheckpointDto {
+                    path: cp.path.clone(),
+                    before: cp.before.clone(),
+                    deleted: cp.after_hash.is_none(),
+                }),
+            }
+        })
+        .collect();
+    ToolChainDetailDto {
+        msg_id,
+        ts: detail.assistant.ts,
+        calls,
+    }
+}
+
+/// write / edit / delete 调用的入参路径（归一化后的全路径）与其「以 `/<入参路径>` 结尾」后缀。
+///
+/// 与 checkpoint 写入侧 `resolve_like_file_tool` + `display_path` 同一套词法规范化：
+/// 去掉 Windows verbatim 前缀（`\\?\` / `\\?\UNC\`），分隔符统一正斜杠，空段 / `.` 丢弃、
+/// `..` 回退一级但不越过锚（盘符 `C:`、UNC 的 `//server/share`、POSIX 根——与
+/// `PathBuf::pop` 在根上是空操作一致）——否则 `src/./a.rs`、`src/../b.rs`、`C:\work\.\a.rs`
+/// 这类入参永远配不上库里折叠后的路径，而它们的 checkpoint 还可能被同链更短后缀的
+/// 调用按第二档抢走。绝对前缀只保留给第一档的相等比较。
+///
+/// 锚判定不分平台：POSIX 上首段恰好形如 `x:` 的相对路径、或 `//server/..` 这类紧跟
+/// `..` 的输入会与写入侧折叠结果不同（写入侧在 POSIX 上把它们当普通段弹掉）——属病态
+/// 输入，接受其落到第二档后缀 / 无匹配。
+fn checkpoint_wanted_path(tool: &str, input: &serde_json::Value) -> Option<(String, String)> {
+    if !matches!(tool, "write" | "edit" | "delete") {
+        return None;
+    }
+    let raw = input.get("path").and_then(serde_json::Value::as_str)?;
+    let text = raw.replace('\\', "/");
+    let text = if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = text.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        text
+    };
+    let unc = text.starts_with("//");
+    let is_drive = |segment: &str| {
+        segment.len() == 2
+            && segment.ends_with(':')
+            && segment.starts_with(|ch: char| ch.is_ascii_alphabetic())
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    // 锚段数：UNC 的 server/share 两段、盘符一段；`..` 不弹出锚段。
+    let mut anchored = 0usize;
+    for segment in text.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if segments.len() > anchored {
+                    segments.pop();
+                }
+            }
+            other => {
+                segments.push(other);
+                if (unc && segments.len() <= 2) || (segments.len() == 1 && is_drive(other)) {
+                    anchored = segments.len();
+                }
+            }
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    let joined = segments.join("/");
+    let suffix = format!("/{joined}");
+    let full = if text.starts_with("//") {
+        format!("//{joined}")
+    } else if text.starts_with('/') {
+        suffix.clone()
+    } else {
+        joined
+    };
+    Some((full, suffix))
+}
+
+/// 把同链 checkpoint 配给 write / edit / delete 调用：checkpoint 记的是归一化绝对路径，
+/// 入参可能是相对路径。两档全局配对而不是逐调用贪心：先配「归一化后相等」的，再按
+/// 「以 `/<入参路径>` 结尾」配且更长的后缀优先——checkpoint 只在文件确有变化时才记，
+/// 同链 `write a.rs`（内容未变、无 checkpoint）+ `write src/a.rs` 时，`…/src/a.rs` 不会
+/// 被前者按短后缀抢走、给 write 面板配上别的文件的「写入前」。同档内按调用顺序取（同一
+/// 文件多次写入各配一条）。仍无法区分的只剩「同路径两次写入、第一次未改动」：checkpoint
+/// 不带 tool_use_id，按调用顺序归第一条。
+fn pair_checkpoints<'a>(
+    calls: &[(&str, &serde_json::Value)],
+    checkpoints: &[&'a rclaw_store::FileCheckpointRecord],
+) -> Vec<Option<&'a rclaw_store::FileCheckpointRecord>> {
+    let wanted: Vec<Option<(String, String)>> = calls
+        .iter()
+        .map(|(tool, input)| checkpoint_wanted_path(tool, input))
+        .collect();
+    let paths: Vec<String> = checkpoints
+        .iter()
+        .map(|cp| cp.path.replace('\\', "/"))
+        .collect();
+    let mut assigned: Vec<Option<&'a rclaw_store::FileCheckpointRecord>> = vec![None; calls.len()];
+    let mut taken = vec![false; checkpoints.len()];
+    // 第一档：归一化后相等。
+    for (ci, want) in wanted.iter().enumerate() {
+        let Some((full, _)) = want else { continue };
+        if let Some(k) = (0..paths.len()).find(|&k| !taken[k] && paths[k] == *full) {
+            taken[k] = true;
+            assigned[ci] = Some(checkpoints[k]);
+        }
+    }
+    // 第二档：后缀匹配，长后缀优先，同长按调用顺序 / checkpoint 顺序。
+    let mut candidates: Vec<(std::cmp::Reverse<usize>, usize, usize)> = Vec::new();
+    for (ci, want) in wanted.iter().enumerate() {
+        if assigned[ci].is_some() {
+            continue;
+        }
+        let Some((_, suffix)) = want else { continue };
+        for (k, path) in paths.iter().enumerate() {
+            if !taken[k] && path.ends_with(suffix.as_str()) {
+                candidates.push((std::cmp::Reverse(suffix.len()), ci, k));
+            }
+        }
+    }
+    candidates.sort_unstable();
+    for (_, ci, k) in candidates {
+        if assigned[ci].is_none() && !taken[k] {
+            taken[k] = true;
+            assigned[ci] = Some(checkpoints[k]);
+        }
+    }
+    assigned
 }
 
 /// 历史快照：完整 transcript 里最近 200 条可回放行 / 4 MB 映射为条目，附带行级游标。
@@ -1536,28 +1882,49 @@ pub async fn chat_history(
     let session = state.session().ok_or("agent 尚未启动")?;
     // 只读，不改库（目标会话可能正有 turn 在追加：进程内共用一条连接、按互斥锁串行，
     // 这里只是排在写事务之后读到一致快照，不与之交错）。
-    let snap = run_blocking("读取会话历史", move || {
-        session
+    let (snap, metas) = run_blocking("读取会话历史", move || {
+        let snap = session
             .load_chat_snapshot(CHANNEL_DESKTOP, &chat_id, 200, 4 * 1024 * 1024)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let metas = load_tool_call_metas(&session, &chat_id, &snap.messages);
+        Ok((snap, metas))
     })
     .await?;
-    let mut entries = history_entries(&snap.messages, true);
-    // 只保留最近 80 条，避免长会话首屏过载（游标不受影响：窗口外的旧行已消费）。
-    if entries.len() > 80 {
-        entries.drain(..entries.len() - 80);
-    }
+    let mut entries = history_entries(&snap.messages, &metas);
+    // 只保留最近 80 行，避免长会话首屏过载（游标不受影响：窗口外的旧行已消费）。
+    retain_last_rows(&mut entries, 80);
     Ok(ChatHistorySnapshot {
         entries,
         cursor: snap.cursor,
     })
 }
 
+/// 首屏截断按持久化行计而不按条目计：同一行派生的 thinking / status / 正文条目同进退，
+/// 思考 / 工具密集的会话也不会被派生条目挤掉对话本身（按条目截断时 80 条可能只剩
+/// 二三十轮对话，且会把一行的思考块留下、正文裁掉）。
+fn retain_last_rows(entries: &mut Vec<HistoryMsgDto>, rows: usize) {
+    let mut distinct = 0usize;
+    let mut last_id: Option<i64> = None;
+    let mut cut = 0usize;
+    for (i, entry) in entries.iter().enumerate().rev() {
+        if last_id != Some(entry.id) {
+            last_id = Some(entry.id);
+            distinct += 1;
+            if distinct > rows {
+                cut = i + 1;
+                break;
+            }
+        }
+    }
+    entries.drain(..cut);
+}
+
 /// 行级增量：返回 `after`（前端持有的 `last_seen_row_id`）之后新落库的条目 + 新游标。
 ///
 /// 与快照同一套「可回放行 → 条目」映射；不做字节裁剪也不做首屏截断——游标已声明
 /// 消费的行不会二次投递，这里丢了就永远丢了（截断只按条数，`more` 提示续拉）。
-/// 不生成 status 条目：直播进度行已在屏上，增量再合成一份就是双份。
+/// status 条目同样产出（带 `tool_calls`）：直播工具行由前端按 (文案, 角色) 对位盖章、
+/// 并用它补齐错过的结束事件（侧表成败 / 耗时），不会双份。
 #[tauri::command]
 pub async fn chat_history_since(
     state: State<'_, AppState>,
@@ -1571,14 +1938,16 @@ pub async fn chat_history_since(
         return Err(format!("非法游标: {after}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
-    let delta = run_blocking("读取会话增量", move || {
-        session
+    let (delta, metas) = run_blocking("读取会话增量", move || {
+        let delta = session
             .load_chat_delta(CHANNEL_DESKTOP, &chat_id, after, 200)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let metas = load_tool_call_metas(&session, &chat_id, &delta.messages);
+        Ok((delta, metas))
     })
     .await?;
     Ok(ChatHistoryDelta {
-        entries: history_entries(&delta.messages, false),
+        entries: history_entries(&delta.messages, &metas),
         cursor: delta.cursor,
         more: delta.more,
     })
@@ -6682,8 +7051,49 @@ mod history_entries_tests {
         }
     }
 
+    fn no_metas() -> ToolCallMetas {
+        ToolCallMetas::new()
+    }
+
     #[test]
-    fn snapshot_path_maps_status_and_skips_carriers_and_compaction() {
+    fn first_screen_budget_counts_rows_not_derived_entries() {
+        // 行 1 user；行 2 派生 thinking + status；行 3 assistant。按行保留最近 2 行 →
+        // 行 2 的两条派生条目同进退，不会出现「思考块留下、正文裁掉」的半行。
+        let msgs = vec![
+            text_msg(1, Role::User, "q"),
+            reasoning_tool_use_msg(2, "想一想"),
+            text_msg(3, Role::Assistant, "done"),
+        ];
+        let mut entries = history_entries(&msgs, &no_metas());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.id, e.role.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "user"),
+                (2, "thinking"),
+                (2, "status"),
+                (3, "assistant")
+            ]
+        );
+        retain_last_rows(&mut entries, 2);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.id, e.role.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "thinking"), (2, "status"), (3, "assistant")]
+        );
+        // 预算不小于行数时原样保留；预算为 0 清空。
+        retain_last_rows(&mut entries, 2);
+        assert_eq!(entries.len(), 3);
+        retain_last_rows(&mut entries, 0);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn maps_status_with_tool_calls_and_skips_carriers_and_compaction() {
         let msgs = vec![
             text_msg(1, Role::User, "  hello  "),
             text_msg(2, Role::User, "[CONTEXT COMPACTION] 摘要"),
@@ -6691,7 +7101,7 @@ mod history_entries_tests {
             tool_result_carrier(4),
             text_msg(5, Role::Assistant, "done"),
         ];
-        let entries = history_entries(&msgs, true);
+        let entries = history_entries(&msgs, &no_metas());
         assert_eq!(
             entries,
             vec![
@@ -6700,36 +7110,57 @@ mod history_entries_tests {
                     role: "user".into(),
                     content: "hello".into(),
                     ts: 1,
+                    tool_calls: None,
                 },
                 HistoryMsgDto {
                     id: 3,
                     role: "status".into(),
                     content: "🔧 调用工具: shell".into(),
                     ts: 3,
+                    tool_calls: Some(vec![ToolCallDto {
+                        id: "call_1".into(),
+                        name: "shell".into(),
+                        input: serde_json::json!({"command": "ls"}),
+                        input_truncated: false,
+                        skill: None,
+                        duration_ms: None,
+                        is_error: None,
+                        aborted: false,
+                    }]),
                 },
                 HistoryMsgDto {
                     id: 5,
                     role: "assistant".into(),
                     content: "done".into(),
                     ts: 5,
+                    tool_calls: None,
                 },
             ]
         );
     }
 
     #[test]
-    fn delta_path_omits_status_entries_but_keeps_assistant_text() {
-        let msgs = vec![tool_use_msg(3), text_msg(5, Role::Assistant, "done")];
-        let entries = history_entries(&msgs, false);
-        assert_eq!(
-            entries,
-            vec![HistoryMsgDto {
-                id: 5,
-                role: "assistant".into(),
-                content: "done".into(),
-                ts: 5,
-            }]
+    fn side_table_metas_enrich_tool_calls_by_id() {
+        let mut metas = no_metas();
+        metas.insert(
+            3,
+            vec![rclaw_store::ToolCallMetaRecord {
+                tool_use_id: "call_1".into(),
+                skill: Some("pdf".into()),
+                started_ms: Some(1),
+                duration_ms: Some(42),
+                is_error: true,
+                aborted: false,
+            }],
         );
+        let entries = history_entries(&[tool_use_msg(3)], &metas);
+        let calls = entries[0]
+            .tool_calls
+            .as_ref()
+            .expect("status 条目带 tool_calls");
+        assert_eq!(calls[0].skill.as_deref(), Some("pdf"));
+        assert_eq!(calls[0].duration_ms, Some(42));
+        assert_eq!(calls[0].is_error, Some(true));
     }
 
     #[test]
@@ -6739,26 +7170,22 @@ mod history_entries_tests {
             reasoning_tool_use_msg(2, "先想想"),
             text_msg(3, Role::Assistant, "答案"),
         ];
-        // 快照路径（with_status=true）：thinking 在同行 status 之前；行 2 无 Text 块，
-        // 不产出 assistant 条目（与既有口径一致）。
-        let snapshot = history_entries(&msgs, true);
+        // thinking 在同行 status 之前；行 2 无 Text 块，不产出 assistant 条目。
+        // 快照与增量同一映射（status 两条路径都产出，前端按文案对位盖章）。
+        let entries = history_entries(&msgs, &no_metas());
         assert_eq!(
-            snapshot
+            entries
                 .iter()
                 .map(|e| (e.id, e.role.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(1, "user"), (2, "thinking"), (2, "status"), (3, "assistant")],
+            vec![
+                (1, "user"),
+                (2, "thinking"),
+                (2, "status"),
+                (3, "assistant")
+            ],
         );
-        assert_eq!(snapshot[1].content, "先想想");
-        // 增量路径（with_status=false）：thinking 仍产出（盖章去重依赖它），status 不产出。
-        let delta = history_entries(&msgs, false);
-        assert_eq!(
-            delta
-                .iter()
-                .map(|e| (e.id, e.role.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(1, "user"), (2, "thinking"), (3, "assistant")],
-        );
+        assert_eq!(entries[1].content, "先想想");
     }
 
     #[test]
@@ -6770,8 +7197,12 @@ mod history_entries_tests {
                 reasoning_content: "".into(),
             },
         );
-        let entries = history_entries(&std::slice::from_ref(&msg), false);
-        assert!(entries.is_empty(), "空/空白 reasoning 不应产出条目");
+        let entries = history_entries(std::slice::from_ref(&msg), &no_metas());
+        assert_eq!(
+            entries.iter().map(|e| e.role.as_str()).collect::<Vec<_>>(),
+            vec!["status"],
+            "空/空白 reasoning 不应产出 thinking 条目（工具轮 status 仍在）"
+        );
     }
 
     #[test]
@@ -6790,15 +7221,16 @@ mod history_entries_tests {
             tool_call_id: None,
             ts: 2,
         };
-        let entries = history_entries(&[msg], true);
+        let entries = history_entries(&[msg], &no_metas());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, "thinking");
         assert_eq!(entries[0].content, "第一段\n\n第二段");
     }
 
     #[test]
-    fn full_tool_iteration_row_maps_thinking_status_text_in_order() {
+    fn full_tool_iteration_row_maps_thinking_text_status_in_order() {
         // build_assistant_message 的完整形态：reasoning + tool_use + text 同一行。
+        // 条目序与直播一致：思考 → 随附说明（intermediate 先出站）→ 工具行。
         let msg = Message {
             id: 2,
             role: Role::Assistant,
@@ -6816,16 +7248,147 @@ mod history_entries_tests {
             tool_call_id: None,
             ts: 2,
         };
-        let entries = history_entries(&[msg], true);
+        let entries = history_entries(&[msg], &no_metas());
         assert_eq!(
             entries
                 .iter()
                 .map(|e| (e.id, e.role.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(2, "thinking"), (2, "status"), (2, "assistant")],
+            vec![(2, "thinking"), (2, "assistant"), (2, "status")],
         );
         assert_eq!(entries[0].content, "想想");
-        assert_eq!(entries[1].content, "🔧 调用工具: read");
-        assert_eq!(entries[2].content, "小结");
+        assert_eq!(entries[1].content, "小结");
+        assert_eq!(entries[2].content, "🔧 调用工具: read");
+    }
+
+    #[test]
+    fn checkpoints_pair_with_write_calls_by_path_suffix() {
+        let detail = rclaw_store::ToolChainDetail {
+            assistant: Message {
+                id: 7,
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "call_0".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": "src/a.rs"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "write".into(),
+                        input: serde_json::json!({"path": "src/a.rs", "content": "new"}),
+                    },
+                ],
+                tool_call_id: None,
+                ts: 7,
+            },
+            results: vec![rclaw_store::ToolResultDetail {
+                tool_use_id: "call_1".into(),
+                content: "written".into(),
+                is_error: false,
+            }],
+            metas: vec![],
+            checkpoints: vec![rclaw_store::FileCheckpointRecord {
+                id: 1,
+                group_id: 9,
+                path: "C:/work/agent/src/a.rs".into(),
+                before: Some("old".into()),
+                before_hash: None,
+                after_hash: Some("h".into()),
+                is_rewind: false,
+                anchor_message_id: Some(8),
+            }],
+        };
+        let dto = tool_chain_detail_dto(7, &detail);
+        assert_eq!(dto.calls.len(), 2);
+        // read 不配 checkpoint；write 按路径后缀配到，before 原样带出。
+        assert!(dto.calls[0].checkpoint.is_none());
+        assert!(dto.calls[0].result.is_none());
+        let cp = dto.calls[1]
+            .checkpoint
+            .as_ref()
+            .expect("write 配到 checkpoint");
+        assert_eq!(cp.before.as_deref(), Some("old"));
+        assert!(!cp.deleted);
+        assert_eq!(
+            dto.calls[1].result.as_ref().map(|r| r.content.as_str()),
+            Some("written")
+        );
+    }
+
+    fn checkpoint(id: i64, path: &str) -> rclaw_store::FileCheckpointRecord {
+        rclaw_store::FileCheckpointRecord {
+            id,
+            group_id: 9,
+            path: path.into(),
+            before: Some(format!("old-{id}")),
+            before_hash: None,
+            after_hash: Some("h".into()),
+            is_rewind: false,
+            anchor_message_id: None,
+        }
+    }
+
+    #[test]
+    fn checkpoint_pairing_prefers_exact_then_longest_suffix() {
+        // 同链：call_0 `write a.rs`（内容未变，没有 checkpoint）、call_1 `write src/a.rs`
+        // （有 checkpoint）。逐调用贪心会让 call_0 按短后缀 `/a.rs` 抢走 `…/src/a.rs`；
+        // 两档全局配对把它留给更长后缀的 call_1，call_0 不配。
+        let cp_src = checkpoint(1, "C:/work/agent/src/a.rs");
+        let shadow = serde_json::json!({"path": "a.rs"});
+        let nested = serde_json::json!({"path": "src/a.rs"});
+        let paired = pair_checkpoints(&[("write", &shadow), ("write", &nested)], &[&cp_src]);
+        assert!(paired[0].is_none());
+        assert_eq!(paired[1].map(|cp| cp.id), Some(1));
+
+        // 两个都改动了：`a.rs` 的后缀同时命中 `…/a.rs` 与 `…/src/a.rs`，长后缀先定
+        // `src/a.rs` ↔ `…/src/a.rs`，`a.rs` 拿剩下的 `…/a.rs`——与 checkpoint 落库顺序无关。
+        let cp_root = checkpoint(2, "C:/work/agent/a.rs");
+        let paired = pair_checkpoints(
+            &[("write", &shadow), ("write", &nested)],
+            &[&cp_src, &cp_root],
+        );
+        assert_eq!(paired[0].map(|cp| cp.id), Some(2));
+        assert_eq!(paired[1].map(|cp| cp.id), Some(1));
+
+        // 相等优先于后缀：绝对路径入参（反斜杠）直接配到自己的 checkpoint。
+        let absolute = serde_json::json!({"path": "C:\\work\\agent\\a.rs"});
+        let paired = pair_checkpoints(&[("edit", &absolute)], &[&cp_src, &cp_root]);
+        assert_eq!(paired[0].map(|cp| cp.id), Some(2));
+
+        // 与写入侧同口径的词法规范化：`.` / `..` / 重复分隔符折叠后，绝对入参仍走相等档、
+        // 相对入参仍按折叠后的长后缀配——`src/./a.rs` 的 checkpoint 不会被 `a.rs` 抢走。
+        let dotted_abs = serde_json::json!({"path": "C:\\work\\agent\\src\\.\\a.rs"});
+        let paired = pair_checkpoints(&[("write", &shadow), ("write", &dotted_abs)], &[&cp_src]);
+        assert!(paired[0].is_none());
+        assert_eq!(paired[1].map(|cp| cp.id), Some(1));
+        let dotted_rel = serde_json::json!({"path": "./src/../src//./a.rs"});
+        let paired = pair_checkpoints(&[("write", &shadow), ("write", &dotted_rel)], &[&cp_src]);
+        assert!(paired[0].is_none());
+        assert_eq!(paired[1].map(|cp| cp.id), Some(1));
+
+        // 写入侧 display_path 去掉 verbatim 前缀、PathBuf::pop 在根上不动：`\\?\C:\…` 按
+        // 相等配对；`C:\..\…`、`\\?\UNC\server\share\..\…` 的 `..` 不越过盘符 / 共享名。
+        let verbatim = serde_json::json!({"path": "\\\\?\\C:\\work\\agent\\a.rs"});
+        let paired = pair_checkpoints(&[("write", &verbatim)], &[&cp_src, &cp_root]);
+        assert_eq!(paired[0].map(|cp| cp.id), Some(2));
+        let drive_parent = serde_json::json!({"path": "C:\\..\\work\\agent\\a.rs"});
+        let paired = pair_checkpoints(&[("write", &drive_parent)], &[&cp_src, &cp_root]);
+        assert_eq!(paired[0].map(|cp| cp.id), Some(2));
+        let cp_unc = checkpoint(4, "//server/share/x.rs");
+        let unc_parent = serde_json::json!({"path": "\\\\?\\UNC\\server\\share\\..\\x.rs"});
+        let paired = pair_checkpoints(&[("write", &unc_parent)], &[&cp_unc]);
+        assert_eq!(paired[0].map(|cp| cp.id), Some(4));
+
+        // 同一文件多次写入：同档内按调用顺序各配一条；非写工具 / 无 path 不参与。
+        let cp_again = checkpoint(3, "C:/work/agent/src/a.rs");
+        let read = serde_json::json!({"path": "src/a.rs"});
+        let paired = pair_checkpoints(
+            &[("read", &read), ("write", &nested), ("edit", &nested)],
+            &[&cp_src, &cp_again],
+        );
+        assert!(paired[0].is_none());
+        assert_eq!(paired[1].map(|cp| cp.id), Some(1));
+        assert_eq!(paired[2].map(|cp| cp.id), Some(3));
     }
 }

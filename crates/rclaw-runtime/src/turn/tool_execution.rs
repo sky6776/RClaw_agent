@@ -89,6 +89,10 @@ pub(crate) async fn execute_tool_batch(
     } = context;
     let mut slots: Vec<Option<ContentBlock>> =
         (0..outcome.tool_calls.len()).map(|_| None).collect();
+    // 每槽位的执行期事实（skill 归属 / 起止 / 耗时）；被拒绝的槽位保持默认（无耗时）。
+    let mut timings: Vec<CallTiming> = (0..outcome.tool_calls.len())
+        .map(|_| CallTiming::default())
+        .collect();
     let mut media_blocks = Vec::new();
     let mut package_skill_contexts = Vec::new();
     state.begin_batch();
@@ -156,16 +160,19 @@ pub(crate) async fn execute_tool_batch(
                 let input = parsed_inputs[index].clone().expect("上方已过滤被拒槽位");
                 async move {
                     tracing::debug!(tool = %tc.name, "并发执行 parallel_safe 工具");
+                    let timing = CallTiming::start();
                     let result = registry.execute(&tc.name, input).await;
                     tracing::debug!(
                         tool = %tc.name,
                         is_error = result.is_error,
                         "parallel_safe 工具返回"
                     );
-                    (index, result)
+                    (index, result, timing.finish())
                 }
             });
-        for (index, mut result) in join_all(futures).await {
+        for (index, mut result, timing) in join_all(futures).await {
+            timings[index] = timing;
+            timings[index].skill = skill_invocation_label(&invocations_per_slot[index]);
             if !result.is_error {
                 apply_skill_invocations(
                     &invocations_per_slot[index],
@@ -206,6 +213,7 @@ pub(crate) async fn execute_tool_batch(
             &callable_dynamic_tools,
             &spill,
             &mut slots,
+            &mut timings,
             &mut media_blocks,
             &mut package_skill_contexts,
             &mut validated_media_markers,
@@ -213,6 +221,26 @@ pub(crate) async fn execute_tool_batch(
         .await;
     }
 
+    // 侧表记录与结果块同序配对：成败以最终结果块为准（Skill 激活失败等后置改写也算）。
+    let call_metas = slots
+        .iter()
+        .zip(timings)
+        .filter_map(|(slot, timing)| match slot {
+            Some(ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            }) => Some(rclaw_store::ToolCallMetaRecord {
+                tool_use_id: tool_use_id.clone(),
+                skill: timing.skill,
+                started_ms: timing.started_ms,
+                duration_ms: timing.duration_ms,
+                is_error: *is_error,
+                aborted: false,
+            }),
+            _ => None,
+        })
+        .collect();
     let tool_result = Message {
         id: 0,
         role: Role::User,
@@ -245,7 +273,51 @@ pub(crate) async fn execute_tool_batch(
         skill_context_message,
         media_message,
         validated_media_markers,
+        call_metas,
     }
+}
+
+/// 单条工具调用的执行期事实（侧表记录的半成品：成败在结果块定型后再配对）。
+#[derive(Debug, Default)]
+struct CallTiming {
+    skill: Option<String>,
+    started_ms: Option<i64>,
+    duration_ms: Option<u64>,
+    started_at: Option<std::time::Instant>,
+}
+
+impl CallTiming {
+    fn start() -> Self {
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok());
+        CallTiming {
+            skill: None,
+            started_ms,
+            duration_ms: None,
+            started_at: Some(std::time::Instant::now()),
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        self.duration_ms = self
+            .started_at
+            .take()
+            .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+        self
+    }
+}
+
+/// `read` 命中 SKILL.md 的 Skill 归属标签（`包 / 名`，与「🧩 正在调用 Skill」文案同口径）；
+/// 一次 read 至多命中一个 skill，多命中取首个。
+fn skill_invocation_label(invocations: &[SkillInvocation]) -> Option<String> {
+    invocations
+        .first()
+        .map(|invocation| match &invocation.package {
+            Some(package) => format!("{package} / {}", invocation.name),
+            None => invocation.name.clone(),
+        })
 }
 
 /// 串行执行路径（原 `execute_tool_batch` 主循环）：逐条处理，允许工具间的状态
@@ -263,6 +335,7 @@ async fn execute_tool_batch_serial(
     callable_dynamic_tools: &HashSet<String>,
     spill: &super::artifact::ToolResultSpill,
     slots: &mut [Option<ContentBlock>],
+    timings: &mut [CallTiming],
     media_blocks: &mut Vec<rclaw_core::ContentBlock>,
     package_skill_contexts: &mut Vec<String>,
     validated_media_markers: &mut Vec<String>,
@@ -315,6 +388,7 @@ async fn execute_tool_batch_serial(
                                         Vec::new(),
                                         Vec::new(),
                                         false,
+                                        CallTiming::default(),
                                     );
                                 }
                             };
@@ -322,7 +396,9 @@ async fn execute_tool_batch_serial(
                             patch_runtime_source_chat(&mut input, &source_chat);
                             inject_package_skill_context(&mut input, loaded_package_skills);
                             tracing::debug!(tool = %tc.name, "并发执行 agent 工具");
+                            let timing = CallTiming::start();
                             let mut result = registry.execute(&tc.name, input).await;
+                            let timing = timing.finish();
                             tracing::debug!(
                                 tool = %tc.name,
                                 is_error = result.is_error,
@@ -359,11 +435,15 @@ async fn execute_tool_batch_serial(
                                 result.attachments,
                                 markers,
                                 attempted,
+                                timing,
                             )
                         }
                     });
-            for (slot_index, block, attachments, markers, attempted) in join_all(futures).await {
+            for (slot_index, block, attachments, markers, attempted, timing) in
+                join_all(futures).await
+            {
                 slots[slot_index] = Some(block);
+                timings[slot_index] = timing;
                 media_blocks.extend(attachments);
                 validated_media_markers.extend(markers);
                 state.media_publish_attempted |= attempted;
@@ -479,6 +559,16 @@ async fn execute_tool_batch_serial(
         } else {
             None
         };
+        // 面板侧表：Manifest 专用工具归属其 skill；`read` 命中 SKILL.md 归属被激活的 skill。
+        let mut timing = CallTiming::start();
+        timing.skill = if callable_dynamic_tools.contains(&tc.name) {
+            state
+                .dynamic
+                .get(&tc.name)
+                .map(|tool| tool.skill_name().to_string())
+        } else {
+            skill_invocation_label(&skill_invocations)
+        };
         // memory 失败上限：同一 turn 内连续失败 ≥3 次后不再执行，返回终态拒绝，
         // 防止记忆触顶/反复未命中把整个回复循环卡到预算耗尽。
         let mut result = if let Some(replay) = workflow_write
@@ -510,6 +600,7 @@ async fn execute_tool_batch_serial(
         if let Some(effect) = &workflow_write {
             effect.finish(&result);
         }
+        timings[index] = timing.finish();
         tracing::debug!(tool = %tc.name, is_error = result.is_error, "工具返回");
         // Layer 5：执行成功且文件确有变化 → 入账待落盘（turn 循环持久化后 flush）。
         if let Some(mut checkpoint) = rewind_capture {

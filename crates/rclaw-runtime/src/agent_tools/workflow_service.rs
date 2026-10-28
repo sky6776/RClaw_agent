@@ -2412,16 +2412,16 @@ impl WorkflowService {
         Ok(json!({"runs": runs, "truncated": filtered > 0, "filtered": filtered}))
     }
 
-/// 从 answer / ask_replayed 事件收集未解决错误披露（去重、保序）。
-fn collect_unresolved_disclosure(event: &Value, out: &mut Vec<String>) {
-    let disclosure = event
-        .get("unresolved_disclosure")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !disclosure.is_empty() && !out.iter().any(|seen| seen == disclosure) {
-        out.push(disclosure.to_string());
+    /// 从 answer / ask_replayed 事件收集未解决错误披露（去重、保序）。
+    fn collect_unresolved_disclosure(event: &Value, out: &mut Vec<String>) {
+        let disclosure = event
+            .get("unresolved_disclosure")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !disclosure.is_empty() && !out.iter().any(|seen| seen == disclosure) {
+            out.push(disclosure.to_string());
+        }
     }
-}
 
     pub(crate) fn get(
         &self,
@@ -2547,9 +2547,7 @@ fn collect_unresolved_disclosure(event: &Value, out: &mut Vec<String>) {
                     {
                         for disclosure in items.iter().filter_map(Value::as_str) {
                             if !disclosure.is_empty()
-                                && !unresolved_disclosures
-                                    .iter()
-                                    .any(|seen| seen == disclosure)
+                                && !unresolved_disclosures.iter().any(|seen| seen == disclosure)
                             {
                                 unresolved_disclosures.push(disclosure.to_string());
                             }

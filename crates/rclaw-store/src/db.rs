@@ -17,7 +17,7 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Result;
 
 /// 当前 schema 版本（`PRAGMA user_version`）。
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// v1 → v2：`file_checkpoint` 加 `anchor_message_id` 列（checkpoint 与同事务写入的
 /// tool_result 消息行的关联；「fork + 文件回滚到锚点」按它切回滚集。旧行 NULL =
@@ -168,6 +168,25 @@ CREATE TABLE IF NOT EXISTS workflow_request (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (scope, request_id)
+);
+"#;
+
+/// v3 → v4：工具调用侧表 `tool_call_meta`——每条 tool_use 在执行期才知道、而
+/// `ToolUse` / `ToolResult` 块本身不携带的事实：归属的 Skill（Manifest 专用入口 /
+/// 触发激活的 SKILL.md 读取）、起止时间、是否失败。桌面 / 安卓会话面板的「工具调用
+/// 可展开观察」据此在重启 / 重装后仍能还原「用了哪个 skill、耗时多久、成功与否」；
+/// 入参与结果正文仍以消息行里的 `ToolUse` / `ToolResult` 块为唯一事实源，不复制。
+///
+/// 主键含 `message_id`：provider 生成的 tool_use id 只保证一次响应内唯一（`call_0`
+/// 这类短 id 跨轮必然重复），不能单独作键。行与所属工具链同事务写入
+/// （`append_tool_chain_full`），要么都在、要么都不在。
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS tool_call_meta (
+  session_id  INTEGER NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+  message_id  INTEGER NOT NULL,
+  tool_use_id TEXT    NOT NULL,
+  meta        TEXT    NOT NULL,
+  PRIMARY KEY (session_id, message_id, tool_use_id)
 );
 "#;
 
@@ -389,7 +408,7 @@ fn migrate(conn: &Connection, path: &Path) -> Result<()> {
         return Ok(());
     }
     let before = supported_schema_version(conn)?;
-    if (1..3).contains(&before) {
+    if (1..SCHEMA_VERSION).contains(&before) {
         // 停库一致性备份：VACUUM INTO 生成快照（WAL 下直接复制会漏数据）。
         backup_before_migration(conn, path, before)?;
     }
@@ -409,6 +428,9 @@ fn migrate(conn: &Connection, path: &Path) -> Result<()> {
         }
         if version < 3 {
             conn.execute_batch(SCHEMA_V3)?;
+        }
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())

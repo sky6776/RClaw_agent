@@ -191,6 +191,91 @@ pub struct FileCheckpointRecord {
     pub anchor_message_id: Option<i64>,
 }
 
+/// 工具调用侧表记录（`tool_call_meta.meta` 列的 JSON 形态；一条 = 一次 tool_use）。
+///
+/// 只放 `ToolUse` / `ToolResult` 块里没有、执行期才知道的事实：归属 Skill、起止、成败。
+/// 入参与结果正文不复制——它们在消息行里，展开面板按需读
+/// （[`SessionStore::load_tool_chain_detail`]）。字段全部 `default`：旧行 / 字段增减
+/// 都能解出，不让面板因一条坏 meta 整体失败。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallMetaRecord {
+    /// 配对 `ToolUse.id`（同一 assistant 行内唯一）。
+    pub tool_use_id: String,
+    /// 归属 Skill：Manifest 专用入口工具所属的 skill，或 `read` 命中 SKILL.md 时激活的
+    /// skill；普通内置工具为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    /// 开始执行时刻（unix 毫秒）；并行批次里各条各自计时。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<i64>,
+    /// 执行耗时（毫秒）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// 结果是否为错误（与同链 `ToolResult.is_error` 一致；列表级状态徽标不必读载体行）。
+    #[serde(default)]
+    pub is_error: bool,
+    /// 调用没有执行完：turn 被取消时链以 aborted 占位结果闭合（`is_error` 同为 true）。
+    /// 面板据此显示「已中断」而不是「失败」。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub aborted: bool,
+}
+
+impl ToolCallMetaRecord {
+    /// 取消中断的调用：没有耗时 / skill，仅标记 aborted + is_error（与占位结果一致）。
+    pub fn aborted(tool_use_id: impl Into<String>) -> Self {
+        Self {
+            tool_use_id: tool_use_id.into(),
+            is_error: true,
+            aborted: true,
+            ..Self::default()
+        }
+    }
+
+    /// 按结果载体的 `ToolResult` 块生成最简记录（只有成败；熔断合成结果等没有执行期
+    /// 计时的链用它，列表级徽标才不会把错误显示成完成）。
+    pub fn from_result_blocks(blocks: &[ContentBlock]) -> Vec<Self> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => Some(Self {
+                    tool_use_id: tool_use_id.clone(),
+                    is_error: *is_error,
+                    ..Self::default()
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// 单条工具结果（展开面板用；从 tool_result 载体行的 `ToolResult` 块投影）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultDetail {
+    pub tool_use_id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// 一条 assistant(tool_calls) 行对应的工具链详情（桌面 / 安卓「工具调用展开观察」）。
+///
+/// 事实源全在库里：入参 = assistant 行的 `ToolUse` 块；结果 = 紧随其后的 tool_result 载体
+/// 行；skill / 耗时 / 成败 = `tool_call_meta`；文件写入前内容 = 锚在载体行上的
+/// `file_checkpoint`（write / edit 的新旧对照）。重启 / 重装（库文件仍在）后同样可得。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolChainDetail {
+    /// assistant(tool_calls) 行本身（含完整 `ToolUse` 入参）。
+    pub assistant: Message,
+    /// 载体行里的结果（按块顺序）；载体缺失（fork 以 tool_use 行为锚、链写入中断）时为空。
+    pub results: Vec<ToolResultDetail>,
+    pub metas: Vec<ToolCallMetaRecord>,
+    /// 本链写入的文件 checkpoint（含 `before` 正文），按行 id 升序。
+    pub checkpoints: Vec<FileCheckpointRecord>,
+}
+
 /// usage 锚点：某条消息（`anchor_message_id`）处 provider 回报的真实 prompt token 总数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageAnchorRecord {
@@ -323,6 +408,32 @@ impl SessionStore {
         group_id: i64,
         checkpoints: &[FileCheckpointRecord],
     ) -> Result<(i64, i64)> {
+        self.append_tool_chain_full(
+            channel,
+            chat_id,
+            asst,
+            tool_result,
+            group_id,
+            checkpoints,
+            &[],
+        )
+    }
+
+    /// 工具链两条 + rewind checkpoint + 工具调用侧表记录在**同一事务**提交。
+    ///
+    /// `metas` 锚定 assistant(tool_calls) 行 id（入参所在行 = 面板条目的身份）；
+    /// 同 id 重复时后者覆盖，侧表永远不让链写入失败。
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_tool_chain_full(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        asst: &Message,
+        tool_result: &Message,
+        group_id: i64,
+        checkpoints: &[FileCheckpointRecord],
+        metas: &[ToolCallMetaRecord],
+    ) -> Result<(i64, i64)> {
         self.db.transaction(|tx| {
             let sid = ensure_session(tx, channel, chat_id)?;
             let a = insert_message(tx, sid, asst, None)?;
@@ -330,6 +441,7 @@ impl SessionStore {
             // checkpoint 锚定同事务的 tool_result 消息行（v2）——按消息锚点回滚文件
             // 的事实源。
             insert_checkpoints(tx, sid, group_id, checkpoints, Some(t))?;
+            insert_tool_call_metas(tx, sid, a, metas)?;
             Ok((a, t))
         })
     }
@@ -818,6 +930,15 @@ impl SessionStore {
                     "INSERT INTO message(session_id, role, ts, data, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![new_sid, role, ts, data, meta],
                 )?;
+                // 工具调用侧表随行复制（键含行 id，重映射到新行）：新分支的面板同样能
+                // 看到 skill 归属 / 耗时 / 成败。checkpoint 不复制（既定：分叉即回滚点）。
+                let new_id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT OR REPLACE INTO tool_call_meta(session_id, message_id, tool_use_id, meta) \
+                     SELECT ?1, ?2, tool_use_id, meta FROM tool_call_meta \
+                     WHERE session_id = ?3 AND message_id = ?4",
+                    params![new_sid, new_id, sid, id],
+                )?;
             }
             let lineage = serde_json::json!({
                 "parent": chat_id,
@@ -1003,8 +1124,8 @@ impl SessionStore {
     pub fn clear_all_sessions(&self) -> Result<()> {
         self.db.transaction(|tx| {
             tx.execute_batch(
-                "DELETE FROM file_checkpoint; DELETE FROM message; DELETE FROM session; \
-                 DELETE FROM usage_anchor;",
+                "DELETE FROM tool_call_meta; DELETE FROM file_checkpoint; DELETE FROM message; \
+                 DELETE FROM session; DELETE FROM usage_anchor;",
             )?;
             // 会话全清，会话级 kv（/goal 目标、fork 血缘）一并删除——否则 /clear 后旧
             // 目标还挂在 kv 里，goal reminder 会把它注进「全新」的会话；血缘行会让复用
@@ -1242,6 +1363,144 @@ impl SessionStore {
                 out.push(row?);
             }
             Ok(out)
+        })
+    }
+
+    /// 行 id 在 `[min_id, max_id]` 内的 assistant(tool_calls) 行的工具调用侧表记录，
+    /// 按行 id 归组（面板快照 / 增量批次的列表级充实：skill 徽标、耗时、成败）。
+    /// 坏 meta 行告警跳过。
+    pub fn load_tool_call_metas(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        min_id: i64,
+        max_id: i64,
+    ) -> Result<HashMap<i64, Vec<ToolCallMetaRecord>>> {
+        if min_id > max_id {
+            return Ok(HashMap::new());
+        }
+        self.db.with(|conn| {
+            let Some(sid) = session_id(conn, channel, chat_id)? else {
+                return Ok(HashMap::new());
+            };
+            let mut stmt = conn.prepare_cached(
+                "SELECT message_id, meta FROM tool_call_meta \
+                 WHERE session_id = ?1 AND message_id BETWEEN ?2 AND ?3 ORDER BY rowid",
+            )?;
+            let rows = stmt.query_map(params![sid, min_id, max_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out: HashMap<i64, Vec<ToolCallMetaRecord>> = HashMap::new();
+            for row in rows {
+                let (message_id, raw) = row?;
+                if let Some(meta) = parse_tool_call_meta(message_id, &raw) {
+                    out.entry(message_id).or_default().push(meta);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// 一条 assistant(tool_calls) 行的工具链详情（展开面板）：入参行 + 紧随其后的
+    /// tool_result 载体 + 侧表 + 锚在载体上的文件 checkpoint。
+    ///
+    /// `None` = 该行不存在 / 不属于该会话 / 不是含工具调用的 assistant 行。载体缺失
+    /// （fork 以 tool_use 行为锚复制、链写入中断）时 `results` 为空而非报错。
+    pub fn load_tool_chain_detail(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        assistant_id: i64,
+    ) -> Result<Option<ToolChainDetail>> {
+        self.db.with(|conn| {
+            let Some(sid) = session_id(conn, channel, chat_id)? else {
+                return Ok(None);
+            };
+            let assistant = conn
+                .query_row(
+                    "SELECT id, data FROM message WHERE session_id = ?1 AND id = ?2",
+                    params![sid, assistant_id],
+                    row_to_message,
+                )
+                .optional()?
+                .flatten();
+            let Some(assistant) = assistant else {
+                return Ok(None);
+            };
+            if !assistant.has_tool_calls() {
+                return Ok(None);
+            }
+            // 载体 = 会话内紧随其后的一行（工具链同事务写入，t == a + 1 在会话内成立；
+            // 跨会话并发落库会让全局 id 不连续，所以按「本会话下一行」取）。
+            let carrier = conn
+                .query_row(
+                    "SELECT id, data FROM message WHERE session_id = ?1 AND id > ?2 \
+                     ORDER BY id LIMIT 1",
+                    params![sid, assistant_id],
+                    row_to_message,
+                )
+                .optional()?
+                .flatten()
+                .filter(|m| m.is_tool_result_carrier());
+            let results = carrier
+                .as_ref()
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => Some(ToolResultDetail {
+                                tool_use_id: tool_use_id.clone(),
+                                content: content.clone(),
+                                is_error: *is_error,
+                            }),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut stmt = conn.prepare_cached(
+                "SELECT meta FROM tool_call_meta WHERE session_id = ?1 AND message_id = ?2 \
+                 ORDER BY rowid",
+            )?;
+            let metas = stmt
+                .query_map(params![sid, assistant_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?
+                .iter()
+                .filter_map(|raw| parse_tool_call_meta(assistant_id, raw))
+                .collect();
+            let checkpoints = match carrier.as_ref() {
+                Some(carrier) => {
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT id, group_id, path, before, before_hash, after_hash, is_rewind, \
+                         anchor_message_id FROM file_checkpoint \
+                         WHERE session_id = ?1 AND anchor_message_id = ?2 ORDER BY id",
+                    )?;
+                    let rows = stmt.query_map(params![sid, carrier.id], |row| {
+                        Ok(FileCheckpointRecord {
+                            id: row.get(0)?,
+                            group_id: row.get(1)?,
+                            path: row.get(2)?,
+                            before: row.get(3)?,
+                            before_hash: row.get(4)?,
+                            after_hash: row.get(5)?,
+                            is_rewind: row.get::<_, i64>(6)? != 0,
+                            anchor_message_id: row.get(7)?,
+                        })
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                }
+                None => Vec::new(),
+            };
+            Ok(Some(ToolChainDetail {
+                assistant,
+                results,
+                metas,
+                checkpoints,
+            }))
         })
     }
 
@@ -1555,6 +1814,38 @@ fn insert_checkpoints(
         ])?;
     }
     Ok(())
+}
+
+/// 工具调用侧表写入（与工具链同事务）。`INSERT OR REPLACE`：同一行内 provider 重复
+/// tool_use id 时后者覆盖，不让主链写入因侧表失败。
+fn insert_tool_call_metas(
+    conn: &Connection,
+    session_id: i64,
+    message_id: i64,
+    metas: &[ToolCallMetaRecord],
+) -> Result<()> {
+    if metas.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR REPLACE INTO tool_call_meta(session_id, message_id, tool_use_id, meta) \
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for meta in metas {
+        let raw = serde_json::to_string(meta)?;
+        stmt.execute(params![session_id, message_id, meta.tool_use_id, raw])?;
+    }
+    Ok(())
+}
+
+fn parse_tool_call_meta(message_id: i64, raw: &str) -> Option<ToolCallMetaRecord> {
+    match serde_json::from_str::<ToolCallMetaRecord>(raw) {
+        Ok(meta) => Some(meta),
+        Err(e) => {
+            tracing::warn!("tool_call_meta 行解析失败，已跳过: message_id={message_id} err={e}");
+            None
+        }
+    }
 }
 
 fn parse_message(id: i64, data: &str) -> Option<Message> {

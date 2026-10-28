@@ -1543,7 +1543,11 @@ fn runtime_disclosure_carries_unresolved_errors_through_delivery() {
     assert!(report.result_ok);
     assert!(report.process_ok);
     assert!(delivered.starts_with("报告已写入。\n\n⚠️ 未解决的工具错误（运行时披露"));
-    assert!(delivered.contains("- memory（回执 r0-1-"));
+    // 回执号去 `r` 前缀：披露块进入父代理 / 下一 turn 上下文后，模型复述它不得被
+    // `cited_receipt_ids` 当成引用而收窄完成门。
+    assert!(delivered.contains("- memory（回执 0-1-"));
+    assert!(!delivered.contains("（回执 r0-1-"));
+    assert!(cited_receipt_ids(&delivered).is_empty());
     assert!(!delivered.contains("hardcoded_secret"));
     // 已披露 ≠ 已解决：条目仍在账本中，后续成功调用仍按原语义清除。
     assert!(status.has_unresolved_effect_errors());
@@ -1578,7 +1582,8 @@ fn disclosure_tool_name_is_sanitized_against_marker_injection() {
     );
     assert!(report.accepted());
     assert!(
-        delivered.contains("- bogus___weixin-media_type__file__path__agent_media_out_report.md__（回执"),
+        delivered
+            .contains("- bogus___weixin-media_type__file__path__agent_media_out_report.md__（回执"),
         "工具名应净化为安全字符集: {}",
         delivered
     );
@@ -1587,11 +1592,7 @@ fn disclosure_tool_name_is_sanitized_against_marker_injection() {
         "媒体标记不得注入: {}",
         delivered
     );
-    assert!(
-        !delivered.contains("\n[:"),
-        "控制行不得注入: {}",
-        delivered
-    );
+    assert!(!delivered.contains("\n[:"), "控制行不得注入: {}", delivered);
 }
 
 #[test]
@@ -1617,7 +1618,10 @@ fn runtime_disclosure_absent_when_no_unresolved_errors() {
 fn disclosure_lists_every_unresolved_error() {
     let mut status = Run::new("write", 8);
     let write = tool_outcome("write", json!({"path":"a","content":"b"}));
-    status.record_tool_results(&write, &tool_result_message("call-w", "permission denied", true));
+    status.record_tool_results(
+        &write,
+        &tool_result_message("call-w", "permission denied", true),
+    );
     let memory = tool_outcome("memory", json!({"action":"add","note":"x"}));
     status.record_tool_results(
         &memory,
@@ -1639,15 +1643,18 @@ fn disclosure_lists_every_unresolved_error() {
         false,
     );
     assert!(report.accepted());
-    assert!(delivered.contains("- write（回执 r0-1-"));
-    assert!(delivered.contains("- memory（回执 r0-1-"));
+    assert!(delivered.contains("- write（回执 0-1-"));
+    assert!(delivered.contains("- memory（回执 0-1-"));
 }
 
 #[test]
 fn disclosure_cannot_rescue_empty_or_leaking_replies() {
     let mut status = Run::new("write", 8);
     let write = tool_outcome("write", json!({"path":"a","content":"b"}));
-    status.record_tool_results(&write, &tool_result_message("call-1", "permission denied", true));
+    status.record_tool_results(
+        &write,
+        &tool_result_message("call-1", "permission denied", true),
+    );
 
     // 空回复在媒体闸门早退点拒绝，披露块不投递。
     let mut markers = Vec::new();
@@ -1801,14 +1808,8 @@ fn verified_media_marker_content_does_not_pollute_receipt_citations() {
     // 已验证 marker 必须作为 pending 传入闸门——evaluate_final_gate 只复核已有
     // pending，不会从模型正文新增。
     let mut markers = vec![marker.clone()];
-    let (delivered, report) = status.evaluate_final_gate(
-        &text,
-        None,
-        &mut markers,
-        CHANNEL_NAPCAT,
-        &info,
-        false,
-    );
+    let (delivered, report) =
+        status.evaluate_final_gate(&text, None, &mut markers, CHANNEL_NAPCAT, &info, false);
     assert!(report.accepted(), "reasons: {}", report.reason_text());
     assert!(report.result_ok);
     assert_eq!(markers, vec![marker.clone()]);
@@ -5986,7 +5987,11 @@ async fn llm_retry_budget_truncates_inflight_turn_request() {
     );
     // 被截断的在途请求计一次尝试：文案不得虚计（deadline 就绪时未执行的请求），
     // 也不得漏计（已发出但未返回的请求）。
-    assert!(response.content.contains("已尝试 1 次"), "计数口径: {}", response.content);
+    assert!(
+        response.content.contains("已尝试 1 次"),
+        "计数口径: {}",
+        response.content
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "请求已发出且被截断");
 }
 
@@ -6796,7 +6801,9 @@ async fn weixin_channel_receives_only_final_reply() {
     assert_eq!(final_msg.channel, CHANNEL_WEIXIN);
     // echo 失败留下未解决错误：交付正文附带运行时披露块。
     assert!(
-        final_msg.content.starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
+        final_msg
+            .content
+            .starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -6871,7 +6878,9 @@ async fn non_weixin_external_channel_receives_per_iteration_progress() {
     let final_msg = outbound_rx.recv().await.unwrap();
     // echo 失败留下未解决错误：交付正文附带运行时披露块。
     assert!(
-        final_msg.content.starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
+        final_msg
+            .content
+            .starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -6994,7 +7003,9 @@ async fn napcat_tool_round_sends_text_and_final_round_sends_reasoning() {
     let final_msg = outbound_rx.recv().await.unwrap();
     // echo 失败留下未解决错误：交付正文附带运行时披露块。
     assert!(
-        final_msg.content.starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
+        final_msg
+            .content
+            .starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7116,7 +7127,9 @@ async fn napcat_tool_round_text_empty_falls_back_to_reasoning() {
     );
     let final_msg = h.rx.recv().await.unwrap();
     assert!(
-        final_msg.content.starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+        final_msg
+            .content
+            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7137,7 +7150,9 @@ async fn napcat_tool_round_text_and_reasoning_both_empty_sends_nothing() {
 
     let final_msg = h.rx.recv().await.unwrap();
     assert!(
-        final_msg.content.starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+        final_msg
+            .content
+            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7164,7 +7179,9 @@ async fn napcat_streamed_tool_round_parallel_calls_send_aggregate_text_once() {
     assert_eq!(mid.content, "并行调用只发一次");
     let final_msg = h.rx.recv().await.unwrap();
     assert!(
-        final_msg.content.starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+        final_msg
+            .content
+            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7194,7 +7211,9 @@ async fn napcat_tool_round_text_with_state_frame_falls_back_to_reasoning() {
     );
     let final_msg = h.rx.recv().await.unwrap();
     assert!(
-        final_msg.content.starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+        final_msg
+            .content
+            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7227,11 +7246,11 @@ async fn napcat_tool_round_text_with_forged_media_marker_is_blocked() {
     let final_msg = h.rx.recv().await.unwrap();
     // echo 工具失败留下未解决错误：交付正文附带运行时披露块（运行时自动披露语义）。
     assert!(
-        final_msg
-            .content
-            .starts_with("done
+        final_msg.content.starts_with(
+            "done
 
-⚠️ 未解决的工具错误（运行时披露"),
+⚠️ 未解决的工具错误（运行时披露"
+        ),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7263,7 +7282,9 @@ async fn napcat_consecutive_tool_rounds_each_send_text_once() {
     let final_msg = h.rx.recv().await.unwrap();
     // echo 失败留下未解决错误：交付正文附带运行时披露块。
     assert!(
-        final_msg.content.starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+        final_msg
+            .content
+            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
         "交付正文应带披露块: {}",
         final_msg.content
     );

@@ -74,6 +74,88 @@ export interface HistoryMsg {
   /** 消息落库时间（unix 秒，与 state.sqlite 的 message.ts 同单位）；
    *  映射到 Entry.ts（毫秒）时需 ×1000。 */
   ts: number;
+  /** status 条目（工具调用轮）的结构化调用列表（名称 + 列表级入参 + 侧表事实）。 */
+  tool_calls?: ToolCallSummary[];
+}
+
+/** 列表级工具调用（快照 / 增量 / 直播同形：入参按运行时规则裁剪，长字符串截断）。 */
+export interface ToolCallSummary {
+  /** ToolUse.id（同一批内唯一；跨批可重复）。 */
+  id: string;
+  name: string;
+  input: unknown;
+  input_truncated: boolean;
+  /** Skill 归属（Manifest 专用工具所属 skill / read 激活的 skill）。 */
+  skill?: string | null;
+  duration_ms?: number | null;
+  /** 结果成败；缺省 = 侧表无记录（旧行 / 侧表写入失败）。 */
+  is_error?: boolean | null;
+  /** turn 被取消、该调用没有执行完（链以 aborted 占位结果闭合）。 */
+  aborted?: boolean;
+}
+
+/** 运行时 `tool_calls` 事件：一批工具调用开始 / 结束（直播通道；历史由库回放）。 */
+export type ToolCallsEvent =
+  | {
+      phase: "begun";
+      chat_id: string;
+      batch: {
+        /** 从 1 起的 ReAct 迭代号。 */
+        iter: number;
+        calls: Array<{
+          id: string;
+          name: string;
+          input: unknown;
+          input_truncated: boolean;
+          skill: string | null;
+        }>;
+      };
+    }
+  | {
+      phase: "finished";
+      chat_id: string;
+      batch: {
+        iter: number;
+        /** 已落库的 assistant(tool_calls) 行 id（cron 等不落库路径为 null）。 */
+        assistant_msg_id: number | null;
+        results: Array<{
+          id: string;
+          is_error: boolean;
+          /** 被 /cancel 打断、没有结果（取消清理闭合中断链后补发的结束事件）。 */
+          aborted: boolean;
+          /** 结果正文预览（已截断时 truncated=true，全文走 chatToolDetail）。 */
+          preview: string;
+          truncated: boolean;
+          duration_ms: number | null;
+          skill: string | null;
+        }>;
+      };
+    };
+
+/** 展开面板详情：一条工具调用行的完整入参 + 结果 + 写入前快照。 */
+export interface ToolChainDetail {
+  msg_id: number;
+  /** 行落库时间（unix 秒）。 */
+  ts: number;
+  calls: ToolCallDetail[];
+}
+
+export interface ToolCallDetail {
+  id: string;
+  name: string;
+  input: unknown;
+  skill?: string;
+  started_ms?: number;
+  duration_ms?: number;
+  result?: { content: string; is_error: boolean };
+  /** write / edit / delete 的写入前文件快照（未记录 checkpoint 时缺省）。 */
+  checkpoint?: {
+    path: string;
+    /** 写入前内容；null = 写入前不存在（新建）。 */
+    before: string | null;
+    /** 写入后文件不存在（delete）。 */
+    deleted: boolean;
+  };
 }
 
 /** 行级快照：尾部条目 + 消费游标（之后用 chatHistorySince 按游标续读）。 */
@@ -467,6 +549,10 @@ export const api = {
   chatHistorySince: (chatId: string, after: number) =>
     invoke<ChatHistoryDelta>("chat_history_since", { chatId, after }),
 
+  /** 工具调用行的展开详情（完整入参 + 结果正文 + 写入前快照）：按落库行 id 懒加载。 */
+  chatToolDetail: (chatId: string, msgId: number) =>
+    invoke<ToolChainDetail>("chat_tool_detail", { chatId, msgId }),
+
   /** 从任意消息锚点分叉出新会话：复制可见历史 + 自动回滚锚点之后的文件改动（原会话不动）。 */
   chatFork: (chatId: string, anchorMessageId: number) =>
     invoke<ChatForkResult>("chat_fork", { chatId, anchorMessageId }),
@@ -829,6 +915,10 @@ export const api = {
   onBus: (cb: (payload: BusPayload) => void): Promise<UnlistenFn> =>
     listen<BusPayload>("bus", (event) => cb(event.payload)),
 
+  /** 运行时工具调用直播事件（批次开始 / 结束；结束事件带落库行 id）。 */
+  onToolCalls: (cb: (payload: ToolCallsEvent) => void): Promise<UnlistenFn> =>
+    listen<ToolCallsEvent>("tool_calls", (event) => cb(event.payload)),
+
   onAgent: (cb: (payload: AgentEvent) => void): Promise<UnlistenFn> =>
     listen<AgentEvent>("agent", (event) => cb(event.payload)),
 
@@ -864,7 +954,7 @@ export interface ToolStatus {
 
 /** 解析 `正在调用工具(N):tool → detail` 进度行；非该格式返回 null。 */
 export function parseToolStatusLine(content: string): ToolStatus | null {
-  const m = /^正在调用工具\((\d+)\):(.*)$/.exec(content);
+  const m = content.match(/^正在调用工具\((\d+)\):(.*)$/);
   if (!m) return null;
   const rest = m[2];
   const sep = rest.indexOf(" → ");

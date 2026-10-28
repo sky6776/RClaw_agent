@@ -12,6 +12,7 @@ import {
   api,
   isStatusLine,
   isThinkingLine,
+  parseToolStatusLine,
   type AgentEvent,
   type AppVersions,
   type ChatHistoryDelta,
@@ -20,9 +21,20 @@ import {
   type PermissionRequest,
   type PlanStatus,
   type Status,
+  type ToolCallsEvent,
   type UpdateInfo,
   type UsageSnapshot,
 } from "./lib/api";
+import {
+  applyFinished,
+  isUnsettled,
+  mergeCommitted,
+  sameToolBatch,
+  settleInterrupted,
+  toolBatchLabel,
+  viewsFromBegun,
+  viewsFromSummary,
+} from "./lib/toolCalls";
 import Wizard from "./components/Wizard";
 import Chat, { type Entry, type QueueItem } from "./components/Chat";
 import AgentsPanel from "./components/AgentsPanel";
@@ -423,7 +435,10 @@ ${event.payload.command}
     setEntriesByChat((prev) => {
       const existing = prev[chatId] ?? [];
       const last = existing[existing.length - 1];
-      if (last?.role === "thinking") {
+      // 只并入未盖章的直播块：已盖上行 id 的思考块是库里的权威内容（恢复的历史、
+      // 已入账的上一块），新 turn 的分片不得写进去——运行时注入的轮（收件箱 /
+      // 通知）没有直播 user 条目隔开，末尾恰是上一块时就会撞上。
+      if (last?.role === "thinking" && last.msgId === undefined) {
         const next = existing.slice();
         next[next.length - 1] = {
           ...last,
@@ -465,13 +480,14 @@ ${event.payload.command}
   //    只在「owner user 到下一条 user」的窗口内找（纯文本轮的孤儿思考块永不落库，
   //    跨轮同文不能错盖）；匹配不上就追加，宁偶有重复不错盖。
   // 2) 没有直播孪生的条目按 (行 id, 同行角色序) 插入——乱序到达的中插行不会落到
-  //    最终回复之后，同行内保持 thinking → status → assistant。
+  //    最终回复之后，同行内保持 thinking → assistant → status。
   const applyCommitted = useCallback((chatId: string, items: HistoryMsg[]) => {
     if (items.length === 0) return;
-    // 条目在同行内的展示序：同一持久化行可产出 thinking/status/text 三种条目
-    // （共享行 id），插入定位时按此序排同行先后。
+    // 条目在同行内的展示序：同一持久化行可产出 thinking/text/status 三种条目
+    // （共享行 id），插入定位时按此序排同行先后——与直播顺序（思考 → 随附说明 →
+    // 工具行）及后端 `history_entries` 一致。
     const roleRank = (role: Entry["role"]) =>
-      role === "thinking" ? 0 : role === "status" ? 1 : role === "assistant" ? 2 : 0;
+      role === "thinking" ? 0 : role === "assistant" ? 1 : role === "status" ? 2 : 0;
     setEntriesByChat((prev) => {
       const existing = prev[chatId] ?? [];
       const next = existing.slice();
@@ -509,21 +525,57 @@ ${event.payload.command}
         }
         return { from: at + 1, to };
       };
-      // 阶段一：身份对位（盖章）。批内遇到 user 条目即以其为窗口锚（盖章→可用；
-      // 追加→直播条目整体缺席，本段无从盖章）；批内还没遇到 user 时按行 id 回溯
-      // 最近一条已盖章 user（思考行必然晚于其 user 行落库）。
-      let ownerAnchorId: number | null = null;
-      let anchorFromBatch = false;
-      let anchorUsable = false;
+      // 没有直播孪生的 user 行（运行时注入的收件箱 / 通知行：用户并未亲手输入，直播
+      // 侧只有它引出的思考 / 工具 / 回复）：窗口从它将落位之处——最后一条行 id 更小
+      // 的已盖章条目之后——开到下一条 user 之前。该轮的直播条目全在这段里；思考块
+      // 盖上章后，阶段二才会把这条 user 行插到它们前面（否则每轮都重复一份思考）。
+      const windowAfterRow = (rowId: number) => {
+        let from = 0;
+        for (let i = next.length - 1; i >= 0; i--) {
+          const id = next[i].msgId;
+          if (id !== undefined && id < rowId) {
+            from = i + 1;
+            break;
+          }
+        }
+        let to = next.length;
+        for (let i = from; i < next.length; i++) {
+          if (next[i].role === "user") {
+            to = i;
+            break;
+          }
+        }
+        return { from, to };
+      };
+      // 阶段一：身份对位（盖章）。批内遇到 user 条目即以其为窗口锚（盖章→其后到
+      // 下一条 user；无孪生→落位处到下一条 user）；批内还没遇到 user 时按行 id 回溯
+      // 最近一条已盖章 user（思考行必然晚于其 user 行落库），回溯不到则不盖章。
+      let anchorWindow: { from: number; to: number } | null = null;
+      const windowOfOwner = (rowId: number) => {
+        const anchor = ownerUserOf(rowId);
+        return anchor === null ? { from: 0, to: 0 } : windowFor(anchor);
+      };
       const unmatched: Array<{ m: HistoryMsg; rank: number }> = [];
       for (const m of items) {
         const key = `${m.id}:${m.role}`;
-        if (have.has(key)) continue;
+        if (have.has(key)) {
+          // 结束事件已当场盖章的工具行：库里的侧表事实（成败 / 耗时 / skill）仍并入，
+          // 错过结束事件时「仍在运行」的调用由此收口。
+          if (m.role === "status" && m.tool_calls) {
+            const at = next.findIndex((e) => e.msgId === m.id && e.role === "status");
+            if (at >= 0 && next[at].tools) {
+              next[at] = {
+                ...next[at],
+                tools: mergeCommitted(next[at].tools, viewsFromSummary(m.tool_calls)),
+              };
+            }
+          }
+          continue;
+        }
         let idx = -1;
+        const committedTools = m.role === "status" && m.tool_calls ? viewsFromSummary(m.tool_calls) : null;
         if (m.role === "thinking") {
-          const anchor = anchorFromBatch ? ownerAnchorId : ownerUserOf(m.id);
-          const usable = anchorFromBatch ? anchorUsable : anchor !== null;
-          const { from, to } = usable ? windowFor(anchor) : { from: 0, to: 0 };
+          const { from, to } = anchorWindow ?? windowOfOwner(m.id);
           if (from < to) {
             idx = next.findIndex(
               (e, i) =>
@@ -536,6 +588,26 @@ ${event.payload.command}
                   normalizeThinkingText(m.content),
             );
           }
+        } else if (committedTools) {
+          // 工具行：与思考行同一窗口内找（调用 id 跨批复用，别的轮留下的孤儿行——
+          // 持久化失败 / cron 轮的批次永远盖不上章——同 id 序列不能错盖），且只认还没
+          // 定局的：收到带行 id 的结束事件的条目已盖章，定局却未盖章的批次没有落库
+          // 行。先按调用 id 序列对位（同名工具连续两批也不会错盖），再退回文案对位。
+          const { from, to } = anchorWindow ?? windowOfOwner(m.id);
+          const candidate = (e: Entry, i: number) =>
+            i >= from &&
+            i < to &&
+            e.msgId === undefined &&
+            e.role === "status" &&
+            !!e.tools?.some((t) => isUnsettled(t.status));
+          idx = next.findIndex(
+            (e, i) => candidate(e, i) && sameToolBatch(e.tools, committedTools),
+          );
+          if (idx < 0) {
+            idx = next.findIndex(
+              (e, i) => candidate(e, i) && e.content.trim() === m.content.trim(),
+            );
+          }
         } else {
           idx = next.findIndex(
             (e) =>
@@ -546,12 +618,12 @@ ${event.payload.command}
           );
         }
         if (idx >= 0) {
-          next[idx] = { ...next[idx], msgId: m.id };
+          next[idx] = committedTools
+            ? { ...next[idx], msgId: m.id, tools: mergeCommitted(next[idx].tools, committedTools) }
+            : { ...next[idx], msgId: m.id };
         }
         if (m.role === "user") {
-          anchorFromBatch = true;
-          anchorUsable = idx >= 0;
-          ownerAnchorId = idx >= 0 ? next[idx].id : null;
+          anchorWindow = idx >= 0 ? windowFor(next[idx].id) : windowAfterRow(m.id);
         }
         if (idx < 0) {
           unmatched.push({ m, rank: roleRank(m.role) });
@@ -559,7 +631,7 @@ ${event.payload.command}
         have.add(key);
       }
       // 阶段二：统一定位插入。按 (行 id, 同行角色序) 全序比较——乱序行落在第一个
-      // 更大行 id 之前，同行内保持 thinking → status → assistant。
+      // 更大行 id 之前，同行内保持 thinking → assistant → status。
       for (const { m, rank } of unmatched) {
         const pos = next.findIndex(
           (e) =>
@@ -572,10 +644,99 @@ ${event.payload.command}
           role: m.role,
           content: m.content,
           msgId: m.id,
+          ...(m.tool_calls ? { tools: viewsFromSummary(m.tool_calls) } : {}),
         };
         if (pos >= 0) next.splice(pos, 0, entry);
         else next.push(entry);
       }
+      return { ...prev, [chatId]: next };
+    });
+  }, []);
+
+  // turn 收口（最终回复 / 取消确认 / 发送失败）：该会话仍标「进行中」的工具调用改为
+  // 「已中断」——取消 / 持久化失败的批次没有结束事件，不能让齿轮一直转。
+  const settleRunningTools = useCallback((chatId: string) => {
+    setEntriesByChat((prev) => {
+      const existing = prev[chatId];
+      if (!existing?.some((e) => e.tools?.some((t) => t.status === "running"))) return prev;
+      return {
+        ...prev,
+        [chatId]: existing.map((e) =>
+          e.tools ? { ...e, tools: settleInterrupted(e.tools) } : e,
+        ),
+      };
+    });
+  }, []);
+
+  // 运行时工具调用直播：开始 → 追加一条带结构化调用列表的 status 条目（文案与库回放
+  // 逐字一致，增量批按它对位盖章）；结束 → 按迭代号 + 调用 id 序列找到该条目，写入
+  // 成败 / 预览 / 耗时，并用落库行 id 当场盖章（展开即可懒加载全文）。
+  const handleToolCalls = useCallback((event: ToolCallsEvent) => {
+    const chatId = event.chat_id;
+    // 形态兜底：事件只由桥按运行时结构发出，但这里的消费在 React 状态更新器里跑，
+    // 形态不对抛错会卸掉整棵树；不合形的事件直接忽略（事实源在库，增量拉取会补）。
+    if (typeof chatId !== "string" || typeof event.batch?.iter !== "number") return;
+    // 元素级形态：两个阶段都按 `.id` 配对，元素不是带字符串 id 的对象同样会抛。
+    const hasStringId = (x: unknown): boolean =>
+      !!x && typeof x === "object" && typeof (x as { id?: unknown }).id === "string";
+    if (event.phase === "begun") {
+      if (!Array.isArray(event.batch.calls) || !event.batch.calls.every(hasStringId)) return;
+      const views = viewsFromBegun(event.batch.calls);
+      if (views.length === 0) return;
+      setEntriesByChat((prev) => ({
+        ...prev,
+        [chatId]: [
+          ...(prev[chatId] ?? []),
+          {
+            id: next_entry_id++,
+            ts: Date.now(),
+            role: "status" as const,
+            content: toolBatchLabel(views.map((v) => v.name)),
+            tools: views,
+            toolIter: event.batch.iter,
+          },
+        ],
+      }));
+      return;
+    }
+    const { batch } = event;
+    if (
+      event.phase !== "finished" ||
+      !Array.isArray(batch.results) ||
+      !batch.results.every(hasStringId) ||
+      (batch.assistant_msg_id !== null && typeof batch.assistant_msg_id !== "number")
+    ) {
+      return;
+    }
+    setEntriesByChat((prev) => {
+      const existing = prev[chatId] ?? [];
+      // 从尾部找：同一迭代号在一个 turn 内唯一，跨 turn 复用时最近的那条才是本批。
+      // 条目可能已被窗口恢复可见触发的增量批抢先盖章（落库与结束事件之间）：行 id
+      // 相同的也算本批，结果预览照样并入。未盖章的只要还没定局就算——包括被收口
+      // 推断为「已中断」的（取消确认先于结束事件到达 / 同会话另一轮回复先到），结束
+      // 事件带来的是真实结果，不能因推断而被丢弃。
+      let at = -1;
+      for (let i = existing.length - 1; i >= 0; i--) {
+        const e = existing[i];
+        if (e.role !== "status" || !e.tools || e.toolIter !== batch.iter) continue;
+        const stampedAsThis = batch.assistant_msg_id !== null && e.msgId === batch.assistant_msg_id;
+        const unstampedUnsettled =
+          e.msgId === undefined && e.tools.some((t) => isUnsettled(t.status));
+        if (
+          (stampedAsThis || unstampedUnsettled) &&
+          batch.results.every((r) => e.tools!.some((t) => t.id === r.id))
+        ) {
+          at = i;
+          break;
+        }
+      }
+      if (at < 0) return prev;
+      const next = existing.slice();
+      next[at] = {
+        ...next[at],
+        tools: applyFinished(next[at].tools!, batch.results),
+        ...(batch.assistant_msg_id !== null ? { msgId: batch.assistant_msg_id } : {}),
+      };
       return { ...prev, [chatId]: next };
     });
   }, []);
@@ -653,9 +814,17 @@ ${event.payload.command}
       if (payload.content === "🟢 Agent工作中...") {
         return;
       }
-      const thinking = isThinkingLine(payload.content);
+      // 思考流（增量「💭\n…」/ 快照「💭 思考中...」）只由运行时以 intermediate 发出；
+      // 正式回复不是 intermediate——模型恰好以 💭 开头的最终回复不能被并进思考块，
+      // 否则这条回复既不显示为正文、也解除不了忙碌态。
+      const thinking = payload.intermediate && isThinkingLine(payload.content);
       if (thinking) {
         mergeThinking(payload.chat_id, payload.content);
+        return;
+      }
+      // 「正在调用工具(N):…」文本进度是外部通道口径；桌面 / APK 的工具调用由结构化
+      // tool_calls 事件渲染成可展开的调用行，这里不再重复落一条文本状态条。
+      if (parseToolStatusLine(payload.content) !== null) {
         return;
       }
       const statusEntry = isStatusLine(payload.content);
@@ -667,9 +836,12 @@ ${event.payload.command}
       ]);
       // 仅 turn 的最终回复 / 收尾确认（非 intermediate 的普通消息）解除忙碌态：
       // 工具轮之间的过程文本（intermediate）不再误判为收尾——修复「调用 skill
-      // 期间侧栏绿点、齿轮行消失」的问题。
+      // 期间侧栏绿点、齿轮行消失」的问题。/cancel 的确认（「已请求停止当前任务。」）
+      // 也走这里：被打断的批次先按「已中断」收口，取消清理补报的结束事件随后把
+      // 真实的 aborted 事实并进去（库里的「（已停止当前任务）」确认只落库不出站）。
       if (!statusEntry && !payload.intermediate) {
         setBusyByChat((prev) => ({ ...prev, [payload.chat_id]: false }));
+        settleRunningTools(payload.chat_id);
         // turn 收尾时会话记录已落库（先 append 后 outbound）：按游标增量拉一轮，
         // 给本轮直播条目回填持久化行 id（fork 锚点）；错过的事件也在此时自愈。
         void resyncChat(payload.chat_id);
@@ -677,11 +849,13 @@ ${event.payload.command}
         void refreshChats();
       }
     });
+    const unTools = api.onToolCalls(handleToolCalls);
     return () => {
       unAgent.then((fn) => fn());
       unBus.then((fn) => fn());
+      unTools.then((fn) => fn());
     };
-  }, [appendEntries, mergeThinking, refreshChats, applyStatus, resyncChat]);
+  }, [appendEntries, mergeThinking, refreshChats, applyStatus, resyncChat, handleToolCalls, settleRunningTools]);
 
   // 窗口重新可见（移动端切回 / 桌面最小化恢复）时给当前会话增量补一轮：隐藏期间
   // 收尾的 turn、后台会话的 outbound 事件可能被系统丢弃，按游标续读自愈。
@@ -737,6 +911,7 @@ ${event.payload.command}
             content: m.content,
             msgId: m.id,
             ts: historyEntryTs(m.ts),
+            ...(m.tool_calls ? { tools: viewsFromSummary(m.tool_calls) } : {}),
           }));
           // 事件可能先于快照返回：每条快照条目一对一消费一条同角色同文的直播孪生
           // （成员资格判断会误伤重复文本——快照之后新发的乐观「继续」、永远无法从
@@ -754,9 +929,20 @@ ${event.payload.command}
                 e.role === c.role &&
                 (c.role === "thinking"
                   ? normalizeThinkingText(e.content) === normalizeThinkingText(c.content)
-                  : e.content.trim() === c.content.trim()),
+                  : c.tools
+                    ? sameToolBatch(e.tools, c.tools) || e.content.trim() === c.content.trim()
+                    : e.content.trim() === c.content.trim()),
             );
             if (rel >= 0) {
+              // 快照条目顶替直播孪生时沿用其条目 id（孪生随即移除，id 不会重复）：
+              // 工具行的展开态按条目 id 记，用户展开着的行不因快照装配而收起。
+              c.id = live[rel].id;
+              // 工具行：直播侧已拿到的结果预览并入快照条目（库里只有成败 / 耗时）；
+              // 迭代号也带上，晚于快照到达的结束事件仍能按 (迭代号, 行 id) 配到它。
+              if (c.tools && live[rel].tools) {
+                c.tools = mergeCommitted(live[rel].tools, c.tools);
+                c.toolIter = live[rel].toolIter;
+              }
               live.splice(rel, 1);
               searchFrom = rel;
             }
@@ -838,10 +1024,11 @@ ${event.payload.command}
           ),
         }));
         setBusyByChat((prev) => ({ ...prev, [chatId]: false }));
+        settleRunningTools(chatId);
       });
       void refreshChats();
     },
-    [appendEntries, refreshChats],
+    [appendEntries, refreshChats, settleRunningTools],
   );
 
   const handleSend = useCallback(

@@ -560,6 +560,15 @@ impl AgentToolRuntime {
         media_publish_attempted: bool,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), RunTaskFailure> {
+        // 预算耗尽终态（与 run_task_inner 其余预算文案同口径：带 sub-agent 前缀与预算值）。
+        let budget_exhausted = || RunTaskFailure::Failed {
+            error: format!(
+                "sub-agent 模型调用重试总预算（{:?}）在错峰等待期间耗尽",
+                self.opts.llm_retry_budget
+            ),
+            completed_steps,
+            media_publish_attempted,
+        };
         // 在等待期间持有闸门，只串行化“请求放行”，不串行化模型调用本身。必须在实际
         // 放行后再安排下一时间点；若运行时一度繁忙，预定时刻同时过期也不会形成补偿性突发。
         let mut next = if let Some(control) = control {
@@ -573,11 +582,7 @@ impl AgentToolRuntime {
                     });
                 }
                 _ = optional_deadline_wait(deadline) => {
-                    return Err(RunTaskFailure::Failed {
-                        error: "模型调用重试总预算在错峰等待期间耗尽".to_string(),
-                        completed_steps,
-                        media_publish_attempted,
-                    });
+                    return Err(budget_exhausted());
                 }
                 next = self.next_inference_start.lock() => next,
             }
@@ -586,11 +591,7 @@ impl AgentToolRuntime {
             tokio::select! {
                 biased;
                 _ = optional_deadline_wait(deadline) => {
-                    return Err(RunTaskFailure::Failed {
-                        error: "模型调用重试总预算在错峰等待期间耗尽".to_string(),
-                        completed_steps,
-                        media_publish_attempted,
-                    });
+                    return Err(budget_exhausted());
                 }
                 lock = self.next_inference_start.lock() => lock,
             }
@@ -609,11 +610,7 @@ impl AgentToolRuntime {
                         });
                     }
                     _ = optional_deadline_wait(deadline) => {
-                        return Err(RunTaskFailure::Failed {
-                            error: "模型调用重试总预算在错峰等待期间耗尽".to_string(),
-                            completed_steps,
-                            media_publish_attempted,
-                        });
+                        return Err(budget_exhausted());
                     }
                     _ = tokio::time::sleep_until(start_at) => {}
                 }
@@ -621,11 +618,7 @@ impl AgentToolRuntime {
                 tokio::select! {
                     biased;
                     _ = optional_deadline_wait(deadline) => {
-                        return Err(RunTaskFailure::Failed {
-                            error: "模型调用重试总预算在错峰等待期间耗尽".to_string(),
-                            completed_steps,
-                            media_publish_attempted,
-                        });
+                        return Err(budget_exhausted());
                     }
                     _ = tokio::time::sleep_until(start_at) => {}
                 }
@@ -1703,8 +1696,9 @@ impl AgentToolRuntime {
                             &control.agent_id,
                             ExecutionState::Waiting,
                             iter,
+                            // 「准备」而非「正在进行」：之后还要过错峰闸门才真正发出请求。
                             format!(
-                                "等待第 {} 次模型推理（正在进行第 {} 次调用尝试，累计 {} 秒）",
+                                "等待第 {} 次模型推理（准备第 {} 次调用尝试，累计 {} 秒）",
                                 iter + 1,
                                 attempt + 1,
                                 retry_started.elapsed().as_secs()
@@ -1808,14 +1802,15 @@ impl AgentToolRuntime {
                                     .saturating_mul(1u32.checked_shl(attempt).unwrap_or(u32::MAX)),
                                 self.opts.llm_retry_max_delay,
                             );
-                            tracing::warn!(
-                                agent = %spec.name,
-                                attempt = attempt + 1,
-                                total_attempts = max_retries + 1,
-                                "sub-agent LLM 调用失败: {error}；{backoff:?} 后重试"
-                            );
                             // 退避会跨过截止时间就不睡了：直接按预算耗尽失败（含最后错误）。
+                            // 先判预算再记「稍后重试」日志，否则日志承诺重试却紧接着失败。
                             if tokio::time::Instant::now() + backoff >= retry_deadline {
+                                tracing::warn!(
+                                    agent = %spec.name,
+                                    attempt = attempt + 1,
+                                    budget = ?self.opts.llm_retry_budget,
+                                    "sub-agent LLM 调用失败: {error}；重试总预算耗尽，不再重试"
+                                );
                                 return Err(RunTaskFailure::Failed {
                                     error: format!(
                                         "sub-agent 模型调用重试总预算（{:?}）耗尽：已尝试 {} 次（最后错误: {error}），不再重试",
@@ -1826,6 +1821,12 @@ impl AgentToolRuntime {
                                     media_publish_attempted: state.media_publish_attempted,
                                 });
                             }
+                            tracing::warn!(
+                                agent = %spec.name,
+                                attempt = attempt + 1,
+                                total_attempts = max_retries + 1,
+                                "sub-agent LLM 调用失败: {error}；{backoff:?} 后重试"
+                            );
                             if let Some(control) = control {
                                 // 状态更新（内部有异步锁等待）与退避 sleep 都受硬截止约束：
                                 // 否则预判与实际 sleep 之间的 await 仍能把序列拖过预算。
@@ -1981,10 +1982,16 @@ impl AgentToolRuntime {
                     // 子 Agent 的文本只是 handoff；已验证 marker 作为运行时状态单独向父
                     // Agent 传递，不能再次依赖模型手抄。这里也清除任何模型手写控制行
                     // （对交付文本再剥一次是幂等的）；披露已由渲染层经独立状态附加，
-                    // 从正文剥掉同文块避免前台 full output 与渲染段重复。
-                    let body = deliver_text
-                        .strip_suffix(&unresolved_disclosure)
-                        .unwrap_or(&deliver_text);
+                    // 从正文剥掉同文块避免前台 full output 与渲染段重复（连同闸门拼接
+                    // 时留下的 `\n\n` 分隔符一起去掉，不留尾部空行；无披露时正文原样）。
+                    let body = if unresolved_disclosure.is_empty() {
+                        deliver_text.as_str()
+                    } else {
+                        deliver_text
+                            .strip_suffix(&unresolved_disclosure)
+                            .map(str::trim_end)
+                            .unwrap_or(&deliver_text)
+                    };
                     let mut final_text = finalize_media_reply(body, &[]);
                     // 交叉验证（可选，只读）：candidate_patch 编码任务的结构化交接由一个
                     // 受限只读 mini 循环核实（引用文件是否存在、diff 是否与真实代码对得上、

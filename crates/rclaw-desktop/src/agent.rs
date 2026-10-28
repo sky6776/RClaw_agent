@@ -186,6 +186,9 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     let opts_for_state = core.opts.clone();
     let channels_for_state = channel_info.clone();
     let web_search_for_state = core.web_search_control.clone();
+    // 工具调用事件与运行时的过程消息走同一条 outbound 队列（顺序保证），观察者拿一份
+    // 发送端。
+    let outbound_for_tool_events = outbound_tx.clone();
     let agent = AgentLoop::new(
         core.provider.clone(),
         core.review_provider.clone(),
@@ -205,6 +208,13 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     let session_lifecycle = agent.session_lifecycle();
     // 统一分叉入口句柄：同样必须在 agent 被 move 进任务前取走。
     let fork_handle = agent.fork_handle();
+    // 会话面板「工具 / Skill 调用可展开观察」的直播通道：运行时在工具批次开始 /
+    // 结束的权威点回调，这里编成控制消息入 outbound 队列、由下方的桥转成 `tool_calls`
+    // Webview 事件（历史由库回放）。
+    crate::tool_events::attach_app();
+    agent.set_turn_observer(Arc::new(crate::tool_events::ToolEventObserver::new(
+        outbound_for_tool_events,
+    )));
     tauri::async_runtime::spawn(agent.run());
 
     // cron + heartbeat 后台服务（与 CLI 相同语义）。
@@ -258,7 +268,9 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     Ok(())
 }
 
-/// outbound 总线消费端：把每条回复 / 状态消息推给 Webview。
+/// outbound 总线消费端：把每条回复 / 状态消息推给 Webview。工具调用事件的控制消息
+/// 也从这里出（`tool_calls` 事件）：与过程文本同队列、同出口，前端收到的顺序就是
+/// 运行时产生的顺序。
 async fn outbound_bridge(app: tauri::AppHandle, mut rx: mpsc::Receiver<BusMessage>) {
     while let Some(msg) = rx.recv().await {
         if msg.channel != CHANNEL_DESKTOP {
@@ -266,6 +278,10 @@ async fn outbound_bridge(app: tauri::AppHandle, mut rx: mpsc::Receiver<BusMessag
         }
         // Bot Mode：群成员会话（grp-…）是编排内部会话，不推给前端。
         if msg.chat_id.starts_with("grp-") {
+            continue;
+        }
+        if let Some(json) = crate::tool_events::control_payload(&msg) {
+            crate::tool_events::emit_control(&app, &msg.chat_id, json);
             continue;
         }
         let payload = BusPayload {
@@ -757,10 +773,12 @@ async fn start_agent_inner(app: &tauri::AppHandle, _home: PathBuf) -> Result<(),
         }
     };
     let runtime = slot.as_ref().expect("槽内运行时已就绪");
-    // 无头期装配的运行时：GUI 现在接管 desktop 通道 outbound。
+    // 无头期装配的运行时：GUI 现在接管 desktop 通道 outbound 与工具调用事件出口
+    // （attach 幂等：GUI 在场装配的路径已在 assemble_apk_agent 里接上）。
     if let Some(rx) = pending_outbound {
         tauri::async_runtime::spawn(outbound_bridge(app.clone(), rx));
     }
+    crate::tool_events::attach_app();
     *app.state::<AppState>()
         .agent
         .write()
@@ -897,8 +915,11 @@ pub(crate) async fn assemble_apk_agent(
     let dispatcher_tx = outbound_tx.clone();
     tokio::spawn(async move {
         while let Some(msg) = status_rx.recv().await {
-            // grp- 内部编排会话不参与状态机（与 outbound_bridge 同过滤）。
-            if !msg.chat_id.starts_with("grp-") {
+            // grp- 内部编排会话不参与状态机（与 outbound_bridge 同过滤）；工具调用事件
+            // 的控制消息不是过程文案，只透传给桥。
+            if !msg.chat_id.starts_with("grp-")
+                && crate::tool_events::control_payload(&msg).is_none()
+            {
                 crate::android_status::on_outbound(
                     &msg.chat_id,
                     &msg.content,
@@ -952,6 +973,8 @@ pub(crate) async fn assemble_apk_agent(
     let opts_for_state = core.opts.clone();
     let channels_for_state = channel_info.clone();
     let web_search_for_state = core.web_search_control.clone();
+    // 工具调用事件走运行时同一条出站队列（状态抽头 → dispatcher → 桥），顺序保证。
+    let outbound_for_tool_events = status_tx.clone();
     let agent = AgentLoop::new(
         core.provider.clone(),
         core.review_provider.clone(),
@@ -974,7 +997,18 @@ pub(crate) async fn assemble_apk_agent(
     // 依赖 GUI send 预置忙碌、cron 投递钩子或 outbound 文本分类。完成提醒对全部通道
     // （desktop/微信/QQ）一视同仁：无头服务模式下手机是 bot 宿主，宿主要知道后台替人
     // 回了消息（过滤规则见 android_status::notifiable）。
-    agent.set_turn_observer(Arc::new(crate::android_status::TurnStatusObserver));
+    // 复合观察者再挂工具调用事件桥：GUI 在场装配时出口立即就绪；无头期装配的出口
+    // 在 GUI 采用共享运行时时再标就绪（start_agent_inner），期间事件不入队、历史由
+    // 库回放。
+    if app.is_some() {
+        crate::tool_events::attach_app();
+    }
+    agent.set_turn_observer(Arc::new(crate::tool_events::CompositeObserver(vec![
+        Arc::new(crate::android_status::TurnStatusObserver),
+        Arc::new(crate::tool_events::ToolEventObserver::new(
+            outbound_for_tool_events,
+        )),
+    ])));
     let agent_task = tokio::spawn(agent.run());
     tokio::spawn(
         CronService::new(

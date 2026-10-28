@@ -37,8 +37,9 @@ pub struct AgentOptions {
     /// 覆盖每次请求、退避与错峰等待：预算耗尽后不再发起新请求，在途请求被截断并按
     /// 失败收尾（子代理 → `RunTaskFailure::Failed`；主 turn → 沿 `llm_error` 路径失败），
     /// 不再出现「端点挂起 × 300s 超时 × 11 次尝试 ≈ 58 分钟无出口」的僵局。用户取消
-    /// 仍优先于预算（终态是 Cancelled 而非 Failed）。应大于 provider 的
-    /// `request_timeout_secs`（默认 300s），否则会截断单次合法长调用。
+    /// 仍优先于预算（终态是 Cancelled 而非 Failed）。必须大于 provider 的
+    /// `request_timeout_secs`，否则会截断单次合法长调用——接线方按
+    /// [`derive_llm_retry_budget`] 从实际超时派生，不要直接写死。
     pub llm_retry_budget: Duration,
     /// 相邻子 agent 模型请求的最小起始间隔。只错峰模型请求，不串行化工具执行。
     pub subagent_request_stagger: Duration,
@@ -210,7 +211,7 @@ impl Default for AgentOptions {
             llm_max_retries: 10,
             llm_retry_base_delay: Duration::from_secs(1),
             llm_retry_max_delay: Duration::from_secs(30),
-            llm_retry_budget: Duration::from_secs(600),
+            llm_retry_budget: LLM_RETRY_BUDGET_FLOOR,
             subagent_request_stagger: Duration::from_secs(2),
             subagent_auto_background: Duration::from_secs(600),
             plan_escalation_wait_secs: 0,
@@ -257,6 +258,25 @@ impl Default for AgentOptions {
             verify_candidate_patches: false,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// LLM 重试总预算派生
+// ---------------------------------------------------------------------------
+
+/// [`AgentOptions::llm_retry_budget`] 的地板（默认 provider 超时 300s 的两倍）。
+pub const LLM_RETRY_BUDGET_FLOOR: Duration = Duration::from_secs(600);
+
+/// 按 provider 单次请求超时派生 [`AgentOptions::llm_retry_budget`]：
+/// `max(LLM_RETRY_BUDGET_FLOOR, 2 × request_timeout)`。
+///
+/// 预算必须容得下至少一次满长的合法请求再加一次重试——否则用户把
+/// `[llm] request_timeout_secs` 调高（本地模型 / 长推理模型，示例配置也建议深度投研
+/// 调大）后，每次长调用都会在写死的 600s 处被预算截断：本来 12 分钟能成功的调用变成
+/// 「重试总预算耗尽」。两倍超时仍是硬上界（最坏 ≈ 两次满长请求 + 退避），不回到
+/// 「11 次 × 超时」的无出口。
+pub fn derive_llm_retry_budget(request_timeout: Duration) -> Duration {
+    LLM_RETRY_BUDGET_FLOOR.max(request_timeout.saturating_mul(2))
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +369,24 @@ mod budget_tests {
             AgentOptions::default().subagent_request_stagger,
             Duration::from_secs(2)
         );
+    }
+
+    #[test]
+    fn retry_budget_tracks_request_timeout_above_floor() {
+        // 默认超时 300s：预算维持地板 600s。
+        assert_eq!(
+            derive_llm_retry_budget(Duration::from_secs(300)),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            AgentOptions::default().llm_retry_budget,
+            LLM_RETRY_BUDGET_FLOOR
+        );
+        // 用户调高超时（900s 长推理模型）：预算随之放大，单次合法长调用不被截断。
+        let timeout = Duration::from_secs(900);
+        let budget = derive_llm_retry_budget(timeout);
+        assert_eq!(budget, Duration::from_secs(1800));
+        assert!(budget > timeout);
     }
 
     #[test]

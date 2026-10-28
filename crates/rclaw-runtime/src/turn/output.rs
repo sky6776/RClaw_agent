@@ -88,6 +88,10 @@ pub(crate) struct ToolExecutionMessages {
     /// 粘性状态（skill_manage 成功、发布尝试、scope 标志）直接写在 TurnState 上，
     /// 不再经由出参往返。
     pub(crate) validated_media_markers: Vec<String>,
+    /// 每条 tool_use 的执行期事实（skill 归属 / 起止 / 成败），与 `tool_result` 的块
+    /// 同序；前台路径随工具链同事务写入 `tool_call_meta` 侧表并进面板直播载荷，
+    /// 子代理路径忽略。
+    pub(crate) call_metas: Vec<rclaw_store::ToolCallMetaRecord>,
 }
 
 pub(super) fn multimodal_unsupported_message() -> Message {

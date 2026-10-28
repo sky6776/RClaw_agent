@@ -56,6 +56,18 @@ fn sanitize_disclosure_tool_name(tool: &str) -> String {
         .collect()
 }
 
+/// 披露条目里的回执号形态：去掉 `r` 前缀（`r0-1-027e4bd5` → `0-1-027e4bd5`）。
+///
+/// 披露块会随交付正文进入父代理的工具结果与下一 turn 的会话历史，而
+/// [`super::external_action::cited_receipt_ids`] 按 `r<迭代>-<序>-<8 位指纹>` 扫描整段
+/// 回复：原样渲染时，模型复述它（「memory 保存被拦截（回执 r0-1-…）」）会被当成
+/// 「回执引用」，把完成门的回执匹配收窄到一个永远对不上的外部 / 过期回执号，误拒
+/// 本 turn 真实完成的动作。失败回执不为任何声明背书，去前缀不损失可追溯性（指纹
+/// 段仍可在日志中检索）。
+fn disclosure_receipt_label(id: &str) -> &str {
+    id.strip_prefix('r').unwrap_or(id)
+}
+
 #[derive(Debug, Clone)]
 struct StatusError {
     category: &'static str,
@@ -582,7 +594,7 @@ impl AgentStatus {
                 format!(
                     "- {}（回执 {}，类别 {}）",
                     sanitize_disclosure_tool_name(&receipt.tool),
-                    receipt.id,
+                    disclosure_receipt_label(&receipt.id),
                     receipt.error_category.unwrap_or("tool_execution")
                 )
             })
@@ -894,6 +906,11 @@ impl<A: RunAdapter> Run<A> {
                 ),
             );
         }
+        // 运行时块是唯一事实源：模型照抄上一轮披露块（回执号指向别的轮、条目可能早已
+        // 解决）一律先从交付正文剥掉——账本非空时否则用户看到两份互相矛盾的「请勿视为已
+        // 完成」，账本已清空时照抄块更是运行时并不主张的过时警告。第 4 / 5 步两条交付
+        // 路径同一处理（第 4 步的候选在预算耗尽时同样会投递）。
+        let body = super::artifact::strip_runtime_disclosure_blocks(&finalized_reply);
         // 4) 声称交付数 > 已验证数，且媒体参与可判定（通道支持 / 本 turn 发起过发布 /
         //    文本含媒体控制行）→ 拒绝：不得夸大发送数量。预算耗尽时该候选会随警告
         //    交付（turn.rs 方案 B），未解决错误披露必须随行——媒体失败不得掩盖过程
@@ -906,11 +923,7 @@ impl<A: RunAdapter> Run<A> {
                 || text.lines().any(is_media_control_line));
         if unverified_media_claim {
             let disclosure = self.status.render_unresolved_error_disclosure();
-            let deliver_text = if disclosure.is_empty() {
-                finalized_reply
-            } else {
-                format!("{finalized_reply}\n\n{disclosure}")
-            };
+            let deliver_text = compose_delivery_text(finalized_reply, body, disclosure);
             return (
                 deliver_text,
                 self.status.reject_completion(format!(
@@ -932,22 +945,33 @@ impl<A: RunAdapter> Run<A> {
         let disclosure = self.status.render_unresolved_error_disclosure();
         let auto_disclosed = !disclosure.is_empty();
         let gate = match reasoning {
-            Some(reasoning) if !reasoning.trim().is_empty() => self.status.evaluate_completion_impl(
-                &model_body,
-                Some(reasoning),
-                auto_disclosed,
-                false,
-            ),
+            Some(reasoning) if !reasoning.trim().is_empty() => self
+                .status
+                .evaluate_completion_impl(&model_body, Some(reasoning), auto_disclosed, false),
             _ => self
                 .status
                 .evaluate_completion_impl(&model_body, None, auto_disclosed, false),
         };
-        let deliver_text = if auto_disclosed {
-            format!("{finalized_reply}\n\n{disclosure}")
-        } else {
-            finalized_reply
-        };
+        let deliver_text = compose_delivery_text(finalized_reply, body, disclosure);
         (deliver_text, gate)
+    }
+}
+
+/// 交付文本组装：`body` 是剥掉照抄披露块后的交付正文，`disclosure` 是运行时自动披露
+/// （可为空）。有披露时附在正文之后，正文剥空则只交付披露；无披露而正文剥空（整段只有
+/// 照抄块）时原样交付 `finalized_reply`——胜过空回复。
+fn compose_delivery_text(finalized_reply: String, body: String, disclosure: String) -> String {
+    let body_empty = body.trim().is_empty();
+    if disclosure.is_empty() {
+        if body_empty {
+            finalized_reply
+        } else {
+            body
+        }
+    } else if body_empty {
+        disclosure
+    } else {
+        format!("{body}\n\n{disclosure}")
     }
 }
 

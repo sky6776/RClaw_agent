@@ -276,8 +276,14 @@ pub async fn assemble_core_with(
     // 在 run_task_inner 里跑）与工具结果落盘阈值（子代理工具循环同样走 spill）；不随
     // 配置传入就永远停在默认值。子代理专属选项（唤醒 / 自动转后台 / 升级等待等）
     // 当前无配置项，取默认值。
+    // LLM 重试总预算按 provider 单次超时派生（两边同一个值）：预算写死 600s 时，用户把
+    // `[llm] request_timeout_secs` 调到 600s 以上，每次合法长调用都会被预算截断。
+    let llm_retry_budget = rclaw_runtime::options::derive_llm_retry_budget(
+        std::time::Duration::from_secs(cfg.llm.request_timeout_secs),
+    );
     let runtime_opts = AgentOptions {
         stream_enabled: cfg.llm.stream,
+        llm_retry_budget,
         daemon,
         verify_candidate_patches: cfg.agent.verify_candidate_patches,
         tool_result_artifact_enabled: cfg.agent.tool_result_artifact_enabled,
@@ -448,6 +454,7 @@ pub async fn assemble_core_with(
     );
     let opts = AgentOptions {
         stream_enabled: cfg.llm.stream,
+        llm_retry_budget,
         max_concurrent_turns: cfg.agent.max_concurrent_turns,
         context_length: cfg.selected_context_length(),
         session_compression_enabled: cfg.agent.session_compression,

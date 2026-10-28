@@ -129,7 +129,9 @@ fn disclosure_survives_content_truncation_in_both_renderers() {
         1
     );
     assert_eq!(
-        render_foreground_result(&result).matches(&disclosure).count(),
+        render_foreground_result(&result)
+            .matches(&disclosure)
+            .count(),
         1
     );
 }

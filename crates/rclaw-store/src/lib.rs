@@ -46,7 +46,8 @@ pub use redact::{redact_sensitive_shell_command, redact_sensitive_text};
 pub use session::{
     append_message, append_tool_chain, clear_session, load_history, repair_tool_chains,
     synthesize_aborted_tool_results, tool_use_counts, FileCheckpointRecord, SearchRow,
-    SessionStats, SessionStore, SessionSummary, UsageAnchorRecord, ABORTED_TOOL_RESULT_PLACEHOLDER,
+    SessionStats, SessionStore, SessionSummary, ToolCallMetaRecord, ToolChainDetail,
+    ToolResultDetail, UsageAnchorRecord, ABORTED_TOOL_RESULT_PLACEHOLDER,
 };
 pub use skills::SkillSummary;
 pub use toml_file::{EditValue, RclawToml};

@@ -8,21 +8,15 @@ import React, {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, parseToolStatusLine, type PermissionMode, type PlanStatus } from "../lib/api";
+import { api, type PermissionMode, type PlanStatus } from "../lib/api";
+import type { ToolCallView } from "../lib/toolCalls";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { parseMediaItems } from "./MediaPreviews";
 import WorkflowCard from "./WorkflowCard";
 import MediaGallery, { type GalleryItem, type GallerySeed } from "./MediaGallery";
-import {
-  CheckIcon,
-  CopyIcon,
-  GearIcon,
-  PencilIcon,
-  SearchIcon,
-  ShieldIcon,
-  TerminalIcon,
-} from "./icons";
+import ToolBatchRows from "./ToolCallRow";
+import { CheckIcon, CopyIcon, GearIcon, PencilIcon, ShieldIcon } from "./icons";
 
 export type Role = "user" | "assistant" | "status" | "thinking";
 export interface Entry {
@@ -38,6 +32,11 @@ export interface Entry {
   /** 发送失败标记：这条消息没有落库（永远拿不到行 id），不得作为「分叉到新会话」
    *  的锚点。 */
   sendFailed?: boolean;
+  /** 工具调用轮（role=status）的结构化调用列表：有它时渲染为可展开的工具 / Skill
+   *  调用行（content 仍是「🔧 调用工具: …」文案，供对位盖章与导出）。 */
+  tools?: ToolCallView[];
+  /** 该批的 ReAct 迭代号（直播 begun / finished 事件配对用）。 */
+  toolIter?: number;
 }
 
 /** 待随消息发送的上传附件（已落入 agent 工作区 uploads/）。 */
@@ -91,26 +90,6 @@ export interface QueueItem {
   text: string;
 }
 
-/** 工具名 → 中文动作标签（未收录的工具显示原名）。 */
-const TOOL_LABELS: Record<string, string> = {
-  read: "读取",
-  write: "写入",
-  edit: "编辑",
-  delete: "删除",
-  grep: "搜索",
-  list: "列出",
-  shell: "命令",
-  web_search: "联网搜索",
-  browser_navigate: "打开网页",
-  browser_snapshot: "页面快照",
-  browser_click: "点击",
-  browser_type: "输入",
-  browser_scroll: "滑动",
-  browser_screenshot: "页面截图",
-  browser_close: "关闭页面",
-  memory: "记忆",
-};
-
 /** 消息选择模式操作按钮样式。 */
 const ACTION_BTN =
   "rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-[11px] text-gray-300 transition hover:text-gray-100 disabled:opacity-40";
@@ -124,88 +103,6 @@ interface MenuMedia {
   path: string;
   display: string;
   kind: "image" | "open";
-}
-
-function toolIcon(tool: string) {
-  if (tool === "shell") return <TerminalIcon />;
-  if (tool === "edit" || tool === "write" || tool === "delete")
-    return <PencilIcon />;
-  if (tool === "read" || tool === "grep" || tool === "list" || tool === "web_search" || tool === "browser_navigate")
-    return <SearchIcon />;
-  return <GearIcon />;
-}
-
-/** 路径类摘要工具：尾部 +N/-N 计为行数增减，其余部分按路径拆文件名与目录。 */
-const PATH_TOOLS = ["read", "write", "edit", "delete", "grep", "list"];
-
-/** 拆分工具摘要：尾部连续的 +/- 行数计入增减，其余部分按路径拆文件名与目录。 */
-function splitToolDetail(
-  tool: string,
-  detail: string,
-): { main: string; dir: string | null; added: number | null; removed: number | null } {
-  let rest = detail;
-  const counts: number[] = [];
-  let m: RegExpExecArray | null;
-  // 仅路径类摘要做尾部 +/- 剥离；命令预览 / 检索词整段展示（文本可能以数字结尾）。
-  const isPath = PATH_TOOLS.includes(tool);
-  if (isPath) {
-    while ((m = /\s+([+-]\d+)\s*$/.exec(rest)) !== null) {
-      counts.unshift(Number(m[1]));
-      rest = rest.slice(0, m.index);
-    }
-  }
-  if (isPath) {
-    const slash = rest.lastIndexOf("/");
-    if (slash !== -1) {
-      return {
-        main: rest.slice(slash + 1),
-        dir: rest.slice(0, slash + 1),
-        added: counts[0] ?? null,
-        removed: counts[1] ?? null,
-      };
-    }
-  }
-  return {
-    main: rest,
-    dir: null,
-    added: counts[0] ?? null,
-    removed: counts[1] ?? null,
-  };
-}
-
-/** 工具动作流水行：图标 + 中文标签 + 文件路径（目录弱化）+ 行数增减。 */
-function ToolStatusRow({
-  tool,
-  detail,
-}: {
-  tool: string;
-  detail: string | null;
-}) {
-  const label = TOOL_LABELS[tool] ?? tool;
-  const parts = detail ? splitToolDetail(tool, detail) : null;
-  return (
-    <div className="flex justify-start">
-      <div
-        className="flex max-w-[85%] items-center gap-2 rounded-xl bg-[#161a22] px-3 py-1.5 text-xs text-gray-400"
-        title={detail ? `${tool} ${detail}` : tool}
-      >
-        <span className="shrink-0 text-gray-500">{toolIcon(tool)}</span>
-        <span className="shrink-0 text-gray-300">{label}</span>
-        {parts && (
-          <>
-            <span className="font-medium text-gray-200">{parts.main}</span>
-            {parts.dir && <span className="min-w-0 truncate text-gray-500">{parts.dir}</span>}
-            {parts.added !== null && (
-              <span className="shrink-0 text-emerald-400">+{parts.added}</span>
-            )}
-            {parts.removed !== null && (
-              <span className="shrink-0 text-red-400">-{parts.removed}</span>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
 }
 
 /** 把秒数格式化为「N 秒 / M 分 S 秒」。 */
@@ -1215,7 +1112,8 @@ export default function Chat({
   // 中的会话」时维护 effect 写入的集合会被这里清掉，且 listBlocks 未变时维护
   // effect 不再重跑，完成渲染会读到空集而折叠。
   useLayoutEffect(() => {
-    setOpenSegs({});
+    // 本就为空时复用原对象：首帧 / 从未展开过的会话切换不多触发一次提交渲染。
+    setOpenSegs((prev) => (Object.keys(prev).length > 0 ? {} : prev));
     runningKeysRef.current = new Set();
     prevRunningSegKeysRef.current = new Set();
   }, [sessionKey]);
@@ -1285,6 +1183,16 @@ export default function Chat({
     if (!el) return;
     if (settle && !settle.wasFollowing) {
       const maxTop = el.scrollHeight - el.clientHeight;
+      if (maxTop <= 0) {
+        // 折叠后内容全部可见（无溢出）：与 handleListScroll / onResize 的无溢出分支
+        // 同口径，等价于停在底部——恢复跟随、不开抑制窗。否则这里置脱离 + 抑制窗会
+        // 吞掉钳位滚动事件，此后无溢出再无滚动事件、滚轮也提前返回，脱离态卡死：
+        // 下一次流式输出在视口下方增长却不跟随（悬浮钮挂在没有滚动条的列表上）。
+        stickToBottomRef.current = true;
+        lastScrollTopRef.current = el.scrollTop;
+        setShowJumpDown(false);
+        return;
+      }
       el.scrollTop = Math.min(settle.scrollTop, maxTop);
       stickToBottomRef.current = false;
       lastScrollTopRef.current = el.scrollTop;
@@ -1649,13 +1557,14 @@ export default function Chat({
     () => {
       const renderEntry = (e: Entry) => {
         if (e.role === "status") {
-          const toolStatus = parseToolStatusLine(e.content);
           const selected = selectIds?.has(e.id) ?? false;
-          if (toolStatus) {
+          if (e.tools && e.tools.length > 0) {
+            // 工具 / Skill 调用批次：逐调用一行，默认折叠、点箭头展开详情（直播与
+            // 库回放同一组件；条目有行 id 时展开按行 id 懒加载全文）。
             return (
               <div
                 key={e.id}
-                className={selectIds ? "flex items-start" : undefined}
+                className={selectIds ? "flex items-start" : "flex justify-start"}
                 {...(selectIds
                   ? { onClick: () => toggleSelected(e.id) }
                   : bubblePressHandlers(e))}
@@ -1676,8 +1585,13 @@ export default function Chat({
                     ✓
                   </button>
                 )}
-                <div className={selectIds ? "min-w-0 flex-1" : undefined}>
-                  <ToolStatusRow tool={toolStatus.tool} detail={toolStatus.detail} />
+                <div className={selectIds ? "min-w-0 flex-1" : "min-w-0 w-full max-w-[92%]"}>
+                  <ToolBatchRows
+                    chatId={sessionKey}
+                    entryId={e.id}
+                    msgId={e.msgId}
+                    calls={e.tools}
+                  />
                 </div>
               </div>
             );
@@ -1918,8 +1832,6 @@ export default function Chat({
         const hasProcess = seg.rows.some(
           (r) => r.role === "status" || r.role === "thinking",
         );
-        const flat =
-          seg.user === null || !!seg.user?.sendFailed || !hasProcess;
         // 最终回复 = 完成段里最后一个 assistant 条目（启发式：Entry 不携带
         // intermediate 标记）。运行段不分离最终正文——运行中的最后 assistant
         // 仍可能是中间说明；无 assistant 的段（被取消/中断的轮）整体留在过程
@@ -1936,6 +1848,13 @@ export default function Chat({
         const processRows = finalIdx >= 0 ? seg.rows.slice(0, finalIdx) : seg.rows;
         const finalRow = finalIdx >= 0 ? seg.rows[finalIdx] : null;
         const followingRows = finalIdx >= 0 ? seg.rows.slice(finalIdx + 1) : [];
+        // 过程行全在最终回复之后（中间说明先到、随后工具调用被取消）的段没有可折叠
+        // 的「工作过程」——平铺，不渲染空的过程容器。
+        const flat =
+          seg.user === null ||
+          !!seg.user?.sendFailed ||
+          !hasProcess ||
+          processRows.length === 0;
         return {
           key: seg.key,
           userEl: seg.user ? renderEntry(seg.user) : null,
@@ -1958,9 +1877,9 @@ export default function Chat({
     // 变化（依赖 activeId），必须列入——否则分叉闭包捕获旧会话 id，切会话后
     // 点「分叉」会 fork 到上一个会话。thinkingGen 参与 ThinkingBlock 的 key，
     // 变化时必须重算否则一键开合不会重挂载。busy 参与运行段判定（最终回复
-    // 是否分离）。
+    // 是否分离）。sessionKey 是工具行懒加载详情的会话键。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId, thinkingGen, busy],
+    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId, thinkingGen, busy, sessionKey],
   );
 
   // 运行段集合仅在提交阶段（useLayoutEffect）写入，渲染期只读上次提交的集合——
