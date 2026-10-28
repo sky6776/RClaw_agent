@@ -26,6 +26,22 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+/// `/workflow` 展开文必须自证命令来源：`workflow_activation = "command"` 的工具描述只认命令，
+/// 模型看不到 `/workflow` 原文，展开文不说明就会被当成普通对话点名。历史回放走同一函数。
+#[test]
+fn workflow_command_expansion_identifies_itself_as_the_command() {
+    let expanded = expand_persisted_workflow_message("/workflow 审计这些文件").expect("应展开");
+    assert!(expanded.starts_with(WORKFLOW_COMMAND_EXPANSION_LEAD));
+    assert!(expanded.contains("invoked the `/workflow` command"));
+    assert!(expanded.contains("\n\n审计这些文件\n\n"));
+    assert!(expanded.contains("`CreateWorkflow` tool"));
+    // 大小写不敏感；`/workflow-foo` 不是本命令；无参数（用法提示）不展开。
+    assert!(expand_persisted_workflow_message("/Workflow x").is_some());
+    assert!(expand_persisted_workflow_message("/workflow-foo x").is_none());
+    assert!(expand_persisted_workflow_message("/workflow").is_none());
+    assert!(expand_persisted_workflow_message("用工作流审计").is_none());
+}
+
 fn tool_outcome(name: &str, input: Value) -> ChatOutcome {
     ChatOutcome {
         text: String::new(),
@@ -2326,6 +2342,70 @@ async fn skill_invocation_is_deduped_and_pushed_to_external_channel() {
     assert!(
         outbound_rx.try_recv().is_err(),
         "同一 turn 重复读取同一 skill 不应再次推送"
+    );
+}
+
+/// 「不丢档」契约：观察者交回的控制消息与最终回复同档投递——队列满时等位而非丢弃，且排在
+/// 先入队的消息之后；ReAct 环内等位期间 turn 被取消则放弃该条；令牌已触发时仍尽力
+/// `try_send`（有空位即投，满载放弃，绝不等位）。
+#[tokio::test]
+async fn deliver_control_waits_for_queue_space_and_respects_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+    let mgr = TurnManager::new(
+        Arc::new(ScriptedProvider {
+            reply: "unused".into(),
+        }),
+        None,
+        SessionStore::new(layout.clone()),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions::default(),
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    );
+    let plain = |text: &str| BusMessage::new(CHANNEL_WEIXIN, "wx-user", text);
+    let control = |tag: &str| {
+        let mut message = plain(&format!("ctl-{tag}"));
+        message.display_content = "[:ctl]".to_string();
+        message
+    };
+
+    // 1) 无 cancel：队列（容量 1）已满 → 等位到消费端腾出位置，不丢且保序。
+    mgr.outbound_tx.try_send(plain("first")).unwrap();
+    let ((), first) = tokio::join!(mgr.deliver_control(control("a"), None), async {
+        outbound_rx.recv().await.unwrap()
+    });
+    assert_eq!(first.content, "first");
+    assert_eq!(outbound_rx.recv().await.unwrap().content, "ctl-a");
+    assert!(outbound_rx.try_recv().is_err());
+
+    // 2) 环内等位期间取消 → 放弃该条（队列里仍只有先前那条）。
+    let cancel = CancellationToken::new();
+    mgr.outbound_tx.try_send(plain("second")).unwrap();
+    tokio::join!(mgr.deliver_control(control("b"), Some(&cancel)), async {
+        cancel.cancel();
+    });
+    assert_eq!(outbound_rx.recv().await.unwrap().content, "second");
+    assert!(
+        outbound_rx.try_recv().is_err(),
+        "取消后等位中的控制消息应被放弃"
+    );
+
+    // 3) 令牌已触发：有空位立即投出；满载则放弃而不是等位。
+    mgr.deliver_control(control("c"), Some(&cancel)).await;
+    assert_eq!(outbound_rx.recv().await.unwrap().content, "ctl-c");
+    mgr.outbound_tx.try_send(plain("third")).unwrap();
+    mgr.deliver_control(control("d"), Some(&cancel)).await;
+    assert_eq!(outbound_rx.recv().await.unwrap().content, "third");
+    assert!(
+        outbound_rx.try_recv().is_err(),
+        "满载 + 已取消应放弃，不得等位"
     );
 }
 

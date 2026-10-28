@@ -443,20 +443,62 @@ function ReadBody({ resolved }: { resolved: Resolved }) {
   const offset = inputField(resolved.input, "offset");
   const limit = inputField(resolved.input, "limit");
   // read 的 offset 是 0 基行号（工具 schema：「起始行号（0 基，默认 0）」），展示按
-  // 人类习惯换成 1 基。
+  // 人类习惯换成 1 基；两者都没传就是从头读整文件（工具默认最多 2000 行，超出时结果
+  // 尾行带翻页提示，实际返回范围标在结果区标题上）。
   const firstLine = (typeof offset === "number" ? offset : 0) + 1;
-  const range =
-    typeof offset === "number" || typeof limit === "number"
-      ? `第 ${firstLine} 行起${typeof limit === "number" ? `，共 ${limit} 行` : ""}`
-      : null;
+  const returned = readReturnedSummary(resolved);
+  // 没传 offset/limit 时，只有拿到结果且没被默认窗口截断才说「全文」；结果未知（回放行
+  // 详情尚未拉到）时不下结论。
+  const windowed = typeof offset === "number" || typeof limit === "number";
+  const range = windowed
+    ? `第 ${firstLine} 行起${typeof limit === "number" ? `，共 ${limit} 行` : ""}`
+    : returned === null
+      ? null
+      : returned.truncated
+        ? "从头读取"
+        : "全文";
   return (
     <>
       <Section title="文件">
         <PathLine path={path} extra={range} />
       </Section>
-      <ResultSection resolved={resolved} title="读到的内容" />
+      <ResultSection resolved={resolved} title={returned ? `读到的内容（${returned.label}）` : "读到的内容"} />
     </>
   );
+}
+
+/** 运行时把超预算工具结果落盘后留给模型的占位首行（turn/artifact.rs）。 */
+const SPILL_STUB_PREFIX = "[工具输出超出预算已落盘";
+
+/** read 实际返回的标注 + 是否被窗口截断（决定文件行能否说「全文」）。 */
+interface ReadReturned {
+  label: string;
+  truncated: boolean;
+}
+
+/** read 实际返回了多少：窗口读取时工具在尾行附翻页提示（文本文件 `[read: 返回第 A–B 行，
+ *  已到文件末尾|仍有后续内容…]`，PDF 提取 `[read: PDF 文本第 A–B 行，已到末尾|仍有后续…]`，
+ *  见 rclaw-tools files/helpers.rs read_window_note 与 files/pdf.rs pdf_window_note），按它
+ *  标注；整文件原样返回则数内容行（去掉 include_metadata 的 `[read-metadata: …]` / PDF 的
+ *  `[PDF: …]` 首行）。只在拿到全文（非预览）且不是错误 / 中断占位时标注；越界 / 扫描上限
+ *  提示、媒体 / url 读取的「OK: 已…」回执、落盘占位（只剩首尾预览，行数不代表文件）都不计行。 */
+function readReturnedSummary(resolved: Resolved): ReadReturned | null {
+  const r = resolved.result;
+  if (!r || r.is_error || resolved.resultPartial || resolved.interrupted) return null;
+  if (inputString(resolved.input, "url") !== null) return null;
+  const lines = splitLines(r.content);
+  const last = lines[lines.length - 1] ?? "";
+  const note = /^\[read: (?:返回|PDF 文本)第 (\d+)–(\d+) 行，(已到文件末尾|已到末尾|仍有后续)/.exec(last);
+  if (note) {
+    const truncated = note[3] === "仍有后续";
+    return { label: `第 ${note[1]}–${note[2]} 行${truncated ? "，仍有后续" : "，已到末尾"}`, truncated };
+  }
+  if (last.startsWith("[read: ")) return null;
+  const head = lines[0] ?? "";
+  const body = head.startsWith("[read-metadata: ") || head.startsWith("[PDF: ") ? lines.slice(1) : lines;
+  const first = body[0] ?? "";
+  if (first.startsWith(SPILL_STUB_PREFIX) || first.startsWith("OK: 已")) return null;
+  return { label: `${body.length} 行`, truncated: false };
 }
 
 /** 行级 diff 视图（上限 400 行）。 */

@@ -10,6 +10,60 @@ use rclaw_tools::{access, Tool, ToolResult};
 
 use super::subagent::get_str;
 use super::workflow_service::{self, CreateInput, SavedRef, WorkflowService};
+use crate::options::WorkflowActivation;
+
+/// `CreateWorkflow` 描述的公共开头（它是什么）。
+macro_rules! create_workflow_intro {
+    () => {
+        "Start a DETERMINISTIC JS workflow that orchestrates sub-agents and world-read \
+         operations. "
+    };
+}
+
+/// 描述的公共结尾（先读技能、返回值）。
+macro_rules! create_workflow_outro {
+    () => {
+        " Read the dynamic-workflows skill first. Returns {status:\"backgrounded\", run_id}; \
+         inspect with GetWorkflowRun."
+    };
+}
+
+/// `workflow_activation = "command"`：唯一的门是 `/workflow` 命令。
+///
+/// 路由规则留在描述里而不是技能里：它决定「要不要调这个工具」，在技能加载之前就得被读到
+/// （与 ZCode `create-workflow-description.ts` 同一取舍）。
+const DESCRIPTION_COMMAND: &str = concat!(
+    create_workflow_intro!(),
+    "When to use: only for a request the user made with the `/workflow` command (that turn, \
+     or a follow-up to it); then this tool is mandatory — do not substitute the Agent tool, \
+     do not do the work inline, and do not judge the task too small: the user chose the tool, \
+     and size only decides how many subagents the script gets. Without that command, never \
+     start a workflow: if the user names workflow/工作流 as the means in prose (\"use a \
+     workflow\", \"用工作流\"), reply with one line telling them to resend the request as \
+     `/workflow <request>`; otherwise delegate with the Agent tool or do the work yourself, \
+     even for multi-step or multi-subagent tasks.",
+    create_workflow_outro!(),
+);
+
+/// `workflow_activation = "always"`（默认）：命令与对话里的点名都是强制门；此外模型可按
+/// 用户意图主动启动（措辞参考 ZCode `workflow-description.ts` 的 Ultracode 常驻 opt-in，
+/// 收紧为「意图明确且形状适合脚本」而非「每个实质任务」）。
+const DESCRIPTION_ALWAYS: &str = concat!(
+    create_workflow_intro!(),
+    "When to use: (1) The user asks for a workflow — with the `/workflow` command or in prose \
+     (\"use a workflow\", \"with a workflow\", \"使用 workflow\", \"用工作流\", or any phrasing \
+     that names workflow/工作流 as the means): this tool is mandatory. Do not substitute the \
+     Agent tool, do not do the work inline, and do not judge the task too small — the user \
+     chose the tool; size only decides how many subagents the script gets. (2) On your own \
+     initiative, when the user's intent clearly calls for it: a substantive task whose shape \
+     suits a deterministic script — results feeding results, a loop with a stopping condition, \
+     control flow on typed results, or a sweep too broad for one context (comprehensive \
+     audits, migrations, multi-angle research). Not for conversational turns, single lookups, \
+     trivial edits, or anything one Agent delegation or inline work handles well; when in \
+     doubt, use the Agent tool or ask. Before starting one on your own initiative, tell the \
+     user in one line that you are running a workflow and why.",
+    create_workflow_outro!(),
+);
 
 fn current_session() -> (String, String) {
     crate::turn::rewind::current_chat()
@@ -67,14 +121,10 @@ impl Tool for CreateWorkflowTool {
     }
 
     fn description(&self) -> &str {
-        "Start a DETERMINISTIC JS workflow that orchestrates sub-agents and world-read \
-         operations. When to use: only when the user explicitly asks for a workflow — \
-         \"use a workflow\", \"with a workflow\", \"使用 workflow\", \"用工作流\", or any phrasing \
-         that names workflow/工作流 as the means: this tool is mandatory. Do not substitute the \
-         Agent tool and do not do the work inline. Without such an explicit request, do not \
-         start a workflow: delegate with the Agent tool or do the work yourself, even for \
-         multi-step or multi-subagent tasks. Read the dynamic-workflows skill first. Returns \
-         {status:\"backgrounded\", run_id}; inspect with GetWorkflowRun."
+        match self.service.activation() {
+            WorkflowActivation::Command => DESCRIPTION_COMMAND,
+            WorkflowActivation::Always => DESCRIPTION_ALWAYS,
+        }
     }
 
     fn input_schema(&self) -> Value {
@@ -253,5 +303,33 @@ impl Tool for WorkflowRunTool {
             Ok(response) => workflow_service::run_result(response),
             Err(error) => workflow_service::error_result(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 两个模式的描述共享「它是什么 / 先读技能 / 返回值」，只在「何时使用」分叉。
+    #[test]
+    fn create_workflow_description_varies_only_in_routing_rule() {
+        for text in [DESCRIPTION_COMMAND, DESCRIPTION_ALWAYS] {
+            assert!(text.starts_with(create_workflow_intro!()));
+            assert!(text.ends_with(create_workflow_outro!()));
+            assert!(
+                text.contains("/workflow"),
+                "两种模式都保留 /workflow 命令入口"
+            );
+            assert!(text.contains("do not judge the task too small"));
+        }
+        // command：命令之外绝不开工作流，对话点名只提示改用命令。
+        assert!(DESCRIPTION_COMMAND.contains("never start a workflow"));
+        assert!(DESCRIPTION_COMMAND.contains("`/workflow <request>`"));
+        assert!(!DESCRIPTION_COMMAND.contains("own initiative"));
+        // always：对话点名同样强制 + 可按用户意图主动启动，但要先告知。
+        assert!(DESCRIPTION_ALWAYS.contains("use a workflow"));
+        assert!(DESCRIPTION_ALWAYS.contains("用工作流"));
+        assert!(DESCRIPTION_ALWAYS.contains("On your own initiative"));
+        assert!(DESCRIPTION_ALWAYS.contains("tell the user in one line"));
     }
 }

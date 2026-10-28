@@ -4756,6 +4756,7 @@ mod tests {
                 legacy_tool: true,
                 max_active: 4,
                 command_confirm: false,
+                ..Default::default()
             },
         )
     }

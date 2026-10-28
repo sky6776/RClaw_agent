@@ -37,6 +37,7 @@ function ItemRow({
 }) {
   const baseline = baselineOf(item);
   const dirty = draft !== baseline;
+  const options = item.options;
   const input =
     item.kind === "bool" ? (
       <input
@@ -45,6 +46,20 @@ function ItemRow({
         onChange={(e) => onChange(e.target.checked ? "true" : "false")}
         className="h-4 w-4 accent-indigo-500"
       />
+    ) : options.length > 0 ? (
+      <select
+        value={draft}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 font-mono text-xs text-gray-200 focus:border-indigo-500/60 focus:outline-none"
+      >
+        {/* 文件里手写了表外取值时仍可见（保存会被 Config 校验拦下），不被静默换成首项。 */}
+        {!options.includes(draft) && <option value={draft}>{draft || "（空）"}</option>}
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
     ) : item.kind === "int" || item.kind === "float" ? (
       <input
         type="number"

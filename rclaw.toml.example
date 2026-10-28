@@ -21,6 +21,14 @@ workflow_legacy_tool = false
 max_active_workflow_runs = 4
 workflow_command_confirm = false
 
+# 动态工作流的启用方式（可选值："command" | "always"，默认 "always"）：
+#   "command" = 只能由 /workflow <请求> 命令启用；用户在普通对话里提到工作流时，模型只提示改用命令。
+#   "always"  = 除 /workflow 命令外，用户在对话中明确要求（"用工作流…"）同样必须启用工作流；
+#               模型也可以根据用户意图主动启动工作流（任务确实适合确定性的多子代理编排：
+#               结果层层喂给下一步、带停止条件的循环、按结构化结果分支、单个上下文装不下的大范围审计/迁移/调研），
+#               并在开工前一句话告知。两种模式都要先完整读取 skills/dynamic-workflows/SKILL.md 才能提交脚本。
+workflow_activation = "always"
+
 # 会话语义压缩开关。开启后，每个新 turn 加载历史前会先读取完整 session，
 # 并估算“完整请求压力”（system prompt + 工具 schema + 会话历史）。这个估算值
 # 超过 compression_threshold_tokens 时，RClaw 会：

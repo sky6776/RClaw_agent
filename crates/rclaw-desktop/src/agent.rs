@@ -186,9 +186,6 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     let opts_for_state = core.opts.clone();
     let channels_for_state = channel_info.clone();
     let web_search_for_state = core.web_search_control.clone();
-    // 工具调用事件与运行时的过程消息走同一条 outbound 队列（顺序保证），观察者拿一份
-    // 发送端。
-    let outbound_for_tool_events = outbound_tx.clone();
     let agent = AgentLoop::new(
         core.provider.clone(),
         core.review_provider.clone(),
@@ -209,12 +206,11 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     // 统一分叉入口句柄：同样必须在 agent 被 move 进任务前取走。
     let fork_handle = agent.fork_handle();
     // 会话面板「工具 / Skill 调用可展开观察」的直播通道：运行时在工具批次开始 /
-    // 结束的权威点回调，这里编成控制消息入 outbound 队列、由下方的桥转成 `tool_calls`
-    // Webview 事件（历史由库回放）。
+    // 结束的权威点回调，观察者编成控制消息交回运行时、由运行时按序投进 outbound 队列
+    // （与最终回复同档，不丢），再由下方的桥转成 `tool_calls` Webview 事件（历史由库
+    // 回放）。
     crate::tool_events::attach_app();
-    agent.set_turn_observer(Arc::new(crate::tool_events::ToolEventObserver::new(
-        outbound_for_tool_events,
-    )));
+    agent.set_turn_observer(Arc::new(crate::tool_events::ToolEventObserver::new()));
     tauri::async_runtime::spawn(agent.run());
 
     // cron + heartbeat 后台服务（与 CLI 相同语义）。
@@ -973,8 +969,6 @@ pub(crate) async fn assemble_apk_agent(
     let opts_for_state = core.opts.clone();
     let channels_for_state = channel_info.clone();
     let web_search_for_state = core.web_search_control.clone();
-    // 工具调用事件走运行时同一条出站队列（状态抽头 → dispatcher → 桥），顺序保证。
-    let outbound_for_tool_events = status_tx.clone();
     let agent = AgentLoop::new(
         core.provider.clone(),
         core.review_provider.clone(),
@@ -997,17 +991,16 @@ pub(crate) async fn assemble_apk_agent(
     // 依赖 GUI send 预置忙碌、cron 投递钩子或 outbound 文本分类。完成提醒对全部通道
     // （desktop/微信/QQ）一视同仁：无头服务模式下手机是 bot 宿主，宿主要知道后台替人
     // 回了消息（过滤规则见 android_status::notifiable）。
-    // 复合观察者再挂工具调用事件桥：GUI 在场装配时出口立即就绪；无头期装配的出口
-    // 在 GUI 采用共享运行时时再标就绪（start_agent_inner），期间事件不入队、历史由
-    // 库回放。
+    // 复合观察者再挂工具调用事件桥：控制消息由运行时按序投进它自己的出站队列（状态
+    // 抽头 → dispatcher → 桥，最终回复档不丢）。GUI 在场装配时出口立即就绪；无头期装配
+    // 的出口在 GUI 采用共享运行时时再标就绪（start_agent_inner），期间事件不交回、历史
+    // 由库回放。
     if app.is_some() {
         crate::tool_events::attach_app();
     }
     agent.set_turn_observer(Arc::new(crate::tool_events::CompositeObserver(vec![
         Arc::new(crate::android_status::TurnStatusObserver),
-        Arc::new(crate::tool_events::ToolEventObserver::new(
-            outbound_for_tool_events,
-        )),
+        Arc::new(crate::tool_events::ToolEventObserver::new()),
     ])));
     let agent_task = tokio::spawn(agent.run());
     tokio::spawn(

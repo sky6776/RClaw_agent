@@ -957,14 +957,22 @@ fn workflow_command_expansion(msg: &BusMessage) -> WorkflowExpansion {
     if arguments.is_empty() {
         return WorkflowExpansion::Usage;
     }
+    // 首句自证「这是 /workflow 命令」：模型看到的是展开文而非 `/workflow` 原文，
+    // `workflow_activation = "command"` 下的工具描述只认命令，不自证会被当成普通对话点名
+    //（模型反过来让已经敲过命令的用户「请改用 /workflow」）。
     WorkflowExpansion::Expanded(format!(
-        "Use the `dynamic-workflows` skill to design and launch a dynamic workflow for this request:\n\n\
+        "{WORKFLOW_COMMAND_EXPANSION_LEAD}\n\n\
          {arguments}\n\n\
          Decide the subagent topology before writing any code: how many subagents, which of them\n\
          share a context, what result each one returns. Then write the script and call the\n\
          `CreateWorkflow` tool. Do not substitute the `Agent` tool and do not do the work inline."
     ))
 }
+
+/// `/workflow` 展开文的首句（自证命令来源 + 指向技能）。
+pub(crate) const WORKFLOW_COMMAND_EXPANSION_LEAD: &str = "The user invoked the `/workflow` \
+    command with the request below (treat it as the command, not as a prose request). Use the \
+    `dynamic-workflows` skill to design and launch a dynamic workflow for it:";
 
 /// 历史里持久化的 `/workflow` 原文在构造 LLM 请求时展开（保证后续轮次模型也看到展开文本）。
 pub(crate) fn expand_persisted_workflow_message(text: &str) -> Option<String> {
@@ -1008,9 +1016,13 @@ pub(crate) fn expand_persisted_workflow_message(text: &str) -> Option<String> {
 ///   （Agent 工具）内部的工具调用不在主会话里，不上报。
 ///
 /// 工具事件回调在 turn 任务上同步触发，而本轮的过程文本 / 思考流此前只是投进了 outbound
-/// 队列（尚未送达通道）：宿主若要事件与过程消息保序，必须把事件也投进同一条 outbound
-/// 队列、在消费端再分发，不能在回调里直接推给界面（否则 begun 会抢在本轮随附说明
-/// 之前到达）。
+/// 队列（尚未送达通道）：宿主若要事件与过程消息保序，不能在回调里直接推给界面（否则
+/// begun 会抢在本轮随附说明之前到达）。回调返回 `Some(控制消息)` 时，运行时在 turn 任务
+/// 上把它 `send().await` 进本会话同一条 outbound 队列——与最终回复同档：满载时等位而非
+/// 丢弃（过程文本 / 思考增量是 `try_send` 可丢档），顺序由单生产者 + 单队列保证；宿主在
+/// 消费端凭自己的标记把它分流成界面事件。ReAct 环内等位期间 turn 被 `/cancel` 打断则
+/// 放弃该条：被打断的批次由取消清理补报 finished，已结束批次的 finished 则靠宿主在 turn
+/// 收尾时的增量拉取兜底（见 [`TurnManager::deliver_control`]）。
 pub trait TurnObserver: Send + Sync {
     fn turn_begun(&self, msg: &BusMessage);
     fn turn_terminal(&self, msg: &BusMessage, reply: &str);
@@ -1019,11 +1031,21 @@ pub trait TurnObserver: Send + Sync {
         let _ = msg;
         true
     }
-    fn tool_calls_begun(&self, msg: &BusMessage, batch: &tool_events::ToolBatchBegun) {
+    fn tool_calls_begun(
+        &self,
+        msg: &BusMessage,
+        batch: &tool_events::ToolBatchBegun,
+    ) -> Option<BusMessage> {
         let _ = (msg, batch);
+        None
     }
-    fn tool_calls_finished(&self, msg: &BusMessage, batch: &tool_events::ToolBatchFinished) {
+    fn tool_calls_finished(
+        &self,
+        msg: &BusMessage,
+        batch: &tool_events::ToolBatchFinished,
+    ) -> Option<BusMessage> {
         let _ = (msg, batch);
+        None
     }
 }
 
@@ -1154,13 +1176,50 @@ impl TurnManager {
     /// 调用观察者回调并吞掉其 panic：观察者是宿主插件，它的缺陷不该毒化 active 锁
     /// （begun 处于锁内）、打断 turn，或在守卫 Drop 里（ended）引发双重 panic 中止进程。
     fn observe(&self, what: &'static str, call: impl FnOnce(&dyn TurnObserver)) {
-        let Some(observer) = self.observer.get() else {
-            return;
-        };
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(observer.as_ref())));
-        if outcome.is_err() {
-            tracing::error!("turn 生命周期观察者 {what} 回调 panic，已忽略");
+        self.observe_map(what, call);
+    }
+
+    /// [`observe`](Self::observe) 的带返回值形态：无观察者 / 回调 panic → `None`。
+    fn observe_map<R>(
+        &self,
+        what: &'static str,
+        call: impl FnOnce(&dyn TurnObserver) -> R,
+    ) -> Option<R> {
+        let observer = self.observer.get()?;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(observer.as_ref()))) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                tracing::error!("turn 生命周期观察者 {what} 回调 panic，已忽略");
+                None
+            }
+        }
+    }
+
+    /// 把观察者交回的控制消息投进 outbound 队列：与最终回复同档 `send().await`（满载等位、
+    /// 不丢；接收端已关则放弃）。`cancel` 由 ReAct 环内的调用点传入——用户取消时不再为
+    /// 一条面板事件等位（中断批次由取消清理补报 finished，已结束的批次由宿主 turn 收尾
+    /// 的增量拉取兜底）；令牌已触发时仍试一次 `try_send`：有空位就立刻投出去（刚结束的
+    /// 批次不必等下一次增量拉取才消掉「推断已中断」），满载才放弃。取消清理里的补报本身
+    /// 不传（令牌已触发，必须等位投递）。
+    async fn deliver_control(&self, control: BusMessage, cancel: Option<&CancellationToken>) {
+        match cancel {
+            Some(cancel) if cancel.is_cancelled() => {
+                if let Err(error) = self.outbound_tx.try_send(control) {
+                    tracing::debug!("turn 已取消，控制消息放弃投递（队列满 / 已关）: {error}");
+                }
+            }
+            Some(cancel) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        tracing::debug!("turn 取消，等位中的控制消息放弃投递");
+                    }
+                    _ = self.outbound_tx.send(control) => {}
+                }
+            }
+            None => {
+                let _ = self.outbound_tx.send(control).await;
+            }
         }
     }
 
@@ -1194,16 +1253,17 @@ impl TurnManager {
     }
 
     /// 一批 tool_calls 即将执行：组装列表级载荷（入参裁剪 + Manifest 工具的 skill 归属）
-    /// 并上报。无观察者 / 宿主不看该会话时不做任何序列化工作。
+    /// 并上报；返回宿主交回的控制消息，调用方以 [`deliver_control`](Self::deliver_control)
+    /// 投递。无观察者 / 宿主不看该会话时不做任何序列化工作。
     fn observe_tool_calls_begun(
         &self,
         msg: &BusMessage,
         iter: u32,
         outcome: &rclaw_core::ChatOutcome,
         state: &TurnState,
-    ) {
+    ) -> Option<BusMessage> {
         if !self.tool_events_wanted(msg) {
-            return;
+            return None;
         }
         let calls = outcome
             .tool_calls
@@ -1225,12 +1285,14 @@ impl TurnManager {
             })
             .collect();
         let batch = tool_events::ToolBatchBegun { iter, calls };
-        self.observe("tool_calls_begun", |observer| {
+        self.observe_map("tool_calls_begun", |observer| {
             observer.tool_calls_begun(msg, &batch)
-        });
+        })
+        .flatten()
     }
 
-    /// 一批 tool_calls 的结果已产生（前台路径：已落库，`assistant_msg_id = Some`）。
+    /// 一批 tool_calls 的结果已产生（前台路径：已落库，`assistant_msg_id = Some`）；返回
+    /// 宿主交回的控制消息，调用方以 [`deliver_control`](Self::deliver_control) 投递。
     fn observe_tool_calls_finished(
         &self,
         msg: &BusMessage,
@@ -1238,9 +1300,9 @@ impl TurnManager {
         assistant_msg_id: Option<i64>,
         tool_result: &Message,
         metas: &[rclaw_store::ToolCallMetaRecord],
-    ) {
+    ) -> Option<BusMessage> {
         if !self.tool_events_wanted(msg) {
-            return;
+            return None;
         }
         let batch = tool_events::ToolBatchFinished::from_results(
             iter,
@@ -1248,9 +1310,10 @@ impl TurnManager {
             &tool_result.content,
             metas,
         );
-        self.observe("tool_calls_finished", |observer| {
+        self.observe_map("tool_calls_finished", |observer| {
             observer.tool_calls_finished(msg, &batch)
-        });
+        })
+        .flatten()
     }
 
     // ---- active map 访问：全部走同步辅助函数 ----
@@ -3964,7 +4027,11 @@ impl TurnManager {
                     }
                     // 熔断合成结果也是一次「工具调用」：面板看到调用与改道提示（无耗时，
                     // 侧表只记成败）。
-                    self.observe_tool_calls_begun(&msg, iter_no, &outcome, &state);
+                    if let Some(control) =
+                        self.observe_tool_calls_begun(&msg, iter_no, &outcome, &state)
+                    {
+                        self.deliver_control(control, Some(&cancel)).await;
+                    }
                     let mut tool_result = build_loop_circuit_result(&outcome, &fingerprints);
                     run.record_tool_results(&outcome, &tool_result);
                     let call_metas =
@@ -3991,20 +4058,26 @@ impl TurnManager {
                             }
                         }
                     }
-                    self.observe_tool_calls_finished(
+                    if let Some(control) = self.observe_tool_calls_finished(
                         &msg,
                         iter_no,
                         (!is_cron).then_some(assistant_msg.id),
                         &tool_result,
                         &call_metas,
-                    );
+                    ) {
+                        self.deliver_control(control, Some(&cancel)).await;
+                    }
                     messages.push(assistant_msg);
                     messages.push(tool_result);
                     continue 'react;
                 }
                 // 面板直播：批次即将执行（取消 / 持久化失败的批次没有 finished，宿主以
                 // turn_ended 收口）。
-                self.observe_tool_calls_begun(&msg, iter_no, &outcome, &state);
+                if let Some(control) =
+                    self.observe_tool_calls_begun(&msg, iter_no, &outcome, &state)
+                {
+                    self.deliver_control(control, Some(&cancel)).await;
+                }
                 // 工具执行（cancel-aware）：取消时 drop `execute_tools` future，
                 // 内部 `Shell` 子进程靠 `kill_on_drop(true)` 被 kill；此时 assistant(tool_calls)
                 // 尚未落盘，B1 在清理阶段把它与 aborted 占位结果一起补写进历史（ADR-0004）。
@@ -4077,13 +4150,15 @@ impl TurnManager {
                     }
                 }
                 // 面板直播：批次结束，带落库行 id（cron 不落库 → None）。
-                self.observe_tool_calls_finished(
+                if let Some(control) = self.observe_tool_calls_finished(
                     &msg,
                     iter_no,
                     (!is_cron).then_some(assistant_msg.id),
                     &tool_exec.tool_result,
                     &tool_exec.call_metas,
-                );
+                ) {
+                    self.deliver_control(control, Some(&cancel)).await;
+                }
 
                 messages.push(assistant_msg);
                 messages.push(tool_exec.tool_result);
@@ -4166,14 +4241,17 @@ impl TurnManager {
                                 checkpoints.clear();
                                 // 面板直播：中断批次闭合落库后补一次结束事件（全为 aborted
                                 // 占位），直播条目由此盖上行 id——取消确认先于清理出站、
-                                // 没有这一步该条目要等下一轮增量才能展开懒加载。
-                                self.observe_tool_calls_finished(
+                                // 没有这一步该条目要等下一轮增量才能展开懒加载。令牌已
+                                // 触发，投递不再看它。
+                                if let Some(control) = self.observe_tool_calls_finished(
                                     &msg,
                                     iter_no,
                                     Some(assistant_id),
                                     &carrier,
                                     &call_metas,
-                                );
+                                ) {
+                                    self.deliver_control(control, None).await;
+                                }
                             }
                             Err(e) => tracing::warn!("中断工具链持久化失败: {e}"),
                         }

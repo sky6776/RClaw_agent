@@ -292,6 +292,7 @@ pub async fn assemble_core_with(
         workflow_legacy_tool: cfg.agent.workflow_legacy_tool,
         max_active_workflow_runs: cfg.agent.max_active_workflow_runs.max(1),
         workflow_command_confirm: cfg.agent.workflow_command_confirm,
+        workflow_activation: cfg.agent.workflow_activation,
         ..AgentOptions::default()
     };
 
@@ -350,8 +351,12 @@ pub async fn assemble_core_with(
         session.clone(),
     )));
     // Layer 3 引擎：动态工作流工具面（主代理专属，子代理被屏蔽表拒绝）。
-    // 技能文件首次安装 + 完整读取观察者（技能门 hash 登记）。
-    let _ = rclaw_runtime::agent_tools::ensure_skill_file(&layout.base);
+    // 技能文件首次安装 / 旧契约版本刷新 + 完整读取观察者（技能门 hash 登记）。
+    if let Err(error) = rclaw_runtime::agent_tools::ensure_skill_file(&layout.base) {
+        tracing::warn!(
+            "安装 dynamic-workflows 技能文件失败（文件缺失时技能门无法通过；旧版文件仍在时模型会继续读到旧契约）: {error}"
+        );
+    }
     rclaw_runtime::agent_tools::install_workflow_skill_observer(
         session.journal(),
         layout.base.clone(),
@@ -364,6 +369,7 @@ pub async fn assemble_core_with(
             legacy_tool: cfg.agent.workflow_legacy_tool,
             max_active: cfg.agent.max_active_workflow_runs.max(1),
             command_confirm: cfg.agent.workflow_command_confirm,
+            activation: cfg.agent.workflow_activation,
         },
     );
     tools.register(Box::new(
@@ -491,6 +497,9 @@ pub async fn assemble_core_with(
         goal_audit_enabled: cfg.agent.goal_audit_enabled,
         tool_result_artifact_enabled: cfg.agent.tool_result_artifact_enabled,
         tool_result_artifact_bytes: cfg.agent.tool_result_artifact_bytes,
+        // 工作流启用方式两份 opts 都写：工具描述读 runtime_opts，主循环侧日后若按模式
+        // 调整提示 / 用法文案时读这份，避免只在一边生效。
+        workflow_activation: cfg.agent.workflow_activation,
         daemon,
         ..AgentOptions::default()
     };

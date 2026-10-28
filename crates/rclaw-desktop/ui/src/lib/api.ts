@@ -363,6 +363,8 @@ export interface ConfigItem {
   kind: "bool" | "int" | "float" | "str" | "str_array";
   commented: boolean;
   secret: boolean;
+  /** 枚举型键的合法取值（非空 → 下拉框；空 → 自由输入）。 */
+  options: string[];
   current: string | null;
 }
 

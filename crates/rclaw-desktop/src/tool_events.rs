@@ -6,18 +6,22 @@
 //! 详情（`chat_tool_detail`）都从库里读——重启 / 重装（库文件仍在）后同样可观察。
 //! finished 事件带落库行 id，前端据此把直播条目当场盖章成持久化条目。
 //!
-//! 事件不在观察点直接 `app.emit`，而是编成控制消息、沿运行时同一条 outbound 队列由
-//! `outbound_bridge` 发出。思考流 / 过程文本走 outbound mpsc（APK 还要再过状态抽头与
-//! dispatcher），观察点上的直接 emit 会抢在刚入队的本轮过程文本、末尾思考片段之前到达
-//! 前端：工具行插到随附说明前面、思考快照落到工具行之后另起一块——与库回放的
-//! thinking → text → status 顺序不符。同一条 FIFO 队列才是顺序保证。
+//! 事件不在观察点直接 `app.emit`，而是编成控制消息交回运行时、沿运行时同一条 outbound
+//! 队列由 `outbound_bridge` 发出。思考流 / 过程文本走 outbound mpsc（APK 还要再过状态
+//! 抽头与 dispatcher），观察点上的直接 emit 会抢在刚入队的本轮过程文本、末尾思考片段
+//! 之前到达前端：工具行插到随附说明前面、思考快照落到工具行之后另起一块——与库回放
+//! 的 thinking → text → status 顺序不符。同一条 FIFO 队列才是顺序保证。
+//!
+//! 入队由运行时在 turn 任务上 `send().await` 完成（见 `TurnObserver` 文档）：与最终回复
+//! 同档，满载时等位而非丢弃——💭 突发灌满队列时丢的是可丢档的思考增量，不是这里的
+//! 开始 / 结束事件。控制消息不标 intermediate：APK 路径上 dispatcher 的满载分流与滞留
+//! 车道只丢 intermediate、按序保留其余（最终回复档），转发超时也用加长宽限。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::Emitter;
-use tokio::sync::mpsc;
 
 use rclaw_core::BusMessage;
 use rclaw_runtime::{ToolBatchBegun, ToolBatchFinished, TurnObserver};
@@ -37,15 +41,15 @@ pub enum ToolCallsPayload<'a> {
 }
 
 /// outbound 队列里的控制消息标记。正文 = 前缀 + [`ToolCallsPayload`] 的 JSON（便于日志
-/// 辨认）；但判定不看正文——模型在工具轮的过程文本原样作为 intermediate 出站，正文里的
-/// 任何前缀都伪造得出来。带外标记放在 `display_content`：运行时构造的出站消息一律把它
-/// 留空，模型文本只进 `content`，无法触及。只有 [`control_payload`] 认到带外标记的消息
-/// 才按 `tool_calls` 事件发出，其余一律是普通 `bus` 文本。
+/// 辨认）；但判定不看正文——模型在工具轮的过程文本原样出站，正文里的任何前缀都伪造
+/// 得出来。带外标记放在 `display_content`：运行时构造的出站消息一律把它留空，模型文本
+/// 只进 `content`，无法触及。只有 [`control_payload`] 认到带外标记的消息才按 `tool_calls`
+/// 事件发出，其余一律是普通 `bus` 文本。
 const CONTROL_PREFIX: &str = "[:rclaw-tool-calls]\n";
 
 /// GUI 是否在场（桌面装配即在场；APK 无头服务先装配、GUI 后到）。不在场时 outbound
-/// 桥没有运行，事件不入队：没有人看直播，历史由库回放；也不让它们在 desktop 通道的
-/// 待接收队列里积压、等 GUI 接管时再回放一遍过时的开始 / 结束。
+/// 桥没有运行，事件不交回运行时：没有人看直播，历史由库回放；也不让它们在 desktop
+/// 通道的待接收队列里积压、等 GUI 接管时再回放一遍过时的开始 / 结束。
 static GUI_ATTACHED: AtomicBool = AtomicBool::new(false);
 
 /// 标记 GUI 出口就绪（幂等）。
@@ -60,10 +64,10 @@ fn visible(msg: &BusMessage) -> bool {
 }
 
 /// outbound 消息是否本模块产出的控制消息；是则返回 JSON 载荷。判定依据是带外标记
-/// （`display_content` == 前缀，且 intermediate），正文前缀只是形态核对——模型文本
-/// 即使整段照抄前缀 + JSON，也只是普通 `bus` 文本。
+/// （`display_content` == 前缀），正文前缀只是形态核对——模型文本即使整段照抄前缀 +
+/// JSON，也只是普通 `bus` 文本。不看 intermediate：控制消息按最终回复档出站。
 pub fn control_payload(msg: &BusMessage) -> Option<&str> {
-    if !msg.is_intermediate() || msg.display_content != CONTROL_PREFIX {
+    if msg.display_content != CONTROL_PREFIX {
         return None;
     }
     msg.content.strip_prefix(CONTROL_PREFIX)
@@ -113,39 +117,32 @@ pub fn emit_control(app: &tauri::AppHandle, chat_id: &str, json: &str) {
     }
 }
 
-/// 运行时工具调用事件 → outbound 队列控制消息 → `tool_calls` Webview 事件。
-pub struct ToolEventObserver {
-    /// 运行时自己的 outbound 发送端（桌面：直连桥；APK：状态抽头 → dispatcher → 桥）。
-    /// 与思考流 / 过程文本同一条队列，顺序由队列保证。
-    outbound: mpsc::Sender<BusMessage>,
-}
+/// 运行时工具调用事件 → outbound 队列控制消息（由运行时投递）→ `tool_calls` Webview 事件。
+#[derive(Default)]
+pub struct ToolEventObserver;
 
 impl ToolEventObserver {
-    pub fn new(outbound: mpsc::Sender<BusMessage>) -> Self {
-        Self { outbound }
+    pub fn new() -> Self {
+        Self
     }
 
-    fn enqueue(&self, msg: &BusMessage, payload: ToolCallsPayload<'_>) {
+    /// 编成控制消息交回运行时。不标 intermediate（见模块文档）；带外标记写在
+    /// `display_content`——模型文本到不了这个字段。
+    fn control(&self, msg: &BusMessage, payload: ToolCallsPayload<'_>) -> Option<BusMessage> {
         let json = match serde_json::to_string(&payload) {
             Ok(json) => json,
             Err(e) => {
                 tracing::warn!("tool_calls 事件序列化失败: {e}");
-                return;
+                return None;
             }
         };
         let mut control = BusMessage::new(
             msg.channel.clone(),
             msg.chat_id.clone(),
             format!("{CONTROL_PREFIX}{json}"),
-        )
-        .with_intermediate();
-        // 带外标记（见 CONTROL_PREFIX 说明）：模型文本到不了这个字段。
+        );
         control.display_content = CONTROL_PREFIX.to_string();
-        // 与运行时的过程消息同为 try_send：队列满时一并丢弃（前端错过的开始 / 结束由
-        // turn 收尾的增量拉取与「已中断」收口自愈）。
-        if let Err(e) = self.outbound.try_send(control) {
-            tracing::debug!("tool_calls 事件入队失败: {e}");
-        }
+        Some(control)
     }
 }
 
@@ -162,30 +159,34 @@ impl TurnObserver for ToolEventObserver {
         visible(msg) && GUI_ATTACHED.load(Ordering::Acquire)
     }
 
-    fn tool_calls_begun(&self, msg: &BusMessage, batch: &ToolBatchBegun) {
+    fn tool_calls_begun(&self, msg: &BusMessage, batch: &ToolBatchBegun) -> Option<BusMessage> {
         if !self.wants_tool_events(msg) {
-            return;
+            return None;
         }
-        self.enqueue(
+        self.control(
             msg,
             ToolCallsPayload::Begun {
                 chat_id: &msg.chat_id,
                 batch,
             },
-        );
+        )
     }
 
-    fn tool_calls_finished(&self, msg: &BusMessage, batch: &ToolBatchFinished) {
+    fn tool_calls_finished(
+        &self,
+        msg: &BusMessage,
+        batch: &ToolBatchFinished,
+    ) -> Option<BusMessage> {
         if !self.wants_tool_events(msg) {
-            return;
+            return None;
         }
-        self.enqueue(
+        self.control(
             msg,
             ToolCallsPayload::Finished {
                 chat_id: &msg.chat_id,
                 batch,
             },
-        );
+        )
     }
 }
 
@@ -197,6 +198,30 @@ impl TurnObserver for ToolEventObserver {
     allow(dead_code)
 )]
 pub struct CompositeObserver(pub Vec<Arc<dyn TurnObserver>>);
+
+/// 运行时每个事件只投递一条控制消息：各成员都调用（副作用照常），取第一条交回的；
+/// 多个成员都交回时后面的丢弃并告警——装配上只有工具事件桥会交回。
+#[cfg_attr(
+    not(all(target_os = "android", feature = "apk-host")),
+    allow(dead_code)
+)]
+fn first_control(
+    observers: &[Arc<dyn TurnObserver>],
+    what: &str,
+    mut call: impl FnMut(&dyn TurnObserver) -> Option<BusMessage>,
+) -> Option<BusMessage> {
+    let mut picked = None;
+    for observer in observers {
+        match (call(observer.as_ref()), &picked) {
+            (Some(control), None) => picked = Some(control),
+            (Some(_), Some(_)) => {
+                tracing::warn!("多个观察者都为 {what} 交回控制消息，只投递第一条");
+            }
+            (None, _) => {}
+        }
+    }
+    picked
+}
 
 impl TurnObserver for CompositeObserver {
     fn turn_begun(&self, msg: &BusMessage) {
@@ -224,16 +249,20 @@ impl TurnObserver for CompositeObserver {
             .any(|observer| observer.wants_tool_events(msg))
     }
 
-    fn tool_calls_begun(&self, msg: &BusMessage, batch: &ToolBatchBegun) {
-        for observer in &self.0 {
-            observer.tool_calls_begun(msg, batch);
-        }
+    fn tool_calls_begun(&self, msg: &BusMessage, batch: &ToolBatchBegun) -> Option<BusMessage> {
+        first_control(&self.0, "tool_calls_begun", |observer| {
+            observer.tool_calls_begun(msg, batch)
+        })
     }
 
-    fn tool_calls_finished(&self, msg: &BusMessage, batch: &ToolBatchFinished) {
-        for observer in &self.0 {
-            observer.tool_calls_finished(msg, batch);
-        }
+    fn tool_calls_finished(
+        &self,
+        msg: &BusMessage,
+        batch: &ToolBatchFinished,
+    ) -> Option<BusMessage> {
+        first_control(&self.0, "tool_calls_finished", |observer| {
+            observer.tool_calls_finished(msg, batch)
+        })
     }
 }
 
@@ -244,11 +273,10 @@ mod tests {
     #[test]
     fn observer_control_messages_are_recognised_but_forgeries_are_not() {
         // GUI_ATTACHED 是进程级单向门闩（生产上无「断开」）：本测试二进制内任何断言
-        // 「未 attach 时不入队」的用例都会与本用例产生顺序依赖——需要时请新开测试
+        // 「未 attach 时不交回」的用例都会与本用例产生顺序依赖——需要时请新开测试
         // 二进制或引入 cfg(test) 的复位钩子，不要在这里依赖初值。
         attach_app();
-        let (tx, mut rx) = mpsc::channel::<BusMessage>(4);
-        let observer = ToolEventObserver::new(tx);
+        let observer = ToolEventObserver::new();
         let turn = BusMessage::new(crate::agent::CHANNEL_DESKTOP, "c1", "做点事");
         let batch = ToolBatchBegun {
             iter: 2,
@@ -261,14 +289,21 @@ mod tests {
             }],
         };
         assert!(observer.wants_tool_events(&turn));
-        observer.tool_calls_begun(&turn, &batch);
-        let control = rx.try_recv().expect("控制消息应入队");
+        let control = observer
+            .tool_calls_begun(&turn, &batch)
+            .expect("应交回控制消息");
+        // 最终回复档：不标 intermediate，dispatcher 满载时按序保留而不是丢弃。
+        assert!(!control.is_intermediate());
+        assert_eq!(control.channel, crate::agent::CHANNEL_DESKTOP);
+        assert_eq!(control.chat_id, "c1");
         let json = control_payload(&control).expect("观察者产出的消息应被认作控制消息");
         let payload: serde_json::Value = serde_json::from_str(json).unwrap();
         assert!(valid_control_payload(&payload, "c1"));
         assert_eq!(payload["phase"], "begun");
         assert_eq!(payload["batch"]["iter"], 2);
         assert_eq!(payload["batch"]["calls"][0]["name"], "read");
+        // 判定不看 intermediate 标志。
+        assert!(control_payload(&control.clone().with_intermediate()).is_some());
         // 与消息 chat_id 不符 / 阶段未知 / 缺列表的载荷过不了形态校验。
         assert!(!valid_control_payload(&payload, "c2"));
         assert!(!valid_control_payload(
@@ -280,27 +315,21 @@ mod tests {
             "c1"
         ));
 
-        // 模型文本整段照抄前缀 + 合法 JSON（工具轮过程文本原样以 intermediate 出站）：
-        // 没有带外标记，仍是普通 bus 文本。
-        let forged = BusMessage::new(crate::agent::CHANNEL_DESKTOP, "c1", control.content.clone())
-            .with_intermediate();
+        // 模型文本整段照抄前缀 + 合法 JSON（工具轮过程文本原样出站，intermediate 与否
+        // 都有）：没有带外标记，仍是普通 bus 文本。
+        let forged = BusMessage::new(crate::agent::CHANNEL_DESKTOP, "c1", control.content.clone());
         assert_eq!(control_payload(&forged), None);
-        // 非 intermediate（正式回复）即使带了标记字段也不算。
-        let mut final_reply =
-            BusMessage::new(crate::agent::CHANNEL_DESKTOP, "c1", control.content.clone());
-        final_reply.display_content = CONTROL_PREFIX.to_string();
-        assert_eq!(control_payload(&final_reply), None);
+        assert_eq!(control_payload(&forged.clone().with_intermediate()), None);
         // 普通过程文本 / 思考流。
         let thinking =
             BusMessage::new(crate::agent::CHANNEL_DESKTOP, "c1", "💭\n想想").with_intermediate();
         assert_eq!(control_payload(&thinking), None);
 
-        // 外部通道 / grp- 编排会话的 turn 不组装、不入队。
+        // 外部通道 / grp- 编排会话的 turn 不组装、不交回。
         let napcat = BusMessage::new(rclaw_core::CHANNEL_NAPCAT, "u1", "hi");
         assert!(!observer.wants_tool_events(&napcat));
-        observer.tool_calls_begun(&napcat, &batch);
+        assert!(observer.tool_calls_begun(&napcat, &batch).is_none());
         let grp = BusMessage::new(crate::agent::CHANNEL_DESKTOP, "grp-1", "hi");
-        observer.tool_calls_begun(&grp, &batch);
-        assert!(rx.try_recv().is_err());
+        assert!(observer.tool_calls_begun(&grp, &batch).is_none());
     }
 }

@@ -47,6 +47,8 @@ pub struct ConfigDocItem {
     pub commented: bool,
     /// 密钥类输入（UI 打码展示）。
     pub secret: bool,
+    /// 枚举型键的合法取值（非空时 UI 渲染为下拉框；空 = 自由输入）。见 [`options_of`]。
+    pub options: Vec<String>,
     /// 用户 rclaw.toml 中的当前值（None = 未配置，用默认）。
     pub current: Option<String>,
 }
@@ -208,16 +210,31 @@ fn push_item(
     if let Some(inline) = inline {
         doc.push(inline);
     }
+    let path = format!("{}.{}", section.path, key);
     section.items.push(ConfigDocItem {
         key: key.to_string(),
-        path: format!("{}.{}", section.path, key),
         doc,
         default_raw: value.trim().to_string(),
         kind: kind_of(value.trim()).to_string(),
         commented,
         secret: is_secret(key),
+        options: options_of(&path),
+        path,
         current: None,
     });
+}
+
+/// 枚举型键的合法取值表（按保存寻址路径）。
+///
+/// 与各键的 serde 枚举保持一致（`rclaw_cli::config::Config::parse_str` 在保存前仍会
+/// 校验，这里只决定 UI 是否渲染下拉框以及选项顺序）。
+fn options_of(path: &str) -> Vec<String> {
+    let options: &[&str] = match path {
+        // `rclaw_runtime::options::WorkflowActivation`（snake_case）。
+        "agent.workflow_activation" => &["always", "command"],
+        _ => &[],
+    };
+    options.iter().map(|s| s.to_string()).collect()
 }
 
 /// `key = value # inline` → (key, value, inline)。
@@ -428,6 +445,32 @@ mod tests {
         // auto_memory 是显式键（未注释）。
         let am = agent.items.iter().find(|i| i.key == "auto_memory").unwrap();
         assert!(!am.commented);
+        // workflow_activation：枚举型 str 键，带下拉选项，文档（含 `"command" = …` 形态的
+        // 说明行）归到本键而不是被误收为键。
+        let activation = agent
+            .items
+            .iter()
+            .find(|i| i.key == "workflow_activation")
+            .expect("agent.workflow_activation 应被收录");
+        assert!(!activation.commented);
+        assert_eq!(activation.kind, "str");
+        assert_eq!(activation.default_raw, "\"always\"");
+        assert_eq!(activation.options, vec!["always", "command"]);
+        assert!(
+            activation.doc.iter().any(|l| l.contains("/workflow")),
+            "启用方式说明应归到 workflow_activation: {:?}",
+            activation.doc
+        );
+        assert!(
+            !agent.items.iter().any(|i| i.key.starts_with('"')),
+            "带引号的说明行不得被误判为键: {:?}",
+            agent
+                .items
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(base.options.is_empty(), "非枚举键无下拉选项");
         // 散文里的键名/公式不得被误判为键（deny_unknown_fields 下它永远存不进去）。
         assert!(
             !agent.items.iter().any(|i| i.key == "compression_threshold_tokens"),

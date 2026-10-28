@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use rclaw_channels::{NapCatConfig, WeixinConfig};
 use rclaw_llm::{AuthScheme, Dialect, MaxTokensKey, ProtocolKind, ProviderConfig, ReasoningField};
+pub use rclaw_runtime::options::WorkflowActivation;
 
 // ---------------------------------------------------------------------------
 // 文件配置结构
@@ -144,6 +145,10 @@ pub struct AgentSection {
     /// `world.run` 是否逐命令确认（P5；默认 false = 仅 ToolAccess，与 shell 同权）。
     #[serde(default = "default_false")]
     pub workflow_command_confirm: bool,
+    /// 动态工作流的启用方式：`"command"` = 只能由 `/workflow` 命令触发；`"always"`（默认）=
+    /// 命令与对话里的明确要求都启用，模型也可按用户意图主动启动。非法取值在解析期拒绝。
+    #[serde(default)]
+    pub workflow_activation: WorkflowActivation,
 }
 impl Default for AgentSection {
     fn default() -> Self {
@@ -178,6 +183,7 @@ impl Default for AgentSection {
             workflow_legacy_tool: false,
             max_active_workflow_runs: default_max_active_workflow_runs(),
             workflow_command_confirm: false,
+            workflow_activation: WorkflowActivation::default(),
         }
     }
 }

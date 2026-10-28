@@ -15,22 +15,30 @@ use rclaw_store::journal::JournalStore;
 
 use super::workflow_paths::normalize_project_key;
 
-/// 当前技能契约版本（工具面变更时 +1，旧登记自动失效）。
-pub const CONTRACT_VERSION: u32 = 5;
+/// 当前技能契约版本（工具面或使用契约变更时 +1，旧登记自动失效；带更旧版本头的
+/// 已安装文件由 [`ensure_skill_file`] 用新正文覆盖）。
+///
+/// v6：「何时使用」改为按 `[agent] workflow_activation` 路由（规则正文在 `CreateWorkflow`
+/// 工具描述里），技能文件不再写死「仅限用户明确要求」。
+pub const CONTRACT_VERSION: u32 = 6;
 
-/// 技能文件正文（首次启动安装；已存在不覆盖）。
+/// 技能文件正文（首次启动安装；已安装文件仅在版本头更旧时覆盖，见 [`ensure_skill_file`]）。
 pub const SKILL_MD: &str = r#"---
 name: dynamic-workflows
 description: Design and run deterministic JS workflows that orchestrate sub-agents, read files, run read-only git, execute commands, publish artifacts, and pause at holes.
 ---
 
-<!-- contract-version: 5 -->
+<!-- contract-version: 6 -->
 
 # Dynamic workflows
 
 A workflow is a **deterministic JS script** executed in an embedded QuickJS sandbox.
-Use it when the user explicitly asks for a workflow ("use a workflow", "with a workflow",
-"使用 workflow", "用工作流"). Do not substitute the `Agent` tool and do not do the work inline.
+When a workflow may be started is set by `[agent] workflow_activation`, and the
+`CreateWorkflow` tool description states the rule in force — follow that description, not
+this paragraph. The `/workflow` command is a valid trigger in every mode; whether a prose
+request ("use a workflow", "用工作流") or your own initiative also counts depends on the mode.
+Once a workflow is the chosen means, do not substitute the `Agent` tool and do not do the work
+inline.
 
 ## Lifecycle
 
@@ -120,18 +128,54 @@ pub fn skill_path(project_root: &Path) -> PathBuf {
         .join("SKILL.md")
 }
 
-/// 首次启动安装技能文件（已存在不覆盖）。
+/// 安装技能文件。
+///
+/// - 不存在：写入 [`SKILL_MD`]。
+/// - 已存在且带 `<!-- contract-version: N -->` 头、N 小于 [`CONTRACT_VERSION`]：是本程序旧版
+///   生成的文件，用新正文覆盖（否则旧文件会继续向模型陈述已失效的使用契约）；覆盖前把旧文件
+///   留作同目录隐藏备份 `.SKILL.md.v<N>.bak`（与 `rclaw_store::fs` / skill_manage 的
+///   `.<名>.bak` 内部产物约定一致；技能扫描只认 `SKILL.md`，备份不会被当成技能），用户在
+///   旧版上的批注不丢。备份失败则放弃刷新（宁可旧契约多活一阵，不丢用户文件）。
+/// - 已存在但无版本头（用户自行改写）或版本不低于当前：不动。
+///
+/// 写入走原子替换：半截文件若已带新版本头，后续启动不会再修复它。
 pub fn ensure_skill_file(project_root: &Path) -> Result<(), String> {
     let path = skill_path(project_root);
     if path.exists() {
-        return Ok(());
+        let installed_version = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| contract_version_of(&text));
+        match installed_version {
+            Some(version) if version < CONTRACT_VERSION => {
+                let backup = stale_backup_path(&path, version);
+                std::fs::copy(&path, &backup).map_err(|error| {
+                    format!("备份旧技能文件到 {} 失败: {error}", backup.display())
+                })?;
+                tracing::info!(
+                    "技能文件 {} 契约版本 {version} 过旧，刷新为 v{CONTRACT_VERSION}（旧文件已备份为 {}）",
+                    path.display(),
+                    backup.display()
+                );
+            }
+            _ => return Ok(()),
+        }
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("创建技能目录 {} 失败: {error}", parent.display()))?;
-    }
-    std::fs::write(&path, SKILL_MD)
+    rclaw_store::fs::atomic_write(&path, SKILL_MD.as_bytes())
         .map_err(|error| format!("写入技能文件 {} 失败: {error}", path.display()))
+}
+
+/// 旧版技能文件的备份路径：`<skill_dir>/.SKILL.md.v<version>.bak`。
+fn stale_backup_path(skill_file: &Path, version: u32) -> PathBuf {
+    skill_file.with_file_name(format!(".SKILL.md.v{version}.bak"))
+}
+
+/// 解析技能正文里的 `<!-- contract-version: N -->` 头（缺失 / 不合法 → None）。
+fn contract_version_of(text: &str) -> Option<u32> {
+    const MARKER: &str = "<!-- contract-version:";
+    let start = text.find(MARKER)? + MARKER.len();
+    let rest = &text[start..];
+    let end = rest.find("-->")?;
+    rest[..end].trim().parse().ok()
 }
 
 /// 文件 sha256（缺失返回 None）。
@@ -177,4 +221,57 @@ pub fn install_observer(journal: JournalStore, project_root: PathBuf) {
         }
     });
     rclaw_tools::files::set_full_read_observer(observer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_skill_header_matches_contract_version() {
+        assert_eq!(contract_version_of(SKILL_MD), Some(CONTRACT_VERSION));
+        assert_eq!(contract_version_of("no header here"), None);
+        assert_eq!(contract_version_of("<!-- contract-version: x -->"), None);
+        assert_eq!(
+            contract_version_of("<!-- contract-version:  3 -->"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn ensure_skill_file_installs_refreshes_stale_and_keeps_custom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = skill_path(dir.path());
+
+        // 不存在 → 安装。
+        ensure_skill_file(dir.path()).expect("首次安装");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_MD);
+
+        // 版本头更旧（本程序旧版生成）→ 覆盖为当前正文，旧文件留隐藏 .bak。
+        let stale = format!(
+            "---\nname: dynamic-workflows\n---\n\n<!-- contract-version: {} -->\n\nold body\n",
+            CONTRACT_VERSION - 1
+        );
+        std::fs::write(&path, &stale).unwrap();
+        ensure_skill_file(dir.path()).expect("刷新旧版");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL_MD);
+        let backup = stale_backup_path(&path, CONTRACT_VERSION - 1);
+        assert_eq!(
+            backup.file_name().unwrap().to_string_lossy(),
+            format!(".SKILL.md.v{}.bak", CONTRACT_VERSION - 1)
+        );
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), stale);
+
+        // 当前版本 → 不动（用户在当前版本上的修改得以保留）。
+        let edited = format!("{SKILL_MD}\n## Local notes\n");
+        std::fs::write(&path, &edited).unwrap();
+        ensure_skill_file(dir.path()).expect("同版本保持");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+        // 无版本头（用户自行改写）→ 不动。
+        let custom = "# my own workflow notes\n";
+        std::fs::write(&path, custom).unwrap();
+        ensure_skill_file(dir.path()).expect("无版本头保持");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+    }
 }

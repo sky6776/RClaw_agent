@@ -548,13 +548,9 @@ impl ClaudeAgentTool {
     }
 }
 
-#[async_trait]
-impl Tool for ClaudeAgentTool {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn description(&self) -> &str {
+/// `Agent` / `Task` 描述的公共正文。
+macro_rules! agent_tool_description_base {
+    () => {
         "Run a named sub-agent. Compatible with Claude Code Agent and legacy Task tool names. \
          Do NOT delegate work that a single ordinary tool call can finish (reading a specific \
          file, a simple search, a quick lookup) — do it directly. The prompt must be \
@@ -563,6 +559,36 @@ impl Tool for ClaudeAgentTool {
          files / run commands), what evidence or artifacts to return, and a clear completion \
          criterion (when to stop). In team mode with an explicit name it runs as a persistent \
          background teammate."
+    };
+}
+
+/// 工作流路由提示（与 ZCode `agent.ts` 的「点名即绑定」行同源），按
+/// `[agent] workflow_activation` 选措辞：Agent 工具不得成为被点名工作流的替身。
+const AGENT_DESCRIPTION_WORKFLOW_ALWAYS: &str = concat!(
+    agent_tool_description_base!(),
+    " If the user asks for a workflow (`/workflow`, \"use a workflow\", \"使用 workflow\", \
+     \"用工作流\", or any phrasing naming workflow/工作流 as the means), the CreateWorkflow \
+     tool is mandatory: do not use this tool instead, however small the task."
+);
+
+const AGENT_DESCRIPTION_WORKFLOW_COMMAND: &str = concat!(
+    agent_tool_description_base!(),
+    " Workflows start only through the `/workflow` command: if the user names workflow/工作流 \
+     as the means in prose, tell them in one line to resend the request as `/workflow \
+     <request>` instead of running this tool as a substitute."
+);
+
+#[async_trait]
+impl Tool for ClaudeAgentTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        match self.runtime.opts.workflow_activation {
+            crate::options::WorkflowActivation::Always => AGENT_DESCRIPTION_WORKFLOW_ALWAYS,
+            crate::options::WorkflowActivation::Command => AGENT_DESCRIPTION_WORKFLOW_COMMAND,
+        }
     }
 
     fn input_schema(&self) -> Value {
@@ -918,5 +944,28 @@ impl Tool for AgentResumeTool {
             Ok(payload) => ToolResult::ok(render_execution_media_payload(payload)),
             Err(error) => ToolResult::err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod workflow_routing_tests {
+    use super::*;
+
+    /// Agent 描述的两个变体共享正文，只在工作流路由行上分叉：always 把「用户点名工作流」
+    /// 绑定到 CreateWorkflow；command 只认 `/workflow` 命令并让模型提示改用命令。
+    #[test]
+    fn agent_description_routes_workflow_requests_by_activation_mode() {
+        for text in [
+            AGENT_DESCRIPTION_WORKFLOW_ALWAYS,
+            AGENT_DESCRIPTION_WORKFLOW_COMMAND,
+        ] {
+            assert!(text.starts_with(agent_tool_description_base!()));
+            assert!(text.contains("/workflow"));
+        }
+        assert!(AGENT_DESCRIPTION_WORKFLOW_ALWAYS.contains("use a workflow"));
+        assert!(AGENT_DESCRIPTION_WORKFLOW_ALWAYS.contains("用工作流"));
+        assert!(AGENT_DESCRIPTION_WORKFLOW_ALWAYS.contains("CreateWorkflow tool is mandatory"));
+        assert!(AGENT_DESCRIPTION_WORKFLOW_COMMAND.contains("only through the `/workflow` command"));
+        assert!(AGENT_DESCRIPTION_WORKFLOW_COMMAND.contains("`/workflow <request>`"));
     }
 }

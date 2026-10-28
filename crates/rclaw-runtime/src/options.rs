@@ -2,6 +2,40 @@
 
 use std::time::Duration;
 
+/// 动态工作流的启用方式（`[agent] workflow_activation`）。
+///
+/// 两种模式下 `/workflow <请求>` 命令都可用；区别只在命令之外模型能否启动工作流。
+/// 模式本身是提示词层约束（写进 `CreateWorkflow` / `Agent` 工具描述），不是运行时硬门：
+/// 技能门（必须先完整读取 SKILL.md）在两种模式下照常生效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowActivation {
+    /// 只能由 `/workflow` 命令触发；用户在对话里点名工作流时，模型只提示改用命令。
+    Command,
+    /// 命令与对话里的明确要求（"用工作流…"）都必须启用工作流；模型也可按用户意图主动启动
+    ///（任务确实适合确定性多子代理编排时），开工前一句话告知。默认。
+    #[default]
+    Always,
+}
+
+impl WorkflowActivation {
+    /// 全部变体（配置面板下拉选项 / 漂移守卫测试按它遍历）。
+    ///
+    /// 新增变体时要同步的是本表与 `rclaw_store::config_doc::options_of`（store 不依赖本
+    /// crate，只能手工维护）；[`Self::as_str`] 的 `match` 由编译器保证穷尽。下方测试
+    /// `all_lists_every_variant` 在新增变体后会编译失败，提醒同步这两处。
+    pub const ALL: &'static [WorkflowActivation] =
+        &[WorkflowActivation::Always, WorkflowActivation::Command];
+
+    /// 配置文件里的字面值（`"command"` / `"always"`，与 serde `snake_case` 一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkflowActivation::Command => "command",
+            WorkflowActivation::Always => "always",
+        }
+    }
+}
+
 /// Agent 主循环与历史的可调参数。
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
@@ -143,6 +177,8 @@ pub struct AgentOptions {
     pub max_active_workflow_runs: usize,
     /// `world.run` 是否逐命令向前端确认（P5；默认 false = 仅 ToolAccess）。
     pub workflow_command_confirm: bool,
+    /// 动态工作流的启用方式（默认 [`WorkflowActivation::Always`]），见该枚举文档。
+    pub workflow_activation: WorkflowActivation,
     /// 是否启用后台自动记忆 review。
     pub auto_memory_enabled: bool,
     /// 是否启用后台自动自进化 review。
@@ -239,6 +275,7 @@ impl Default for AgentOptions {
             workflow_legacy_tool: false,
             max_active_workflow_runs: 4,
             workflow_command_confirm: false,
+            workflow_activation: WorkflowActivation::Always,
             auto_memory_enabled: false,
             auto_evolve_enabled: false,
             auto_review_tooled: false,
@@ -353,6 +390,30 @@ pub fn derive_summary_token_ceiling(context_length: usize, absolute_ceiling: usi
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    /// `WorkflowActivation::ALL` 穷尽性绊线：新增变体后这里的 `match` 不再穷尽 → 编译失败，
+    /// 提醒同步 `ALL` 与 `rclaw_store::config_doc::options_of`；长度断言防止只加 match 臂
+    /// 不加表项。默认值与 serde 字面值也在此钉住。
+    #[test]
+    fn workflow_activation_all_lists_every_variant() {
+        for variant in WorkflowActivation::ALL {
+            match variant {
+                WorkflowActivation::Always | WorkflowActivation::Command => {}
+            }
+        }
+        assert_eq!(WorkflowActivation::ALL.len(), 2);
+        assert_eq!(WorkflowActivation::default(), WorkflowActivation::Always);
+        assert_eq!(
+            AgentOptions::default().workflow_activation,
+            WorkflowActivation::Always
+        );
+        for variant in WorkflowActivation::ALL {
+            let json = serde_json::to_string(variant).unwrap();
+            assert_eq!(json, format!("\"{}\"", variant.as_str()));
+            let back: WorkflowActivation = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, *variant);
+        }
+    }
 
     #[test]
     fn main_loop_caps_at_256_iters_review_at_32_with_input_budget() {

@@ -2416,8 +2416,10 @@ pub fn config_save_edits(home: &std::path::Path, edits: &[ConfigEdit]) -> Result
         parsed.push((e.path.clone(), parse_edit_value(&e.kind, &e.value)?));
     }
     let preview = toml_file.apply_edits_preview(&parsed)?;
+    // `{e:#}`：anyhow 链式展示——`parse_str` 外层只有「配置解析失败」，真正说明问题的
+    // 是里层 toml 错误（如枚举键 `unknown variant …, expected …`），面板要能把它显示出来。
     rclaw_cli::config::Config::parse_str(&preview)
-        .map_err(|e| format!("保存被校验拒绝（未写入文件）: {e}"))?;
+        .map_err(|e| format!("保存被校验拒绝（未写入文件）: {e:#}"))?;
     validate_provider_names(&preview, parsed.iter().map(|(p, _)| p.as_str()))?;
     toml_file.write_text(&preview)
 }
@@ -2520,7 +2522,7 @@ pub fn config_import_raw_for(home: &std::path::Path, content: &str) -> Result<()
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| format!("rclaw.toml 解析失败: {e}"))?;
     rclaw_cli::config::Config::parse_str(content)
-        .map_err(|e| format!("导入被校验拒绝（未写入文件）: {e}"))?;
+        .map_err(|e| format!("导入被校验拒绝（未写入文件）: {e:#}"))?;
     validate_provider_names(content, ["llm.provider", "llm.review_provider"].into_iter())?;
     rclaw_store::RclawToml::new(home.join("rclaw.toml")).write_text(content)
 }

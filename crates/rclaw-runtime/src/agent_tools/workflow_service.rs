@@ -35,6 +35,9 @@ pub struct WorkflowOptions {
     pub legacy_tool: bool,
     pub max_active: usize,
     pub command_confirm: bool,
+    /// 启用方式（`[agent] workflow_activation`）：决定 `CreateWorkflow` / `Agent`
+    /// 工具描述里的路由规则措辞，不改变引擎与技能门行为。
+    pub activation: crate::options::WorkflowActivation,
 }
 
 impl Default for WorkflowOptions {
@@ -44,6 +47,7 @@ impl Default for WorkflowOptions {
             legacy_tool: false,
             max_active: 4,
             command_confirm: false,
+            activation: crate::options::WorkflowActivation::Always,
         }
     }
 }
@@ -301,6 +305,11 @@ impl WorkflowService {
 
     pub(crate) fn is_read_only(&self) -> bool {
         self.inner.read_only.load(Ordering::SeqCst)
+    }
+
+    /// 启用方式（供工具描述按模式选措辞）。
+    pub fn activation(&self) -> crate::options::WorkflowActivation {
+        self.inner.opts.activation
     }
 
     fn set_degraded(&self, code: &str, message: impl Into<String>) {

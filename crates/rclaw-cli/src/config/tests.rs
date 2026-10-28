@@ -21,6 +21,67 @@ fn example_config_parses() {
     );
     // 示例显式给出的压缩摘要上限必须是 12_000（不是旧的 2048）。
     assert_eq!(cfg.agent.compression_summary_max_tokens, 12_000);
+    // 示例显式给出动态工作流启用方式默认值 always。
+    assert_eq!(cfg.agent.workflow_activation, WorkflowActivation::Always);
+}
+
+/// `[agent] workflow_activation`：缺省 always；`"command"` 可解析；非法取值在解析期拒绝
+/// （配置面板保存前走 `Config::parse_str`，错误信息要能说明合法取值）。
+#[test]
+fn workflow_activation_parses_defaults_and_rejects_unknown() {
+    let default_cfg: Config = toml::from_str("").unwrap();
+    assert_eq!(
+        default_cfg.agent.workflow_activation,
+        WorkflowActivation::Always
+    );
+    assert_eq!(
+        AgentSection::default().workflow_activation,
+        WorkflowActivation::Always
+    );
+
+    let command: Config = toml::from_str("[agent]\nworkflow_activation = \"command\"\n").unwrap();
+    assert_eq!(
+        command.agent.workflow_activation,
+        WorkflowActivation::Command
+    );
+    assert_eq!(command.agent.workflow_activation.as_str(), "command");
+
+    // `{:#}` 展示 anyhow 链：外层「配置解析失败」+ 里层 toml 的 `unknown variant … expected …`。
+    let error = Config::parse_str("[agent]\nworkflow_activation = \"sometimes\"\n").unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("command") && error.contains("always"),
+        "错误信息应列出合法取值: {error}"
+    );
+}
+
+/// 配置面板的下拉选项表（`rclaw_store::config_doc::options_of`，store 不能依赖 runtime 所以
+/// 手工维护）必须与 `WorkflowActivation` 的变体一一对应，且每个选项都能解析回同一枚举值。
+#[test]
+fn config_panel_options_track_workflow_activation_variants() {
+    let doc = rclaw_store::config_doc::parse_example(rclaw_store::config_doc::EXAMPLE);
+    let item = doc
+        .sections
+        .iter()
+        .find(|s| s.path == "agent")
+        .and_then(|s| s.items.iter().find(|i| i.key == "workflow_activation"))
+        .expect("面板应收录 agent.workflow_activation");
+    let mut options = item.options.clone();
+    options.sort();
+    let mut variants: Vec<String> = WorkflowActivation::ALL
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect();
+    variants.sort();
+    assert_eq!(options, variants, "面板选项与枚举变体漂移");
+    for variant in WorkflowActivation::ALL {
+        let cfg: Config = toml::from_str(&format!(
+            "[agent]\nworkflow_activation = \"{}\"\n",
+            variant.as_str()
+        ))
+        .unwrap();
+        assert_eq!(cfg.agent.workflow_activation, *variant);
+    }
 }
 
 #[test]
