@@ -68,7 +68,8 @@ export interface AppVersions {
 export interface HistoryMsg {
   /** 消息行 id（state.sqlite 的 message.id；消息「分叉到新会话」的锚点）。 */
   id: number;
-  role: "user" | "assistant" | "status";
+  /** thinking = assistant 行内 Reasoning 块的投影（重启后思考块恢复的通道）。 */
+  role: "user" | "assistant" | "thinking" | "status";
   content: string;
   /** 消息落库时间（unix 秒，与 state.sqlite 的 message.ts 同单位）；
    *  映射到 Entry.ts（毫秒）时需 ×1000。 */

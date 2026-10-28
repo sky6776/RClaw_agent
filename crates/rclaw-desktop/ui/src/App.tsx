@@ -118,6 +118,12 @@ function historyEntryTs(secs: number): number | undefined {
   return secs > 0 ? secs * 1000 : undefined;
 }
 
+/** 思考文本归一化：剥直播快照前缀 + trim。持久化 reasoning 与直播思考块的对位比较
+ *  两处共用（快照合并 + 增量盖章）——两边口径不一致就会留下双份思考块。 */
+function normalizeThinkingText(text: string): string {
+  return text.replace(/^💭\s*思考中\.\.\.\n?/, "").trim();
+}
+
 // ---------------------------------------------------------------------------
 // 多主题：dark/light 之外的背景风格。base 决定复用哪套文字调色板
 // （浅色系加挂 theme-light），聊天/侧边栏背景由 index.css 的 theme-* 层接管。
@@ -453,49 +459,122 @@ ${event.payload.command}
   );
 
   // 已落库条目并入会话视图（行级增量的装配步），两阶段保证幂等与顺序：
-  // 1) 按行 id 去重（已在视图里的行直接跳过——重叠/重放的增量不产生双份，也不会把
-  //    新到的同文消息误盖上一轮的行 id）；再把同角色同文的【未盖章】直播条目一对一
-  //    原位盖上行 id——顺序与对象身份都不动，fork 菜单持有的条目引用因此拿到锚点；
-  //    发送失败条目与思考块永远匹配不上：前者没落库，后者不产生持久化行。
-  // 2) 没有直播孪生的行（错过事件 / 重连补洞）按行 id 插到第一个更大行 id 的条目
-  //    之前、否则追加尾部——乱序到达的中插行不会落到最终回复之后。
+  // 1) 按 (行 id, 角色) 去重（同一持久化行可产出 thinking/status/text 多个条目）；
+  //    再把同角色同文的【未盖章】直播条目一对一原位盖上行 id——顺序与对象身份都
+  //    不动，fork 菜单持有的条目引用因此拿到锚点。思考条目按归一化文本匹配、且
+  //    只在「owner user 到下一条 user」的窗口内找（纯文本轮的孤儿思考块永不落库，
+  //    跨轮同文不能错盖）；匹配不上就追加，宁偶有重复不错盖。
+  // 2) 没有直播孪生的条目按 (行 id, 同行角色序) 插入——乱序到达的中插行不会落到
+  //    最终回复之后，同行内保持 thinking → status → assistant。
   const applyCommitted = useCallback((chatId: string, items: HistoryMsg[]) => {
     if (items.length === 0) return;
+    // 条目在同行内的展示序：同一持久化行可产出 thinking/status/text 三种条目
+    // （共享行 id），插入定位时按此序排同行先后。
+    const roleRank = (role: Entry["role"]) =>
+      role === "thinking" ? 0 : role === "status" ? 1 : role === "assistant" ? 2 : 0;
     setEntriesByChat((prev) => {
       const existing = prev[chatId] ?? [];
       const next = existing.slice();
+      // 去重身份 = (行 id, 角色)：按行 id 去重会把同行的正文吞掉（thinking 入账后
+      // 同 id 的 assistant 条目被跳过，正文丢失也拿不到分叉锚点）。
       const have = new Set(
-        existing.flatMap((e) => (e.msgId === undefined ? [] : [e.msgId])),
+        existing.flatMap((e) =>
+          e.msgId === undefined ? [] : [`${e.msgId}:${e.role}`],
+        ),
       );
-      const appended: Entry[] = [];
+      // 两阶段：先完成本批全部身份对位（盖章），再统一插入未匹配条目。单遍混合时
+      // 「先到的 thinking 追加到尾部、后到的 assistant 原位盖章」会让同行顺序倒置
+      // （thinking 排到正文后面）——对位完成后比较器才能看到同行已盖章条目。
+      const ownerUserOf = (rowId: number) => {
+        // 思考行必然晚于其 user 行落库：owner = 最后一条已盖章且行 id 更小的 user。
+        // 只认已盖章的：未盖章 user 的行 id 未知，可能属于更晚的轮。
+        for (let i = next.length - 1; i >= 0; i--) {
+          const e = next[i];
+          if (e.role === "user" && e.msgId !== undefined && e.msgId < rowId) return e.id;
+        }
+        return null;
+      };
+      const windowFor = (anchorId: number | null) => {
+        // 窗口 = [owner user 之后, 下一条 user 之前)：双边界把跨轮同文的孤儿块和
+        // 下一轮的直播块都排除在外。
+        if (anchorId === null) return { from: 0, to: next.length };
+        const at = next.findIndex((e) => e.id === anchorId);
+        if (at < 0) return { from: 0, to: next.length };
+        let to = next.length;
+        for (let i = at + 1; i < next.length; i++) {
+          if (next[i].role === "user") {
+            to = i;
+            break;
+          }
+        }
+        return { from: at + 1, to };
+      };
+      // 阶段一：身份对位（盖章）。批内遇到 user 条目即以其为窗口锚（盖章→可用；
+      // 追加→直播条目整体缺席，本段无从盖章）；批内还没遇到 user 时按行 id 回溯
+      // 最近一条已盖章 user（思考行必然晚于其 user 行落库）。
+      let ownerAnchorId: number | null = null;
+      let anchorFromBatch = false;
+      let anchorUsable = false;
+      const unmatched: Array<{ m: HistoryMsg; rank: number }> = [];
       for (const m of items) {
-        if (have.has(m.id)) continue;
-        const idx = next.findIndex(
-          (e) =>
-            e.msgId === undefined &&
-            !e.sendFailed &&
-            e.role === m.role &&
-            e.content.trim() === m.content.trim(),
-        );
+        const key = `${m.id}:${m.role}`;
+        if (have.has(key)) continue;
+        let idx = -1;
+        if (m.role === "thinking") {
+          const anchor = anchorFromBatch ? ownerAnchorId : ownerUserOf(m.id);
+          const usable = anchorFromBatch ? anchorUsable : anchor !== null;
+          const { from, to } = usable ? windowFor(anchor) : { from: 0, to: 0 };
+          if (from < to) {
+            idx = next.findIndex(
+              (e, i) =>
+                i >= from &&
+                i < to &&
+                e.msgId === undefined &&
+                !e.sendFailed &&
+                e.role === "thinking" &&
+                normalizeThinkingText(e.content) ===
+                  normalizeThinkingText(m.content),
+            );
+          }
+        } else {
+          idx = next.findIndex(
+            (e) =>
+              e.msgId === undefined &&
+              !e.sendFailed &&
+              e.role === m.role &&
+              e.content.trim() === m.content.trim(),
+          );
+        }
         if (idx >= 0) {
           next[idx] = { ...next[idx], msgId: m.id };
-        } else {
-          appended.push({
-            id: next_entry_id++,
-            ts: historyEntryTs(m.ts),
-            role: m.role,
-            content: m.content,
-            msgId: m.id,
-          });
         }
-        have.add(m.id);
+        if (m.role === "user") {
+          anchorFromBatch = true;
+          anchorUsable = idx >= 0;
+          ownerAnchorId = idx >= 0 ? next[idx].id : null;
+        }
+        if (idx < 0) {
+          unmatched.push({ m, rank: roleRank(m.role) });
+        }
+        have.add(key);
       }
-      // 乱序行插到第一个更大持久化 id 之前；未盖章直播条目（msgId 缺省）不参与
-      // 定位——它们的位置在增量入账前本来就是临时序。
-      for (const item of appended) {
-        const pos = next.findIndex((e) => e.msgId !== undefined && e.msgId > item.msgId!);
-        if (pos >= 0) next.splice(pos, 0, item);
-        else next.push(item);
+      // 阶段二：统一定位插入。按 (行 id, 同行角色序) 全序比较——乱序行落在第一个
+      // 更大行 id 之前，同行内保持 thinking → status → assistant。
+      for (const { m, rank } of unmatched) {
+        const pos = next.findIndex(
+          (e) =>
+            e.msgId !== undefined &&
+            (e.msgId > m.id || (e.msgId === m.id && roleRank(e.role) > rank)),
+        );
+        const entry: Entry = {
+          id: next_entry_id++,
+          ts: historyEntryTs(m.ts),
+          role: m.role,
+          content: m.content,
+          msgId: m.id,
+        };
+        if (pos >= 0) next.splice(pos, 0, entry);
+        else next.push(entry);
       }
       return { ...prev, [chatId]: next };
     });
@@ -661,17 +740,26 @@ ${event.payload.command}
           }));
           // 事件可能先于快照返回：每条快照条目一对一消费一条同角色同文的直播孪生
           // （成员资格判断会误伤重复文本——快照之后新发的乐观「继续」、永远无法从
-          // 库里恢复的发送失败条目都会被整批错杀）。没被消费的直播条目与思考块
-          // 保留在尾部，等增量入账盖章。
+          // 库里恢复的发送失败条目都会被整批错杀）。两边都按时间序，用前进指针从
+          // 上次消费位继续找：跨轮同文的思考块不会被更早的孤儿直播块顶替消费。
+          // 思考块比较走归一化（直播侧带「💭 思考中...」前缀/流式差异）。没被消费
+          // 的直播条目与思考块保留在尾部，等增量入账盖章。
           const live = [...(prev[chatId] ?? [])];
+          let searchFrom = 0;
           for (const c of committed) {
-            const idx = live.findIndex(
-              (e) =>
+            const rel = live.findIndex(
+              (e, i) =>
+                i >= searchFrom &&
                 !e.sendFailed &&
                 e.role === c.role &&
-                e.content.trim() === c.content.trim(),
+                (c.role === "thinking"
+                  ? normalizeThinkingText(e.content) === normalizeThinkingText(c.content)
+                  : e.content.trim() === c.content.trim()),
             );
-            if (idx >= 0) live.splice(idx, 1);
+            if (rel >= 0) {
+              live.splice(rel, 1);
+              searchFrom = rel;
+            }
           }
           return { ...prev, [chatId]: [...committed, ...live] };
         });

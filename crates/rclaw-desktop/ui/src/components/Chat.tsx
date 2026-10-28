@@ -1,4 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  Fragment,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, parseToolStatusLine, type PermissionMode, type PlanStatus } from "../lib/api";
@@ -283,6 +290,81 @@ const ThinkingBody = React.memo(function ThinkingBody({
     </div>
   );
 });
+
+/** 「已工作 X 分 X 秒」折叠条（zcode 同款交互，参考 ConversationTurnGroup）：
+ *  完成态显示过程耗时（首/末条目时间差，固定不随时钟增长），运行态每秒跳动。
+ *  时长是展示跨度（直播到达/落库时间差），不是运行时的权威工时。秒级 tick 只在
+ *  本组件内 setState，不驱动消息列表重建。 */
+function WorkSegmentBar({
+  running,
+  startMs,
+  endMs,
+  open,
+  collapsible,
+  onToggle,
+}: {
+  running: boolean;
+  startMs?: number;
+  endMs?: number;
+  open: boolean;
+  collapsible: boolean;
+  onToggle: () => void;
+}) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => setTick((v) => v + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [running]);
+  let label: string;
+  if (running) {
+    label = startMs ? `工作中 ${formatDuration(Math.max(1, Math.round((Date.now() - startMs) / 1000)))}` : "工作中";
+  } else if (startMs && endMs && endMs > startMs) {
+    label = `已工作 ${formatDuration(Math.max(1, Math.round((endMs - startMs) / 1000)))}`;
+  } else {
+    label = "已处理";
+  }
+  return (
+    <button
+      onClick={collapsible ? onToggle : undefined}
+      disabled={!collapsible}
+      title={collapsible ? (open ? "收起工作过程" : "展开工作过程") : undefined}
+      aria-label={label}
+      aria-expanded={collapsible ? open : undefined}
+      className={`flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-xs text-gray-500 transition ${
+        collapsible ? "hover:bg-[#1a2030] hover:text-gray-300" : "cursor-default"
+      }`}
+    >
+      <span>{label}</span>
+      {collapsible && (
+        <span className="text-[10px] text-gray-600">{open ? "▾" : "▸"}</span>
+      )}
+    </button>
+  );
+}
+
+/** 工作过程容器壳：折叠条 + 展开内容。open 状态由外层按段管理；children 元素
+ *  身份在上层 memo 中保持稳定——开合只重排本壳，不重建消息子树。 */
+function ProcessGroupShell({
+  header,
+  open,
+  children,
+}: {
+  header: React.ReactNode;
+  open: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="min-w-0">
+      {header}
+      {open && (
+        <div className="ml-1 space-y-2.5 border-l-2 border-[#2a2f3a] pl-2.5 max-md:pl-2">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
 
 /** 把文本写进剪贴板：Android WebView 非安全上下文 / 无焦点时 clipboard API 报
  *  NotAllowedError: Write permission denied，回退隐藏 textarea + execCommand。 */
@@ -690,6 +772,18 @@ export default function Chat({
   // 思考块批量开合的代次：每次一键展开/折叠 +1，强制所有 ThinkingBlock 按新
   // 默认态重挂载（defaultOpen 只在挂载时生效，仅改 prop 不影响已挂载的块）。
   const [thinkingGen, setThinkingGen] = useState(0);
+  // 工作过程折叠段的显隐（按段 key = 段首条目 id）：缺省 = 收起（历史段）；运行中
+  // 段强制展开不占此表；busy→false 完成时补一次 true（完成瞬间不收缩）。切会话清空。
+  const [openSegs, setOpenSegs] = useState<Record<number, boolean>>({});
+  // 运行段集合 ref（仅提交阶段写入，见 listBlocks 后的 useLayoutEffect）与上一
+  // 提交的快照（完成段对比用）。busy→false 的首次渲染从 ref 读到「上次提交还在
+  // 运行」——不等 effect 补账（否则过程先卸载再重挂：思考块局部状态丢失、跟随
+  // effect 按收缩后的高度拉底，长过程把最终正文推出视口）。
+  const runningKeysRef = useRef<Set<number>>(new Set());
+  const prevRunningSegKeysRef = useRef<Set<number>>(new Set());
+  // 工作段开合的结算代次：与 thinkingGen 共用同一套「动作前跟随态 + 滚动位置 →
+  // 结算」机制（思考块批量开合引入，见下方结算 effect）。
+  const [foldGen, setFoldGen] = useState(0);
   // 移动端无物理键盘：占位文案去掉 Enter/↑↓ 提示。
   const isMobile = useIsMobile();
   useEffect(() => {
@@ -1094,7 +1188,9 @@ export default function Chat({
     // 切会话清附件与 ↑↓ 浏览态（附件发错对象/历史错位）；草稿清空由 App 的
     // openChat/newChat 入口同步完成——若在此清，分享确认「先切会话再并入」
     // 的文本会被这个后跑的 effect 抹掉。排队消息不清：队列在 App 按会话分桶，
-    // 这里显示的只是当前会话的那一份，切回来还在。
+    // 这里显示的只是当前会话的那一份，切回来还在。工作段折叠态的清空在提交
+    // 阶段的会话边界 layout effect（下方）里做——这里清会把维护 effect 刚记录
+    // 的运行集合抹掉且同次提交不再重跑。
     setAttachments([]);
     setHistoryIndex(null);
     setQuote(null);
@@ -1112,6 +1208,16 @@ export default function Chat({
       el.scrollTop = el.scrollHeight;
       lastScrollTopRef.current = el.scrollTop;
     }
+  }, [sessionKey]);
+
+  // 会话边界（提交阶段）：清工作段折叠态与运行集合 ref。必须声明在下方维护
+  // effect 之前（同阶段按声明序执行：先重置、再按新会话记录）——否则「切到运行
+  // 中的会话」时维护 effect 写入的集合会被这里清掉，且 listBlocks 未变时维护
+  // effect 不再重跑，完成渲染会读到空集而折叠。
+  useLayoutEffect(() => {
+    setOpenSegs({});
+    runningKeysRef.current = new Set();
+    prevRunningSegKeysRef.current = new Set();
   }, [sessionKey]);
 
   // 排队消息（第十二轮 · zcode 同款）：agent 运行期间发送的消息进入队列，显示在
@@ -1136,22 +1242,42 @@ export default function Chat({
     null,
   );
   const scrollSettleSuppressUntilRef = useRef(0);
-  const toggleAllThinking = () => {
-    const collapsed = !futureThinkingCollapsed;
+  const captureSettle = () => {
     thinkingSettleRef.current = {
       wasFollowing: stickToBottomRef.current,
       scrollTop: listRef.current?.scrollTop ?? 0,
     };
+  };
+  const toggleAllThinking = () => {
+    const collapsed = !futureThinkingCollapsed;
+    captureSettle();
     onToggleThinking(collapsed);
     setThinkingGen((gen) => gen + 1);
   };
 
-  // 批量开合后的滚动结算：列表高度变了，但现有跟随 effect 只依赖条数/末条长度/
-  // busy，不会因此重跑。动作前脱离 → 复原脱离（把位置钳回保存值 + 开抑制窗，
-  // 后续的钳位滚动事件不再改判跟随）；动作前跟随 → 补拉底（展开可能把最新消息
-  // 顶出视口）。不做无条件拉底。
+  // 工作过程折叠段开合：与思考块批量开合同一套滚动结算（captureSettle + bump 代次）。
+  const toggleSegment = (key: number) => {
+    captureSettle();
+    setOpenSegs((prev) => ({ ...prev, [key]: !(prev[key] ?? false) }));
+    setFoldGen((gen) => gen + 1);
+  };
+
+  // 退出选择模式统一入口：先 capture 动作前的跟随态/位置并 bump 结算代次，再清
+  // 选择。清空会让强制展开的段收回、高度骤减触发钳位——被动的 effect 在 DOM 收缩
+  // 之后才跑，钳位滚动可能已把脱离态翻转（系统返回键等外部路径同样走这里）。
+  const exitSelection = () => {
+    if (selectIds === null) return;
+    captureSettle();
+    setFoldGen((gen) => gen + 1);
+    setSelectIds(null);
+  };
+
+  // 批量开合（思考块 / 工作段）后的滚动结算：列表高度变了，但现有跟随 effect 只
+  // 依赖条数/末条长度/busy，不会因此重跑。动作前脱离 → 复原脱离（把位置钳回保存
+  // 值 + 开抑制窗，后续的钳位滚动事件不再改判跟随）；动作前跟随 → 补拉底（展开
+  // 可能把最新消息顶出视口）。不做无条件拉底。
   useEffect(() => {
-    if (thinkingGen === 0) return;
+    if (thinkingGen === 0 && foldGen === 0) return;
     const settle = thinkingSettleRef.current;
     thinkingSettleRef.current = null;
     if (touchStateRef.current.active || touchStateRef.current.zombie) return;
@@ -1173,7 +1299,7 @@ export default function Chat({
       const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       setShowJumpDown(!nearBottom || !stickToBottomRef.current);
     }
-  }, [thinkingGen]);
+  }, [thinkingGen, foldGen]);
 
   const send = () => {
     const content = draft.trim();
@@ -1388,7 +1514,7 @@ export default function Chat({
     setTextSelectId(null);
     window.getSelection?.()?.removeAllRanges();
   });
-  useBackClose(selectIds !== null, () => setSelectIds(null));
+  useBackClose(selectIds !== null, exitSelection);
   useBackClose(gallery !== null, () => setGallery(null));
   useBackClose(attachMenuOpen, () => setAttachMenuOpen(false));
   useBackClose(permOpen, () => setPermOpen(false));
@@ -1516,9 +1642,12 @@ export default function Chat({
   // 真机上可感知（曾表现为点图片开全屏查看器要顿 1~2s）。缓存的元素身份
   // 不变时 React 直接跳过对应子树。行内闭包只触达 setState 与 ref，沿用
   // 旧闭包无碍。
-  const listItems = useMemo(
-    () =>
-      entries.map((e, i) => {
+  // 输出为「展示段」块（zcode「已工作 X」同款）：每段 = user 条目 + 工作过程
+  // （折叠容器内）+ 最终回复（容器外）。开合状态（openSegs）在外层读取，块内
+  // 元素身份不随开合变化——折叠只重排壳，不重建消息子树。
+  const listBlocks = useMemo(
+    () => {
+      const renderEntry = (e: Entry) => {
         if (e.role === "status") {
           const toolStatus = parseToolStatusLine(e.content);
           const selected = selectIds?.has(e.id) ?? false;
@@ -1584,9 +1713,7 @@ export default function Chat({
           );
         }
         if (e.role === "thinking") {
-          const next = i + 1 < entries.length ? entries[i + 1] : undefined;
-          const elapsed = e.ts && next?.ts ? Math.round((next.ts - e.ts) / 1000) : null;
-          const durationSecs = elapsed !== null && elapsed >= 1 ? elapsed : null;
+          const durationSecs = durationById.get(e.id) ?? null;
           const selected = selectIds?.has(e.id) ?? false;
           return (
             <div
@@ -1755,15 +1882,129 @@ export default function Chat({
             </div>
           </div>
         );
-      }),
+      };
+
+      // 思考块的持续时长（下一条目到达与本条到达的时间差，历史恢复无时间戳则不
+      // 显示）：与原 entries[i+1] 平铺口径完全一致，只是预计算成表供 renderEntry 查。
+      const durationById = new Map<number, number | null>();
+      entries.forEach((e, i) => {
+        if (e.role !== "thinking") return;
+        const nxt = i + 1 < entries.length ? entries[i + 1] : undefined;
+        const elapsed = e.ts && nxt?.ts ? Math.round((nxt.ts - e.ts) / 1000) : null;
+        durationById.set(e.id, elapsed !== null && elapsed >= 1 ? elapsed : null);
+      });
+
+      // 展示段分段：user 条目开启一段（展示段 ≠ 后端 turn：「立即」投递并入运行中
+      // 的 turn、排队出队开启新段）。快照只裁最近 80 条时可能没有 user 开头——该
+      // 前缀段整段平铺（不做折叠壳）；发送失败段同样平铺（错误提示必须显眼）。
+      const segs: Array<{ key: number; user: Entry | null; rows: Entry[] }> = [];
+      let cur: { key: number; user: Entry | null; rows: Entry[] } | null = null;
+      for (const e of entries) {
+        if (e.role === "user") {
+          cur = { key: e.id, user: e, rows: [] };
+          segs.push(cur);
+          continue;
+        }
+        if (!cur) {
+          cur = { key: e.id, user: null, rows: [] };
+          segs.push(cur);
+        }
+        cur.rows.push(e);
+      }
+
+      return segs.map((seg, si) => {
+        const running = busy && si === segs.length - 1;
+        const hasAssistant = seg.rows.some((r) => r.role === "assistant");
+        const hasProcess = seg.rows.some(
+          (r) => r.role === "status" || r.role === "thinking",
+        );
+        const flat =
+          seg.user === null || !!seg.user?.sendFailed || !hasProcess;
+        // 最终回复 = 完成段里最后一个 assistant 条目（启发式：Entry 不携带
+        // intermediate 标记）。运行段不分离最终正文——运行中的最后 assistant
+        // 仍可能是中间说明；无 assistant 的段（被取消/中断的轮）整体留在过程
+        // 容器并强制展开，上下文不丢。
+        let finalIdx = -1;
+        if (!running && hasAssistant) {
+          for (let ri = seg.rows.length - 1; ri >= 0; ri--) {
+            if (seg.rows[ri].role === "assistant") {
+              finalIdx = ri;
+              break;
+            }
+          }
+        }
+        const processRows = finalIdx >= 0 ? seg.rows.slice(0, finalIdx) : seg.rows;
+        const finalRow = finalIdx >= 0 ? seg.rows[finalIdx] : null;
+        const followingRows = finalIdx >= 0 ? seg.rows.slice(finalIdx + 1) : [];
+        return {
+          key: seg.key,
+          userEl: seg.user ? renderEntry(seg.user) : null,
+          flat,
+          flatRowsEls: flat ? seg.rows.map(renderEntry) : [],
+          processEls: flat ? [] : processRows.map(renderEntry),
+          finalEl: flat || !finalRow ? null : renderEntry(finalRow),
+          followingEls: flat ? [] : followingRows.map(renderEntry),
+          running,
+          collapsible: !running && hasAssistant,
+          startMs: processRows[0]?.ts,
+          // 跨度终点 = 最终回复条目（无则最后一条过程行）；段尾 following 行不计入
+          // 工作时长。
+          endMs: (finalRow ?? processRows[processRows.length - 1])?.ts,
+        };
+      });
+    },
     // 行内闭包只触达 setState / ref（openMsgMenu、toggleSelected 等），不列入
     // 依赖是刻意的；onError 需要稳定身份（App 侧已 useCallback）；onFork 随会话
     // 变化（依赖 activeId），必须列入——否则分叉闭包捕获旧会话 id，切会话后
     // 点「分叉」会 fork 到上一个会话。thinkingGen 参与 ThinkingBlock 的 key，
-    // 变化时必须重算否则一键开合不会重挂载。
+    // 变化时必须重算否则一键开合不会重挂载。busy 参与运行段判定（最终回复
+    // 是否分离）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId, thinkingGen],
+    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId, thinkingGen, busy],
   );
+
+  // 运行段集合仅在提交阶段（useLayoutEffect）写入，渲染期只读上次提交的集合——
+  // 渲染函数保持可重复（StrictMode 双调用 / 并发渲染被丢弃都不会污染 ref）。
+  // busy→false 的完成渲染据此推导 open=true（上次提交还在运行），过程不卸载；
+  // 同一提交阶段把决定固化进 openSegs，后续渲染从 state 读、可手动收起。
+  // sessionKey 入依赖：会话边界 layout effect（上方）先清、本 effect 后按新会话
+  // 重录运行集合（同阶段按声明序执行）。
+  useLayoutEffect(() => {
+    runningKeysRef.current = new Set(
+      listBlocks.filter((b) => b.running).map((b) => b.key),
+    );
+    const finished = [...prevRunningSegKeysRef.current].filter(
+      (k) => !runningKeysRef.current.has(k),
+    );
+    prevRunningSegKeysRef.current = runningKeysRef.current;
+    if (finished.length === 0) return;
+    setOpenSegs((prevOpen) => {
+      const patch = { ...prevOpen };
+      let changed = false;
+      for (const k of finished) {
+        if (patch[k] === undefined) {
+          patch[k] = true;
+          changed = true;
+        }
+      }
+      return changed ? patch : prevOpen;
+    });
+  }, [listBlocks, sessionKey]);
+
+  // 段开合状态在渲染期推导（只读上次提交的运行集合，本渲染不产生副作用——可
+  // 被 StrictMode / 并发渲染安全地重复执行）。
+  const segOpen = new Map<number, boolean>();
+  const segForced = new Map<number, boolean>();
+  for (const b of listBlocks) {
+    // 选择模式（selectIds 非 null 即处于选择模式，空集也是）强制全部展开，保证
+    // 每一行都可达；运行段/无 assistant 段强制展开且不可收起。
+    const forcedOpen = selectIds !== null || b.running || !b.collapsible;
+    segForced.set(b.key, forcedOpen);
+    segOpen.set(
+      b.key,
+      forcedOpen || (openSegs[b.key] ?? runningKeysRef.current.has(b.key)),
+    );
+  }
 
   return (
     <div className="chat-bg flex h-full flex-col">
@@ -1786,7 +2027,40 @@ export default function Chat({
             </p>
           </div>
         )}
-        {listItems}
+        {listBlocks.map((b) => {
+          const forcedOpen = segForced.get(b.key) ?? false;
+          const open = segOpen.get(b.key) ?? false;
+          if (b.flat) {
+            return (
+              <Fragment key={b.key}>
+                {b.userEl}
+                {b.flatRowsEls}
+              </Fragment>
+            );
+          }
+          return (
+            <Fragment key={b.key}>
+              {b.userEl}
+              <ProcessGroupShell
+                header={
+                  <WorkSegmentBar
+                    running={b.running}
+                    startMs={b.startMs}
+                    endMs={b.endMs}
+                    open={open}
+                    collapsible={!forcedOpen}
+                    onToggle={() => toggleSegment(b.key)}
+                  />
+                }
+                open={open}
+              >
+                {b.processEls}
+              </ProcessGroupShell>
+              {b.finalEl}
+              {b.followingEls}
+            </Fragment>
+          );
+        })}
         {/* turn 进行中：消息流底部转圈齿轮，表示 agent 正在执行 */}
         {busy && (
           <div className="flex justify-start">
@@ -1925,7 +2199,7 @@ export default function Chat({
                   : "全选"}
               </button>
               <button
-                onClick={() => setSelectIds(null)}
+                onClick={exitSelection}
                 className="ml-auto rounded px-1.5 py-0.5 text-[11px] text-gray-400 transition hover:text-gray-200"
               >
                 退出选择
@@ -1935,7 +2209,7 @@ export default function Chat({
               <button
                 onClick={() => {
                   const text = buildPackageText();
-                  setSelectIds(null);
+                  exitSelection();
                   if (text) onForwardToChat?.(text);
                 }}
                 disabled={selectedCount === 0}

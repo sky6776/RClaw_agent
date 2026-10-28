@@ -1419,6 +1419,10 @@ pub struct ChatHistoryDelta {
 
 /// transcript 行 → 面板条目（快照与增量共用同一映射，两边口径才不会走散）。
 ///
+/// thinking 条目（Reasoning 块）在两条路径都生成：增量路径必须产出它，turn 收尾的
+/// 增量批才能与屏幕上的直播思考块对上并盖章（前端按归一化文本匹配；匹配不上则追加，
+/// 宁可偶有重复也不错盖别的轮）。
+///
 /// status 条目（工具调用轮）只在快照路径生成（调用方传 `with_status`）：直播视图里
 /// 同一工具轮已有运行时的「正在调用工具(N):…」进度行，增量再合成一份「🔧 调用工具」
 /// 就会双份；重载后的快照没有直播进度行，仍需要它充当工具轮占位。
@@ -1448,6 +1452,33 @@ fn history_entries(msgs: &[rclaw_core::Message], with_status: bool) -> Vec<Histo
                 });
             }
             rclaw_core::Role::Assistant => {
+                // 思考块恢复：assistant 行内的 Reasoning 块（工具迭代行与 had_tool_iter
+                // 的最终回复行都落库了）映射为 thinking 条目，不做这一步重启后思考块
+                // 全丢。不受 with_status 门控：增量路径（chat_history_since）同样要
+                // 产出，否则 turn 收尾的增量批无法盖掉屏幕上的直播思考块（会重复）。
+                // 同行多个 Reasoning 块聚合成一条（现行构造每行至多一块，防御性拼接）。
+                let reasoning: String = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        rclaw_core::ContentBlock::Reasoning {
+                            reasoning_content, ..
+                        } => {
+                            let t = reasoning_content.trim();
+                            (!t.is_empty()).then(|| t.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !reasoning.is_empty() {
+                    out.push(HistoryMsgDto {
+                        id: msg.id,
+                        role: "thinking".into(),
+                        content: reasoning,
+                        ts: msg.ts,
+                    });
+                }
                 let tools: Vec<&str> = msg
                     .content
                     .iter()
@@ -6617,6 +6648,26 @@ mod history_entries_tests {
         }
     }
 
+    /// 工具迭代行：reasoning + tool_use（build_assistant_message 的落库形态）。
+    fn reasoning_tool_use_msg(id: i64, reasoning: &str) -> Message {
+        Message {
+            id,
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    reasoning_content: reasoning.into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+            ],
+            tool_call_id: None,
+            ts: id,
+        }
+    }
+
     fn tool_result_carrier(id: i64) -> Message {
         Message {
             id,
@@ -6679,5 +6730,102 @@ mod history_entries_tests {
                 ts: 5,
             }]
         );
+    }
+
+    #[test]
+    fn reasoning_block_maps_to_thinking_before_status_and_text() {
+        let msgs = vec![
+            text_msg(1, Role::User, "问题"),
+            reasoning_tool_use_msg(2, "先想想"),
+            text_msg(3, Role::Assistant, "答案"),
+        ];
+        // 快照路径（with_status=true）：thinking 在同行 status 之前；行 2 无 Text 块，
+        // 不产出 assistant 条目（与既有口径一致）。
+        let snapshot = history_entries(&msgs, true);
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|e| (e.id, e.role.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "user"), (2, "thinking"), (2, "status"), (3, "assistant")],
+        );
+        assert_eq!(snapshot[1].content, "先想想");
+        // 增量路径（with_status=false）：thinking 仍产出（盖章去重依赖它），status 不产出。
+        let delta = history_entries(&msgs, false);
+        assert_eq!(
+            delta
+                .iter()
+                .map(|e| (e.id, e.role.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "user"), (2, "thinking"), (3, "assistant")],
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_reasoning_are_skipped() {
+        let mut msg = reasoning_tool_use_msg(2, "  ");
+        msg.content.insert(
+            0,
+            ContentBlock::Reasoning {
+                reasoning_content: "".into(),
+            },
+        );
+        let entries = history_entries(&std::slice::from_ref(&msg), false);
+        assert!(entries.is_empty(), "空/空白 reasoning 不应产出条目");
+    }
+
+    #[test]
+    fn multiple_reasoning_blocks_aggregate_into_one_entry() {
+        let msg = Message {
+            id: 2,
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    reasoning_content: "第一段".into(),
+                },
+                ContentBlock::Reasoning {
+                    reasoning_content: " 第二段 ".into(),
+                },
+            ],
+            tool_call_id: None,
+            ts: 2,
+        };
+        let entries = history_entries(&[msg], true);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, "thinking");
+        assert_eq!(entries[0].content, "第一段\n\n第二段");
+    }
+
+    #[test]
+    fn full_tool_iteration_row_maps_thinking_status_text_in_order() {
+        // build_assistant_message 的完整形态：reasoning + tool_use + text 同一行。
+        let msg = Message {
+            id: 2,
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    reasoning_content: "想想".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({"path": "a.md"}),
+                },
+                ContentBlock::text("小结"),
+            ],
+            tool_call_id: None,
+            ts: 2,
+        };
+        let entries = history_entries(&[msg], true);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.id, e.role.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "thinking"), (2, "status"), (2, "assistant")],
+        );
+        assert_eq!(entries[0].content, "想想");
+        assert_eq!(entries[1].content, "🔧 调用工具: read");
+        assert_eq!(entries[2].content, "小结");
     }
 }
