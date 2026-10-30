@@ -888,6 +888,52 @@ impl CollaborationState {
         Ok(())
     }
 
+    /// 清除已终态、且满足 `filter` 的执行记录（登记表 + journal 事件流一并删除），
+    /// 返回清除条数。非终态（排队/运行/等待/取消中）是活任务，一律保留。
+    ///
+    /// 等待在该执行上的 AgentWait / 恢复入口随后会拿到 unknown 错误——记录都没了，
+    /// 这是预期语义（桌面会话删除级联与「清除历史」按钮共用）。
+    async fn remove_terminal_executions(
+        &self,
+        filter: impl Fn(&ExecutionSnapshot) -> bool,
+    ) -> usize {
+        let removed: Vec<String> = {
+            let mut executions = self.executions.lock().await;
+            let doomed: Vec<String> = executions
+                .iter()
+                .filter(|(_, record)| {
+                    record.snapshot.state.is_terminal() && filter(&record.snapshot)
+                })
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect();
+            for agent_id in &doomed {
+                executions.remove(agent_id);
+            }
+            doomed
+        };
+        // journal 流删除在锁外做（sqlite 阻塞 IO）：失败只告警——内存登记表已清，
+        // 残留流下次重启会被 recover 装回登记表（终态记录，仅展示），可再次清除。
+        for agent_id in &removed {
+            if let Err(error) = self.journal.delete_stream(JOURNAL_EXEC_LOG, agent_id) {
+                tracing::warn!("清理子 agent 执行事件流 {agent_id} 失败: {error}");
+            }
+        }
+        removed.len()
+    }
+
+    /// 清空全部已终态的后台执行记录（桌面「Agent 状态 / 任务概览」的清除按钮）。
+    pub(super) async fn clear_finished_executions(&self) -> usize {
+        self.remove_terminal_executions(|_| true).await
+    }
+
+    /// 清掉源自指定会话的已终态执行记录（会话删除级联）。
+    pub(super) async fn forget_session_executions(&self, channel: &str, chat_id: &str) -> usize {
+        self.remove_terminal_executions(|snapshot| {
+            snapshot.spec.source_channel == channel && snapshot.spec.origin_chat_id == chat_id
+        })
+        .await
+    }
+
     pub(super) async fn execution_payload(&self, agent_id: &str) -> Option<Value> {
         let executions = self.executions.lock().await;
         let record = executions.get(agent_id)?;

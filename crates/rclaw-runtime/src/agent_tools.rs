@@ -1268,6 +1268,20 @@ impl AgentToolRuntime {
         self.collaboration.execution_list_payload().await
     }
 
+    /// 清空全部已终态的后台执行记录（登记表 + journal 事件流），返回清除条数。
+    /// 非终态（排队/运行/等待/取消中）是活任务，一律保留；会话不受任何影响。
+    pub async fn clear_finished_executions(&self) -> usize {
+        self.collaboration.clear_finished_executions().await
+    }
+
+    /// 会话删除级联：清掉源自指定会话（source_channel + origin_chat_id）的已终态
+    /// 执行记录，返回清除条数。活任务保留——它们完成后成为终态记录，可再被清除。
+    pub async fn forget_session_executions(&self, channel: &str, chat_id: &str) -> usize {
+        self.collaboration
+            .forget_session_executions(channel, chat_id)
+            .await
+    }
+
     async fn cancel_execution(&self, agent_id: &str, reason: &str) -> Result<Value, String> {
         self.collaboration
             .request_cancellation(agent_id, reason)

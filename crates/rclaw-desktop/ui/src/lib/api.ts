@@ -625,6 +625,9 @@ export const api = {
 
   agentsList: () => invoke<{ executions: AgentExecution[]; total: number }>("agents_list"),
 
+  /** 清空已终态的后台执行记录（只清任务历史，不动会话；活任务保留）。返回清除条数。 */
+  agentsClearHistory: () => invoke<number>("agents_clear_history"),
+
   usageSnapshot: (chatId: string) => invoke<UsageSnapshot>("usage_snapshot", { chatId }),
 
   toolsList: () => invoke<ToolEntry[]>("tools_list"),

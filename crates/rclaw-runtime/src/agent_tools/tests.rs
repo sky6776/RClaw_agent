@@ -1836,6 +1836,69 @@ async fn cancellation_before_spawn_never_regresses_to_running() {
     assert_eq!(states, vec!["queued", "cancelling", "cancelled"]);
 }
 
+#[tokio::test]
+async fn clear_finished_and_session_cascade_remove_only_terminal_records() {
+    let (runtime, _layout, _registry) = test_runtime_with_provider(Arc::new(PendingProvider));
+
+    // 终态记录 ×2（desktop 会话 main 的 done-1、会话 other 的 other-1）+ 活任务 ×1
+    // （同会话 main 的 live-1：排队中，清除必须保留）。
+    for (agent_id, chat) in [("done-1", "main"), ("other-1", "other"), ("live-1", "main")] {
+        let mut spec = test_spec(&format!("work for {agent_id}"));
+        spec.source_channel = "desktop".to_string();
+        spec.origin_chat_id = chat.to_string();
+        runtime
+            .insert_queued_execution(
+                agent_id.to_string(),
+                spec,
+                rclaw_core::ToolAccess::Sandboxed,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+    }
+    for agent_id in ["done-1", "other-1"] {
+        runtime
+            .transition_execution(
+                agent_id,
+                ExecutionState::Cancelled,
+                0,
+                "测试终态",
+                ExecutionOutcomeUpdate::default(),
+                "cancelled",
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(runtime.execution_list_payload().await["total"], 3);
+
+    // 会话删除级联：只清 desktop/main 的终态记录（done-1），活任务与他会话保留。
+    let removed = runtime
+        .forget_session_executions("desktop", "main")
+        .await;
+    assert_eq!(removed, 1);
+    let payload = runtime.execution_list_payload().await;
+    assert_eq!(payload["total"], 2);
+    let ids: Vec<&str> = payload["executions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["agent_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"live-1"), "活任务保留: {ids:?}");
+    assert!(ids.contains(&"other-1"), "其他会话保留: {ids:?}");
+    assert!(!ids.contains(&"done-1"), "终态记录已级联清除: {ids:?}");
+    // journal 事件流一并删除。
+    let streams = runtime.collaboration.journal().streams(JOURNAL_EXEC_LOG).unwrap();
+    assert!(!streams.iter().any(|s| s == "done-1"), "journal 流应已删除: {streams:?}");
+
+    // 清除历史：剩余的终态记录（other-1）清掉，活任务（live-1）保留。
+    let cleared = runtime.clear_finished_executions().await;
+    assert_eq!(cleared, 1);
+    let payload = runtime.execution_list_payload().await;
+    assert_eq!(payload["total"], 1);
+    assert_eq!(payload["executions"][0]["agent_id"], "live-1");
+}
+
 #[test]
 fn recovery_replays_nonterminal_log_as_resumable_waiting() {
     let dir = tempfile::tempdir().unwrap();

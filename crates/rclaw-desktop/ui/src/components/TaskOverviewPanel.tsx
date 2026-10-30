@@ -25,6 +25,9 @@ function stateOf(e: AgentExecution): string {
   return e.state?.toLowerCase?.() ?? "";
 }
 
+/** 已终态（可被「清除历史」清掉的记录）。 */
+const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
+
 /** 任务概览详情页（移动端侧边栏入口）：概览四格 + 后台子 agent 执行列表。
  *
  * 与右侧任务面板同源数据（agentsList，2.5s 轮询）；桌面侧仍由 TaskPanel
@@ -32,6 +35,7 @@ function stateOf(e: AgentExecution): string {
 export default function TaskOverviewPanel({ agentReady }: { agentReady: boolean }) {
   const [executions, setExecutions] = useState<AgentExecution[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
 
   useEffect(() => {
     if (!agentReady) return;
@@ -55,6 +59,27 @@ export default function TaskOverviewPanel({ agentReady }: { agentReady: boolean 
     };
   }, [agentReady]);
 
+  const finishedCount = executions.filter((e) => TERMINAL_STATES.has(stateOf(e))).length;
+
+  const clearHistory = async () => {
+    if (
+      !window.confirm(
+        "清除全部已结束的后台任务记录？（不影响会话；运行中 / 排队 / 等待中的任务保留）",
+      )
+    ) {
+      return;
+    }
+    setClearing(true);
+    try {
+      await api.agentsClearHistory();
+      setExecutions((prev) => prev.filter((e) => !TERMINAL_STATES.has(stateOf(e))));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
+
   const total = executions.length;
   const done = executions.filter((e) => stateOf(e) === "succeeded").length;
   const active = executions.filter((e) =>
@@ -67,7 +92,17 @@ export default function TaskOverviewPanel({ agentReady }: { agentReady: boolean 
     <div className="h-full overflow-y-auto p-6 max-md:p-3">
       <div className="mb-4 flex items-center justify-between">
         <h1 className="text-base font-semibold text-gray-100">任务概览</h1>
-        <span className="text-xs text-gray-600">每 2.5 秒自动刷新</span>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={clearHistory}
+            disabled={!agentReady || clearing || finishedCount === 0}
+            title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
+            className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-[#1c2230] disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {clearing ? "清除中…" : `清除历史${finishedCount > 0 ? `（${finishedCount}）` : ""}`}
+          </button>
+          <span className="text-xs text-gray-600">每 2.5 秒自动刷新</span>
+        </div>
       </div>
 
       <div className="mb-4 grid grid-cols-4 gap-2">

@@ -22,6 +22,9 @@ const STATE_STYLE: Record<string, string> = {
   cancelled: "bg-gray-500/10 text-gray-500",
 };
 
+/** 已终态（可被「清除」清掉的记录）。 */
+const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
+
 function stateOf(e: AgentExecution): string {
   return e.state?.toLowerCase?.() ?? "";
 }
@@ -44,6 +47,7 @@ export default function TaskPanel({
 }) {
   const [executions, setExecutions] = useState<AgentExecution[]>([]);
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
+  const [clearing, setClearing] = useState(false);
 
   // 任务快照轮询（与 AgentsPanel 相同节奏）。
   useEffect(() => {
@@ -94,6 +98,29 @@ export default function TaskPanel({
   const queued = executions.filter((e) => stateOf(e) === "queued").length;
   const failed = executions.filter((e) => stateOf(e) === "failed").length;
 
+  const finishedCount = executions.filter((e) => TERMINAL_STATES.has(stateOf(e))).length;
+
+  // 清除历史（与 Agent 状态页 / 任务概览页同源命令）：只清已终态的任务记录，
+  // 不影响任何会话；活任务保留。本地立即过滤，下个轮询周期自动对齐。
+  const clearHistory = async () => {
+    if (
+      !window.confirm(
+        "清除全部已结束的后台任务记录？（不影响会话；运行中 / 排队 / 等待中的任务保留）",
+      )
+    ) {
+      return;
+    }
+    setClearing(true);
+    try {
+      await api.agentsClearHistory();
+      setExecutions((prev) => prev.filter((e) => !TERMINAL_STATES.has(stateOf(e))));
+    } catch {
+      // 下一个轮询周期带回真实状态。
+    } finally {
+      setClearing(false);
+    }
+  };
+
   const capacity = usage?.context_length ?? 0;
   const used = usage?.request_used ?? 0;
   const pct = capacity > 0 ? Math.min(100, (used / capacity) * 100) : 0;
@@ -104,13 +131,23 @@ export default function TaskPanel({
       {/* 任务概览 */}
       <div className="flex items-center justify-between px-4 pt-4 pb-2">
         <span className="text-xs font-medium text-gray-400">任务概览</span>
-        <button
-          onClick={onOpenAgents}
-          title="打开 Agent 状态页"
-          className="rounded-md px-1.5 text-xs text-gray-500 transition hover:bg-[#1a1f29] hover:text-indigo-300"
-        >
-          详情
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={clearHistory}
+            disabled={!agentReady || clearing || finishedCount === 0}
+            title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
+            className="rounded-md px-1.5 text-xs text-gray-500 transition hover:bg-[#1a1f29] hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {clearing ? "清除中…" : `清除${finishedCount > 0 ? `（${finishedCount}）` : ""}`}
+          </button>
+          <button
+            onClick={onOpenAgents}
+            title="打开 Agent 状态页"
+            className="rounded-md px-1.5 text-xs text-gray-500 transition hover:bg-[#1a1f29] hover:text-indigo-300"
+          >
+            详情
+          </button>
+        </div>
       </div>
       <div className="px-4">
         <div className="mb-2 flex items-baseline gap-1">

@@ -21,6 +21,9 @@ const STATE_LABEL: Record<string, string> = {
   cancelled: "已取消",
 };
 
+/** 已终态（可被「清除历史」清掉的记录）。 */
+const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
+
 /** Agent 状态面板：轮询后台子 agent 执行快照。
  *
  * 只覆盖后台/异步执行的子 agent（Agent 工具的 run_in_background / 团队成员）；
@@ -29,6 +32,7 @@ const STATE_LABEL: Record<string, string> = {
 export default function AgentsPanel({ agentReady }: { agentReady: boolean }) {
   const [executions, setExecutions] = useState<AgentExecution[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
 
   useEffect(() => {
     if (!agentReady) return;
@@ -52,11 +56,46 @@ export default function AgentsPanel({ agentReady }: { agentReady: boolean }) {
     };
   }, [agentReady]);
 
+  const finishedCount = executions.filter((e) =>
+    TERMINAL_STATES.has(e.state?.toLowerCase?.() ?? ""),
+  ).length;
+
+  const clearHistory = async () => {
+    if (
+      !window.confirm(
+        "清除全部已结束的后台任务记录？（不影响会话；运行中 / 排队 / 等待中的任务保留）",
+      )
+    ) {
+      return;
+    }
+    setClearing(true);
+    try {
+      await api.agentsClearHistory();
+      setExecutions((prev) =>
+        prev.filter((e) => !TERMINAL_STATES.has(e.state?.toLowerCase?.() ?? "")),
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
+
   return (
     <div className="h-full overflow-y-auto p-6 max-md:p-3">
       <div className="mb-4 flex items-center justify-between">
         <h1 className="text-base font-semibold text-gray-100">Agent 状态</h1>
-        <span className="text-xs text-gray-600">每 2.5 秒自动刷新</span>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={clearHistory}
+            disabled={!agentReady || clearing || finishedCount === 0}
+            title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
+            className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-[#1c2230] disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {clearing ? "清除中…" : `清除历史${finishedCount > 0 ? `（${finishedCount}）` : ""}`}
+          </button>
+          <span className="text-xs text-gray-600">每 2.5 秒自动刷新</span>
+        </div>
       </div>
 
       <p className="mb-4 rounded-lg border border-[#2a2f3a] bg-[#141821] px-4 py-3 text-xs text-gray-500">

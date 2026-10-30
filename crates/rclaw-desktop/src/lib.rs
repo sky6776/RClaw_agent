@@ -173,6 +173,7 @@ pub fn run() {
             commands::chat_rename,
             commands::chat_export,
             commands::agents_list,
+            commands::agents_clear_history,
             commands::usage_snapshot,
             commands::tools_list,
             commands::set_tool_enabled,

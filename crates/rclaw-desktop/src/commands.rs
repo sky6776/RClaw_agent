@@ -1970,10 +1970,25 @@ async fn set_chat_archived(state: &AppState, chat_id: String, archive: bool) -> 
         return Err(format!("非法会话 id: {chat_id}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
+    let cascade_chat_id = chat_id.clone();
     run_blocking("更新会话归档状态", move || {
         set_session_archived(&session, &chat_id, archive)
     })
-    .await
+    .await?;
+    // 归档即清场（与删除同语义）：该会话的后台执行记录（终态）一并从「Agent 状态 /
+    // 任务概览」移除；恢复会话不回滚这一步。活任务保留——完成后成为终态记录，可被
+    // 清除按钮清走。agent 未启动时不存在执行记录，跳过。
+    if archive {
+        if let Some(runtime) = state.agent_runtime() {
+            let removed = runtime
+                .forget_session_executions(CHANNEL_DESKTOP, &cascade_chat_id)
+                .await;
+            if removed > 0 {
+                tracing::info!("已归档会话 {cascade_chat_id}，级联清除 {removed} 条后台执行记录");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 归档 / 恢复的核心：只改会话标记，与 Tauri 状态解耦便于测试。
@@ -2003,6 +2018,7 @@ pub async fn chat_delete(state: State<'_, AppState>, chat_id: String) -> Result<
     let session = state.session().ok_or("agent 尚未启动")?;
     let lifecycle = state.session_lifecycle().ok_or("agent 尚未启动")?;
     let home = state.home.clone();
+    let cascade_chat_id = chat_id.clone();
     run_blocking("删除会话", move || {
         // 正在跑的会话不删：turn 收尾会把消息 / 检查点写回刚清空的 chat，变成一个只有
         // 半截历史的「幽灵会话」。后端兜底，不依赖前端是否按运行态禁用了删除按钮。
@@ -2018,7 +2034,18 @@ pub async fn chat_delete(state: State<'_, AppState>, chat_id: String) -> Result<
         // 自定义标题随会话一起清掉（空标题 = 删除该键）。
         agent::write_chat_title(&home, &chat_id, "")
     })
-    .await
+    .await?;
+    // 级联清掉源自该会话的后台执行记录（仅终态；活任务保留，完成后可被「清除历史」清走）。
+    // agent 未启动时不存在执行记录，跳过。
+    if let Some(runtime) = state.agent_runtime() {
+        let removed = runtime
+            .forget_session_executions(CHANNEL_DESKTOP, &cascade_chat_id)
+            .await;
+        if removed > 0 {
+            tracing::info!("已删除会话 {cascade_chat_id}，级联清除 {removed} 条后台执行记录");
+        }
+    }
+    Ok(())
 }
 
 /// 删除的核心：只做会话记录删除（活动 / 归档同一张表），与 Tauri 状态解耦便于测试。
@@ -2040,6 +2067,14 @@ fn delete_session_record(
 pub async fn agents_list(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let runtime = state.agent_runtime().ok_or("agent 尚未启动")?;
     Ok(runtime.executions_payload().await)
+}
+
+/// 清空已终态的后台执行记录（「Agent 状态 / 任务概览」的清除按钮）：只清任务历史，
+/// 不影响任何会话；排队/运行/等待中的活任务保留。返回清除条数。
+#[tauri::command]
+pub async fn agents_clear_history(state: State<'_, AppState>) -> Result<usize, String> {
+    let runtime = state.agent_runtime().ok_or("agent 尚未启动")?;
+    Ok(runtime.clear_finished_executions().await)
 }
 
 // ---------------------------------------------------------------------------
