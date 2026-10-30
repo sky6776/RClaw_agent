@@ -8,14 +8,16 @@ STORED(0) 静默压成 DEFLATE，违反 targetSdk 30+ 对 resources.arsc 不压�
 
 用法：python scripts/repack_apk.py <apk 路径>
 产物：<同目录>/<同名>.apk（原文件保留为 .bak）。zipalign/apksigner 取
-ANDROID_TOOLCHAIN 环境变量（缺省 E:\\my-android\\android-toolchain）。
+ANDROID_TOOLCHAIN 环境变量（必填，不内置机器相关路径）。
 """
 import os
 import subprocess
 import sys
 import zipfile
 
-TOOLCHAIN = os.environ.get("ANDROID_TOOLCHAIN", r"E:\my-android\android-toolchain")
+TOOLCHAIN = os.environ.get("ANDROID_TOOLCHAIN")
+if not TOOLCHAIN:
+    sys.exit("请设置 ANDROID_TOOLCHAIN 环境变量（Android toolchain 根目录）")
 BUILD_TOOLS = os.path.join(TOOLCHAIN, "sdk", "build-tools", "36.0.0")
 KEYSTORE = os.path.join(os.environ["USERPROFILE"], ".android", "debug.keystore")
 

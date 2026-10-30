@@ -2,13 +2,20 @@
 """真机 skill 脚本矩阵测试：每个 skill 的主入口以 --help 走一遍
 SkillScriptInstrumentation（真实 Chaquopy 桥 + 技能安装 + 隔离配置）。"""
 import base64
+import os
 import re
 import subprocess
 import sys
 import threading
 import time
 
-ADB = r"E:\my-android\android-toolchain\sdk\platform-tools\adb.exe"
+ADB = os.environ.get("ADB") or os.path.join(
+    os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or "",
+    "platform-tools",
+    "adb.exe",
+)
+if not os.path.isfile(ADB):
+    sys.exit("找不到 adb：请设置 ADB 或 ANDROID_HOME/ANDROID_SDK_ROOT")
 INSTR = "ai.rclaw.app.test/ai.rclaw.app.SkillScriptInstrumentation"
 ARGS_B64 = base64.b64encode('["--help"]'.encode()).decode()
 
