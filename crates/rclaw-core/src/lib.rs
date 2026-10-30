@@ -14,7 +14,7 @@ pub mod model;
 // 顶层 re-export，方便外部 `use rclaw_core::*` 或单符号引用。
 pub use bus::{
     BusMessage, MessageSource, ToolAccess, CHANNEL_CLI, CHANNEL_NAPCAT, CHANNEL_SYSTEM,
-    CHANNEL_TELEGRAM, CHANNEL_WEBSOCKET, CHANNEL_WEIXIN, CRON_TASK_PREFIX,
+    CHANNEL_TELEGRAM, CHANNEL_WEBSOCKET, CHANNEL_WEIXIN, CHANNEL_WXBOT, CRON_TASK_PREFIX,
 };
 pub use model::{
     ChatEvent, ChatOutcome, ChatRequest, ContentBlock, FinishReason, MediaKind, Message, Role,

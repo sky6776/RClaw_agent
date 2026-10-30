@@ -12,10 +12,12 @@
 pub mod console;
 pub mod napcat;
 pub mod weixin;
+pub mod wxbot;
 
 pub use console::Console;
 pub use napcat::{NapCat, NapCatConfig};
 pub use weixin::{Weixin, WeixinConfig};
+pub use wxbot::{Wxbot, WxbotConfig};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

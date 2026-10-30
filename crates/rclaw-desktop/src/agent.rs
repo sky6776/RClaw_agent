@@ -950,6 +950,11 @@ pub(crate) async fn assemble_apk_agent(
         dispatcher.route_to(rclaw_core::CHANNEL_NAPCAT, tx);
         tokio::spawn(napcat.run(inbound_tx.clone(), rx));
     }
+    if let Some(wxbot) = channels.wxbot {
+        let (tx, rx) = mpsc::channel::<BusMessage>(16);
+        dispatcher.route_to(rclaw_core::CHANNEL_WXBOT, tx);
+        tokio::spawn(wxbot.run(inbound_tx.clone(), rx));
+    }
     tokio::spawn(dispatcher.run());
 
     let bot_router = Arc::new(rclaw_runtime::BotRouter::new(

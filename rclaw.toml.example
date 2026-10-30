@@ -207,6 +207,29 @@ enabled = false
 api_base = "https://ilinkai.weixin.qq.com"
 token = "your-ilink-bot-token"
 
+[wxbot]
+# 个人微信通道（VA + WCX 容器内微信；设计契约见 docs/wxbot-channel.md）。
+# 前置：手机上 VA 内微信装好 WCX 模块，开启「API + MCP 服务器」与「Webhook 消息推送」
+# 两个功能，令牌/密钥与下方一致。仅支持同机 loopback（非回环地址会拒绝启动）。
+enabled = false
+api_base = "http://127.0.0.1:3001"          # wcx ApiServer（必须 loopback）
+api_token = "your-wcx-api-token"            # wcx「API + MCP 服务器」里的认证令牌
+webhook_listen = "127.0.0.1:38081"          # 本机 webhook 监听（必须 loopback）
+webhook_path = "/wxbot/webhook"             # 须与 wcx WebhookPush 的 URL 路径一致
+webhook_secret = "your-webhook-secret"      # 与 wcx WebhookPush 一致；留空则通道不启动
+# allow_from = ""                           # 逗号分隔的允许私聊 wxid；空 = 放行全部私聊
+# allow_groups = ""                         # 逗号分隔的允许群 id（xxx@chatroom）；空 = 所有群不响应
+group_reply_policy = "mention"              # 群触发：mention(仅精确 @ 本账号) / all / none(全部静默接收归档)
+# poll_fallback_enabled = true              # webhook 之外的兜底长轮询（保持开启）
+# send_min_gap_sec = 2                      # 相邻发送基础间隔（秒）
+# send_jitter_sec = 3                       # 随机抖动上限（秒）；实际间隔 = min + rand(0..=jitter)
+# send_window_max = 10                      # 60s 滑动窗口内最大发送条数；0 = 关闭窗口限制
+# send_failure_fuse = 5                     # 连续发送失败熔断阈值；0 = 关闭熔断
+# 换微信账号后需重启 RClaw 才会重新绑定（防跨账号复用历史/误发）。
+# 媒体：收到的图片/语音/表情/文件会下载到 agent/media/wxbot/；要把本地文件发给用户，
+#   用 write_file 写到 agent/media/out/ 后由 publish_media 回执生成 `[:wxbot-media ...]`
+#   标记（与 napcat 同款用法；路径须在 media 沙箱内）。
+
 [cron]
 check_interval_sec = 60
 

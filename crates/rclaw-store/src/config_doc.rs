@@ -333,6 +333,8 @@ fn is_secret(key: &str) -> bool {
     matches!(key, "api_key" | "api_keys" | "token" | "access_token")
         || key.ends_with("_key")
         || key.ends_with("_keys")
+        || key.ends_with("_token")
+        || key.ends_with("_secret")
 }
 
 /// 在用户 rclaw.toml（toml_edit 文档）里解析点分路径的当前值。
@@ -416,6 +418,7 @@ mod tests {
             "web_search.zhipu",
             "napcat",
             "weixin",
+            "wxbot",
             "log",
             "mcp",
             "mcp.servers.gbrain",
@@ -552,6 +555,33 @@ mod tests {
             "read_top 行内注释应进文档: {:?}",
             read_top.doc
         );
+    }
+
+    #[test]
+    fn wxbot_secrets_are_masked() {
+        // [wxbot] 段的两个凭据（api_token / webhook_secret）必须被识别为密钥，
+        // 配置面板才会用密码框展示（is_secret 的 _token/_secret 后缀识别）。
+        assert!(is_secret("api_token"));
+        assert!(is_secret("webhook_secret"));
+        assert!(is_secret("access_token"));
+        assert!(!is_secret("api_base"));
+        assert!(!is_secret("webhook_listen"));
+        assert!(!is_secret("allow_from"));
+
+        let doc = parse_example(EXAMPLE);
+        let wxbot = doc
+            .sections
+            .iter()
+            .find(|s| s.path == "wxbot")
+            .expect("[wxbot] 段");
+        for key in ["api_token", "webhook_secret"] {
+            let item = wxbot
+                .items
+                .iter()
+                .find(|i| i.key == key)
+                .unwrap_or_else(|| panic!("wxbot.{key} 应被收录"));
+            assert!(item.secret, "wxbot.{key} 应打码（密码框展示）");
+        }
     }
 
     #[test]

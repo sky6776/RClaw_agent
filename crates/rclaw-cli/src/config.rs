@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use secrecy::Secret;
 use serde::Deserialize;
 
-use rclaw_channels::{NapCatConfig, WeixinConfig};
+use rclaw_channels::{NapCatConfig, WeixinConfig, WxbotConfig};
 use rclaw_llm::{AuthScheme, Dialect, MaxTokensKey, ProtocolKind, ProviderConfig, ReasoningField};
 pub use rclaw_runtime::options::WorkflowActivation;
 
@@ -31,6 +31,8 @@ pub struct Config {
     pub weixin: WeixinSection,
     #[serde(default)]
     pub napcat: NapCatSection,
+    #[serde(default)]
+    pub wxbot: WxbotSection,
     #[serde(default)]
     pub cron: CronSection,
     #[serde(default)]
@@ -644,6 +646,135 @@ fn default_weixin_backoff() -> u64 {
 }
 fn default_weixin_max_failures() -> u32 {
     3
+}
+
+// ---------------------------------------------------------------------------
+// wxbot（VA + WCX 容器内个人微信）
+// ---------------------------------------------------------------------------
+
+/// `[wxbot]` 段：个人微信通道配置（VA + WCX 容器内微信，经本机 REST/webhook 交互）。
+/// 与 [`WeixinSection`] 一样启用 deny_unknown_fields，拼错字段（如把 api_token 误写成
+/// apitoken）将在启动期直接解析失败，而非静默忽略。设计契约见 docs/wxbot-channel.md。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WxbotSection {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// wcx ApiServer 基址（必须 loopback：127.0.0.1 / [::1] / localhost）。
+    #[serde(default = "default_wxbot_api_base")]
+    pub api_base: String,
+    /// wcx「API + MCP 服务器」的认证令牌；启用时必须非空。
+    pub api_token: Option<String>,
+    /// webhook 监听地址（必须 loopback）。
+    #[serde(default = "default_wxbot_webhook_listen")]
+    pub webhook_listen: String,
+    #[serde(default = "default_wxbot_webhook_path")]
+    pub webhook_path: String,
+    /// webhook secret（与 wcx WebhookPush 一致）；启用时必须非空。
+    pub webhook_secret: Option<String>,
+    /// 逗号分隔的允许私聊 wxid；空 = 放行全部。
+    pub allow_from: Option<String>,
+    /// 逗号分隔的允许群 id（xxx@chatroom）；空 = 所有群不响应。
+    pub allow_groups: Option<String>,
+    /// 群消息触发策略：mention(仅精确 @ 本账号) / all。
+    #[serde(default = "default_wxbot_group_reply_policy")]
+    pub group_reply_policy: String,
+    /// 兜底长轮询开关（webhook 主路之外的 fallback）。
+    #[serde(default = "default_wxbot_poll_fallback")]
+    pub poll_fallback_enabled: bool,
+    /// 长轮询单次超时（秒）。
+    #[serde(default = "default_wxbot_poll_timeout")]
+    pub poll_timeout_sec: u64,
+    /// 两次重试之间的基础间隔（秒）。
+    #[serde(default = "default_wxbot_retry")]
+    pub retry_sec: u64,
+    /// 连续失败达阈值后的退避时长（秒）。
+    #[serde(default = "default_wxbot_backoff")]
+    pub backoff_sec: u64,
+    /// 单分片最大重试次数 / 连续失败阈值。下限保护在 [`Config::wxbot_channel_config`] 中做（>=1）。
+    #[serde(default = "default_wxbot_max_failures")]
+    pub max_failures: u32,
+    /// 单分片最大字节数（UTF-8 安全分段）。下限保护在 [`Config::wxbot_channel_config`] 中做（>=1）。
+    #[serde(default = "default_chunk")]
+    pub chunk_bytes: usize,
+    /// 出站相邻发送基础间隔（秒）。
+    #[serde(default = "default_wxbot_send_min_gap")]
+    pub send_min_gap_sec: u64,
+    /// 出站发送随机抖动上限（秒）。
+    #[serde(default = "default_wxbot_send_jitter")]
+    pub send_jitter_sec: u64,
+    /// 60s 滑动窗口内最大发送条数；0 = 关闭窗口限制。
+    #[serde(default = "default_wxbot_send_window_max")]
+    pub send_window_max: usize,
+    /// 连续发送失败熔断阈值；0 = 关闭熔断。
+    #[serde(default = "default_wxbot_send_failure_fuse")]
+    pub send_failure_fuse: u32,
+}
+
+impl Default for WxbotSection {
+    fn default() -> Self {
+        WxbotSection {
+            enabled: None,
+            api_base: default_wxbot_api_base(),
+            api_token: None,
+            webhook_listen: default_wxbot_webhook_listen(),
+            webhook_path: default_wxbot_webhook_path(),
+            webhook_secret: None,
+            allow_from: None,
+            allow_groups: None,
+            group_reply_policy: default_wxbot_group_reply_policy(),
+            poll_fallback_enabled: default_wxbot_poll_fallback(),
+            poll_timeout_sec: default_wxbot_poll_timeout(),
+            retry_sec: default_wxbot_retry(),
+            backoff_sec: default_wxbot_backoff(),
+            max_failures: default_wxbot_max_failures(),
+            chunk_bytes: default_chunk(),
+            send_min_gap_sec: default_wxbot_send_min_gap(),
+            send_jitter_sec: default_wxbot_send_jitter(),
+            send_window_max: default_wxbot_send_window_max(),
+            send_failure_fuse: default_wxbot_send_failure_fuse(),
+        }
+    }
+}
+fn default_wxbot_api_base() -> String {
+    "http://127.0.0.1:3001".into()
+}
+fn default_wxbot_webhook_listen() -> String {
+    "127.0.0.1:38081".into()
+}
+fn default_wxbot_webhook_path() -> String {
+    "/wxbot/webhook".into()
+}
+fn default_wxbot_group_reply_policy() -> String {
+    "mention".into()
+}
+fn default_wxbot_poll_fallback() -> bool {
+    true
+}
+// wxbot 调优项默认值——与 [`WxbotConfig::default`] 保持一致。
+fn default_wxbot_poll_timeout() -> u64 {
+    60
+}
+fn default_wxbot_retry() -> u64 {
+    2
+}
+fn default_wxbot_backoff() -> u64 {
+    30
+}
+fn default_wxbot_max_failures() -> u32 {
+    3
+}
+fn default_wxbot_send_min_gap() -> u64 {
+    2
+}
+fn default_wxbot_send_jitter() -> u64 {
+    3
+}
+fn default_wxbot_send_window_max() -> usize {
+    10
+}
+fn default_wxbot_send_failure_fuse() -> u32 {
+    5
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,6 +1444,36 @@ impl Config {
             poll_timeout_sec: self.weixin.poll_timeout_sec,
             retry_sec: self.weixin.retry_sec,
             backoff_sec: self.weixin.backoff_sec,
+        }
+    }
+
+    /// 构造 wxbot 通道配置（融合文件配置）。
+    ///
+    /// 与 [`Self::weixin_channel_config`] 同款下限保护：`send_chunk_bytes`/`max_failures`
+    /// 为 0 会导致分段死循环 / 重试循环一次都不执行，强制 >=1。
+    pub fn wxbot_channel_config(&self) -> WxbotConfig {
+        WxbotConfig {
+            enabled: self.wxbot.enabled.unwrap_or(false),
+            api_base: self.wxbot.api_base.clone(),
+            api_token: self.wxbot.api_token.clone().unwrap_or_default(),
+            webhook_listen: self.wxbot.webhook_listen.clone(),
+            webhook_path: self.wxbot.webhook_path.clone(),
+            webhook_secret: self.wxbot.webhook_secret.clone().unwrap_or_default(),
+            allow_from: self.wxbot.allow_from.clone().unwrap_or_default(),
+            allow_groups: self.wxbot.allow_groups.clone().unwrap_or_default(),
+            group_reply_policy: self.wxbot.group_reply_policy.clone(),
+            poll_fallback_enabled: self.wxbot.poll_fallback_enabled,
+            poll_timeout_sec: self.wxbot.poll_timeout_sec,
+            retry_sec: self.wxbot.retry_sec.max(1),
+            backoff_sec: self.wxbot.backoff_sec.max(1),
+            max_failures: self.wxbot.max_failures.max(1),
+            send_chunk_bytes: self.wxbot.chunk_bytes.max(1),
+            send_min_gap_sec: self.wxbot.send_min_gap_sec,
+            send_jitter_sec: self.wxbot.send_jitter_sec,
+            send_window_max: self.wxbot.send_window_max,
+            send_failure_fuse: self.wxbot.send_failure_fuse,
+            // media_dir 为运行期路径，默认留空；由 main.rs / host_glue 注入（agent/media）。
+            media_dir: std::path::PathBuf::new(),
         }
     }
 

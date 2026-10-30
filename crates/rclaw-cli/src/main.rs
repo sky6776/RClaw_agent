@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use rclaw_channels::{Channel, Console, NapCat, OutboundDispatcher, Weixin};
+use rclaw_channels::{Channel, Console, NapCat, OutboundDispatcher, Weixin, Wxbot};
 use rclaw_core::{
     BusMessage, ChannelCaps, RuntimeChannelInfo, CHANNEL_CLI, CHANNEL_NAPCAT, CHANNEL_WEIXIN,
+    CHANNEL_WXBOT,
 };
 use rclaw_runtime::{AgentLoop, CronService, Heartbeat};
 
@@ -76,6 +77,10 @@ async fn async_main() -> Result<()> {
     } else {
         None
     };
+    let mut wbcfg = cfg.wxbot_channel_config();
+    wbcfg.media_dir = media_dir.clone();
+    let wxb_enabled = wbcfg.enabled;
+    let wxbot_channel = if wxb_enabled { Wxbot::new(wbcfg) } else { None };
     let mut channel_caps: Vec<ChannelCaps> = Vec::new();
     channel_caps.push(console_channel.capabilities());
     if let Some(wx) = &wx_channel {
@@ -83,6 +88,9 @@ async fn async_main() -> Result<()> {
     }
     if let Some(nc) = &napcat_channel {
         channel_caps.push(nc.capabilities());
+    }
+    if let Some(wb) = &wxbot_channel {
+        channel_caps.push(wb.capabilities());
     }
     let channel_info = RuntimeChannelInfo {
         media_dir: Some(media_dir_str.clone()),
@@ -96,6 +104,10 @@ async fn async_main() -> Result<()> {
     std::env::remove_var("RCLAW_NAPCAT_ENABLED");
     if napcat_channel.is_some() {
         std::env::set_var("RCLAW_NAPCAT_ENABLED", "1");
+    }
+    std::env::remove_var("RCLAW_WXBOT_ENABLED");
+    if wxbot_channel.is_some() {
+        std::env::set_var("RCLAW_WXBOT_ENABLED", "1");
     }
 
     // 4) 核心组件（provider / 工具 / opts / cron / slash）——与桌面版共用同一装配。
@@ -166,6 +178,17 @@ async fn async_main() -> Result<()> {
         tracing::info!("NapCatQQ 通道已启动");
     } else if napcat_enabled {
         tracing::warn!("NapCatQQ 通道启用但 ws_url 为空，已跳过");
+    }
+
+    if let Some(wb) = wxbot_channel {
+        let (wb_tx, wb_rx) = mpsc::channel::<BusMessage>(16);
+        dispatcher.route_to(CHANNEL_WXBOT, wb_tx);
+        tokio::spawn(wb.run(inbound_tx.clone(), wb_rx));
+        tracing::info!("wxbot（个人微信）通道已启动");
+    } else if wxb_enabled {
+        tracing::warn!(
+            "wxbot 通道启用但构造失败（api_token/webhook_secret 为空或地址非 loopback），已跳过"
+        );
     }
 
     // 分发器自身常驻。

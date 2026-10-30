@@ -45,7 +45,7 @@ set "ANDROID_SDK_ROOT=%ANDROID_HOME%"
 set "ANDROID_NDK_HOME=%ANDROID_HOME%\ndk\29.0.14206865"
 set "NDK_HOME=%ANDROID_NDK_HOME%"
 set "NDK_ROOT=%ANDROID_NDK_HOME%"
-set "GRADLE_USER_HOME=%ANDROID_TOOLCHAIN%\gradle-user-home"
+if not defined GRADLE_USER_HOME set "GRADLE_USER_HOME=%ANDROID_TOOLCHAIN%\gradle-user-home"
 REM rquickjs/bindgen (aarch64 target) runs on the host and needs libclang.
 if not defined LIBCLANG_PATH set "LIBCLANG_PATH=%ANDROID_NDK_HOME%\toolchains\llvm\prebuilt\windows-x86_64\bin"
 REM The NDK's libclang auto resource-dir detection fails under bindgen on
@@ -69,6 +69,21 @@ if "%RCLAW_BUILD_PYTHON%"=="" (
 )
 set "PATH=%JAVA_HOME%\bin;%ANDROID_HOME%\platform-tools;%PATH%"
 
+REM Rust: 本机可能只装了 rustup toolchain，而 ~/.cargo/bin 缺 cargo.exe shim
+REM （只有 cargo-ndk 等子命令）。先把 cargo bin 放回 PATH，再用 where 检查；
+REM 仍找不到时回退到 rustup stable toolchain 的真实 bin，避免构建直接报
+REM 「'cargo' 不是内部或外部命令」。
+if exist "%USERPROFILE%\.cargo\bin" set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+where cargo >nul 2>nul
+if errorlevel 1 (
+    if exist "%USERPROFILE%\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe" (
+        set "PATH=%USERPROFILE%\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin;%PATH%"
+    ) else (
+        echo [ERROR] cargo not found. Install Rust or add its bin directory to PATH.
+        goto :fail
+    )
+)
+
 set "REPO=%~dp0"
 if "%REPO:~-1%"=="\" set "REPO=%REPO:~0,-1%"
 
@@ -91,10 +106,21 @@ REM (the dir is gitignored), so create it up front.
 if not exist "%WRY_ANDROID_KOTLIN_FILES_OUT_DIR%" mkdir "%WRY_ANDROID_KOTLIN_FILES_OUT_DIR%"
 
 echo [1/5] frontend build - ui/dist
+REM RCLAW_SKIP_FRONTEND_BUILD=1 reuses an existing ui/dist (offline/restricted
+REM sandboxes where esbuild's child-process pipe is blocked). Default still builds.
+if /i "%RCLAW_SKIP_FRONTEND_BUILD%"=="1" (
+    if not exist "%REPO%\crates\rclaw-desktop\ui\dist\index.html" (
+        echo [ERROR] RCLAW_SKIP_FRONTEND_BUILD=1 but ui\dist\index.html is missing
+        goto :fail
+    )
+    echo [1/5] frontend build skipped - reusing ui\dist
+    goto :frontend_done
+)
 pushd "%REPO%\crates\rclaw-desktop\ui"
 call npm install --no-audit --no-fund || goto :fail
 call npm run build || goto :fail
 popd
+:frontend_done
 
 echo [2/5] Rust single .so - librclaw_desktop.so, aarch64, apk-host
 cargo ndk -t arm64-v8a build -p rclaw-desktop --features apk-host,tauri/custom-protocol %CARGO_FLAGS% || goto :fail

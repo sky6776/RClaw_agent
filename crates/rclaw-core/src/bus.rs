@@ -10,6 +10,8 @@ pub const CHANNEL_CLI: &str = "cli";
 pub const CHANNEL_WEIXIN: &str = "weixin";
 /// 通道名：NapCatQQ（OneBot 11 over WebSocket）。
 pub const CHANNEL_NAPCAT: &str = "napcat";
+/// 通道名：个人微信（VA + WCX 容器内微信，经本机 REST/webhook 交互）。
+pub const CHANNEL_WXBOT: &str = "wxbot";
 /// 通道名：系统内部消息（heartbeat、cron 兜底目标等）。
 pub const CHANNEL_SYSTEM: &str = "system";
 /// 通道名：WebSocket（预留，暂不实现）。

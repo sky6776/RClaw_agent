@@ -5,6 +5,8 @@
 # 内置通道：
 #   - console (cli)：stdin 读取 / stdout 输出（与流式输出协作）
 #   - weixin：iLink Bot 长轮询 getupdates + sendmessage（UTF-8 安全分段 + allowlist + 退避）
+#   - wxbot：个人微信（VA+WCX 容器）：webhook 推送（axum 回环监听）+ /api/messages/wait
+#     长轮询兜底（双路同源于 wcx 事件收集器，dedup_key 账本合并）+ REST 发送
 # 通道通过 tokio::mpsc 与 agent loop 解耦（inbound/outbound 各一条）。
 # 通道层：消息总线接入与 outbound 分发。
 # =============================================================================
@@ -26,7 +28,9 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] } # wxbot：/api/media/upload 出站媒体上传
+axum = { workspace = true } # wxbot：webhook 监听（127.0.0.1 回环）
+rusqlite = { workspace = true } # wxbot：入站消息持久化（引用回填索引 + 静默群消息归档，media_dir/wxbot/message_index.db）
 base64 = "0.22"     # 仅 weixin 的 X-WECHAT-UIN 头需要
 rand = { workspace = true }
 rustyline = "18"     # console 通道：行编辑（方向键 / 行内编辑 / 历史），替代裸 read_line

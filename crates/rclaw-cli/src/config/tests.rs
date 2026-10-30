@@ -588,6 +588,23 @@ fn unknown_top_level_keys_are_still_rejected() {
 }
 
 #[test]
+fn wxbot_send_pacer_config_defaults_and_zero_clamps() {
+    let cfg = Config::default();
+    let w = cfg.wxbot_channel_config();
+    assert_eq!(w.send_min_gap_sec, 2);
+    assert_eq!(w.send_jitter_sec, 3);
+    assert_eq!(w.send_window_max, 10);
+    assert_eq!(w.send_failure_fuse, 5);
+
+    let mut cfg = Config::default();
+    cfg.wxbot.retry_sec = 0;
+    cfg.wxbot.backoff_sec = 0;
+    let w = cfg.wxbot_channel_config();
+    assert_eq!(w.retry_sec, 1, "retry_sec 0 会热循环，必须钳到 1");
+    assert_eq!(w.backoff_sec, 1, "backoff_sec 0 会热循环，必须钳到 1");
+}
+
+#[test]
 fn strip_removed_legacy_sections_reports_and_preserves_rest() {
     let text = "# 顶部注释\n[llm]\nprovider = \"deepseek\"\n\n[web_browser]\nengine = \"baidu\"\n";
     let (stripped, removed) = strip_removed_legacy_sections(text);

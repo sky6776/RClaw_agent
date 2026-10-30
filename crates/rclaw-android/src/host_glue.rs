@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use rclaw_channels::{Channel, NapCat, Weixin};
+use rclaw_channels::{Channel, NapCat, Weixin, Wxbot};
 use rclaw_core::ChannelCaps;
 use rclaw_core::RuntimeChannelInfo;
 use rclaw_store::fs::{init_layout, Layout};
@@ -178,6 +178,7 @@ fn wait_for_bundled_skills_ready(source: &Path) {
 pub struct ApkChannels {
     pub weixin: Option<Weixin>,
     pub napcat: Option<NapCat>,
+    pub wxbot: Option<Wxbot>,
     pub info: RuntimeChannelInfo,
 }
 
@@ -196,12 +197,22 @@ pub fn build_channels(resolved: &ResolvedAndroidConfig, media_dir: &Path) -> Apk
     } else {
         None
     };
+    let mut wxbot_cfg = resolved.config.wxbot_channel_config();
+    wxbot_cfg.media_dir = media_dir.to_path_buf();
+    let wxbot = if wxbot_cfg.enabled {
+        Wxbot::new(wxbot_cfg)
+    } else {
+        None
+    };
     let mut channel_caps: Vec<ChannelCaps> = Vec::new();
     if let Some(wx) = &weixin {
         channel_caps.push(wx.capabilities());
     }
     if let Some(nc) = &napcat {
         channel_caps.push(nc.capabilities());
+    }
+    if let Some(wb) = &wxbot {
+        channel_caps.push(wb.capabilities());
     }
     let info = RuntimeChannelInfo {
         media_dir: Some(media_dir.to_string_lossy().replace('\\', "/")),
@@ -210,6 +221,7 @@ pub fn build_channels(resolved: &ResolvedAndroidConfig, media_dir: &Path) -> Apk
     ApkChannels {
         weixin,
         napcat,
+        wxbot,
         info,
     }
 }

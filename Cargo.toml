@@ -75,6 +75,8 @@ serde_json = "1"
 # ---- HTTP（含 TLS 与 SSE 流）----
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 bytes = "1"
+# wxbot 通道：webhook 监听（内嵌 HTTP server；只用最小 feature 集）
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
 # ---- 错误与日志 ----
 thiserror = "1"          # 库层结构化错误
