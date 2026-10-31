@@ -124,7 +124,7 @@ export function RoundNavButton({
       aria-label={label}
       aria-haspopup="dialog"
       aria-expanded={open}
-      className={`relative flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition hover:bg-[#1a2030] hover:text-indigo-300 ${
+      className={`flex h-10 w-auto shrink-0 items-center justify-center gap-1 rounded-lg px-2 transition hover:bg-[#1a2030] hover:text-indigo-300 ${
         open ? "text-indigo-300" : "text-gray-500"
       }`}
     >
@@ -142,7 +142,7 @@ export function RoundNavButton({
         <path d="M4 12h16" />
         <path d="M4 18h10" />
       </svg>
-      <span aria-hidden className="absolute bottom-0 right-0.5 text-[10px] leading-none">
+      <span aria-hidden className="text-[10px] leading-none tabular-nums">
         {count}
       </span>
     </button>
