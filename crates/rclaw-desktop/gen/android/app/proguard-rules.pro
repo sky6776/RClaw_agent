@@ -29,3 +29,14 @@
 # ---------------------------------------------------------------------------
 -keep class ai.rclaw.app.NativeBridge { *; }
 -keep class ai.rclaw.app.PythonRuntime { *; }
+
+# ---------------------------------------------------------------------------
+# Python 侧经 chaquopy jclass 按名反射调用的桥类（rclaw_android_runtime.py）。
+# chaquopy 只播种保类（seeds.txt），`-keep class` 不带 { *; } 时成员仍会被
+# shrinking 剥离——实证 v2.8.20~v2.8.22：PdfRuntime.pageCount/renderPdf/
+# renderPdfPage、MediaRuntime.extractVideoFrames 被 R8 删除（usage.txt），
+# skill 脚本统一报「type object 'PdfRuntime' has no attribute 'pageCount'」。
+# release.yml 的「Verify JNI bridge survived R8」步骤同步校验这些方法名。
+# ---------------------------------------------------------------------------
+-keep class ai.rclaw.app.PdfRuntime { *; }
+-keep class ai.rclaw.app.MediaRuntime { *; }
