@@ -218,8 +218,11 @@ webhook_listen = "127.0.0.1:38081"          # 本机 webhook 监听（必须 loo
 webhook_path = "/wxbot/webhook"             # 须与 wcx WebhookPush 的 URL 路径一致
 webhook_secret = "your-webhook-secret"      # 与 wcx WebhookPush 一致；留空则通道不启动
 # allow_from = ""                           # 逗号分隔的允许私聊 wxid；空 = 放行全部私聊
-# allow_groups = ""                         # 逗号分隔的允许群 id（xxx@chatroom）；空 = 所有群不响应
-group_reply_policy = "mention"              # 群触发：mention(仅精确 @ 本账号) / all / none(全部静默接收归档)
+# allow_groups = ""                         # 逗号分隔的允许回复群 id（xxx@chatroom）；空 = 所有群不回复（即使被 @）。
+#                                           #   注意：群消息「记录」不受此名单约束——所有群（含白名单外）的入站
+#                                           #   消息都会尽力落库到 media_dir/wxbot/message_index.db（白名单外媒体
+#                                           #   仅标注不下载；白名单内按既有流程下载）
+group_reply_policy = "mention"              # 白名单群的回复触发：mention(仅精确 @ 本账号) / all / none(全部静默接收归档)
 # poll_fallback_enabled = true              # webhook 之外的兜底长轮询（保持开启）
 # send_min_gap_sec = 2                      # 相邻发送基础间隔（秒）
 # send_jitter_sec = 3                       # 随机抖动上限（秒）；实际间隔 = min + rand(0..=jitter)

@@ -18,8 +18,11 @@
 //! - **账号绑定**：启动时经 `/api/self/info` 绑定微信账号；运行中收到其他账号的事件
 //!   一律丢弃（换号需重启通道，防跨账号复用历史 / 误发）。
 //!
-//! 白名单：私聊 `allow_from` 空 = 放行全部（与 weixin 通道一致）；群聊 `allow_groups`
-//! 空 = 全部拒绝；群默认仅「精确 @ 本账号」触发（`group_reply_policy = "mention"`）。
+//! 白名单 = **回复**门槛（记录与回复解耦）：私聊 `allow_from` 空 = 放行全部（与
+//! weixin 通道一致）；群聊 `allow_groups` 空 = 所有群不回复（即使被 @）。群消息
+//! 一律静默落库——白名单外文本进本地索引、媒体仅标注不下载；白名单内按既有
+//! 流程（媒体照常下载），未触发回复的归档（`archived=1`）。回复才按
+//! `group_reply_policy`（默认 `"mention"`，仅精确 @ 本账号）触发。
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -51,8 +54,9 @@ const TEXT_INDEX_MAX_BYTES: usize = 256 * 1024;
 
 /// 入站消息持久化库的 schema（v2）。
 ///
-/// 一张表承载三类用途：引用回填索引（按 account+chat_id+svr_id 点查）、静默群消息归档
-/// （`archived=1`，替代 napcat 的散落 txt）、以及私聊/群聊全量消息的本地落盘。
+/// 一张表承载三类用途：引用回填索引（按 account+chat_id+svr_id 点查）、群消息静默
+/// 归档（`archived=1`，含白名单外群——记录与回复解耦，替代 napcat 的散落 txt）、
+/// 以及私聊/群聊全量消息的本地落盘（尽力而为，落库失败仅告警不重投）。
 /// `dedup_key` 唯一约束让 webhook/wait 双路重复投递天然幂等（INSERT OR IGNORE）。
 /// `account` 隔离不同微信账号：换号后同一群/同一 svr_id 的历史不得跨账号回填。
 const DB_SCHEMA: &str = r#"
@@ -90,7 +94,7 @@ pub struct WxbotConfig {
     pub webhook_secret: String,
     /// 私聊白名单：空 = 放行全部；非空 = 仅名单内。逗号分隔 wxid。
     pub allow_from: String,
-    /// 群白名单：空 = 全部群拒绝。逗号分隔群 id（xxx@chatroom）。
+    /// 群回复白名单：空 = 所有群不回复（消息仍全量落库）。逗号分隔群 id（xxx@chatroom）。
     pub allow_groups: String,
     /// 群触发策略："mention"（默认，仅精确 @ 本账号）| "all"。
     pub group_reply_policy: String,
@@ -408,7 +412,8 @@ impl Wxbot {
             .collect()
     }
 
-    /// 白名单门槛（文档 §6.2.1）：决定一条消息是否进入处理管线。
+    /// 回复门槛（文档 §6.2.1）：决定一条消息是否进入回复管线（记录门槛另见
+    /// [`Self::ingest_one`] 步骤 3——群消息一律落库，与白名单无关）。
     ///
     /// 群消息过了这道门之后还要再过 [`Self::group_reaches_llm`] 的触发判定——未触发的
     /// 白名单群消息走「静默接收」：媒体照常下载、正文进引用索引、内容归档落盘，
@@ -783,7 +788,8 @@ impl Wxbot {
         }
     }
 
-    /// 单一 ingest 任务：队列消费 → 去重 → 账号 → 白名单 → 媒体 → 投递 → 提交。
+    /// 单一 ingest 任务：队列消费 → 去重 → 账号 → 回复门槛（白名单外群消息静默
+    /// 落库后即返回；私聊未命中丢弃）→ 媒体 → 投递 → 提交。
     ///
     /// 全通道串行（顺序优先于吞吐）：媒体拉取最长 150s 会阻塞后续消息，可接受。
     async fn ingest_loop(
@@ -815,13 +821,36 @@ impl Wxbot {
                 return;
             }
         }
-        // 3) 白名单门槛。不命中静默丢弃（对陌生人零响应）。
+        // 3) 回复门槛。私聊未命中直接丢弃（对陌生人零响应）；群消息未命中走
+        //    「静默落库」：文本进本地索引（media_notes 空、不下载媒体），不投递
+        //    LLM——记录与回复解耦（文档 §6.2.1）。落库尽力而为：webhook 入队即回
+        //    200、wait 推进 cursor，双路都不会重放同一条事件，失败无法靠重投补救，
+        //    仅 warn；账本仍提交（重复事件在去重处丢弃）。复核与落库同一临界区，
+        //    不跨 await 持锁（锁停/换号后不落库，与步骤 5 的不变量一致）。
         if !self.allowed(&ev) {
-            tracing::debug!(
-                "wxbot：白名单未命中已丢弃 talker={} type={}",
-                ev.talker,
-                ev.kind
-            );
+            if ev.is_group && !ev.talker.is_empty() {
+                let text = record_text(&ev);
+                let mut st = match self.state.lock() {
+                    Ok(st) => st,
+                    Err(_) => return, // 毒锁：不落库不提交
+                };
+                if !st.account_ok(&ev.account) {
+                    return;
+                }
+                self.db_record(&ev, &key, &[], true, &text);
+                st.commit(key);
+                tracing::debug!(
+                    "wxbot：白名单外群消息已静默落库 talker={} type={}",
+                    ev.talker,
+                    ev.kind
+                );
+            } else {
+                tracing::debug!(
+                    "wxbot：白名单未命中已丢弃 talker={} type={}",
+                    ev.talker,
+                    ev.kind
+                );
+            }
             return;
         }
         // 4) 组装正文（媒体落盘在 ingest 内顺序执行，保序），并收集已落盘媒体标注
@@ -845,7 +874,10 @@ impl Wxbot {
             if !st.account_ok(&ev.account) {
                 return;
             }
-            self.db_record(&ev, &key, &media_notes, !reaches, &ev.content);
+            // 落库文本与白名单外路径同用 record_text：text 类两路等价，媒体/链接
+            // 类带类型标注（content 常为空的图片不再落成空行、链接不丢标题/URL），
+            // 引用回填（db_quote_lookup）拿到的是消息自身的展示文本。
+            self.db_record(&ev, &key, &media_notes, !reaches, &record_text(&ev));
             if !reaches {
                 st.commit(key);
                 return;
@@ -981,10 +1013,11 @@ impl Wxbot {
     // 入站消息持久化（SQLite；私聊/群聊全量落盘）
     // -------------------------------------------------------------------------
 
-    /// 记录一条入站消息（含静默接收的群消息：`archived=1`）。
+    /// 记录一条入站消息（含静默接收/白名单外静默落库的群消息：`archived=1`）。
     ///
     /// `INSERT OR IGNORE` + dedup_key 唯一约束：webhook/wait 双路与 wcx 重试的重复
-    /// 投递天然幂等。失败仅告警——持久化是尽力而为，绝不阻断收消息。
+    /// 投递天然幂等。失败仅告警——持久化是尽力而为，绝不阻断收消息（webhook 入队
+    /// 即回 200、wait 推进 cursor，双路都不会重放同一条事件，失败无法靠重投补救）。
     /// 私聊与群聊都落盘：引用回填（quote）在两种会话里都可能指向任何一条历史消息。
     fn db_record(
         &self,
@@ -1885,6 +1918,56 @@ fn plain_label(label: &str, title: &str, content: &str) -> String {
     s
 }
 
+/// 入站消息的落库文本（类型映射的廉价版；白名单外群消息的静默落库、白名单内
+/// 归档/投递与私聊路径共用）：与 [`Wxbot::build_content`] 同一张映射表，但
+/// **不下载媒体**（白名单外是陌生人内容，下载有成本与安全面）、不做引用回填、
+/// 不带发送者前缀（`sender` 列已单独存）。直接用 `ev.content` 会丢信息：图片的
+/// content 常为空、链接的标题/URL/摘要分列在 title/url/des——这里保证非文本
+/// 消息至少落类型标注与标题。
+fn record_text(ev: &CollectorEvent) -> String {
+    let title = ev.title.as_deref().unwrap_or("");
+    match ev.kind.as_str() {
+        "text" => ev.content.clone(),
+        "image" => plain_label("[图片]", title, &ev.content),
+        "voice" => plain_label("[语音]", title, &ev.content),
+        "sticker" => plain_label("[表情]", title, &ev.content),
+        "video" => plain_label("[视频]", title, &ev.content),
+        "file" => {
+            if title.is_empty() {
+                "[文件]".to_string()
+            } else {
+                format!("[文件: {title}]")
+            }
+        }
+        "link" => {
+            let mut s = format!("[链接] {title}");
+            if let Some(u) = &ev.url {
+                s.push(' ');
+                s.push_str(u);
+            }
+            if let Some(d) = &ev.des {
+                s.push(' ');
+                s.push_str(d);
+            }
+            s
+        }
+        "miniprogram" => plain_label("[小程序]", title, &ev.content),
+        "quote" => plain_label("[引用]", title, &ev.content),
+        "card" => plain_label("[名片]", title, &ev.content),
+        "location" => plain_label("[位置]", title, &ev.content),
+        "red_packet" => plain_label("[红包]", title, &ev.content),
+        "transfer" => plain_label("[转账]", title, &ev.content),
+        "video_account" => plain_label("[视频号]", title, &ev.content),
+        "system" => plain_label("[系统]", title, &ev.content),
+        "recall" => plain_label("[撤回]", title, &ev.content),
+        _ => format!(
+            "[消息 type_code={}] {}",
+            ev.type_code,
+            truncate(&ev.raw_content, 200)
+        ),
+    }
+}
+
 #[async_trait]
 impl Channel for Wxbot {
     fn name(&self) -> &str {
@@ -1906,6 +1989,18 @@ impl Channel for Wxbot {
         let me = Arc::new(self);
         // 启动即尝试绑定账号（best-effort；失败由首个事件兜底绑定）。
         me.bind_account().await;
+        // 群消息全量落库的显式提示（隐私边界：记录不受 allow_groups 约束，回复才
+        // 受）。尽力而为口径——落库失败仅告警不重投；db 缺失时明示不会落库。
+        // 注意措辞：白名单外群消息媒体仅标注不下载；白名单内按既有流程下载。
+        match &me.db {
+            Some(_) => tracing::warn!(
+                "wxbot：群消息全量落库已启用——所有群（含白名单外）的入站消息将尽力记录到本地索引 {}（白名单外媒体仅标注不下载；回复仍按 allow_groups/group_reply_policy）",
+                me.cfg.media_dir.join("wxbot").join("message_index.db").display()
+            ),
+            None => tracing::warn!(
+                "wxbot：未配置媒体目录或索引库不可用，入站消息不会落库"
+            ),
+        }
         let (queue_tx, queue_rx) = mpsc::channel::<CollectorEvent>(QUEUE_CAP);
         let webhook = me.clone();
         let poller = me.clone();

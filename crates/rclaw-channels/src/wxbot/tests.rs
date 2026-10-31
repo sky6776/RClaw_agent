@@ -172,7 +172,7 @@ fn group_requires_allowlist_and_mention() {
         !b2.allowed(&event(json!({
             "talker": "123@chatroom", "is_group": true, "type": "text",
         }))),
-        "allow_groups 为空 = 所有群拒绝（即使被 @）"
+        "allow_groups 为空 = 所有群不回复（即使被 @；消息仍全量落库，见 ingest 用例）"
     );
 
     let mut c3 = cfg();
@@ -520,7 +520,214 @@ async fn db_persists_private_and_group_messages() {
         b.state.lock().unwrap().contains("k2"),
         "静默群消息处理完必须提交账本"
     );
+
+    // 白名单内群消息的落库文本与白名单外同用 record_text：content 为空的图片
+    // 落类型标注，不再是空文本（媒体标注仍在 media_json）。msg_svr_id=0：媒体
+    // 标注降级为纯标注、不发 /api/media/raw 请求——用例保持 hermetic。
+    let ev = event(json!({
+        "event": "message", "seq": 3, "dedup_key": "k3", "msg_svr_id": 0,
+        "type": "image", "talker": "123@chatroom", "is_group": true,
+        "content": "", "at_users": [],
+    }));
+    b.ingest_one(ev, &tx).await;
+    assert_eq!(b.db.as_ref().unwrap().lock().unwrap()
+        .query_row("SELECT text FROM inbound_messages WHERE dedup_key = 'k3'", [], |r| r.get::<_, String>(0))
+        .unwrap(), "[图片]", "白名单内图片落类型标注而非空文本");
     drop(dir);
+}
+
+/// 白名单外的群消息：静默落库（archived=1、不投递、不下载媒体）+ 提交账本；
+/// 文本/图片（content 常为空）/链接的落库文本带类型标注与标题（record_text）；
+/// 私聊白名单未命中仍直接丢弃（连库都不进）；重复 dedup_key 只落一行。
+#[tokio::test]
+async fn ingest_outside_allowlist_group_silently_records() {
+    let (b, dir) = bot_with_db(); // allow_groups = "123@chatroom"
+    {
+        let mut st = b.state.lock().unwrap();
+        st.bind("wxid_self");
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<BusMessage>(8);
+    let db = || b.db.as_ref().unwrap().lock().unwrap();
+
+    // 1) 非白名单群文本：落库 archived=1、不投递、账本已提交。
+    let ev = event(json!({
+        "event": "message", "seq": 1, "dedup_key": "o1", "msg_svr_id": 501,
+        "type": "text", "talker": "456@chatroom", "is_group": true, "sender": "wxid_x",
+        "content": "白名单外群消息",
+    }));
+    b.ingest_one(ev, &tx).await;
+    assert!(rx.try_recv().is_err(), "白名单外群消息不得投递");
+    assert_eq!(
+        db().query_row("SELECT archived FROM inbound_messages WHERE dedup_key = 'o1'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        1,
+        "白名单外群消息 archived=1"
+    );
+    assert!(
+        b.state.lock().unwrap().contains("o1"),
+        "白名单外群消息落库后提交账本（重复事件在去重处丢弃）"
+    );
+
+    // 2) 非白名单群图片（content 为空）与链接：record_text 不得落成空行/丢标题；
+    //    且不下载媒体——媒体目录除索引库外不得新增任何文件。
+    let ev = event(json!({
+        "event": "message", "seq": 2, "dedup_key": "o2", "msg_svr_id": 502,
+        "type": "image", "talker": "456@chatroom", "is_group": true, "content": "",
+    }));
+    b.ingest_one(ev, &tx).await;
+    assert_eq!(
+        db().query_row("SELECT text FROM inbound_messages WHERE dedup_key = 'o2'", [], |r| r.get::<_, String>(0)).unwrap(),
+        "[图片]",
+        "图片落类型标注而非空文本"
+    );
+    {
+        let mut media_files = Vec::new();
+        collect_files(dir.path(), &mut media_files);
+        // 索引库本体 + SQLite 边车（-wal/-shm）都算库文件；除此之外不得有任何
+        // 媒体文件（图片/语音等未下载）。
+        assert!(
+            media_files.iter().all(|p| p.file_name().map(|n| {
+                let n = n.to_string_lossy();
+                n == "message_index.db"
+                    || n.starts_with("message_index.db-")
+            }).unwrap_or(false)),
+            "白名单外群消息不得产生媒体文件: {media_files:?}"
+        );
+    }
+    let ev = event(json!({
+        "event": "message", "seq": 3, "dedup_key": "o3", "msg_svr_id": 503,
+        "type": "link", "title": "某篇文章",
+        "url": "https://example.com/a", "des": "摘要",
+        "talker": "456@chatroom", "is_group": true, "content": "",
+    }));
+    b.ingest_one(ev, &tx).await;
+    assert_eq!(
+        db().query_row("SELECT text FROM inbound_messages WHERE dedup_key = 'o3'", [], |r| r.get::<_, String>(0)).unwrap(),
+        "[链接] 某篇文章 https://example.com/a 摘要",
+        "链接落标题+URL+摘要"
+    );
+
+    // 3) allow_groups 为空：群消息同样落库不投递（记录与回复解耦）。
+    let mut c = cfg();
+    c.media_dir = dir.path().to_path_buf();
+    c.allow_groups = String::new();
+    let b2 = Wxbot::new(c).unwrap();
+    let ev = event(json!({
+        "event": "message", "seq": 4, "dedup_key": "o4", "msg_svr_id": 504,
+        "type": "text", "talker": "789@chatroom", "is_group": true, "content": "空白名单群",
+    }));
+    let (tx2, mut rx2) = tokio::sync::mpsc::channel::<BusMessage>(8);
+    b2.ingest_one(ev, &tx2).await;
+    assert!(rx2.try_recv().is_err());
+    assert!(b2.db.as_ref().unwrap().lock().unwrap()
+        .query_row("SELECT 1 FROM inbound_messages WHERE dedup_key = 'o4'", [], |r| r.get::<_, i64>(0))
+        .is_ok(), "allow_groups 为空的群消息仍落库");
+
+    // 4) 私聊白名单未命中：不落库不投递（连库都不进）。
+    let mut c = cfg();
+    c.media_dir = dir.path().to_path_buf();
+    c.allow_from = "wxid_a".into();
+    let b3 = Wxbot::new(c).unwrap();
+    let ev = event(json!({
+        "event": "message", "seq": 5, "dedup_key": "o5", "msg_svr_id": 505,
+        "type": "text", "talker": "wxid_stranger", "content": "陌生私聊",
+    }));
+    let (tx3, mut rx3) = tokio::sync::mpsc::channel::<BusMessage>(8);
+    b3.ingest_one(ev, &tx3).await;
+    assert!(rx3.try_recv().is_err());
+    assert!(b3.db.as_ref().unwrap().lock().unwrap()
+        .query_row("SELECT 1 FROM inbound_messages WHERE dedup_key = 'o5'", [], |r| r.get::<_, i64>(0))
+        .is_err(), "私聊白名单未命中不得落库");
+
+    // 5) 同 dedup_key 重投：仍只有一行（INSERT OR IGNORE 幂等）。
+    let ev = event(json!({
+        "event": "message", "seq": 6, "dedup_key": "o1", "msg_svr_id": 501,
+        "type": "text", "talker": "456@chatroom", "is_group": true, "sender": "wxid_x",
+        "content": "白名单外群消息",
+    }));
+    b.ingest_one(ev, &tx).await;
+    assert_eq!(
+        db().query_row("SELECT COUNT(*) FROM inbound_messages WHERE dedup_key = 'o1'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        1,
+        "重复事件只落一行"
+    );
+}
+
+/// 递归收集目录下的全部文件路径（媒体下载断言用）。
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+/// 无持久化库（media_dir 空 → db=None）：白名单外群消息仍提交账本（dedup 推进，
+/// 双路重复事件在 contains 处丢弃——C 点的「db=None 空转」消除回归）。
+#[tokio::test]
+async fn ingest_outside_allowlist_group_commits_without_db() {
+    let b = bot(); // cfg() 默认 media_dir 空 → db = None
+    let ev = event(json!({
+        "event": "message", "seq": 1, "dedup_key": "n1", "msg_svr_id": 601,
+        "type": "text", "talker": "456@chatroom", "is_group": true, "content": "无库群消息",
+    }));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<BusMessage>(8);
+    b.ingest_one(ev, &tx).await;
+    assert!(rx.try_recv().is_err(), "无库也不得投递");
+    assert!(
+        b.state.lock().unwrap().contains("n1"),
+        "db=None 时白名单外群消息仍必须提交账本（防重复处理空转）"
+    );
+}
+
+/// record_text：类型映射的廉价版（无媒体下载/引用回填/发送者前缀）。
+#[test]
+fn record_text_mappings() {
+    let mk = |v: Value| event(v);
+    assert_eq!(
+        record_text(&mk(json!({ "type": "text", "content": "你好" }))),
+        "你好"
+    );
+    assert_eq!(record_text(&mk(json!({ "type": "image", "content": "" }))), "[图片]");
+    assert_eq!(
+        record_text(&mk(json!({ "type": "image", "title": "截图.png", "content": "" }))),
+        "[图片] 截图.png"
+    );
+    assert_eq!(record_text(&mk(json!({ "type": "voice", "content": "" }))), "[语音]");
+    assert_eq!(record_text(&mk(json!({ "type": "sticker", "content": "" }))), "[表情]");
+    assert_eq!(record_text(&mk(json!({ "type": "video", "content": "" }))), "[视频]");
+    assert_eq!(
+        record_text(&mk(json!({ "type": "file", "title": "报告.pdf", "content": "" }))),
+        "[文件: 报告.pdf]"
+    );
+    assert_eq!(
+        record_text(&mk(json!({ "type": "link", "title": "t", "url": "https://e.com", "des": "d", "content": "" }))),
+        "[链接] t https://e.com d"
+    );
+    assert_eq!(
+        record_text(&mk(json!({ "type": "quote", "title": "wxid_p: 原发言", "content": "回复" }))),
+        "[引用] wxid_p: 原发言 回复"
+    );
+    assert_eq!(
+        record_text(&mk(json!({ "type": "miniprogram", "title": "小程序", "content": "" }))),
+        "[小程序] 小程序"
+    );
+    assert_eq!(
+        record_text(&mk(json!({ "type": "recall", "content": "x 撤回了一条消息" }))),
+        "[撤回] x 撤回了一条消息"
+    );
+    assert_eq!(
+        record_text(&mk(json!({ "type": "system", "title": "进群", "content": "x 加入了群聊" }))),
+        "[系统] 进群 x 加入了群聊"
+    );
+    // 未知类型：type_code + raw 截断（与投递路径同款兜底）。
+    assert_eq!(
+        record_text(&mk(json!({ "type_code": 51, "type": "other", "raw_content": "raw" }))),
+        "[消息 type_code=51] raw"
+    );
 }
 
 #[tokio::test]
