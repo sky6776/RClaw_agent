@@ -17,7 +17,7 @@ import MediaPreviews, { parseMediaItems } from "./MediaPreviews";
 import WorkflowCard from "./WorkflowCard";
 import MediaGallery, { type GalleryItem, type GallerySeed } from "./MediaGallery";
 import ToolBatchRows from "./ToolCallRow";
-import { RoundFab, RoundRail, useWidePointer, type RoundNavItem } from "./RoundNav";
+import { RoundNavButton, RoundNavSheet, RoundRail, useWidePointer, type RoundNavItem } from "./RoundNav";
 import { CheckIcon, CopyIcon, GearIcon, PencilIcon, ShieldIcon } from "./icons";
 
 export type Role = "user" | "assistant" | "status" | "thinking";
@@ -2010,6 +2010,19 @@ export default function Chat({
   const navEnabled = rounds.length >= 2 && selectIds === null && textSelectId === null;
   const railVisible = navEnabled && !isAndroidDevice() && widePointer;
   const fabVisible = navEnabled && !railVisible;
+  // 轮次面板开合（安卓/窄窗形态）：触发钮在输入区工具条、面板在消息列表
+  // wrapper，分居两个子树，状态只能放这里。fab 形态退场（切选择模式/切桌面
+  // 宽屏/rounds<2）时必须复位，否则回到该形态时面板自动重开。
+  const [navOpen, setNavOpen] = useState(false);
+  // 面板关闭（遮罩/选行/返回键）后焦点返还触发钮，读屏用户不落回 body。
+  const navBtnRef = useRef<HTMLButtonElement | null>(null);
+  const closeNav = () => {
+    setNavOpen(false);
+    navBtnRef.current?.focus();
+  };
+  useEffect(() => {
+    if (!fabVisible) setNavOpen(false);
+  }, [fabVisible]);
 
   // 跳转到第 N 轮：锚点行顶对齐列表视口顶。最后一轮 = 最新对话，恢复跟随拉底
   // （跳到最新还显示「回到底部」是反直觉的）；其余轮次脱离跟随。zcode 同款坐
@@ -2196,10 +2209,16 @@ export default function Chat({
           </div>
         )}
         </div>
-        {/* 移动端 / 窄窗：右下角「轮次 N/M」chip + 底部 sheet（rail 是桌面宽屏
-            形态，两者互斥）。 */}
+        {/* 移动端 / 窄窗：轮次导航底部面板（入口在输入区工具条；rail 是桌面
+            宽屏形态，两者互斥）。 */}
         {fabVisible && (
-          <RoundFab rounds={rounds} activeId={activeRoundId} onJump={scrollToRound} />
+          <RoundNavSheet
+            open={navOpen}
+            onClose={closeNav}
+            rounds={rounds}
+            activeId={activeRoundId}
+            onJump={scrollToRound}
+          />
         )}
       </div>
 
@@ -2664,6 +2683,18 @@ export default function Chat({
                   <path d="m7 9 5-5 5 5" />
                 </svg>
               </button>
+            )}
+            {/* 轮次导航（安卓/窄窗形态；桌面宽屏用左缘 rail，互斥）：与权限/
+                附件/思考块按钮同排，右下角小计数显示当前轮/总轮数（已加载
+                序号），点开消息区底部面板逐轮跳转。 */}
+            {fabVisible && (
+              <RoundNavButton
+                rounds={rounds}
+                activeId={activeRoundId}
+                open={navOpen}
+                onToggle={() => setNavOpen((v) => !v)}
+                triggerRef={navBtnRef}
+              />
             )}
             <input
               ref={fileRef}

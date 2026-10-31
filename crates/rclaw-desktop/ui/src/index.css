@@ -308,6 +308,15 @@ html.theme-light #root {
 .theme-light .bg-\[\#1a2030\]\/90 {
   background-color: #ffffffef;
 }
+/* 工具条按钮（权限/附件/思考块/轮次导航）的 hover 底：hover: 变体同样编译成
+   独立类名，缺覆盖会在浅色主题下 hover 出深底（同上面 /90 的病）。 */
+.theme-light .hover\:bg-\[\#1a2030\]:hover {
+  background-color: #e4e8fb;
+}
+/* 轮次导航面板的激活行 indigo 半透明底：/15 修饰符独立类名，浅色下换浅靛。 */
+.theme-light .bg-indigo-500\/15 {
+  background-color: #e0e7ff;
+}
 .theme-light .border-\[\#2a2f3a\] {
   border-color: #d8dce4;
 }
