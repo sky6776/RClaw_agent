@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import traceback
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -647,6 +648,13 @@ def fetch_ir_presentation(code, pure, market, out_dir):
                         with open(pdf_path, "wb") as f:
                             f.write(resp.read())
                         if os.path.getsize(pdf_path) < 500:
+                            os.remove(pdf_path)
+                            continue
+                        if not _looks_like_pdf(pdf_path):
+                            with open(pdf_path, "rb") as f:
+                                head = f.read(48)
+                            os.remove(pdf_path)
+                            print(f"    ⚠ 非 PDF 内容（疑似风控/挑战页），已丢弃: {head!r}")
                             continue
                         # 提取关键图表页
                         if _android:
@@ -1063,6 +1071,17 @@ def _report_matches_stock(report, stock_name="", stock_code=""):
 # ── 研报 PDF 自动下载 ──
 
 
+def _looks_like_pdf(path):
+    """文件头 1024 字节内须有 %PDF- 魔数：拦截研报/IR 接口偶发的 JS 风控挑战页
+    （真机 2026-10-31 实测：984 字节 <script> 页以 .pdf 落盘，size<100 拦不住）。
+    PDF 规范允许 %PDF- 前有前导垃圾字节，故在前 1024 字节内查找而非只看头 5 字节。"""
+    try:
+        with open(path, "rb") as f:
+            return b"%PDF-" in f.read(1024)
+    except OSError:
+        return False
+
+
 def auto_fetch_report_pdf(
     reports, out_dir, stock_name="", stock_code="", max_reports=2, max_pages=4
 ):
@@ -1081,8 +1100,11 @@ def auto_fetch_report_pdf(
     rdir = os.path.join(out_dir, "research_reports")
     os.makedirs(rdir, exist_ok=True)
     downloaded = 0
+    attempts = 0
+    # 尝试上限独立于成功上限：全部被挑战页拦截时不再空跑完整个研报列表。
+    max_attempts = max_reports * 2
     for r in reports:
-        if downloaded >= max_reports:
+        if downloaded >= max_reports or attempts >= max_attempts:
             break
         if len(all_pages) >= max_pages:
             break
@@ -1095,8 +1117,11 @@ def auto_fetch_report_pdf(
             print(f"    ⏭ 跳过无关研报: {title[:40]}")
             continue
 
-        pdf_path = os.path.join(rdir, f"report_{downloaded+1}.pdf")
-        print(f"    尝试下载研报: [{r['org']}] {title[:40]}...")
+        # 每次尝试独立命名：失败不互相覆盖（旧实现 downloaded 恒 0，15 篇全部
+        # 互相覆盖写同一个 report_1.pdf——真机 2026-10-31 实证）。
+        attempts += 1
+        pdf_path = os.path.join(rdir, f"report_{attempts}.pdf")
+        print(f"    尝试下载研报: [{r.get('org') or '?'}] {title[:40]}...")
         try:
             req = urllib.request.Request(
                 pdf_url,
@@ -1109,6 +1134,13 @@ def auto_fetch_report_pdf(
             with open(pdf_path, "wb") as f:
                 f.write(resp.read())
             if os.path.getsize(pdf_path) < 100:
+                os.remove(pdf_path)
+                continue
+            if not _looks_like_pdf(pdf_path):
+                with open(pdf_path, "rb") as f:
+                    head = f.read(48)
+                os.remove(pdf_path)
+                print(f"    ⚠ 非 PDF 内容（疑似风控/挑战页），已丢弃: {head!r}")
                 continue
             if _android:
                 extracted = _android_extract_chart_pages(
@@ -1133,7 +1165,18 @@ def auto_fetch_report_pdf(
             if all_pages:
                 print(f"    ✅ 提取了 {len(all_pages)} 页研报图表")
         except Exception as e:
-            print(f"    ⚠ 研报下载失败: {e}")
+            # 分类文案：桥方法缺失（release 构建被 R8 剥离 / APK 过旧）单独提示，
+            # 其余附 traceback 便于真机诊断（旧实现只打 str(e) 无栈）。
+            hint = (
+                "（宿主 PDF 桥不可用，请升级 APK）"
+                if "pageCount" in str(e) or "PdfRuntime" in str(e)
+                else ""
+            )
+            print(
+                f"    ⚠ 研报处理失败{hint}: [{r.get('org') or '?'}] "
+                f"{title[:40]} {pdf_url}: {e}"
+            )
+            traceback.print_exc()
     return all_pages
 
 

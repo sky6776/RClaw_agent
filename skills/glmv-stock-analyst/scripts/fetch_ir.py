@@ -23,18 +23,26 @@ import sys
 import urllib.request
 from urllib.parse import urlparse
 
-try:
-    import fitz  # pymupdf（桌面 / Termux）
-except ImportError:
-    # APK 宿主无 pymupdf：pdf_to_pages 的 RCLAW_ANDROID 分支走 pypdf + PdfRenderer
-    # 桥。顶层直接退出会让安卓分支永远不可达（import 阶段就死），故降级为哨兵。
+if os.environ.get("RCLAW_ANDROID") == "1":
+    # APK 宿主无 pymupdf（兼容垫片已删除）：顶层不 import fitz，pdf_to_pages 的
+    # RCLAW_ANDROID 分支走 pypdf + PdfRenderer 桥。桌面 / Termux 照常导入。
     fitz = None
+else:
+    try:
+        import fitz  # pymupdf（桌面 / Termux）
+    except ImportError:
+        # 无 pymupdf 时降级为哨兵：pdf_to_pages 会给出明确的安装提示。
+        fitz = None
 
 
 # 允许的 URL scheme（仅 HTTPS，防止 file:// 等 SSRF）
 _ALLOWED_SCHEMES = {"https"}
 # 最大下载文件大小（50 MB）
 _MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+# %PDF- 魔数嗅探：先嗅探后落盘，几十 MB 的挑战页不再写满整个限额。按 PDF 规范
+# %PDF- 允许前导垃圾字节，比「头 5 字节」更宽松地在嗅探窗口内查找；实际补读至
+# 4096 字节再判，规避 HTTPResponse.read(amt) 的短读误杀。
+_PDF_SNIFF_BYTES = 4096
 
 
 def download_pdf(url: str, output_path: str, timeout: int = 30) -> bool:
@@ -54,9 +62,23 @@ def download_pdf(url: str, output_path: str, timeout: int = 30) -> bool:
             },
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
+        # 先嗅探 %PDF- 魔数：挑战页/HTML 在落盘前即拒绝（单篇失败不中断批次）。
+        # 循环补读到窗口满，read(amt) 允许返回少于 amt（短读会把 magic 拆到两次读）。
+        sniff = b""
+        while len(sniff) < _PDF_SNIFF_BYTES:
+            chunk = resp.read(_PDF_SNIFF_BYTES - len(sniff))
+            if not chunk:
+                break
+            sniff += chunk
+        if b"%PDF-" not in sniff:
+            print(
+                f"  ❌ 非 PDF 内容（疑似风控/挑战页），已丢弃: {sniff[:48]!r}",
+                file=sys.stderr,
+            )
+            return False
         # 分块读取，限制最大大小
-        chunks = []
-        total = 0
+        chunks = [sniff]
+        total = len(sniff)
         while True:
             chunk = resp.read(1024 * 1024)  # 1 MB chunks
             if not chunk:
