@@ -567,10 +567,12 @@ async fn ingest_outside_allowlist_group_silently_records() {
         "白名单外群消息落库后提交账本（重复事件在去重处丢弃）"
     );
 
-    // 2) 非白名单群图片（content 为空）与链接：record_text 不得落成空行/丢标题；
-    //    且不下载媒体——媒体目录除索引库外不得新增任何文件。
+    // 2) 非白名单群图片（content 为空）与链接：record_text 不得落成空行/丢标题。
+    //    媒体下载已接线（download_media_notes 与白名单内同链路），msg_svr_id=0
+    //    让 media_annotation 在发 HTTP 请求前就降级（hermetic：不依赖本机是否
+    //    恰好有 wcx 监听）；媒体落盘的成功路径由真机端到端验证（不建 mock）。
     let ev = event(json!({
-        "event": "message", "seq": 2, "dedup_key": "o2", "msg_svr_id": 502,
+        "event": "message", "seq": 2, "dedup_key": "o2", "msg_svr_id": 0,
         "type": "image", "talker": "456@chatroom", "is_group": true, "content": "",
     }));
     b.ingest_one(ev, &tx).await;
@@ -582,15 +584,15 @@ async fn ingest_outside_allowlist_group_silently_records() {
     {
         let mut media_files = Vec::new();
         collect_files(dir.path(), &mut media_files);
-        // 索引库本体 + SQLite 边车（-wal/-shm）都算库文件；除此之外不得有任何
-        // 媒体文件（图片/语音等未下载）。
+        // 索引库本体 + SQLite 边车（-wal/-shm）都算库文件；下载失败降级后不得有
+        // 任何媒体文件/临时文件残留。
         assert!(
             media_files.iter().all(|p| p.file_name().map(|n| {
                 let n = n.to_string_lossy();
                 n == "message_index.db"
                     || n.starts_with("message_index.db-")
             }).unwrap_or(false)),
-            "白名单外群消息不得产生媒体文件: {media_files:?}"
+            "下载失败降级后不得有媒体文件/临时文件残留: {media_files:?}"
         );
     }
     let ev = event(json!({
@@ -683,6 +685,53 @@ async fn ingest_outside_allowlist_group_commits_without_db() {
     );
 }
 
+/// inbound_media_params 参数表：build_content 与 download_media_notes 共用，
+/// 口径必须与旧 build_content 完全一致（防漂移）；video 有意不在表内。
+#[test]
+fn inbound_media_params_table() {
+    assert_eq!(
+        inbound_media_params("image", "", "t").unwrap(),
+        ("image".to_string(), "[图片]".to_string(), None)
+    );
+    assert_eq!(
+        inbound_media_params("voice", "", "t").unwrap(),
+        ("voice".to_string(), "[语音]".to_string(), None)
+    );
+    assert_eq!(
+        inbound_media_params("sticker", "", "t").unwrap(),
+        ("sticker".to_string(), "[表情]".to_string(), None)
+    );
+    assert_eq!(
+        inbound_media_params("file", "", "t").unwrap(),
+        ("file".to_string(), "[文件]".to_string(), Some("t".to_string()))
+    );
+    assert_eq!(
+        inbound_media_params("file", "报告.pdf", "t").unwrap(),
+        (
+            "file".to_string(),
+            "[文件: 报告.pdf]".to_string(),
+            Some("t".to_string())
+        )
+    );
+    // video 不在表内：wcx raw 端点暂不支持 type=video（恒 400），绝不发无效请求。
+    assert!(inbound_media_params("video", "", "t").is_none());
+    // 非媒体类型同样不在表内（text/link/quote 等走各自臂）。
+    assert!(inbound_media_params("link", "", "t").is_none());
+    assert!(inbound_media_params("text", "", "t").is_none());
+}
+
+/// 媒体大小门控纯函数：预检（未知长度放行/恰好等于上限放行/超限拒绝）与
+/// 流式计数（saturating 加法防溢出回绕）。
+#[test]
+fn media_size_gate_basics() {
+    assert!(precheck_content_length(None, 100), "未知长度放行（流式兜底）");
+    assert!(precheck_content_length(Some(100), 100), "恰好等于上限放行");
+    assert!(!precheck_content_length(Some(101), 100), "超上限拒绝");
+    assert!(!exceeds_cap(90, 10, 100), "累计恰好到上限仍放行");
+    assert!(exceeds_cap(91, 10, 100), "累计超上限中止");
+    assert!(exceeds_cap(u64::MAX - 1, 10, 100), "饱和加法防回绕");
+}
+
 /// record_text：类型映射的廉价版（无媒体下载/引用回填/发送者前缀）。
 #[test]
 fn record_text_mappings() {
@@ -727,6 +776,27 @@ fn record_text_mappings() {
     assert_eq!(
         record_text(&mk(json!({ "type_code": 51, "type": "other", "raw_content": "raw" }))),
         "[消息 type_code=51] raw"
+    );
+    // 与 inbound_media_params 参数表的标签口径交叉断言（防三处漂移：record_text /
+    // build_content / download_media_notes）。
+    for kind in ["image", "voice", "sticker"] {
+        let (_, label, _) = inbound_media_params(kind, "", "t").unwrap();
+        assert_eq!(
+            record_text(&mk(json!({ "type": kind, "content": "" }))),
+            label,
+            "{kind} 落库标签与参数表口径不一致"
+        );
+    }
+    assert_eq!(
+        record_text(&mk(json!({ "type": "file", "title": "a.pdf", "content": "" }))),
+        inbound_media_params("file", "a.pdf", "t").unwrap().1,
+        "file 落库标签与参数表口径不一致"
+    );
+    // file 空 title 变体同样一致。
+    assert_eq!(
+        record_text(&mk(json!({ "type": "file", "title": "", "content": "" }))),
+        inbound_media_params("file", "", "t").unwrap().1,
+        "file 空 title 落库标签与参数表口径不一致"
     );
 }
 

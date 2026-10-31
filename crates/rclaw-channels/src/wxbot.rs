@@ -20,9 +20,9 @@
 //!
 //! 白名单 = **回复**门槛（记录与回复解耦）：私聊 `allow_from` 空 = 放行全部（与
 //! weixin 通道一致）；群聊 `allow_groups` 空 = 所有群不回复（即使被 @）。群消息
-//! 一律静默落库——白名单外文本进本地索引、媒体仅标注不下载；白名单内按既有
-//! 流程（媒体照常下载），未触发回复的归档（`archived=1`）。回复才按
-//! `group_reply_policy`（默认 `"mention"`，仅精确 @ 本账号）触发。
+//! 一律静默落库，媒体与白名单内同链路下载（图片/语音/表情/文件；视频暂仅标注
+//! ——wcx raw 端点暂不支持 type=video），未触发回复的归档（`archived=1`）。
+//! 回复才按 `group_reply_policy`（默认 `"mention"`，仅精确 @ 本账号）触发。
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,7 @@ use rand::Rng;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use rclaw_core::{BusMessage, CHANNEL_WXBOT};
@@ -829,6 +830,13 @@ impl Wxbot {
         //    不跨 await 持锁（锁停/换号后不落库，与步骤 5 的不变量一致）。
         if !self.allowed(&ev) {
             if ev.is_group && !ev.talker.is_empty() {
+                // 媒体与白名单内同链路下载（await 在锁外）：白名单外群消息也全量
+                // 留档（用户要求：只要在群里，所有消息含媒体都保存到本地）。视频
+                // 不在下载表内（wcx raw 端点暂不支持 type=video），仍仅标注。
+                // 下载后复核与落库同一临界区：锁停/换号窗口内文件可能白下载
+                // （与白名单内在途语义一致，孤儿文件不清理）。
+                let mut media_notes: Vec<CachedMediaNote> = Vec::new();
+                self.download_media_notes(&ev, &mut media_notes).await;
                 let text = record_text(&ev);
                 let mut st = match self.state.lock() {
                     Ok(st) => st,
@@ -837,7 +845,7 @@ impl Wxbot {
                 if !st.account_ok(&ev.account) {
                     return;
                 }
-                self.db_record(&ev, &key, &[], true, &text);
+                self.db_record(&ev, &key, &media_notes, true, &text);
                 st.commit(key);
                 tracing::debug!(
                     "wxbot：白名单外群消息已静默落库 talker={} type={}",
@@ -922,41 +930,24 @@ impl Wxbot {
         let title = ev.title.clone().unwrap_or_default();
         match ev.kind.as_str() {
             "text" => parts.push(ev.content.clone()),
-            "image" => {
-                let (s, note) = self
-                    .media_annotation(ev, "image", "[图片]", None, &title)
-                    .await;
-                media_notes.extend(note);
-                parts.push(s);
+            // 可下载媒体（图片/语音/表情/文件）：与 download_media_notes 共用
+            // inbound_media_params 参数表，media_annotation 下载与标注一体。
+            "image" | "voice" | "sticker" | "file" => {
+                match inbound_media_params(&ev.kind, &title, &ev.talker) {
+                    Some((raw_type, label, talker)) => {
+                        let (s, note) = self
+                            .media_annotation(ev, &raw_type, &label, talker.as_deref(), &title)
+                            .await;
+                        media_notes.extend(note);
+                        parts.push(s);
+                    }
+                    // 参数表与上一行类型集合同步维护；漏配时降级为裸标注（与
+                    // kind_label_for 的兜底同名），不 panic。
+                    None => parts.push(plain_label("[媒体]", &title, &ev.content)),
+                }
             }
-            "voice" => {
-                let (s, note) = self
-                    .media_annotation(ev, "voice", "[语音]", None, &title)
-                    .await;
-                media_notes.extend(note);
-                parts.push(s);
-            }
-            "sticker" => {
-                let (s, note) = self
-                    .media_annotation(ev, "sticker", "[表情]", None, &title)
-                    .await;
-                media_notes.extend(note);
-                parts.push(s);
-            }
-            // 视频体量大，默认不拉取，仅标注。
+            // 视频体量大且 wcx raw 端点暂不支持 type=video：仅标注不下载。
             "video" => parts.push(plain_label("[视频]", &title, &ev.content)),
-            "file" => {
-                let label = if title.is_empty() {
-                    "[文件]".to_string()
-                } else {
-                    format!("[文件: {title}]")
-                };
-                let (s, note) = self
-                    .media_annotation(ev, "file", &label, Some(&ev.talker), &title)
-                    .await;
-                media_notes.extend(note);
-                parts.push(s);
-            }
             "link" => {
                 let mut s = format!("[链接] {title}");
                 if let Some(u) = &ev.url {
@@ -1122,6 +1113,23 @@ impl Wxbot {
         }
     }
 
+    /// 入站媒体的下载落盘（仅供本地记录/引用回填，不组装投递正文）：与
+    /// `build_content` 的媒体臂共用同一参数表与 [`Self::media_annotation`] 下载
+    /// 链路。视频不在参数表内（wcx raw 端点暂不支持 type=video），不下载仅标注。
+    async fn download_media_notes(&self, ev: &CollectorEvent, notes: &mut Vec<CachedMediaNote>) {
+        let title = ev.title.as_deref().unwrap_or("");
+        let Some((raw_type, label, talker)) = inbound_media_params(&ev.kind, title, &ev.talker)
+        else {
+            return;
+        };
+        let (_, note) = self
+            .media_annotation(ev, &raw_type, &label, talker.as_deref(), title)
+            .await;
+        if let Some(note) = note {
+            notes.push(note);
+        }
+    }
+
     /// `GET /api/media/raw` 拉字节流落盘。服务端会等待文件就绪（最长 ~120s），
     /// 客户端预算 150s 盖过它，失败不重试（避免触发重复下载）。
     async fn fetch_media(
@@ -1139,7 +1147,7 @@ impl Wxbot {
             query.push(("talker", t.to_string()));
         }
         let url = self.api_url("media/raw");
-        let resp = self
+        let mut resp = self
             .media_http
             .get(&url)
             .query(&query)
@@ -1151,22 +1159,11 @@ impl Wxbot {
             tracing::warn!("wxbot media/raw({raw_type}) HTTP {}", resp.status());
             return None;
         }
-        if let Some(len) = resp.content_length().filter(|len| *len > MEDIA_MAX_BYTES) {
-            tracing::warn!("wxbot 媒体 {len} 字节超过上限 {MEDIA_MAX_BYTES}，跳过");
-            return None;
-        }
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("wxbot 媒体下载失败 {raw_type}: {e}");
-                return None;
-            }
-        };
-        if bytes.len() as u64 > MEDIA_MAX_BYTES {
-            tracing::warn!("wxbot 媒体超过上限 {MEDIA_MAX_BYTES} 字节，已丢弃");
-            return None;
-        }
-        if bytes.is_empty() {
+        // 预检已知长度（快速拒绝省带宽）；真实上限由下面的流式计数兜底——
+        // Content-Length 未知不再跳过（本地 wcx 服务文件响应恒带长度，异常流
+        // 也会被中途上限拦住）。
+        if !precheck_content_length(resp.content_length(), MEDIA_MAX_BYTES) {
+            tracing::warn!("wxbot 媒体超过上限 {MEDIA_MAX_BYTES} 字节（预检），跳过");
             return None;
         }
         let dir = self.cfg.media_dir.join("wxbot");
@@ -1174,26 +1171,82 @@ impl Wxbot {
             tracing::warn!("wxbot：无法创建媒体目录 {}", dir.display());
             return None;
         }
-        // 文件名用 dedup_key 哈希（跨 wcx 重启稳定）而非 seq：wcx 重启后 seq 归零，
-        // 不同消息的裸 seq 会撞名互相覆盖，历史标注路径将指向新内容。
-        // 图片/表情按字节魔数定扩展名（wcx 不统一转码，PNG/WebP 原样透传，
-        // 固定 .jpg 会让 MIME 与内容不符）；识别不了沿用类型推断。
-        let base = sanitize_filename(if title.is_empty() { raw_type } else { title });
+        // 流式落盘到临时文件（resp.bytes() 会把最大 256MB 整段驻留内存，安卓低
+        // 内存设备有 OOM 风险）：chunk 循环 + 累计计数，中途超限即中止。文件名
+        // 用 dedup_key 哈希（跨 wcx 重启稳定）而非 seq：wcx 重启后 seq 归零，不
+        // 同消息的裸 seq 会撞名互相覆盖。.tmp_* 残留仅限进程被杀 / future 被取
+        // 消（常规失败路径均显式删除），不清扫，同 hash 重下覆盖。
+        let temp_path = dir.join(format!(
+            ".tmp_{:016x}",
+            media_file_hash(&effective_key(ev), raw_type, title),
+        ));
+        let mut file = match tokio::fs::File::create(&temp_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("wxbot：无法创建临时媒体文件 {}: {e}", temp_path.display());
+                return None;
+            }
+        };
+        const HEAD_SNIFF_BYTES: usize = 12; // 覆盖 WebP 的 RIFF/WEBP 魔数窗口
+        let mut written: u64 = 0;
+        let mut head: Vec<u8> = Vec::with_capacity(HEAD_SNIFF_BYTES);
+        // 下载主体：任何失败路径（chunk 读错/超限/写盘错）统一 Err，下方删临时文件。
+        let download: Result<(), ()> = async {
+            loop {
+                let chunk = match resp.chunk().await {
+                    Ok(Some(c)) => c,
+                    Ok(None) => return Ok(()),
+                    Err(e) => {
+                        tracing::warn!("wxbot 媒体下载失败 {raw_type}: {e}");
+                        return Err(());
+                    }
+                };
+                if exceeds_cap(written, chunk.len(), MEDIA_MAX_BYTES) {
+                    tracing::warn!("wxbot 媒体超过上限 {MEDIA_MAX_BYTES} 字节（流式中止），已丢弃");
+                    return Err(());
+                }
+                if head.len() < HEAD_SNIFF_BYTES {
+                    let take = (HEAD_SNIFF_BYTES - head.len()).min(chunk.len());
+                    head.extend_from_slice(&chunk[..take]);
+                }
+                if let Err(e) = file.write_all(&chunk).await {
+                    tracing::warn!("wxbot：媒体临时文件写失败 {}: {e}", temp_path.display());
+                    return Err(());
+                }
+                written += chunk.len() as u64;
+            }
+        }
+        .await;
+        drop(file);
+        // 空体与失败都删临时文件（防 .tmp_* 残留），语义与旧「空字节返回 None」一致。
+        if download.is_err() || written == 0 {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return None;
+        }
+        // 扩展名：仅 image/sticker 按头部魔数嗅探（wcx 不统一转码，PNG/WebP 原样
+        // 透传，固定 .jpg 会让 MIME 与内容不符）；voice/file 沿用类型推断，绝不
+        // 用嗅探兜底（PDF/语音不能被存成 .jpg）。
         let ext = match raw_type {
-            "image" | "sticker" => sniff_image_ext(&bytes)
+            "image" | "sticker" => sniff_image_ext(&head)
                 .map(str::to_string)
                 .unwrap_or_else(|| ext_for_media(raw_type, Some(title))),
             _ => ext_for_media(raw_type, Some(title)),
         };
-        let fname = format!(
+        let base = sanitize_filename(if title.is_empty() { raw_type } else { title });
+        let path = dir.join(format!(
             "{:016x}_{base}.{ext}",
             media_file_hash(&effective_key(ev), raw_type, title),
-        );
-        let path = dir.join(fname);
-        match std::fs::write(&path, &bytes) {
+        ));
+        // 同 hash 重下时目标可能已存在：std::fs::rename 在 Windows 走
+        // MOVEFILE_REPLACE_EXISTING，目标已存在一般直接覆盖成功。rename 失败
+        // （目标被其它进程占用等）时**不删旧文件**、删临时文件返回 None——旧
+        // media_json 路径继续有效，任何路径都不丢旧媒体文件。以下同步文件调用
+        // 为同目录毫秒级，async 上下文可接受。
+        match std::fs::rename(&temp_path, &path) {
             Ok(()) => Some(path),
             Err(e) => {
                 tracing::warn!("wxbot：媒体落盘失败 {}: {e}", path.display());
+                let _ = std::fs::remove_file(&temp_path);
                 None
             }
         }
@@ -1859,6 +1912,45 @@ fn kind_label_for(raw_type: &str) -> &'static str {
     }
 }
 
+/// 入站可下载媒体类型的统一参数表：`build_content` 组装投递正文与
+/// [`Wxbot::download_media_notes`] 只下载落盘共用，防两处 raw_type/label/talker
+/// 漂移。视频**有意不在表内**——wcx `/api/media/raw` 端点暂不支持 type=video
+/// （硬编码白名单，恒 400），视频仍仅标注；待 wcx 侧支持后接入（届时按 64MB
+/// 上限守卫，见 docs/wxbot-channel.md §4.2）。
+fn inbound_media_params(
+    kind: &str,
+    title: &str,
+    talker: &str,
+) -> Option<(String, String, Option<String>)> {
+    match kind {
+        "image" => Some(("image".into(), "[图片]".into(), None)),
+        "voice" => Some(("voice".into(), "[语音]".into(), None)),
+        "sticker" => Some(("sticker".into(), "[表情]".into(), None)),
+        "file" => {
+            let label = if title.is_empty() {
+                "[文件]".to_string()
+            } else {
+                format!("[文件: {title}]")
+            };
+            // talker 原样透传（与旧 build_content 一致；空 talker 的异常事件会
+            // 被 wcx raw 400 拒绝，调用方降级为标注，不另做过滤）。
+            Some(("file".into(), label, Some(talker.into())))
+        }
+        _ => None,
+    }
+}
+
+/// 预检已知 Content-Length：超过上限快速拒绝（省带宽）；未知长度放行——由
+/// 流式计数兜底（本地 wcx 服务的文件响应恒带长度，异常流也会被中途上限拦住）。
+fn precheck_content_length(len: Option<u64>, max: u64) -> bool {
+    !len.is_some_and(|l| l > max)
+}
+
+/// 流式累计写入是否超出上限（saturating 加法防溢出回绕）。
+fn exceeds_cap(written: u64, next_len: usize, max: u64) -> bool {
+    written.saturating_add(next_len as u64) > max
+}
+
 /// 引用回填的文本标注行（napcat format_cached_text_note 同款）。
 fn format_cached_text_note(text: &CachedText) -> String {
     let suffix = if text.truncated {
@@ -1920,10 +2012,11 @@ fn plain_label(label: &str, title: &str, content: &str) -> String {
 
 /// 入站消息的落库文本（类型映射的廉价版；白名单外群消息的静默落库、白名单内
 /// 归档/投递与私聊路径共用）：与 [`Wxbot::build_content`] 同一张映射表，但
-/// **不下载媒体**（白名单外是陌生人内容，下载有成本与安全面）、不做引用回填、
-/// 不带发送者前缀（`sender` 列已单独存）。直接用 `ev.content` 会丢信息：图片的
-/// content 常为空、链接的标题/URL/摘要分列在 title/url/des——这里保证非文本
-/// 消息至少落类型标注与标题。
+/// **本身不下载媒体**（下载由媒体臂的 `media_annotation` /
+/// [`Wxbot::download_media_notes`] 负责）、不做引用回填、不带发送者前缀
+/// （`sender` 列已单独存）。直接用 `ev.content` 会丢信息：图片的 content 常为
+/// 空、链接的标题/URL/摘要分列在 title/url/des——这里保证非文本消息至少落
+/// 类型标注与标题。
 fn record_text(ev: &CollectorEvent) -> String {
     let title = ev.title.as_deref().unwrap_or("");
     match ev.kind.as_str() {
@@ -1991,10 +2084,10 @@ impl Channel for Wxbot {
         me.bind_account().await;
         // 群消息全量落库的显式提示（隐私边界：记录不受 allow_groups 约束，回复才
         // 受）。尽力而为口径——落库失败仅告警不重投；db 缺失时明示不会落库。
-        // 注意措辞：白名单外群消息媒体仅标注不下载；白名单内按既有流程下载。
+        // 注意措辞：白名单外群消息媒体与白名单内同链路下载；视频暂不支持。
         match &me.db {
             Some(_) => tracing::warn!(
-                "wxbot：群消息全量落库已启用——所有群（含白名单外）的入站消息将尽力记录到本地索引 {}（白名单外媒体仅标注不下载；回复仍按 allow_groups/group_reply_policy）",
+                "wxbot：群消息全量落库已启用——所有群（含白名单外）的入站消息将尽力记录到本地索引 {}（媒体同白名单内下载：图片/语音/表情/文件；视频暂仅标注；回复仍按 allow_groups/group_reply_policy）",
                 me.cfg.media_dir.join("wxbot").join("message_index.db").display()
             ),
             None => tracing::warn!(
