@@ -7,7 +7,8 @@ import {
   type TouchEvent,
 } from "react";
 import { api } from "../lib/api";
-import { useIsMobile } from "../lib/useIsMobile";
+import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
+import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 
 /** 会话流内嵌媒体预览条目。 */
 export interface PreviewItem {
@@ -155,7 +156,6 @@ export default function MediaPreviews({
   const [videoUrls, setVideoUrls] = useState<Record<string, string>>({});
   const videoRequested = useRef<Set<string>>(new Set());
   const isMobile = useIsMobile();
-  const pressTimer = useRef<number | null>(null);
   // 长按触发后吞掉紧随的 click（长按松手仍会派发 click，会误触「点开」/查看器）。
   const suppressClickRef = useRef(false);
 
@@ -194,45 +194,52 @@ export default function MediaPreviews({
 
   // ---- 长按 / 右键上抛（菜单在 Chat 层统一渲染） ----
 
-  // 长按起点：move 位移超 12px（touch slop）才取消——同坐标长按与手指微抖都
-  // 会持续派发 touchmove，无条件取消会让长按永远不触发。
-  const pressOrigin = useRef<{ x: number; y: number } | null>(null);
-
-  const cancelPress = () => {
-    pressOrigin.current = null;
-    if (pressTimer.current !== null) {
-      window.clearTimeout(pressTimer.current);
-      pressTimer.current = null;
+  // 触摸序列交给 lib/longPress 的 window capture 守卫（与消息行同一套 slop/
+  // 计时/滚动漂移校验；媒体卡也会被流式重渲染替换 DOM，行级 move 跟踪同样会
+  // 丢）。这里只记录待弹的媒体与滚动基线来源（最近的 .chat-msg-list）。选择
+  // 模式下长按停用（点击即选中切换）。
+  const pressGuardRef = useRef<LongPressGuard | null>(null);
+  const pressItemRef = useRef<MediaMenuPayload | null>(null);
+  const pressListElRef = useRef<Element | null>(null);
+  // 守卫只创建一次，onFire 闭包里不能直接用渲染期的 onMediaMenu（每渲染都是
+  // 新箭头、捕获当轮 props）——经 ref 取最新，避免流式期间菜单拿到旧回调。
+  const onMediaMenuRef = useRef(onMediaMenu);
+  onMediaMenuRef.current = onMediaMenu;
+  const selectModeRef = useRef(selectMode);
+  selectModeRef.current = selectMode;
+  const getPressGuard = () => {
+    // lazy init：useRef(createLongPressGuard(...)) 会在每次渲染新建实例。
+    if (!pressGuardRef.current) {
+      pressGuardRef.current = createLongPressGuard({
+        getScrollTop: () =>
+          pressListElRef.current instanceof HTMLElement
+            ? pressListElRef.current.scrollTop
+            : null,
+        onFire: (x, y) => {
+          const item = pressItemRef.current;
+          // 按下后 450ms 内进入了选择模式：菜单让位（点击语义已变为选中切换）。
+          if (selectModeRef.current) return;
+          if (!item || !onMediaMenuRef.current) return;
+          // 长按触发后的合成 click 必须吞掉（600ms 窗口），否则菜单弹出的
+          // 同一瞬间图片查看器 / 视频播放器跟着开。
+          suppressClickRef.current = true;
+          window.setTimeout(() => (suppressClickRef.current = false), 600);
+          if (navigator.vibrate) navigator.vibrate(15);
+          onMediaMenuRef.current(item, x, y, true);
+        },
+      });
     }
+    return pressGuardRef.current;
   };
-
-  // 长按 450ms 上抛（Chat 弹统一菜单，轻震动反馈）；选择模式下长按停用
-  // （点击即选中切换）。
-  const startPress = (item: PreviewItem, x: number, y: number) => {
+  const startPress = (item: PreviewItem, el: Element, x: number, y: number) => {
     if (selectMode || !onMediaMenu) return;
-    cancelPress();
-    pressOrigin.current = { x, y };
-    pressTimer.current = window.setTimeout(() => {
-      pressTimer.current = null;
-      suppressClickRef.current = true;
-      window.setTimeout(() => (suppressClickRef.current = false), 600);
-      if (navigator.vibrate) navigator.vibrate(15);
-      onMediaMenu(
-        { path: item.path, display: item.display, kind: item.kind },
-        x,
-        y,
-        true,
-      );
-    }, 450);
+    pressItemRef.current = { path: item.path, display: item.display, kind: item.kind };
+    pressListElRef.current = el.closest(".chat-msg-list");
+    getPressGuard().start(x, y);
   };
 
-  const movePress = (x: number, y: number) => {
-    const o = pressOrigin.current;
-    if (o && Math.hypot(x - o.x, y - o.y) > 12) cancelPress();
-  };
-
-  // 组件卸载清定时器（返回 cancelPress 作 cleanup）。
-  useEffect(() => cancelPress, []);
+  // 组件卸载清计时器与 window 监听。
+  useEffect(() => () => pressGuardRef.current?.cancel(), []);
 
   const openItem = (item: PreviewItem) => {
     if (suppressClickRef.current) {
@@ -252,27 +259,37 @@ export default function MediaPreviews({
     <div className="mt-1 flex max-w-full flex-col gap-2">
       {rendered.map((it) => {
         // 长按 / 右键 handlers（各媒体卡共用）。选择模式下点击交给消息列的
-        // 选中切换，本组件只拦截触摸冒泡（防消息气泡长按计时器叠加）。
+        // 选中切换，本组件只拦截触摸冒泡（防消息气泡长按守卫同时上抛）。
         const handlers = {
           onTouchStart: (e: TouchEvent) => {
-            if (!isMobile || e.touches.length === 0) return;
+            if (!isMobile || e.touches.length !== 1) return;
             // 阻止冒泡：消息气泡也有长按（统一菜单），媒体卡菜单不能同时触发。
             // 不在此处做任何图片解码预热：真机实测 WebView83 对 12MP data URL
             // 的 decode() 会阻塞主线程 1~2s，把点击响应整个挡住——查看器即时
             // 挂载 + decoding=async 已足够（遮罩先出、大图解码后光栅上屏）。
             e.stopPropagation();
-            if (!selectMode) startPress(it, e.touches[0].clientX, e.touches[0].clientY);
+            if (!selectMode) {
+              startPress(
+                it,
+                e.currentTarget as Element,
+                e.touches[0].clientX,
+                e.touches[0].clientY,
+              );
+            }
           },
-          onTouchEnd: cancelPress,
-          onTouchMove: (e: TouchEvent) => {
-            if (e.touches[0]) movePress(e.touches[0].clientX, e.touches[0].clientY);
-          },
-          onTouchCancel: cancelPress,
           onContextMenu: (e: MouseEvent) => {
             e.preventDefault();
             e.stopPropagation();
-            // 右键即时弹（与消息气泡一致），不走 450ms 长按计时；fromTouch=false
-            // 不布防 click 吞吐（吞吐只服务于长按抬指的合成 click）。
+            // 安卓：系统长按 ~500ms 补发的原生 contextmenu 不弹应用菜单——应用
+            // 菜单由长按守卫的 450ms 计时器负责（fromTouch=false 无 click 吞吐，
+            // 从这里弹会被合成 click 瞬间关掉）。守卫顺带 cancel：正常路径计时
+            // 器已触发（cancel 无害）；计时器被事件循环压迟到 contextmenu 之后
+            // 时，避免迟到的菜单再弹出。安卓 + 鼠标右键随之牺牲（触摸长按是
+            // 主路径）。桌面右键即时弹（不走 450ms 长按计时）。
+            if (isAndroidDevice()) {
+              pressGuardRef.current?.cancel();
+              return;
+            }
             if (!selectMode && onMediaMenu) {
               onMediaMenu(
                 { path: it.path, display: it.display, kind: it.kind },

@@ -10,12 +10,14 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, type PermissionMode, type PlanStatus } from "../lib/api";
 import type { ToolCallView } from "../lib/toolCalls";
+import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { parseMediaItems } from "./MediaPreviews";
 import WorkflowCard from "./WorkflowCard";
 import MediaGallery, { type GalleryItem, type GallerySeed } from "./MediaGallery";
 import ToolBatchRows from "./ToolCallRow";
+import { RoundFab, RoundRail, useWidePointer, type RoundNavItem } from "./RoundNav";
 import { CheckIcon, CopyIcon, GearIcon, PencilIcon, ShieldIcon } from "./icons";
 
 export type Role = "user" | "assistant" | "status" | "thinking";
@@ -170,19 +172,33 @@ const AssistantMarkdown = React.memo(function AssistantMarkdown({
   );
 });
 
+/** 思考块正文的展示文本：剥「💭 思考中...」流式占位前缀（ThinkingBody 渲染与
+ *  菜单「选择文字」的空正文判断共用同一口径，避免两处正则漂移）。 */
+function thinkingBodyText(content: string): string {
+  return content.replace(/^💭\s*思考中\.\.\.\n?/, "").trim();
+}
+
 /** 思考块正文（memo 边界）：展开且内容不变时跳过重渲，流式期间只有正在增长的
- *  那一个块真正更新。清洗（剥「💭 思考中...」前缀）在边界内完成。 */
+ *  那一个块真正更新。清洗（剥「💭 思考中...」前缀）在边界内完成。selectable =
+ *  文字选择模式选中了本块（安卓）：正文强制显示并恢复原生选择（收起状态的块
+ *  被选中时若不强制展开，选区会落在不可见内容上——选了个寂寞）。 */
 const ThinkingBody = React.memo(function ThinkingBody({
   content,
   open,
+  selectable,
 }: {
   content: string;
   open: boolean;
+  selectable: boolean;
 }) {
-  if (!open) return null;
-  const body = content.replace(/^💭\s*思考中\.\.\.\n?/, "").trim();
+  if (!open && !selectable) return null;
+  const body = thinkingBodyText(content);
   return (
-    <div className="md-body border-t border-[#2a2f3a] px-4 py-2 text-xs whitespace-pre-wrap text-gray-400 max-md:px-3">
+    <div
+      className={`md-body border-t border-[#2a2f3a] px-4 py-2 text-xs whitespace-pre-wrap text-gray-400 max-md:px-3 ${
+        selectable ? "text-selectable" : ""
+      }`}
+    >
       {body}
     </div>
   );
@@ -522,22 +538,39 @@ function PlanStepsCard({
 /** 可折叠的思考过程块：点击标题行（或右侧箭头）收起 / 展开。
  *  durationSecs = 下一条消息到达与本块到达的时间差（历史恢复无时间戳则不显示）。
  *  defaultOpen 只在本块挂载时生效；手动收起 / 展开经 onToggle 上报，作为之后
- *  新到块的默认状态，不影响任何已在屏上的块。 */
+ *  新到块的默认状态，不影响任何已在屏上的块。selectable = 文字选择模式选中了
+ *  本块（安卓）：正文强制显示、卡片放开裁剪（overflow-hidden 会裁掉选择手柄），
+ *  并先把块滚入视口。标题箭头 / aria / 正文可见性统一按 expanded（手动开合 ∨
+ *  selectable），避免「正文已显示、箭头还是收起」的状态矛盾；selectable 时标题
+ *  仍可点（只改 open，正文因 expanded 保持显示，onToggle 上报语义不变）。 */
 function ThinkingBlock({
   content,
   durationSecs,
   defaultOpen,
   onToggle,
+  selectable,
 }: {
   content: string;
   durationSecs: number | null;
   defaultOpen: boolean;
   onToggle?: (collapsed: boolean) => void;
+  selectable: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  // 进入选择模式后（正文已强制展开）再把块滚入视口：同步回调里正文还没展开，
+  // 位置不准，layout effect 时机正合适。
+  useLayoutEffect(() => {
+    if (selectable) rootRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selectable]);
+  const expanded = open || selectable;
   return (
-    <div className="flex justify-start">
-      <div className="w-full overflow-hidden rounded-2xl rounded-bl-md border border-dashed border-[#3a4150] bg-[#141821]">
+    <div ref={rootRef} className="flex justify-start">
+      <div
+        className={`w-full rounded-2xl rounded-bl-md border border-dashed border-[#3a4150] bg-[#141821] ${
+          selectable ? "overflow-visible" : "overflow-hidden"
+        }`}
+      >
         <button
           onClick={(ev) => {
             // 不冒泡：多选模式下点折叠标题不应切换整行选中。
@@ -557,9 +590,9 @@ function ThinkingBlock({
               </span>
             )}
           </span>
-          <span className="text-[10px] text-gray-600">{open ? "▾" : "▸"}</span>
+          <span className="text-[10px] text-gray-600">{expanded ? "▾" : "▸"}</span>
         </button>
-        <ThinkingBody content={content} open={open} />
+        <ThinkingBody content={content} open={open} selectable={selectable} />
       </div>
     </div>
   );
@@ -660,7 +693,6 @@ export default function Chat({
   const [exporting, setExporting] = useState(false);
   const [exportResult, setExportResult] = useState<string | null>(null);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
-  const selectPressTimer = useRef<number | null>(null);
   // 工具权限模式（null = 尚未加载到，隐藏选择器）。
   const [permMode, setPermMode] = useState<PermissionMode | null>(null);
   const [permOpen, setPermOpen] = useState(false);
@@ -845,6 +877,8 @@ export default function Chat({
   const handleListScroll = () => {
     const el = listRef.current;
     if (!el) return;
+    // 轮次导航的当前轮跟随滚动刷新（rAF 节流，见下方 computeActiveRound）。
+    scheduleActiveRound();
     // 批量开合思考块的布局滚动抑制窗：钳位/结算复位产生的滚动事件（位置等于
     // 基线）只吞掉不改判——脱离态复原不被 atExactBottom / 无溢出分支翻转；
     // 位置与基线不同的滚动（键盘翻页 / 滚动条 / 滚轮等真实滚动）立即结束抑制
@@ -1365,56 +1399,67 @@ export default function Chat({
     });
   };
 
-  const clearSelectPress = () => {
-    if (selectPressTimer.current !== null) {
-      window.clearTimeout(selectPressTimer.current);
-      selectPressTimer.current = null;
-    }
-  };
-
   // 消息行的长按 / 右键 → 统一操作菜单（用户/助手/思考/工具行通用；媒体卡有
-  // 独立入口且已 stopPropagation，不会同时触发）。touchmove 只在位移超过 12px
-  // （touch slop）时取消计时：系统同坐标长按与手指微抖都会持续派发 move，
-  // 无条件取消会让长按永远不触发。起点坐标放组件级 ref：流式更新会重建行
-  // handler，闭包局部变量每次渲染归零，按住期间一次流式重渲染 + 微抖就会
-  // 被误判成「移动了 12px+」掐掉计时器。同一时刻只有一个长按手势在途，
-  // 多行共享一个坐标 ref 是安全的。
+  // 独立入口且已 stopPropagation，不会同时触发）。触摸序列交给 lib/longPress
+  // 的 window capture 守卫：流式重渲染会替换触摸目标（行级 onTouchMove 派发到
+  // 已摘除的旧节点收不到，slop 取消失效——「正常滑动也弹长按」的根因），capture
+  // 自 window 下行不受影响；触发前还校验列表滚动漂移（慢滚取消）与条目仍存在。
+  // 同一时刻只有一个长按手势在途，全部行共享一个守卫是安全的。
   // 挂在整行（而非气泡内层）上：行内任意位置长按都可触发，包括气泡外空白。
-  const selectPressPosRef = useRef({ x: 0, y: 0 });
+  const pressGuardRef = useRef<LongPressGuard | null>(null);
+  const pressEntryIdRef = useRef<number | null>(null);
+  // 流式期间 entries 每个 chunk 都在变：触发时按 id 取最新条目，菜单复制到的
+  // 是按下→触发之间增长后的完整内容。
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
+  const getPressGuard = () => {
+    // lazy init：useRef(createLongPressGuard(...)) 会在每次渲染新建实例，
+    // 在途手势容易失联。
+    if (!pressGuardRef.current) {
+      pressGuardRef.current = createLongPressGuard({
+        getScrollTop: () => listRef.current?.scrollTop ?? null,
+        isStillValid: () => {
+          const id = pressEntryIdRef.current;
+          return id === null || entriesRef.current.some((e) => e.id === id);
+        },
+        onFire: (x, y) => {
+          const id = pressEntryIdRef.current;
+          const entry =
+            id === null ? undefined : entriesRef.current.find((e) => e.id === id);
+          if (!entry) return;
+          if (navigator.vibrate) navigator.vibrate(15);
+          openMsgMenu({ entry, media: null, x, y }, true);
+        },
+      });
+    }
+    return pressGuardRef.current;
+  };
   const bubblePressHandlers = (entry: Entry) => {
     return {
       onTouchStart: (e: React.TouchEvent) => {
         if (!isMobile || e.touches.length !== 1) return;
         const { clientX, clientY } = e.touches[0];
-        selectPressPosRef.current = { x: clientX, y: clientY };
-        clearSelectPress();
-        selectPressTimer.current = window.setTimeout(() => {
-          selectPressTimer.current = null;
-          if (navigator.vibrate) navigator.vibrate(15);
-          openMsgMenu({ entry, media: null, x: clientX, y: clientY }, true);
-        }, 450);
+        pressEntryIdRef.current = entry.id;
+        getPressGuard().start(clientX, clientY);
       },
-      onTouchEnd: clearSelectPress,
-      onTouchMove: (e: React.TouchEvent) => {
-        const t = e.touches[0];
-        if (
-          t &&
-          Math.hypot(
-            t.clientX - selectPressPosRef.current.x,
-            t.clientY - selectPressPosRef.current.y,
-          ) > 12
-        )
-          clearSelectPress();
-      },
-      onTouchCancel: clearSelectPress,
       onContextMenu: (e: React.MouseEvent) => {
         e.preventDefault();
+        // 安卓：系统长按 ~500ms 补发的原生 contextmenu 不弹应用菜单——应用菜
+        // 单由 450ms 计时器负责（先于 contextmenu 打开，抬指合成 click 由
+        // msgMenuClickGuard 吞掉）；fromTouch=false 不布防 click 吞吐，从这里
+        // 弹会被瞬间关掉再重开。守卫顺带 cancel：正常路径计时器已触发（无害），
+        // 被压迟到 contextmenu 之后时避免迟到的菜单再弹出。安卓 + 鼠标右键
+        // 随之牺牲（触摸长按是主路径）。桌面右键照常即时弹。
+        if (isAndroidDevice()) {
+          pressGuardRef.current?.cancel();
+          return;
+        }
         openMsgMenu({ entry, media: null, x: e.clientX, y: e.clientY }, false);
       },
     };
   };
-  // 卸载清定时器。
-  useEffect(() => clearSelectPress, []);
+  // 卸载清计时器与 window 监听。
+  useEffect(() => () => pressGuardRef.current?.cancel(), []);
 
   // 系统返回键关一层菜单 / 选择模式（与弹层栈共用管道）。
   useBackClose(msgMenu !== null, () => setMsgMenu(null));
@@ -1635,7 +1680,9 @@ export default function Chat({
               className={selectIds ? "flex cursor-pointer items-start" : undefined}
               {...(selectIds
                 ? { onClick: () => toggleSelected(e.id) }
-                : bubblePressHandlers(e))}
+                : textSelectId === e.id
+                  ? undefined
+                  : bubblePressHandlers(e))}
             >
               {selectIds && (
                 <button
@@ -1660,6 +1707,7 @@ export default function Chat({
                   durationSecs={durationSecs}
                   defaultOpen={!futureThinkingCollapsed}
                   onToggle={onToggleThinking}
+                  selectable={textSelectId === e.id}
                 />
               </div>
             </div>
@@ -1672,6 +1720,8 @@ export default function Chat({
               key={e.id}
               role="group"
               aria-label="用户消息"
+              // 轮次导航锚点：RoundNav 按 data-entry-id 定位与判当前轮。
+              data-entry-id={e.id}
               className="flex justify-end"
               {...(selectIds || textSelectId === e.id
                 ? undefined
@@ -1910,6 +1960,19 @@ export default function Chat({
     });
   }, [listBlocks, sessionKey]);
 
+  // 文字选择模式选中的思考块所在段：同样强制展开（历史过程段收起时思考块正文
+  // 不可见，选择模式就是空选）。key 口径与下方分段一致（user 条目开段；无 user
+  // 前缀段 = 段首条目 id）。
+  const textSelectSegKey = useMemo(() => {
+    if (textSelectId === null) return null;
+    let curKey: number | null = null;
+    for (const e of entries) {
+      if (e.role === "user" || curKey === null) curKey = e.id;
+      if (e.id === textSelectId) return curKey;
+    }
+    return null;
+  }, [entries, textSelectId]);
+
   // 段开合状态在渲染期推导（只读上次提交的运行集合，本渲染不产生副作用——可
   // 被 StrictMode / 并发渲染安全地重复执行）。
   const segOpen = new Map<number, boolean>();
@@ -1917,7 +1980,8 @@ export default function Chat({
   for (const b of listBlocks) {
     // 选择模式（selectIds 非 null 即处于选择模式，空集也是）强制全部展开，保证
     // 每一行都可达；运行段/无 assistant 段强制展开且不可收起。
-    const forcedOpen = selectIds !== null || b.running || !b.collapsible;
+    const forcedOpen =
+      selectIds !== null || b.running || !b.collapsible || b.key === textSelectSegKey;
     segForced.set(b.key, forcedOpen);
     segOpen.set(
       b.key,
@@ -1925,19 +1989,133 @@ export default function Chat({
     );
   }
 
+  // ── 轮次快捷导航（桌面 rail / 移动 chip+底部 sheet，组件在 RoundNav.tsx）──
+  // 轮次 = 用户消息（发送失败的不算：没落库、带错误提示，导航意义小）。后端
+  // 只保留最近 ~80 条目：编号按「已加载序号」，不是全会话轮次（面板有说明）。
+  const rounds = useMemo<RoundNavItem[]>(
+    () =>
+      entries
+        .filter((e) => e.role === "user" && !e.sendFailed)
+        .map((e) => ({
+          id: e.id,
+          preview:
+            stripMediaMarkers(e.content).split("\n")[0]?.trim().slice(0, 80) ||
+            "（媒体消息）",
+          time: e.ts && e.ts > 0 ? formatEntryTime(new Date(e.ts)) : null,
+        })),
+    [entries],
+  );
+  const widePointer = useWidePointer();
+  // 选择模式 / 文字选择期间隐藏导航（选择手势与导航互抢）。
+  const navEnabled = rounds.length >= 2 && selectIds === null && textSelectId === null;
+  const railVisible = navEnabled && !isAndroidDevice() && widePointer;
+  const fabVisible = navEnabled && !railVisible;
+
+  // 跳转到第 N 轮：锚点行顶对齐列表视口顶。最后一轮 = 最新对话，恢复跟随拉底
+  // （跳到最新还显示「回到底部」是反直觉的）；其余轮次脱离跟随。zcode 同款坐
+  // 标公式；prefers-reduced-motion 时全部 instant。
+  const scrollToRound = (id: number) => {
+    const el = listRef.current;
+    if (!el) return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (rounds[rounds.length - 1]?.id === id) {
+      scrollListToBottom(!reduce);
+      return;
+    }
+    const row = el.querySelector<HTMLElement>(`[data-entry-id="${id}"]`);
+    if (!row) return;
+    stickToBottomRef.current = false;
+    setShowJumpDown(true);
+    el.scrollTo({
+      top:
+        el.scrollTop +
+        row.getBoundingClientRect().top -
+        el.getBoundingClientRect().top,
+      behavior: reduce ? "auto" : "smooth",
+    });
+  };
+
+  // 当前轮 = 视口顶以上最近的一条用户消息（zcode 同语义）；一条都不到线（视口
+  // 停在第一条消息内部）才取第一条——底部不管多长的回复都不回退第一条。rAF
+  // 节流：scroll 每 tick 至多一次，DOM 查询量 = 轮次数（≤80）。
+  const [activeRoundId, setActiveRoundId] = useState<number | null>(null);
+  const activeRoundRafRef = useRef<number | null>(null);
+  // 最新实现经 ref 供 rAF 回调读取（见 scheduleActiveRound）；layout effect 写入
+  // 而非渲染期——并发渲染丢弃的渲染不得更新 ref。
+  const computeActiveRoundRef = useRef<() => void>(() => {});
+  const computeActiveRound = () => {
+    const el = listRef.current;
+    if (!el || rounds.length === 0) {
+      setActiveRoundId((v) => (v === null ? v : null));
+      return;
+    }
+    const containerTop = el.getBoundingClientRect().top;
+    let current: number | null = null;
+    for (const r of rounds) {
+      const row = el.querySelector<HTMLElement>(`[data-entry-id="${r.id}"]`);
+      if (!row) continue;
+      if (row.getBoundingClientRect().top <= containerTop + 8) current = r.id;
+      else break;
+    }
+    const next = current ?? rounds[0].id;
+    setActiveRoundId((v) => (v === next ? v : next));
+  };
+  const scheduleActiveRound = () => {
+    // 经 ref 取最新 computeActiveRound：rAF 闭包若捕获调度帧的旧 rounds，会在
+    // 流式 entries 更新后把高亮改回旧轮（layout effect 先按新值算、旧 rAF 后跑
+    // 覆盖回去）。
+    if (activeRoundRafRef.current !== null) return;
+    activeRoundRafRef.current = window.requestAnimationFrame(() => {
+      activeRoundRafRef.current = null;
+      computeActiveRoundRef.current();
+    });
+  };
+  // computeActiveRoundRef 每次 commit 后刷新（无依赖 layout effect：layout 同步
+  // 于提交、先于 rAF 回调，rAF 永远读到刚提交的实现；并发渲染丢弃的渲染不会
+  // 更新 ref，签名不变但 rounds 引用换新的边界场景也覆盖）。
+  useLayoutEffect(() => {
+    computeActiveRoundRef.current = computeActiveRound;
+  });
+  // 补算时机：滚动之外没有 scroll 事件的场景——切会话/首屏/发送/轮次集合变化/
+  // 忙碌翻转。依赖收窄到轮次集合签名（长度+首尾 id）：流式每 chunk 变 entries
+  // 不再逐 chunk 全量查 DOM（滚动路径的 rAF 兜住其余时机）。
+  const roundsSignature = `${rounds.length}:${rounds[0]?.id ?? ""}:${rounds[rounds.length - 1]?.id ?? ""}`;
+  useLayoutEffect(() => {
+    computeActiveRound();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roundsSignature, sessionKey, busy]);
+  // 卸载取消挂着的 rAF。
+  useEffect(
+    () => () => {
+      if (activeRoundRafRef.current !== null) {
+        cancelAnimationFrame(activeRoundRafRef.current);
+      }
+    },
+    [],
+  );
+
   return (
     <div className="chat-bg flex h-full flex-col">
-      {/* 消息流（移动端收窄页边距，把宽度还给消息正文） */}
-      <div
-        ref={listRef}
-        onScroll={handleListScroll}
-        onTouchStartCapture={handleListTouchStart}
-        onTouchMoveCapture={handleListTouchMove}
-        onTouchEndCapture={handleListTouchFinish}
-        onTouchCancelCapture={handleListTouchFinish}
-        onWheel={handleListWheel}
-        className="chat-msg-list flex-1 space-y-3 overflow-y-auto px-6 py-4 max-md:space-y-2.5 max-md:px-3 max-md:py-3"
-      >
+      {/* 消息流 wrapper：rail / fab 的定位基准必须是消息列表视口（rail 的
+          top-1/2 若挂在 chat-bg 上会居中到整个聊天列、压到输入区）。 */}
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        {railVisible && (
+          <RoundRail rounds={rounds} activeId={activeRoundId} onJump={scrollToRound} />
+        )}
+        {/* 消息流（移动端收窄页边距，把宽度还给消息正文）；rail 可见时左侧
+            让位 56px（rail 宽 40px + 边距），不压住正文。 */}
+        <div
+          ref={listRef}
+          onScroll={handleListScroll}
+          onTouchStartCapture={handleListTouchStart}
+          onTouchMoveCapture={handleListTouchMove}
+          onTouchEndCapture={handleListTouchFinish}
+          onTouchCancelCapture={handleListTouchFinish}
+          onWheel={handleListWheel}
+          className={`chat-msg-list flex-1 space-y-3 overflow-y-auto py-4 max-md:space-y-2.5 max-md:px-3 max-md:py-3 ${
+            railVisible ? "pl-14 pr-6" : "px-6"
+          }`}
+        >
         {entries.length === 0 && (
           <div className="mt-24 text-center text-sm text-gray-600 max-md:mt-36 max-md:px-6">
             <p className="text-base text-gray-400">向 RClaw 发出第一条消息</p>
@@ -2016,6 +2194,12 @@ export default function Chat({
               </svg>
             </button>
           </div>
+        )}
+        </div>
+        {/* 移动端 / 窄窗：右下角「轮次 N/M」chip + 底部 sheet（rail 是桌面宽屏
+            形态，两者互斥）。 */}
+        {fabVisible && (
+          <RoundFab rounds={rounds} activeId={activeRoundId} onJump={scrollToRound} />
         )}
       </div>
 
@@ -2634,12 +2818,15 @@ export default function Chat({
             >
               复制
             </button>
-            {/* 选择文字（安卓限定；桌面本来就可用原生拖选；仅用户/助手正文——
-                思考/工具/状态行没有接 text-selectable 渲染）。进入该条消息的
-                原生选择模式，长按出手势手柄按范围复制。 */}
+            {/* 选择文字（安卓限定；桌面本来就可用原生拖选；用户/助手正文 + 思考
+                块正文接了 text-selectable 渲染，工具/状态行没有）。进入该条消息的
+                原生选择模式，长按出手势手柄按范围复制。空正文（纯媒体/空思考）
+                没有可复制的字，不显示该项。 */}
             {isAndroidDevice() &&
               (msgMenu.entry.role === "user" ||
-                msgMenu.entry.role === "assistant") && (
+                msgMenu.entry.role === "assistant" ||
+                (msgMenu.entry.role === "thinking" &&
+                  thinkingBodyText(msgMenu.entry.content) !== "")) && (
                 <button
                   className={MENU_ITEM}
                   onClick={closeMenuAnd((m) => {
