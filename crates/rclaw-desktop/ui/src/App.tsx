@@ -1385,6 +1385,9 @@ ${event.payload.command}
     title: string;
     x: number;
     y: number;
+    // 打开菜单的触发元素（「···」钮 / 会话行）：菜单卸载后键盘/读屏焦点
+    // 的返还锚点（导出对话框关闭时用）。
+    trigger: HTMLElement | null;
   } | null>(null);
   // 菜单外按下或 Esc 关闭；菜单内点击交给菜单项自己的 onClick。
   // 在会话行上右键时不关闭——行处理器会把菜单移到新位置。
@@ -1413,21 +1416,50 @@ ${event.payload.command}
     };
   }, [chatMenu]);
 
-  // 导出完整聊天记录：后端返回不裁剪的 Markdown，经 Blob 触发 .md 下载。
-  const exportChat = useCallback(async (chatId: string, title: string) => {
-    try {
-      const md = await api.chatExport(chatId);
-      const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${(title || chatId).replace(/[\\/:*?"<>|]/g, "_")}.md`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setErrorToast(String(e));
-    }
-  }, []);
+  // 导出完整聊天记录：「···」菜单 → 格式选择对话框 → 后端全量导出落盘
+  // output/exports/ → 结果条（保存到本地 / 转发(仅安卓) / 打开）。取代旧的
+  // Blob + <a download> 前端下载——安卓 WebView 对该下载原语静默 no-op（用户
+  // 表现为点了没反应），且 Blob 拿不到带图 docx。
+  const [exportFmtTarget, setExportFmtTarget] = useState<{
+    chatId: string;
+    title: string;
+  } | null>(null);
+  const [exportFullBusy, setExportFullBusy] = useState(false);
+  const [exportedFull, setExportedFull] = useState<string | null>(null);
+  // 保存完成的行内反馈（保持结果条打开，成功态换按钮文案；错误才走 toast）。
+  const [exportFullSaved, setExportFullSaved] = useState(false);
+  // 结果条动作的 in-flight 标记：禁用对应按钮防重复点击。
+  const [exportFullActing, setExportFullActing] = useState<
+    "save" | "share" | "open" | null
+  >(null);
+  // 焦点管理：打开对话框前记下触发元素（会话行「···」钮），关闭时返还焦点；
+  // 导出中全部按钮禁用时把焦点收进对话框容器（tabIndex=-1），Tab 不再逃出。
+  const exportDialogRef = useRef<HTMLDivElement | null>(null);
+  const exportReturnFocusRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (exportFmtTarget && exportFullBusy) exportDialogRef.current?.focus();
+  }, [exportFmtTarget, exportFullBusy]);
+  const closeExportDialog = () => {
+    setExportFmtTarget(null);
+    exportReturnFocusRef.current?.focus();
+    exportReturnFocusRef.current = null;
+  };
+  const runChatExportFull = (fmt: "md" | "docx") => {
+    if (!exportFmtTarget || exportFullBusy) return;
+    setExportFullBusy(true);
+    // Promise.resolve().then 包一层：invoke 同步抛错时 finally 也能复位 busy。
+    Promise.resolve()
+      .then(() => api.chatExportFull(exportFmtTarget.chatId, exportFmtTarget.title, fmt))
+      .then((rel) => {
+        setExportFmtTarget(null);
+        exportReturnFocusRef.current?.focus();
+        exportReturnFocusRef.current = null;
+        setExportFullSaved(false);
+        setExportedFull(rel);
+      })
+      .catch((e) => setErrorToast(`导出失败: ${String(e)}`))
+      .finally(() => setExportFullBusy(false));
+  };
 
   // 移动端抽屉的上下文/内存状态（桌面由右侧 TaskPanel 承担，互不影响）。
   // 任务概览不内嵌抽屉（具体任务状态展示不下），改为侧边栏同级入口 +
@@ -1744,6 +1776,10 @@ ${event.payload.command}
     setForwardChooserOpen(false);
   });
   useBackClose(chatMenu !== null, () => setChatMenu(null));
+  useBackClose(
+    exportFmtTarget !== null && !exportFullBusy,
+    () => closeExportDialog(),
+  );
   useBackClose(deleteConfirm !== null, () => setDeleteConfirm(null));
   useBackClose(permQueue.length > 0, () => answerPermission(false));
   useBackClose(photoEditor !== null, discardPhotoEditor);
@@ -2123,6 +2159,7 @@ ${event.payload.command}
                           x: e.clientX,
                           // 靠底行向上弹，避免菜单溢出窗口。
                           y: Math.min(e.clientY, window.innerHeight - 170),
+                          trigger: e.currentTarget,
                         });
                       }}
                       className="min-w-0 flex-1 px-2 py-1.5 text-left max-md:py-2.5"
@@ -2146,6 +2183,7 @@ ${event.payload.command}
                             title: c.title || c.chat_id,
                             x: Math.min(r.left, window.innerWidth - 176),
                             y: Math.min(r.bottom + 4, window.innerHeight - 170),
+                            trigger: e.currentTarget,
                           });
                         }}
                         title="会话操作"
@@ -2418,8 +2456,11 @@ ${event.payload.command}
             className={CHAT_MENU_ITEM}
             onClick={() => {
               const m = chatMenu;
+              // 焦点返还锚点用打开菜单的触发元素（菜单项自身即将被卸载，
+              // 对它 focus() 是 no-op）。
+              exportReturnFocusRef.current = m.trigger;
               setChatMenu(null);
-              void exportChat(m.chatId, m.title);
+              setExportFmtTarget({ chatId: m.chatId, title: m.title });
             }}
           >
             导出完整聊天记录
@@ -2444,6 +2485,159 @@ ${event.payload.command}
           >
             删除
           </button>
+        </div>
+      )}
+
+      {/* 导出完整聊天记录：格式选择（md 纯文本 / docx 内嵌图片）。 */}
+      {exportFmtTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div
+            ref={exportDialogRef}
+            tabIndex={-1}
+            role="dialog"
+            aria-modal="true"
+            aria-label="导出完整聊天记录"
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && !exportFullBusy) {
+                closeExportDialog();
+                return;
+              }
+              // 简易 focus trap：Tab/Shift+Tab 在对话框内首尾循环（aria-modal 语义）；
+              // busy 全按钮禁用时焦点收在对话框容器上，不逃出。
+              if (e.key !== "Tab") return;
+              const focusables = e.currentTarget.querySelectorAll<HTMLElement>(
+                "button:not(:disabled)",
+              );
+              if (focusables.length === 0) {
+                e.preventDefault();
+                exportDialogRef.current?.focus();
+                return;
+              }
+              const first = focusables[0];
+              const last = focusables[focusables.length - 1];
+              // busy 结束后焦点可能仍停在容器上（tabIndex=-1）：Tab 去首钮、
+              // Shift+Tab 去末钮，aria-modal 语义内不逃出。
+              const onContainer = document.activeElement === exportDialogRef.current;
+              if (e.shiftKey && (document.activeElement === first || onContainer)) {
+                e.preventDefault();
+                last.focus();
+              } else if (!e.shiftKey && (document.activeElement === last || onContainer)) {
+                e.preventDefault();
+                first.focus();
+              }
+            }}
+            className="mx-4 w-[20rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-4 shadow-2xl focus:ring-2 focus:ring-indigo-500/30 max-md:w-[calc(100%-2rem)]"
+          >
+            <h2 className="text-sm font-semibold text-gray-100">导出完整聊天记录</h2>
+            <p className="mt-1 truncate text-[11px] text-gray-500">
+              {exportFmtTarget.title || exportFmtTarget.chatId}
+            </p>
+            <div className="mt-3 space-y-2">
+              <button
+                autoFocus
+                onClick={() => runChatExportFull("md")}
+                disabled={exportFullBusy}
+                className="block w-full rounded-lg bg-indigo-500/10 px-3 py-2 text-left text-sm text-indigo-200 transition hover:bg-indigo-500/20 disabled:opacity-50"
+              >
+                📄 Markdown (.md)
+                <span className="mt-0.5 block text-[11px] text-gray-500">
+                  纯文本，体积小，适合归档
+                </span>
+              </button>
+              <button
+                onClick={() => runChatExportFull("docx")}
+                disabled={exportFullBusy}
+                className="block w-full rounded-lg bg-indigo-500/10 px-3 py-2 text-left text-sm text-indigo-200 transition hover:bg-indigo-500/20 disabled:opacity-50"
+              >
+                📝 Word (.docx)
+                <span className="mt-0.5 block text-[11px] text-gray-500">
+                  会话图片内嵌进文档（上限 24 张）
+                </span>
+              </button>
+            </div>
+            <div className="mt-3 flex items-center justify-end gap-2">
+              {exportFullBusy && (
+                <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-[1.5px] border-indigo-400 border-t-transparent" />
+              )}
+              <button
+                onClick={closeExportDialog}
+                disabled={exportFullBusy}
+                className="rounded-lg px-3 py-1.5 text-xs text-gray-400 transition hover:text-gray-200 disabled:opacity-50"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 导出结果条：产物在工作区 output/exports/，可保存到本地或转发（安卓）。 */}
+      {exportedFull && (
+        <div className="fixed bottom-14 left-1/2 z-50 w-[min(40rem,calc(100%-2rem))] -translate-x-1/2 rounded-xl border border-emerald-500/40 bg-[#141821] px-3 py-2 shadow-2xl">
+          {/* live region 只包结果文本行，不含交互按钮（读屏语义纯净）。 */}
+          <div role="status" className="break-all font-mono text-[11px] text-emerald-300">
+            已导出：{exportedFull}
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-2">
+            <button
+              onClick={() => {
+                if (exportFullSaved || exportFullActing) return;
+                setExportFullActing("save");
+                Promise.resolve()
+                  .then(() => api.saveMedia(exportedFull))
+                  .then((r) => {
+                    if (r === "permission_requested") {
+                      setErrorToast("请在系统授权弹窗允许后重试保存");
+                    } else {
+                      setExportFullSaved(true);
+                    }
+                  })
+                  .catch((err) => setErrorToast(`保存失败: ${String(err)}`))
+                  .finally(() => setExportFullActing(null));
+              }}
+              disabled={exportFullSaved || exportFullActing !== null}
+              className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-[11px] text-gray-300 transition hover:text-gray-100 disabled:opacity-60"
+            >
+              {exportFullSaved ? "✓ 已保存到本地" : "保存到本地"}
+            </button>
+            {isAndroidDevice() && (
+              <button
+                onClick={() => {
+                  if (exportFullActing) return;
+                  setExportFullActing("share");
+                  Promise.resolve()
+                    .then(() => api.shareMedia(exportedFull))
+                    .catch((err) => setErrorToast(`转发失败: ${String(err)}`))
+                    .finally(() => setExportFullActing(null));
+                }}
+                disabled={exportFullActing !== null}
+                className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-[11px] text-gray-300 transition hover:text-gray-100 disabled:opacity-60"
+              >
+                转发到其他应用
+              </button>
+            )}
+            <button
+              onClick={() => {
+                if (exportFullActing) return;
+                setExportFullActing("open");
+                Promise.resolve()
+                  .then(() => api.openMedia(exportedFull))
+                  .catch((err) => setErrorToast(`打开失败: ${String(err)}`))
+                  .finally(() => setExportFullActing(null));
+              }}
+              disabled={exportFullActing !== null}
+              className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-[11px] text-gray-300 transition hover:text-gray-100 disabled:opacity-60"
+            >
+              打开
+            </button>
+            <button
+              onClick={() => setExportedFull(null)}
+              disabled={exportFullActing !== null}
+              className="ml-auto rounded-lg px-2.5 py-1 text-[11px] text-gray-500 transition hover:text-gray-200 disabled:opacity-60"
+            >
+              关闭
+            </button>
+          </div>
         </div>
       )}
 

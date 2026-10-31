@@ -683,85 +683,113 @@ pub async fn chat_rename(
     .await
 }
 
-/// 导出完整聊天记录为 Markdown 文本（不做条数裁剪，前端触发下载）。
-/// 读完整 transcript（含被压缩进摘要的消息），不是 provider 可见的压缩视图。
+/// 导出文档渲染 + 落盘的共用尾巴（`export_messages` / `chat_export_full` 同一条
+/// 管线）：title 空白兜底「会话导出」并截 60 字；产物写 agent/output/exports/，
+/// 返回工作区相对路径（前端经 save_media / share_media 决定去向）。fmt 由调用方校验。
+fn write_export_file(
+    home: &std::path::Path,
+    title: &str,
+    fmt: &str,
+    messages: Vec<crate::export::ExportMessage>,
+) -> Result<String, String> {
+    let title = if title.trim().is_empty() {
+        "会话导出".to_string()
+    } else {
+        title.trim().chars().take(60).collect()
+    };
+    let stamp = chrono::Local::now();
+    let agent_root = home.join("agent");
+    let rel = crate::export::export_rel_path(
+        &title,
+        &stamp.format("%Y%m%d-%H%M%S").to_string(),
+        fmt,
+    );
+    let bytes = if fmt == "docx" {
+        crate::export::render_docx(
+            &title,
+            &stamp.format("%Y-%m-%d %H:%M").to_string(),
+            &messages,
+            &agent_root,
+        )?
+    } else {
+        crate::export::render_markdown(
+            &title,
+            &stamp.format("%Y-%m-%d %H:%M").to_string(),
+            &messages,
+        )
+        .into_bytes()
+    };
+    let abs = crate::export::export_abs_path(&agent_root, &rel);
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建导出目录失败: {e}"))?;
+    }
+    // 先写临时文件再原子替换：中断不留半截文档；同秒导出同名时也是完整替换。
+    let tmp = abs.with_file_name(format!(
+        "{}.tmp",
+        abs.file_name().and_then(|n| n.to_str()).unwrap_or("export")
+    ));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入导出文件失败: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &abs) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入导出文件失败: {e}"));
+    }
+    Ok(rel)
+}
+
+/// 导出完整聊天记录为文档（fmt: "md" | "docx"，docx 内嵌会话图片）。
+///
+/// 读完整 transcript（含被压缩进摘要的消息），与会话页多选导出走同一条
+/// 渲染/落盘管线（`history_entries` 同一映射：thinking/status 条目、媒体
+/// marker 原样保留，docx 据此内嵌图片）；产物落 output/exports/，前端经
+/// save_media / share_media 决定去向。取代旧的 chat_export（返回 Markdown
+/// 字符串由前端 Blob 触发下载——安卓 WebView 对该下载原语静默 no-op，用户
+/// 表现为点了「没反应」）。
 #[tauri::command]
-pub async fn chat_export(state: State<'_, AppState>, chat_id: String) -> Result<String, String> {
+pub async fn chat_export_full(
+    state: State<'_, AppState>,
+    chat_id: String,
+    title: String,
+    fmt: String,
+) -> Result<String, String> {
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
     }
+    if !matches!(fmt.as_str(), "md" | "docx") {
+        return Err(format!("不支持的导出格式: {fmt}"));
+    }
     let session = state.session().ok_or("agent 尚未启动")?;
-    let transcript = run_blocking("读取会话", {
-        let chat_id = chat_id.clone();
-        move || {
-            session
-                .load_transcript(CHANNEL_DESKTOP, &chat_id)
-                .map_err(|e| format!("读取会话失败: {e}"))
+    let home = state.home.clone();
+    run_blocking("导出聊天记录", move || {
+        let msgs = session
+            .load_transcript(CHANNEL_DESKTOP, &chat_id)
+            .map_err(|e| format!("读取会话失败: {e}"))?;
+        if msgs.is_empty() {
+            return Err(format!("会话 {chat_id} 不存在或没有记录"));
         }
+        // 与多选导出同一映射（两处导出口径一致）；导出不消费工具调用侧表
+        // （metas 只充实 tool_calls 字段，status 行文案不依赖它），传空表。
+        let entries = history_entries(&msgs, &ToolCallMetas::new());
+        if entries.is_empty() {
+            return Err("会话没有可导出的内容".to_string());
+        }
+        let title = if title.trim().is_empty() {
+            extract_title(&session, &chat_id)
+        } else {
+            title
+        };
+        let messages = entries
+            .into_iter()
+            .map(|e| crate::export::ExportMessage {
+                role: e.role,
+                content: e.content,
+            })
+            .collect();
+        write_export_file(&home, &title, &fmt, messages)
     })
-    .await?;
-    if transcript.is_empty() {
-        return Err(format!("会话 {chat_id} 不存在或没有记录"));
-    }
-    let stamp = |ts: i64| -> String {
-        if ts <= 0 {
-            return String::new();
-        }
-        use chrono::TimeZone;
-        chrono::Local
-            .timestamp_opt(ts, 0)
-            .single()
-            .map(|t| format!("（{}）", t.format("%Y-%m-%d %H:%M")))
-            .unwrap_or_default()
-    };
-    let mut out = format!(
-        "# 聊天记录：{chat_id}\n\n- 导出时间：{}\n\n---\n\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
-    for msg in transcript {
-        if msg.is_tool_result_carrier() {
-            continue;
-        }
-        match msg.role {
-            rclaw_core::Role::User => {
-                let text: String = msg
-                    .content
-                    .iter()
-                    .filter_map(|b| b.as_text())
-                    .collect::<Vec<_>>()
-                    .join("");
-                let t = text.trim();
-                if t.is_empty() || t.starts_with("[CONTEXT COMPACTION") {
-                    continue;
-                }
-                out.push_str(&format!("## 用户{}\n\n{t}\n\n", stamp(msg.ts)));
-            }
-            rclaw_core::Role::Assistant => {
-                let tools: Vec<&str> = msg
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        rclaw_core::ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if !tools.is_empty() {
-                    out.push_str(&format!("> 🔧 调用工具：{}\n\n", tools.join("、")));
-                }
-                let text: String = msg
-                    .content
-                    .iter()
-                    .filter_map(|b| b.as_text())
-                    .collect::<Vec<_>>()
-                    .join("");
-                if !text.trim().is_empty() {
-                    out.push_str(&format!("## 助手{}\n\n{}\n\n", stamp(msg.ts), text.trim()));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(out)
+    .await
 }
 
 /// 从会话最早的几条用户消息提取标题：首条非压缩摘要的用户文本，截 60 字符。
@@ -1864,7 +1892,7 @@ fn pair_checkpoints<'a>(
 
 /// 历史快照：完整 transcript 里最近 200 条可回放行 / 4 MB 映射为条目，附带行级游标。
 ///
-/// 与 `chat_export` 同源读 transcript，而不是 provider 可见的压缩视图：压缩是非破坏性的，
+/// 与 `chat_export_full` 同源读 transcript，而不是 provider 可见的压缩视图：压缩是非破坏性的，
 /// 回放若按压缩视图渲染，压缩点处会无提示地缺一段中间对话（boundary 行只是摘要，还被
 /// 过滤掉）。boundary 行与工具结果载体由 store 在 SQL 层筛掉、不占 200 条的额度（否则
 /// 工具密集的会话首屏只剩几条对话）；下面的过滤只是兜底。
@@ -3044,6 +3072,133 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn chat_export_full_pipeline_maps_and_writes_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_session(dir.path());
+        const CHAT: &str = "export-me";
+        // 一轮带思考/工具调用/媒体 marker 的完整消息序列：导出映射必须产出
+        // thinking/status 条目，媒体 marker 原样保留（docx 图片内嵌依赖它）。
+        session
+            .append(
+                super::CHANNEL_DESKTOP,
+                CHAT,
+                &rclaw_core::Message::plain(rclaw_core::Role::User, "看这张图 media/out/a.png"),
+            )
+            .unwrap();
+        session
+            .append(
+                super::CHANNEL_DESKTOP,
+                CHAT,
+                &rclaw_core::Message {
+                    id: 0,
+                    role: rclaw_core::Role::Assistant,
+                    content: vec![
+                        rclaw_core::ContentBlock::reasoning("先看图再答"),
+                        rclaw_core::ContentBlock::text(
+                            "MEDIA_MARKER=[:x-media type=image path=\"media/out/a.png\"]\n图如下",
+                        ),
+                        rclaw_core::ContentBlock::ToolUse {
+                            id: "t1".into(),
+                            name: "read".into(),
+                            input: serde_json::json!({"path": "media/out/a.png"}),
+                        },
+                    ],
+                    tool_call_id: None,
+                    ts: 0,
+                },
+            )
+            .unwrap();
+
+        let msgs = session
+            .load_transcript(super::CHANNEL_DESKTOP, CHAT)
+            .unwrap();
+        // 与 chat_export_full 同参：导出不消费工具调用侧表（空表）。
+        let entries = super::history_entries(&msgs, &super::ToolCallMetas::new());
+        let roles: Vec<&str> = entries.iter().map(|e| e.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "thinking", "assistant", "status"]);
+        // status 行文案不依赖 metas。
+        assert_eq!(entries[3].content, "🔧 调用工具: read");
+        assert!(entries[2].content.contains("MEDIA_MARKER=[:x-media"));
+
+        // 图片落位后渲染 md + docx：产物在 output/exports/，docx 内嵌图片。
+        let png = {
+            let mut b = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+            b.extend_from_slice(&[0, 0, 0, 13]);
+            b.extend_from_slice(b"IHDR");
+            b.extend_from_slice(&10u32.to_be_bytes());
+            b.extend_from_slice(&20u32.to_be_bytes());
+            b
+        };
+        let img = dir.path().join("agent/media/out/a.png");
+        std::fs::create_dir_all(img.parent().unwrap()).unwrap();
+        std::fs::write(&img, &png).unwrap();
+        let messages: Vec<crate::export::ExportMessage> = entries
+            .iter()
+            .map(|e| crate::export::ExportMessage {
+                role: e.role.clone(),
+                content: e.content.clone(),
+            })
+            .collect();
+        let rel_md =
+            super::write_export_file(dir.path(), "", "md", messages.clone()).unwrap();
+        let rel_docx =
+            super::write_export_file(dir.path(), "测试导出", "docx", messages).unwrap();
+        // title 空白兜底「会话导出」在 helper 内统一完成（前端传空也安全）。
+        assert!(rel_md.contains("会话导出"));
+        assert!(rel_md.starts_with("output/exports/") && rel_md.ends_with(".md"));
+        assert!(rel_docx.starts_with("output/exports/") && rel_docx.ends_with(".docx"));
+
+        let md = std::fs::read_to_string(dir.path().join("agent").join(&rel_md)).unwrap();
+        assert!(md.contains("## 用户"));
+        assert!(md.contains("图如下"));
+        assert!(!md.contains("MEDIA_MARKER"));
+        let docx = std::fs::read(dir.path().join("agent").join(&rel_docx)).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&docx)).unwrap();
+        assert!(zip.file_names().any(|n| n == "word/media/image1.png"));
+    }
+
+    #[test]
+    fn chat_export_full_transcript_is_not_capped() {
+        // 锁定「完整导出不截断」的承诺：200+ 条消息首尾都必须出现在产物里，
+        // 防止未来 history_entries 被加行数 cap 时静默漏导出。
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_session(dir.path());
+        const CHAT: &str = "long-chat";
+        for i in 0..210 {
+            session
+                .append(
+                    super::CHANNEL_DESKTOP,
+                    CHAT,
+                    &rclaw_core::Message::plain(
+                        if i % 2 == 0 {
+                            rclaw_core::Role::User
+                        } else {
+                            rclaw_core::Role::Assistant
+                        },
+                        format!("消息{i}"),
+                    ),
+                )
+                .unwrap();
+        }
+        let msgs = session
+            .load_transcript(super::CHANNEL_DESKTOP, CHAT)
+            .unwrap();
+        let entries = super::history_entries(&msgs, &super::ToolCallMetas::new());
+        assert_eq!(entries.len(), 210);
+        let messages: Vec<crate::export::ExportMessage> = entries
+            .iter()
+            .map(|e| crate::export::ExportMessage {
+                role: e.role.clone(),
+                content: e.content.clone(),
+            })
+            .collect();
+        let rel = super::write_export_file(dir.path(), "长会话", "md", messages).unwrap();
+        let md = std::fs::read_to_string(dir.path().join("agent").join(&rel)).unwrap();
+        assert!(md.contains("消息0"));
+        assert!(md.contains("消息209"));
     }
 
     #[test]
@@ -4882,11 +5037,6 @@ pub async fn export_messages(
     if !matches!(fmt.as_str(), "md" | "docx") {
         return Err(format!("不支持的导出格式: {fmt}"));
     }
-    let title = if title.trim().is_empty() {
-        "会话导出".to_string()
-    } else {
-        title.trim().chars().take(60).collect()
-    };
     let home = state.home.clone();
     let parsed: Vec<crate::export::ExportMessage> = messages
         .into_iter()
@@ -4904,38 +5054,9 @@ pub async fn export_messages(
     if parsed.is_empty() {
         return Err("未包含可导出的消息".into());
     }
-    let stamp = chrono::Local::now();
-    tauri::async_runtime::spawn_blocking(move || {
-        let agent_root = home.join("agent");
-        let rel = crate::export::export_rel_path(
-            &title,
-            &stamp.format("%Y%m%d-%H%M%S").to_string(),
-            &fmt,
-        );
-        let bytes = if fmt == "docx" {
-            crate::export::render_docx(
-                &title,
-                &stamp.format("%Y-%m-%d %H:%M").to_string(),
-                &parsed,
-                &agent_root,
-            )?
-        } else {
-            crate::export::render_markdown(
-                &title,
-                &stamp.format("%Y-%m-%d %H:%M").to_string(),
-                &parsed,
-            )
-            .into_bytes()
-        };
-        let abs = crate::export::export_abs_path(&agent_root, &rel);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("创建导出目录失败: {e}"))?;
-        }
-        std::fs::write(&abs, bytes).map_err(|e| format!("写入导出文件失败: {e}"))?;
-        Ok(rel)
-    })
-    .await
-    .map_err(|e| format!("导出任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || write_export_file(&home, &title, &fmt, parsed))
+        .await
+        .map_err(|e| format!("导出任务失败: {e}"))?
 }
 
 // ---------------------------------------------------------------------------

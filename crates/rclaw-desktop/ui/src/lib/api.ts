@@ -620,8 +620,11 @@ export const api = {
   chatRename: (chatId: string, title: string) =>
     invoke<void>("chat_rename", { chatId, title }),
 
-  /** 导出完整聊天记录（Markdown 文本，不裁剪条数；前端经 Blob 触发下载）。 */
-  chatExport: (chatId: string) => invoke<string>("chat_export", { chatId }),
+  /** 导出完整聊天记录为文档（fmt: "md" / "docx" 含图片）：后端读全量 transcript
+   *  落盘 output/exports/，返回工作区相对路径；保存/转发走 saveMedia / shareMedia
+   *  （旧实现返回 Markdown 字符串经前端 Blob 下载，安卓 WebView 静默 no-op 已废弃）。 */
+  chatExportFull: (chatId: string, title: string, fmt: "md" | "docx") =>
+    invoke<string>("chat_export_full", { chatId, title, fmt }),
 
   agentsList: () => invoke<{ executions: AgentExecution[]; total: number }>("agents_list"),
 

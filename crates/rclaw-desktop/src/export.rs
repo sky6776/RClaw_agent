@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 单条待导出消息（role: user | assistant | thinking | status；content 为消息原文）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExportMessage {
     pub role: String,
     pub content: String,

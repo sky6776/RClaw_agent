@@ -171,7 +171,7 @@ pub fn run() {
             commands::chat_restore,
             commands::chat_delete,
             commands::chat_rename,
-            commands::chat_export,
+            commands::chat_export_full,
             commands::agents_list,
             commands::agents_clear_history,
             commands::usage_snapshot,
