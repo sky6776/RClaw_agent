@@ -1444,7 +1444,7 @@ ${event.payload.command}
     exportReturnFocusRef.current?.focus();
     exportReturnFocusRef.current = null;
   };
-  const runChatExportFull = (fmt: "md" | "docx") => {
+  const runChatExportFull = (fmt: "md" | "docx" | "html") => {
     if (!exportFmtTarget || exportFullBusy) return;
     setExportFullBusy(true);
     // Promise.resolve().then 包一层：invoke 同步抛错时 finally 也能复位 busy。
@@ -2488,7 +2488,7 @@ ${event.payload.command}
         </div>
       )}
 
-      {/* 导出完整聊天记录：格式选择（md 纯文本 / docx 内嵌图片）。 */}
+      {/* 导出完整聊天记录：格式选择（md 纯文本 / docx 内嵌图片 / html 折叠+导航）。 */}
       {exportFmtTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div
@@ -2551,7 +2551,17 @@ ${event.payload.command}
               >
                 📝 Word (.docx)
                 <span className="mt-0.5 block text-[11px] text-gray-500">
-                  会话图片内嵌进文档（上限 24 张）
+                  会话图片内嵌进文档（上限 200 张）
+                </span>
+              </button>
+              <button
+                onClick={() => runChatExportFull("html")}
+                disabled={exportFullBusy}
+                className="block w-full rounded-lg bg-indigo-500/10 px-3 py-2 text-left text-sm text-indigo-200 transition hover:bg-indigo-500/20 disabled:opacity-50"
+              >
+                🌐 网页 (.html)
+                <span className="mt-0.5 block text-[11px] text-gray-500">
+                  可折叠思考/工具块 + 轮次导航，图片内嵌（浏览器打开）
                 </span>
               </button>
             </div>

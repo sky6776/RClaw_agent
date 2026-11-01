@@ -620,10 +620,11 @@ export const api = {
   chatRename: (chatId: string, title: string) =>
     invoke<void>("chat_rename", { chatId, title }),
 
-  /** 导出完整聊天记录为文档（fmt: "md" / "docx" 含图片）：后端读全量 transcript
-   *  落盘 output/exports/，返回工作区相对路径；保存/转发走 saveMedia / shareMedia
-   *  （旧实现返回 Markdown 字符串经前端 Blob 下载，安卓 WebView 静默 no-op 已废弃）。 */
-  chatExportFull: (chatId: string, title: string, fmt: "md" | "docx") =>
+  /** 导出完整聊天记录为文档（fmt: "md" / "docx" 含图片 / "html" 折叠块+轮次导航
+   *  含图片）：后端读全量 transcript 落盘 output/exports/，返回工作区相对路径；
+   *  保存/转发走 saveMedia / shareMedia（旧实现返回 Markdown 字符串经前端 Blob
+   *  下载，安卓 WebView 静默 no-op 已废弃）。 */
+  chatExportFull: (chatId: string, title: string, fmt: "md" | "docx" | "html") =>
     invoke<string>("chat_export_full", { chatId, title, fmt }),
 
   agentsList: () => invoke<{ executions: AgentExecution[]; total: number }>("agents_list"),
@@ -724,11 +725,11 @@ export const api = {
   shareText: (title: string, text: string) =>
     invoke<void>("share_text", { title, text }),
 
-  /** 选中消息导出为文档（fmt: "md" 文本文档 / "docx" 内嵌图片文档）。
-   *  返回 output/exports/ 下的工作区相对路径。 */
+  /** 选中消息导出为文档（fmt: "md" 文本文档 / "docx" 内嵌图片文档 /
+   *  "html" 折叠块+轮次导航含图片）。返回 output/exports/ 下的工作区相对路径。 */
   exportMessages: (
     title: string,
-    fmt: "md" | "docx",
+    fmt: "md" | "docx" | "html",
     messages: Array<{
       role: "user" | "assistant" | "thinking" | "status";
       content: string;

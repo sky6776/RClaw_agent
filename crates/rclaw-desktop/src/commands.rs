@@ -704,20 +704,29 @@ fn write_export_file(
         &stamp.format("%Y%m%d-%H%M%S").to_string(),
         fmt,
     );
-    let bytes = if fmt == "docx" {
-        crate::export::render_docx(
+    let bytes = match fmt {
+        "docx" => crate::export::render_docx(
+            &title,
+            &stamp.format("%Y-%m-%d %H:%M").to_string(),
+            &messages,
+            &agent_root,
+        )?,
+        "html" => crate::export::render_html(
             &title,
             &stamp.format("%Y-%m-%d %H:%M").to_string(),
             &messages,
             &agent_root,
         )?
-    } else {
-        crate::export::render_markdown(
+        .into_bytes(),
+        // md：命令层白名单（is_supported_format）已挡未知格式；这里再显式
+        // 兜底，防止未来漏校验时把 markdown 内容写成别的扩展名。
+        "md" => crate::export::render_markdown(
             &title,
             &stamp.format("%Y-%m-%d %H:%M").to_string(),
             &messages,
         )
-        .into_bytes()
+        .into_bytes(),
+        other => return Err(format!("不支持的导出格式: {other}")),
     };
     let abs = crate::export::export_abs_path(&agent_root, &rel);
     if let Some(parent) = abs.parent() {
@@ -739,7 +748,8 @@ fn write_export_file(
     Ok(rel)
 }
 
-/// 导出完整聊天记录为文档（fmt: "md" | "docx"，docx 内嵌会话图片）。
+/// 导出完整聊天记录为文档（fmt: "md" | "docx" | "html"，docx/html 内嵌会话图片，
+/// html 另有折叠块与轮次导航）。
 ///
 /// 读完整 transcript（含被压缩进摘要的消息），与会话页多选导出走同一条
 /// 渲染/落盘管线（`history_entries` 同一映射：thinking/status 条目、媒体
@@ -757,7 +767,7 @@ pub async fn chat_export_full(
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
     }
-    if !matches!(fmt.as_str(), "md" | "docx") {
+    if !crate::export::is_supported_format(&fmt) {
         return Err(format!("不支持的导出格式: {fmt}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
@@ -3156,8 +3166,59 @@ mod tests {
         assert!(md.contains("图如下"));
         assert!(!md.contains("MEDIA_MARKER"));
         let docx = std::fs::read(dir.path().join("agent").join(&rel_docx)).unwrap();
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&docx)).unwrap();
+        let zip = zip::ZipArchive::new(std::io::Cursor::new(&docx)).unwrap();
         assert!(zip.file_names().any(|n| n == "word/media/image1.png"));
+    }
+
+    #[test]
+    fn write_export_file_html_renders_document_and_rejects_unknown_fmt() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_session(dir.path());
+        const CHAT: &str = "export-html";
+        session
+            .append(
+                super::CHANNEL_DESKTOP,
+                CHAT,
+                &rclaw_core::Message::plain(rclaw_core::Role::User, "第一问 <i>带标签</i>"),
+            )
+            .unwrap();
+        session
+            .append(
+                super::CHANNEL_DESKTOP,
+                CHAT,
+                &rclaw_core::Message::plain(rclaw_core::Role::Assistant, "第一答"),
+            )
+            .unwrap();
+        session
+            .append(
+                super::CHANNEL_DESKTOP,
+                CHAT,
+                &rclaw_core::Message::plain(rclaw_core::Role::User, "第二问"),
+            )
+            .unwrap();
+        let msgs = session
+            .load_transcript(super::CHANNEL_DESKTOP, CHAT)
+            .unwrap();
+        let entries = super::history_entries(&msgs, &super::ToolCallMetas::new());
+        let messages: Vec<crate::export::ExportMessage> = entries
+            .iter()
+            .map(|e| crate::export::ExportMessage {
+                role: e.role.clone(),
+                content: e.content.clone(),
+            })
+            .collect();
+        let rel = super::write_export_file(dir.path(), "网页导出", "html", messages).unwrap();
+        assert!(rel.starts_with("output/exports/") && rel.ends_with(".html"));
+        let html = std::fs::read_to_string(dir.path().join("agent").join(&rel)).unwrap();
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        // 两轮 → 轮次导航 + 锚点 section。
+        assert!(html.contains("href=\"#round-1\"") && html.contains("href=\"#round-2\""));
+        // 正文转义：用户消息里的 <i> 不能以原始标签存活。
+        assert!(!html.contains("<i>"));
+        assert!(html.contains("&lt;i&gt;"));
+        // 未知格式在 write_export_file 内部兜底拒绝（命令层白名单之外的防线）。
+        let err = super::write_export_file(dir.path(), "x", "pdf", Vec::new()).unwrap_err();
+        assert!(err.contains("不支持的导出格式"));
     }
 
     #[test]
@@ -5023,7 +5084,7 @@ pub struct ExportMessageDto {
     pub content: String,
 }
 
-/// 导出选中消息为文档。fmt: "md" | "docx"。返回 output/exports/ 相对路径。
+/// 导出选中消息为文档。fmt: "md" | "docx" | "html"。返回 output/exports/ 相对路径。
 #[tauri::command]
 pub async fn export_messages(
     state: State<'_, AppState>,
@@ -5034,7 +5095,7 @@ pub async fn export_messages(
     if messages.is_empty() {
         return Err("未选择任何消息".into());
     }
-    if !matches!(fmt.as_str(), "md" | "docx") {
+    if !crate::export::is_supported_format(&fmt) {
         return Err(format!("不支持的导出格式: {fmt}"));
     }
     let home = state.home.clone();

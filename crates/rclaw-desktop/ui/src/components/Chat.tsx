@@ -1570,7 +1570,7 @@ export default function Chat({
     return (text.split("\n")[0] || "会话导出").slice(0, 20) || "会话导出";
   }, [selectedMessages]);
 
-  const doExport = (fmt: "md" | "docx") => {
+  const doExport = (fmt: "md" | "docx" | "html") => {
     if (selectedMessages.length === 0) return;
     setExporting(true);
     api
@@ -2352,6 +2352,13 @@ export default function Chat({
                 className={ACTION_BTN}
               >
                 导出 Word(.docx 含图片)
+              </button>
+              <button
+                onClick={() => doExport("html")}
+                disabled={selectedCount === 0 || exporting}
+                className={ACTION_BTN}
+              >
+                导出网页(.html 折叠+导航)
               </button>
               {isAndroidDevice() && (
                 <button
