@@ -113,6 +113,31 @@ function formatDuration(secs: number): string {
   return `${Math.floor(secs / 60)} 分 ${secs % 60} 秒`;
 }
 
+/** 段完整性判定（HTML 导出「已工作 X」防虚报）：段 = user 条目开段（与列表
+ *  listBlocks 同口径），段完整 = 段内每条都被选中且非发送失败段。不完整段
+ *  后端平铺渲染、不显示时长——选中子集的时间跨度会虚报，还可能把中间
+ *  assistant 误判成最终回复。返回 entry id → 是否完整。 */
+export function computeSegmentComplete(
+  entries: Entry[],
+  selectIds: Set<number> | null,
+): Map<number, boolean> {
+  const segComplete = new Map<number, boolean>();
+  let segIds: number[] = [];
+  let complete = true;
+  const flush = () => segIds.forEach((id) => segComplete.set(id, complete));
+  for (const e of entries) {
+    if (e.role === "user") {
+      flush();
+      segIds = [];
+      complete = !e.sendFailed;
+    }
+    segIds.push(e.id);
+    if (!selectIds?.has(e.id)) complete = false;
+  }
+  flush();
+  return segComplete;
+}
+
 /** ReactMarkdown 的 components 配置（模块级常量）。内联字面量会让每次渲染产生
  *  新的组件类型，React 按类型不同直接重挂载子树——表格横向滚动位置丢失、触摸
  *  目标被摘除；稳定身份后与普通组件行为一致。 */
@@ -1573,11 +1598,18 @@ export default function Chat({
   const doExport = (fmt: "md" | "docx" | "html") => {
     if (selectedMessages.length === 0) return;
     setExporting(true);
+    const segComplete = computeSegmentComplete(entries, selectIds);
     api
       .exportMessages(
         exportTitle,
         fmt,
-        selectedMessages.map((e) => ({ role: e.role, content: e.content })),
+        // Entry.ts 是毫秒；导出管线统一 unix 秒（0=未知），html 算「已工作 X」用。
+        selectedMessages.map((e) => ({
+          role: e.role,
+          content: e.content,
+          ts: e.ts && e.ts > 0 ? Math.floor(e.ts / 1000) : 0,
+          seg_complete: segComplete.get(e.id) ?? false,
+        })),
       )
       .then((rel) => setExportResult(rel))
       .catch((e) => onError?.(`导出失败: ${String(e)}`))

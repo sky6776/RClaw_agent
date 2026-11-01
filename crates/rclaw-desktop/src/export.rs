@@ -11,10 +11,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 单条待导出消息（role: user | assistant | thinking | status；content 为消息原文）。
+/// ts 为落库时间（unix 秒，0=未知）：HTML 导出按它算「已工作 X」段时长；md/docx 不消费。
+/// seg_complete 为「该消息所在的会话段是否整段被导出」：完整导出恒 true；多选导出由
+/// 前端按段判定——不完整段平铺渲染，不显示「已工作 X」（选中子集的时间跨度会虚报）。
 #[derive(Debug, Clone)]
 pub struct ExportMessage {
     pub role: String,
     pub content: String,
+    pub ts: i64,
+    pub seg_complete: bool,
 }
 
 /// 导出文件名安全化：保留中英数字与连字符，其余折叠为下划线。
@@ -580,9 +585,21 @@ fn file_magic_ok(path: &Path) -> bool {
 
 /// 一轮 = 一条 user 条目及其后的 assistant/thinking/status；首条 user 之前
 /// 的归 preamble（不进导航）。与聊天页 RoundNav 同口径（连续 user 各算一轮）。
+/// 段内分组与会话页 listBlocks 同启发式：最终回复 = 段内最后一个 assistant，
+/// 其之前的行是工作过程（折叠容器内），之后的为随附行（容器外平铺）；段内
+/// 无 thinking/status（无过程可折）时整体平铺不拆。
 struct HtmlRound<'a> {
     preview: String,
-    messages: Vec<&'a ExportMessage>,
+    user: &'a ExportMessage,
+    /// user 之后、最终回复之前的全部行（工作过程，折叠容器内；可能为空）。
+    process: Vec<&'a ExportMessage>,
+    /// 段内最后一个 assistant 条目（最终回复，容器外）。None = 整段平铺。
+    final_reply: Option<&'a ExportMessage>,
+    /// 最终回复之后的行（随附行，容器外平铺）。
+    following: Vec<&'a ExportMessage>,
+    /// 「已工作 X」秒数：首条过程行 → 最终回复的落库时间差（与会话页同口径
+    /// 的展示跨度）；None = 无过程/时间戳缺失/跨度非正，显示「已处理」。
+    work_secs: Option<i64>,
 }
 
 fn split_html_rounds(messages: &[ExportMessage]) -> (Vec<&ExportMessage>, Vec<HtmlRound<'_>>) {
@@ -600,15 +617,65 @@ fn split_html_rounds(messages: &[ExportMessage]) -> (Vec<&ExportMessage>, Vec<Ht
             };
             rounds.push(HtmlRound {
                 preview,
-                messages: vec![msg],
+                user: msg,
+                process: Vec::new(),
+                final_reply: None,
+                following: Vec::new(),
+                work_secs: None,
             });
         } else if let Some(round) = rounds.last_mut() {
-            round.messages.push(msg);
+            if round.final_reply.is_none() {
+                round.process.push(msg);
+            } else {
+                round.following.push(msg);
+            }
         } else {
             preamble.push(msg);
         }
     }
+    // 倒序找段内最后一个 assistant 为最终回复；仅当段完整（多选导出未截断，
+    // 由前端逐条 seg_complete 判定）且存在可折叠的过程行（thinking/status，
+    // 与会话页 hasProcess+processRows 非空同条件）才拆段，否则整段平铺——
+    // 选中子集的时间跨度会虚报「已工作 X」，还可能把中间 assistant 误判为
+    // 最终回复。随后算工作时长跨度。
+    for round in &mut rounds {
+        let complete = std::iter::once(round.user)
+            .chain(round.process.iter().copied())
+            .all(|m| m.seg_complete);
+        if !complete {
+            continue;
+        }
+        let Some(fi) = round.process.iter().rposition(|m| m.role == "assistant") else {
+            continue;
+        };
+        let has_process = round
+            .process
+            .iter()
+            .any(|m| m.role == "status" || m.role == "thinking");
+        if !has_process || fi == 0 {
+            continue;
+        }
+        let final_reply = round.process.remove(fi);
+        round.following.splice(0..0, round.process[fi..].to_vec());
+        round.process.truncate(fi);
+        round.final_reply = Some(final_reply);
+        if let Some(first) = round.process.first() {
+            let last_ts = round.final_reply.map(|m| m.ts).unwrap_or(0);
+            if first.ts > 0 && last_ts > first.ts {
+                round.work_secs = Some(last_ts - first.ts);
+            }
+        }
+    }
     (preamble, rounds)
+}
+
+/// 「已工作 X」时长文案，与会话页 formatDuration 同口径：X 秒 / X 分 Y 秒。
+fn format_work_duration(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs} 秒")
+    } else {
+        format!("{} 分 {} 秒", secs / 60, secs % 60)
+    }
 }
 
 /// HTML 内联样式：浅/深色跟随系统；折叠、气泡、响应式导航（宽屏右侧固定
@@ -642,6 +709,7 @@ details>summary::before{content:"\25B8\A0";color:var(--muted)}
 details[open]>summary::before{content:"\25BE\A0"}
 details>summary:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;border-radius:.8rem}
 details.thinking{border-style:dashed}
+details.work>summary{font-weight:600}
 details .body{margin:0 .8rem .6rem;white-space:pre-wrap}
 details.tool .body{color:var(--muted)}
 .media{margin:.5rem 0 0;scroll-margin-top:3.6rem}
@@ -835,14 +903,21 @@ const SKIP_NOTE_MAX: usize = 20;
 /// 内嵌数量上限（200，只由 embedded 把守）互不影响。
 const MAX_IMAGE_ATTEMPTS: usize = 2000;
 
-/// 渲染一条消息的折叠/正文结构（图片在正文之后原位内嵌）。
-fn render_html_message(out: &mut String, msg: &ExportMessage, budget: &mut HtmlImageBudget) {
+/// 渲染一条消息的折叠/正文结构（图片在正文之后原位内嵌）。allow_backlink_target：
+/// 该消息是否渲染在默认可见（非折叠容器内）的位置——折叠容器里的图不能作为
+/// 重复图回链目标（锚点滚动不会展开 details）。
+fn render_html_message(
+    out: &mut String,
+    msg: &ExportMessage,
+    budget: &mut HtmlImageBudget,
+    allow_backlink_target: bool,
+) {
     use std::fmt::Write as _;
     let text = strip_control_chars(&strip_media_control_lines(&msg.content));
     let trimmed = text.trim();
     match msg.role.as_str() {
         "thinking" => {
-            out.push_str("<details class=\"thinking\" open><summary>💭 思考过程</summary>");
+            out.push_str("<details class=\"thinking\"><summary>💭 思考过程</summary>");
             let body = if trimmed.is_empty() { "（媒体消息）" } else { trimmed };
             let _ = write!(out, "<div class=\"body\">{}</div>", html_escape(body));
             budget.render_images(out, &msg.content, false);
@@ -857,7 +932,7 @@ fn render_html_message(out: &mut String, msg: &ExportMessage, budget: &mut HtmlI
             let _ = write!(out, "<article class=\"msg {cls}\"><div class=\"who\">{who}</div>");
             let body = if trimmed.is_empty() { "（媒体消息）" } else { trimmed };
             let _ = write!(out, "<div class=\"body\">{}</div>", html_escape(body));
-            budget.render_images(out, &msg.content, true);
+            budget.render_images(out, &msg.content, allow_backlink_target);
             out.push_str("</article>");
         }
         // status（工具行）与其余未知角色：独立折叠行，summary 露出动词/目标，
@@ -885,8 +960,8 @@ fn render_html_message(out: &mut String, msg: &ExportMessage, budget: &mut HtmlI
     }
 }
 
-/// 渲染自包含单文件 HTML：`<details>` 折叠（thinking 默认展开、status 默认
-/// 折叠，与会话页一致）+ 锚点轮次导航 + 图片 base64 原位内嵌。零 JS、零
+/// 渲染自包含单文件 HTML：`<details>` 折叠（thinking/status 均默认折叠，
+/// 由用户点击展开）+ 锚点轮次导航 + 图片 base64 原位内嵌。零 JS、零
 /// 外部资源；所有动态值经 html_escape。
 ///
 /// 与 docx 不同：工作区不可用时**不整体报错**——图片逐张占位，正文照常
@@ -1083,7 +1158,7 @@ fn render_html_with_budget(
             "<section class=\"round\" id=\"preamble\" aria-label=\"会话开始\"><h2>会话开始</h2>",
         );
         for msg in &preamble {
-            render_html_message(&mut out, msg, &mut budget);
+            render_html_message(&mut out, msg, &mut budget, true);
         }
         out.push_str("</section>");
     }
@@ -1095,8 +1170,36 @@ fn render_html_with_budget(
             idx + 1,
             idx + 1
         );
-        for msg in &round.messages {
-            render_html_message(&mut out, msg, &mut budget);
+        render_html_message(&mut out, round.user, &mut budget, true);
+        if let Some(final_reply) = round.final_reply {
+            // 工作过程折叠容器（会话页「已工作 X」段同款：默认收起，点开看
+            // 思考/工具行/中间说明——内部各条仍是独立可折叠的 details）。
+            // 容器内消息不做回链目标（折叠着，锚点滚不过来）。
+            let label = match round.work_secs {
+                Some(secs) => format!("已工作 {}", format_work_duration(secs)),
+                None => "已处理".to_string(),
+            };
+            let _ = write!(
+                out,
+                "<details class=\"work\"><summary>{}</summary>",
+                html_escape(&label)
+            );
+            for msg in &round.process {
+                render_html_message(&mut out, msg, &mut budget, false);
+            }
+            out.push_str("</details>");
+            // 最终回复容器外；其后的随附行平铺（与会话页同构）。
+            render_html_message(&mut out, final_reply, &mut budget, true);
+            for msg in &round.following {
+                render_html_message(&mut out, msg, &mut budget, true);
+            }
+        } else {
+            // 整段平铺：无 thinking/status 的纯问答轮、无最终回复的轮、或多选
+            // 导出的不完整段（会话页 flat 口径——没有可折叠的过程就不渲染空
+            // 容器，不完整段的时长会虚报故同样平铺）。
+            for msg in &round.process {
+                render_html_message(&mut out, msg, &mut budget, true);
+            }
         }
         out.push_str("</section>");
     }
@@ -1208,18 +1311,26 @@ mod tests {
                 ExportMessage {
                     role: "user".into(),
                     content: "你好".into(),
+                    ts: 0,
+                    seg_complete: true,
                 },
                 ExportMessage {
                     role: "assistant".into(),
                     content: "MEDIA_MARKER=[:x-media type=image path=\"p\"]\n图如下".into(),
+                    ts: 0,
+                    seg_complete: true,
                 },
                 ExportMessage {
                     role: "thinking".into(),
                     content: "先列出目录".into(),
+                    ts: 0,
+                    seg_complete: true,
                 },
                 ExportMessage {
                     role: "status".into(),
                     content: "🔧 调用工具: list output".into(),
+                    ts: 0,
+                    seg_complete: true,
                 },
             ],
         );
@@ -1244,6 +1355,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "看 media/a.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let bytes = render_docx("标题", "2026-10-03", &messages, dir.path()).unwrap();
         let cursor = std::io::Cursor::new(&bytes);
@@ -1293,10 +1406,14 @@ mod tests {
             ExportMessage {
                 role: "user".into(),
                 content: "<script>alert(1)</script>".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "\"><img src=x onerror=alert(2)>".into(),
+                ts: 0,
+                seg_complete: true,
             },
         ];
         let html = render_html("标\"题", "2026-11-01", &messages, Path::new("/nonexistent"))
@@ -1310,23 +1427,31 @@ mod tests {
     }
 
     #[test]
-    fn html_thinking_open_and_status_closed_with_summary() {
+    fn html_thinking_and_status_default_collapsed_with_summary() {
         let messages = vec![
             ExportMessage {
                 role: "thinking".into(),
                 content: "先列目录".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "🔧 调用工具: read".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "多行状态\n第二行详情".into(),
+                ts: 0,
+                seg_complete: true,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
-        assert!(html.contains("<details class=\"thinking\" open>"));
+        // thinking 与 status 一致默认折叠（用户指令），无 open 属性。
+        assert!(html.contains("<details class=\"thinking\">"));
+        assert!(!html.contains("details class=\"thinking\" open"));
         assert!(html.contains("<details class=\"tool\"><summary>🔧 调用工具: read</summary>"));
         // 单行 status 与 summary 全同 → body 是弱化注记而非重复原文。
         assert!(html.contains("导出数据仅含工具状态文案，完整入参/结果未包含"));
@@ -1342,14 +1467,20 @@ mod tests {
             ExportMessage {
                 role: "user".into(),
                 content: "第一轮的问题".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "回答一".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "第二轮的问题".into(),
+                ts: 0,
+                seg_complete: true,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -1367,6 +1498,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "只有一个问题".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
         assert!(!html.contains("<nav class=\"rounds\""));
@@ -1379,14 +1512,20 @@ mod tests {
             ExportMessage {
                 role: "assistant".into(),
                 content: "开场白（首条 user 之前）".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "问一".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "问二".into(),
+                ts: 0,
+                seg_complete: true,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -1406,6 +1545,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "assistant".into(),
             content: "MEDIA_MARKER=[:desktop-media type=image path=\"/data/user/0/a/files/agent/media/out/图.png\" name=\"图.png\"]".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         // strip 后正文为空 → （媒体消息）占位；图片仍在原位内嵌。
@@ -1425,10 +1566,14 @@ mod tests {
             ExportMessage {
                 role: "assistant".into(),
                 content: marker.to_string(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: format!("{marker}\n再次引用"),
+                ts: 0,
+                seg_complete: true,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
@@ -1444,6 +1589,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "看 media/../../secret.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(!html.contains("data:image"));
@@ -1462,10 +1609,14 @@ mod tests {
             ExportMessage {
                 role: "user".into(),
                 content: "图一 media/out/a.png".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "图二 media/out/b.png".into(),
+                ts: 0,
+                seg_complete: true,
             },
         ];
         let html = render_html_with_budget(
@@ -1501,10 +1652,14 @@ mod tests {
             ExportMessage {
                 role: "user".into(),
                 content: "q1".into(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "q2".into(),
+                ts: 0,
+                seg_complete: true,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -1523,6 +1678,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "看 media/out/big.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html_with_budget(
             "t",
@@ -1555,6 +1712,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "图 media/out/a.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         // 提示阈值注入 1 字节：24 字节的图必触发。
         let html = render_html_with_budget(
@@ -1590,6 +1749,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "MEDIA_MARKER=[:x-media type=image path=\"C:/windows/evil.png\"]".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(!html.contains("data:image"));
@@ -1609,14 +1770,20 @@ mod tests {
             ExportMessage {
                 role: "assistant".into(),
                 content: marker.to_string(),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: format!("再看一次\n{marker}"),
+                ts: 0,
+                seg_complete: true,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: format!("最后一次\n{marker}"),
+                ts: 0,
+                seg_complete: true,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
@@ -1630,6 +1797,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "正文\u{1}带 ANSI\u{7}控制符".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
         assert!(!html.contains('\u{1}'));
@@ -1643,6 +1812,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "纯文本".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
         assert!(!html.contains("图片已内嵌"));
@@ -1653,6 +1824,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "图 media/out/a.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(html.contains("图片已内嵌，可离线打开"));
@@ -1660,6 +1833,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "缺图 media/out/nope.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(html.contains("图片未能内嵌"));
@@ -1670,6 +1845,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "好图 media/out/ok.png\n缺图 media/out/nope.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir2.path()).unwrap();
         assert!(html.contains("内嵌 1 张图片 · 1 张未内嵌"));
@@ -1688,6 +1865,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content,
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         // 前 20 条占位，之后只累计：头部统计仍准确（22 张未内嵌）。
@@ -1707,6 +1886,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "空图 media/out/empty.png\n缺图 media/out/nope.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(html.contains("（空文件）"));
@@ -1722,6 +1903,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "看 media/out/evil.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(!html.contains("data:image"));
@@ -1742,6 +1925,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content,
+            ts: 0,
+            seg_complete: true,
         }];
         // 200 个坏路径不占内嵌名额：后续有效图仍内嵌（尝试数上限 2000 与
         // 内嵌上限 200 是两回事）。
@@ -1768,6 +1953,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "ok media/out/ok.png\nbig media/out/big.png\nempty media/out/empty.png\nbad media/out/bad.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         // 单张上限 50：big 超限 → 只有 ok 可内嵌。
         let (_, image_bytes) =
@@ -1790,6 +1977,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "b media/out/b.bmp\nj media/out/j.jpg\nx media/out/x.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         // 预扫用「读至多 4 字节」口径，与渲染全量 sniff 一致：2/3 字节魔数
         // 可内嵌（计 2+3 字节），1 字节 x.png 不计。
@@ -1810,6 +1999,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content,
+            ts: 0,
+            seg_complete: true,
         }];
         // 尝试预算被 2000 个缺失路径耗尽：预扫与渲染同口径，late.png 两边
         // 都不计/不嵌（文档化的产品取舍——超长坏路径列表截断处理）。
@@ -1830,6 +2021,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content,
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         // 尝试上限触发：有效图不再内嵌，聚合提示出现一次，头部把「未内嵌
@@ -1869,6 +2062,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content,
+            ts: 0,
+            seg_complete: true,
         }];
         // 预扫 + 渲染放进子线程并限时：若未来实现回归成先 open FIFO，
         // 这里会超时 panic（明确失败）而非挂死整个测试进程。
@@ -1910,6 +2105,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "assistant".into(),
             content,
+            ts: 0,
+            seg_complete: true,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert_eq!(html.matches("data:image/png;base64,").count(), 200);
@@ -1928,6 +2125,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content,
+            ts: 0,
+            seg_complete: true,
         }];
         // 前 200 个缺失候选不占名额：有效图仍被计数并进入容量预估。
         let (_, image_bytes) =
@@ -1937,10 +2136,324 @@ mod tests {
         let bad_only = vec![ExportMessage {
             role: "user".into(),
             content: "缺图 media/out/missing0.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         let (_, image_bytes) =
             estimate_html_capacity(&bad_only, dir.path(), u64::MAX, u64::MAX);
         assert_eq!(image_bytes, 0);
+    }
+
+    #[test]
+    fn html_work_process_folds_with_duration() {
+        let messages = vec![
+            ExportMessage {
+                role: "user".into(),
+                content: "问题".into(),
+                ts: 100,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "thinking".into(),
+                content: "先列目录看看".into(),
+                ts: 110,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "status".into(),
+                content: "🔧 调用工具: read".into(),
+                ts: 120,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: "最终回答".into(),
+                ts: 165,
+                seg_complete: true,
+            },
+        ];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        // 段容器默认收起；时长 = 首条过程行(110) → 最终回复(165) 的跨度。
+        assert!(html.contains("<details class=\"work\"><summary>已工作 55 秒</summary>"));
+        // 顺序：user → 容器内思考/工具 → 容器外最终回复；容器必须在最终
+        // 回复前闭合（段内开合标签配对——若容器意外包住 final，开数会多于
+        // 闭数，find 首个 </details> 的弱断言抓不住）。
+        let work_open = html.find("<details class=\"work\"").unwrap();
+        let think = html.find("先列目录看看").unwrap();
+        let final_pos = html.find("最终回答").unwrap();
+        assert!(work_open < think && think < final_pos);
+        let seg = &html[work_open..final_pos];
+        assert_eq!(
+            seg.matches("<details").count(),
+            seg.matches("</details>").count()
+        );
+    }
+
+    #[test]
+    fn html_work_flat_when_no_process_rows() {
+        let messages = vec![
+            ExportMessage {
+                role: "user".into(),
+                content: "问".into(),
+                ts: 100,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: "答".into(),
+                ts: 130,
+                seg_complete: true,
+            },
+        ];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        // 无 thinking/status 的纯问答轮：不渲染空容器（会话页 flat 口径）。
+        assert!(!html.contains("<details class=\"work\""));
+        assert!(html.contains("id=\"round-1\""));
+    }
+
+    #[test]
+    fn html_work_duration_missing_ts_shows_processed() {
+        let messages = vec![
+            ExportMessage {
+                role: "user".into(),
+                content: "问".into(),
+                ts: 0,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "thinking".into(),
+                content: "想".into(),
+                ts: 0,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: "答".into(),
+                ts: 0,
+                seg_complete: true,
+            },
+        ];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        // 时间戳缺失/跨度非正 → 会话页同 fallback「已处理」。
+        assert!(html.contains("<details class=\"work\"><summary>已处理</summary>"));
+    }
+
+    #[test]
+    fn html_intermediate_assistant_inside_process_and_following_outside() {
+        let messages = vec![
+            ExportMessage {
+                role: "user".into(),
+                content: "问".into(),
+                ts: 100,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: "中间说明".into(),
+                ts: 110,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "status".into(),
+                content: "🔧 调用工具: shell".into(),
+                ts: 120,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: "最终回答".into(),
+                ts: 150,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "status".into(),
+                content: "🔧 调用工具: 事后".into(),
+                ts: 160,
+                seg_complete: true,
+            },
+        ];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        // 中间说明在容器内；容器在最终回复前闭合（开合配对）；随附行在最后。
+        let work_open = html.find("<details class=\"work\"").unwrap();
+        let final_pos = html.find("最终回答").unwrap();
+        assert!(html.find("中间说明").unwrap() > work_open);
+        let seg = &html[work_open..final_pos];
+        assert_eq!(
+            seg.matches("<details").count(),
+            seg.matches("</details>").count()
+        );
+        assert!(final_pos < html.find("事后").unwrap());
+        // 时长从首条过程行（中间说明 110）到最终回复（150）。
+        assert!(html.contains("已工作 40 秒"));
+    }
+
+    #[test]
+    fn html_no_final_segment_flat() {
+        let messages = vec![
+            ExportMessage {
+                role: "user".into(),
+                content: "问".into(),
+                ts: 100,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "thinking".into(),
+                content: "想的".into(),
+                ts: 110,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "status".into(),
+                content: "🔧 调用工具: read".into(),
+                ts: 120,
+                seg_complete: true,
+            },
+        ];
+        // 取消轮（无最终回复）：整段平铺，无容器，内容完整可见。
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        assert!(!html.contains("<details class=\"work\""));
+        assert!(html.contains("想的") && html.contains("🔧 调用工具: read"));
+    }
+
+    #[test]
+    fn html_preamble_with_process_flat() {
+        let messages = vec![
+            ExportMessage {
+                role: "assistant".into(),
+                content: "开场".into(),
+                ts: 50,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "thinking".into(),
+                content: "开场思考".into(),
+                ts: 60,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "user".into(),
+                content: "问".into(),
+                ts: 100,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: "答".into(),
+                ts: 130,
+                seg_complete: true,
+            },
+        ];
+        // preamble（首条 user 之前）含 thinking 也不套 work 容器；round-1
+        // 纯问答段同样平铺。
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        assert!(!html.contains("<details class=\"work\""));
+        assert!(html.contains("id=\"preamble\"") && html.contains("开场思考"));
+        assert!(html.contains("id=\"round-1\""));
+    }
+
+    #[test]
+    fn html_mixed_seg_complete_flat() {
+        let messages = vec![
+            ExportMessage {
+                role: "user".into(),
+                content: "问".into(),
+                ts: 100,
+                seg_complete: false,
+            },
+            ExportMessage {
+                role: "thinking".into(),
+                content: "思考正文".into(),
+                ts: 110,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: "最终回答".into(),
+                ts: 150,
+                seg_complete: false,
+            },
+        ];
+        // 同段混用 true/false：.all 门槛 fail-closed → 平铺。
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        assert!(!html.contains("<details class=\"work\""));
+        assert!(html.contains("思考正文") && html.contains("最终回答"));
+    }
+
+    #[test]
+    fn html_partial_selection_renders_flat_without_duration() {
+        let messages = vec![
+            ExportMessage {
+                role: "user".into(),
+                content: "问".into(),
+                ts: 100,
+                seg_complete: false,
+            },
+            ExportMessage {
+                role: "thinking".into(),
+                content: "思考内容".into(),
+                ts: 110,
+                seg_complete: false,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: "最终回答".into(),
+                ts: 150,
+                seg_complete: false,
+            },
+        ];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        // 多选不完整段：平铺、无「已工作」——选中子集的跨度会虚报。
+        assert!(!html.contains("<details class=\"work\""));
+        assert!(!html.contains("已工作"));
+        // 内容一个不丢。
+        assert!(html.contains("思考内容") && html.contains("最终回答"));
+    }
+
+    #[test]
+    fn html_backlink_never_targets_folded_container() {
+        let dir = tempfile::tempdir().unwrap();
+        write_png(dir.path(), "media/out/a.png");
+        let marker = "MEDIA_MARKER=[:x-media type=image path=\"/agent/media/out/a.png\"]";
+        let messages = vec![
+            ExportMessage {
+                role: "user".into(),
+                content: "问".into(),
+                ts: 100,
+                seg_complete: true,
+            },
+            // 中间说明带图（进折叠容器内）；最终回复引用同图。
+            ExportMessage {
+                role: "assistant".into(),
+                content: format!("中间说明 {marker}"),
+                ts: 110,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "status".into(),
+                content: "🔧 调用工具: read".into(),
+                ts: 120,
+                seg_complete: true,
+            },
+            ExportMessage {
+                role: "assistant".into(),
+                content: format!("最终回答 {marker}"),
+                ts: 150,
+                seg_complete: true,
+            },
+        ];
+        let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
+        // 首图在折叠容器内：同图回链必须降级为文本注记（锚点滚动不会展开
+        // details，指向折叠 figure 的链接点了也看不到）。
+        assert_eq!(html.matches("data:image/png;base64,").count(), 1);
+        assert!(!html.contains("href=\"#img-"));
+        assert!(html.contains("位于折叠块中"));
+    }
+
+    #[test]
+    fn work_duration_format_matches_chat() {
+        assert_eq!(format_work_duration(55), "55 秒");
+        assert_eq!(format_work_duration(60), "1 分 0 秒");
+        assert_eq!(format_work_duration(90), "1 分 30 秒");
     }
 
     #[cfg(unix)]
@@ -1956,6 +2469,8 @@ mod tests {
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "图 media/out/link.png".into(),
+            ts: 0,
+            seg_complete: true,
         }];
         // 预扫：symlink 指向根外 → resolve 拒绝 → 不计数不 stat。
         let (_, image_bytes) =

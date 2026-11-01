@@ -726,13 +726,18 @@ export const api = {
     invoke<void>("share_text", { title, text }),
 
   /** 选中消息导出为文档（fmt: "md" 文本文档 / "docx" 内嵌图片文档 /
-   *  "html" 折叠块+轮次导航含图片）。返回 output/exports/ 下的工作区相对路径。 */
+   *  "html" 折叠块+轮次导航含图片）。messages.ts 为落库 unix 秒（Entry.ts
+   *  是毫秒，调用方除 1000），html 按它算「已工作 X」段时长；seg_complete =
+   *  所在会话段是否整段被选（不完整段平铺、不显示时长）。
+   *  返回 output/exports/ 下的工作区相对路径。 */
   exportMessages: (
     title: string,
     fmt: "md" | "docx" | "html",
     messages: Array<{
       role: "user" | "assistant" | "thinking" | "status";
       content: string;
+      ts: number;
+      seg_complete: boolean;
     }>,
   ) => invoke<string>("export_messages", { title, fmt, messages }),
 

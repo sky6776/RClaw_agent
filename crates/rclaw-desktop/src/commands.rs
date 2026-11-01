@@ -795,6 +795,8 @@ pub async fn chat_export_full(
             .map(|e| crate::export::ExportMessage {
                 role: e.role,
                 content: e.content,
+                ts: e.ts,
+                seg_complete: true,
             })
             .collect();
         write_export_file(&home, &title, &fmt, messages)
@@ -3150,6 +3152,8 @@ mod tests {
             .map(|e| crate::export::ExportMessage {
                 role: e.role.clone(),
                 content: e.content.clone(),
+                ts: e.ts,
+                seg_complete: true,
             })
             .collect();
         let rel_md =
@@ -3205,6 +3209,8 @@ mod tests {
             .map(|e| crate::export::ExportMessage {
                 role: e.role.clone(),
                 content: e.content.clone(),
+                ts: e.ts,
+                seg_complete: true,
             })
             .collect();
         let rel = super::write_export_file(dir.path(), "网页导出", "html", messages).unwrap();
@@ -3219,6 +3225,20 @@ mod tests {
         // 未知格式在 write_export_file 内部兜底拒绝（命令层白名单之外的防线）。
         let err = super::write_export_file(dir.path(), "x", "pdf", Vec::new()).unwrap_err();
         assert!(err.contains("不支持的导出格式"));
+    }
+
+    #[test]
+    fn export_message_dto_missing_seg_complete_is_fail_closed() {
+        // 省略 seg_complete 的旧调用方按「不完整段」处理（默认 false），
+        // 绝不把未知来源的选中子集当成完整段虚报工时。
+        let dto: super::ExportMessageDto =
+            serde_json::from_str(r#"{"role":"assistant","content":"x","ts":10}"#).unwrap();
+        assert!(!dto.seg_complete);
+        let dto: super::ExportMessageDto = serde_json::from_str(
+            r#"{"role":"assistant","content":"x","ts":10,"seg_complete":true}"#,
+        )
+        .unwrap();
+        assert!(dto.seg_complete);
     }
 
     #[test]
@@ -3254,6 +3274,8 @@ mod tests {
             .map(|e| crate::export::ExportMessage {
                 role: e.role.clone(),
                 content: e.content.clone(),
+                ts: e.ts,
+                seg_complete: true,
             })
             .collect();
         let rel = super::write_export_file(dir.path(), "长会话", "md", messages).unwrap();
@@ -5080,8 +5102,17 @@ pub async fn share_text(title: String, text: String) -> Result<(), String> {
 pub struct ExportMessageDto {
     /// user | assistant | thinking | status。
     pub role: String,
-    /// 消息原文（媒体路径引用保持原样，docx 据此内嵌图片）。
+    /// 消息原文（媒体路径引用保持原样，docx/html 据此内嵌图片）。
     pub content: String,
+    /// 落库时间（unix 秒，0=未知）：HTML 导出按它算「已工作 X」段时长。
+    /// 前端 Entry.ts 是毫秒，调用方需先除 1000。
+    pub ts: i64,
+    /// 该消息所在会话段是否整段被选（前端按段判定）：不完整段平铺渲染，
+    /// 不显示「已工作 X」（选中子集的时间跨度会虚报，还可能误判最终回复）。
+    /// 默认 false（fail-closed）：省略字段的旧调用方按不完整处理，绝不把
+    /// 未知来源的选中子集当成完整段虚报工时。
+    #[serde(default)]
+    pub seg_complete: bool,
 }
 
 /// 导出选中消息为文档。fmt: "md" | "docx" | "html"。返回 output/exports/ 相对路径。
@@ -5110,6 +5141,8 @@ pub async fn export_messages(
         .map(|m| crate::export::ExportMessage {
             role: m.role,
             content: m.content,
+            ts: m.ts,
+            seg_complete: m.seg_complete,
         })
         .collect();
     if parsed.is_empty() {
