@@ -24,7 +24,8 @@ import {
   viewsFromSummary,
   type ToolCallView,
 } from "../lib/toolCalls";
-import ToolBatchRows, { type ToolDetailLoader } from "./ToolCallRow";
+import { isAndroidDevice } from "../lib/useIsMobile";
+import ToolBatchRows, { transferToolRowOpenState, type ToolDetailLoader } from "./ToolCallRow";
 import { ProgressBar, StateBadge, elapsedText } from "./ExecutionCard";
 
 /**
@@ -145,11 +146,38 @@ function entryFrom(m: HistoryMsg): TranscriptEntry {
   };
 }
 
-/** 落库的工具批到达：撤掉对应的直播行（按调用 id 序列对位；落库行带权威成败）。 */
-function withoutCommitted(pending: PendingBatch[], fresh: TranscriptEntry[]): PendingBatch[] {
+/** 首屏窗口上限（与后端 `agent_execution_history` 的 retain_last_rows 同值）：拉满即视为
+ *  被截断，最早的行（任务书）不在窗口里。 */
+const HISTORY_WINDOW_ROWS = 200;
+
+/** 落库行与直播批对位的时间余量：行 ts 是落库时刻取整到秒，一定不早于该批开始；
+ *  比直播批开始时刻还早超过这个余量的行是更早的一批（provider 复用调用 id 时同序）。 */
+const COMMIT_MATCH_SLACK_MS = 1_500;
+
+/** 落库的工具批到达：撤掉对应的直播行（调用 id 序列一致且落库不早于该批开始；落库行带
+ *  权威成败），并把用户展开着的行的开合状态搬到落库行上。幂等。 */
+function withoutCommitted(
+  pending: PendingBatch[],
+  fresh: TranscriptEntry[],
+  chatId: string,
+): PendingBatch[] {
   const committed = fresh.filter((e) => e.role === "status" && e.tools && e.tools.length > 0);
   if (committed.length === 0 || pending.length === 0) return pending;
-  const next = pending.filter((p) => !committed.some((c) => sameToolBatch(p.tools, c.tools)));
+  const next = pending.filter((p) => {
+    const match = committed.find(
+      (c) => sameToolBatch(p.tools, c.tools) && (c.ts === 0 || c.ts >= p.ts - COMMIT_MATCH_SLACK_MS),
+    );
+    if (!match) return true;
+    if (match.msgId !== undefined) {
+      transferToolRowOpenState(
+        chatId,
+        -p.iter,
+        match.msgId,
+        p.tools.map((t) => t.id),
+      );
+    }
+    return false;
+  });
   return next.length === pending.length ? pending : next;
 }
 
@@ -276,18 +304,26 @@ export default function AgentExecutionDetail({
   const [cancelling, setCancelling] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  /** 首屏窗口被截断（最早的行不在屏上）：首行不再当「任务」标注。 */
+  const [truncated, setTruncated] = useState(false);
+  /** 列表是否在跟随底部（只用于显示「回到底部」按钮；判定本身在 ref 里，不触发重渲）。 */
+  const [following, setFollowing] = useState(true);
   const cursorRef = useRef(0);
   /** 首屏快照已到（之后 transcript 事件才按游标续拉；之前到达的事件在首屏后补拉一次）。 */
   const loadedRef = useRef(false);
   const syncingRef = useRef(false);
   const resyncQueuedRef = useRef(false);
+  /** 加载代际：切换执行 / 卸载时递增，在途的拉取回来后发现代际变了就丢弃结果。 */
+  const genRef = useRef(0);
   const listRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const live = summary ? isLive(summary) : false;
   const terminal = summary ? isTerminal(summary) : detail ? isTerminal(detail.execution) : false;
   const now = useNow(live || stateOf(summary ?? { state: "" }) === "queued");
+  const transcriptKey = `agent:${agentId}`;
 
   // 详情（事件尾 / handoff / inbox / cancellable）：首次 + 快照每次更新时重拉。
   const updatedAt = summary?.updated_at;
@@ -308,8 +344,10 @@ export default function AgentExecutionDetail({
     };
   }, [agentId, updatedAt]);
 
-  // 活动记录：首屏快照 + 游标增量（串行化：同时只跑一个拉取，期间到达的事件合并为一次续拉）。
+  // 活动记录：首屏快照 + 游标增量（串行化：同时只跑一个拉取，期间到达的事件合并为一次续拉；
+  // 代际校验：切换执行后在途的旧拉取不得把旧记录的行与游标写进新记录）。
   const pullDelta = useCallback(async () => {
+    const gen = genRef.current;
     if (syncingRef.current) {
       resyncQueuedRef.current = true;
       return;
@@ -318,6 +356,7 @@ export default function AgentExecutionDetail({
     try {
       for (;;) {
         const delta = await api.agentExecutionHistorySince(agentId, cursorRef.current);
+        if (gen !== genRef.current) return;
         if (delta.cursor > cursorRef.current) cursorRef.current = delta.cursor;
         if (delta.entries.length > 0) {
           const fresh = delta.entries.map(entryFrom);
@@ -326,24 +365,28 @@ export default function AgentExecutionDetail({
             const add = fresh.filter((e) => !have.has(e.key));
             return add.length > 0 ? [...prev, ...add] : prev;
           });
-          setPending((prev) => withoutCommitted(prev, fresh));
+          setPending((prev) => withoutCommitted(prev, fresh, transcriptKey));
         }
         setHistoryError(null);
         if (!delta.more) break;
       }
     } catch (e) {
-      setHistoryError(String(e));
+      if (gen === genRef.current) setHistoryError(String(e));
     } finally {
-      syncingRef.current = false;
-      if (resyncQueuedRef.current) {
-        resyncQueuedRef.current = false;
-        void pullDelta();
+      if (gen === genRef.current) {
+        syncingRef.current = false;
+        if (resyncQueuedRef.current) {
+          resyncQueuedRef.current = false;
+          void pullDelta();
+        }
       }
     }
-  }, [agentId]);
+  }, [agentId, transcriptKey]);
 
   useEffect(() => {
     let cancelled = false;
+    genRef.current += 1;
+    const gen = genRef.current;
     cursorRef.current = 0;
     loadedRef.current = false;
     syncingRef.current = false;
@@ -353,15 +396,18 @@ export default function AgentExecutionDetail({
     setRemoved(false);
     setDetail(null);
     setHistoryError(null);
+    setTruncated(false);
     stickToBottomRef.current = true;
+    setFollowing(true);
     // 首屏拉取期间到达的 transcript 事件先记下，首屏到位后按游标补拉一次（排队中的执行
     // 首屏可能为空、游标为 0，所以不能拿游标是否为 0 当「已加载」）。
     let eventSeen = false;
     const unsubscribe = subscribeAgentEvents(agentId, (event: AgentExecEvent) => {
+      if (cancelled) return;
       if (event.kind === "transcript") {
         if (!loadedRef.current) {
           eventSeen = true;
-        } else if (!cancelled && event.cursor > cursorRef.current) {
+        } else if (event.cursor > cursorRef.current) {
           void pullDelta();
         }
       } else if (event.kind === "tools_begun") {
@@ -372,31 +418,46 @@ export default function AgentExecutionDetail({
         ]);
       } else if (event.kind === "removed") {
         setRemoved(true);
+      } else if (event.kind === "resync") {
+        // 宿主广播滞后：中间的 transcript 事件可能已丢，按游标补拉对齐。
+        if (loadedRef.current) void pullDelta();
+        else eventSeen = true;
       }
     });
+    // 后台期间 WebView 事件可能被节流 / 丢弃：回到前台按游标补拉一次。
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && loadedRef.current && !cancelled) {
+        void pullDelta();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     api
       .agentExecutionHistory(agentId)
       .then((snapshot) => {
-        if (cancelled) return;
+        if (cancelled || gen !== genRef.current) return;
         cursorRef.current = Math.max(cursorRef.current, snapshot.cursor);
         loadedRef.current = true;
         const fresh = snapshot.entries.map(entryFrom);
         setEntries(fresh);
-        setPending((prev) => withoutCommitted(prev, fresh));
+        setPending((prev) => withoutCommitted(prev, fresh, transcriptKey));
+        setTruncated(snapshot.entries.length >= HISTORY_WINDOW_ROWS);
         setHistoryError(null);
         if (eventSeen) void pullDelta();
       })
       .catch((e) => {
-        if (cancelled) return;
+        if (cancelled || gen !== genRef.current) return;
         // 首屏失败也进入「已加载」：之后的事件 / 重试按游标 0 续拉能拿回全部行。
         loadedRef.current = true;
         setHistoryError(String(e));
       });
     return () => {
       cancelled = true;
+      // 让在途的拉取作废（卸载 / 切换执行）。
+      genRef.current += 1;
+      document.removeEventListener("visibilitychange", onVisibility);
       unsubscribe();
     };
-  }, [agentId, pullDelta]);
+  }, [agentId, pullDelta, transcriptKey]);
 
   // 终态：仍在「进行中」的直播工具行标为已中断（没有落库行会来替换它们）；
   // 同时再按游标补拉一次，兜底收尾阶段可能错过的 transcript 事件。
@@ -406,11 +467,30 @@ export default function AgentExecutionDetail({
     if (loadedRef.current) void pullDelta();
   }, [terminal, pullDelta]);
 
-  // 自动跟随到底部（用户上滑离开底部后不再打扰）。
+  // 自动跟随到底部。只有用户主动向上滚才解除跟随（软键盘弹出等布局变化引起的滚动事件
+  // 不会让 scrollTop 变小）；回到底部附近 / 内容没溢出时恢复跟随。
   const handleScroll = () => {
     const el = listRef.current;
     if (!el) return;
-    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distance < 48 || el.scrollHeight <= el.clientHeight;
+    const scrolledUp = el.scrollTop < lastScrollTopRef.current - 1;
+    lastScrollTopRef.current = el.scrollTop;
+    if (atBottom) {
+      if (!stickToBottomRef.current) {
+        stickToBottomRef.current = true;
+        setFollowing(true);
+      }
+    } else if (scrolledUp && stickToBottomRef.current) {
+      stickToBottomRef.current = false;
+      setFollowing(false);
+    }
+  };
+  const jumpToBottom = () => {
+    stickToBottomRef.current = true;
+    setFollowing(true);
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   };
   useEffect(() => {
     const el = listRef.current;
@@ -421,7 +501,6 @@ export default function AgentExecutionDetail({
     () => (msgId: number) => api.agentExecutionToolDetail(agentId, msgId),
     [agentId],
   );
-  const transcriptKey = `agent:${agentId}`;
 
   // 活动记录 + 直播批按时间合并（直播批总在最后：它们一定晚于已落库的行）。
   const lastThinkingKey = useMemo(() => {
@@ -448,9 +527,9 @@ export default function AgentExecutionDetail({
       await api.agentExecutionSend(agentId, text);
       setDraft("");
       setActionNotice("已发送：子 agent 将在下一个安全点读到这条消息并回应。");
-      stickToBottomRef.current = true;
-      // 立即重拉详情拿到 inbox_pending（快照事件也会到，这里只是更快）。
-      api.agentExecutionDetail(agentId).then(setDetail).catch(() => undefined);
+      jumpToBottom();
+      // inbox_pending 由随之而来的快照事件（updated_at 推进 → 详情重拉）带回，不在这里
+      // 另发一次详情请求——两路响应乱序会让旧详情盖掉新的。
     } catch (e) {
       setActionError(String(e));
     } finally {
@@ -598,7 +677,8 @@ export default function AgentExecutionDetail({
       </div>
 
       {/* 活动记录 */}
-      <div ref={listRef} onScroll={handleScroll} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-6 py-4 max-md:px-3">
+      <div className="relative min-h-0 flex-1">
+      <div ref={listRef} onScroll={handleScroll} className="h-full space-y-3 overflow-y-auto px-6 py-4 max-md:px-3">
         {exec?.error && (
           <div className="whitespace-pre-wrap rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-2 text-xs text-red-300 [overflow-wrap:anywhere]">
             {stateOf(exec) === "cancelled" ? "取消原因：" : "失败原因："}
@@ -654,7 +734,8 @@ export default function AgentExecutionDetail({
             return <ThinkingBlock key={e.key} content={e.content} defaultOpen={e.key === lastThinkingKey} />;
           }
           if (e.role === "user") {
-            const { kind, body } = classifyUser(e.content, index === 0);
+            // 首屏窗口被截断时最早的行不在屏上，首行不一定是任务书。
+            const { kind, body } = classifyUser(e.content, index === 0 && !truncated);
             if (kind === "system") {
               return (
                 <div key={e.key} className="flex justify-start">
@@ -707,6 +788,16 @@ export default function AgentExecutionDetail({
         {exec?.handoff && <HandoffCard handoff={exec.handoff} />}
         {detail && <EventsTimeline events={detail.events} />}
       </div>
+      {!following && (
+        <button
+          type="button"
+          onClick={jumpToBottom}
+          className="absolute bottom-3 right-6 rounded-full border border-[#2a2f3a] bg-[#141821]/95 px-3 py-1 text-[11px] text-gray-300 shadow-lg transition hover:text-gray-100 max-md:right-3"
+        >
+          ↓ 回到底部
+        </button>
+      )}
+      </div>
 
       {/* 对话输入 */}
       <div className="border-t border-[#2a2f3a] px-6 py-3 max-md:px-3">
@@ -727,23 +818,25 @@ export default function AgentExecutionDetail({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-                e.preventDefault();
-                void send();
-              }
+              if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+              // 安卓 App：Enter 一律换行不发送（与对话页同规则：软键盘没有 Shift，发送走
+              // 右侧按钮）；外接硬件键盘 Ctrl/⌘+Enter 发送。
+              if (isAndroidDevice() && !(e.ctrlKey || e.metaKey)) return;
+              e.preventDefault();
+              void send();
             }}
             disabled={!canSend}
             rows={2}
             placeholder={
               canSend
-                ? "给这个子 agent 发消息（追问进展、补充要求、纠正方向）… Enter 发送，Shift+Enter 换行"
+                ? isAndroidDevice()
+                  ? "给这个子 agent 发消息（追问进展、补充要求、纠正方向）… 回车换行，点右侧发送"
+                  : "给这个子 agent 发消息（追问进展、补充要求、纠正方向）… Enter 发送，Shift+Enter 换行"
                 : removed
                   ? "记录已清除"
                   : terminal
                     ? "执行已结束，不能再对话"
-                    : stateOf(summary ?? { state: "" }) === "queued"
-                      ? "排队中：开始执行后才能对话"
-                      : "当前没有执行者（重启后恢复的记录），不能对话"
+                    : "当前没有执行者（重启后恢复的记录需先 AgentResume），不能对话"
             }
             className="min-h-[2.5rem] flex-1 resize-none rounded-xl border border-[#2a2f3a] bg-[#141821] px-3 py-2 text-sm text-gray-200 placeholder:text-gray-600 focus:border-indigo-500/60 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 max-md:text-[15px]"
           />

@@ -25,10 +25,39 @@ export interface ExecutionsState {
 }
 
 const FALLBACK_POLL_MS = 15_000;
+/** `removed` 事件的墓碑保留时长：拦住「删除前就已发出、删除后才返回」的全量列表把条目复活。 */
+const REMOVED_TOMBSTONE_MS = 30_000;
+/** 全量拉取期间经事件新入表的条目（created_at 晚于拉取发起时刻）保留；留点钟差余量。 */
+const INFLIGHT_CREATED_SLACK_MS = 2_000;
+
+/** 活跃统计（侧边栏徽标 / 概览四格）。 */
+export interface ExecutionCounts {
+  active: number;
+  running: number;
+  queued: number;
+  done: number;
+  failed: number;
+  finished: number;
+  total: number;
+}
+
+const EMPTY_COUNTS: ExecutionCounts = {
+  active: 0,
+  running: 0,
+  queued: 0,
+  done: 0,
+  failed: 0,
+  finished: 0,
+  total: 0,
+};
 
 let state: ExecutionsState = { executions: [], loaded: false, error: null, truncated: false };
+/** 列表的统计投影：只在数字变化时换引用，徽标订阅者不随每条快照事件重渲。 */
+let counts: ExecutionCounts = EMPTY_COUNTS;
 const listeners = new Set<() => void>();
 const agentListeners = new Map<string, Set<(event: AgentExecEvent) => void>>();
+/** 最近被 `removed` 事件清掉的 id → 清除时刻。 */
+const tombstones = new Map<string, number>();
 
 let started = false;
 let refreshing = false;
@@ -38,8 +67,24 @@ function emit() {
   for (const listener of listeners) listener();
 }
 
+function sameCounts(a: ExecutionCounts, b: ExecutionCounts): boolean {
+  return (
+    a.active === b.active &&
+    a.running === b.running &&
+    a.queued === b.queued &&
+    a.done === b.done &&
+    a.failed === b.failed &&
+    a.finished === b.finished &&
+    a.total === b.total
+  );
+}
+
 function setState(patch: Partial<ExecutionsState>) {
   state = { ...state, ...patch };
+  if (patch.executions) {
+    const next = countByState(state.executions);
+    if (!sameCounts(counts, next)) counts = next;
+  }
   emit();
 }
 
@@ -47,21 +92,39 @@ function sortExecutions(list: AgentExecution[]): AgentExecution[] {
   return [...list].sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
 }
 
-/** 全量拉取并与本地合并：本地更新时间更新的条目保留（事件先到、列表后到）。 */
+function pruneTombstones(now: number) {
+  for (const [id, at] of tombstones) {
+    if (now - at > REMOVED_TOMBSTONE_MS) tombstones.delete(id);
+  }
+}
+
+/** 全量拉取并与本地合并：本地更新时间更新的条目保留（事件先到、列表后到）；拉取期间
+ *  被 `removed` 清掉的不复活；拉取期间新入表的（事件已带来、列表快照里还没有）保留。 */
 export async function refreshExecutions(): Promise<void> {
   if (refreshing) {
     refreshQueued = true;
     return;
   }
   refreshing = true;
+  const startedAt = Date.now();
   try {
     const payload = await api.agentsList();
     const fetched = payload.executions ?? [];
+    pruneTombstones(Date.now());
     const local = new Map(state.executions.map((e) => [e.agent_id, e] as const));
-    const merged = fetched.map((e) => {
+    const fetchedIds = new Set<string>();
+    const merged: AgentExecution[] = [];
+    for (const e of fetched) {
+      fetchedIds.add(e.agent_id);
+      if (tombstones.has(e.agent_id)) continue;
       const mine = local.get(e.agent_id);
-      return mine && mine.updated_at > e.updated_at ? mine : e;
-    });
+      merged.push(mine && mine.updated_at > e.updated_at ? mine : e);
+    }
+    for (const e of state.executions) {
+      if (fetchedIds.has(e.agent_id)) continue;
+      const created = parseTs(e.created_at);
+      if (created !== null && created >= startedAt - INFLIGHT_CREATED_SLACK_MS) merged.push(e);
+    }
     setState({
       executions: sortExecutions(merged),
       loaded: true,
@@ -80,10 +143,16 @@ export async function refreshExecutions(): Promise<void> {
   }
 }
 
+function fanOut(agentId: string, event: AgentExecEvent) {
+  const subs = agentListeners.get(agentId);
+  if (subs) for (const cb of subs) cb(event);
+}
+
 function applyEvent(event: AgentExecEvent) {
   switch (event.kind) {
     case "snapshot": {
       const next = event.execution;
+      if (tombstones.has(next.agent_id)) return;
       const index = state.executions.findIndex((e) => e.agent_id === next.agent_id);
       if (index === -1) {
         setState({ executions: sortExecutions([...state.executions, next]) });
@@ -96,24 +165,24 @@ function applyEvent(event: AgentExecEvent) {
     }
     case "removed": {
       const gone = new Set(event.agent_ids);
+      const now = Date.now();
+      pruneTombstones(now);
+      for (const id of gone) tombstones.set(id, now);
       if (state.executions.some((e) => gone.has(e.agent_id))) {
         setState({ executions: state.executions.filter((e) => !gone.has(e.agent_id)) });
       }
-      for (const id of gone) {
-        const subs = agentListeners.get(id);
-        if (subs) for (const cb of subs) cb(event);
-      }
+      for (const id of gone) fanOut(id, event);
       return;
     }
     case "resync":
+      // 宿主广播滞后：列表重拉；正在看的详情页同样要按游标补拉活动记录。
       void refreshExecutions();
+      for (const [id] of agentListeners) fanOut(id, event);
       return;
     case "tools_begun":
-    case "transcript": {
-      const subs = agentListeners.get(event.agent_id);
-      if (subs) for (const cb of subs) cb(event);
+    case "transcript":
+      fanOut(event.agent_id, event);
       return;
-    }
     default:
       return;
   }
@@ -122,10 +191,18 @@ function applyEvent(event: AgentExecEvent) {
 function ensureStarted() {
   if (started) return;
   started = true;
-  void refreshExecutions();
-  void api.onAgentExec(applyEvent).catch(() => {
-    // 监听失败（非 Tauri 环境）：只剩兜底轮询。
-  });
+  // 先接事件再拉全量：listen 就绪前到达的事件没人收，只能等下一次兜底轮询补。
+  let listening: Promise<unknown>;
+  try {
+    listening = api.onAgentExec(applyEvent);
+  } catch {
+    listening = Promise.resolve();
+  }
+  void listening
+    .catch(() => {
+      // 监听失败（非 Tauri 环境）：只剩兜底轮询。
+    })
+    .then(() => refreshExecutions());
   setInterval(() => {
     if (typeof document === "undefined" || document.visibilityState !== "hidden") {
       void refreshExecutions();
@@ -156,6 +233,19 @@ export function useAgentExecutions(enabled: boolean): ExecutionsState {
     if (enabled) ensureStarted();
   }, [enabled]);
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+function getCounts(): ExecutionCounts {
+  return counts;
+}
+
+/** 只订阅统计数字（侧边栏徽标）：快照事件没改变计数时订阅者不重渲——App 根组件用它，
+ *  避免每条进度 / token 事件都整树重渲。 */
+export function useAgentExecutionCounts(enabled: boolean): ExecutionCounts {
+  useEffect(() => {
+    if (enabled) ensureStarted();
+  }, [enabled]);
+  return useSyncExternalStore(subscribe, getCounts, getCounts);
 }
 
 /** 单条执行的列表级快照（不存在 / 已清除时 undefined）。 */
@@ -321,7 +411,7 @@ export function displayName(e: Pick<AgentExecution, "name" | "agent_id">): strin
 }
 
 /** 活跃统计（徽标 / 概览四格）。 */
-export function countByState(list: AgentExecution[]) {
+export function countByState(list: AgentExecution[]): ExecutionCounts {
   let active = 0;
   let running = 0;
   let queued = 0;

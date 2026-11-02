@@ -35,7 +35,7 @@ import {
   viewsFromBegun,
   viewsFromSummary,
 } from "./lib/toolCalls";
-import { countByState, useAgentExecutions } from "./lib/agentExecutions";
+import { useAgentExecutionCounts } from "./lib/agentExecutions";
 import Wizard from "./components/Wizard";
 import Chat, { type Entry, type QueueItem } from "./components/Chat";
 import AgentsPanel from "./components/AgentsPanel";
@@ -219,8 +219,8 @@ export default function App() {
   // 正在查看详情的子 agent 执行（Agent / 任务概览页内的详情层；null = 列表）。
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   // 侧边栏「Agent / 任务概览」实时徽标：直播仓里活跃（排队 / 运行 / 等待 / 取消中）的执行数。
-  const { executions: liveExecutions } = useAgentExecutions(agentState === "ready");
-  const liveCounts = countByState(liveExecutions);
+  // 只订阅统计数字：每条进度 / token 事件都不该让 App 整树重渲。
+  const liveCounts = useAgentExecutionCounts(agentState === "ready");
 
   // 标题栏循环标语（界面偏好，非 rclaw.toml）。加载失败或为空时回退应用名。
   const [slogans, setSlogans] = useState<string[]>([]);
@@ -1919,7 +1919,8 @@ ${event.payload.command}
               <button
                 key={key}
                 onClick={() => {
-                  if (page !== key) setSelectedAgentId(null);
+                  // 点栏目总是回到列表层（在详情里再点一次「Agent」= 返回列表）。
+                  setSelectedAgentId(null);
                   setPage(key);
                   setDrawerOpen(false);
                 }}
@@ -2285,21 +2286,43 @@ ${event.payload.command}
         {agentState === "ready" && page === "tools" && <ToolsPanel agentReady />}
         {agentState === "ready" && page === "skills" && <SkillsPanel agentReady />}
         {agentState === "ready" && page === "files" && <FilePanel onError={setErrorToast} />}
+        {/* Agent / 任务概览：进详情时列表面板仍挂着（只是隐藏），返回不重新加载、滚动位置不丢；
+            详情按 agentId 作 key，切换执行时整页重建，不复用旧记录的状态。 */}
         {agentState === "ready" && page === "agents" && (
-          selectedAgentId !== null ? (
-            <AgentExecutionDetail agentId={selectedAgentId} onBack={() => setSelectedAgentId(null)} />
-          ) : (
-            <AgentsPanel agentReady onOpen={setSelectedAgentId} />
-          )
+          <div className="relative h-full">
+            <div
+              className={selectedAgentId !== null ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
+              aria-hidden={selectedAgentId !== null}
+            >
+              <AgentsPanel agentReady onOpen={setSelectedAgentId} />
+            </div>
+            {selectedAgentId !== null && (
+              <AgentExecutionDetail
+                key={selectedAgentId}
+                agentId={selectedAgentId}
+                onBack={() => setSelectedAgentId(null)}
+              />
+            )}
+          </div>
         )}
         {agentState === "ready" && page === "evolution" && <EvolutionPanel agentReady />}
         {agentState === "ready" && page === "cron" && <CronPanel agentReady />}
         {agentState === "ready" && page === "taskview" && (
-          selectedAgentId !== null ? (
-            <AgentExecutionDetail agentId={selectedAgentId} onBack={() => setSelectedAgentId(null)} />
-          ) : (
-            <TaskOverviewPanel agentReady onOpen={setSelectedAgentId} />
-          )
+          <div className="relative h-full">
+            <div
+              className={selectedAgentId !== null ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
+              aria-hidden={selectedAgentId !== null}
+            >
+              <TaskOverviewPanel agentReady onOpen={setSelectedAgentId} />
+            </div>
+            {selectedAgentId !== null && (
+              <AgentExecutionDetail
+                key={selectedAgentId}
+                agentId={selectedAgentId}
+                onBack={() => setSelectedAgentId(null)}
+              />
+            )}
+          </div>
         )}
         {agentState === "ready" && page === "config" && (
           <ConfigPanel

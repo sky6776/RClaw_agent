@@ -30,6 +30,20 @@ import { GearIcon, PencilIcon, SearchIcon, TerminalIcon } from "./icons";
 /** 展开状态按 (会话, 条目, 调用) 记在模块级：Chat 随页面切换卸载重挂时不丢。 */
 const openState = new Map<string, boolean>();
 
+/** 把一批调用行的展开状态从一个条目键搬到另一个：直播批（临时条目 id）被落库行
+ *  （行 id）替换时条目 id 变了，用户展开着看的行不该因此收起。幂等。 */
+export function transferToolRowOpenState(
+  chatId: string,
+  fromEntryId: number,
+  toEntryId: number,
+  callIds: string[],
+) {
+  for (const id of callIds) {
+    const open = openState.get(`${chatId}:${fromEntryId}:${id}`);
+    if (open !== undefined) openState.set(`${chatId}:${toEntryId}:${id}`, open);
+  }
+}
+
 /** 详情缓存（按会话 + 行 id）：同一行多次展开不重复读库；失败的请求不缓存，可重试。 */
 const detailCache = new Map<string, Promise<ToolChainDetail>>();
 
