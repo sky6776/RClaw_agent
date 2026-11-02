@@ -1199,9 +1199,23 @@ impl SessionStore {
     pub fn scan_messages(
         &self,
         channel: Option<&str>,
+        visit: impl FnMut(&SessionSummary, &Message),
+    ) -> Result<()> {
+        self.scan_messages_where(channel, |_| true, visit)
+    }
+
+    /// 同 [`Self::scan_messages`]，但先按会话摘要筛（`keep` 返回 false 的会话连 transcript
+    /// 都不加载）：调用方要跳过整类会话（心跳 / 子 agent 活动记录等）时不必先整份读出来再丢。
+    pub fn scan_messages_where(
+        &self,
+        channel: Option<&str>,
+        mut keep: impl FnMut(&SessionSummary) -> bool,
         mut visit: impl FnMut(&SessionSummary, &Message),
     ) -> Result<()> {
         for summary in self.list_sessions(channel)? {
+            if !keep(&summary) {
+                continue;
+            }
             for message in self.load_transcript(&summary.channel, &summary.chat_id)? {
                 visit(&summary, &message);
             }

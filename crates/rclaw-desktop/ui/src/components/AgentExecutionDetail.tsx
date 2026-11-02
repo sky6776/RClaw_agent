@@ -63,9 +63,11 @@ const INTERJECTION_HEAD = "## Message from the user";
 const INTERJECTION_TAIL = "\n\nThe user is watching this execution live";
 const NUDGE_HEAD = "Your reply has been shown to the user.";
 const TEAM_HEAD = "## Incoming Team Messages";
+/** 续跑分隔标记（运行时 `SUBAGENT_RESUME_MARKER`）：AgentResume 后任务书不重复落库，只落这条。 */
+const RESUME_HEAD = "## Execution resumed";
 
-/** 用户角色行的来源分类：任务书 / 用户插话 / 团队消息 / 系统提示（闸门反馈等）。 */
-type UserKind = "task" | "interjection" | "team" | "system";
+/** 用户角色行的来源分类：任务书 / 用户插话 / 团队消息 / 续跑标记 / 系统提示（闸门反馈等）。 */
+type UserKind = "task" | "interjection" | "team" | "resume" | "system";
 
 function classifyUser(content: string, first: boolean): { kind: UserKind; body: string } {
   if (content.startsWith(INTERJECTION_HEAD)) {
@@ -74,6 +76,9 @@ function classifyUser(content: string, first: boolean): { kind: UserKind; body: 
     return { kind: "interjection", body };
   }
   if (content.startsWith(TEAM_HEAD)) return { kind: "team", body: content };
+  if (content.startsWith(RESUME_HEAD)) {
+    return { kind: "resume", body: "进程重启后续跑（AgentResume）：子 agent 从顶部的任务书重新开始，上方是上一轮的记录。" };
+  }
   if (first && !content.startsWith(NUDGE_HEAD)) return { kind: "task", body: content };
   return { kind: "system", body: content };
 }
@@ -82,6 +87,7 @@ const USER_KIND_LABEL: Record<UserKind, string> = {
   task: "任务",
   interjection: "你的插话",
   team: "团队消息",
+  resume: "续跑",
   system: "系统提示",
 };
 
@@ -736,7 +742,7 @@ export default function AgentExecutionDetail({
           if (e.role === "user") {
             // 首屏窗口被截断时最早的行不在屏上，首行不一定是任务书。
             const { kind, body } = classifyUser(e.content, index === 0 && !truncated);
-            if (kind === "system") {
+            if (kind === "system" || kind === "resume") {
               return (
                 <div key={e.key} className="flex justify-start">
                   <div className="max-w-[92%] whitespace-pre-wrap rounded-xl border border-dashed border-[#2a2f3a] px-3 py-1.5 text-[11px] text-gray-500 [overflow-wrap:anywhere]">

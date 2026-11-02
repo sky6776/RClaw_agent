@@ -92,11 +92,12 @@ pub fn compute(session: &SessionStore, skills_dir: &Path, memory: &MemoryStore) 
             agg.total_chats += 1;
         }
     }
-    if let Err(error) = session.scan_messages(None, |summary, msg| {
-        if !is_heartbeat_session(summary) {
-            scan_message(msg, &mut agg);
-        }
-    }) {
+    // 非用户会话在会话级就跳过：子 agent 活动记录整份带着工具结果，先读出来再丢太贵。
+    if let Err(error) = session.scan_messages_where(
+        None,
+        |summary| !is_heartbeat_session(summary),
+        |_, msg| scan_message(msg, &mut agg),
+    ) {
         tracing::debug!("insights 会话扫描失败（面板按零显示）: {error}");
     }
 

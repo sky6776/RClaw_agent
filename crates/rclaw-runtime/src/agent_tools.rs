@@ -97,6 +97,13 @@ const MAX_ACTIVE_EXECUTIONS: usize = 32;
 /// （思考块 / 工具与 Skill 调用可展开）回放它。随执行记录一起删除。
 pub const SUBAGENT_CHANNEL: &str = "subagent";
 
+/// 续跑（AgentResume）时落进 transcript 的分隔标记：记录里已有上一轮的行，任务书不再
+/// 重复落一遍——模型上下文仍从完整任务书重新开始，这条只给看记录的人定位「从这里重跑」。
+/// 宿主 UI 按首行识别（`## Execution resumed`）。
+pub const SUBAGENT_RESUME_MARKER: &str = "## Execution resumed\n\n\
+    This execution was resumed (AgentResume). The sub-agent restarts from the task brief at \
+    the top of this record; rows above are from the previous run and are not in its context.";
+
 mod escalate;
 pub use amend_workflow::AmendWorkflowTool;
 pub use cancel_workflow_run::CancelWorkflowRunTool;
@@ -806,6 +813,18 @@ impl AgentToolRuntime {
         true
     }
 
+    /// 该执行的 transcript 里是否已有行（续跑判定）。读失败按「没有」处理：最坏是任务书
+    /// 多落一遍，不能因为可观察性的读错让任务起不来。
+    fn transcript_has_rows(&self, agent_id: &str) -> bool {
+        match self.transcript.session_summary(SUBAGENT_CHANNEL, agent_id) {
+            Ok(summary) => summary.is_some_and(|summary| summary.message_count > 0),
+            Err(error) => {
+                tracing::warn!(agent_id, %error, "读取子代理 transcript 摘要失败，按空记录处理");
+                false
+            }
+        }
+    }
+
     /// 子代理 transcript 落一行（通道 [`SUBAGENT_CHANNEL`]、chat_id = agent_id）并广播
     /// 游标。transcript 只是可观察性：写失败告警，不影响任务本身。
     fn persist_transcript_message(&self, agent_id: &str, message: &Message) {
@@ -1368,20 +1387,21 @@ impl AgentToolRuntime {
         self.collaboration.execution_list_payload().await
     }
 
-    /// 全部后台子 agent 执行的快照（桌面版「Agent 状态」面板用）。
+    /// 全部后台子 agent 执行的快照（桌面版「Agent 状态 / 任务概览」面板用；条目与直播
+    /// `snapshot` 事件同形，比模型可见的 AgentStatus 列表多 UI 字段）。
     ///
-    /// 返回 `{executions: [{agent_id, state, progress, goal, ...}], total, truncated}`；
-    /// 只覆盖后台/异步执行——前台并行子 agent 在父回合内同步运行，
+    /// 返回 `{executions: [{agent_id, name, state, progress, goal, usage, started_at, ...}],
+    /// total, truncated}`；只覆盖后台/异步执行——前台并行子 agent 在父回合内同步运行，
     /// 其进度体现在父回合的对话状态条中。
     pub async fn executions_payload(&self) -> Value {
-        self.collaboration.execution_list_payload().await
+        self.collaboration.execution_list_payload_ui().await
     }
 
     /// 单条执行的详情（`execution` 完整快照含 spec / handoff / error / usage、`events`
     /// 尾部事件、`cancellable` / `resumable`、`inbox_pending`、`summary` 列表级条目）；
     /// 未知 id 返回 None。
     pub async fn execution_detail(&self, agent_id: &str) -> Option<Value> {
-        self.collaboration.execution_payload(agent_id).await
+        self.collaboration.execution_detail_payload(agent_id).await
     }
 
     /// 订阅执行登记表直播（宿主 UI 事件桥）。订阅方滞后（`Lagged`）时应重拉全量
@@ -1758,8 +1778,16 @@ impl AgentToolRuntime {
 
         let task_prompt = Message::plain(Role::User, prompt);
         // 登记在册的执行：完整运行记录按前台会话同形落 transcript（宿主 UI 回放）。
+        // 续跑（AgentResume）时记录里已有上一轮的行：任务书不重复落，只落一条续跑标记。
         if let Some(control) = control {
-            self.persist_transcript_message(&control.agent_id, &task_prompt);
+            if self.transcript_has_rows(&control.agent_id) {
+                self.persist_transcript_message(
+                    &control.agent_id,
+                    &Message::plain(Role::User, SUBAGENT_RESUME_MARKER),
+                );
+            } else {
+                self.persist_transcript_message(&control.agent_id, &task_prompt);
+            }
         }
         let mut messages = vec![task_prompt];
         // 用户插话已读入、模型尚未以「继续干活」回应：此时的纯文本回复是对用户的回应，

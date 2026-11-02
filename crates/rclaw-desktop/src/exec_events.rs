@@ -20,6 +20,9 @@ pub const EVENT_NAME: &str = "agent_exec";
 /// 订阅运行时的执行直播并转发到 Webview，直到运行时被丢弃（广播端关闭）。
 pub async fn run_bridge(app: tauri::AppHandle, runtime: AgentToolRuntime) {
     let mut rx = runtime.subscribe_execution_updates();
+    // 只留接收端：桥本身若还攥着运行时句柄，广播发送端永远不会关闭，`Closed` 也就永远
+    // 不会到来——运行时被丢弃时这个任务得跟着退出，而不是把它钉在内存里。
+    drop(runtime);
     loop {
         match rx.recv().await {
             Ok(update) => emit(&app, &update),
