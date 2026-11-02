@@ -2268,8 +2268,9 @@ pub async fn agents_list(state: State<'_, AppState>) -> Result<serde_json::Value
     Ok(runtime.executions_payload().await)
 }
 
-/// 清空已终态的后台执行记录（「Agent 状态 / 任务概览」的清除按钮）：只清任务历史，
-/// 不影响任何会话；排队/运行/等待中的活任务保留。返回清除条数。
+/// 清空已终态的后台执行记录（「Agent 状态 / 任务概览」的清除按钮）：只清任务历史（含
+/// 子代理自己的 transcript），不影响用户会话；排队/运行/等待中的活任务保留。返回登记
+/// 表里清掉的条数。
 #[tauri::command]
 pub async fn agents_clear_history(state: State<'_, AppState>) -> Result<usize, String> {
     let runtime = state.agent_runtime().ok_or("agent 尚未启动")?;

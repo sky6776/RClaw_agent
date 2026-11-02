@@ -55,8 +55,9 @@ export default function TaskPanel({
   // 概览四格：succeeded / running+waiting+cancelling / queued / failed。
   const { total, done, running: active, queued, failed, finished: finishedCount } = counts;
 
-  // 清除历史（与 Agent 状态页 / 任务概览页同源命令）：只清已终态的任务记录，
-  // 不影响任何会话；活任务保留。本地立即过滤，removed 事件 / 重拉对齐。
+  // 清除历史（与 Agent 状态页 / 任务概览页同源命令）：只清已终态的任务记录（连同
+  // 子代理自己的活动记录），不影响用户会话；活任务保留。本地立即过滤，removed 事件 /
+  // 重拉对齐。
   const clearHistory = async () => {
     if (
       !window.confirm(

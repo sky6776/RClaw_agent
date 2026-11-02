@@ -1141,23 +1141,49 @@ impl CollaborationState {
             }
             doomed
         };
-        // journal 流删除在锁外做（sqlite 阻塞 IO）：失败只告警——内存登记表已清，
-        // 残留流下次重启会被 recover 装回登记表（终态记录，仅展示），可再次清除。
-        for agent_id in &removed {
-            if let Err(error) = self.journal.delete_stream(JOURNAL_EXEC_LOG, agent_id) {
-                tracing::warn!("清理子 agent 执行事件流 {agent_id} 失败: {error}");
-            }
-            // transcript 随记录一起删（记录没了就再没有入口能打开它）。
-            if let Err(error) = self.transcript.delete_session(SUBAGENT_CHANNEL, agent_id) {
-                tracing::warn!("清理子 agent transcript {agent_id} 失败: {error}");
-            }
-        }
+        // journal 流 / transcript 删除在锁外、blocking 线程上做：失败只告警——内存登记表
+        // 已清，残留流下次重启会被 recover 装回登记表（终态记录，仅展示），可再次清除。
+        self.delete_execution_streams(removed.clone()).await;
         if !removed.is_empty() {
             self.publish(ExecutionUpdate::Removed {
                 agent_ids: removed.clone(),
             });
         }
         removed.len()
+    }
+
+    /// 删除若干执行的 journal 事件流与 transcript（记录没了就再没有入口能打开它）。
+    /// 放到 blocking 线程：`secure_delete` 下删一份几千行的 transcript 要清零页面再走
+    /// WAL，是百毫秒级的同步 IO，不能占着 tokio worker——同一时刻别的子代理的
+    /// `transition_execution` 还在排队等 Db 锁。返回流删除成功的条数；transcript 删除
+    /// 失败只告警（孤儿回收兜底）。
+    async fn delete_execution_streams(&self, agent_ids: Vec<String>) -> usize {
+        if agent_ids.is_empty() {
+            return 0;
+        }
+        let journal = self.journal.clone();
+        let transcript = self.transcript.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut deleted = 0;
+            for agent_id in &agent_ids {
+                if let Err(error) = journal.delete_stream(JOURNAL_EXEC_LOG, agent_id) {
+                    tracing::warn!("清理子 agent 执行事件流 {agent_id} 失败: {error}");
+                    continue;
+                }
+                deleted += 1;
+                if let Err(error) = transcript.delete_session(SUBAGENT_CHANNEL, agent_id) {
+                    tracing::warn!("清理子 agent transcript {agent_id} 失败: {error}");
+                }
+            }
+            deleted
+        });
+        match task.await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::warn!("清理子 agent 执行记录的 blocking 任务异常: {error}");
+                0
+            }
+        }
     }
 
     /// 登记表窗口之外的终态执行流（含 transcript）清理。
@@ -1170,53 +1196,44 @@ impl CollaborationState {
     /// 登记表里（启动时全部装载），不在登记表的非终态流只可能是正在入表的新执行，不碰。
     /// 返回清掉的流数。
     ///
-    /// 时序：先一条 SQL 取每条流的最后一条事件，【之后】再取登记表快照。终态事件只会由
-    /// 登记表里的记录持锁写出（[`Self::transition_execution`]），所以查询里看到的任何终态
-    /// 流，其记录要么此刻仍在登记表（快照里有、跳过），要么已被
+    /// 时序：先一条 SQL 扫每条流的最后一条事件挑出候选，【之后】再对照登记表。终态事件
+    /// 只会由登记表里的记录持锁写出（[`Self::transition_execution`]），所以查询里看到的
+    /// 任何终态流，其记录要么此刻仍在登记表（跳过），要么已被
     /// [`Self::remove_terminal_executions`] 连流一起删掉（再删一次是空操作）——「枚举之后
-    /// 才入表、随即终结」的新执行不会被误当成窗口外历史。删除前再按登记表复核一次，与
-    /// [`Self::sweep_orphan_transcripts`] 口径一致。
+    /// 才入表、随即终结」的新执行不会被误当成窗口外历史。
     async fn sweep_unregistered_terminal_executions(
         &self,
         filter: impl Fn(&ExecutionSnapshot) -> bool,
     ) -> usize {
-        // 会话删除 / 归档级联每次都走这里：一条 SQL，不做 N+1 点查（历史流可达上千条）。
-        let latest = match self.journal.latest_per_stream(JOURNAL_EXEC_LOG) {
-            Ok(latest) => latest,
-            Err(error) => {
-                tracing::warn!("枚举子 agent 执行事件流失败，跳过窗口外清理: {error}");
-                return 0;
-            }
-        };
-        if latest.is_empty() {
+        // 会话删除 / 归档级联每次都走这里：一条 SQL、解析一条看一条、只留候选流名——不做
+        // N+1 点查，也不把上千份快照（含 spec.context）一次物化进内存。
+        let mut candidates: Vec<String> = Vec::new();
+        let scanned = self
+            .journal
+            .for_each_latest(JOURNAL_EXEC_LOG, |stream, value| {
+                // 解析不了的流（schema 漂移 / 损坏）不动：多进程共用一个库，可能是别的版本在写。
+                let Ok(last) = serde_json::from_value::<ExecutionLogEntry>(value) else {
+                    return;
+                };
+                if last.snapshot.state.is_terminal() && filter(&last.snapshot) {
+                    candidates.push(stream.to_string());
+                }
+            });
+        if let Err(error) = scanned {
+            tracing::warn!("枚举子 agent 执行事件流失败，跳过窗口外清理: {error}");
             return 0;
         }
-        let registered: BTreeSet<String> = self.executions.lock().await.keys().cloned().collect();
-        let mut swept = 0;
-        for (stream, value) in latest {
-            if registered.contains(&stream) {
-                continue;
-            }
-            // 解析不了的流（schema 漂移 / 损坏）不动：多进程共用一个库，可能是别的版本在写。
-            let Ok(last) = serde_json::from_value::<ExecutionLogEntry>(value) else {
-                continue;
-            };
-            if !last.snapshot.state.is_terminal() || !filter(&last.snapshot) {
-                continue;
-            }
-            if self.executions.lock().await.contains_key(&stream) {
-                continue;
-            }
-            if let Err(error) = self.journal.delete_stream(JOURNAL_EXEC_LOG, &stream) {
-                tracing::warn!("清理历史子 agent 执行事件流 {stream} 失败: {error}");
-                continue;
-            }
-            if let Err(error) = self.transcript.delete_session(SUBAGENT_CHANNEL, &stream) {
-                tracing::warn!("清理子 agent transcript {stream} 失败: {error}");
-            }
-            swept += 1;
+        if candidates.is_empty() {
+            return 0;
         }
-        swept
+        let doomed: Vec<String> = {
+            let executions = self.executions.lock().await;
+            candidates
+                .into_iter()
+                .filter(|stream| !executions.contains_key(stream))
+                .collect()
+        };
+        self.delete_execution_streams(doomed).await
     }
 
     /// 孤儿 transcript 回收：`subagent` 通道里既无登记记录、也无执行事件流的会话（流已删
@@ -1241,29 +1258,43 @@ impl CollaborationState {
             }
         };
         let cutoff = chrono::Utc::now().timestamp_millis() - 60_000;
-        let mut swept = 0;
-        for session in sessions {
-            if session.updated_at >= cutoff || streams.contains(&session.chat_id) {
-                continue;
-            }
-            // 删除前再按登记表核一次：入表发生在首行落库之前，不在表里的就没有活的写入方。
-            if self.executions.lock().await.contains_key(&session.chat_id) {
-                continue;
-            }
-            match self
-                .transcript
-                .delete_session(SUBAGENT_CHANNEL, &session.chat_id)
-            {
-                Ok(true) => swept += 1,
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        "回收孤儿子 agent transcript {} 失败: {error}",
-                        session.chat_id
-                    );
+        // 删除前再按登记表核一次：入表发生在首行落库之前，不在表里的就没有活的写入方。
+        let doomed: Vec<String> = {
+            let executions = self.executions.lock().await;
+            sessions
+                .into_iter()
+                .filter(|session| {
+                    session.updated_at < cutoff
+                        && !streams.contains(&session.chat_id)
+                        && !executions.contains_key(&session.chat_id)
+                })
+                .map(|session| session.chat_id)
+                .collect()
+        };
+        if doomed.is_empty() {
+            return 0;
+        }
+        let transcript = self.transcript.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut swept = 0;
+            for chat_id in &doomed {
+                match transcript.delete_session(SUBAGENT_CHANNEL, chat_id) {
+                    Ok(true) => swept += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!("回收孤儿子 agent transcript {chat_id} 失败: {error}");
+                    }
                 }
             }
-        }
+            swept
+        });
+        let swept = match task.await {
+            Ok(swept) => swept,
+            Err(error) => {
+                tracing::warn!("回收孤儿子 agent transcript 的 blocking 任务异常: {error}");
+                0
+            }
+        };
         if swept > 0 {
             tracing::info!("回收了 {swept} 份孤儿子 agent transcript");
         }

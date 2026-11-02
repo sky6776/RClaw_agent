@@ -253,12 +253,14 @@ impl JournalStore {
         })
     }
 
-    /// 某类 journal 每条流的最后一条事件 `(stream, payload)`，流按首次出现顺序。
+    /// 逐流访问某类 journal 的最后一条事件 `(stream, payload)`，流按首次出现顺序。
     ///
     /// 一条 SQL 代替「[`Self::streams`] + 逐流 [`Self::latest`]」的 N+1 点查：历史执行流
-    /// 可达上千条，而会话删除级联每次都要扫一遍。payload 不可解析的流告警并跳过，与
-    /// [`Self::latest`] 的策略一致。
-    pub fn latest_per_stream(&self, kind: &str) -> Result<Vec<(String, Value)>> {
+    /// 可达上千条，而会话删除级联每次都要扫一遍。访问者形态：payload（整份快照，可达
+    /// 数十 KB）解析一条、交出一条，调用方只留下自己要的，不把全部流一次物化进内存。
+    /// payload 不可解析的流告警并跳过，与 [`Self::latest`] 的策略一致。闭包在持连接锁
+    /// 期间运行，不得再调用本 store 的其它方法。
+    pub fn for_each_latest(&self, kind: &str, mut visit: impl FnMut(&str, Value)) -> Result<()> {
         self.db.with(|conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT e.stream, e.payload FROM journal_event e \
@@ -270,18 +272,24 @@ impl JournalStore {
             let rows = stmt.query_map(params![kind], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
-            let mut out = Vec::new();
             for row in rows {
                 let (stream, text) = row?;
                 match serde_json::from_str(&text) {
-                    Ok(value) => out.push((stream, value)),
+                    Ok(value) => visit(&stream, value),
                     Err(e) => tracing::warn!(
                         "journal 最新事件解析失败，跳过该流: kind={kind} stream={stream} err={e}"
                     ),
                 }
             }
-            Ok(out)
+            Ok(())
         })
+    }
+
+    /// [`Self::for_each_latest`] 的收集版：全部流的最后一条事件 `(stream, payload)`。
+    pub fn latest_per_stream(&self, kind: &str) -> Result<Vec<(String, Value)>> {
+        let mut out = Vec::new();
+        self.for_each_latest(kind, |stream, value| out.push((stream.to_string(), value)))?;
+        Ok(out)
     }
 
     /// 某类 journal 的全部 stream 名（去重，按首次出现顺序）。

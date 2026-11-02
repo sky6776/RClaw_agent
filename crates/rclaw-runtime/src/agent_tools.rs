@@ -749,9 +749,12 @@ impl AgentToolRuntime {
             .await
     }
 
+    /// 安全点：把团队邮箱里的新消息读入上下文；有登记的执行同时落一行 transcript（宿主
+    /// 回放的活动记录里能看到模型是因为哪条团队消息改变了行为）。
     async fn append_current_mailbox_to_context(
         &self,
         spec: &AgentTaskSpec,
+        control: Option<&ExecutionControl>,
         messages: &mut Vec<Message>,
         state: &mut TurnState,
     ) -> bool {
@@ -782,10 +785,14 @@ impl AgentToolRuntime {
         state.media_publish_attempted |= inbound
             .iter()
             .any(|message| message.media_publish_attempted);
-        messages.push(Message::plain(
+        let message = Message::plain(
             Role::User,
             render_inbound_team_messages(&inbound, &identity.name),
-        ));
+        );
+        if let Some(control) = control {
+            self.persist_transcript_message(&control.agent_id, &message);
+        }
+        messages.push(message);
         true
     }
 
@@ -1430,8 +1437,10 @@ impl AgentToolRuntime {
             .await
     }
 
-    /// 清空全部已终态的后台执行记录（登记表 + journal 事件流），返回清除条数。
-    /// 非终态（排队/运行/等待/取消中）是活任务，一律保留；会话不受任何影响。
+    /// 清空全部已终态的后台执行记录：登记表里的终态记录 + 登记表窗口之外库里的终态流，
+    /// 都连同子代理 transcript（`subagent` 通道会话）一起删，再回收孤儿 transcript。
+    /// 返回登记表里清掉的条数（UI 上看得见的那些）。非终态（排队/运行/等待/取消中）是
+    /// 活任务，一律保留；用户会话不受影响。
     pub async fn clear_finished_executions(&self) -> usize {
         self.collaboration.clear_finished_executions().await
     }
@@ -1812,7 +1821,7 @@ impl AgentToolRuntime {
                     media_publish_attempted: state.media_publish_attempted,
                 });
             }
-            self.append_current_mailbox_to_context(spec, &mut messages, state)
+            self.append_current_mailbox_to_context(spec, control, &mut messages, state)
                 .await;
             if self
                 .append_execution_inbox_to_context(control, &mut messages)
@@ -2122,7 +2131,7 @@ impl AgentToolRuntime {
             // 也未执行工具；先消费新消息并重新推理，避免角色在漏看挑战、shutdown_request
             // 或后台完成回执的情况下提前结束或执行过期动作。
             let mailbox_updated = self
-                .append_current_mailbox_to_context(spec, &mut messages, state)
+                .append_current_mailbox_to_context(spec, control, &mut messages, state)
                 .await;
             let inbox_updated = self
                 .append_execution_inbox_to_context(control, &mut messages)
@@ -2170,8 +2179,13 @@ impl AgentToolRuntime {
                 // 用户插话后的首条纯文本回复按「对话回应」处理而不是最终结果：回复已经
                 // 展示给用户，提醒模型任务未完成就继续；确已完成时它会再返回一次结果
                 // （多一次模型调用），不能反过来让一句问候提前结束任务。最后一次迭代
-                // 不再兜底——继续也只会以达到上限收场。
-                if interjection_pending && iter + 1 < spec.max_tool_iter {
+                // 不再兜底——继续也只会以达到上限收场。空正文（预算耗在思考上等）不算
+                // 回应：不能把空 assistant 行推进上下文（部分 provider 直接 400），仍交
+                // 给下面的完成闸门按原路径处理。
+                if interjection_pending
+                    && iter + 1 < spec.max_tool_iter
+                    && !outcome.text.trim().is_empty()
+                {
                     interjection_pending = false;
                     messages.push(Message::plain(Role::Assistant, outcome.text.clone()));
                     let nudge = Message::plain(
