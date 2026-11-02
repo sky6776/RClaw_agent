@@ -1997,41 +1997,15 @@ async fn session_cascade_sweeps_unregistered_terminal_streams_of_that_session_on
     let (runtime, _layout, _registry) = test_runtime_with_provider(Arc::new(PendingProvider));
     // 窗口外（未登记）的终态流：源自 desktop/main 两条，desktop/other 一条，cli/main
     // 一条（同 chat_id 不同通道），外加一条 desktop/main 的非终态流（活任务不动）。
-    seed_unregistered_stream_from(
-        &runtime,
-        "main-a",
-        ExecutionState::Succeeded,
-        "desktop",
-        "main",
-    );
-    seed_unregistered_stream_from(
-        &runtime,
-        "main-b",
-        ExecutionState::Failed,
-        "desktop",
-        "main",
-    );
-    seed_unregistered_stream_from(
-        &runtime,
-        "other-a",
-        ExecutionState::Succeeded,
-        "desktop",
-        "other",
-    );
-    seed_unregistered_stream_from(
-        &runtime,
-        "cli-main",
-        ExecutionState::Succeeded,
-        "cli",
-        "main",
-    );
-    seed_unregistered_stream_from(
-        &runtime,
-        "main-live",
-        ExecutionState::Running,
-        "desktop",
-        "main",
-    );
+    for (agent_id, state, channel, chat_id) in [
+        ("main-a", ExecutionState::Succeeded, "desktop", "main"),
+        ("main-b", ExecutionState::Failed, "desktop", "main"),
+        ("other-a", ExecutionState::Succeeded, "desktop", "other"),
+        ("cli-main", ExecutionState::Succeeded, "cli", "main"),
+        ("main-live", ExecutionState::Running, "desktop", "main"),
+    ] {
+        seed_unregistered_stream_from(&runtime, agent_id, state, channel, chat_id);
+    }
     assert_eq!(runtime.execution_list_payload().await["total"], 0);
 
     // 探针按 spec 取值筛：字段名若漂移成空串，这里一条都清不掉。

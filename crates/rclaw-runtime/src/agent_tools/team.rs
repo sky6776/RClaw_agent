@@ -162,12 +162,14 @@ pub(super) struct ExecutionLogEntry {
 }
 
 /// [`ExecutionLogEntry`] 的扫库探针：清理窗口外终态流时只需要「终态了没有、源自哪个
-/// 会话」，整份快照（`spec.context` 可达数十 KB）不建 `Value` 树、不物化，单行文本逐条
-/// 读出即丢。字段名与 serde 属性必须与 [`ExecutionLogEntry`] / [`ExecutionSnapshot`] /
-/// [`AgentTaskSpec`] 保持一致：探针只要求这三个字段，所以本版本写出的任何流都解析得了
-/// （比启动恢复的全量解析更宽松——别的版本改了探针不读的字段、恢复装不进登记表的终态
-/// 流，这里仍会按终态清掉；「清除历史」/ 会话删除本就是全库语义）。反过来，字段名漂移
-/// 会被 `#[serde(default)]` 吞成空串而不是解析失败，表现为会话级联「清不掉」——
+/// 会话」，整份快照（`spec.context` 可达数十 KB）在 Rust 侧不建 `Value` 树、不物化，
+/// 每行解析完即丢。字段名与 serde 属性必须与 [`ExecutionLogEntry`] / [`ExecutionSnapshot`]
+/// / [`AgentTaskSpec`] 保持一致：探针只硬性要求 `snapshot.state`（须是认识的状态值）与
+/// `snapshot.spec` 存在，两个会话字段缺省为空串，所以本版本写出的任何流都解析得了（比
+/// 启动恢复的全量解析更宽松——别的版本改了探针不读的字段、恢复装不进登记表的终态流，
+/// 这里仍会按终态清掉；「清除历史」/ 会话删除本就是全库语义。别的版本新增了状态值的流
+/// 则解析失败被跳过，不误删）。反过来，会话字段名漂移会被 `#[serde(default)]` 吞成空串
+/// 而不是解析失败，表现为会话级联「清不掉」——
 /// `execution_log_probe_reads_the_same_fields_as_the_full_entry` 与会话级联测试盯着这点。
 #[derive(Deserialize)]
 pub(super) struct ExecutionLogProbe {
