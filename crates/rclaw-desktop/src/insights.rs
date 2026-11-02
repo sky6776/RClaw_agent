@@ -92,11 +92,12 @@ pub fn compute(session: &SessionStore, skills_dir: &Path, memory: &MemoryStore) 
             agg.total_chats += 1;
         }
     }
-    if let Err(error) = session.scan_messages(None, |summary, msg| {
-        if !is_heartbeat_session(summary) {
-            scan_message(msg, &mut agg);
-        }
-    }) {
+    // 非用户会话在会话级就跳过：子 agent 活动记录整份带着工具结果，先读出来再丢太贵。
+    if let Err(error) = session.scan_messages_where(
+        None,
+        |summary| !is_heartbeat_session(summary),
+        |_, msg| scan_message(msg, &mut agg),
+    ) {
         tracing::debug!("insights 会话扫描失败（面板按零显示）: {error}");
     }
 
@@ -174,9 +175,10 @@ fn scan_message(msg: &Message, agg: &mut SessionAgg) {
     }
 }
 
-/// 心跳会话：`system` 通道。
+/// 非用户会话：心跳（`system` 通道）与子 agent 活动记录（`subagent` 通道，每条后台执行
+/// 一个会话）——都不是用户的会话，不计入会话数，也不参与日活跃 / 工具榜扫描。
 fn is_heartbeat_session(summary: &SessionSummary) -> bool {
-    summary.channel == HEARTBEAT_CHANNEL
+    summary.channel == HEARTBEAT_CHANNEL || summary.channel == rclaw_runtime::SUBAGENT_CHANNEL
 }
 
 fn bump_day(map: &mut BTreeMap<String, u64>, ts: i64) {

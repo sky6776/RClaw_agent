@@ -914,6 +914,9 @@ async fn failed_event_persistence_does_not_commit_lifecycle_state() {
                 created_at: now.clone(),
                 updated_at: now,
                 recovered: true,
+                started_at: None,
+                finished_at: None,
+                usage: ExecutionUsage::default(),
             },
         )
         .await;
@@ -1872,9 +1875,7 @@ async fn clear_finished_and_session_cascade_remove_only_terminal_records() {
     assert_eq!(runtime.execution_list_payload().await["total"], 3);
 
     // 会话删除级联：只清 desktop/main 的终态记录（done-1），活任务与他会话保留。
-    let removed = runtime
-        .forget_session_executions("desktop", "main")
-        .await;
+    let removed = runtime.forget_session_executions("desktop", "main").await;
     assert_eq!(removed, 1);
     let payload = runtime.execution_list_payload().await;
     assert_eq!(payload["total"], 2);
@@ -1888,8 +1889,15 @@ async fn clear_finished_and_session_cascade_remove_only_terminal_records() {
     assert!(ids.contains(&"other-1"), "其他会话保留: {ids:?}");
     assert!(!ids.contains(&"done-1"), "终态记录已级联清除: {ids:?}");
     // journal 事件流一并删除。
-    let streams = runtime.collaboration.journal().streams(JOURNAL_EXEC_LOG).unwrap();
-    assert!(!streams.iter().any(|s| s == "done-1"), "journal 流应已删除: {streams:?}");
+    let streams = runtime
+        .collaboration
+        .journal()
+        .streams(JOURNAL_EXEC_LOG)
+        .unwrap();
+    assert!(
+        !streams.iter().any(|s| s == "done-1"),
+        "journal 流应已删除: {streams:?}"
+    );
 
     // 清除历史：剩余的终态记录（other-1）清掉，活任务（live-1）保留。
     let cleared = runtime.clear_finished_executions().await;
@@ -1897,6 +1905,225 @@ async fn clear_finished_and_session_cascade_remove_only_terminal_records() {
     let payload = runtime.execution_list_payload().await;
     assert_eq!(payload["total"], 1);
     assert_eq!(payload["executions"][0]["agent_id"], "live-1");
+}
+
+/// 一条历史执行流的最后一条事件：`state` 对应的快照，来源会话为 `(channel, chat_id)`。
+fn history_log_entry(
+    agent_id: &str,
+    state: ExecutionState,
+    channel: &str,
+    chat_id: &str,
+) -> ExecutionLogEntry {
+    let now = chrono::Utc::now().to_rfc3339();
+    let stage = if state.is_terminal() {
+        "finished"
+    } else {
+        "running"
+    };
+    let mut spec = test_spec(&format!("history of {agent_id}"));
+    spec.source_channel = channel.to_string();
+    spec.origin_chat_id = chat_id.to_string();
+    ExecutionLogEntry {
+        event: stage.to_string(),
+        timestamp: now.clone(),
+        snapshot: ExecutionSnapshot {
+            agent_id: agent_id.to_string(),
+            spec,
+            state,
+            progress: ExecutionProgress {
+                completed_steps: 1,
+                total_steps: 1,
+                stage: stage.to_string(),
+            },
+            handoff: None,
+            error: None,
+            validated_media_markers: Vec::new(),
+            media_publish_attempted: false,
+            unrestricted: false,
+            unresolved_disclosure: String::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            recovered: false,
+            started_at: None,
+            finished_at: None,
+            usage: ExecutionUsage::default(),
+        },
+    }
+}
+
+/// 绕过登记表直接写一条执行事件流（模拟启动恢复窗口之外、库里残留的历史流），
+/// 并给它落一行 transcript。
+fn seed_unregistered_stream(runtime: &AgentToolRuntime, agent_id: &str, state: ExecutionState) {
+    seed_unregistered_stream_from(runtime, agent_id, state, "", "");
+}
+
+/// 同 [`seed_unregistered_stream`]，但指定来源会话（会话删除级联按它筛）。
+fn seed_unregistered_stream_from(
+    runtime: &AgentToolRuntime,
+    agent_id: &str,
+    state: ExecutionState,
+    channel: &str,
+    chat_id: &str,
+) {
+    append_execution_log(
+        &runtime.journal,
+        &history_log_entry(agent_id, state, channel, chat_id),
+    )
+    .unwrap();
+    runtime
+        .transcript
+        .append(
+            SUBAGENT_CHANNEL,
+            agent_id,
+            &Message::plain(Role::Assistant, format!("transcript of {agent_id}")),
+        )
+        .unwrap();
+}
+
+#[test]
+fn execution_log_probe_reads_the_same_fields_as_the_full_entry() {
+    // 探针与 ExecutionLogEntry 之间只有字段名约定：任一侧改名，`#[serde(default)]` 会把
+    // 探针字段吞成空串而不是报错——这里把真实事件序列化后用探针读回，逐字段核对。
+    let entry = history_log_entry("probe-me", ExecutionState::Succeeded, "desktop", "main");
+    let value = serde_json::to_value(&entry).unwrap();
+    let probe: ExecutionLogProbe = serde_json::from_value(value).unwrap();
+    assert_eq!(probe.snapshot.state, ExecutionState::Succeeded);
+    assert_eq!(probe.snapshot.spec.source_channel, "desktop");
+    assert_eq!(probe.snapshot.spec.origin_chat_id, "main");
+}
+
+#[tokio::test]
+async fn session_cascade_sweeps_unregistered_terminal_streams_of_that_session_only() {
+    let (runtime, _layout, _registry) = test_runtime_with_provider(Arc::new(PendingProvider));
+    // 窗口外（未登记）的终态流：源自 desktop/main 两条，desktop/other 一条，cli/main
+    // 一条（同 chat_id 不同通道），外加一条 desktop/main 的非终态流（活任务不动）。
+    for (agent_id, state, channel, chat_id) in [
+        ("main-a", ExecutionState::Succeeded, "desktop", "main"),
+        ("main-b", ExecutionState::Failed, "desktop", "main"),
+        ("other-a", ExecutionState::Succeeded, "desktop", "other"),
+        ("cli-main", ExecutionState::Succeeded, "cli", "main"),
+        ("main-live", ExecutionState::Running, "desktop", "main"),
+    ] {
+        seed_unregistered_stream_from(&runtime, agent_id, state, channel, chat_id);
+    }
+    assert_eq!(runtime.execution_list_payload().await["total"], 0);
+
+    // 探针按 spec 取值筛：字段名若漂移成空串，这里一条都清不掉。
+    let removed = runtime.forget_session_executions("desktop", "main").await;
+    assert_eq!(removed, 2, "登记表外清掉的流数计入会话级联返回值");
+    for agent_id in ["main-a", "main-b"] {
+        assert!(
+            !has_exec_stream(&runtime, agent_id),
+            "{agent_id} 应被级联清除"
+        );
+        assert!(
+            !has_transcript(&runtime, agent_id),
+            "{agent_id} 的 transcript 应随流删除"
+        );
+    }
+    for agent_id in ["other-a", "cli-main", "main-live"] {
+        assert!(has_exec_stream(&runtime, agent_id), "{agent_id} 必须保留");
+        assert!(
+            has_transcript(&runtime, agent_id),
+            "{agent_id} 的 transcript 必须保留"
+        );
+    }
+}
+
+fn has_exec_stream(runtime: &AgentToolRuntime, agent_id: &str) -> bool {
+    runtime
+        .journal
+        .streams(JOURNAL_EXEC_LOG)
+        .unwrap()
+        .iter()
+        .any(|s| s == agent_id)
+}
+
+fn has_transcript(runtime: &AgentToolRuntime, agent_id: &str) -> bool {
+    runtime
+        .transcript
+        .session_summary(SUBAGENT_CHANNEL, agent_id)
+        .unwrap()
+        .is_some()
+}
+
+#[tokio::test]
+async fn clear_finished_sweeps_unregistered_terminal_streams_with_transcripts() {
+    let (runtime, _layout, _registry) = test_runtime_with_provider(Arc::new(PendingProvider));
+    seed_unregistered_stream(&runtime, "old-done", ExecutionState::Succeeded);
+    assert!(has_exec_stream(&runtime, "old-done"));
+    assert!(has_transcript(&runtime, "old-done"));
+    // 不在登记表：UI 看不见。
+    assert_eq!(runtime.execution_list_payload().await["total"], 0);
+
+    // 返回值只计登记表里清掉的条数；窗口外的流在计数之外、但确实被清掉了。
+    assert_eq!(runtime.clear_finished_executions().await, 0);
+    assert!(
+        !has_exec_stream(&runtime, "old-done"),
+        "窗口外终态流应被清除"
+    );
+    assert!(
+        !has_transcript(&runtime, "old-done"),
+        "transcript 应随流一起删除"
+    );
+}
+
+#[tokio::test]
+async fn clear_finished_keeps_unregistered_nonterminal_streams() {
+    let (runtime, _layout, _registry) = test_runtime_with_provider(Arc::new(PendingProvider));
+    // 不在登记表的非终态流只可能是正在入表的新执行（或别的进程在写）：一律不碰。
+    seed_unregistered_stream(&runtime, "still-running", ExecutionState::Running);
+
+    assert_eq!(runtime.clear_finished_executions().await, 0);
+    assert!(
+        has_exec_stream(&runtime, "still-running"),
+        "非终态流必须保留"
+    );
+    assert!(
+        has_transcript(&runtime, "still-running"),
+        "活任务的 transcript 必须保留"
+    );
+}
+
+#[tokio::test]
+async fn clear_finished_recycles_only_stale_orphan_transcripts() {
+    let (runtime, _layout, _registry) = test_runtime_with_provider(Arc::new(PendingProvider));
+    // 两份孤儿 transcript（既无登记记录也无事件流）：一份一小时前写的，一份刚写的。
+    for agent_id in ["orphan-old", "orphan-new"] {
+        runtime
+            .transcript
+            .append(
+                SUBAGENT_CHANNEL,
+                agent_id,
+                &Message::plain(Role::Assistant, "leftover"),
+            )
+            .unwrap();
+    }
+    // 直接回拨 session 表的 updated_at（依赖 rclaw-store SCHEMA_V1：`session.updated_at`
+    // 为 Unix 毫秒，与 sweep_orphan_transcripts 的 cutoff 同单位）；store 不暴露改时间戳
+    // 的接口，一分钟的护栏也不能靠真等。
+    let hour_ago = chrono::Utc::now().timestamp_millis() - 3_600_000;
+    runtime
+        .transcript
+        .db()
+        .with(|conn| {
+            conn.execute(
+                "UPDATE session SET updated_at = ?1 WHERE channel = ?2 AND chat_id = ?3",
+                (hour_ago, SUBAGENT_CHANNEL, "orphan-old"),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    runtime.clear_finished_executions().await;
+    assert!(
+        !has_transcript(&runtime, "orphan-old"),
+        "一分钟前就没动静的孤儿应回收"
+    );
+    assert!(
+        has_transcript(&runtime, "orphan-new"),
+        "刚写入的孤儿可能是尚未入表的新执行，时间护栏内必须保留"
+    );
 }
 
 #[test]
@@ -1923,6 +2150,9 @@ fn recovery_replays_nonterminal_log_as_resumable_waiting() {
         created_at: now.clone(),
         updated_at: now.clone(),
         recovered: false,
+        started_at: None,
+        finished_at: None,
+        usage: ExecutionUsage::default(),
     };
     append_execution_log(
         &journal,
@@ -1957,6 +2187,9 @@ fn recovery_replays_nonterminal_log_as_resumable_waiting() {
                 created_at: cancelling_time.clone(),
                 updated_at: cancelling_time,
                 recovered: false,
+                started_at: None,
+                finished_at: None,
+                usage: ExecutionUsage::default(),
             },
         },
     )
@@ -2285,6 +2518,9 @@ async fn background_launch_inherits_launcher_context_and_resume_restores_snapsho
                 created_at: now.clone(),
                 updated_at: now,
                 recovered: true,
+                started_at: None,
+                finished_at: None,
+                usage: ExecutionUsage::default(),
             },
         )
         .await;

@@ -35,9 +35,11 @@ import {
   viewsFromBegun,
   viewsFromSummary,
 } from "./lib/toolCalls";
+import { useAgentExecutionCounts } from "./lib/agentExecutions";
 import Wizard from "./components/Wizard";
 import Chat, { type Entry, type QueueItem } from "./components/Chat";
 import AgentsPanel from "./components/AgentsPanel";
+import AgentExecutionDetail from "./components/AgentExecutionDetail";
 import BotsPanel from "./components/BotsPanel";
 import ToolsPanel from "./components/ToolsPanel";
 import SkillsPanel from "./components/SkillsPanel";
@@ -205,6 +207,57 @@ function ResizeHandle({ onDrag }: { onDrag: (clientX: number) => void }) {
   );
 }
 
+/** Agent / 任务概览页：列表面板（children，按「是否被盖住」渲染）+ 盖在上面的执行详情。
+ *  进详情时列表面板仍挂着（只是隐藏），返回不重新加载、滚动位置不丢；详情按 agentId 作
+ *  key，切换执行时整页重建，不复用旧记录的状态。返回时把焦点还给刚才点开的那张卡片
+ *  （`data-agent-id`）：详情卸载后焦点否则落到 body；卡片在面板的滚动容器里，键盘翻页
+ *  仍然可用——列表容器本身不做可聚焦（可聚焦祖先会截住键盘滚动）。卡片已被清掉就退到
+ *  列表第一张；一张都没有则不聚焦。 */
+function ExecutionPage({
+  selectedAgentId,
+  onBack,
+  children,
+}: {
+  selectedAgentId: string | null;
+  onBack: () => void;
+  children: (hidden: boolean) => ReactNode;
+}) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const back = () => {
+    const agentId = selectedAgentId;
+    onBack();
+    if (agentId === null) return;
+    // 列表容器在这次更新提交后才重新可见（visibility:hidden 的元素不可聚焦），下一帧再聚焦。
+    // 那张卡片已被清掉（详情里看到「已被清除」后返回）就退到列表第一张，键盘翻页仍有锚点；
+    // 一张都没有则无处可聚焦，也无可滚动。回到原卡片时 preventScroll 保住列表滚动位置
+    // （卡片若被新入表的执行顶出可视区，焦点环会暂时不可见，接受这个取舍）；退到第一张时
+    // 原锚点已不存在，让它滚进视口。
+    requestAnimationFrame(() => {
+      const list = listRef.current;
+      if (!list) return;
+      const card =
+        list.querySelector<HTMLElement>(`[data-agent-id="${CSS.escape(agentId)}"]`) ??
+        list.querySelector<HTMLElement>("[data-agent-id]");
+      card?.focus({ preventScroll: card.dataset.agentId === agentId });
+    });
+  };
+  const showingDetail = selectedAgentId !== null;
+  return (
+    <div className="relative h-full">
+      <div
+        ref={listRef}
+        className={showingDetail ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
+        aria-hidden={showingDetail}
+      >
+        {children(showingDetail)}
+      </div>
+      {selectedAgentId !== null && (
+        <AgentExecutionDetail key={selectedAgentId} agentId={selectedAgentId} onBack={back} />
+      )}
+    </div>
+  );
+}
+
 /** 应用壳：向导模式 / agent 启动中 / 主界面三态。
  *
  * 会话转录与忙碌状态按 chat_id 提升到本层持有——切换页面 / 会话都不会丢失；
@@ -214,6 +267,11 @@ export default function App() {
   const [agentState, setAgentState] = useState<"idle" | "starting" | "ready" | "error">("idle");
   const [agentError, setAgentError] = useState<string | null>(null);
   const [page, setPage] = useState<Page>("chat");
+  // 正在查看详情的子 agent 执行（Agent / 任务概览页内的详情层；null = 列表）。
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  // 侧边栏「Agent / 任务概览」实时徽标：直播仓里活跃（排队 / 运行 / 等待 / 取消中）的执行数。
+  // 只订阅统计数字：每条进度 / token 事件都不该让 App 整树重渲。
+  const liveCounts = useAgentExecutionCounts(agentState === "ready");
 
   // 标题栏循环标语（界面偏好，非 rclaw.toml）。加载失败或为空时回退应用名。
   const [slogans, setSlogans] = useState<string[]>([]);
@@ -1785,6 +1843,22 @@ ${event.payload.command}
   useBackClose(photoEditor !== null, discardPhotoEditor);
   useBackClose(captureDialog !== null, () => setCaptureDialog(null));
   useBackClose(recording !== null, () => void cancelRecording());
+  // 子 agent 执行详情层：返回键先回到列表。抽屉盖在上面时不接管——抽屉开着按返回是
+  // 「退出应用」（见 installBackNavigation），不该先把底下看不见的详情关掉。
+  // agent 未就绪时详情层根本没渲染，返回键不该被一个看不见的层吃掉。
+  useBackClose(
+    agentState === "ready" &&
+      selectedAgentId !== null &&
+      (page === "agents" || page === "taskview") &&
+      !drawerOpen,
+    () => setSelectedAgentId(null),
+  );
+
+  /** 打开 Agent 页（可选直达某条执行的详情）。 */
+  const openAgents = useCallback((agentId?: string) => {
+    setSelectedAgentId(agentId ?? null);
+    setPage("agents");
+  }, []);
 
   let body: ReactNode;
   if (!status) {
@@ -1893,28 +1967,52 @@ ${event.payload.command}
                   ...NAV.slice(7, -1),
                 ] as Array<[Page, string, () => ReactNode]>)
               : NAV.slice(0, -1)
-          ).map(([key, label, Icon]) => (
-            <button
-              key={key}
-              onClick={() => {
-                setPage(key);
-                setDrawerOpen(false);
-              }}
-              title={label}
-              className={`flex w-full items-center rounded-lg text-sm transition max-md:text-[15px] ${
-                sidebarCollapsed ? "justify-center py-2" : "gap-2.5 px-3 py-2 text-left max-md:py-2"
-              } ${
-                page === key
-                  ? "bg-indigo-500/10 text-indigo-300"
-                  : "text-gray-400 hover:bg-[#1a1f29] hover:text-gray-200"
-              }`}
-            >
-              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
-                <Icon />
-              </span>
-              {!sidebarCollapsed && label}
-            </button>
-          ))}
+          ).map(([key, label, Icon]) => {
+            // Agent / 任务概览：实时徽标 = 活跃执行数（有在运行的带脉动；收起时只剩小圆点）。
+            const badge = key === "agents" || key === "taskview" ? liveCounts.active : 0;
+            const pulse = badge > 0 && liveCounts.running > 0;
+            return (
+              <button
+                key={key}
+                onClick={() => {
+                  // 点栏目总是回到列表层（在详情里再点一次「Agent」= 返回列表）。
+                  setSelectedAgentId(null);
+                  setPage(key);
+                  setDrawerOpen(false);
+                }}
+                title={badge > 0 ? `${label}：${badge} 个任务活跃` : label}
+                className={`relative flex w-full items-center rounded-lg text-sm transition max-md:text-[15px] ${
+                  sidebarCollapsed ? "justify-center py-2" : "gap-2.5 px-3 py-2 text-left max-md:py-2"
+                } ${
+                  page === key
+                    ? "bg-indigo-500/10 text-indigo-300"
+                    : "text-gray-400 hover:bg-[#1a1f29] hover:text-gray-200"
+                }`}
+              >
+                <span className="relative flex h-4 w-4 shrink-0 items-center justify-center">
+                  <Icon />
+                  {badge > 0 && sidebarCollapsed && (
+                    <span
+                      className={`absolute -right-1 -top-1 h-2 w-2 rounded-full bg-amber-400 ${
+                        pulse ? "animate-pulse" : ""
+                      }`}
+                    />
+                  )}
+                </span>
+                {!sidebarCollapsed && <span className="min-w-0 flex-1 truncate">{label}</span>}
+                {!sidebarCollapsed && badge > 0 && (
+                  <span
+                    className={`ml-auto inline-flex min-w-[1.25rem] shrink-0 items-center justify-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-px font-mono text-[10px] tabular-nums text-amber-300 ${
+                      pulse ? "" : "opacity-80"
+                    }`}
+                  >
+                    {pulse && <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />}
+                    {badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
           {/* 安卓 App：主题选择入口（顶栏已移除，收进侧栏栏目；仅手机布局）。 */}
           {isAndroidDevice() && isMobile && !sidebarCollapsed && (
             <button
@@ -2244,10 +2342,19 @@ ${event.payload.command}
         {agentState === "ready" && page === "tools" && <ToolsPanel agentReady />}
         {agentState === "ready" && page === "skills" && <SkillsPanel agentReady />}
         {agentState === "ready" && page === "files" && <FilePanel onError={setErrorToast} />}
-        {agentState === "ready" && page === "agents" && <AgentsPanel agentReady />}
+        {/* Agent / 任务概览：列表 + 盖在上面的执行详情（见 ExecutionPage）。 */}
+        {agentState === "ready" && page === "agents" && (
+          <ExecutionPage selectedAgentId={selectedAgentId} onBack={() => setSelectedAgentId(null)}>
+            {(hidden) => <AgentsPanel agentReady hidden={hidden} onOpen={setSelectedAgentId} />}
+          </ExecutionPage>
+        )}
         {agentState === "ready" && page === "evolution" && <EvolutionPanel agentReady />}
         {agentState === "ready" && page === "cron" && <CronPanel agentReady />}
-        {agentState === "ready" && page === "taskview" && <TaskOverviewPanel agentReady />}
+        {agentState === "ready" && page === "taskview" && (
+          <ExecutionPage selectedAgentId={selectedAgentId} onBack={() => setSelectedAgentId(null)}>
+            {(hidden) => <TaskOverviewPanel agentReady hidden={hidden} onOpen={setSelectedAgentId} />}
+          </ExecutionPage>
+        )}
         {agentState === "ready" && page === "config" && (
           <ConfigPanel
             agentReady
@@ -2271,7 +2378,7 @@ ${event.payload.command}
             agentReady
             activeChatId={activeId}
             width={rightWidth}
-            onOpenAgents={() => setPage("agents")}
+            onOpenAgents={openAgents}
           />
         </>
       )}

@@ -1,37 +1,17 @@
 import { useEffect, useState } from "react";
-import { api, type AgentExecution, type UsageSnapshot } from "../lib/api";
+import { api, type UsageSnapshot } from "../lib/api";
+import {
+  countByState,
+  dropTerminalLocally,
+  refreshExecutions,
+  useAgentExecutions,
+  useNow,
+} from "../lib/agentExecutions";
+import ExecutionCard from "./ExecutionCard";
 
-/** 执行状态 → 语义分组（概览四格）与展示样式（列表徽标）。 */
-const STATE_LABEL: Record<string, string> = {
-  queued: "排队中",
-  running: "运行中",
-  waiting: "等待输入",
-  cancelling: "正在取消",
-  succeeded: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
-const STATE_STYLE: Record<string, string> = {
-  queued: "bg-gray-500/10 text-gray-400",
-  running: "bg-amber-500/10 text-amber-400",
-  waiting: "bg-sky-500/10 text-sky-400",
-  cancelling: "bg-orange-500/10 text-orange-400",
-  succeeded: "bg-emerald-500/10 text-emerald-400",
-  failed: "bg-red-500/10 text-red-400",
-  cancelled: "bg-gray-500/10 text-gray-500",
-};
-
-/** 已终态（可被「清除」清掉的记录）。 */
-const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
-
-function stateOf(e: AgentExecution): string {
-  return e.state?.toLowerCase?.() ?? "";
-}
-
-/** 右侧任务面板：任务概览（后台子 agent 执行快照）+ 底部状态（上下文窗口 / 内存）。
+/** 右侧任务面板：任务概览（后台子 agent 执行，实时）+ 底部状态（上下文窗口 / 内存）。
  *
- * 与 AgentsPanel 同源数据（executions_payload），2.5s 轮询；状态区 5s 轮询。
+ * 任务列表与 AgentsPanel 同一份直播仓（事件驱动 + 低频兜底）；状态区 5s 轮询。
  * 仅在 agentReady 且面板可见时挂载（由 App 控制），卸载即停止轮询。 */
 export default function TaskPanel({
   agentReady,
@@ -41,33 +21,16 @@ export default function TaskPanel({
 }: {
   agentReady: boolean;
   activeChatId: string;
-  onOpenAgents: () => void;
+  /** 打开 Agent 页；带 agentId 时直接进入该条执行的详情。 */
+  onOpenAgents: (agentId?: string) => void;
   /** 面板宽度（px；App 侧拖拽手柄调整并持久化）。 */
   width: number;
 }) {
-  const [executions, setExecutions] = useState<AgentExecution[]>([]);
+  const { executions, truncated } = useAgentExecutions(agentReady);
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
   const [clearing, setClearing] = useState(false);
-
-  // 任务快照轮询（与 AgentsPanel 相同节奏）。
-  useEffect(() => {
-    if (!agentReady) return;
-    let stopped = false;
-    const tick = async () => {
-      try {
-        const payload = await api.agentsList();
-        if (!stopped) setExecutions(payload.executions ?? []);
-      } catch {
-        // agent 未启动等瞬时错误：保留上次快照。
-      }
-    };
-    void tick();
-    const timer = setInterval(tick, 2500);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [agentReady]);
+  const counts = countByState(executions);
+  const now = useNow(counts.active > 0);
 
   // 上下文 / 内存轮询（估算要扫技能目录，频率放宽）。
   useEffect(() => {
@@ -90,18 +53,11 @@ export default function TaskPanel({
   }, [agentReady, activeChatId]);
 
   // 概览四格：succeeded / running+waiting+cancelling / queued / failed。
-  const total = executions.length;
-  const done = executions.filter((e) => stateOf(e) === "succeeded").length;
-  const active = executions.filter((e) =>
-    ["running", "waiting", "cancelling"].includes(stateOf(e)),
-  ).length;
-  const queued = executions.filter((e) => stateOf(e) === "queued").length;
-  const failed = executions.filter((e) => stateOf(e) === "failed").length;
+  const { total, done, running: active, queued, failed, finished: finishedCount } = counts;
 
-  const finishedCount = executions.filter((e) => TERMINAL_STATES.has(stateOf(e))).length;
-
-  // 清除历史（与 Agent 状态页 / 任务概览页同源命令）：只清已终态的任务记录，
-  // 不影响任何会话；活任务保留。本地立即过滤，下个轮询周期自动对齐。
+  // 清除历史（与 Agent 状态页 / 任务概览页同源命令）：只清已终态的任务记录（连同
+  // 子代理自己的活动记录），不影响用户会话；活任务保留。本地立即过滤，removed 事件 /
+  // 重拉对齐。
   const clearHistory = async () => {
     if (
       !window.confirm(
@@ -113,9 +69,10 @@ export default function TaskPanel({
     setClearing(true);
     try {
       await api.agentsClearHistory();
-      setExecutions((prev) => prev.filter((e) => !TERMINAL_STATES.has(stateOf(e))));
+      dropTerminalLocally();
+      void refreshExecutions();
     } catch {
-      // 下一个轮询周期带回真实状态。
+      // 下一次拉取带回真实状态。
     } finally {
       setClearing(false);
     }
@@ -134,14 +91,18 @@ export default function TaskPanel({
         <div className="flex items-center gap-1">
           <button
             onClick={clearHistory}
-            disabled={!agentReady || clearing || finishedCount === 0}
-            title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
+            disabled={!agentReady || clearing || (finishedCount === 0 && !truncated)}
+            title={
+              truncated
+                ? "清空已结束的后台任务记录（列表已截断，窗口外更早的已结束记录也会一并清除；不影响会话与运行中的任务）"
+                : "清空已结束的后台任务记录（不影响会话与运行中的任务）"
+            }
             className="rounded-md px-1.5 text-xs text-gray-500 transition hover:bg-[#1a1f29] hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {clearing ? "清除中…" : `清除${finishedCount > 0 ? `（${finishedCount}）` : ""}`}
           </button>
           <button
-            onClick={onOpenAgents}
+            onClick={() => onOpenAgents()}
             title="打开 Agent 状态页"
             className="rounded-md px-1.5 text-xs text-gray-500 transition hover:bg-[#1a1f29] hover:text-indigo-300"
           >
@@ -184,35 +145,16 @@ export default function TaskPanel({
           </div>
         ) : (
           <div className="space-y-1.5">
-            {executions.map((e, i) => {
-              const state = stateOf(e);
-              return (
-                <button
-                  key={e.agent_id}
-                  onClick={onOpenAgents}
-                  className="block w-full rounded-lg border border-[#2a2f3a] bg-[#141821] px-2.5 py-2 text-left transition hover:border-[#3a4150]"
-                  title={e.goal}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate font-mono text-[10px] text-gray-500">
-                      {String(i + 1).padStart(2, "0")} · {e.agent_id}
-                    </span>
-                    <span
-                      className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] ${
-                        STATE_STYLE[state] ?? "bg-gray-500/10 text-gray-400"
-                      }`}
-                    >
-                      {STATE_LABEL[state] ?? e.state}
-                    </span>
-                  </div>
-                  <div className="mt-1 truncate text-xs text-gray-400">{e.goal}</div>
-                  <div className="mt-0.5 truncate text-[10px] text-gray-600">
-                    {e.progress?.stage || "—"} · {e.progress?.completed_steps ?? 0}/
-                    {e.progress?.total_steps ?? 0} 步
-                  </div>
-                </button>
-              );
-            })}
+            {executions.map((e, i) => (
+              <ExecutionCard
+                key={e.agent_id}
+                e={e}
+                now={now}
+                index={i}
+                compact
+                onOpen={(id) => onOpenAgents(id)}
+              />
+            ))}
           </div>
         )}
       </div>

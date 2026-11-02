@@ -1,65 +1,33 @@
-import { useEffect, useState } from "react";
-import { api, type AgentExecution } from "../lib/api";
+import { useState } from "react";
+import { api } from "../lib/api";
+import {
+  countByState,
+  dropTerminalLocally,
+  refreshExecutions,
+  useAgentExecutions,
+  useNow,
+} from "../lib/agentExecutions";
+import ExecutionCard from "./ExecutionCard";
 
-const STATE_LABEL: Record<string, string> = {
-  queued: "排队中",
-  running: "运行中",
-  waiting: "等待输入",
-  cancelling: "正在取消",
-  succeeded: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
-const STATE_STYLE: Record<string, string> = {
-  queued: "bg-gray-500/10 text-gray-400",
-  running: "bg-amber-500/10 text-amber-400",
-  waiting: "bg-sky-500/10 text-sky-400",
-  cancelling: "bg-orange-500/10 text-orange-400",
-  succeeded: "bg-emerald-500/10 text-emerald-400",
-  failed: "bg-red-500/10 text-red-400",
-  cancelled: "bg-gray-500/10 text-gray-500",
-};
-
-function stateOf(e: AgentExecution): string {
-  return e.state?.toLowerCase?.() ?? "";
-}
-
-/** 已终态（可被「清除历史」清掉的记录）。 */
-const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
-
-/** 任务概览详情页（移动端侧边栏入口）：概览四格 + 后台子 agent 执行列表。
+/** 任务概览详情页（移动端侧边栏入口）：概览四格 + 后台子 agent 执行列表（实时）。
  *
- * 与右侧任务面板同源数据（agentsList，2.5s 轮询）；桌面侧仍由 TaskPanel
- * 承担，本页面双向可用但入口只在移动端抽屉。 */
-export default function TaskOverviewPanel({ agentReady }: { agentReady: boolean }) {
-  const [executions, setExecutions] = useState<AgentExecution[]>([]);
-  const [error, setError] = useState<string | null>(null);
+ * 与右侧任务面板 / Agent 状态页同一份直播仓；桌面侧仍由 TaskPanel 承担，本页面双向
+ * 可用但入口只在移动端抽屉。点任一条进入执行详情。 */
+export default function TaskOverviewPanel({
+  agentReady,
+  hidden = false,
+  onOpen,
+}: {
+  agentReady: boolean;
+  /** 被详情页盖住（仍挂载以保住滚动位置）：停掉秒表，不白白每秒重渲。 */
+  hidden?: boolean;
+  onOpen: (agentId: string) => void;
+}) {
+  const { executions, loaded, error, truncated } = useAgentExecutions(agentReady);
   const [clearing, setClearing] = useState(false);
-
-  useEffect(() => {
-    if (!agentReady) return;
-    let stopped = false;
-    const tick = async () => {
-      try {
-        const payload = await api.agentsList();
-        if (!stopped) {
-          setExecutions(payload.executions ?? []);
-          setError(null);
-        }
-      } catch (e) {
-        if (!stopped) setError(String(e));
-      }
-    };
-    void tick();
-    const timer = setInterval(tick, 2500);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [agentReady]);
-
-  const finishedCount = executions.filter((e) => TERMINAL_STATES.has(stateOf(e))).length;
+  const [actionError, setActionError] = useState<string | null>(null);
+  const counts = countByState(executions);
+  const now = useNow(!hidden && counts.active > 0);
 
   const clearHistory = async () => {
     if (
@@ -72,21 +40,14 @@ export default function TaskOverviewPanel({ agentReady }: { agentReady: boolean 
     setClearing(true);
     try {
       await api.agentsClearHistory();
-      setExecutions((prev) => prev.filter((e) => !TERMINAL_STATES.has(stateOf(e))));
+      dropTerminalLocally();
+      void refreshExecutions();
     } catch (e) {
-      setError(String(e));
+      setActionError(String(e));
     } finally {
       setClearing(false);
     }
   };
-
-  const total = executions.length;
-  const done = executions.filter((e) => stateOf(e) === "succeeded").length;
-  const active = executions.filter((e) =>
-    ["running", "waiting", "cancelling"].includes(stateOf(e)),
-  ).length;
-  const queued = executions.filter((e) => stateOf(e) === "queued").length;
-  const failed = executions.filter((e) => stateOf(e) === "failed").length;
 
   return (
     <div className="h-full overflow-y-auto p-6 max-md:p-3">
@@ -95,23 +56,36 @@ export default function TaskOverviewPanel({ agentReady }: { agentReady: boolean 
         <div className="flex items-center gap-3">
           <button
             onClick={clearHistory}
-            disabled={!agentReady || clearing || finishedCount === 0}
+            disabled={!agentReady || clearing || (counts.finished === 0 && !truncated)}
             title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
             className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-[#1c2230] disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {clearing ? "清除中…" : `清除历史${finishedCount > 0 ? `（${finishedCount}）` : ""}`}
+            {clearing ? "清除中…" : `清除历史${counts.finished > 0 ? `（${counts.finished}）` : ""}`}
           </button>
-          <span className="text-xs text-gray-600">每 2.5 秒自动刷新</span>
+          <span className="flex items-center gap-1.5 text-xs text-gray-600">
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                counts.running > 0 ? "animate-pulse bg-amber-400" : "bg-gray-600"
+              }`}
+            />
+            实时
+            {counts.stalled > 0 && (
+              <span className="text-sky-500" title="进程重启后恢复的记录，没有执行者；在对话里用 AgentResume 续跑">
+                · {counts.stalled} 个待恢复
+              </span>
+            )}
+          </span>
         </div>
       </div>
 
+      {/* 「进行中」只数本进程真在跑的；重启后待恢复的记录单列在右上角，不混进来。 */}
       <div className="mb-4 grid grid-cols-4 gap-2">
         {(
           [
-            ["已完成", done, "text-emerald-400"],
-            ["进行中", active, "text-amber-400"],
-            ["排队中", queued, "text-sky-400"],
-            ["失败", failed, "text-red-400"],
+            ["已完成", counts.done, "text-emerald-400"],
+            ["进行中", counts.running, "text-amber-400"],
+            ["排队中", counts.queued, "text-sky-400"],
+            ["失败", counts.failed, "text-red-400"],
           ] as Array<[string, number, string]>
         ).map(([label, count, color]) => (
           <div
@@ -126,47 +100,28 @@ export default function TaskOverviewPanel({ agentReady }: { agentReady: boolean 
         ))}
       </div>
 
-      {error && (
+      {(error || actionError) && (
         <div className="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-          {error}
+          {actionError ?? error}
         </div>
       )}
 
-      {total === 0 ? (
+      {loaded && executions.length === 0 ? (
         <div className="rounded-xl border border-[#2a2f3a] bg-[#141821] px-4 py-3 text-xs leading-relaxed text-gray-500">
           暂无后台任务。让 RClaw「后台 / 并行跑任务」时，这里能看到每个子 agent
-          的实时状态（目标、当前步骤、进度）。
+          的实时状态（目标、当前步骤、运行时长、token）；点开可查看完整活动记录并与它对话。
         </div>
       ) : (
         <div className="space-y-2">
-          {executions.map((e, i) => {
-            const state = stateOf(e);
-            return (
-              <div
-                key={e.agent_id}
-                className="rounded-xl border border-[#2a2f3a] bg-[#141821] px-4 py-3"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate font-mono text-[10px] text-gray-500">
-                    {String(i + 1).padStart(2, "0")} · {e.agent_id}
-                  </span>
-                  <span
-                    className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${
-                      STATE_STYLE[state] ?? "bg-gray-500/10 text-gray-400"
-                    }`}
-                  >
-                    {STATE_LABEL[state] ?? e.state}
-                  </span>
-                </div>
-                <div className="mt-1 text-xs text-gray-400">{e.goal}</div>
-                <div className="mt-1 truncate text-[11px] text-gray-600">
-                  {e.progress?.stage || "—"} · {e.progress?.completed_steps ?? 0}/
-                  {e.progress?.total_steps ?? 0} 步
-                </div>
-              </div>
-            );
-          })}
+          {executions.map((e, i) => (
+            <ExecutionCard key={e.agent_id} e={e} now={now} index={i} onOpen={onOpen} />
+          ))}
         </div>
+      )}
+      {truncated && (
+        <p className="mt-3 text-center text-[11px] text-gray-600">
+          仅显示最近 {executions.length} 条（四格统计也只计这些）；更早的已结束记录可用「清除历史」一并清掉。
+        </p>
       )}
     </div>
   );

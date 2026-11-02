@@ -1,5 +1,10 @@
 use super::*;
 
+use crate::turn::tool_events::ToolBatchBegun;
+use rclaw_core::TokenUsage;
+use rclaw_store::session::SessionStore;
+use tokio::sync::broadcast;
+
 pub(super) const DEFAULT_MAX_TOOL_ITER: usize = 256;
 pub(super) const MAX_TOOL_ITER: usize = 256;
 pub(super) const DEFAULT_MAX_OUTPUT_CHARS: usize = 48_000;
@@ -79,7 +84,75 @@ pub(super) struct ExecutionSnapshot {
     pub(super) created_at: String,
     pub(super) updated_at: String,
     pub(super) recovered: bool,
+    /// 本次运行首次进入 Running 的时刻（RFC3339）；排队中为 None，AgentResume 重跑时
+    /// 重置——「运行了多长时间」只算真正在跑的这一段，不含重启前后的空档。
+    #[serde(default)]
+    pub(super) started_at: Option<String>,
+    /// 进入终态的时刻（RFC3339）；非终态为 None。
+    #[serde(default)]
+    pub(super) finished_at: Option<String>,
+    /// 累计 token 用量 / 模型调用次数（按每次模型结果累加）。
+    #[serde(default)]
+    pub(super) usage: ExecutionUsage,
 }
+
+/// 子代理累计 token 用量：provider 上报的真实 usage 逐次模型调用累加；provider 没报
+/// usage 的调用只计次数（`unreported_calls` > 0 时 token 数只是下限）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// 已拿到结果的模型调用次数（含未上报 usage 的）。
+    pub model_calls: u32,
+    /// 其中未上报 usage 的调用次数。
+    pub unreported_calls: u32,
+}
+
+impl ExecutionUsage {
+    fn add(&mut self, usage: Option<TokenUsage>) {
+        self.model_calls = self.model_calls.saturating_add(1);
+        match usage {
+            Some(usage) => {
+                self.prompt_tokens = self.prompt_tokens.saturating_add(usage.prompt_tokens);
+                self.completion_tokens = self
+                    .completion_tokens
+                    .saturating_add(usage.completion_tokens);
+                self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+            }
+            None => self.unreported_calls = self.unreported_calls.saturating_add(1),
+        }
+    }
+}
+
+/// 执行登记表的直播更新（宿主订阅后转成 UI 事件）。
+///
+/// 只是加速通道：事实源仍是登记表（[`AgentToolRuntime::executions_payload`] /
+/// [`AgentToolRuntime::execution_detail`]）与 transcript 库；订阅方漏掉事件（广播队列
+/// 滞后）时重新拉全量即可对齐。
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionUpdate {
+    /// 某条执行的列表级快照变化（与 `executions_payload` 的 `executions[]` 条目同形）。
+    Snapshot { execution: Value },
+    /// 执行记录被清除（清除历史 / 会话删除级联）。
+    Removed { agent_ids: Vec<String> },
+    /// 一批工具即将执行（在跑的工具行直播；落库后由 `Transcript` 接替为持久化条目）。
+    ToolsBegun {
+        agent_id: String,
+        batch: ToolBatchBegun,
+    },
+    /// transcript 有新行落库，`cursor` = 最新行 id（UI 按游标增量拉取）。
+    Transcript { agent_id: String, cursor: i64 },
+}
+
+/// 广播队列容量：订阅方（UI 事件桥）消费很快，滞后只会发生在它完全卡住时——届时丢
+/// 旧事件并由订阅方按 `Lagged` 重拉全量，不在运行时侧攒无界队列。
+const EXECUTION_UPDATE_CAPACITY: usize = 512;
+/// 每条执行的用户插话收件箱上限（子代理只在安全点消费；堆积说明它卡在长工具里）。
+const EXECUTION_INBOX_LIMIT: usize = 32;
+/// 单条用户插话的字符上限（进入子代理上下文的是原文；过长直接拒绝而不是静默截断）。
+pub const EXECUTION_INBOX_MESSAGE_MAX_CHARS: usize = 8_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ExecutionLogEntry {
@@ -88,11 +161,81 @@ pub(super) struct ExecutionLogEntry {
     pub(super) snapshot: ExecutionSnapshot,
 }
 
+/// [`ExecutionLogEntry`] 的扫库探针：清理窗口外终态流时只需要「终态了没有、源自哪个
+/// 会话」，整份快照（`spec.context` 可达数十 KB）在 Rust 侧不建 `Value` 树、不物化，
+/// 每行解析完即丢。字段名与 serde 属性必须与 [`ExecutionLogEntry`] / [`ExecutionSnapshot`]
+/// / [`AgentTaskSpec`] 保持一致：探针只硬性要求 `snapshot.state`（须是认识的状态值）与
+/// `snapshot.spec` 存在，两个会话字段缺省为空串，所以本版本写出的任何流都解析得了（比
+/// 启动恢复的全量解析更宽松——别的版本改了探针不读的字段、恢复装不进登记表的终态流，
+/// 这里仍会按终态清掉；「清除历史」/ 会话删除本就是全库语义。别的版本新增了状态值的流
+/// 则解析失败被跳过，不误删）。反过来，会话字段名漂移会被 `#[serde(default)]` 吞成空串
+/// 而不是解析失败，表现为会话级联「清不掉」——
+/// `execution_log_probe_reads_the_same_fields_as_the_full_entry` 与会话级联测试盯着这点。
+#[derive(Deserialize)]
+pub(super) struct ExecutionLogProbe {
+    pub(super) snapshot: ExecutionSnapshotProbe,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ExecutionSnapshotProbe {
+    pub(super) state: ExecutionState,
+    pub(super) spec: ExecutionSpecProbe,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ExecutionSpecProbe {
+    #[serde(default)]
+    pub(super) source_channel: String,
+    #[serde(default)]
+    pub(super) origin_chat_id: String,
+}
+
+/// 执行清理的范围：全部，或只清源自某个会话（通道 + chat_id）的。登记表内（内存快照）
+/// 与登记表外（扫库探针）两条路径共用同一判定，不会走散。
+enum CleanupScope {
+    All,
+    Session { channel: String, chat_id: String },
+}
+
+impl CleanupScope {
+    fn covers(&self, source_channel: &str, origin_chat_id: &str) -> bool {
+        match self {
+            CleanupScope::All => true,
+            CleanupScope::Session { channel, chat_id } => {
+                source_channel == channel && origin_chat_id == chat_id
+            }
+        }
+    }
+}
+
 pub(super) struct ExecutionRecord {
     pub(super) snapshot: ExecutionSnapshot,
     pub(super) events: Vec<ExecutionLogEntry>,
     pub(super) cancel: Option<CancellationToken>,
     pub(super) notify: Arc<Notify>,
+    /// 用户（宿主 UI）发给该子代理、尚未被它在安全点消费的插话。
+    pub(super) inbox: Vec<String>,
+}
+
+impl ExecutionRecord {
+    pub(super) fn new(
+        snapshot: ExecutionSnapshot,
+        events: Vec<ExecutionLogEntry>,
+        cancel: Option<CancellationToken>,
+    ) -> Self {
+        ExecutionRecord {
+            snapshot,
+            events,
+            cancel,
+            notify: Arc::new(Notify::new()),
+            inbox: Vec::new(),
+        }
+    }
+
+    /// 本进程正在跑（持有取消句柄且未终态）——可取消、可插话。
+    fn live(&self) -> bool {
+        self.cancel.is_some() && !self.snapshot.state.is_terminal()
+    }
 }
 
 #[derive(Clone)]
@@ -176,23 +319,70 @@ pub(super) struct CollaborationState {
     mailbox_notifies: Arc<Mutex<MailboxNotifyMap>>,
     /// `state.sqlite` journal：团队运行态快照流 + 每个子 agent 的执行事件流。
     journal: JournalStore,
+    /// 子代理 transcript 所在的会话库（与 journal 同一连接；通道 [`SUBAGENT_CHANNEL`]、
+    /// chat_id = agent_id）。这里只负责随执行记录一起删除，写入在运行时循环里。
+    transcript: SessionStore,
+    /// 执行登记表直播广播（宿主 UI 订阅）。无订阅者时 send 失败是正常态，忽略。
+    updates: broadcast::Sender<ExecutionUpdate>,
     /// 测试注入：模拟持久化失败（旧实现靠把事件目录换成文件触发 IO 错误）。
     #[cfg(test)]
     fail_persistence: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CollaborationState {
-    pub(super) fn open(journal: JournalStore) -> Self {
+    pub(super) fn open(journal: JournalStore, transcript: SessionStore) -> Self {
         let teams = recover_team_state(&journal);
-        let executions = recover_execution_records(&journal);
+        let (executions, pruned) = recover_execution_records_inner(&journal);
+        // 启动时被裁掉的最旧终态执行流：它们的 transcript 一并删除，否则会话库里会无限
+        // 积累再也无人能打开的子代理记录。
+        for agent_id in &pruned {
+            if let Err(error) = transcript.delete_session(SUBAGENT_CHANNEL, agent_id) {
+                tracing::warn!("清理子 agent transcript {agent_id} 失败: {error}");
+            }
+        }
+        let (updates, _) = broadcast::channel(EXECUTION_UPDATE_CAPACITY);
         Self {
             teams: Arc::new(Mutex::new(teams)),
             executions: Arc::new(Mutex::new(executions)),
             mailbox_notifies: Arc::new(Mutex::new(HashMap::new())),
             journal,
+            transcript,
+            updates,
             #[cfg(test)]
             fail_persistence: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// 订阅执行登记表直播（见 [`ExecutionUpdate`]）。
+    pub(super) fn subscribe_updates(&self) -> broadcast::Receiver<ExecutionUpdate> {
+        self.updates.subscribe()
+    }
+
+    fn publish(&self, update: ExecutionUpdate) {
+        // 没有订阅者（CLI / 无头 APK 服务期）时 send 返回 Err，属正常态。
+        let _ = self.updates.send(update);
+    }
+
+    fn publish_snapshot(&self, record: &ExecutionRecord) {
+        self.publish(ExecutionUpdate::Snapshot {
+            execution: execution_list_item(&record.snapshot, record.live(), record.inbox.len()),
+        });
+    }
+
+    /// transcript 新行落库后的游标广播（运行时写完行调用）。
+    pub(super) fn publish_transcript(&self, agent_id: &str, cursor: i64) {
+        self.publish(ExecutionUpdate::Transcript {
+            agent_id: agent_id.to_string(),
+            cursor,
+        });
+    }
+
+    /// 一批工具即将执行（在跑的工具行直播）。
+    pub(super) fn publish_tools_begun(&self, agent_id: &str, batch: ToolBatchBegun) {
+        self.publish(ExecutionUpdate::ToolsBegun {
+            agent_id: agent_id.to_string(),
+            batch,
+        });
     }
 
     /// 团队状态变更落 journal（先写后提交内存态；写失败则状态不变）。
@@ -787,6 +977,14 @@ impl CollaborationState {
             snapshot.media_publish_attempted = outcome.media_publish_attempted;
             snapshot.unresolved_disclosure = outcome.unresolved_disclosure;
             snapshot.updated_at = chrono::Utc::now().to_rfc3339();
+            // 计时锚点：离开 Queued 即开跑（Queued 只能转 Running / Cancelling）；终态盖
+            // 结束时刻。取消请求本身不算开跑（排队中被取消的执行没有运行时长）。
+            if snapshot.started_at.is_none() && snapshot.state == ExecutionState::Running {
+                snapshot.started_at = Some(snapshot.updated_at.clone());
+            }
+            if snapshot.state.is_terminal() {
+                snapshot.finished_at = Some(snapshot.updated_at.clone());
+            }
             let entry = ExecutionLogEntry {
                 event: event.to_string(),
                 timestamp: snapshot.updated_at.clone(),
@@ -796,13 +994,88 @@ impl CollaborationState {
             record.snapshot = snapshot.clone();
             if record.snapshot.state.is_terminal() {
                 record.cancel = None;
+                // 终态后没人再消费插话；留着只会在下次 live 判定前误导「有待读消息」。
+                record.inbox.clear();
             }
             record.events.push(entry);
             trim_execution_events(&mut record.events);
+            self.publish_snapshot(record);
             (snapshot, Arc::clone(&record.notify))
         };
         notify.notify_waiters();
         Ok(snapshot)
+    }
+
+    /// 一次模型调用的 token 用量累加到执行快照（内存态 + 直播；随下一次状态切换落盘——
+    /// 模型结果紧接着就是 `model_result` 切换，不单独写 journal）。
+    pub(super) async fn record_model_usage(&self, agent_id: &str, usage: Option<TokenUsage>) {
+        let mut executions = self.executions.lock().await;
+        let Some(record) = executions.get_mut(agent_id) else {
+            return;
+        };
+        record.snapshot.usage.add(usage);
+        // updated_at 同步推进：UI 以它判定事件快照与全量列表谁更新。
+        record.snapshot.updated_at = chrono::Utc::now().to_rfc3339();
+        self.publish_snapshot(record);
+    }
+
+    /// 用户（宿主 UI）向正在跑的子代理插话：进入该执行的收件箱，子代理在下一个安全点
+    /// （模型推理前后）把它作为 user 消息读入上下文。只接受本进程在跑的执行——重启后
+    /// 恢复的 waiting 记录没有执行者，先 AgentResume；终态 / 取消中的不再接收。
+    pub(super) async fn post_execution_message(
+        &self,
+        agent_id: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("消息为空".to_string());
+        }
+        if text.chars().count() > EXECUTION_INBOX_MESSAGE_MAX_CHARS {
+            return Err(format!(
+                "消息过长（上限 {EXECUTION_INBOX_MESSAGE_MAX_CHARS} 字符）"
+            ));
+        }
+        let mut executions = self.executions.lock().await;
+        let record = executions
+            .get_mut(agent_id)
+            .ok_or_else(|| format!("unknown agent execution: {agent_id}"))?;
+        if record.snapshot.state.is_terminal() {
+            return Err("该子 Agent 已结束，不再接收消息".to_string());
+        }
+        if record.snapshot.state == ExecutionState::Cancelling {
+            return Err("该子 Agent 正在取消，不再接收消息".to_string());
+        }
+        if record.cancel.is_none() {
+            return Err(
+                "该子 Agent 不在本进程运行（重启后恢复的记录需先 AgentResume）".to_string(),
+            );
+        }
+        if record.inbox.len() >= EXECUTION_INBOX_LIMIT {
+            return Err(format!(
+                "该子 Agent 还有 {} 条消息未读（它正在长时间的工具执行中），请稍后再发",
+                record.inbox.len()
+            ));
+        }
+        record.inbox.push(text.to_string());
+        record.snapshot.updated_at = chrono::Utc::now().to_rfc3339();
+        self.publish_snapshot(record);
+        Ok(())
+    }
+
+    /// 子代理在安全点取走全部待读插话（取走即清空）。
+    pub(super) async fn drain_execution_inbox(&self, agent_id: &str) -> Vec<String> {
+        let mut executions = self.executions.lock().await;
+        let Some(record) = executions.get_mut(agent_id) else {
+            return Vec::new();
+        };
+        if record.inbox.is_empty() {
+            return Vec::new();
+        }
+        let drained = std::mem::take(&mut record.inbox);
+        record.snapshot.updated_at = chrono::Utc::now().to_rfc3339();
+        self.publish_snapshot(record);
+        drained
     }
 
     /// 终态持久化失败后的兜底：后台 future 已经结束，记录却停在非终态且仍持有取消句柄——
@@ -822,7 +1095,10 @@ impl CollaborationState {
             record.snapshot.progress.stage = "终态持久化失败".to_string();
             record.snapshot.error = Some(error.to_string());
             record.snapshot.updated_at = chrono::Utc::now().to_rfc3339();
+            record.snapshot.finished_at = Some(record.snapshot.updated_at.clone());
             record.cancel = None;
+            record.inbox.clear();
+            self.publish_snapshot(record);
             Arc::clone(&record.notify)
         };
         notify.notify_waiters();
@@ -869,6 +1145,9 @@ impl CollaborationState {
             created_at: now.clone(),
             updated_at: now.clone(),
             recovered: false,
+            started_at: None,
+            finished_at: None,
+            usage: ExecutionUsage::default(),
         };
         let entry = ExecutionLogEntry {
             event: "queued".to_string(),
@@ -876,33 +1155,32 @@ impl CollaborationState {
             snapshot: snapshot.clone(),
         };
         self.persist_execution(&entry)?;
-        self.executions.lock().await.insert(
-            agent_id,
-            ExecutionRecord {
-                snapshot,
-                events: vec![entry],
-                cancel: Some(cancel),
-                notify: Arc::new(Notify::new()),
-            },
-        );
+        let record = ExecutionRecord::new(snapshot, vec![entry], Some(cancel));
+        let update = ExecutionUpdate::Snapshot {
+            execution: execution_list_item(&record.snapshot, record.live(), record.inbox.len()),
+        };
+        self.executions.lock().await.insert(agent_id, record);
+        // 先入表再广播：订阅方收到事件回查详情时记录必须已可见。
+        self.publish(update);
         Ok(())
     }
 
-    /// 清除已终态、且满足 `filter` 的执行记录（登记表 + journal 事件流一并删除），
+    /// 清除已终态、且在 `scope` 内的执行记录（登记表 + journal 事件流一并删除），
     /// 返回清除条数。非终态（排队/运行/等待/取消中）是活任务，一律保留。
     ///
     /// 等待在该执行上的 AgentWait / 恢复入口随后会拿到 unknown 错误——记录都没了，
     /// 这是预期语义（桌面会话删除级联与「清除历史」按钮共用）。
-    async fn remove_terminal_executions(
-        &self,
-        filter: impl Fn(&ExecutionSnapshot) -> bool,
-    ) -> usize {
+    async fn remove_terminal_executions(&self, scope: &CleanupScope) -> usize {
         let removed: Vec<String> = {
             let mut executions = self.executions.lock().await;
             let doomed: Vec<String> = executions
                 .iter()
                 .filter(|(_, record)| {
-                    record.snapshot.state.is_terminal() && filter(&record.snapshot)
+                    record.snapshot.state.is_terminal()
+                        && scope.covers(
+                            &record.snapshot.spec.source_channel,
+                            &record.snapshot.spec.origin_chat_id,
+                        )
                 })
                 .map(|(agent_id, _)| agent_id.clone())
                 .collect();
@@ -911,76 +1189,292 @@ impl CollaborationState {
             }
             doomed
         };
-        // journal 流删除在锁外做（sqlite 阻塞 IO）：失败只告警——内存登记表已清，
-        // 残留流下次重启会被 recover 装回登记表（终态记录，仅展示），可再次清除。
-        for agent_id in &removed {
-            if let Err(error) = self.journal.delete_stream(JOURNAL_EXEC_LOG, agent_id) {
-                tracing::warn!("清理子 agent 执行事件流 {agent_id} 失败: {error}");
+        if removed.is_empty() {
+            return 0;
+        }
+        // 事实源（登记表）已经不含这些记录，先广播让 UI 立刻收起，再慢慢删库。
+        self.publish(ExecutionUpdate::Removed {
+            agent_ids: removed.clone(),
+        });
+        // journal 流 / transcript 删除在锁外、blocking 线程上做：失败只告警——内存登记表
+        // 已清，残留流下次重启会被 recover 装回登记表（终态记录，仅展示），可再次清除。
+        let count = removed.len();
+        self.delete_execution_streams(removed).await;
+        count
+    }
+
+    /// 删除若干执行的 journal 事件流与 transcript（记录没了就再没有入口能打开它）。
+    /// 放到 blocking 线程：`secure_delete` 下删一份几千行的 transcript 要清零页面再走
+    /// WAL，是百毫秒级的同步 IO，不能占着 tokio worker——同一时刻别的子代理的
+    /// `transition_execution` 还在排队等 Db 锁。返回实际删掉的流数（流已被别处删掉的
+    /// 空操作不计）；transcript 删除失败只告警（孤儿回收兜底）。
+    async fn delete_execution_streams(&self, agent_ids: Vec<String>) -> usize {
+        if agent_ids.is_empty() {
+            return 0;
+        }
+        let journal = self.journal.clone();
+        let transcript = self.transcript.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut deleted = 0;
+            for agent_id in &agent_ids {
+                match journal.delete_stream(JOURNAL_EXEC_LOG, agent_id) {
+                    Ok(0) => {}
+                    Ok(_) => deleted += 1,
+                    Err(error) => {
+                        tracing::warn!("清理子 agent 执行事件流 {agent_id} 失败: {error}");
+                        continue;
+                    }
+                }
+                if let Err(error) = transcript.delete_session(SUBAGENT_CHANNEL, agent_id) {
+                    tracing::warn!("清理子 agent transcript {agent_id} 失败: {error}");
+                }
+            }
+            deleted
+        });
+        match task.await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::warn!("清理子 agent 执行记录的 blocking 任务异常: {error}");
+                0
             }
         }
-        removed.len()
     }
 
-    /// 清空全部已终态的后台执行记录（桌面「Agent 状态 / 任务概览」的清除按钮）。
+    /// 登记表窗口之外的终态执行流（含 transcript）清理。
+    ///
+    /// 启动恢复只把最近 [`RECOVERED_TERMINAL_EXECUTIONS_MAX`] 条终态执行装进登记表，更早的
+    /// 终态流留在库里直到积满 [`RETAINED_TERMINAL_EXECUTION_STREAMS`] 才在某次启动被裁。
+    /// 它们没有登记记录：UI 看不到、[`Self::remove_terminal_executions`] 也碰不到——有了整份
+    /// transcript 之后这份「看不见的积累」是实打实的磁盘占用，所以「清除历史」/ 会话删除
+    /// 级联要把 `scope` 内的这些流连同 transcript 一并清掉。只动终态流；非终态流都在
+    /// 登记表里（启动时全部装载），不在登记表的非终态流只可能是正在入表的新执行，不碰。
+    /// 多进程共用一个库时（桌面 + CLI），另一进程登记表里的终态流对本进程来说也是
+    /// 「不在登记表」，同样会被清——「清除历史」/ 会话删除本就是全库语义，这是预期行为。
+    /// 返回清掉的流数。
+    ///
+    /// 时序：先一条 SQL 扫每条流的最后一条事件挑出候选，【之后】再对照登记表。终态事件
+    /// 只会由登记表里的记录持锁写出（[`Self::transition_execution`]），所以扫描里看到的
+    /// 任何终态流，其记录要么此刻仍在登记表（跳过），要么已被 / 正在被
+    /// [`Self::remove_terminal_executions`] 连流一起删掉——两边的 `delete_stream` /
+    /// `delete_session` 都是独立事务、由连接锁串行且幂等，再删一次是空操作。「枚举之后
+    /// 才入表、随即终结」的新执行不会被误当成窗口外历史。
+    async fn sweep_unregistered_terminal_executions(&self, scope: CleanupScope) -> usize {
+        // 会话删除 / 归档级联每次都走这里：一条 SQL、探针只解析判定字段、只留候选流名——
+        // 不做 N+1 点查，也不把上千份快照（含 spec.context）物化。整段扫描持 Db 锁同步
+        // 进行，放 blocking 线程，不占 tokio worker。
+        let journal = self.journal.clone();
+        let scan = tokio::task::spawn_blocking(move || {
+            let mut candidates: Vec<String> = Vec::new();
+            // 解析不成探针的流（schema 漂移 / 损坏）由 store 告警跳过，不动：多进程共用一个
+            // 库，可能是别的版本在写。
+            journal
+                .for_each_latest::<ExecutionLogProbe>(JOURNAL_EXEC_LOG, |stream, probe| {
+                    let spec = &probe.snapshot.spec;
+                    if probe.snapshot.state.is_terminal()
+                        && scope.covers(&spec.source_channel, &spec.origin_chat_id)
+                    {
+                        candidates.push(stream.to_string());
+                    }
+                })
+                .map(|()| candidates)
+        });
+        let candidates = match scan.await {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(error)) => {
+                tracing::warn!("枚举子 agent 执行事件流失败，跳过窗口外清理: {error}");
+                return 0;
+            }
+            Err(error) => {
+                tracing::warn!("枚举子 agent 执行事件流的 blocking 任务异常: {error}");
+                return 0;
+            }
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+        let doomed: Vec<String> = {
+            let executions = self.executions.lock().await;
+            candidates
+                .into_iter()
+                .filter(|stream| !executions.contains_key(stream))
+                .collect()
+        };
+        self.delete_execution_streams(doomed).await
+    }
+
+    /// 孤儿 transcript 回收：`subagent` 通道里既无登记记录、也无执行事件流的会话（流已删
+    /// 而 transcript 当时删除失败的残留）。只回收最近一分钟没有写入的会话——刚入表、尚未
+    /// 落首行的新执行在登记表里能查到，这里再加时间护栏兜住「枚举与入表交错」的极端时序。
+    async fn sweep_orphan_transcripts(&self) -> usize {
+        // 枚举（两条全表查询，各自进出一次 Db 锁，不在同一快照里）与删除都是同步 IO，各自
+        // 放 blocking 线程；中间按登记表复核一次要拿 tokio 锁，所以分两跳。两条查询之间
+        // 被插入的写入（并发清除 / 新执行入表 / 别的进程）由后面的登记表复核、一分钟护栏与
+        // `delete_session` 的幂等兜住。
+        let transcript = self.transcript.clone();
+        let journal = self.journal.clone();
+        let cutoff = chrono::Utc::now().timestamp_millis() - 60_000;
+        let scan = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+            let sessions = transcript
+                .list_sessions(Some(SUBAGENT_CHANNEL))
+                .map_err(|error| format!("枚举子 agent transcript 失败: {error}"))?;
+            if sessions.is_empty() {
+                return Ok(Vec::new());
+            }
+            let streams: BTreeSet<String> = journal
+                .streams(JOURNAL_EXEC_LOG)
+                .map_err(|error| format!("枚举子 agent 执行事件流失败: {error}"))?
+                .into_iter()
+                .collect();
+            Ok(sessions
+                .into_iter()
+                .filter(|session| {
+                    session.updated_at < cutoff && !streams.contains(&session.chat_id)
+                })
+                .map(|session| session.chat_id)
+                .collect())
+        });
+        let candidates = match scan.await {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(error)) => {
+                tracing::warn!("{error}，跳过孤儿回收");
+                return 0;
+            }
+            Err(error) => {
+                tracing::warn!("枚举孤儿子 agent transcript 的 blocking 任务异常: {error}");
+                return 0;
+            }
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+        // 删除前再按登记表核一次：入表发生在首行落库之前，不在表里的就没有活的写入方。
+        let doomed: Vec<String> = {
+            let executions = self.executions.lock().await;
+            candidates
+                .into_iter()
+                .filter(|chat_id| !executions.contains_key(chat_id))
+                .collect()
+        };
+        if doomed.is_empty() {
+            return 0;
+        }
+        let transcript = self.transcript.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let mut swept = 0;
+            for chat_id in &doomed {
+                match transcript.delete_session(SUBAGENT_CHANNEL, chat_id) {
+                    Ok(true) => swept += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!("回收孤儿子 agent transcript {chat_id} 失败: {error}");
+                    }
+                }
+            }
+            swept
+        });
+        let swept = match task.await {
+            Ok(swept) => swept,
+            Err(error) => {
+                tracing::warn!("回收孤儿子 agent transcript 的 blocking 任务异常: {error}");
+                0
+            }
+        };
+        if swept > 0 {
+            tracing::info!("回收了 {swept} 份孤儿子 agent transcript");
+        }
+        swept
+    }
+
+    /// 清空全部已终态的后台执行记录（桌面「Agent 状态 / 任务概览」的清除按钮）：登记表
+    /// 里的终态记录 + 登记表窗口之外库里的终态流（都连同 transcript），再回收孤儿 transcript。
+    /// 返回值只计登记表里清掉的条数（UI 上看得见的那些）。
     pub(super) async fn clear_finished_executions(&self) -> usize {
-        self.remove_terminal_executions(|_| true).await
+        let removed = self.remove_terminal_executions(&CleanupScope::All).await;
+        let swept = self
+            .sweep_unregistered_terminal_executions(CleanupScope::All)
+            .await;
+        if swept > 0 {
+            tracing::info!("清理了 {swept} 条登记表窗口之外的历史子 agent 执行流");
+        }
+        self.sweep_orphan_transcripts().await;
+        removed
     }
 
-    /// 清掉源自指定会话的已终态执行记录（会话删除级联）。
+    /// 清掉源自指定会话的已终态执行记录（会话删除级联），登记表内外都算。
     pub(super) async fn forget_session_executions(&self, channel: &str, chat_id: &str) -> usize {
-        self.remove_terminal_executions(|snapshot| {
-            snapshot.spec.source_channel == channel && snapshot.spec.origin_chat_id == chat_id
+        let scope = CleanupScope::Session {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+        };
+        let removed = self.remove_terminal_executions(&scope).await;
+        removed + self.sweep_unregistered_terminal_executions(scope).await
+    }
+
+    /// 单条执行的模型可见载荷（AgentStatus / AgentWait 工具结果）：完整快照 + 尾部事件 +
+    /// 可取消 / 可恢复。宿主 UI 要的额外字段走 [`Self::execution_detail_payload`]，不混进
+    /// 模型上下文。
+    pub(super) async fn execution_payload(&self, agent_id: &str) -> Option<Value> {
+        let executions = self.executions.lock().await;
+        let record = executions.get(agent_id)?;
+        Some(execution_record_payload(agent_id, record))
+    }
+
+    /// 宿主 UI 的详情载荷：模型载荷 + 待读插话数 + 列表级条目（与直播 `snapshot` 事件同形，
+    /// 详情页头部直接复用列表卡片的渲染）。
+    pub(super) async fn execution_detail_payload(&self, agent_id: &str) -> Option<Value> {
+        let executions = self.executions.lock().await;
+        let record = executions.get(agent_id)?;
+        let mut payload = execution_record_payload(agent_id, record);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("inbox_pending".to_string(), json!(record.inbox.len()));
+            object.insert(
+                "summary".to_string(),
+                execution_list_item(&record.snapshot, record.live(), record.inbox.len()),
+            );
+        }
+        Some(payload)
+    }
+
+    /// 执行列表的模型可见载荷（AgentStatus 不带 agent_id）：每条只给模型决策需要的字段，
+    /// 列表最多 100 条、每条都进上下文，UI 专用字段（名字 / 模型 / 起止时刻 / token /
+    /// 来源会话……）不在这里重复。
+    pub(super) async fn execution_list_payload(&self) -> Value {
+        self.execution_list_payload_with(|record| {
+            let snapshot = &record.snapshot;
+            json!({
+                "agent_id": snapshot.agent_id,
+                "state": snapshot.state,
+                "progress": snapshot.progress,
+                "goal": truncate_chars(&snapshot.spec.task, 240),
+                "isolation": snapshot.spec.isolation,
+                "created_at": snapshot.created_at,
+                "updated_at": snapshot.updated_at,
+                "recovered": snapshot.recovered,
+            })
         })
         .await
     }
 
-    pub(super) async fn execution_payload(&self, agent_id: &str) -> Option<Value> {
-        let executions = self.executions.lock().await;
-        let record = executions.get(agent_id)?;
-        let events = record
-            .events
-            .iter()
-            .map(|entry| {
-                json!({
-                    "event": entry.event,
-                    "timestamp": entry.timestamp,
-                    "state": entry.snapshot.state,
-                    "progress": entry.snapshot.progress,
-                })
-            })
-            .collect::<Vec<_>>();
-        Some(json!({
-            "execution": record.snapshot,
-            "events": events,
-            "eventLog": execution_log_ref(agent_id),
-            "cancellable": record.cancel.is_some() && !record.snapshot.state.is_terminal(),
-            "resumable": record.cancel.is_none() && record.snapshot.state == ExecutionState::Waiting,
-        }))
+    /// 执行列表的宿主 UI 载荷：条目与直播 `snapshot` 事件同形（[`execution_list_item`]）。
+    pub(super) async fn execution_list_payload_ui(&self) -> Value {
+        self.execution_list_payload_with(|record| {
+            execution_list_item(&record.snapshot, record.live(), record.inbox.len())
+        })
+        .await
     }
 
-    pub(super) async fn execution_list_payload(&self) -> Value {
+    async fn execution_list_payload_with(&self, item: impl Fn(&ExecutionRecord) -> Value) -> Value {
         let executions = self.executions.lock().await;
-        let mut snapshots = executions
+        let mut items = executions
             .values()
-            .map(|record| record.snapshot.clone())
+            .map(|record| (record.snapshot.created_at.as_str(), record))
             .collect::<Vec<_>>();
-        snapshots.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-        let total = snapshots.len();
-        let executions = snapshots
+        items.sort_by(|left, right| right.0.cmp(left.0));
+        let total = items.len();
+        let executions = items
             .into_iter()
             .take(100)
-            .map(|snapshot| {
-                json!({
-                    "agent_id": snapshot.agent_id,
-                    "state": snapshot.state,
-                    "progress": snapshot.progress,
-                    "goal": truncate_chars(&snapshot.spec.task, 240),
-                    "isolation": snapshot.spec.isolation,
-                    "created_at": snapshot.created_at,
-                    "updated_at": snapshot.updated_at,
-                    "recovered": snapshot.recovered,
-                })
-            })
+            .map(|(_, record)| item(record))
             .collect::<Vec<_>>();
         json!({
             "executions": executions,
@@ -1028,6 +1522,7 @@ impl CollaborationState {
             record.snapshot = snapshot;
             record.events.push(entry);
             trim_execution_events(&mut record.events);
+            self.publish_snapshot(record);
             (cancel, Arc::clone(&record.notify))
         };
         cancel.cancel();
@@ -1119,6 +1614,10 @@ impl CollaborationState {
         snapshot.media_publish_attempted = false;
         snapshot.updated_at = chrono::Utc::now().to_rfc3339();
         snapshot.recovered = false;
+        // 重跑重新计时（started_at 在下一次 Running 切换时重盖）；累计 token 保留——
+        // 恢复前的消耗是真实发生过的。
+        snapshot.started_at = None;
+        snapshot.finished_at = None;
         let entry = ExecutionLogEntry {
             event: "resumed_queued".to_string(),
             timestamp: snapshot.updated_at.clone(),
@@ -1129,6 +1628,7 @@ impl CollaborationState {
         record.cancel = Some(cancel.clone());
         record.events.push(entry);
         trim_execution_events(&mut record.events);
+        self.publish_snapshot(record);
         Ok((cancel, Arc::clone(&record.notify)))
     }
 
@@ -1138,15 +1638,10 @@ impl CollaborationState {
         agent_id: String,
         snapshot: ExecutionSnapshot,
     ) {
-        self.executions.lock().await.insert(
-            agent_id,
-            ExecutionRecord {
-                snapshot,
-                events: Vec::new(),
-                cancel: None,
-                notify: Arc::new(Notify::new()),
-            },
-        );
+        self.executions
+            .lock()
+            .await
+            .insert(agent_id, ExecutionRecord::new(snapshot, Vec::new(), None));
     }
 
     #[cfg(test)]
@@ -1483,15 +1978,82 @@ pub(super) fn recover_team_state(journal: &JournalStore) -> TeamRuntimeState {
     state
 }
 
+/// 单条执行记录的基础载荷（模型与 UI 共用）：完整快照、尾部事件、事件流引用、可取消 /
+/// 可恢复。
+fn execution_record_payload(agent_id: &str, record: &ExecutionRecord) -> Value {
+    let events = record
+        .events
+        .iter()
+        .map(|entry| {
+            json!({
+                "event": entry.event,
+                "timestamp": entry.timestamp,
+                "state": entry.snapshot.state,
+                "progress": entry.snapshot.progress,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "execution": record.snapshot,
+        "events": events,
+        "eventLog": execution_log_ref(agent_id),
+        "cancellable": record.live(),
+        "resumable": record.cancel.is_none() && record.snapshot.state == ExecutionState::Waiting,
+    })
+}
+
+/// 执行列表条目（宿主 UI 的 `executions[]` 与 [`ExecutionUpdate::Snapshot`] 同形）：登记表
+/// 快照里 UI 列表需要的字段 + 本进程是否在跑（可取消 / 可插话）+ 待读插话数。
+/// `goal` 截断到 240 字符；完整任务文本走详情（`execution.spec.task`）。
+pub(super) fn execution_list_item(
+    snapshot: &ExecutionSnapshot,
+    live: bool,
+    inbox_pending: usize,
+) -> Value {
+    json!({
+        "inbox_pending": inbox_pending,
+        "agent_id": snapshot.agent_id,
+        "name": snapshot.spec.name,
+        "role": snapshot.spec.role,
+        "state": snapshot.state,
+        "progress": snapshot.progress,
+        "goal": truncate_chars(&snapshot.spec.task, 240),
+        "isolation": snapshot.spec.isolation,
+        "model": snapshot.spec.model,
+        "team_name": snapshot.spec.team_name,
+        "source_channel": snapshot.spec.source_channel,
+        "origin_chat_id": snapshot.spec.origin_chat_id,
+        "created_at": snapshot.created_at,
+        "updated_at": snapshot.updated_at,
+        "started_at": snapshot.started_at,
+        "finished_at": snapshot.finished_at,
+        "usage": snapshot.usage,
+        "recovered": snapshot.recovered,
+        "live": live,
+        "error": snapshot.error.as_deref().map(|error| truncate_chars(error, 400)),
+        "has_handoff": snapshot.handoff.is_some(),
+    })
+}
+
+#[cfg(test)]
 pub(super) fn recover_execution_records(
     journal: &JournalStore,
 ) -> HashMap<String, ExecutionRecord> {
+    recover_execution_records_inner(journal).0
+}
+
+/// 启动恢复：返回 (登记表, 被裁掉的最旧终态执行 id)。被裁掉的流已从 journal 删除，
+/// 调用方负责级联清理它们的 transcript。
+pub(super) fn recover_execution_records_inner(
+    journal: &JournalStore,
+) -> (HashMap<String, ExecutionRecord>, Vec<String>) {
     let mut records = HashMap::new();
+    let mut pruned = Vec::new();
     let streams = match journal.streams(JOURNAL_EXEC_LOG) {
         Ok(streams) => streams,
         Err(error) => {
             tracing::warn!("枚举子 agent 执行事件流失败，跳过恢复: {error}");
-            return records;
+            return (records, pruned);
         }
     };
     // 已终态的历史执行：先只读最后一条事件判定状态，按流的创建顺序（streams() 的顺序）
@@ -1535,6 +2097,8 @@ pub(super) fn recover_execution_records(
             snapshot.progress.stage = "进程重启后确认原取消请求已生效".to_string();
             snapshot.updated_at = chrono::Utc::now().to_rfc3339();
             snapshot.recovered = true;
+            // 终态时刻：与 transition_execution 的终态盖章同口径（UI 的「运行时长」以它收口）。
+            snapshot.finished_at = Some(snapshot.updated_at.clone());
             let recovered = ExecutionLogEntry {
                 event: "recovered_cancelled".to_string(),
                 timestamp: snapshot.updated_at.clone(),
@@ -1565,12 +2129,7 @@ pub(super) fn recover_execution_records(
         }
         records.insert(
             snapshot.agent_id.clone(),
-            ExecutionRecord {
-                snapshot,
-                events,
-                cancel: None,
-                notify: Arc::new(Notify::new()),
-            },
+            ExecutionRecord::new(snapshot, events, None),
         );
     }
     // 最旧的在前：先清理超出保留上限的流，再把最近的装进登记表。
@@ -1581,6 +2140,7 @@ pub(super) fn recover_execution_records(
         if let Err(error) = journal.delete_stream(JOURNAL_EXEC_LOG, &stream) {
             tracing::warn!("清理历史子 agent 执行事件流 {stream} 失败: {error}");
         }
+        pruned.push(stream);
     }
     let skip = terminal
         .len()
@@ -1588,15 +2148,34 @@ pub(super) fn recover_execution_records(
     for (_, last) in terminal.into_iter().skip(skip) {
         records.insert(
             last.snapshot.agent_id.clone(),
-            ExecutionRecord {
-                snapshot: last.snapshot.clone(),
-                events: vec![last],
-                cancel: None,
-                notify: Arc::new(Notify::new()),
-            },
+            ExecutionRecord::new(last.snapshot.clone(), vec![last], None),
         );
     }
-    records
+    (records, pruned)
+}
+
+/// 用户（宿主 UI 里正在观看这条执行的人）发给子代理的插话 → 注入上下文的 user 消息。
+///
+/// 与团队邮箱不同，这是最终用户本人的话，按权威指引对待：可以收窄 / 修正 / 改向委派
+/// 任务。但纯文本回复在子代理循环里意味着「任务完成」，所以明确要求把对用户的回应
+/// 放在下一步动作的随附文字里，任务没完成就别只回文字（运行时另有兜底：插话后的首条
+/// 纯文本回复会被当成对话回应而非最终结果，见 `run_task_inner`）。
+pub(super) fn render_user_interjections(messages: &[String]) -> String {
+    let mut out = String::from("## Message from the user\n\n");
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            out.push_str("\n\n---\n\n");
+        }
+        out.push_str(message.trim());
+    }
+    out.push_str(
+        "\n\nThe user is watching this execution live and sent the message(s) above. \
+         They come from the person you ultimately work for, so treat them as authoritative \
+         guidance: answer any question briefly and apply any correction or redirection to the \
+         delegated task. Put your reply in the text that accompanies your next action; if the \
+         task is still unfinished, keep working (call tools) instead of replying with text only.\n",
+    );
+    out
 }
 
 pub(super) fn render_inbound_team_messages(messages: &[TeamMessage], reader_name: &str) -> String {

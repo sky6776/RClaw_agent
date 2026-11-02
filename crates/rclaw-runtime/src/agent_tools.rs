@@ -89,6 +89,21 @@ impl RunAdapter for SubagentRunAdapter<'_> {
 /// 子调用共用一张登记表，这是进程级总闸）。
 const MAX_ACTIVE_EXECUTIONS: usize = 32;
 
+/// 子代理 transcript 在会话库里的通道名（chat_id = 执行的 agent_id）。
+///
+/// 登记在册的子代理（后台 / 自动转后台 / 团队成员）把完整运行记录按前台会话同一形态
+/// 落库：user 行（任务提示、用户插话、团队邮箱）、assistant 行（正文 + Reasoning 块 +
+/// tool_calls）、结果载体行与 `tool_call_meta` 侧表——宿主 UI 用前台会话同一套投影
+/// （思考块 / 工具与 Skill 调用可展开）回放它。随执行记录一起删除。
+pub const SUBAGENT_CHANNEL: &str = "subagent";
+
+/// 续跑（AgentResume）时落进 transcript 的分隔标记：记录里已有上一轮的行，任务书不再
+/// 重复落一遍——模型上下文仍从完整任务书重新开始，这条只给看记录的人定位「从这里重跑」。
+/// 宿主 UI 按首行识别（`## Execution resumed`）。
+pub const SUBAGENT_RESUME_MARKER: &str = "## Execution resumed\n\n\
+    This execution was resumed (AgentResume). The sub-agent restarts from the task brief at \
+    the top of this record; rows above are from the previous run and are not in its context.";
+
 mod escalate;
 pub use amend_workflow::AmendWorkflowTool;
 pub use cancel_workflow_run::CancelWorkflowRunTool;
@@ -117,6 +132,7 @@ pub fn plan_is_active(plan_id: &str) -> bool {
 use subagent::*;
 pub(crate) use team::sanitize_agent_name;
 use team::*;
+pub use team::{ExecutionUpdate, ExecutionUsage, EXECUTION_INBOX_MESSAGE_MAX_CHARS};
 pub use tools::*;
 use verify::verify_candidate_patch;
 
@@ -376,6 +392,8 @@ pub struct AgentToolRuntime {
     layout: Layout,
     /// `state.sqlite` journal / kv 句柄（PlanRun / WorkflowRun 事件流、团队收件箱计数）。
     journal: JournalStore,
+    /// 子代理 transcript 的会话库门面（与 journal 共享同一连接；通道 [`SUBAGENT_CHANNEL`]）。
+    transcript: rclaw_store::session::SessionStore,
     opts: AgentOptions,
     /// 后台完成通知的批量唤醒器（ZCode 移植 · Layer 4）：完成入箱后合批投递
     /// 系统消息驱动收集轮次；inbound 发送端由二进制装配期 attach。
@@ -408,7 +426,10 @@ impl AgentToolRuntime {
         // 子代理基础提示不再在此构建：装配期 registry 还是空的 OnceLock，
         // 按注册差异裁剪的文案（如浏览器工具行）会失真。改为子代理执行时
         // 惰性构建（见 [`Self::base_system_prompt`]），届时注册表已终态。
-        let collaboration = CollaborationState::open(journal.clone());
+        // transcript 与 journal 共用一条连接：子代理工具链落库与执行事件落盘在同一把
+        // 连接锁下串行，不另开连接（APK 上多连接的 WAL 争用是真实问题）。
+        let transcript = rclaw_store::session::SessionStore::from_db(journal.db(), layout.clone());
+        let collaboration = CollaborationState::open(journal.clone(), transcript.clone());
         let (wake_enabled, wake_debounce) =
             (opts.background_wake_enabled, opts.background_wake_debounce);
         AgentToolRuntime {
@@ -426,6 +447,7 @@ impl AgentToolRuntime {
                 wake_debounce,
             ),
             journal,
+            transcript,
             opts,
             model_factory: Arc::new(std::sync::OnceLock::new()),
             model_cache: Arc::new(StdMutex::new(HashMap::new())),
@@ -727,9 +749,12 @@ impl AgentToolRuntime {
             .await
     }
 
+    /// 安全点：把团队邮箱里的新消息读入上下文；有登记的执行同时落一行 transcript（宿主
+    /// 回放的活动记录里能看到模型是因为哪条团队消息改变了行为）。
     async fn append_current_mailbox_to_context(
         &self,
         spec: &AgentTaskSpec,
+        control: Option<&ExecutionControl>,
         messages: &mut Vec<Message>,
         state: &mut TurnState,
     ) -> bool {
@@ -760,11 +785,121 @@ impl AgentToolRuntime {
         state.media_publish_attempted |= inbound
             .iter()
             .any(|message| message.media_publish_attempted);
-        messages.push(Message::plain(
+        let message = Message::plain(
             Role::User,
             render_inbound_team_messages(&inbound, &identity.name),
-        ));
+        );
+        if let Some(control) = control {
+            self.persist_transcript_message(&control.agent_id, &message);
+        }
+        messages.push(message);
         true
+    }
+
+    /// 安全点：把用户插话（宿主 UI 发给这条执行的消息）读入上下文并落 transcript。
+    /// 返回是否读到了消息（模型结果之后读到 → 调用方重新推理，与团队邮箱同语义）。
+    /// 无登记（前台并行子代理）的任务没有收件箱。
+    async fn append_execution_inbox_to_context(
+        &self,
+        control: Option<&ExecutionControl>,
+        messages: &mut Vec<Message>,
+    ) -> bool {
+        let Some(control) = control else {
+            return false;
+        };
+        let inbound = self
+            .collaboration
+            .drain_execution_inbox(&control.agent_id)
+            .await;
+        if inbound.is_empty() {
+            return false;
+        }
+        let message = Message::plain(Role::User, render_user_interjections(&inbound));
+        self.persist_transcript_message(&control.agent_id, &message);
+        messages.push(message);
+        true
+    }
+
+    /// 该执行的 transcript 里是否已有行（续跑判定）。读失败按「没有」处理：最坏是任务书
+    /// 多落一遍，不能因为可观察性的读错让任务起不来。
+    fn transcript_has_rows(&self, agent_id: &str) -> bool {
+        match self.transcript.session_summary(SUBAGENT_CHANNEL, agent_id) {
+            Ok(summary) => summary.is_some_and(|summary| summary.message_count > 0),
+            Err(error) => {
+                tracing::warn!(agent_id, %error, "读取子代理 transcript 摘要失败，按空记录处理");
+                false
+            }
+        }
+    }
+
+    /// 子代理 transcript 落一行（通道 [`SUBAGENT_CHANNEL`]、chat_id = agent_id）并广播
+    /// 游标。transcript 只是可观察性：写失败告警，不影响任务本身。
+    fn persist_transcript_message(&self, agent_id: &str, message: &Message) {
+        match self.transcript.append(SUBAGENT_CHANNEL, agent_id, message) {
+            Ok(id) => self.collaboration.publish_transcript(agent_id, id),
+            Err(error) => {
+                tracing::warn!(agent_id, %error, "子代理 transcript 落库失败（跳过该行）");
+            }
+        }
+    }
+
+    /// 子代理一轮工具链（assistant(tool_calls) + 结果载体 + 侧表）落 transcript，与前台
+    /// `append_tool_chain_full` 同形，宿主的工具行展开详情才能同一套读法。
+    fn persist_transcript_tool_chain(
+        &self,
+        agent_id: &str,
+        assistant: &Message,
+        tool_result: &Message,
+        metas: &[rclaw_store::ToolCallMetaRecord],
+    ) {
+        match self.transcript.append_tool_chain_full(
+            SUBAGENT_CHANNEL,
+            agent_id,
+            assistant,
+            tool_result,
+            0,
+            &[],
+            metas,
+        ) {
+            Ok((_, result_id)) => self.collaboration.publish_transcript(agent_id, result_id),
+            Err(error) => {
+                tracing::warn!(agent_id, %error, "子代理 transcript 工具链落库失败（跳过该轮）");
+            }
+        }
+    }
+
+    /// 一批工具即将执行：按前台 `observe_tool_calls_begun` 同一口径（入参裁剪 + Manifest
+    /// 工具的 skill 归属）广播在跑的工具行。
+    fn publish_tools_begun(
+        &self,
+        agent_id: &str,
+        iter: u32,
+        outcome: &rclaw_core::ChatOutcome,
+        state: &TurnState,
+    ) {
+        let calls = outcome
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                let parsed = serde_json::from_str::<Value>(&tc.input)
+                    .unwrap_or_else(|_| Value::String(tc.input.clone()));
+                let (input, input_truncated) = crate::turn::tool_events::brief_input(&parsed);
+                crate::turn::tool_events::ToolCallBegun {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    input,
+                    input_truncated,
+                    skill: state
+                        .dynamic
+                        .get(&tc.name)
+                        .map(|tool| tool.skill_name().to_string()),
+                }
+            })
+            .collect();
+        self.collaboration.publish_tools_begun(
+            agent_id,
+            crate::turn::tool_events::ToolBatchBegun { iter, calls },
+        );
     }
 
     async fn wait_for_mailbox_for_name(&self, team_name: &str, name: &str, timeout_ms: u64) {
@@ -1259,17 +1394,53 @@ impl AgentToolRuntime {
         self.collaboration.execution_list_payload().await
     }
 
-    /// 全部后台子 agent 执行的快照（桌面版「Agent 状态」面板用）。
+    /// 全部后台子 agent 执行的快照（桌面版「Agent 状态 / 任务概览」面板用；条目与直播
+    /// `snapshot` 事件同形，比模型可见的 AgentStatus 列表多 UI 字段）。
     ///
-    /// 返回 `{executions: [{agent_id, state, progress, goal, ...}], total, truncated}`；
-    /// 只覆盖后台/异步执行——前台并行子 agent 在父回合内同步运行，
+    /// 返回 `{executions: [{agent_id, name, state, progress, goal, usage, started_at, ...}],
+    /// total, truncated}`；只覆盖后台/异步执行——前台并行子 agent 在父回合内同步运行，
     /// 其进度体现在父回合的对话状态条中。
     pub async fn executions_payload(&self) -> Value {
-        self.collaboration.execution_list_payload().await
+        self.collaboration.execution_list_payload_ui().await
     }
 
-    /// 清空全部已终态的后台执行记录（登记表 + journal 事件流），返回清除条数。
-    /// 非终态（排队/运行/等待/取消中）是活任务，一律保留；会话不受任何影响。
+    /// 单条执行的详情（`execution` 完整快照含 spec / handoff / error / usage、`events`
+    /// 尾部事件、`cancellable` / `resumable`、`inbox_pending`、`summary` 列表级条目）；
+    /// 未知 id 返回 None。
+    pub async fn execution_detail(&self, agent_id: &str) -> Option<Value> {
+        self.collaboration.execution_detail_payload(agent_id).await
+    }
+
+    /// 订阅执行登记表直播（宿主 UI 事件桥）。订阅方滞后（`Lagged`）时应重拉全量
+    /// （[`Self::executions_payload`]）对齐，事件只是加速。
+    pub fn subscribe_execution_updates(&self) -> tokio::sync::broadcast::Receiver<ExecutionUpdate> {
+        self.collaboration.subscribe_updates()
+    }
+
+    /// 用户向正在跑的子代理插话（宿主 UI「和它对话」）：进入该执行的收件箱，子代理在
+    /// 下一个安全点读入；消息同时落 transcript（由子代理消费时写入，保证顺序与它实际
+    /// 看到的一致）。拒绝条件见 `CollaborationState::post_execution_message`。
+    pub async fn post_execution_message(&self, agent_id: &str, text: &str) -> Result<(), String> {
+        self.collaboration
+            .post_execution_message(agent_id, text)
+            .await
+    }
+
+    /// 宿主 UI 的取消按钮：与 AgentCancel 工具同一路径（置 Cancelling、触发取消句柄）。
+    pub async fn request_execution_cancel(
+        &self,
+        agent_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.collaboration
+            .request_cancellation(agent_id, reason)
+            .await
+    }
+
+    /// 清空全部已终态的后台执行记录：登记表里的终态记录 + 登记表窗口之外库里的终态流，
+    /// 都连同子代理 transcript（`subagent` 通道会话）一起删，再回收孤儿 transcript。
+    /// 返回登记表里清掉的条数（UI 上看得见的那些）。非终态（排队/运行/等待/取消中）是
+    /// 活任务，一律保留；用户会话不受影响。
     pub async fn clear_finished_executions(&self) -> usize {
         self.collaboration.clear_finished_executions().await
     }
@@ -1614,7 +1785,23 @@ impl AgentToolRuntime {
             );
         }
 
-        let mut messages = vec![Message::plain(Role::User, prompt)];
+        let task_prompt = Message::plain(Role::User, prompt);
+        // 登记在册的执行：完整运行记录按前台会话同形落 transcript（宿主 UI 回放）。
+        // 续跑（AgentResume）时记录里已有上一轮的行：任务书不重复落，只落一条续跑标记。
+        if let Some(control) = control {
+            if self.transcript_has_rows(&control.agent_id) {
+                self.persist_transcript_message(
+                    &control.agent_id,
+                    &Message::plain(Role::User, SUBAGENT_RESUME_MARKER),
+                );
+            } else {
+                self.persist_transcript_message(&control.agent_id, &task_prompt);
+            }
+        }
+        let mut messages = vec![task_prompt];
+        // 用户插话已读入、模型尚未以「继续干活」回应：此时的纯文本回复是对用户的回应，
+        // 不是最终结果（否则一句「进展如何」就会让任务提前收尾）。
+        let mut interjection_pending = false;
         // 内核携带子 Agent 适配器：附加闸门 = 团队任务未完成不得提前收尾。
         let mut run = Run::with_adapter(
             &spec.task,
@@ -1634,8 +1821,14 @@ impl AgentToolRuntime {
                     media_publish_attempted: state.media_publish_attempted,
                 });
             }
-            self.append_current_mailbox_to_context(spec, &mut messages, state)
+            self.append_current_mailbox_to_context(spec, control, &mut messages, state)
                 .await;
+            if self
+                .append_execution_inbox_to_context(control, &mut messages)
+                .await
+            {
+                interjection_pending = true;
+            }
 
             if let Some(control) = control {
                 self.transition_execution(
@@ -1927,13 +2120,26 @@ impl AgentToolRuntime {
                 completed_steps: iter,
                 media_publish_attempted: state.media_publish_attempted,
             })?;
-            // 安全点：团队消息可能在模型推理期间到达。此时旧候选尚未持久化，也未
-            // 执行工具；先消费新消息并重新推理，避免角色在漏看挑战、shutdown_request
+            // token 用量先记账再进安全点：下面的 continue 分支会丢弃这次结果，但它消耗
+            // 的 token 是真实发生的。
+            if let Some(control) = control {
+                self.collaboration
+                    .record_model_usage(&control.agent_id, outcome.usage)
+                    .await;
+            }
+            // 安全点：团队消息 / 用户插话可能在模型推理期间到达。此时旧候选尚未持久化，
+            // 也未执行工具；先消费新消息并重新推理，避免角色在漏看挑战、shutdown_request
             // 或后台完成回执的情况下提前结束或执行过期动作。
-            if self
-                .append_current_mailbox_to_context(spec, &mut messages, state)
-                .await
-            {
+            let mailbox_updated = self
+                .append_current_mailbox_to_context(spec, control, &mut messages, state)
+                .await;
+            let inbox_updated = self
+                .append_execution_inbox_to_context(control, &mut messages)
+                .await;
+            if inbox_updated {
+                interjection_pending = true;
+            }
+            if mailbox_updated || inbox_updated {
                 continue;
             }
             if control.is_some_and(|control| control.cancel.is_cancelled()) {
@@ -1964,6 +2170,36 @@ impl AgentToolRuntime {
             }
 
             if !outcome.wants_tools() {
+                // transcript：正文 + 思考块（无 tool_calls 时 build_assistant_message 不会失败）。
+                if let Some(control) = control {
+                    if let Ok(reply) = build_assistant_message(&outcome) {
+                        self.persist_transcript_message(&control.agent_id, &reply);
+                    }
+                }
+                // 用户插话后的首条纯文本回复按「对话回应」处理而不是最终结果：回复已经
+                // 展示给用户，提醒模型任务未完成就继续；确已完成时它会再返回一次结果
+                // （多一次模型调用），不能反过来让一句问候提前结束任务。最后一次迭代
+                // 不再兜底——继续也只会以达到上限收场。空正文（预算耗在思考上等）不算
+                // 回应：不能把空 assistant 行推进上下文（部分 provider 直接 400），仍交
+                // 给下面的完成闸门按原路径处理。
+                if interjection_pending
+                    && iter + 1 < spec.max_tool_iter
+                    && !outcome.text.trim().is_empty()
+                {
+                    interjection_pending = false;
+                    messages.push(Message::plain(Role::Assistant, outcome.text.clone()));
+                    let nudge = Message::plain(
+                        Role::User,
+                        "Your reply has been shown to the user. If the delegated task is not \
+                         finished yet, continue working on it now (call tools as needed); if it \
+                         is finished, return the final result.",
+                    );
+                    if let Some(control) = control {
+                        self.persist_transcript_message(&control.agent_id, &nudge);
+                    }
+                    messages.push(nudge);
+                    continue;
+                }
                 // 媒体认领闸门 + 完成闸门统一由内核裁决；pending marker 原地复核。
                 // 交付文本含运行时披露块（仍未解决的副作用错误）——handoff 必须把它
                 // 带回父代理，否则子代理侧的过程错误在任务边界上静默丢失。
@@ -1986,7 +2222,11 @@ impl AgentToolRuntime {
                             });
                         }
                         messages.push(Message::plain(Role::Assistant, outcome.text));
-                        messages.push(Message::plain(Role::User, reason));
+                        let gate_feedback = Message::plain(Role::User, reason);
+                        if let Some(control) = control {
+                            self.persist_transcript_message(&control.agent_id, &gate_feedback);
+                        }
+                        messages.push(gate_feedback);
                         continue;
                     }
                     // 未解决错误披露作为独立状态随结果传递：handoff 结构化渲染与
@@ -2042,6 +2282,8 @@ impl AgentToolRuntime {
                     completed_steps: iter + 1,
                     media_publish_attempted: state.media_publish_attempted,
                 })?;
+            // 模型以动作回应了插话（回应在随附文字里），不再需要纯文本兜底。
+            interjection_pending = false;
             if let LoopDecision::Trip {
                 fingerprints,
                 hard_stop,
@@ -2063,6 +2305,17 @@ impl AgentToolRuntime {
                 }
                 let tool_result = build_loop_circuit_result(&outcome, &fingerprints);
                 run.record_tool_results(&outcome, &tool_result);
+                if let Some(control) = control {
+                    // 熔断合成结果同样落 transcript（前台同款）：用户能看到这轮被拦下。
+                    let metas =
+                        rclaw_store::ToolCallMetaRecord::from_result_blocks(&tool_result.content);
+                    self.persist_transcript_tool_chain(
+                        &control.agent_id,
+                        &assistant,
+                        &tool_result,
+                        &metas,
+                    );
+                }
                 messages.push(assistant);
                 messages.push(tool_result);
                 continue;
@@ -2097,6 +2350,8 @@ impl AgentToolRuntime {
                         state.media_publish_attempted,
                     )
                 })?;
+                // 在跑的工具行直播（落库后由 transcript 游标事件接替）。
+                self.publish_tools_begun(&control.agent_id, (iter + 1) as u32, &outcome, state);
             }
             let tool_future = execute_subagent_tools(
                 &outcome,
@@ -2142,6 +2397,14 @@ impl AgentToolRuntime {
                 state.accept_validated_marker(marker);
             }
             run.record_tool_results(&outcome, &tool_execution.tool_result);
+            if let Some(control) = control {
+                self.persist_transcript_tool_chain(
+                    &control.agent_id,
+                    &assistant,
+                    &tool_execution.tool_result,
+                    &tool_execution.call_metas,
+                );
+            }
             messages.push(assistant);
             messages.push(tool_execution.tool_result);
             if let Some(skill_context) = tool_execution.skill_context_message {
