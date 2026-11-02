@@ -227,10 +227,16 @@ function ExecutionPage({
     onBack();
     if (agentId === null) return;
     // 列表容器在这次更新提交后才重新可见（visibility:hidden 的元素不可聚焦），下一帧再聚焦。
+    // 那张卡片已被清掉（详情里看到「已被清除」后返回）就退到列表第一张，键盘翻页仍有锚点；
+    // 一张都没有则无处可聚焦，也无可滚动。preventScroll 保住列表滚动位置——卡片若被新入表
+    // 的执行顶出可视区，焦点环会暂时不可见，接受这个取舍。
     requestAnimationFrame(() => {
-      listRef.current
-        ?.querySelector<HTMLElement>(`[data-agent-id="${CSS.escape(agentId)}"]`)
-        ?.focus({ preventScroll: true });
+      const list = listRef.current;
+      if (!list) return;
+      const card =
+        list.querySelector<HTMLElement>(`[data-agent-id="${CSS.escape(agentId)}"]`) ??
+        list.querySelector<HTMLElement>("[data-agent-id]");
+      card?.focus({ preventScroll: true });
     });
   };
   const showingDetail = selectedAgentId !== null;

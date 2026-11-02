@@ -26,7 +26,7 @@ export default function TaskPanel({
   /** 面板宽度（px；App 侧拖拽手柄调整并持久化）。 */
   width: number;
 }) {
-  const { executions } = useAgentExecutions(agentReady);
+  const { executions, truncated } = useAgentExecutions(agentReady);
   const [usage, setUsage] = useState<UsageSnapshot | null>(null);
   const [clearing, setClearing] = useState(false);
   const counts = countByState(executions);
@@ -91,7 +91,7 @@ export default function TaskPanel({
         <div className="flex items-center gap-1">
           <button
             onClick={clearHistory}
-            disabled={!agentReady || clearing || finishedCount === 0}
+            disabled={!agentReady || clearing || (finishedCount === 0 && !truncated)}
             title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
             className="rounded-md px-1.5 text-xs text-gray-500 transition hover:bg-[#1a1f29] hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-40"
           >
