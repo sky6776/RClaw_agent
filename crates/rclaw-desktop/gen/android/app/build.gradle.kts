@@ -51,6 +51,16 @@ android {
     val releaseKeystoreFile = file("rclaw-release.keystore")
     val releaseKeystorePassword = System.getenv("RCLAW_KEYSTORE_PASSWORD")
     val hasReleaseSigning = releaseKeystoreFile.exists() && !releaseKeystorePassword.isNullOrBlank()
+    // 应用内更新的签名不变量：系统只允许「同包名 + 同签名」覆盖安装，否则安装器
+    // 报「软件包与现有软件包存在冲突」，用户只能卸载重装（本地配置全丢）。
+    // 远端 release APK 由 CI 用 secrets 里的 debug keystore 签名（= 本机
+    // ~/.android/debug.keystore）；本机 debug 包默认用各自机器的 debug
+    // keystore，换一台机器编出来就覆盖不上。这里允许把同一份 keystore 放到
+    // app/rclaw-update.keystore（不进 git），debug 与未配置 release keystore 的
+    // release 都优先用它，保证本机/多机与 CI 出的包始终可互相覆盖升级。
+    val updateKeystoreFile = file("rclaw-update.keystore")
+    val updateKeystorePassword = System.getenv("RCLAW_UPDATE_KEYSTORE_PASSWORD") ?: "android"
+    val hasUpdateSigning = updateKeystoreFile.exists()
     signingConfigs {
         if (hasReleaseSigning) {
             create("release") {
@@ -60,9 +70,26 @@ android {
                 keyPassword = releaseKeystorePassword
             }
         }
+        if (hasUpdateSigning) {
+            create("update") {
+                storeFile = updateKeystoreFile
+                storePassword = updateKeystorePassword
+                keyAlias = System.getenv("RCLAW_UPDATE_KEY_ALIAS") ?: "androiddebugkey"
+                keyPassword = updateKeystorePassword
+            }
+        }
+    }
+    // 本机所有安装包统一签名：有 release keystore 就是发布链本身；否则用更新
+    // 通道 keystore；两者都没有才退回本机默认 debug keystore（build-android-apk.bat
+    // 会告警：跨机/与 CI 覆盖安装可能冲突）。
+    val localSigning = when {
+        hasReleaseSigning -> signingConfigs.getByName("release")
+        hasUpdateSigning -> signingConfigs.getByName("update")
+        else -> signingConfigs.getByName("debug")
     }
     buildTypes {
         getByName("debug") {
+            signingConfig = localSigning
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = true
@@ -74,11 +101,7 @@ android {
         getByName("release") {
             // 全新克隆没有本机 keystore/口令（均不进 git）：退回 debug 签名，
             // 保证 release 包编译即可安装（目标：git 拉下来编译完直接能用）。
-            signingConfig = if (hasReleaseSigning) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = localSigning
             optimization {
                enable = true
             }

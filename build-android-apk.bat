@@ -72,10 +72,11 @@ if "%RCLAW_BUILD_PYTHON%"=="" (
 )
 set "PATH=%JAVA_HOME%\bin;%ANDROID_HOME%\platform-tools;%PATH%"
 
-REM Rust: 本机可能只装了 rustup toolchain，而 ~/.cargo/bin 缺 cargo.exe shim
-REM （只有 cargo-ndk 等子命令）。先把 cargo bin 放回 PATH，再用 where 检查；
-REM 仍找不到时回退到 rustup stable toolchain 的真实 bin，避免构建直接报
-REM 「'cargo' 不是内部或外部命令」。
+REM Rust: some PCs only have a rustup toolchain and no cargo.exe shim in
+REM ~/.cargo/bin (that dir only holds subcommands like cargo-ndk). Put the
+REM cargo bin dir back on PATH, then check with where; fall back to the real
+REM bin dir of the rustup stable toolchain so the build does not fail with
+REM "(cargo) not recognized".
 if exist "%USERPROFILE%\.cargo\bin" set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 where cargo >nul 2>nul
 if errorlevel 1 (
@@ -89,6 +90,19 @@ if errorlevel 1 (
 
 set "REPO=%~dp0"
 if "%REPO:~-1%"=="\" set "REPO=%REPO:~0,-1%"
+
+REM Update-channel signing: the in-app updater can only overwrite an app signed
+REM with the SAME key. CI signs the published release APK with the debug
+REM keystore stored in the ANDROID_DEBUG_KEYSTORE_BASE64 secret; copy that same
+REM keystore to gen\android\app\rclaw-update.keystore (kept out of git) so
+REM builds from ANY machine share the published signature. Without it gradle
+REM falls back to this PC's ~/.android/debug.keystore and the in-app update
+REM fails with "application not installed: package conflicts with existing
+REM package" (the only fix is uninstall + reinstall, losing local config).
+if not exist "%REPO%\crates\rclaw-desktop\gen\android\app\rclaw-update.keystore" (
+    echo [WARN] rclaw-update.keystore missing: signed with this PC's ~/.android/debug.keystore.
+    echo [WARN] In-app update from the published release APK may fail with a package conflict.
+)
 
 REM tauri-build only generates gen/android/tauri.settings.gradle and
 REM app/tauri.build.gradle.kts when TAURI_ANDROID_PROJECT_PATH is set;

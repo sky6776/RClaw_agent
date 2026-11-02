@@ -363,7 +363,7 @@ jobs:
           DEX_DUMP="$(mktemp)"
           trap 'rm -f "$DEX_DUMP"' EXIT
           unzip -p "$APK" 'classes*.dex' > "$DEX_DUMP"
-          for method in installUpdate runScript openUrl updateRuntimeStatus \
+          for method in installUpdate verifyUpdateApk runScript openUrl updateRuntimeStatus \
             renderPdf renderPdfPage pageCount extractVideoFrames; do
             grep -a "$method" "$DEX_DUMP" >/dev/null || {
               echo "::error::R8 剥离/改了反射桥方法 $method（proguard-rules.pro 的 keep 规则失效？）"

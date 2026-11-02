@@ -45,6 +45,9 @@ skills/ai-berkshire/references/
 skills/ai-berkshire/local/
 skills/glm-image-gen/references/
 crates/rclaw-desktop/gen/android/app/rclaw-release.keystore
+# 更新通道签名 keystore：与 CI 的 ANDROID_DEBUG_KEYSTORE_BASE64 同一份，debug 与
+# release 共用（应用内更新要求同签名覆盖安装）；不进 git，机器间手工同步。
+crates/rclaw-desktop/gen/android/app/rclaw-update.keystore
 
 # whisper.cpp 上游克隆与构建产物（scripts/build-whisper.bat 首次自动拉取编译）
 third_party/whisper.cpp/

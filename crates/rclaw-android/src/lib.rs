@@ -167,6 +167,24 @@ pub fn install_update(apk_abs: &str) -> Result<()> {
     }
 }
 
+/// 应用内更新预检：待装 APK 必须与已安装包同包名、同签名，且 versionCode 不
+/// 降级——系统安装器对这几类问题分别只报「软件包与现有软件包存在冲突」/
+/// 「版本降级」，用户看不出是签名问题，也不知道重装会丢本地配置。
+/// 返回 `Ok("ok")`；否则返回可直接展示的中文原因。
+pub fn verify_update_apk(apk_abs: &str) -> Result<String> {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::verify_update_apk(apk_abs)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = apk_abs;
+        Err(anyhow!(
+            "verify_update_apk 仅在 Android 宿主可用（桌面走自替换脚本）"
+        ))
+    }
+}
+
 /// CDP 浏览器会话就绪信息（Java start JSON 带回；pid 供拼 DevTools socket 名，
 /// 尺寸为 WebView 离屏布局的真实 Display CSS 视口，指纹一致性记录用）。
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -1561,6 +1579,34 @@ pub mod jni_bridge {
             ));
         }
         Ok(())
+    }
+
+    /// 应用内更新预检：调 NativeBridge.verifyUpdateApk（签名/包名/versionCode
+    /// 比对在 Java 侧用 PackageManager 完成，这里只透传结果字符串）。
+    pub(super) fn verify_update_apk(apk_abs: &str) -> Result<String> {
+        let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
+        let mut env = vm
+            .attach_current_thread()
+            .context("附加更新预检线程到 JavaVM 失败")?;
+        let class =
+            native_bridge_class(&mut env).map_err(|e| anyhow!("获取 NativeBridge 类失败: {e}"))?;
+        let jpath = env.new_string(apk_abs)?;
+        let result = env
+            .call_static_method(
+                class,
+                "verifyUpdateApk",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&JObject::from(jpath))],
+            )
+            .map_err(|error| {
+                let _ = env.exception_clear();
+                anyhow!("调用 NativeBridge.verifyUpdateApk 失败: {error}")
+            })?;
+        let value = result
+            .l()
+            .map_err(|error| anyhow!("读取 NativeBridge.verifyUpdateApk 返回值失败: {error}"))?;
+        let value = JString::from(value);
+        Ok(env.get_string(&value)?.to_string_lossy().into_owned())
     }
 
     /// 前台服务通知状态更新（Rust android_status 推送 → NativeBridge。

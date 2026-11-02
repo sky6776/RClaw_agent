@@ -57,6 +57,121 @@ public final class NativeBridge {
         }
     }
 
+    /** 应用内更新预检（Rust verify_update_apk 的 JNI 入口）：安装前本地校验
+     *  待装 APK 与已安装包的签名/包名/versionCode。系统安装器对「同包名不同
+     *  签名」只会弹「软件包与现有软件包存在冲突」，用户既看不出是签名问题，
+     *  也不知道继续重装=丢失本地配置——这里提前拦下并给出可操作的原因。
+     *  返回 "ok" 或可直接展示在更新卡片上的中文原因。 */
+    public static String verifyUpdateApk(String absPath) {
+        android.content.Context context = appContext;
+        if (context == null) {
+            return "应用未就绪（宿主上下文未初始化，稍后重试）";
+        }
+        try {
+            java.io.File apk = new java.io.File(absPath);
+            if (!apk.isFile() || apk.length() == 0) {
+                return "更新包不存在或为空（下载可能未完成）";
+            }
+            android.content.pm.PackageManager pm = context.getPackageManager();
+            String self = context.getPackageName();
+            android.content.pm.PackageInfo update = archiveInfo(pm, absPath);
+            if (update == null) {
+                return "更新包无法解析（文件损坏或不是有效 APK）";
+            }
+            if (!self.equals(update.packageName)) {
+                return "更新包不是本应用（包名 " + update.packageName + "，本机 " + self + "）";
+            }
+            android.content.pm.PackageInfo installed = packageInfo(pm, self);
+            if (installed == null) {
+                return "读取已安装版本信息失败";
+            }
+            java.util.List<String> installedCerts = signerSha256(installed);
+            java.util.List<String> updateCerts = signerSha256(update);
+            if (installedCerts.isEmpty()) {
+                android.util.Log.w("NativeBridge", "verifyUpdateApk: installed signers unavailable");
+                return "ok";
+            }
+            if (updateCerts.isEmpty()) {
+                // 个别机型/系统版本解析 APK 归档签名会失败：不误拦，交回系统
+                // 安装器兜底（最坏退化为原来的「冲突」提示）。
+                android.util.Log.w("NativeBridge", "verifyUpdateApk: archive signers unavailable");
+                return "ok";
+            }
+            if (!new java.util.HashSet<>(installedCerts).containsAll(updateCerts)) {
+                return "更新包与已安装版本的签名不一致，系统会拒绝覆盖安装（报「软件包与现有软件包存在冲突」）。"
+                        + "远端包与本地自编译包必须用同一份签名证书：本地 debug 包请配置与发布共用"
+                        + "的 app/rclaw-update.keystore 后重编，或先卸载重装（本地配置会丢失）。";
+            }
+            long installedCode = versionCode(installed);
+            long updateCode = versionCode(update);
+            if (updateCode < installedCode) {
+                return "更新包 versionCode（" + updateCode + "）低于已安装版本（" + installedCode + "），系统会拒绝降级安装";
+            }
+            return "ok";
+        } catch (Exception error) {
+            android.util.Log.e("NativeBridge", "verifyUpdateApk failed", error);
+            return "更新包校验失败: " + error;
+        }
+    }
+
+    private static android.content.pm.PackageInfo packageInfo(
+            android.content.pm.PackageManager pm, String pkg) {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                return pm.getPackageInfo(pkg, android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES);
+            }
+            // API 26/27 走旧签名字段（GET_SIGNATURES，API 33 起 deprecated）。
+            return pm.getPackageInfo(pkg, android.content.pm.PackageManager.GET_SIGNATURES);
+        } catch (android.content.pm.PackageManager.NameNotFoundException error) {
+            return null;
+        }
+    }
+
+    /** 解析 APK 归档的 PackageInfo（含签名信息）。 */
+    private static android.content.pm.PackageInfo archiveInfo(
+            android.content.pm.PackageManager pm, String absPath) {
+        int flags;
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            flags = android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES;
+        } else {
+            flags = android.content.pm.PackageManager.GET_SIGNATURES;
+        }
+        return pm.getPackageArchiveInfo(absPath, flags);
+    }
+
+    private static long versionCode(android.content.pm.PackageInfo info) {
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            return info.getLongVersionCode();
+        }
+        return info.versionCode;
+    }
+
+    /** 当前签名证书的 SHA-256（小写 hex）；多签名时返回全部。 */
+    private static java.util.List<String> signerSha256(android.content.pm.PackageInfo info)
+            throws java.security.NoSuchAlgorithmException {
+        android.content.pm.Signature[] certs;
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            android.content.pm.SigningInfo signing = info.signingInfo;
+            certs = signing == null ? null : signing.getApkContentsSigners();
+        } else {
+            certs = info.signatures;
+        }
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (certs == null) {
+            return out;
+        }
+        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+        for (android.content.pm.Signature cert : certs) {
+            byte[] hash = digest.digest(cert.toByteArray());
+            StringBuilder hex = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                hex.append(String.format("%02x", b & 0xff));
+            }
+            out.add(hex.toString());
+        }
+        return out;
+    }
+
     /** 会话内点开工作区媒体（视频/图片）：经 FileProvider 授只读 URI，
      *  拉起系统播放器/查看器（Rust open_media 的 JNI 入口）。
      *  relativePath 是相对 agent/ 的路径（如 media/skilltest_fish.mp4）。 */

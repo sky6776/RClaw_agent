@@ -243,6 +243,20 @@ pub async fn update_download_install(app: AppHandle) -> Result<(), String> {
     );
     #[cfg(all(target_os = "android", feature = "apk-host"))]
     {
+        // 系统安装器对「同包名不同签名」只报「软件包与现有软件包存在冲突」，
+        // 用户看不出原因（也容易去卸载重装→本地配置全丢）。下载完先在本地
+        // 校验签名/包名/versionCode：不通过就删包并返回可操作的中文原因。
+        match rclaw_android::verify_update_apk(dest.to_string_lossy().as_ref()) {
+            Ok(reason) if reason == "ok" => {}
+            Ok(reason) => {
+                let _ = tokio::fs::remove_file(&dest).await;
+                return Err(reason);
+            }
+            Err(error) => {
+                // 预检通道本身失败（JNI 桥异常等）不阻断：交回系统安装器兜底。
+                tracing::warn!("更新包签名预检失败，跳过: {error}");
+            }
+        }
         rclaw_android::install_update(dest.to_string_lossy().as_ref())
             .map_err(|e| format!("拉起系统安装器失败: {e}"))?;
     }

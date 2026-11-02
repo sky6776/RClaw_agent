@@ -94,6 +94,7 @@ build-android-apk-d.bat            :: 另一台机器的工具链路径包装示
 - **工具链**：需自备 Android 工具链（JDK 17 / SDK / NDK / Gradle），用环境变量 `ANDROID_TOOLCHAIN` 指定根目录；`RCLAW_BUILD_PYTHON` 覆盖 Chaquopy 构建用 Python。
 - **内置能力**：Chaquopy 内置 Python 运行时（技能脚本可直接跑）、whisper 语音模型资产、gbrain 进程内集成（数据自动归一化到应用私有目录）；首次启动自动解包内置技能。
 - **签名**：release 签名读取 `gen\android\app\rclaw-release.keystore`（不进 git）+ 环境变量 `RCLAW_KEYSTORE_PASSWORD`；二者缺任一时自动回退 debug 签名，保证全新克隆构建即可安装。
+- **签名一致性（应用内更新）**：Android 只允许「同包名 + 同签名」覆盖安装，否则系统安装器报「软件包与现有软件包存在冲突」，只能卸载重装（本地配置全丢）。CI 的 release APK 用仓库 secret `ANDROID_DEBUG_KEYSTORE_BASE64` 里的 debug keystore 签名；本机把**同一份** keystore 复制为 `gen\android\app\rclaw-update.keystore`（不进 git）后，debug 与 release 构建都会优先用它，多台机器 / 本机 / CI 出的包可以互相覆盖升级。应用内更新在拉起安装器前还会经 `NativeBridge.verifyUpdateApk` 预检包名、签名与 versionCode，不一致时直接给出可读原因，而不是让用户撞上系统弹窗。
 - **安装**：`adb install -r <apk>`；vivo 等对 adb 直装不自动放图标的机型，可用 `scripts/adb_install_confirm.py` 走安装器 UI 路径并自动处理确认弹窗（`RCLAW_ADB` 可指定 adb 路径）。
 
 ## Termux（手机直接跑 CLI）
