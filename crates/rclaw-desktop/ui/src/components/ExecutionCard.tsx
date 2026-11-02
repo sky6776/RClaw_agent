@@ -82,6 +82,7 @@ export default function ExecutionCard({
   return (
     <button
       type="button"
+      data-agent-id={e.agent_id}
       onClick={() => onOpen(e.agent_id)}
       title={e.goal}
       className={`block w-full text-left transition hover:border-[#3a4150] ${

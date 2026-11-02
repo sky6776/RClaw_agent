@@ -289,9 +289,14 @@ export function subscribeAgentEvents(
   };
 }
 
-/** 本地乐观更新：清除历史后立即过滤终态记录（事件 / 下次拉取对齐真实状态）。 */
+/** 本地乐观更新：清除历史后立即过滤终态记录（事件 / 下次拉取对齐真实状态）。
+ *  `truncated` 一并清掉：清除把窗口外的终态流也删了，剩下的活任务不会再被截断；
+ *  真要是还截断，紧随其后的全量拉取会把它纠正回来。 */
 export function dropTerminalLocally() {
-  setState({ executions: state.executions.filter((e) => !TERMINAL_STATES.has(stateOf(e))) });
+  setState({
+    executions: state.executions.filter((e) => !TERMINAL_STATES.has(stateOf(e))),
+    truncated: false,
+  });
 }
 
 // ---------------------------------------------------------------------------

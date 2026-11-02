@@ -56,7 +56,7 @@ export default function TaskOverviewPanel({
         <div className="flex items-center gap-3">
           <button
             onClick={clearHistory}
-            disabled={!agentReady || clearing || counts.finished === 0}
+            disabled={!agentReady || clearing || (counts.finished === 0 && !truncated)}
             title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
             className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-[#1c2230] disabled:cursor-not-allowed disabled:opacity-40"
           >

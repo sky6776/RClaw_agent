@@ -207,34 +207,41 @@ function ResizeHandle({ onDrag }: { onDrag: (clientX: number) => void }) {
   );
 }
 
-/** Agent / 任务概览页：列表面板（children）+ 盖在上面的执行详情。进详情时列表面板仍挂着
- *  （只是隐藏），返回不重新加载、滚动位置不丢；详情按 agentId 作 key，切换执行时整页重建，
- *  不复用旧记录的状态。返回时把焦点还给列表容器——详情卸载后焦点否则落到 body。 */
+/** Agent / 任务概览页：列表面板（children，按「是否被盖住」渲染）+ 盖在上面的执行详情。
+ *  进详情时列表面板仍挂着（只是隐藏），返回不重新加载、滚动位置不丢；详情按 agentId 作
+ *  key，切换执行时整页重建，不复用旧记录的状态。返回时把焦点还给刚才点开的那张卡片
+ *  （`data-agent-id`）：详情卸载后焦点否则落到 body；卡片在面板的滚动容器里，键盘翻页
+ *  仍然可用——列表容器本身不做可聚焦（可聚焦祖先会截住键盘滚动）。卡片已被清掉就不聚焦。 */
 function ExecutionPage({
   selectedAgentId,
-  onSelect,
+  onBack,
   children,
 }: {
   selectedAgentId: string | null;
-  onSelect: (agentId: string | null) => void;
-  children: ReactNode;
+  onBack: () => void;
+  children: (hidden: boolean) => ReactNode;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const back = () => {
-    onSelect(null);
+    const agentId = selectedAgentId;
+    onBack();
+    if (agentId === null) return;
     // 列表容器在这次更新提交后才重新可见（visibility:hidden 的元素不可聚焦），下一帧再聚焦。
-    requestAnimationFrame(() => listRef.current?.focus({ preventScroll: true }));
+    requestAnimationFrame(() => {
+      listRef.current
+        ?.querySelector<HTMLElement>(`[data-agent-id="${CSS.escape(agentId)}"]`)
+        ?.focus({ preventScroll: true });
+    });
   };
   const showingDetail = selectedAgentId !== null;
   return (
     <div className="relative h-full">
       <div
         ref={listRef}
-        tabIndex={-1}
-        className={`outline-none ${showingDetail ? "invisible absolute inset-0 overflow-hidden" : "h-full"}`}
+        className={showingDetail ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
         aria-hidden={showingDetail}
       >
-        {children}
+        {children(showingDetail)}
       </div>
       {selectedAgentId !== null && (
         <AgentExecutionDetail key={selectedAgentId} agentId={selectedAgentId} onBack={back} />
@@ -2329,15 +2336,15 @@ ${event.payload.command}
         {agentState === "ready" && page === "files" && <FilePanel onError={setErrorToast} />}
         {/* Agent / 任务概览：列表 + 盖在上面的执行详情（见 ExecutionPage）。 */}
         {agentState === "ready" && page === "agents" && (
-          <ExecutionPage selectedAgentId={selectedAgentId} onSelect={setSelectedAgentId}>
-            <AgentsPanel agentReady hidden={selectedAgentId !== null} onOpen={setSelectedAgentId} />
+          <ExecutionPage selectedAgentId={selectedAgentId} onBack={() => setSelectedAgentId(null)}>
+            {(hidden) => <AgentsPanel agentReady hidden={hidden} onOpen={setSelectedAgentId} />}
           </ExecutionPage>
         )}
         {agentState === "ready" && page === "evolution" && <EvolutionPanel agentReady />}
         {agentState === "ready" && page === "cron" && <CronPanel agentReady />}
         {agentState === "ready" && page === "taskview" && (
-          <ExecutionPage selectedAgentId={selectedAgentId} onSelect={setSelectedAgentId}>
-            <TaskOverviewPanel agentReady hidden={selectedAgentId !== null} onOpen={setSelectedAgentId} />
+          <ExecutionPage selectedAgentId={selectedAgentId} onBack={() => setSelectedAgentId(null)}>
+            {(hidden) => <TaskOverviewPanel agentReady hidden={hidden} onOpen={setSelectedAgentId} />}
           </ExecutionPage>
         )}
         {agentState === "ready" && page === "config" && (
