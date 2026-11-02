@@ -1169,35 +1169,42 @@ impl CollaborationState {
     /// 级联要把满足 `filter` 的这些流连同 transcript 一并清掉。只动终态流；非终态流都在
     /// 登记表里（启动时全部装载），不在登记表的非终态流只可能是正在入表的新执行，不碰。
     /// 返回清掉的流数。
+    ///
+    /// 时序：先一条 SQL 取每条流的最后一条事件，【之后】再取登记表快照。终态事件只会由
+    /// 登记表里的记录持锁写出（[`Self::transition_execution`]），所以查询里看到的任何终态
+    /// 流，其记录要么此刻仍在登记表（快照里有、跳过），要么已被
+    /// [`Self::remove_terminal_executions`] 连流一起删掉（再删一次是空操作）——「枚举之后
+    /// 才入表、随即终结」的新执行不会被误当成窗口外历史。删除前再按登记表复核一次，与
+    /// [`Self::sweep_orphan_transcripts`] 口径一致。
     async fn sweep_unregistered_terminal_executions(
         &self,
         filter: impl Fn(&ExecutionSnapshot) -> bool,
     ) -> usize {
-        let registered: BTreeSet<String> = self.executions.lock().await.keys().cloned().collect();
-        let streams = match self.journal.streams(JOURNAL_EXEC_LOG) {
-            Ok(streams) => streams,
+        // 会话删除 / 归档级联每次都走这里：一条 SQL，不做 N+1 点查（历史流可达上千条）。
+        let latest = match self.journal.latest_per_stream(JOURNAL_EXEC_LOG) {
+            Ok(latest) => latest,
             Err(error) => {
                 tracing::warn!("枚举子 agent 执行事件流失败，跳过窗口外清理: {error}");
                 return 0;
             }
         };
+        if latest.is_empty() {
+            return 0;
+        }
+        let registered: BTreeSet<String> = self.executions.lock().await.keys().cloned().collect();
         let mut swept = 0;
-        for stream in streams {
+        for (stream, value) in latest {
             if registered.contains(&stream) {
                 continue;
             }
-            let last = match self.journal.latest(JOURNAL_EXEC_LOG, &stream) {
-                Ok(Some(value)) => serde_json::from_value::<ExecutionLogEntry>(value).ok(),
-                Ok(None) => None,
-                Err(error) => {
-                    tracing::warn!("读取子 agent 执行事件流 {stream} 失败，跳过: {error}");
-                    None
-                }
-            };
-            let Some(last) = last else {
+            // 解析不了的流（schema 漂移 / 损坏）不动：多进程共用一个库，可能是别的版本在写。
+            let Ok(last) = serde_json::from_value::<ExecutionLogEntry>(value) else {
                 continue;
             };
             if !last.snapshot.state.is_terminal() || !filter(&last.snapshot) {
+                continue;
+            }
+            if self.executions.lock().await.contains_key(&stream) {
                 continue;
             }
             if let Err(error) = self.journal.delete_stream(JOURNAL_EXEC_LOG, &stream) {

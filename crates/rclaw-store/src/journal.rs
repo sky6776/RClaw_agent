@@ -253,6 +253,37 @@ impl JournalStore {
         })
     }
 
+    /// 某类 journal 每条流的最后一条事件 `(stream, payload)`，流按首次出现顺序。
+    ///
+    /// 一条 SQL 代替「[`Self::streams`] + 逐流 [`Self::latest`]」的 N+1 点查：历史执行流
+    /// 可达上千条，而会话删除级联每次都要扫一遍。payload 不可解析的流告警并跳过，与
+    /// [`Self::latest`] 的策略一致。
+    pub fn latest_per_stream(&self, kind: &str) -> Result<Vec<(String, Value)>> {
+        self.db.with(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT e.stream, e.payload FROM journal_event e \
+                 JOIN (SELECT stream, max(seq) AS seq, min(id) AS first_id \
+                       FROM journal_event WHERE kind = ?1 GROUP BY stream) m \
+                   ON m.stream = e.stream AND m.seq = e.seq \
+                 WHERE e.kind = ?1 ORDER BY m.first_id",
+            )?;
+            let rows = stmt.query_map(params![kind], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (stream, text) = row?;
+                match serde_json::from_str(&text) {
+                    Ok(value) => out.push((stream, value)),
+                    Err(e) => tracing::warn!(
+                        "journal 最新事件解析失败，跳过该流: kind={kind} stream={stream} err={e}"
+                    ),
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// 某类 journal 的全部 stream 名（去重，按首次出现顺序）。
     pub fn streams(&self, kind: &str) -> Result<Vec<String>> {
         self.db.with(|conn| {
@@ -416,6 +447,34 @@ mod tests {
             j.load(JOURNAL_PLAN, "p1").unwrap()
         );
         assert!(j.load_tail(JOURNAL_PLAN, "nope", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_per_stream_returns_each_streams_last_event_in_first_seen_order() {
+        let (_dir, j) = store();
+        // p2 先出现、p1 后出现但事件更多：顺序按首次出现，取值按各自最大 seq。
+        j.append(JOURNAL_EXEC_LOG, "p2", &json!({"e": "p2-1"}))
+            .unwrap();
+        j.append(JOURNAL_EXEC_LOG, "p1", &json!({"e": "p1-1"}))
+            .unwrap();
+        j.append(JOURNAL_EXEC_LOG, "p1", &json!({"e": "p1-2"}))
+            .unwrap();
+        j.append(JOURNAL_EXEC_LOG, "p2", &json!({"e": "p2-2"}))
+            .unwrap();
+        // 其它 kind 的同名流不混进来。
+        j.append(JOURNAL_PLAN, "p1", &json!({"e": "plan"})).unwrap();
+        assert_eq!(
+            j.latest_per_stream(JOURNAL_EXEC_LOG).unwrap(),
+            vec![
+                ("p2".to_string(), json!({"e": "p2-2"})),
+                ("p1".to_string(), json!({"e": "p1-2"})),
+            ]
+        );
+        assert!(j.latest_per_stream(JOURNAL_WORKFLOW).unwrap().is_empty());
+        // 与逐流 latest 一致。
+        for (stream, value) in j.latest_per_stream(JOURNAL_EXEC_LOG).unwrap() {
+            assert_eq!(j.latest(JOURNAL_EXEC_LOG, &stream).unwrap(), Some(value));
+        }
     }
 
     #[test]
