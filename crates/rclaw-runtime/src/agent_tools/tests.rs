@@ -1907,43 +1907,67 @@ async fn clear_finished_and_session_cascade_remove_only_terminal_records() {
     assert_eq!(payload["executions"][0]["agent_id"], "live-1");
 }
 
-/// 绕过登记表直接写一条执行事件流（模拟启动恢复窗口之外、库里残留的历史流），
-/// 并给它落一行 transcript。
-fn seed_unregistered_stream(runtime: &AgentToolRuntime, agent_id: &str, state: ExecutionState) {
+/// 一条历史执行流的最后一条事件：`state` 对应的快照，来源会话为 `(channel, chat_id)`。
+fn history_log_entry(
+    agent_id: &str,
+    state: ExecutionState,
+    channel: &str,
+    chat_id: &str,
+) -> ExecutionLogEntry {
     let now = chrono::Utc::now().to_rfc3339();
     let stage = if state.is_terminal() {
         "finished"
     } else {
         "running"
     };
+    let mut spec = test_spec(&format!("history of {agent_id}"));
+    spec.source_channel = channel.to_string();
+    spec.origin_chat_id = chat_id.to_string();
+    ExecutionLogEntry {
+        event: stage.to_string(),
+        timestamp: now.clone(),
+        snapshot: ExecutionSnapshot {
+            agent_id: agent_id.to_string(),
+            spec,
+            state,
+            progress: ExecutionProgress {
+                completed_steps: 1,
+                total_steps: 1,
+                stage: stage.to_string(),
+            },
+            handoff: None,
+            error: None,
+            validated_media_markers: Vec::new(),
+            media_publish_attempted: false,
+            unrestricted: false,
+            unresolved_disclosure: String::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            recovered: false,
+            started_at: None,
+            finished_at: None,
+            usage: ExecutionUsage::default(),
+        },
+    }
+}
+
+/// 绕过登记表直接写一条执行事件流（模拟启动恢复窗口之外、库里残留的历史流），
+/// 并给它落一行 transcript。
+fn seed_unregistered_stream(runtime: &AgentToolRuntime, agent_id: &str, state: ExecutionState) {
+    seed_unregistered_stream_from(runtime, agent_id, state, "", "");
+}
+
+/// 同 [`seed_unregistered_stream`]，但指定来源会话（会话删除级联按它筛）。
+fn seed_unregistered_stream_from(
+    runtime: &AgentToolRuntime,
+    agent_id: &str,
+    state: ExecutionState,
+    channel: &str,
+    chat_id: &str,
+) {
     append_execution_log(
         &runtime.journal,
-        &ExecutionLogEntry {
-            event: stage.to_string(),
-            timestamp: now.clone(),
-            snapshot: ExecutionSnapshot {
-                agent_id: agent_id.to_string(),
-                spec: test_spec(&format!("history of {agent_id}")),
-                state,
-                progress: ExecutionProgress {
-                    completed_steps: 1,
-                    total_steps: 1,
-                    stage: stage.to_string(),
-                },
-                handoff: None,
-                error: None,
-                validated_media_markers: Vec::new(),
-                media_publish_attempted: false,
-                unrestricted: false,
-                unresolved_disclosure: String::new(),
-                created_at: now.clone(),
-                updated_at: now,
-                recovered: false,
-                started_at: None,
-                finished_at: None,
-                usage: ExecutionUsage::default(),
-            },
-        },
+        &history_log_entry(agent_id, state, channel, chat_id),
     )
     .unwrap();
     runtime
@@ -1954,6 +1978,82 @@ fn seed_unregistered_stream(runtime: &AgentToolRuntime, agent_id: &str, state: E
             &Message::plain(Role::Assistant, format!("transcript of {agent_id}")),
         )
         .unwrap();
+}
+
+#[test]
+fn execution_log_probe_reads_the_same_fields_as_the_full_entry() {
+    // 探针与 ExecutionLogEntry 之间只有字段名约定：任一侧改名，`#[serde(default)]` 会把
+    // 探针字段吞成空串而不是报错——这里把真实事件序列化后用探针读回，逐字段核对。
+    let entry = history_log_entry("probe-me", ExecutionState::Succeeded, "desktop", "main");
+    let value = serde_json::to_value(&entry).unwrap();
+    let probe: ExecutionLogProbe = serde_json::from_value(value).unwrap();
+    assert_eq!(probe.snapshot.state, ExecutionState::Succeeded);
+    assert_eq!(probe.snapshot.spec.source_channel, "desktop");
+    assert_eq!(probe.snapshot.spec.origin_chat_id, "main");
+}
+
+#[tokio::test]
+async fn session_cascade_sweeps_unregistered_terminal_streams_of_that_session_only() {
+    let (runtime, _layout, _registry) = test_runtime_with_provider(Arc::new(PendingProvider));
+    // 窗口外（未登记）的终态流：源自 desktop/main 两条，desktop/other 一条，cli/main
+    // 一条（同 chat_id 不同通道），外加一条 desktop/main 的非终态流（活任务不动）。
+    seed_unregistered_stream_from(
+        &runtime,
+        "main-a",
+        ExecutionState::Succeeded,
+        "desktop",
+        "main",
+    );
+    seed_unregistered_stream_from(
+        &runtime,
+        "main-b",
+        ExecutionState::Failed,
+        "desktop",
+        "main",
+    );
+    seed_unregistered_stream_from(
+        &runtime,
+        "other-a",
+        ExecutionState::Succeeded,
+        "desktop",
+        "other",
+    );
+    seed_unregistered_stream_from(
+        &runtime,
+        "cli-main",
+        ExecutionState::Succeeded,
+        "cli",
+        "main",
+    );
+    seed_unregistered_stream_from(
+        &runtime,
+        "main-live",
+        ExecutionState::Running,
+        "desktop",
+        "main",
+    );
+    assert_eq!(runtime.execution_list_payload().await["total"], 0);
+
+    // 探针按 spec 取值筛：字段名若漂移成空串，这里一条都清不掉。
+    let removed = runtime.forget_session_executions("desktop", "main").await;
+    assert_eq!(removed, 2, "登记表外清掉的流数计入会话级联返回值");
+    for agent_id in ["main-a", "main-b"] {
+        assert!(
+            !has_exec_stream(&runtime, agent_id),
+            "{agent_id} 应被级联清除"
+        );
+        assert!(
+            !has_transcript(&runtime, agent_id),
+            "{agent_id} 的 transcript 应随流删除"
+        );
+    }
+    for agent_id in ["other-a", "cli-main", "main-live"] {
+        assert!(has_exec_stream(&runtime, agent_id), "{agent_id} 必须保留");
+        assert!(
+            has_transcript(&runtime, agent_id),
+            "{agent_id} 的 transcript 必须保留"
+        );
+    }
 }
 
 fn has_exec_stream(runtime: &AgentToolRuntime, agent_id: &str) -> bool {

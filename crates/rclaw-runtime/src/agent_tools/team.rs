@@ -162,31 +162,34 @@ pub(super) struct ExecutionLogEntry {
 }
 
 /// [`ExecutionLogEntry`] 的扫库探针：清理窗口外终态流时只需要「终态了没有、源自哪个
-/// 会话」，整份快照（`spec.context` 可达数十 KB）不建树、不进内存。字段名与 serde 属性
-/// 必须与 [`ExecutionLogEntry`] / [`ExecutionSnapshot`] / [`AgentTaskSpec`] 保持一致——
-/// 探针解析失败的流会被 store 告警跳过，表现为「清不掉」。
+/// 会话」，整份快照（`spec.context` 可达数十 KB）不建 `Value` 树、不物化，单行文本逐条
+/// 读出即丢。字段名与 serde 属性必须与 [`ExecutionLogEntry`] / [`ExecutionSnapshot`] /
+/// [`AgentTaskSpec`] 保持一致：探针只要求这三个字段，所以本版本写出的任何流都解析得了
+/// （比启动恢复的全量解析更宽松——别的版本改了探针不读的字段、恢复装不进登记表的终态
+/// 流，这里仍会按终态清掉；「清除历史」/ 会话删除本就是全库语义）。反过来，字段名漂移
+/// 会被 `#[serde(default)]` 吞成空串而不是解析失败，表现为会话级联「清不掉」——
+/// `execution_log_probe_reads_the_same_fields_as_the_full_entry` 与会话级联测试盯着这点。
 #[derive(Deserialize)]
-struct ExecutionLogProbe {
-    snapshot: ExecutionSnapshotProbe,
+pub(super) struct ExecutionLogProbe {
+    pub(super) snapshot: ExecutionSnapshotProbe,
 }
 
 #[derive(Deserialize)]
-struct ExecutionSnapshotProbe {
-    state: ExecutionState,
-    spec: ExecutionSpecProbe,
+pub(super) struct ExecutionSnapshotProbe {
+    pub(super) state: ExecutionState,
+    pub(super) spec: ExecutionSpecProbe,
 }
 
 #[derive(Deserialize)]
-struct ExecutionSpecProbe {
+pub(super) struct ExecutionSpecProbe {
     #[serde(default)]
-    source_channel: String,
+    pub(super) source_channel: String,
     #[serde(default)]
-    origin_chat_id: String,
+    pub(super) origin_chat_id: String,
 }
 
 /// 执行清理的范围：全部，或只清源自某个会话（通道 + chat_id）的。登记表内（内存快照）
 /// 与登记表外（扫库探针）两条路径共用同一判定，不会走散。
-#[derive(Clone, Debug)]
 enum CleanupScope {
     All,
     Session { channel: String, chat_id: String },
@@ -1301,8 +1304,10 @@ impl CollaborationState {
     /// 而 transcript 当时删除失败的残留）。只回收最近一分钟没有写入的会话——刚入表、尚未
     /// 落首行的新执行在登记表里能查到，这里再加时间护栏兜住「枚举与入表交错」的极端时序。
     async fn sweep_orphan_transcripts(&self) -> usize {
-        // 枚举（两条全表查询）与删除都是持 Db 锁的同步 IO，各自放 blocking 线程；中间按
-        // 登记表复核一次要拿 tokio 锁，所以分两跳。
+        // 枚举（两条全表查询，各自进出一次 Db 锁，不在同一快照里）与删除都是同步 IO，各自
+        // 放 blocking 线程；中间按登记表复核一次要拿 tokio 锁，所以分两跳。两条查询之间
+        // 被插入的写入（并发清除 / 新执行入表 / 别的进程）由后面的登记表复核、一分钟护栏与
+        // `delete_session` 的幂等兜住。
         let transcript = self.transcript.clone();
         let journal = self.journal.clone();
         let cutoff = chrono::Utc::now().timestamp_millis() - 60_000;

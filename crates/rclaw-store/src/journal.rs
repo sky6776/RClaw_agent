@@ -259,8 +259,9 @@ impl JournalStore {
     /// 一条 SQL 代替「[`Self::streams`] + 逐流 [`Self::latest`]」的 N+1 点查：历史执行流
     /// 可达上千条，而会话删除级联每次都要扫一遍。访问者形态：payload 直接按调用方给的
     /// `T` 反序列化、解析一条交出一条——调用方传一个只含判定字段的探针类型，整份快照
-    /// （可达数十 KB）既不建 `Value` 树也不进内存；`T = Value` 则是通用取值。
-    /// payload 解析不成 `T` 的流告警并跳过，与 [`Self::latest`] 的策略一致。
+    /// （可达数十 KB）不建 `Value` 树、不物化，单行文本逐条读出即丢，峰值内存从「全部流
+    /// × 快照」降到「一行文本 + 探针」；`T = Value` 则是通用取值。payload 解析不成 `T`
+    /// 的流告警并跳过、继续访问后面的流，与 [`Self::latest`] 的策略一致。
     ///
     /// 整个扫描持连接锁同步进行：闭包不得再调用本 store 的其它方法；在 async 环境里请
     /// 放到 `spawn_blocking`（见 [`Db`] 文档）。
@@ -468,9 +469,11 @@ mod tests {
     #[test]
     fn for_each_latest_visits_each_streams_last_event_in_first_seen_order() {
         let (_dir, j) = store();
-        // p2 先出现、p1 后出现但事件更多：顺序按首次出现，取值按各自最大 seq。
+        // p2 先出现、odd 其次、p1 最后出现但事件更多：顺序按首次出现，取值按各自最大 seq。
+        // odd 夹在中间：探针解析不了它时必须跳过并继续访问 p1，而不是在它那里停下。
         j.append(JOURNAL_EXEC_LOG, "p2", &json!({"e": "p2-1", "n": 1}))
             .unwrap();
+        j.append(JOURNAL_EXEC_LOG, "odd", &json!({"n": 3})).unwrap();
         j.append(JOURNAL_EXEC_LOG, "p1", &json!({"e": "p1-1", "n": 1}))
             .unwrap();
         j.append(JOURNAL_EXEC_LOG, "p1", &json!({"e": "p1-2", "n": 2}))
@@ -483,6 +486,7 @@ mod tests {
             collect_latest::<Value>(&j, JOURNAL_EXEC_LOG),
             vec![
                 ("p2".to_string(), json!({"e": "p2-2", "n": 2})),
+                ("odd".to_string(), json!({"n": 3})),
                 ("p1".to_string(), json!({"e": "p1-2", "n": 2})),
             ]
         );
@@ -492,13 +496,11 @@ mod tests {
             assert_eq!(j.latest(JOURNAL_EXEC_LOG, &stream).unwrap(), Some(value));
         }
 
-        // 探针类型：只取判定字段，其余字段忽略；解析不成探针的流跳过而不是整体失败。
+        // 探针类型：只取判定字段，其余字段忽略；解析不成探针的 odd 被跳过，后面的 p1 照常访问。
         #[derive(Debug, PartialEq, serde::Deserialize)]
         struct Probe {
             e: String,
         }
-        j.append(JOURNAL_EXEC_LOG, "broken", &json!({"n": 3}))
-            .unwrap();
         assert_eq!(
             collect_latest::<Probe>(&j, JOURNAL_EXEC_LOG),
             vec![
