@@ -790,15 +790,29 @@ pub async fn chat_export_full(
         } else {
             title
         };
-        let messages = entries
+        let mut messages = entries
             .into_iter()
             .map(|e| crate::export::ExportMessage {
                 role: e.role,
                 content: e.content,
                 ts: e.ts,
                 seg_complete: true,
+                msg_id: e.id,
+                tools: Vec::new(),
+                tool_detail_error: None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // 工具全量详情仅 HTML 需要（md/docx 维持一行摘要）；查询失败只降级。
+        if fmt == "html" {
+            let agent_root = home.join("agent");
+            attach_html_tool_details(
+                &session,
+                &chat_id,
+                &agent_root,
+                &mut messages,
+                crate::export::TOOL_TOTAL_MAX_BYTES,
+            );
+        }
         write_export_file(&home, &title, &fmt, messages)
     })
     .await
@@ -1783,6 +1797,146 @@ fn tool_chain_detail_dto(msg_id: i64, detail: &rclaw_store::ToolChainDetail) -> 
         ts: detail.assistant.ts,
         calls,
     }
+}
+
+/// HTML 导出装载工具全量详情（仅 fmt=html 调用；md/docx 不查库）：
+/// 逐个 status 条目按行 id 查 `load_tool_chain_detail`，cap 在本阶段完成
+/// （先截断再挂载，内存峰值不进渲染层）；单条字段总量先算后挂，超出剩余
+/// 预算整条只留元信息；任何单条失败只写 tool_detail_error，绝不让整份导出
+/// 失败。checkpoint 路径相对化到工作区显示（防转发泄露本机目录）。
+///
+/// 已知边界：字段级 cap 只限制挂载进导出的文本，`load_tool_chain_detail`
+/// 仍会把 DB 里的完整行读进内存——单条几百 MB 的历史 checkpoint 在读取
+/// 瞬间仍可能占内存（store 层按需截断属另一项改造，本期不涉及）。
+fn attach_html_tool_details(
+    session: &rclaw_store::session::SessionStore,
+    chat_id: &str,
+    agent_root: &std::path::Path,
+    messages: &mut [crate::export::ExportMessage],
+    tool_total_budget: usize,
+) {
+    use crate::export::{
+        truncate_tool_field, truncate_tool_result, ExportToolCall, ExportToolCheckpoint,
+        ExportToolResult, TOOL_CHECKPOINT_MAX_BYTES, TOOL_INPUT_MAX_BYTES, TOOL_RESULT_MAX_BYTES,
+    };
+    // 根目录 canonicalize 只碰目录（必存在），不碰 checkpoint 文件本身。
+    let agent_root_canon = agent_root.canonicalize().ok();
+    let mut budget_left = tool_total_budget;
+    for msg in messages.iter_mut() {
+        if msg.role != "status" {
+            continue;
+        }
+        // 直播未落库（msg_id=0）：拍板的降级说明，不查库、不走旧注记。
+        if msg.msg_id <= 0 {
+            msg.tool_detail_error = Some("该工具行尚未落库，无法读取完整详情".into());
+            continue;
+        }
+        match session.load_tool_chain_detail(CHANNEL_DESKTOP, chat_id, msg.msg_id) {
+            Ok(Some(detail)) => {
+                let dto = tool_chain_detail_dto(msg.msg_id, &detail);
+                let mut tools = Vec::with_capacity(dto.calls.len());
+                for c in &dto.calls {
+                    // 预算耗尽短路：不再序列化/截断（不先加载再丢弃）。
+                    if budget_left == 0 {
+                        tools.push(ExportToolCall {
+                            name: c.name.clone(),
+                            skill: c.skill.clone(),
+                            input: String::new(),
+                            duration_ms: c.duration_ms,
+                            result: None,
+                            checkpoint: None,
+                            content_omitted: true,
+                        });
+                        continue;
+                    }
+                    let input = serde_json::to_string_pretty(&c.input)
+                        .unwrap_or_else(|_| "（入参无法序列化）".to_string());
+                    let (input, _) = truncate_tool_field(&input, TOOL_INPUT_MAX_BYTES);
+                    let mut used = input.len();
+                    let result = if let Some(r) = &c.result {
+                        let (content, _) =
+                            truncate_tool_result(&r.content, TOOL_RESULT_MAX_BYTES);
+                        used += content.len();
+                        Some(ExportToolResult {
+                            content,
+                            is_error: r.is_error,
+                        })
+                    } else {
+                        None
+                    };
+                    let checkpoint = c.checkpoint.as_ref().map(|cp| {
+                        let before = cp.before.as_ref().map(|b| {
+                            let (t, _) = truncate_tool_field(b, TOOL_CHECKPOINT_MAX_BYTES);
+                            used += t.len();
+                            t
+                        });
+                        ExportToolCheckpoint {
+                            path: relativize_tool_path(
+                                &cp.path,
+                                agent_root,
+                                agent_root_canon.as_deref(),
+                            ),
+                            before,
+                            deleted: cp.deleted,
+                        }
+                    });
+                    // 先算后挂：本调用正文超出剩余预算 → 整条只留元信息
+                    // （字段 cap 后最坏 2+8+8 MiB，不能让总量冲破安全阀）。
+                    if used > budget_left {
+                        tools.push(ExportToolCall {
+                            name: c.name.clone(),
+                            skill: c.skill.clone(),
+                            input: String::new(),
+                            duration_ms: c.duration_ms,
+                            result: None,
+                            checkpoint: None,
+                            content_omitted: true,
+                        });
+                        budget_left = 0;
+                        continue;
+                    }
+                    budget_left -= used;
+                    tools.push(ExportToolCall {
+                        name: c.name.clone(),
+                        skill: c.skill.clone(),
+                        input,
+                        duration_ms: c.duration_ms,
+                        result,
+                        checkpoint,
+                        content_omitted: false,
+                    });
+                }
+                msg.tools = tools;
+            }
+            Ok(None) => {
+                msg.tool_detail_error =
+                    Some("未找到工具详情（可能不是工具调用行或已被清理）".into());
+            }
+            Err(e) => {
+                msg.tool_detail_error = Some(format!("读取工具详情失败: {e}"));
+            }
+        }
+    }
+}
+
+/// checkpoint 显示路径相对化：词法 strip_prefix（Path 组件语义，防
+/// `C:\agent2` 被 `C:\agent` 字符串前缀误剥），不读盘；工作区内剥前缀，
+/// 工作区外原样保留。
+fn relativize_tool_path(
+    path: &str,
+    agent_root: &std::path::Path,
+    agent_root_canon: Option<&std::path::Path>,
+) -> String {
+    let p = std::path::Path::new(path);
+    if let Ok(rel) = p.strip_prefix(agent_root) {
+        return rel.to_string_lossy().into_owned();
+    }
+    if let Some(canon) = agent_root_canon {
+        if let Ok(rel) = p.strip_prefix(canon) {
+            return rel.to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
 }
 
 /// write / edit / delete 调用的入参路径（归一化后的全路径）与其「以 `/<入参路径>` 结尾」后缀。
@@ -3154,6 +3308,9 @@ mod tests {
                 content: e.content.clone(),
                 ts: e.ts,
                 seg_complete: true,
+                msg_id: e.id,
+                tools: Vec::new(),
+                tool_detail_error: None,
             })
             .collect();
         let rel_md =
@@ -3211,6 +3368,9 @@ mod tests {
                 content: e.content.clone(),
                 ts: e.ts,
                 seg_complete: true,
+                msg_id: e.id,
+                tools: Vec::new(),
+                tool_detail_error: None,
             })
             .collect();
         let rel = super::write_export_file(dir.path(), "网页导出", "html", messages).unwrap();
@@ -3239,6 +3399,178 @@ mod tests {
         )
         .unwrap();
         assert!(dto.seg_complete);
+    }
+
+    #[test]
+    fn export_message_dto_msg_id_defaults_to_zero() {
+        // 前端必须传 Entry.msgId（落库行 id）；缺省 0 = 未落库，后端不查详情。
+        let dto: super::ExportMessageDto =
+            serde_json::from_str(r#"{"role":"status","content":"x","ts":1}"#).unwrap();
+        assert_eq!(dto.msg_id, 0);
+        let dto: super::ExportMessageDto =
+            serde_json::from_str(r#"{"role":"status","content":"x","ts":1,"msg_id":9}"#).unwrap();
+        assert_eq!(dto.msg_id, 9);
+    }
+
+    #[test]
+    fn attach_html_tool_details_loads_real_tooluse_row() {
+        // 真实落库的 ToolUse 行：attach 按行 id 查到详情并挂载（复用
+        // tool_chain_detail_dto 的配对逻辑）。
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_session(dir.path());
+        const CHAT: &str = "tool-export";
+        session
+            .append(
+                super::CHANNEL_DESKTOP,
+                CHAT,
+                &rclaw_core::Message::plain(rclaw_core::Role::User, "跑个命令"),
+            )
+            .unwrap();
+        session
+            .append(
+                super::CHANNEL_DESKTOP,
+                CHAT,
+                &rclaw_core::Message {
+                    id: 0,
+                    role: rclaw_core::Role::Assistant,
+                    content: vec![
+                        rclaw_core::ContentBlock::ToolUse {
+                            id: "t9".into(),
+                            name: "read".into(),
+                            input: serde_json::json!({"path": "media/a.png"}),
+                        },
+                        rclaw_core::ContentBlock::ToolUse {
+                            id: "t10".into(),
+                            name: "shell".into(),
+                            input: serde_json::json!({"cmd": "ls"}),
+                        },
+                    ],
+                    tool_call_id: None,
+                    ts: 0,
+                },
+            )
+            .unwrap();
+        let msgs = session
+            .load_transcript(super::CHANNEL_DESKTOP, CHAT)
+            .unwrap();
+        let mut messages: Vec<crate::export::ExportMessage> =
+            super::history_entries(&msgs, &super::ToolCallMetas::new())
+                .into_iter()
+                .map(|e| crate::export::ExportMessage {
+                    role: e.role,
+                    content: e.content,
+                    ts: e.ts,
+                    seg_complete: true,
+                    msg_id: e.id,
+                    tools: Vec::new(),
+                    tool_detail_error: None,
+                })
+                .collect();
+        let agent_root = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_root).unwrap();
+        // 两个调用、预算充足：都完整装载。
+        super::attach_html_tool_details(&session, CHAT, &agent_root, &mut messages, 4096);
+        let status = messages.iter().find(|m| m.role == "status").unwrap();
+        assert!(status.tool_detail_error.is_none());
+        assert_eq!(status.tools.len(), 2);
+        assert_eq!(status.tools[0].name, "read");
+        assert!(status.tools[0].input.contains("media/a.png"));
+        assert_eq!(status.tools[1].name, "shell");
+        assert!(status.tools.iter().all(|t| !t.content_omitted));
+        // fixture 无工具结果侧表 → result None（渲染层显示「无结果记录」）。
+        assert!(status.tools[0].result.is_none());
+        // 预算注入 1 字节：第一个调用 used > budget_left 走省略分支并归零，
+        // 第二个调用在循环开头短路（不再序列化/截断）——两条都 content_omitted。
+        super::attach_html_tool_details(&session, CHAT, &agent_root, &mut messages, 1);
+        let status = messages.iter().find(|m| m.role == "status").unwrap();
+        assert_eq!(status.tools.len(), 2);
+        assert!(status
+            .tools
+            .iter()
+            .all(|t| t.content_omitted && t.input.is_empty()));
+
+        // msg_id=0（直播未落库）：拍板降级说明，不查库、不走旧注记。
+        let mut live: Vec<crate::export::ExportMessage> = vec![crate::export::ExportMessage {
+            role: "status".into(),
+            content: "🔧 调用工具: read".into(),
+            ts: 0,
+            seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
+        }];
+        super::attach_html_tool_details(&session, CHAT, &agent_root, &mut live, 4096);
+        assert_eq!(
+            live[0].tool_detail_error.as_deref(),
+            Some("该工具行尚未落库，无法读取完整详情")
+        );
+        assert!(live[0].tools.is_empty());
+    }
+
+    #[test]
+    fn attach_html_tool_details_missing_row_notes_not_fail() {
+        // Ok(None)（行 id 不存在/非工具行/会话不存在）→ tool_detail_error
+        // 说明 + 不整体失败。
+        let dir = tempfile::tempdir().unwrap();
+        let session = test_session(dir.path());
+        let agent_root = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_root).unwrap();
+        let mut messages: Vec<crate::export::ExportMessage> =
+            vec![crate::export::ExportMessage {
+                role: "status".into(),
+                content: "🔧 调用工具: read".into(),
+                ts: 0,
+                seg_complete: true,
+                msg_id: 999_999,
+                tools: Vec::new(),
+                tool_detail_error: None,
+            }];
+        super::attach_html_tool_details(
+            &session,
+            "no-such-chat",
+            &agent_root,
+            &mut messages,
+            4096,
+        );
+        assert_eq!(
+            messages[0].tool_detail_error.as_deref(),
+            Some("未找到工具详情（可能不是工具调用行或已被清理）")
+        );
+        assert!(messages[0].tools.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relativize_tool_path_strips_only_component_prefix() {
+        let root = std::path::Path::new("E:\\work\\agent");
+        assert_eq!(
+            super::relativize_tool_path("E:\\work\\agent\\media\\a.png", root, None),
+            "media\\a.png"
+        );
+        // 字符串前缀会误剥 C:\agent2 → C:\agent；Path 组件语义不会。
+        assert_eq!(
+            super::relativize_tool_path("E:\\work\\agent2\\x.png", root, None),
+            "E:\\work\\agent2\\x.png"
+        );
+        assert_eq!(
+            super::relativize_tool_path("D:\\elsewhere\\y.png", root, None),
+            "D:\\elsewhere\\y.png"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relativize_tool_path_strips_only_component_prefix_unix() {
+        let root = std::path::Path::new("/tmp/work/agent");
+        assert_eq!(
+            super::relativize_tool_path("/tmp/work/agent/media/a.png", root, None),
+            "media/a.png"
+        );
+        // 字符串前缀会误剥 /tmp/work/agent2；Path 组件语义不会。
+        assert_eq!(
+            super::relativize_tool_path("/tmp/work/agent2/x.png", root, None),
+            "/tmp/work/agent2/x.png"
+        );
     }
 
     #[test]
@@ -3276,6 +3608,9 @@ mod tests {
                 content: e.content.clone(),
                 ts: e.ts,
                 seg_complete: true,
+                msg_id: e.id,
+                tools: Vec::new(),
+                tool_detail_error: None,
             })
             .collect();
         let rel = super::write_export_file(dir.path(), "长会话", "md", messages).unwrap();
@@ -5113,12 +5448,19 @@ pub struct ExportMessageDto {
     /// 未知来源的选中子集当成完整段虚报工时。
     #[serde(default)]
     pub seg_complete: bool,
+    /// state.sqlite 行 id（0=未落库/未知；前端 Entry.msgId，不是合成 Entry.id）：
+    /// HTML 导出按它查工具全量详情。
+    #[serde(default)]
+    pub msg_id: i64,
 }
 
-/// 导出选中消息为文档。fmt: "md" | "docx" | "html"。返回 output/exports/ 相对路径。
+/// 导出选中消息为文档。chat_id 用于 HTML 装载工具全量详情（required：详情
+/// 查询按 (chat_id, msg_id) 定位）。fmt: "md" | "docx" | "html"。
+/// 返回 output/exports/ 相对路径。
 #[tauri::command]
 pub async fn export_messages(
     state: State<'_, AppState>,
+    chat_id: String,
     title: String,
     fmt: String,
     messages: Vec<ExportMessageDto>,
@@ -5129,8 +5471,12 @@ pub async fn export_messages(
     if !crate::export::is_supported_format(&fmt) {
         return Err(format!("不支持的导出格式: {fmt}"));
     }
+    if !is_valid_chat_id(&chat_id) {
+        return Err(format!("非法会话 id: {chat_id}"));
+    }
     let home = state.home.clone();
-    let parsed: Vec<crate::export::ExportMessage> = messages
+    let session = state.session();
+    let mut parsed: Vec<crate::export::ExportMessage> = messages
         .into_iter()
         .filter(|m| {
             matches!(
@@ -5143,14 +5489,45 @@ pub async fn export_messages(
             content: m.content,
             ts: m.ts,
             seg_complete: m.seg_complete,
+            msg_id: m.msg_id,
+            tools: Vec::new(),
+            tool_detail_error: None,
         })
         .collect();
     if parsed.is_empty() {
         return Err("未包含可导出的消息".into());
     }
-    tauri::async_runtime::spawn_blocking(move || write_export_file(&home, &title, &fmt, parsed))
-        .await
-        .map_err(|e| format!("导出任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        // 工具全量详情仅 HTML 需要；session 不可用只降级说明，不整体失败。
+        if fmt == "html" {
+            match &session {
+                Some(session) => {
+                    let agent_root = home.join("agent");
+                    attach_html_tool_details(
+                        session,
+                        &chat_id,
+                        &agent_root,
+                        &mut parsed,
+                        crate::export::TOOL_TOTAL_MAX_BYTES,
+                    );
+                }
+                None => {
+                    for m in parsed.iter_mut() {
+                        if m.role == "status" {
+                            m.tool_detail_error = Some(if m.msg_id > 0 {
+                                "agent 尚未启动，无法读取工具详情".into()
+                            } else {
+                                "该工具行尚未落库，无法读取完整详情".into()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        write_export_file(&home, &title, &fmt, parsed)
+    })
+    .await
+    .map_err(|e| format!("导出任务失败: {e}"))?
 }
 
 // ---------------------------------------------------------------------------

@@ -14,12 +14,124 @@ use std::path::{Path, PathBuf};
 /// ts 为落库时间（unix 秒，0=未知）：HTML 导出按它算「已工作 X」段时长；md/docx 不消费。
 /// seg_complete 为「该消息所在的会话段是否整段被导出」：完整导出恒 true；多选导出由
 /// 前端按段判定——不完整段平铺渲染，不显示「已工作 X」（选中子集的时间跨度会虚报）。
+/// msg_id 为 state.sqlite 行 id（0=未落库/未知）；tools/tool_detail_error 仅 HTML 消费
+/// （md/docx 渲染器忽略），由 commands 层 attach（仅 fmt=html 时查询详情）。
 #[derive(Debug, Clone)]
 pub struct ExportMessage {
     pub role: String,
     pub content: String,
     pub ts: i64,
     pub seg_complete: bool,
+    pub msg_id: i64,
+    pub tools: Vec<ExportToolCall>,
+    pub tool_detail_error: Option<String>,
+}
+
+/// 单条工具调用的导出全量内容（HTML 消费；字段已在装载层按 cap 截断）。
+#[derive(Debug, Clone)]
+pub struct ExportToolCall {
+    pub name: String,
+    pub skill: Option<String>,
+    /// 完整入参（pretty JSON 文本，可能带截断注记）。
+    pub input: String,
+    pub duration_ms: Option<u64>,
+    pub result: Option<ExportToolResult>,
+    pub checkpoint: Option<ExportToolCheckpoint>,
+    /// 工具详情总预算超限后，本调用只保留元信息、正文未装载。
+    pub content_omitted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportToolResult {
+    pub content: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportToolCheckpoint {
+    /// 写入前文件的显示路径（装载层已相对化到工作区，防泄露本机目录）。
+    pub path: String,
+    /// 写入前文件全文；None = 新建（无写入前内容）。
+    pub before: Option<String>,
+    /// 该次操作删除了文件。
+    pub deleted: bool,
+}
+
+/// 工具详情安全阀（异常大字段/总量；正常内容几 KB 内不触发）。
+pub(crate) const TOOL_INPUT_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const TOOL_RESULT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const TOOL_CHECKPOINT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const TOOL_TOTAL_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// 工具详情总量超过该值时在文档头提示「工具详情较大，打开可能较慢」。
+const TOOL_BIG_HINT_BYTES: usize = 20 * 1024 * 1024;
+
+/// 按字符边界截到 max 字节以内（不切坏 UTF-8）。
+fn truncate_chars_to_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// 从尾部取至多 max 字节（字符边界对齐）。
+fn tail_chars_to_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// 字段级截断：超限保留头部 + 截断注记。
+/// 返回 (截断后文本, 原始字节数 Option——None 未截断)。
+pub(crate) fn truncate_tool_field(text: &str, max: usize) -> (String, Option<usize>) {
+    if text.len() <= max {
+        return (text.to_string(), None);
+    }
+    let original = text.len();
+    (
+        format!(
+            "{}\n…（已截断，原文 {}）",
+            truncate_chars_to_bytes(text, max),
+            format_bytes(original)
+        ),
+        Some(original),
+    )
+}
+
+/// result 专用：头尾各半（shell 错误常在尾部），中间省略。
+pub(crate) fn truncate_tool_result(text: &str, max: usize) -> (String, Option<usize>) {
+    if text.len() <= max {
+        return (text.to_string(), None);
+    }
+    let original = text.len();
+    let half = max / 2;
+    let head = truncate_chars_to_bytes(text, half);
+    let tail = tail_chars_to_bytes(text, half);
+    (
+        format!(
+            "{head}\n…（中间省略 {}）\n{tail}",
+            format_bytes(original - head.len() - tail.len())
+        ),
+        Some(original),
+    )
+}
+
+fn format_bytes(n: usize) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
 }
 
 /// 导出文件名安全化：保留中英数字与连字符，其余折叠为下划线。
@@ -681,8 +793,8 @@ fn format_work_duration(secs: i64) -> String {
 /// HTML 内联样式：浅/深色跟随系统；折叠、气泡、响应式导航（宽屏右侧固定
 /// 栏 / 窄屏顶部 sticky chips）。const 而非 format! 拼接，避免大括号转义。
 const HTML_CSS: &str = r#"
-:root{--bg:#f6f7f9;--card:#fff;--ink:#1d2230;--muted:#5c6675;--line:#dfe3ea;--accent:#4f5bd5;--user:#e9ebfb}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1218;--card:#171b24;--ink:#e3e7ef;--muted:#9aa3b2;--line:#2a2f3a;--accent:#8b93f8;--user:#1f2536}}
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1d2230;--muted:#5c6675;--line:#dfe3ea;--accent:#4f5bd5;--user:#e9ebfb;--code:#eef0f4;--danger:#c0392b}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1218;--card:#171b24;--ink:#e3e7ef;--muted:#9aa3b2;--line:#2a2f3a;--accent:#8b93f8;--user:#1f2536;--code:#1d222c;--danger:#e07060}}
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
 @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
@@ -710,6 +822,14 @@ details[open]>summary::before{content:"\25BE\A0"}
 details>summary:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;border-radius:.8rem}
 details.thinking{border-style:dashed}
 details.work>summary{font-weight:600}
+.tool-call{margin:.45rem 0;padding:.45rem .6rem;border:1px solid var(--line);border-radius:.5rem}
+.tool-call-head{margin:0 0 .25rem;font-size:.8rem;font-weight:600;color:var(--ink)}
+.tool-skill,.tool-duration{margin-left:.4rem;font-size:.72rem;font-weight:400;color:var(--muted)}
+.tool-error{margin-left:.4rem;font-size:.72rem;font-weight:400;color:var(--danger)}
+.tool-field h5{margin:.4rem 0 .15rem;font-size:.72rem;font-weight:600;color:var(--muted)}
+.tool-pre{margin:0;max-height:28rem;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--code);border:1px solid var(--line);border-radius:.4rem;padding:.4rem .6rem;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:.75rem}
+.tool-empty{font-size:.75rem;color:var(--muted)}
+.tool-note{color:var(--muted)}
 details .body{margin:0 .8rem .6rem;white-space:pre-wrap}
 details.tool .body{color:var(--muted)}
 .media{margin:.5rem 0 0;scroll-margin-top:3.6rem}
@@ -757,6 +877,8 @@ struct HtmlImageBudget {
     noted_rel: std::collections::HashSet<String>,
     /// 尝试上限的聚合提示只发一次。
     attempts_note_emitted: bool,
+    /// 已渲染的工具详情文本量（头部「工具详情较大」提示用）。
+    tool_text_bytes: usize,
 }
 
 impl HtmlImageBudget {
@@ -773,6 +895,7 @@ impl HtmlImageBudget {
             embedded_rel: std::collections::HashMap::new(),
             noted_rel: std::collections::HashSet::new(),
             attempts_note_emitted: false,
+            tool_text_bytes: 0,
         }
     }
 
@@ -903,6 +1026,108 @@ const SKIP_NOTE_MAX: usize = 20;
 /// 内嵌数量上限（200，只由 embedded 把守）互不影响。
 const MAX_IMAGE_ATTEMPTS: usize = 2000;
 
+/// 「耗时」文案：毫秒 → 「X 毫秒 / X.X 秒 / X 分 Y 秒」。
+fn format_tool_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms} 毫秒")
+    } else if ms < 60_000 {
+        // 59.5s 以上按整数秒显示，避免四舍五入出「60.0 秒」与下一档矛盾。
+        if ms >= 59_500 {
+            format!("{} 秒", ms / 1000)
+        } else {
+            format!("{:.1} 秒", ms as f64 / 1000.0)
+        }
+    } else {
+        format_work_duration((ms / 1000) as i64)
+    }
+}
+
+/// 渲染一个 status 条目的全量工具调用（section 平铺，不嵌套 details——
+/// 外层 status 已折叠，三层交互太深）。所有动态值经 html_escape。
+fn render_tool_details(out: &mut String, tools: &[ExportToolCall], budget: &mut HtmlImageBudget) {
+    use std::fmt::Write as _;
+    for call in tools {
+        let _ = write!(
+            out,
+            "<section class=\"tool-call\"><h4 class=\"tool-call-head\"><span class=\"tool-name\">{}</span>",
+            html_escape(&call.name)
+        );
+        if let Some(skill) = &call.skill {
+            let _ = write!(out, "<span class=\"tool-skill\">🧩 {}</span>", html_escape(skill));
+        }
+        if let Some(ms) = call.duration_ms {
+            let _ = write!(
+                out,
+                "<span class=\"tool-duration\">耗时 {}</span>",
+                format_tool_duration(ms)
+            );
+        }
+        if call.result.as_ref().is_some_and(|r| r.is_error) {
+            out.push_str("<span class=\"tool-error\">❌ 出错</span>");
+        }
+        out.push_str("</h4>");
+        if call.content_omitted {
+            out.push_str(
+                "<div class=\"tool-empty\">工具详情总量已达上限，本调用的入参/结果正文未展开</div></section>",
+            );
+            continue;
+        }
+        out.push_str("<div class=\"tool-field\"><h5>入参</h5><pre class=\"tool-pre\">");
+        out.push_str(&html_escape(&call.input));
+        out.push_str("</pre></div>");
+        match &call.result {
+            Some(result) => {
+                out.push_str("<div class=\"tool-field\"><h5>结果</h5><pre class=\"tool-pre\">");
+                out.push_str(&html_escape(&result.content));
+                out.push_str("</pre></div>");
+            }
+            None => out.push_str(
+                "<div class=\"tool-field\"><h5>结果</h5><div class=\"tool-empty\">（无结果记录）</div></div>",
+            ),
+        }
+        if let Some(cp) = &call.checkpoint {
+            let _ = write!(
+                out,
+                "<div class=\"tool-field\"><h5>文件写入前快照 · {}{}</h5>",
+                html_escape(&cp.path),
+                if cp.deleted { "（该次操作删除了文件）" } else { "" }
+            );
+            match &cp.before {
+                Some(before) => {
+                    out.push_str("<pre class=\"tool-pre\">");
+                    out.push_str(&html_escape(before));
+                    out.push_str("</pre>");
+                }
+                // 四象限：新建 / 已删除 / 普通快照 / 删除前快照。
+                None if cp.deleted => {
+                    out.push_str("<div class=\"tool-empty\">文件已删除（无写入前内容）</div>")
+                }
+                None => out.push_str("<div class=\"tool-empty\">新建文件（无写入前内容）</div>"),
+            }
+            out.push_str("</div>");
+        }
+        out.push_str("</section>");
+        // 头部提示口径与预估一致：按转义后的近似渲染量累计（高转义内容
+        // 原始字节远小于渲染量，只算原始会漏报）。
+        budget.tool_text_bytes += html_escaped_len(&call.input)
+            + html_escaped_len(&call.name)
+            + call.skill.as_deref().map(html_escaped_len).unwrap_or(0)
+            + call
+                .result
+                .as_ref()
+                .map(|r| html_escaped_len(&r.content))
+                .unwrap_or(0)
+            + call
+                .checkpoint
+                .as_ref()
+                .map(|c| {
+                    html_escaped_len(&c.path)
+                        + c.before.as_deref().map(html_escaped_len).unwrap_or(0)
+                })
+                .unwrap_or(0);
+    }
+}
+
 /// 渲染一条消息的折叠/正文结构（图片在正文之后原位内嵌）。allow_backlink_target：
 /// 该消息是否渲染在默认可见（非折叠容器内）的位置——折叠容器里的图不能作为
 /// 重复图回链目标（锚点滚动不会展开 details）。
@@ -935,8 +1160,9 @@ fn render_html_message(
             budget.render_images(out, &msg.content, allow_backlink_target);
             out.push_str("</article>");
         }
-        // status（工具行）与其余未知角色：独立折叠行，summary 露出动词/目标，
-        // 单行且完整可见时 body 只放弱化注记（避免与 summary 重复）。
+        // status（工具行）与其余未知角色：独立折叠行，summary 露出动词/目标。
+        // 有全量工具详情时逐调用渲染；详情读取失败显示说明；都没有才回落到
+        // 现状注记/原文。
         _ => {
             let summary = html_summary_line(&msg.content, 120);
             let summary = if summary.is_empty() { "🔧 工具调用".to_string() } else { summary };
@@ -945,14 +1171,25 @@ fn render_html_message(
                 "<details class=\"tool\"><summary>{}</summary>",
                 html_escape(&summary)
             );
-            let single_visible =
-                !trimmed.is_empty() && !trimmed.contains('\n') && trimmed.chars().count() <= 120;
-            if single_visible {
-                out.push_str(
-                    "<div class=\"body\">导出数据仅含工具状态文案，完整入参/结果未包含</div>",
+            if !msg.tools.is_empty() {
+                render_tool_details(out, &msg.tools, budget);
+            } else if let Some(err) = &msg.tool_detail_error {
+                let _ = write!(
+                    out,
+                    "<div class=\"body tool-note\">{}</div>",
+                    html_escape(err)
                 );
             } else {
-                let _ = write!(out, "<div class=\"body\">{}</div>", html_escape(trimmed));
+                let single_visible = !trimmed.is_empty()
+                    && !trimmed.contains('\n')
+                    && trimmed.chars().count() <= 120;
+                if single_visible {
+                    out.push_str(
+                        "<div class=\"body\">导出数据仅含工具状态文案，完整入参/结果未包含</div>",
+                    );
+                } else {
+                    let _ = write!(out, "<div class=\"body\">{}</div>", html_escape(trimmed));
+                }
             }
             budget.render_images(out, &msg.content, false);
             out.push_str("</details>");
@@ -977,9 +1214,12 @@ pub fn render_html(
         stamp,
         messages,
         agent_root,
-        HTML_IMAGE_TOTAL_MAX_BYTES,
-        DOCX_IMAGE_MAX_BYTES,
-        HTML_BIG_FILE_HINT_BYTES,
+        HtmlBudgetPolicy {
+            total_budget: HTML_IMAGE_TOTAL_MAX_BYTES,
+            max_image_bytes: DOCX_IMAGE_MAX_BYTES,
+            big_file_hint_bytes: HTML_BIG_FILE_HINT_BYTES,
+            tool_big_hint_bytes: TOOL_BIG_HINT_BYTES,
+        },
     )
 }
 
@@ -1021,13 +1261,41 @@ fn estimate_html_capacity(
         .iter()
         .map(|m| {
             let base = html_escaped_len(&m.content) + 256;
-            if matches!(m.role.as_str(), "user" | "assistant" | "thinking") {
+            let base = if matches!(m.role.as_str(), "user" | "assistant" | "thinking") {
                 base
             } else {
                 // status/未知角色：summary 另占最多 120 字（高转义内容下
                 // 不可忽略）。
                 base + html_escaped_len(&html_summary_line(&m.content, 120)) + 128
-            }
+            };
+            // 工具详情文本（装载层已按 cap 截断，这里按实际长度计）+ 每调用
+            // 标记开销——不纳入会让单缓冲「一次预留」失效，退回反复扩容。
+            let tools: usize = m
+                .tools
+                .iter()
+                .map(|t| {
+                    if t.content_omitted {
+                        128
+                    } else {
+                        html_escaped_len(&t.input)
+                            + html_escaped_len(&t.name)
+                            + t.skill.as_deref().map(html_escaped_len).unwrap_or(0)
+                            + t.result
+                                .as_ref()
+                                .map(|r| html_escaped_len(&r.content))
+                                .unwrap_or(0)
+                            + t.checkpoint
+                                .as_ref()
+                                .map(|c| {
+                                    html_escaped_len(&c.path)
+                                        + c.before.as_deref().map(html_escaped_len).unwrap_or(0)
+                                })
+                                .unwrap_or(0)
+                            + 512
+                    }
+                })
+                .sum();
+            base + tools
         })
         .sum();
     let mut image_bytes: u64 = 0;
@@ -1091,14 +1359,25 @@ const HTML_STATS_TOKEN: &str = "RCLAW\u{1}EXPORT_STATS\u{1}";
 /// 直接流入，最后回填统计——避免「body + out」双份完整 HTML 的内存峰值
 /// （80MB 预算的产物 base64 后 ~107MB，双份就是 214MB）。容量按文字与
 /// 候选图片体积预估一次到位，避免中途翻倍扩容的瞬时拷贝。
+/// 渲染预算与提示阈值（生产走常量，测试注入小值）。
+#[derive(Debug, Clone, Copy)]
+struct HtmlBudgetPolicy {
+    /// 图片内嵌总预算（原始字节）。
+    total_budget: u64,
+    /// 单张图片上限。
+    max_image_bytes: u64,
+    /// 图片总量超过该值 → 头部提示。
+    big_file_hint_bytes: u64,
+    /// 工具详情文本超过该值 → 头部提示。
+    tool_big_hint_bytes: usize,
+}
+
 fn render_html_with_budget(
     title: &str,
     stamp: &str,
     messages: &[ExportMessage],
     agent_root: &Path,
-    total_budget: u64,
-    max_image_bytes: u64,
-    big_file_hint_bytes: u64,
+    policy: HtmlBudgetPolicy,
 ) -> Result<String, String> {
     use std::fmt::Write as _;
     // 根不可用（canonicalize 失败）时用原路径兜底：逐图在 fs 访问处失败
@@ -1110,7 +1389,7 @@ fn render_html_with_budget(
 
     // 容量预估（预扫与实际内嵌同口径：只计 resolve 成功的候选）。
     let (estimate, _) =
-        estimate_html_capacity(messages, &root_canon, total_budget, max_image_bytes);
+        estimate_html_capacity(messages, &root_canon, policy.total_budget, policy.max_image_bytes);
     let mut out = String::with_capacity(estimate);
 
     out.push_str("<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n");
@@ -1152,7 +1431,7 @@ fn render_html_with_budget(
     out.push_str("<main>\n");
 
     // 消息主体直接流入 out（单缓冲，无第二份全文）。
-    let mut budget = HtmlImageBudget::new(&root_canon, total_budget, max_image_bytes);
+    let mut budget = HtmlImageBudget::new(&root_canon, policy.total_budget, policy.max_image_bytes);
     if !preamble.is_empty() {
         out.push_str(
             "<section class=\"round\" id=\"preamble\" aria-label=\"会话开始\"><h2>会话开始</h2>",
@@ -1214,8 +1493,11 @@ fn render_html_with_budget(
     if budget.unattempted > 0 {
         meta.push_str(&format!(" · {} 张未尝试", budget.unattempted));
     }
-    if budget.total_bytes > big_file_hint_bytes {
+    if budget.total_bytes > policy.big_file_hint_bytes {
         meta.push_str(" · 文件较大，打开可能较慢");
+    }
+    if budget.tool_text_bytes > policy.tool_big_hint_bytes {
+        meta.push_str(" · 工具详情较大，打开可能较慢");
     }
     let stats = html_escape(&meta);
     match out.find(HTML_STATS_TOKEN) {
@@ -1313,24 +1595,36 @@ mod tests {
                     content: "你好".into(),
                     ts: 0,
                     seg_complete: true,
+                    msg_id: 0,
+                    tools: Vec::new(),
+                    tool_detail_error: None,
                 },
                 ExportMessage {
                     role: "assistant".into(),
                     content: "MEDIA_MARKER=[:x-media type=image path=\"p\"]\n图如下".into(),
                     ts: 0,
                     seg_complete: true,
+                    msg_id: 0,
+                    tools: Vec::new(),
+                    tool_detail_error: None,
                 },
                 ExportMessage {
                     role: "thinking".into(),
                     content: "先列出目录".into(),
                     ts: 0,
                     seg_complete: true,
+                    msg_id: 0,
+                    tools: Vec::new(),
+                    tool_detail_error: None,
                 },
                 ExportMessage {
                     role: "status".into(),
                     content: "🔧 调用工具: list output".into(),
                     ts: 0,
                     seg_complete: true,
+                    msg_id: 0,
+                    tools: Vec::new(),
+                    tool_detail_error: None,
                 },
             ],
         );
@@ -1357,6 +1651,9 @@ mod tests {
             content: "看 media/a.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let bytes = render_docx("标题", "2026-10-03", &messages, dir.path()).unwrap();
         let cursor = std::io::Cursor::new(&bytes);
@@ -1408,12 +1705,18 @@ mod tests {
                 content: "<script>alert(1)</script>".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "\"><img src=x onerror=alert(2)>".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("标\"题", "2026-11-01", &messages, Path::new("/nonexistent"))
@@ -1434,18 +1737,27 @@ mod tests {
                 content: "先列目录".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "🔧 调用工具: read".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "多行状态\n第二行详情".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -1469,18 +1781,27 @@ mod tests {
                 content: "第一轮的问题".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "回答一".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "第二轮的问题".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -1500,6 +1821,9 @@ mod tests {
             content: "只有一个问题".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
         assert!(!html.contains("<nav class=\"rounds\""));
@@ -1514,18 +1838,27 @@ mod tests {
                 content: "开场白（首条 user 之前）".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "问一".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "问二".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -1547,6 +1880,9 @@ mod tests {
             content: "MEDIA_MARKER=[:desktop-media type=image path=\"/data/user/0/a/files/agent/media/out/图.png\" name=\"图.png\"]".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         // strip 后正文为空 → （媒体消息）占位；图片仍在原位内嵌。
@@ -1568,12 +1904,18 @@ mod tests {
                 content: marker.to_string(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: format!("{marker}\n再次引用"),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
@@ -1591,6 +1933,9 @@ mod tests {
             content: "看 media/../../secret.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(!html.contains("data:image"));
@@ -1611,12 +1956,18 @@ mod tests {
                 content: "图一 media/out/a.png".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "图二 media/out/b.png".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html_with_budget(
@@ -1624,9 +1975,12 @@ mod tests {
             "2026-11-01",
             &messages,
             dir.path(),
-            24,
-            u64::MAX,
-            u64::MAX,
+            HtmlBudgetPolicy {
+                total_budget: 24,
+                max_image_bytes: u64::MAX,
+                big_file_hint_bytes: u64::MAX,
+                tool_big_hint_bytes: usize::MAX,
+            },
         )
         .unwrap();
         // 第一张内嵌；第二张超总量预算 → 占位 + 未内嵌计数。
@@ -1654,12 +2008,18 @@ mod tests {
                 content: "q1".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "q2".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -1680,15 +2040,21 @@ mod tests {
             content: "看 media/out/big.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html_with_budget(
             "t",
             "2026-11-01",
             &messages,
             dir.path(),
-            u64::MAX,
-            1,
-            u64::MAX,
+            HtmlBudgetPolicy {
+                total_budget: u64::MAX,
+                max_image_bytes: 1,
+                big_file_hint_bytes: u64::MAX,
+                tool_big_hint_bytes: usize::MAX,
+            },
         )
         .unwrap();
         assert!(html.contains("超过单张大小上限"));
@@ -1714,6 +2080,9 @@ mod tests {
             content: "图 media/out/a.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         // 提示阈值注入 1 字节：24 字节的图必触发。
         let html = render_html_with_budget(
@@ -1721,9 +2090,12 @@ mod tests {
             "2026-11-01",
             &messages,
             dir.path(),
-            u64::MAX,
-            u64::MAX,
-            1,
+            HtmlBudgetPolicy {
+                total_budget: u64::MAX,
+                max_image_bytes: u64::MAX,
+                big_file_hint_bytes: 1,
+                tool_big_hint_bytes: usize::MAX,
+            },
         )
         .unwrap();
         assert!(html.contains("文件较大，打开可能较慢"));
@@ -1733,9 +2105,12 @@ mod tests {
             "2026-11-01",
             &messages,
             dir.path(),
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
+            HtmlBudgetPolicy {
+                total_budget: u64::MAX,
+                max_image_bytes: u64::MAX,
+                big_file_hint_bytes: u64::MAX,
+                tool_big_hint_bytes: usize::MAX,
+            },
         )
         .unwrap();
         assert!(!html2.contains("文件较大"));
@@ -1751,6 +2126,9 @@ mod tests {
             content: "MEDIA_MARKER=[:x-media type=image path=\"C:/windows/evil.png\"]".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(!html.contains("data:image"));
@@ -1772,18 +2150,27 @@ mod tests {
                 content: marker.to_string(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: format!("再看一次\n{marker}"),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: format!("最后一次\n{marker}"),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
@@ -1799,6 +2186,9 @@ mod tests {
             content: "正文\u{1}带 ANSI\u{7}控制符".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
         assert!(!html.contains('\u{1}'));
@@ -1814,6 +2204,9 @@ mod tests {
             content: "纯文本".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
         assert!(!html.contains("图片已内嵌"));
@@ -1826,6 +2219,9 @@ mod tests {
             content: "图 media/out/a.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(html.contains("图片已内嵌，可离线打开"));
@@ -1835,6 +2231,9 @@ mod tests {
             content: "缺图 media/out/nope.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(html.contains("图片未能内嵌"));
@@ -1847,6 +2246,9 @@ mod tests {
             content: "好图 media/out/ok.png\n缺图 media/out/nope.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir2.path()).unwrap();
         assert!(html.contains("内嵌 1 张图片 · 1 张未内嵌"));
@@ -1867,6 +2269,9 @@ mod tests {
             content,
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         // 前 20 条占位，之后只累计：头部统计仍准确（22 张未内嵌）。
@@ -1888,6 +2293,9 @@ mod tests {
             content: "空图 media/out/empty.png\n缺图 media/out/nope.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(html.contains("（空文件）"));
@@ -1905,6 +2313,9 @@ mod tests {
             content: "看 media/out/evil.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert!(!html.contains("data:image"));
@@ -1927,6 +2338,9 @@ mod tests {
             content,
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         // 200 个坏路径不占内嵌名额：后续有效图仍内嵌（尝试数上限 2000 与
         // 内嵌上限 200 是两回事）。
@@ -1955,6 +2369,9 @@ mod tests {
             content: "ok media/out/ok.png\nbig media/out/big.png\nempty media/out/empty.png\nbad media/out/bad.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         // 单张上限 50：big 超限 → 只有 ok 可内嵌。
         let (_, image_bytes) =
@@ -1979,6 +2396,9 @@ mod tests {
             content: "b media/out/b.bmp\nj media/out/j.jpg\nx media/out/x.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         // 预扫用「读至多 4 字节」口径，与渲染全量 sniff 一致：2/3 字节魔数
         // 可内嵌（计 2+3 字节），1 字节 x.png 不计。
@@ -2001,6 +2421,9 @@ mod tests {
             content,
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         // 尝试预算被 2000 个缺失路径耗尽：预扫与渲染同口径，late.png 两边
         // 都不计/不嵌（文档化的产品取舍——超长坏路径列表截断处理）。
@@ -2023,6 +2446,9 @@ mod tests {
             content,
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         // 尝试上限触发：有效图不再内嵌，聚合提示出现一次，头部把「未内嵌
@@ -2064,6 +2490,9 @@ mod tests {
             content,
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         // 预扫 + 渲染放进子线程并限时：若未来实现回归成先 open FIFO，
         // 这里会超时 panic（明确失败）而非挂死整个测试进程。
@@ -2107,6 +2536,9 @@ mod tests {
             content,
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         assert_eq!(html.matches("data:image/png;base64,").count(), 200);
@@ -2127,6 +2559,9 @@ mod tests {
             content,
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         // 前 200 个缺失候选不占名额：有效图仍被计数并进入容量预估。
         let (_, image_bytes) =
@@ -2138,6 +2573,9 @@ mod tests {
             content: "缺图 media/out/missing0.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         let (_, image_bytes) =
             estimate_html_capacity(&bad_only, dir.path(), u64::MAX, u64::MAX);
@@ -2152,24 +2590,36 @@ mod tests {
                 content: "问题".into(),
                 ts: 100,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "thinking".into(),
                 content: "先列目录看看".into(),
                 ts: 110,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "🔧 调用工具: read".into(),
                 ts: 120,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "最终回答".into(),
                 ts: 165,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -2197,12 +2647,18 @@ mod tests {
                 content: "问".into(),
                 ts: 100,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "答".into(),
                 ts: 130,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -2219,18 +2675,27 @@ mod tests {
                 content: "问".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "thinking".into(),
                 content: "想".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "答".into(),
                 ts: 0,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -2246,30 +2711,45 @@ mod tests {
                 content: "问".into(),
                 ts: 100,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "中间说明".into(),
                 ts: 110,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "🔧 调用工具: shell".into(),
                 ts: 120,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "最终回答".into(),
                 ts: 150,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "🔧 调用工具: 事后".into(),
                 ts: 160,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -2295,18 +2775,27 @@ mod tests {
                 content: "问".into(),
                 ts: 100,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "thinking".into(),
                 content: "想的".into(),
                 ts: 110,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "🔧 调用工具: read".into(),
                 ts: 120,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         // 取消轮（无最终回复）：整段平铺，无容器，内容完整可见。
@@ -2323,24 +2812,36 @@ mod tests {
                 content: "开场".into(),
                 ts: 50,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "thinking".into(),
                 content: "开场思考".into(),
                 ts: 60,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "user".into(),
                 content: "问".into(),
                 ts: 100,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "答".into(),
                 ts: 130,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         // preamble（首条 user 之前）含 thinking 也不套 work 容器；round-1
@@ -2359,18 +2860,27 @@ mod tests {
                 content: "问".into(),
                 ts: 100,
                 seg_complete: false,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "thinking".into(),
                 content: "思考正文".into(),
                 ts: 110,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "最终回答".into(),
                 ts: 150,
                 seg_complete: false,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         // 同段混用 true/false：.all 门槛 fail-closed → 平铺。
@@ -2387,18 +2897,27 @@ mod tests {
                 content: "问".into(),
                 ts: 100,
                 seg_complete: false,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "thinking".into(),
                 content: "思考内容".into(),
                 ts: 110,
                 seg_complete: false,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: "最终回答".into(),
                 ts: 150,
                 seg_complete: false,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
@@ -2420,6 +2939,9 @@ mod tests {
                 content: "问".into(),
                 ts: 100,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             // 中间说明带图（进折叠容器内）；最终回复引用同图。
             ExportMessage {
@@ -2427,18 +2949,27 @@ mod tests {
                 content: format!("中间说明 {marker}"),
                 ts: 110,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "status".into(),
                 content: "🔧 调用工具: read".into(),
                 ts: 120,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
             ExportMessage {
                 role: "assistant".into(),
                 content: format!("最终回答 {marker}"),
                 ts: 150,
                 seg_complete: true,
+                msg_id: 0,
+                tools: Vec::new(),
+                tool_detail_error: None,
             },
         ];
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
@@ -2456,6 +2987,257 @@ mod tests {
         assert_eq!(format_work_duration(90), "1 分 30 秒");
     }
 
+    #[test]
+    fn html_tool_msg_id_zero_note_not_old_placeholder() {
+        // 直播未落库（msg_id=0）：拍板的降级说明，不是旧「仅状态文案」注记。
+        let messages = vec![ExportMessage {
+            role: "status".into(),
+            content: "🔧 调用工具: read".into(),
+            ts: 0,
+            seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: Some("该工具行尚未落库，无法读取完整详情".into()),
+        }];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        assert!(html.contains("该工具行尚未落库，无法读取完整详情"));
+        assert!(!html.contains("导出数据仅含工具状态文案"));
+    }
+
+    #[test]
+    fn format_tool_duration_boundaries() {
+        assert_eq!(format_tool_duration(999), "999 毫秒");
+        assert_eq!(format_tool_duration(1500), "1.5 秒");
+        // 59_999ms 四舍五入会出「60.0 秒」，与 1 分档矛盾 → 整数秒显示。
+        assert_eq!(format_tool_duration(59_999), "59 秒");
+        assert_eq!(format_tool_duration(59_500), "59 秒");
+        assert_eq!(format_tool_duration(60_000), "1 分 0 秒");
+    }
+
+    #[test]
+    fn format_bytes_small_values() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn html_tool_details_render_and_escape() {
+        let messages = vec![ExportMessage {
+            role: "status".into(),
+            content: "🔧 调用工具: read".into(),
+            ts: 100,
+            seg_complete: true,
+            msg_id: 7,
+            tools: vec![ExportToolCall {
+                name: "read".into(),
+                skill: Some("pdf-to-ppt".into()),
+                input: "{\"path\":\"a</pre><script>alert(1)</script>\"}".into(),
+                duration_ms: Some(1500),
+                result: Some(ExportToolResult {
+                    content: "输出 \"quoted\" & <b>html</b>".into(),
+                    is_error: true,
+                }),
+                checkpoint: None,
+                content_omitted: false,
+            }],
+            tool_detail_error: None,
+        }];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        // 全部动态值转义：script/引号/尖括号不穿透 pre。
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&quot;quoted&quot;"));
+        // 结构与元信息；checkpoint None → 快照块整块省略。
+        assert!(html.contains("<section class=\"tool-call\">"));
+        assert!(html.contains("🧩 pdf-to-ppt"));
+        assert!(html.contains("耗时 1.5 秒"));
+        assert!(html.contains("❌ 出错"));
+        assert!(html.contains("<h5>入参</h5>") && html.contains("<h5>结果</h5>"));
+        assert!(!html.contains("文件写入前快照"));
+    }
+
+    #[test]
+    fn html_tool_checkpoint_three_states() {
+        let mk = |before: Option<&str>, deleted: bool, path: &str| ExportToolCall {
+            name: "write".into(),
+            skill: None,
+            input: "{}".into(),
+            duration_ms: None,
+            result: None,
+            checkpoint: Some(ExportToolCheckpoint {
+                path: path.to_string(),
+                before: before.map(str::to_string),
+                deleted,
+            }),
+            content_omitted: false,
+        };
+        let messages = vec![ExportMessage {
+            role: "status".into(),
+            content: "🔧 调用工具: write".into(),
+            ts: 0,
+            seg_complete: true,
+            msg_id: 0,
+            tools: vec![
+                mk(Some("旧内容"), false, "media/out/a.txt"),
+                mk(None, false, "media/out/new.txt"),
+                mk(None, true, "media/out/gone<b>.txt"),
+            ],
+            tool_detail_error: None,
+        }];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        assert!(html.contains("旧内容"));
+        // 四象限各归各位：「新建」只出现一次（deleted+无 before 不能落进
+        // 新建分支——回归曾经的矛盾文案）。
+        assert_eq!(html.matches("新建文件（无写入前内容）").count(), 1);
+        assert!(html.contains("文件已删除（无写入前内容）"));
+        assert!(html.contains("（该次操作删除了文件）"));
+        // checkpoint.path 转义。
+        assert!(!html.contains("gone<b>.txt"));
+        assert!(html.contains("gone&lt;b&gt;.txt"));
+    }
+
+    #[test]
+    fn html_tool_detail_error_and_no_tools_notes() {
+        let messages = vec![ExportMessage {
+            role: "status".into(),
+            content: "🔧 调用工具: read".into(),
+            ts: 0,
+            seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: Some("读取工具详情失败: <script>alert(9)</script>".into()),
+        }];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        // 失败说明可见且转义。
+        assert!(!html.contains("<script>alert(9)"));
+        assert!(html.contains("读取工具详情失败: &lt;script&gt;"));
+        assert!(!html.contains("<section class=\"tool-call\">"));
+    }
+
+    #[test]
+    fn html_tool_content_omitted_note() {
+        let messages = vec![ExportMessage {
+            role: "status".into(),
+            content: "🔧 调用工具: shell".into(),
+            ts: 0,
+            seg_complete: true,
+            msg_id: 0,
+            tools: vec![ExportToolCall {
+                name: "shell".into(),
+                skill: None,
+                input: String::new(),
+                duration_ms: Some(300),
+                result: None,
+                checkpoint: None,
+                content_omitted: true,
+            }],
+            tool_detail_error: None,
+        }];
+        let html = render_html("t", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
+        assert!(html.contains("工具详情总量已达上限，本调用的入参/结果正文未展开"));
+    }
+
+    #[test]
+    fn truncate_tool_result_keeps_head_tail_and_char_boundary() {
+        let text = "0".repeat(100);
+        let (out, original) = truncate_tool_result(&text, 10);
+        assert_eq!(original, Some(100));
+        assert!(out.starts_with("00000"));
+        assert!(out.ends_with("00000"));
+        assert!(out.contains("中间省略"));
+        // 中文多字节：max 落在字符中间时回退到边界，输出仍是合法 UTF-8。
+        let cjk = "汉".repeat(50); // 150 字节
+        let (out, _) = truncate_tool_result(&cjk, 10);
+        assert!(out.starts_with("汉") && out.ends_with("汉"));
+        let (out, _) = truncate_tool_field(&cjk, 10);
+        assert!(out.starts_with("汉") && out.contains("已截断"));
+    }
+
+    #[test]
+    fn estimate_html_capacity_includes_tool_text() {
+        let mut messages = vec![ExportMessage {
+            role: "status".into(),
+            content: "🔧 x".into(),
+            ts: 0,
+            seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
+        }];
+        let (est0, _) =
+            estimate_html_capacity(&messages, Path::new("/nonexistent"), u64::MAX, u64::MAX);
+        messages[0].tools.push(ExportToolCall {
+            name: "shell".into(),
+            skill: None,
+            input: "y".repeat(1000),
+            duration_ms: None,
+            result: Some(ExportToolResult {
+                content: "z".repeat(2000),
+                is_error: false,
+            }),
+            checkpoint: None,
+            content_omitted: false,
+        });
+        let (est1, _) =
+            estimate_html_capacity(&messages, Path::new("/nonexistent"), u64::MAX, u64::MAX);
+        // 工具文本进预估（转义后长度 + 标记余量），单缓冲一次预留不失效。
+        assert!(est1 - est0 >= 3000);
+    }
+
+    #[test]
+    fn html_tool_big_hint_in_header() {
+        let big = "x".repeat(64);
+        let messages = vec![ExportMessage {
+            role: "status".into(),
+            content: "🔧 调用工具: shell".into(),
+            ts: 0,
+            seg_complete: true,
+            msg_id: 0,
+            tools: vec![ExportToolCall {
+                name: "shell".into(),
+                skill: None,
+                input: big,
+                duration_ms: None,
+                result: None,
+                checkpoint: None,
+                content_omitted: false,
+            }],
+            tool_detail_error: None,
+        }];
+        // 工具提示阈值注入 1 字节：64 字节工具文本必触发。
+        let html = render_html_with_budget(
+            "t",
+            "2026-11-01",
+            &messages,
+            Path::new("/nonexistent"),
+            HtmlBudgetPolicy {
+                total_budget: u64::MAX,
+                max_image_bytes: u64::MAX,
+                big_file_hint_bytes: u64::MAX,
+                tool_big_hint_bytes: 1,
+            },
+        )
+        .unwrap();
+        assert!(html.contains("工具详情较大，打开可能较慢"));
+        // 阈值放宽后不出现。
+        let html2 = render_html_with_budget(
+            "t",
+            "2026-11-01",
+            &messages,
+            Path::new("/nonexistent"),
+            HtmlBudgetPolicy {
+                total_budget: u64::MAX,
+                max_image_bytes: u64::MAX,
+                big_file_hint_bytes: u64::MAX,
+                tool_big_hint_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        assert!(!html2.contains("工具详情较大"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn estimate_and_render_do_not_follow_symlink_outside_root() {
@@ -2471,6 +3253,9 @@ mod tests {
             content: "图 media/out/link.png".into(),
             ts: 0,
             seg_complete: true,
+            msg_id: 0,
+            tools: Vec::new(),
+            tool_detail_error: None,
         }];
         // 预扫：symlink 指向根外 → resolve 拒绝 → 不计数不 stat。
         let (_, image_bytes) =

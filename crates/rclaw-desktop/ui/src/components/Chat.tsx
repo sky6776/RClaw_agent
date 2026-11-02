@@ -1601,14 +1601,17 @@ export default function Chat({
     const segComplete = computeSegmentComplete(entries, selectIds);
     api
       .exportMessages(
+        sessionKey,
         exportTitle,
         fmt,
         // Entry.ts 是毫秒；导出管线统一 unix 秒（0=未知），html 算「已工作 X」用。
+        // msg_id 必须是落库行 id（Entry.msgId）——合成 id 查工具详情会错行。
         selectedMessages.map((e) => ({
           role: e.role,
           content: e.content,
           ts: e.ts && e.ts > 0 ? Math.floor(e.ts / 1000) : 0,
           seg_complete: segComplete.get(e.id) ?? false,
+          msg_id: e.msgId ?? 0,
         })),
       )
       .then((rel) => setExportResult(rel))

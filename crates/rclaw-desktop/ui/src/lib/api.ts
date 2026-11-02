@@ -726,11 +726,13 @@ export const api = {
     invoke<void>("share_text", { title, text }),
 
   /** 选中消息导出为文档（fmt: "md" 文本文档 / "docx" 内嵌图片文档 /
-   *  "html" 折叠块+轮次导航含图片）。messages.ts 为落库 unix 秒（Entry.ts
-   *  是毫秒，调用方除 1000），html 按它算「已工作 X」段时长；seg_complete =
-   *  所在会话段是否整段被选（不完整段平铺、不显示时长）。
+   *  "html" 折叠块+轮次导航含图片+工具全量详情）。chatId 用于后端按行 id
+   *  查工具详情；messages.ts 为落库 unix 秒（Entry.ts 是毫秒，调用方除
+   *  1000）；msg_id 必须是落库行 id（Entry.msgId，不是合成 Entry.id），
+   *  0=未落库；seg_complete = 所在会话段是否整段被选（不完整段平铺）。
    *  返回 output/exports/ 下的工作区相对路径。 */
   exportMessages: (
+    chatId: string,
     title: string,
     fmt: "md" | "docx" | "html",
     messages: Array<{
@@ -738,8 +740,9 @@ export const api = {
       content: string;
       ts: number;
       seg_complete: boolean;
+      msg_id: number;
     }>,
-  ) => invoke<string>("export_messages", { title, fmt, messages }),
+  ) => invoke<string>("export_messages", { chatId, title, fmt, messages }),
 
   /** 关于页的模块版本信息（应用/Agent 各子模块/Tauri/编译器/构建提交）。 */
   appVersions: () => invoke<AppVersions>("app_versions"),
