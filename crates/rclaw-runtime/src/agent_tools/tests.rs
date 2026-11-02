@@ -2025,6 +2025,9 @@ async fn clear_finished_recycles_only_stale_orphan_transcripts() {
             )
             .unwrap();
     }
+    // 直接回拨 session 表的 updated_at（依赖 rclaw-store SCHEMA_V1：`session.updated_at`
+    // 为 Unix 毫秒，与 sweep_orphan_transcripts 的 cutoff 同单位）；store 不暴露改时间戳
+    // 的接口，一分钟的护栏也不能靠真等。
     let hour_ago = chrono::Utc::now().timestamp_millis() - 3_600_000;
     runtime
         .transcript

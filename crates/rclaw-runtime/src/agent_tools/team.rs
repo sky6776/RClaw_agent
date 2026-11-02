@@ -161,6 +161,48 @@ pub(super) struct ExecutionLogEntry {
     pub(super) snapshot: ExecutionSnapshot,
 }
 
+/// [`ExecutionLogEntry`] 的扫库探针：清理窗口外终态流时只需要「终态了没有、源自哪个
+/// 会话」，整份快照（`spec.context` 可达数十 KB）不建树、不进内存。字段名与 serde 属性
+/// 必须与 [`ExecutionLogEntry`] / [`ExecutionSnapshot`] / [`AgentTaskSpec`] 保持一致——
+/// 探针解析失败的流会被 store 告警跳过，表现为「清不掉」。
+#[derive(Deserialize)]
+struct ExecutionLogProbe {
+    snapshot: ExecutionSnapshotProbe,
+}
+
+#[derive(Deserialize)]
+struct ExecutionSnapshotProbe {
+    state: ExecutionState,
+    spec: ExecutionSpecProbe,
+}
+
+#[derive(Deserialize)]
+struct ExecutionSpecProbe {
+    #[serde(default)]
+    source_channel: String,
+    #[serde(default)]
+    origin_chat_id: String,
+}
+
+/// 执行清理的范围：全部，或只清源自某个会话（通道 + chat_id）的。登记表内（内存快照）
+/// 与登记表外（扫库探针）两条路径共用同一判定，不会走散。
+#[derive(Clone, Debug)]
+enum CleanupScope {
+    All,
+    Session { channel: String, chat_id: String },
+}
+
+impl CleanupScope {
+    fn covers(&self, source_channel: &str, origin_chat_id: &str) -> bool {
+        match self {
+            CleanupScope::All => true,
+            CleanupScope::Session { channel, chat_id } => {
+                source_channel == channel && origin_chat_id == chat_id
+            }
+        }
+    }
+}
+
 pub(super) struct ExecutionRecord {
     pub(super) snapshot: ExecutionSnapshot,
     pub(super) events: Vec<ExecutionLogEntry>,
@@ -1118,21 +1160,22 @@ impl CollaborationState {
         Ok(())
     }
 
-    /// 清除已终态、且满足 `filter` 的执行记录（登记表 + journal 事件流一并删除），
+    /// 清除已终态、且在 `scope` 内的执行记录（登记表 + journal 事件流一并删除），
     /// 返回清除条数。非终态（排队/运行/等待/取消中）是活任务，一律保留。
     ///
     /// 等待在该执行上的 AgentWait / 恢复入口随后会拿到 unknown 错误——记录都没了，
     /// 这是预期语义（桌面会话删除级联与「清除历史」按钮共用）。
-    async fn remove_terminal_executions(
-        &self,
-        filter: impl Fn(&ExecutionSnapshot) -> bool,
-    ) -> usize {
+    async fn remove_terminal_executions(&self, scope: &CleanupScope) -> usize {
         let removed: Vec<String> = {
             let mut executions = self.executions.lock().await;
             let doomed: Vec<String> = executions
                 .iter()
                 .filter(|(_, record)| {
-                    record.snapshot.state.is_terminal() && filter(&record.snapshot)
+                    record.snapshot.state.is_terminal()
+                        && scope.covers(
+                            &record.snapshot.spec.source_channel,
+                            &record.snapshot.spec.origin_chat_id,
+                        )
                 })
                 .map(|(agent_id, _)| agent_id.clone())
                 .collect();
@@ -1141,22 +1184,25 @@ impl CollaborationState {
             }
             doomed
         };
+        if removed.is_empty() {
+            return 0;
+        }
+        // 事实源（登记表）已经不含这些记录，先广播让 UI 立刻收起，再慢慢删库。
+        self.publish(ExecutionUpdate::Removed {
+            agent_ids: removed.clone(),
+        });
         // journal 流 / transcript 删除在锁外、blocking 线程上做：失败只告警——内存登记表
         // 已清，残留流下次重启会被 recover 装回登记表（终态记录，仅展示），可再次清除。
-        self.delete_execution_streams(removed.clone()).await;
-        if !removed.is_empty() {
-            self.publish(ExecutionUpdate::Removed {
-                agent_ids: removed.clone(),
-            });
-        }
-        removed.len()
+        let count = removed.len();
+        self.delete_execution_streams(removed).await;
+        count
     }
 
     /// 删除若干执行的 journal 事件流与 transcript（记录没了就再没有入口能打开它）。
     /// 放到 blocking 线程：`secure_delete` 下删一份几千行的 transcript 要清零页面再走
     /// WAL，是百毫秒级的同步 IO，不能占着 tokio worker——同一时刻别的子代理的
-    /// `transition_execution` 还在排队等 Db 锁。返回流删除成功的条数；transcript 删除
-    /// 失败只告警（孤儿回收兜底）。
+    /// `transition_execution` 还在排队等 Db 锁。返回实际删掉的流数（流已被别处删掉的
+    /// 空操作不计）；transcript 删除失败只告警（孤儿回收兜底）。
     async fn delete_execution_streams(&self, agent_ids: Vec<String>) -> usize {
         if agent_ids.is_empty() {
             return 0;
@@ -1166,11 +1212,14 @@ impl CollaborationState {
         let task = tokio::task::spawn_blocking(move || {
             let mut deleted = 0;
             for agent_id in &agent_ids {
-                if let Err(error) = journal.delete_stream(JOURNAL_EXEC_LOG, agent_id) {
-                    tracing::warn!("清理子 agent 执行事件流 {agent_id} 失败: {error}");
-                    continue;
+                match journal.delete_stream(JOURNAL_EXEC_LOG, agent_id) {
+                    Ok(0) => {}
+                    Ok(_) => deleted += 1,
+                    Err(error) => {
+                        tracing::warn!("清理子 agent 执行事件流 {agent_id} 失败: {error}");
+                        continue;
+                    }
                 }
-                deleted += 1;
                 if let Err(error) = transcript.delete_session(SUBAGENT_CHANNEL, agent_id) {
                     tracing::warn!("清理子 agent transcript {agent_id} 失败: {error}");
                 }
@@ -1192,37 +1241,49 @@ impl CollaborationState {
     /// 终态流留在库里直到积满 [`RETAINED_TERMINAL_EXECUTION_STREAMS`] 才在某次启动被裁。
     /// 它们没有登记记录：UI 看不到、[`Self::remove_terminal_executions`] 也碰不到——有了整份
     /// transcript 之后这份「看不见的积累」是实打实的磁盘占用，所以「清除历史」/ 会话删除
-    /// 级联要把满足 `filter` 的这些流连同 transcript 一并清掉。只动终态流；非终态流都在
+    /// 级联要把 `scope` 内的这些流连同 transcript 一并清掉。只动终态流；非终态流都在
     /// 登记表里（启动时全部装载），不在登记表的非终态流只可能是正在入表的新执行，不碰。
+    /// 多进程共用一个库时（桌面 + CLI），另一进程登记表里的终态流对本进程来说也是
+    /// 「不在登记表」，同样会被清——「清除历史」/ 会话删除本就是全库语义，这是预期行为。
     /// 返回清掉的流数。
     ///
     /// 时序：先一条 SQL 扫每条流的最后一条事件挑出候选，【之后】再对照登记表。终态事件
-    /// 只会由登记表里的记录持锁写出（[`Self::transition_execution`]），所以查询里看到的
-    /// 任何终态流，其记录要么此刻仍在登记表（跳过），要么已被
-    /// [`Self::remove_terminal_executions`] 连流一起删掉（再删一次是空操作）——「枚举之后
+    /// 只会由登记表里的记录持锁写出（[`Self::transition_execution`]），所以扫描里看到的
+    /// 任何终态流，其记录要么此刻仍在登记表（跳过），要么已被 / 正在被
+    /// [`Self::remove_terminal_executions`] 连流一起删掉——两边的 `delete_stream` /
+    /// `delete_session` 都是独立事务、由连接锁串行且幂等，再删一次是空操作。「枚举之后
     /// 才入表、随即终结」的新执行不会被误当成窗口外历史。
-    async fn sweep_unregistered_terminal_executions(
-        &self,
-        filter: impl Fn(&ExecutionSnapshot) -> bool,
-    ) -> usize {
-        // 会话删除 / 归档级联每次都走这里：一条 SQL、解析一条看一条、只留候选流名——不做
-        // N+1 点查，也不把上千份快照（含 spec.context）一次物化进内存。
-        let mut candidates: Vec<String> = Vec::new();
-        let scanned = self
-            .journal
-            .for_each_latest(JOURNAL_EXEC_LOG, |stream, value| {
-                // 解析不了的流（schema 漂移 / 损坏）不动：多进程共用一个库，可能是别的版本在写。
-                let Ok(last) = serde_json::from_value::<ExecutionLogEntry>(value) else {
-                    return;
-                };
-                if last.snapshot.state.is_terminal() && filter(&last.snapshot) {
-                    candidates.push(stream.to_string());
-                }
-            });
-        if let Err(error) = scanned {
-            tracing::warn!("枚举子 agent 执行事件流失败，跳过窗口外清理: {error}");
-            return 0;
-        }
+    async fn sweep_unregistered_terminal_executions(&self, scope: CleanupScope) -> usize {
+        // 会话删除 / 归档级联每次都走这里：一条 SQL、探针只解析判定字段、只留候选流名——
+        // 不做 N+1 点查，也不把上千份快照（含 spec.context）物化。整段扫描持 Db 锁同步
+        // 进行，放 blocking 线程，不占 tokio worker。
+        let journal = self.journal.clone();
+        let scan = tokio::task::spawn_blocking(move || {
+            let mut candidates: Vec<String> = Vec::new();
+            // 解析不成探针的流（schema 漂移 / 损坏）由 store 告警跳过，不动：多进程共用一个
+            // 库，可能是别的版本在写。
+            journal
+                .for_each_latest::<ExecutionLogProbe>(JOURNAL_EXEC_LOG, |stream, probe| {
+                    let spec = &probe.snapshot.spec;
+                    if probe.snapshot.state.is_terminal()
+                        && scope.covers(&spec.source_channel, &spec.origin_chat_id)
+                    {
+                        candidates.push(stream.to_string());
+                    }
+                })
+                .map(|()| candidates)
+        });
+        let candidates = match scan.await {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(error)) => {
+                tracing::warn!("枚举子 agent 执行事件流失败，跳过窗口外清理: {error}");
+                return 0;
+            }
+            Err(error) => {
+                tracing::warn!("枚举子 agent 执行事件流的 blocking 任务异常: {error}");
+                return 0;
+            }
+        };
         if candidates.is_empty() {
             return 0;
         }
@@ -1240,35 +1301,51 @@ impl CollaborationState {
     /// 而 transcript 当时删除失败的残留）。只回收最近一分钟没有写入的会话——刚入表、尚未
     /// 落首行的新执行在登记表里能查到，这里再加时间护栏兜住「枚举与入表交错」的极端时序。
     async fn sweep_orphan_transcripts(&self) -> usize {
-        let sessions = match self.transcript.list_sessions(Some(SUBAGENT_CHANNEL)) {
-            Ok(sessions) => sessions,
+        // 枚举（两条全表查询）与删除都是持 Db 锁的同步 IO，各自放 blocking 线程；中间按
+        // 登记表复核一次要拿 tokio 锁，所以分两跳。
+        let transcript = self.transcript.clone();
+        let journal = self.journal.clone();
+        let cutoff = chrono::Utc::now().timestamp_millis() - 60_000;
+        let scan = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+            let sessions = transcript
+                .list_sessions(Some(SUBAGENT_CHANNEL))
+                .map_err(|error| format!("枚举子 agent transcript 失败: {error}"))?;
+            if sessions.is_empty() {
+                return Ok(Vec::new());
+            }
+            let streams: BTreeSet<String> = journal
+                .streams(JOURNAL_EXEC_LOG)
+                .map_err(|error| format!("枚举子 agent 执行事件流失败: {error}"))?
+                .into_iter()
+                .collect();
+            Ok(sessions
+                .into_iter()
+                .filter(|session| {
+                    session.updated_at < cutoff && !streams.contains(&session.chat_id)
+                })
+                .map(|session| session.chat_id)
+                .collect())
+        });
+        let candidates = match scan.await {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(error)) => {
+                tracing::warn!("{error}，跳过孤儿回收");
+                return 0;
+            }
             Err(error) => {
-                tracing::warn!("枚举子 agent transcript 失败，跳过孤儿回收: {error}");
+                tracing::warn!("枚举孤儿子 agent transcript 的 blocking 任务异常: {error}");
                 return 0;
             }
         };
-        if sessions.is_empty() {
+        if candidates.is_empty() {
             return 0;
         }
-        let streams: BTreeSet<String> = match self.journal.streams(JOURNAL_EXEC_LOG) {
-            Ok(streams) => streams.into_iter().collect(),
-            Err(error) => {
-                tracing::warn!("枚举子 agent 执行事件流失败，跳过孤儿回收: {error}");
-                return 0;
-            }
-        };
-        let cutoff = chrono::Utc::now().timestamp_millis() - 60_000;
         // 删除前再按登记表核一次：入表发生在首行落库之前，不在表里的就没有活的写入方。
         let doomed: Vec<String> = {
             let executions = self.executions.lock().await;
-            sessions
+            candidates
                 .into_iter()
-                .filter(|session| {
-                    session.updated_at < cutoff
-                        && !streams.contains(&session.chat_id)
-                        && !executions.contains_key(&session.chat_id)
-                })
-                .map(|session| session.chat_id)
+                .filter(|chat_id| !executions.contains_key(chat_id))
                 .collect()
         };
         if doomed.is_empty() {
@@ -1305,8 +1382,10 @@ impl CollaborationState {
     /// 里的终态记录 + 登记表窗口之外库里的终态流（都连同 transcript），再回收孤儿 transcript。
     /// 返回值只计登记表里清掉的条数（UI 上看得见的那些）。
     pub(super) async fn clear_finished_executions(&self) -> usize {
-        let removed = self.remove_terminal_executions(|_| true).await;
-        let swept = self.sweep_unregistered_terminal_executions(|_| true).await;
+        let removed = self.remove_terminal_executions(&CleanupScope::All).await;
+        let swept = self
+            .sweep_unregistered_terminal_executions(CleanupScope::All)
+            .await;
         if swept > 0 {
             tracing::info!("清理了 {swept} 条登记表窗口之外的历史子 agent 执行流");
         }
@@ -1316,14 +1395,12 @@ impl CollaborationState {
 
     /// 清掉源自指定会话的已终态执行记录（会话删除级联），登记表内外都算。
     pub(super) async fn forget_session_executions(&self, channel: &str, chat_id: &str) -> usize {
-        let from_session = |snapshot: &ExecutionSnapshot| {
-            snapshot.spec.source_channel == channel && snapshot.spec.origin_chat_id == chat_id
+        let scope = CleanupScope::Session {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
         };
-        let removed = self.remove_terminal_executions(from_session).await;
-        removed
-            + self
-                .sweep_unregistered_terminal_executions(from_session)
-                .await
+        let removed = self.remove_terminal_executions(&scope).await;
+        removed + self.sweep_unregistered_terminal_executions(scope).await
     }
 
     /// 单条执行的模型可见载荷（AgentStatus / AgentWait 工具结果）：完整快照 + 尾部事件 +

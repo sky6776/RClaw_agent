@@ -7,6 +7,7 @@
 //! 不再依赖文件追加的原子性与目录扫描。
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::db::{now_ms, Db};
@@ -256,11 +257,18 @@ impl JournalStore {
     /// 逐流访问某类 journal 的最后一条事件 `(stream, payload)`，流按首次出现顺序。
     ///
     /// 一条 SQL 代替「[`Self::streams`] + 逐流 [`Self::latest`]」的 N+1 点查：历史执行流
-    /// 可达上千条，而会话删除级联每次都要扫一遍。访问者形态：payload（整份快照，可达
-    /// 数十 KB）解析一条、交出一条，调用方只留下自己要的，不把全部流一次物化进内存。
-    /// payload 不可解析的流告警并跳过，与 [`Self::latest`] 的策略一致。闭包在持连接锁
-    /// 期间运行，不得再调用本 store 的其它方法。
-    pub fn for_each_latest(&self, kind: &str, mut visit: impl FnMut(&str, Value)) -> Result<()> {
+    /// 可达上千条，而会话删除级联每次都要扫一遍。访问者形态：payload 直接按调用方给的
+    /// `T` 反序列化、解析一条交出一条——调用方传一个只含判定字段的探针类型，整份快照
+    /// （可达数十 KB）既不建 `Value` 树也不进内存；`T = Value` 则是通用取值。
+    /// payload 解析不成 `T` 的流告警并跳过，与 [`Self::latest`] 的策略一致。
+    ///
+    /// 整个扫描持连接锁同步进行：闭包不得再调用本 store 的其它方法；在 async 环境里请
+    /// 放到 `spawn_blocking`（见 [`Db`] 文档）。
+    pub fn for_each_latest<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        mut visit: impl FnMut(&str, T),
+    ) -> Result<()> {
         self.db.with(|conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT e.stream, e.payload FROM journal_event e \
@@ -274,7 +282,7 @@ impl JournalStore {
             })?;
             for row in rows {
                 let (stream, text) = row?;
-                match serde_json::from_str(&text) {
+                match serde_json::from_str::<T>(&text) {
                     Ok(value) => visit(&stream, value),
                     Err(e) => tracing::warn!(
                         "journal 最新事件解析失败，跳过该流: kind={kind} stream={stream} err={e}"
@@ -283,13 +291,6 @@ impl JournalStore {
             }
             Ok(())
         })
-    }
-
-    /// [`Self::for_each_latest`] 的收集版：全部流的最后一条事件 `(stream, payload)`。
-    pub fn latest_per_stream(&self, kind: &str) -> Result<Vec<(String, Value)>> {
-        let mut out = Vec::new();
-        self.for_each_latest(kind, |stream, value| out.push((stream.to_string(), value)))?;
-        Ok(out)
     }
 
     /// 某类 journal 的全部 stream 名（去重，按首次出现顺序）。
@@ -457,32 +458,54 @@ mod tests {
         assert!(j.load_tail(JOURNAL_PLAN, "nope", 5).unwrap().is_empty());
     }
 
+    fn collect_latest<T: DeserializeOwned>(j: &JournalStore, kind: &str) -> Vec<(String, T)> {
+        let mut out = Vec::new();
+        j.for_each_latest::<T>(kind, |stream, value| out.push((stream.to_string(), value)))
+            .unwrap();
+        out
+    }
+
     #[test]
-    fn latest_per_stream_returns_each_streams_last_event_in_first_seen_order() {
+    fn for_each_latest_visits_each_streams_last_event_in_first_seen_order() {
         let (_dir, j) = store();
         // p2 先出现、p1 后出现但事件更多：顺序按首次出现，取值按各自最大 seq。
-        j.append(JOURNAL_EXEC_LOG, "p2", &json!({"e": "p2-1"}))
+        j.append(JOURNAL_EXEC_LOG, "p2", &json!({"e": "p2-1", "n": 1}))
             .unwrap();
-        j.append(JOURNAL_EXEC_LOG, "p1", &json!({"e": "p1-1"}))
+        j.append(JOURNAL_EXEC_LOG, "p1", &json!({"e": "p1-1", "n": 1}))
             .unwrap();
-        j.append(JOURNAL_EXEC_LOG, "p1", &json!({"e": "p1-2"}))
+        j.append(JOURNAL_EXEC_LOG, "p1", &json!({"e": "p1-2", "n": 2}))
             .unwrap();
-        j.append(JOURNAL_EXEC_LOG, "p2", &json!({"e": "p2-2"}))
+        j.append(JOURNAL_EXEC_LOG, "p2", &json!({"e": "p2-2", "n": 2}))
             .unwrap();
         // 其它 kind 的同名流不混进来。
         j.append(JOURNAL_PLAN, "p1", &json!({"e": "plan"})).unwrap();
         assert_eq!(
-            j.latest_per_stream(JOURNAL_EXEC_LOG).unwrap(),
+            collect_latest::<Value>(&j, JOURNAL_EXEC_LOG),
             vec![
-                ("p2".to_string(), json!({"e": "p2-2"})),
-                ("p1".to_string(), json!({"e": "p1-2"})),
+                ("p2".to_string(), json!({"e": "p2-2", "n": 2})),
+                ("p1".to_string(), json!({"e": "p1-2", "n": 2})),
             ]
         );
-        assert!(j.latest_per_stream(JOURNAL_WORKFLOW).unwrap().is_empty());
+        assert!(collect_latest::<Value>(&j, JOURNAL_WORKFLOW).is_empty());
         // 与逐流 latest 一致。
-        for (stream, value) in j.latest_per_stream(JOURNAL_EXEC_LOG).unwrap() {
+        for (stream, value) in collect_latest::<Value>(&j, JOURNAL_EXEC_LOG) {
             assert_eq!(j.latest(JOURNAL_EXEC_LOG, &stream).unwrap(), Some(value));
         }
+
+        // 探针类型：只取判定字段，其余字段忽略；解析不成探针的流跳过而不是整体失败。
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Probe {
+            e: String,
+        }
+        j.append(JOURNAL_EXEC_LOG, "broken", &json!({"n": 3}))
+            .unwrap();
+        assert_eq!(
+            collect_latest::<Probe>(&j, JOURNAL_EXEC_LOG),
+            vec![
+                ("p2".to_string(), Probe { e: "p2-2".into() }),
+                ("p1".to_string(), Probe { e: "p1-2".into() }),
+            ]
+        );
     }
 
     #[test]
