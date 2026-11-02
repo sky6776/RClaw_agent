@@ -1561,13 +1561,14 @@ fn tool_call_row_range(msgs: &[rclaw_core::Message]) -> Option<(i64, i64)> {
 /// 读取该批消息对应的工具调用侧表（连接上同步执行；无工具行时不查库）。
 fn load_tool_call_metas(
     session: &rclaw_store::SessionStore,
+    channel: &str,
     chat_id: &str,
     msgs: &[rclaw_core::Message],
 ) -> ToolCallMetas {
     let Some((lo, hi)) = tool_call_row_range(msgs) else {
         return ToolCallMetas::new();
     };
-    match session.load_tool_call_metas(CHANNEL_DESKTOP, chat_id, lo, hi) {
+    match session.load_tool_call_metas(channel, chat_id, lo, hi) {
         Ok(metas) => metas,
         Err(e) => {
             // 侧表只是充实（skill / 耗时 / 成败徽标），读不到不该让历史整体失败。
@@ -2080,7 +2081,7 @@ pub async fn chat_history(
         let snap = session
             .load_chat_snapshot(CHANNEL_DESKTOP, &chat_id, 200, 4 * 1024 * 1024)
             .map_err(|e| e.to_string())?;
-        let metas = load_tool_call_metas(&session, &chat_id, &snap.messages);
+        let metas = load_tool_call_metas(&session, CHANNEL_DESKTOP, &chat_id, &snap.messages);
         Ok((snap, metas))
     })
     .await?;
@@ -2136,7 +2137,7 @@ pub async fn chat_history_since(
         let delta = session
             .load_chat_delta(CHANNEL_DESKTOP, &chat_id, after, 200)
             .map_err(|e| e.to_string())?;
-        let metas = load_tool_call_metas(&session, &chat_id, &delta.messages);
+        let metas = load_tool_call_metas(&session, CHANNEL_DESKTOP, &chat_id, &delta.messages);
         Ok((delta, metas))
     })
     .await?;
@@ -2269,6 +2270,167 @@ pub async fn agents_list(state: State<'_, AppState>) -> Result<serde_json::Value
 pub async fn agents_clear_history(state: State<'_, AppState>) -> Result<usize, String> {
     let runtime = state.agent_runtime().ok_or("agent 尚未启动")?;
     Ok(runtime.clear_finished_executions().await)
+}
+
+// ---------------------------------------------------------------------------
+// 子 agent 执行详情：实时快照 + 完整活动记录（transcript）+ 对话 / 取消
+// ---------------------------------------------------------------------------
+
+/// 子 agent 执行 id 的字符集校验：运行时生成的 id = 清洗后的名字（字母数字 / `-` /
+/// `_`，可含非 ASCII 字母）+ 微秒时间戳 + 序号，不是会话 id 的 ASCII 子集；这里只拦
+/// 明显不是 id 的输入（空 / 超长 / 含分隔符与控制字符），存在性由运行时登记表判定。
+fn is_valid_agent_id(agent_id: &str) -> bool {
+    !agent_id.is_empty()
+        && agent_id.chars().count() <= 96
+        && agent_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 单条执行的实时详情：完整快照（spec / 进度 / 阶段 / handoff / 错误 / token 用量 /
+/// 起止时刻）、尾部事件、可取消 / 可恢复、待读插话数。未知 id（已清除）报错。
+#[tauri::command]
+pub async fn agent_execution_detail(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    if !is_valid_agent_id(&agent_id) {
+        return Err(format!("非法子 agent id: {agent_id}"));
+    }
+    let runtime = state.agent_runtime().ok_or("agent 尚未启动")?;
+    runtime
+        .execution_detail(&agent_id)
+        .await
+        .ok_or_else(|| format!("子 agent 执行 {agent_id} 不存在（可能已被清除）"))
+}
+
+/// 子 agent 的完整活动记录（transcript）快照：与会话历史同一套投影——user 行（任务
+/// 提示 / 用户插话 / 团队消息）、assistant 正文、thinking（Reasoning 块）、status（工具
+/// 调用轮，带结构化 `tool_calls`）；游标语义与 [`chat_history`] 相同。
+///
+/// 记录在会话库通道 `subagent`、chat_id = agent_id（运行时在子代理循环里按前台同形落
+/// 库）；尚未落任何行（刚排队）时返回空快照、游标 0。
+#[tauri::command]
+pub async fn agent_execution_history(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<ChatHistorySnapshot, String> {
+    if !is_valid_agent_id(&agent_id) {
+        return Err(format!("非法子 agent id: {agent_id}"));
+    }
+    let session = state.session().ok_or("agent 尚未启动")?;
+    let (snap, metas) = run_blocking("读取子 agent 活动记录", move || {
+        let snap = session
+            .load_chat_snapshot(
+                rclaw_runtime::SUBAGENT_CHANNEL,
+                &agent_id,
+                400,
+                4 * 1024 * 1024,
+            )
+            .map_err(|e| e.to_string())?;
+        let metas = load_tool_call_metas(
+            &session,
+            rclaw_runtime::SUBAGENT_CHANNEL,
+            &agent_id,
+            &snap.messages,
+        );
+        Ok((snap, metas))
+    })
+    .await?;
+    let mut entries = history_entries(&snap.messages, &metas);
+    // 子代理的记录以工具轮为主，首屏窗口比会话放宽（200 行）；更早的行只在游标之前，
+    // 详情页不翻页——完整记录的事实源仍在库里。
+    retain_last_rows(&mut entries, 200);
+    Ok(ChatHistorySnapshot {
+        entries,
+        cursor: snap.cursor,
+    })
+}
+
+/// 子 agent 活动记录的行级增量（`agent_exec` 的 `transcript` 事件带来新游标后调用）。
+#[tauri::command]
+pub async fn agent_execution_history_since(
+    state: State<'_, AppState>,
+    agent_id: String,
+    after: i64,
+) -> Result<ChatHistoryDelta, String> {
+    if !is_valid_agent_id(&agent_id) {
+        return Err(format!("非法子 agent id: {agent_id}"));
+    }
+    if after < 0 {
+        return Err(format!("非法游标: {after}"));
+    }
+    let session = state.session().ok_or("agent 尚未启动")?;
+    let (delta, metas) = run_blocking("读取子 agent 活动记录增量", move || {
+        let delta = session
+            .load_chat_delta(rclaw_runtime::SUBAGENT_CHANNEL, &agent_id, after, 200)
+            .map_err(|e| e.to_string())?;
+        let metas = load_tool_call_metas(
+            &session,
+            rclaw_runtime::SUBAGENT_CHANNEL,
+            &agent_id,
+            &delta.messages,
+        );
+        Ok((delta, metas))
+    })
+    .await?;
+    Ok(ChatHistoryDelta {
+        entries: history_entries(&delta.messages, &metas),
+        cursor: delta.cursor,
+        more: delta.more,
+    })
+}
+
+/// 子 agent 活动记录里一条工具调用行的展开详情（完整入参 + 结果 + 侧表；与
+/// [`chat_tool_detail`] 同一读法，只是通道不同）。
+#[tauri::command]
+pub async fn agent_execution_tool_detail(
+    state: State<'_, AppState>,
+    agent_id: String,
+    msg_id: i64,
+) -> Result<ToolChainDetailDto, String> {
+    if !is_valid_agent_id(&agent_id) {
+        return Err(format!("非法子 agent id: {agent_id}"));
+    }
+    let session = state.session().ok_or("agent 尚未启动")?;
+    let detail = run_blocking("读取子 agent 工具调用详情", move || {
+        session
+            .load_tool_chain_detail(rclaw_runtime::SUBAGENT_CHANNEL, &agent_id, msg_id)
+            .map_err(|e| e.to_string())
+    })
+    .await?
+    .ok_or_else(|| format!("消息 {msg_id} 不是该子 agent 记录里的工具调用行"))?;
+    Ok(tool_chain_detail_dto(msg_id, &detail))
+}
+
+/// 向正在运行的子 agent 发消息（详情页输入框）：进入该执行的收件箱，子代理在下一个
+/// 安全点（模型推理前后）读入并落活动记录；已结束 / 取消中 / 不在本进程运行的拒绝。
+#[tauri::command]
+pub async fn agent_execution_send(
+    state: State<'_, AppState>,
+    agent_id: String,
+    text: String,
+) -> Result<(), String> {
+    if !is_valid_agent_id(&agent_id) {
+        return Err(format!("非法子 agent id: {agent_id}"));
+    }
+    let runtime = state.agent_runtime().ok_or("agent 尚未启动")?;
+    runtime.post_execution_message(&agent_id, &text).await
+}
+
+/// 取消正在运行的子 agent（详情页取消按钮；与 AgentCancel 工具同一路径）。
+#[tauri::command]
+pub async fn agent_execution_cancel(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<(), String> {
+    if !is_valid_agent_id(&agent_id) {
+        return Err(format!("非法子 agent id: {agent_id}"));
+    }
+    let runtime = state.agent_runtime().ok_or("agent 尚未启动")?;
+    runtime
+        .request_execution_cancel(&agent_id, "用户在桌面端取消")
+        .await
 }
 
 // ---------------------------------------------------------------------------

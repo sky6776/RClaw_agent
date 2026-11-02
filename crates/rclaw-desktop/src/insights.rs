@@ -174,9 +174,10 @@ fn scan_message(msg: &Message, agg: &mut SessionAgg) {
     }
 }
 
-/// 心跳会话：`system` 通道。
+/// 非用户会话：心跳（`system` 通道）与子 agent 活动记录（`subagent` 通道，每条后台执行
+/// 一个会话）——都不是用户的会话，不计入会话数，也不参与日活跃 / 工具榜扫描。
 fn is_heartbeat_session(summary: &SessionSummary) -> bool {
-    summary.channel == HEARTBEAT_CHANNEL
+    summary.channel == HEARTBEAT_CHANNEL || summary.channel == rclaw_runtime::SUBAGENT_CHANNEL
 }
 
 fn bump_day(map: &mut BTreeMap<String, u64>, ts: i64) {

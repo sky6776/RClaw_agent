@@ -35,9 +35,11 @@ import {
   viewsFromBegun,
   viewsFromSummary,
 } from "./lib/toolCalls";
+import { countByState, useAgentExecutions } from "./lib/agentExecutions";
 import Wizard from "./components/Wizard";
 import Chat, { type Entry, type QueueItem } from "./components/Chat";
 import AgentsPanel from "./components/AgentsPanel";
+import AgentExecutionDetail from "./components/AgentExecutionDetail";
 import BotsPanel from "./components/BotsPanel";
 import ToolsPanel from "./components/ToolsPanel";
 import SkillsPanel from "./components/SkillsPanel";
@@ -214,6 +216,11 @@ export default function App() {
   const [agentState, setAgentState] = useState<"idle" | "starting" | "ready" | "error">("idle");
   const [agentError, setAgentError] = useState<string | null>(null);
   const [page, setPage] = useState<Page>("chat");
+  // 正在查看详情的子 agent 执行（Agent / 任务概览页内的详情层；null = 列表）。
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  // 侧边栏「Agent / 任务概览」实时徽标：直播仓里活跃（排队 / 运行 / 等待 / 取消中）的执行数。
+  const { executions: liveExecutions } = useAgentExecutions(agentState === "ready");
+  const liveCounts = countByState(liveExecutions);
 
   // 标题栏循环标语（界面偏好，非 rclaw.toml）。加载失败或为空时回退应用名。
   const [slogans, setSlogans] = useState<string[]>([]);
@@ -1785,6 +1792,17 @@ ${event.payload.command}
   useBackClose(photoEditor !== null, discardPhotoEditor);
   useBackClose(captureDialog !== null, () => setCaptureDialog(null));
   useBackClose(recording !== null, () => void cancelRecording());
+  // 子 agent 执行详情层：返回键先回到列表。
+  useBackClose(
+    selectedAgentId !== null && (page === "agents" || page === "taskview"),
+    () => setSelectedAgentId(null),
+  );
+
+  /** 打开 Agent 页（可选直达某条执行的详情）。 */
+  const openAgents = useCallback((agentId?: string) => {
+    setSelectedAgentId(agentId ?? null);
+    setPage("agents");
+  }, []);
 
   let body: ReactNode;
   if (!status) {
@@ -1893,28 +1911,51 @@ ${event.payload.command}
                   ...NAV.slice(7, -1),
                 ] as Array<[Page, string, () => ReactNode]>)
               : NAV.slice(0, -1)
-          ).map(([key, label, Icon]) => (
-            <button
-              key={key}
-              onClick={() => {
-                setPage(key);
-                setDrawerOpen(false);
-              }}
-              title={label}
-              className={`flex w-full items-center rounded-lg text-sm transition max-md:text-[15px] ${
-                sidebarCollapsed ? "justify-center py-2" : "gap-2.5 px-3 py-2 text-left max-md:py-2"
-              } ${
-                page === key
-                  ? "bg-indigo-500/10 text-indigo-300"
-                  : "text-gray-400 hover:bg-[#1a1f29] hover:text-gray-200"
-              }`}
-            >
-              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
-                <Icon />
-              </span>
-              {!sidebarCollapsed && label}
-            </button>
-          ))}
+          ).map(([key, label, Icon]) => {
+            // Agent / 任务概览：实时徽标 = 活跃执行数（有在运行的带脉动；收起时只剩小圆点）。
+            const badge = key === "agents" || key === "taskview" ? liveCounts.active : 0;
+            const pulse = badge > 0 && liveCounts.running > 0;
+            return (
+              <button
+                key={key}
+                onClick={() => {
+                  if (page !== key) setSelectedAgentId(null);
+                  setPage(key);
+                  setDrawerOpen(false);
+                }}
+                title={badge > 0 ? `${label}：${badge} 个任务活跃` : label}
+                className={`relative flex w-full items-center rounded-lg text-sm transition max-md:text-[15px] ${
+                  sidebarCollapsed ? "justify-center py-2" : "gap-2.5 px-3 py-2 text-left max-md:py-2"
+                } ${
+                  page === key
+                    ? "bg-indigo-500/10 text-indigo-300"
+                    : "text-gray-400 hover:bg-[#1a1f29] hover:text-gray-200"
+                }`}
+              >
+                <span className="relative flex h-4 w-4 shrink-0 items-center justify-center">
+                  <Icon />
+                  {badge > 0 && sidebarCollapsed && (
+                    <span
+                      className={`absolute -right-1 -top-1 h-2 w-2 rounded-full bg-amber-400 ${
+                        pulse ? "animate-pulse" : ""
+                      }`}
+                    />
+                  )}
+                </span>
+                {!sidebarCollapsed && <span className="min-w-0 flex-1 truncate">{label}</span>}
+                {!sidebarCollapsed && badge > 0 && (
+                  <span
+                    className={`ml-auto inline-flex min-w-[1.25rem] shrink-0 items-center justify-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-px font-mono text-[10px] tabular-nums text-amber-300 ${
+                      pulse ? "" : "opacity-80"
+                    }`}
+                  >
+                    {pulse && <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />}
+                    {badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
           {/* 安卓 App：主题选择入口（顶栏已移除，收进侧栏栏目；仅手机布局）。 */}
           {isAndroidDevice() && isMobile && !sidebarCollapsed && (
             <button
@@ -2244,10 +2285,22 @@ ${event.payload.command}
         {agentState === "ready" && page === "tools" && <ToolsPanel agentReady />}
         {agentState === "ready" && page === "skills" && <SkillsPanel agentReady />}
         {agentState === "ready" && page === "files" && <FilePanel onError={setErrorToast} />}
-        {agentState === "ready" && page === "agents" && <AgentsPanel agentReady />}
+        {agentState === "ready" && page === "agents" && (
+          selectedAgentId !== null ? (
+            <AgentExecutionDetail agentId={selectedAgentId} onBack={() => setSelectedAgentId(null)} />
+          ) : (
+            <AgentsPanel agentReady onOpen={setSelectedAgentId} />
+          )
+        )}
         {agentState === "ready" && page === "evolution" && <EvolutionPanel agentReady />}
         {agentState === "ready" && page === "cron" && <CronPanel agentReady />}
-        {agentState === "ready" && page === "taskview" && <TaskOverviewPanel agentReady />}
+        {agentState === "ready" && page === "taskview" && (
+          selectedAgentId !== null ? (
+            <AgentExecutionDetail agentId={selectedAgentId} onBack={() => setSelectedAgentId(null)} />
+          ) : (
+            <TaskOverviewPanel agentReady onOpen={setSelectedAgentId} />
+          )
+        )}
         {agentState === "ready" && page === "config" && (
           <ConfigPanel
             agentReady
@@ -2271,7 +2324,7 @@ ${event.payload.command}
             agentReady
             activeChatId={activeId}
             width={rightWidth}
-            onOpenAgents={() => setPage("agents")}
+            onOpenAgents={openAgents}
           />
         </>
       )}

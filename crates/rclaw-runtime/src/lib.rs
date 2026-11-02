@@ -23,8 +23,9 @@ pub mod turn;
 pub use agent_loop::{AgentLoop, ForkHandle, SessionLifecycle};
 pub use agent_tools::{
     plan_is_active, plan_pause_key, AgentCancelTool, AgentResumeTool, AgentStatusTool,
-    AgentToolRuntime, AgentWaitTool, ClaudeAgentTool, PlanRunTool, SendMessageTool, TaskCreateTool,
-    TaskGetTool, TaskListTool, TaskUpdateTool, TeamCreateTool, TeamDeleteTool,
+    AgentToolRuntime, AgentWaitTool, ClaudeAgentTool, ExecutionUpdate, ExecutionUsage, PlanRunTool,
+    SendMessageTool, TaskCreateTool, TaskGetTool, TaskListTool, TaskUpdateTool, TeamCreateTool,
+    TeamDeleteTool, EXECUTION_INBOX_MESSAGE_MAX_CHARS, SUBAGENT_CHANNEL,
 };
 pub use bots::{
     bot_inbox_chat_id, chat_key, group_member_chat_id, sanitize_control_frames, BotRegistry,

@@ -280,15 +280,117 @@ export interface WizardInput {
   autoEvolve: boolean;
 }
 
-/** 后台子 agent 执行快照（executions_payload 的 JSON）。 */
+/** 子 agent 累计 token 用量（provider 上报的真实 usage 逐次模型调用累加）。 */
+export interface AgentExecutionUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  /** 已拿到结果的模型调用次数。 */
+  model_calls: number;
+  /** 其中 provider 没上报 usage 的调用次数（>0 时 token 数只是下限）。 */
+  unreported_calls: number;
+}
+
+/** 后台子 agent 执行的列表级快照（executions_payload 的 `executions[]` 条目；
+ *  `agent_exec` 的 snapshot 事件同形）。 */
 export interface AgentExecution {
   agent_id: string;
+  /** 子代理名字（Agent 工具的 name 入参；可为空）。 */
+  name?: string;
+  role?: string;
   state: string;
   progress: { completed_steps: number; total_steps: number; stage: string };
+  /** 任务文本（截断到 240 字符；全文在详情 `execution.spec.task`）。 */
   goal: string;
+  isolation?: string;
+  model?: string | null;
+  team_name?: string | null;
+  /** 发起会话（通道 + chat_id）。 */
+  source_channel?: string;
+  origin_chat_id?: string;
   created_at: string;
   updated_at: string;
+  /** 本次运行开跑时刻（RFC3339）；排队中 / 恢复待续为 null。 */
+  started_at?: string | null;
+  /** 终态时刻（RFC3339）；非终态为 null。 */
+  finished_at?: string | null;
+  usage?: AgentExecutionUsage;
+  /** 进程重启后恢复的记录（没有执行者，需 AgentResume）。 */
+  recovered?: boolean;
+  /** 本进程正在跑（可取消 / 可插话）。 */
+  live?: boolean;
+  /** 失败 / 取消原因（截断到 400 字符）。 */
+  error?: string | null;
+  has_handoff?: boolean;
+  /** 已发送、子代理尚未读到的插话条数。 */
+  inbox_pending?: number;
 }
+
+/** 子 agent 结构化交接（handoff）。 */
+export interface AgentHandoff {
+  goal: string;
+  summary: string;
+  evidence: string[];
+  artifacts: string[];
+  open_risks: string[];
+  validation: string[];
+}
+
+/** `agent_execution_detail` 的返回：完整快照 + 尾部事件 + 控制位。 */
+export interface AgentExecutionDetail {
+  execution: {
+    agent_id: string;
+    spec: {
+      name: string;
+      role: string;
+      task: string;
+      context: string;
+      team_name?: string | null;
+      subagent_type?: string | null;
+      source_channel?: string;
+      origin_chat_id?: string;
+      model?: string | null;
+      isolation: string;
+      max_tool_iter: number;
+      max_output_chars: number;
+    };
+    state: string;
+    progress: { completed_steps: number; total_steps: number; stage: string };
+    handoff: AgentHandoff | null;
+    error: string | null;
+    unresolved_disclosure?: string;
+    created_at: string;
+    updated_at: string;
+    started_at?: string | null;
+    finished_at?: string | null;
+    usage?: AgentExecutionUsage;
+    recovered: boolean;
+  };
+  events: Array<{
+    event: string;
+    timestamp: string;
+    state: string;
+    progress: { completed_steps: number; total_steps: number; stage: string };
+  }>;
+  cancellable: boolean;
+  resumable: boolean;
+  /** 已发送、子代理尚未读到的插话条数。 */
+  inbox_pending: number;
+  summary: AgentExecution;
+}
+
+/** 运行时 `agent_exec` 直播事件（执行登记表变更 / 在跑的工具批 / 活动记录新行）。
+ *  `resync` 由宿主在广播滞后时发出：前端应重拉全量对齐。 */
+export type AgentExecEvent =
+  | { kind: "snapshot"; execution: AgentExecution }
+  | { kind: "removed"; agent_ids: string[] }
+  | {
+      kind: "tools_begun";
+      agent_id: string;
+      batch: Extract<ToolCallsEvent, { phase: "begun" }>["batch"];
+    }
+  | { kind: "transcript"; agent_id: string; cursor: number }
+  | { kind: "resync" };
 
 export interface ToolEntry {
   name: string;
@@ -627,7 +729,32 @@ export const api = {
   chatExportFull: (chatId: string, title: string, fmt: "md" | "docx" | "html") =>
     invoke<string>("chat_export_full", { chatId, title, fmt }),
 
-  agentsList: () => invoke<{ executions: AgentExecution[]; total: number }>("agents_list"),
+  agentsList: () =>
+    invoke<{ executions: AgentExecution[]; total: number; truncated?: boolean }>("agents_list"),
+
+  /** 单条子 agent 执行的实时详情（完整快照 / 事件 / 控制位）。 */
+  agentExecutionDetail: (agentId: string) =>
+    invoke<AgentExecutionDetail>("agent_execution_detail", { agentId }),
+
+  /** 子 agent 完整活动记录快照（与会话历史同形：user / assistant / thinking / status）。 */
+  agentExecutionHistory: (agentId: string) =>
+    invoke<ChatHistorySnapshot>("agent_execution_history", { agentId }),
+
+  /** 子 agent 活动记录的行级增量（`agent_exec` 的 transcript 事件之后按游标续读）。 */
+  agentExecutionHistorySince: (agentId: string, after: number) =>
+    invoke<ChatHistoryDelta>("agent_execution_history_since", { agentId, after }),
+
+  /** 子 agent 活动记录里一条工具调用行的展开详情。 */
+  agentExecutionToolDetail: (agentId: string, msgId: number) =>
+    invoke<ToolChainDetail>("agent_execution_tool_detail", { agentId, msgId }),
+
+  /** 向正在运行的子 agent 发消息（它在下一个安全点读入）。 */
+  agentExecutionSend: (agentId: string, text: string) =>
+    invoke<void>("agent_execution_send", { agentId, text }),
+
+  /** 取消正在运行的子 agent。 */
+  agentExecutionCancel: (agentId: string) =>
+    invoke<void>("agent_execution_cancel", { agentId }),
 
   /** 清空已终态的后台执行记录（只清任务历史，不动会话；活任务保留）。返回清除条数。 */
   agentsClearHistory: () => invoke<number>("agents_clear_history"),
@@ -938,6 +1065,10 @@ export const api = {
 
   onAgent: (cb: (payload: AgentEvent) => void): Promise<UnlistenFn> =>
     listen<AgentEvent>("agent", (event) => cb(event.payload)),
+
+  /** 子 agent 执行登记表直播事件（侧边栏 Agent / 任务概览实时进度与详情页直播）。 */
+  onAgentExec: (cb: (payload: AgentExecEvent) => void): Promise<UnlistenFn> =>
+    listen<AgentExecEvent>("agent_exec", (event) => cb(event.payload)),
 
   /** Bot Mode：群聊房间更新事件（载荷为房间 id，前端据此刷新）。 */
   onGroup: (cb: (payload: { id: string }) => void): Promise<UnlistenFn> =>

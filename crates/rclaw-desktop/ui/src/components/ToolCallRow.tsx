@@ -33,11 +33,18 @@ const openState = new Map<string, boolean>();
 /** 详情缓存（按会话 + 行 id）：同一行多次展开不重复读库；失败的请求不缓存，可重试。 */
 const detailCache = new Map<string, Promise<ToolChainDetail>>();
 
-function loadDetail(chatId: string, msgId: number): Promise<ToolChainDetail> {
+/** 按行 id 读完整工具链详情的加载器（默认读前台会话；子 agent 活动记录传自己的）。 */
+export type ToolDetailLoader = (msgId: number) => Promise<ToolChainDetail>;
+
+function loadDetail(
+  chatId: string,
+  msgId: number,
+  loader: ToolDetailLoader | undefined,
+): Promise<ToolChainDetail> {
   const key = `${chatId}:${msgId}`;
   let pending = detailCache.get(key);
   if (!pending) {
-    pending = api.chatToolDetail(chatId, msgId);
+    pending = loader ? loader(msgId) : api.chatToolDetail(chatId, msgId);
     detailCache.set(key, pending);
     pending.catch(() => detailCache.delete(key));
   }
@@ -115,11 +122,15 @@ export default function ToolBatchRows({
   entryId,
   msgId,
   calls,
+  detailLoader,
 }: {
+  /** 会话 id（展开状态 / 详情缓存的键；子 agent 记录用 `agent:<id>` 之类不与会话冲突的键）。 */
   chatId: string;
   entryId: number;
   msgId?: number;
   calls: ToolCallView[];
+  /** 自定义详情加载器（缺省按 chatId 读前台会话）。 */
+  detailLoader?: ToolDetailLoader;
 }) {
   return (
     <div className="flex w-full flex-col gap-1">
@@ -130,6 +141,7 @@ export default function ToolBatchRows({
           entryId={entryId}
           msgId={msgId}
           call={call}
+          detailLoader={detailLoader}
         />
       ))}
     </div>
@@ -141,11 +153,13 @@ function ToolCallRow({
   entryId,
   msgId,
   call,
+  detailLoader,
 }: {
   chatId: string;
   entryId: number;
   msgId?: number;
   call: ToolCallView;
+  detailLoader?: ToolDetailLoader;
 }) {
   const stateKey = `${chatId}:${entryId}:${call.id}`;
   const [open, setOpen] = useState(() => openState.get(stateKey) ?? false);
@@ -200,7 +214,7 @@ function ToolCallRow({
       </button>
       {open && (
         <div className="w-full max-w-full rounded-b-xl rounded-tr-xl border border-[#242a36] bg-[#11151d] px-3 py-2 text-xs text-gray-300">
-          <ToolCallDetailPanel chatId={chatId} msgId={msgId} call={call} />
+          <ToolCallDetailPanel chatId={chatId} msgId={msgId} call={call} detailLoader={detailLoader} />
         </div>
       )}
     </div>
@@ -235,10 +249,12 @@ function ToolCallDetailPanel({
   chatId,
   msgId,
   call,
+  detailLoader,
 }: {
   chatId: string;
   msgId?: number;
   call: ToolCallView;
+  detailLoader?: ToolDetailLoader;
 }) {
   const [detail, setDetail] = useState<ToolCallDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -250,7 +266,7 @@ function ToolCallDetailPanel({
     let cancelled = false;
     setLoading(true);
     setError(null);
-    loadDetail(chatId, msgId)
+    loadDetail(chatId, msgId, detailLoader)
       .then((chain) => {
         if (cancelled) return;
         const found = chain.calls.find((c) => c.id === call.id) ?? null;
@@ -266,6 +282,8 @@ function ToolCallDetailPanel({
     return () => {
       cancelled = true;
     };
+    // detailLoader 只在缓存未命中时用到，且按 chatId 选定；不进依赖，避免内联函数触发重拉。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId, msgId, call.id, retry]);
 
   const resolved: Resolved = {

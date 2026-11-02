@@ -914,6 +914,9 @@ async fn failed_event_persistence_does_not_commit_lifecycle_state() {
                 created_at: now.clone(),
                 updated_at: now,
                 recovered: true,
+                started_at: None,
+                finished_at: None,
+                usage: ExecutionUsage::default(),
             },
         )
         .await;
@@ -1923,6 +1926,9 @@ fn recovery_replays_nonterminal_log_as_resumable_waiting() {
         created_at: now.clone(),
         updated_at: now.clone(),
         recovered: false,
+        started_at: None,
+        finished_at: None,
+        usage: ExecutionUsage::default(),
     };
     append_execution_log(
         &journal,
@@ -1957,6 +1963,9 @@ fn recovery_replays_nonterminal_log_as_resumable_waiting() {
                 created_at: cancelling_time.clone(),
                 updated_at: cancelling_time,
                 recovered: false,
+                started_at: None,
+                finished_at: None,
+                usage: ExecutionUsage::default(),
             },
         },
     )
@@ -2285,6 +2294,9 @@ async fn background_launch_inherits_launcher_context_and_resume_restores_snapsho
                 created_at: now.clone(),
                 updated_at: now,
                 recovered: true,
+                started_at: None,
+                finished_at: None,
+                usage: ExecutionUsage::default(),
             },
         )
         .await;

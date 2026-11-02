@@ -78,6 +78,11 @@ pub async fn start_agent(app: tauri::AppHandle, home: PathBuf) -> Result<(), Str
         .set_start_error(result.as_ref().err().cloned());
     match result {
         Ok(()) => {
+            // 子 agent 执行直播桥（桌面与 APK 共用；APK 的 GUI 采用共享运行时同样从这里
+            // 接上）。本函数对已启动的 agent 早返回，所以每进程只起一次。
+            if let Some(runtime) = app.state::<AppState>().agent_runtime() {
+                tauri::async_runtime::spawn(crate::exec_events::run_bridge(app.clone(), runtime));
+            }
             let _ = app.emit(
                 "agent",
                 AgentEvent {

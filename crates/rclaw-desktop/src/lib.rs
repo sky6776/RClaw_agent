@@ -18,6 +18,8 @@ mod android_status;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod commands;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
+mod exec_events;
+#[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod export;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod groups;
@@ -174,6 +176,12 @@ pub fn run() {
             commands::chat_export_full,
             commands::agents_list,
             commands::agents_clear_history,
+            commands::agent_execution_detail,
+            commands::agent_execution_history,
+            commands::agent_execution_history_since,
+            commands::agent_execution_tool_detail,
+            commands::agent_execution_send,
+            commands::agent_execution_cancel,
             commands::usage_snapshot,
             commands::tools_list,
             commands::set_tool_enabled,

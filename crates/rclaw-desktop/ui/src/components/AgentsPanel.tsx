@@ -1,64 +1,32 @@
-import { useEffect, useState } from "react";
-import { api, type AgentExecution } from "../lib/api";
+import { useState } from "react";
+import { api } from "../lib/api";
+import {
+  countByState,
+  dropTerminalLocally,
+  refreshExecutions,
+  useAgentExecutions,
+  useNow,
+} from "../lib/agentExecutions";
+import ExecutionCard from "./ExecutionCard";
 
-const STATE_STYLE: Record<string, string> = {
-  queued: "bg-gray-500/10 text-gray-400",
-  running: "bg-amber-500/10 text-amber-400",
-  waiting: "bg-sky-500/10 text-sky-400",
-  cancelling: "bg-orange-500/10 text-orange-400",
-  succeeded: "bg-emerald-500/10 text-emerald-400",
-  failed: "bg-red-500/10 text-red-400",
-  cancelled: "bg-gray-500/10 text-gray-500",
-};
-
-const STATE_LABEL: Record<string, string> = {
-  queued: "排队中",
-  running: "运行中",
-  waiting: "等待中",
-  cancelling: "正在取消",
-  succeeded: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
-/** 已终态（可被「清除历史」清掉的记录）。 */
-const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
-
-/** Agent 状态面板：轮询后台子 agent 执行快照。
+/** Agent 状态面板：后台 / 异步执行的子 agent 实时列表（直播仓驱动，事件到达即更新）。
  *
- * 只覆盖后台/异步执行的子 agent（Agent 工具的 run_in_background / 团队成员）；
- * 前台并行子 agent 在父回合内同步运行，其进度体现在对话状态条中。
- */
-export default function AgentsPanel({ agentReady }: { agentReady: boolean }) {
-  const [executions, setExecutions] = useState<AgentExecution[]>([]);
-  const [error, setError] = useState<string | null>(null);
+ * 覆盖登记在册的子 agent：Agent 工具的后台任务、自动转后台的前台调用、团队成员。
+ * 点任一条进入详情页（实时阶段 / 时长 / token、完整活动记录、与它对话、取消）。 */
+export default function AgentsPanel({
+  agentReady,
+  onOpen,
+}: {
+  agentReady: boolean;
+  /** 打开某条执行的详情。 */
+  onOpen: (agentId: string) => void;
+}) {
+  const { executions, loaded, error } = useAgentExecutions(agentReady);
   const [clearing, setClearing] = useState(false);
-
-  useEffect(() => {
-    if (!agentReady) return;
-    let stopped = false;
-    const tick = async () => {
-      try {
-        const payload = await api.agentsList();
-        if (!stopped) {
-          setExecutions(payload.executions ?? []);
-          setError(null);
-        }
-      } catch (e) {
-        if (!stopped) setError(String(e));
-      }
-    };
-    void tick();
-    const timer = setInterval(tick, 2500);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [agentReady]);
-
-  const finishedCount = executions.filter((e) =>
-    TERMINAL_STATES.has(e.state?.toLowerCase?.() ?? ""),
-  ).length;
+  const [actionError, setActionError] = useState<string | null>(null);
+  const counts = countByState(executions);
+  // 有在跑的任务才每秒刷新时长；全是终态时不跑定时器。
+  const now = useNow(counts.active > 0);
 
   const clearHistory = async () => {
     if (
@@ -71,11 +39,10 @@ export default function AgentsPanel({ agentReady }: { agentReady: boolean }) {
     setClearing(true);
     try {
       await api.agentsClearHistory();
-      setExecutions((prev) =>
-        prev.filter((e) => !TERMINAL_STATES.has(e.state?.toLowerCase?.() ?? "")),
-      );
+      dropTerminalLocally();
+      void refreshExecutions();
     } catch (e) {
-      setError(String(e));
+      setActionError(String(e));
     } finally {
       setClearing(false);
     }
@@ -88,24 +55,31 @@ export default function AgentsPanel({ agentReady }: { agentReady: boolean }) {
         <div className="flex items-center gap-3">
           <button
             onClick={clearHistory}
-            disabled={!agentReady || clearing || finishedCount === 0}
+            disabled={!agentReady || clearing || counts.finished === 0}
             title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
             className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-[#1c2230] disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {clearing ? "清除中…" : `清除历史${finishedCount > 0 ? `（${finishedCount}）` : ""}`}
+            {clearing ? "清除中…" : `清除历史${counts.finished > 0 ? `（${counts.finished}）` : ""}`}
           </button>
-          <span className="text-xs text-gray-600">每 2.5 秒自动刷新</span>
+          <span className="flex items-center gap-1.5 text-xs text-gray-600">
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                counts.running > 0 ? "animate-pulse bg-amber-400" : "bg-gray-600"
+              }`}
+            />
+            {counts.running > 0 ? `${counts.running} 个在运行 · 实时` : "实时"}
+          </span>
         </div>
       </div>
 
       <p className="mb-4 rounded-lg border border-[#2a2f3a] bg-[#141821] px-4 py-3 text-xs text-gray-500">
-        这里展示后台 / 异步执行的子 agent（run_in_background、团队成员）。前台并行子
-        agent 在当前回合内同步运行，进度直接体现在对话状态条里。
+        这里展示登记在册的子 agent（后台任务、自动转后台的调用、团队成员）的实时进度。
+        点开任一条可查看完整活动记录（思考、工具与 Skill 调用）、累计 token 与运行时长，并能直接和它对话或取消。
       </p>
 
-      {error && (
+      {(error || actionError) && (
         <div className="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">
-          {error}
+          {actionError ?? error}
         </div>
       )}
       {!agentReady && (
@@ -113,7 +87,7 @@ export default function AgentsPanel({ agentReady }: { agentReady: boolean }) {
           agent 启动后可用。
         </div>
       )}
-      {agentReady && executions.length === 0 && (
+      {agentReady && loaded && executions.length === 0 && (
         <div className="rounded-lg border border-[#2a2f3a] bg-[#141821] px-4 py-3 text-sm text-gray-500">
           当前没有后台执行的子 agent。让 RClaw「并行研究 / 后台跑任务」时，这里能看到每个
           agent 的实时状态。
@@ -121,35 +95,9 @@ export default function AgentsPanel({ agentReady }: { agentReady: boolean }) {
       )}
 
       <div className="space-y-2">
-        {executions.map((e) => {
-          const state = e.state?.toLowerCase?.() ?? "";
-          return (
-            <div
-              key={e.agent_id}
-              className="rounded-xl border border-[#2a2f3a] bg-[#141821] px-4 py-3"
-            >
-              <div className="flex items-center justify-between">
-                <div className="flex min-w-0 items-center gap-2">
-                  <span className="truncate font-mono text-xs text-gray-400">{e.agent_id}</span>
-                  <span
-                    className={`rounded-full px-2 py-0.5 text-[10px] ${
-                      STATE_STYLE[state] ?? "bg-gray-500/10 text-gray-400"
-                    }`}
-                  >
-                    {STATE_LABEL[state] ?? e.state}
-                  </span>
-                </div>
-                <span className="shrink-0 text-[10px] text-gray-600">
-                  {e.progress?.completed_steps ?? 0}/{e.progress?.total_steps ?? 0} 步
-                </span>
-              </div>
-              <div className="mt-1 truncate text-xs text-gray-500">
-                {e.progress?.stage || "—"}
-              </div>
-              <div className="mt-1 truncate text-xs text-gray-400">{e.goal}</div>
-            </div>
-          );
-        })}
+        {executions.map((e, i) => (
+          <ExecutionCard key={e.agent_id} e={e} now={now} index={i} onOpen={onOpen} />
+        ))}
       </div>
     </div>
   );
