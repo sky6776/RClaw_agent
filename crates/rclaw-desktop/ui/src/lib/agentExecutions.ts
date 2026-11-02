@@ -124,7 +124,9 @@ export async function refreshExecutions(): Promise<void> {
       fetchedIds.add(e.agent_id);
       if (tombstones.has(e.agent_id)) continue;
       const mine = local.get(e.agent_id);
-      merged.push(mine && mine.updated_at > e.updated_at ? mine : e);
+      // 同一 updated_at 即同一份内容（每次变更都盖新时间戳）：保留本地对象，引用不变，
+      // 选择器式订阅（useAgentExecution）不会因兜底轮询而白白重渲。
+      merged.push(mine && mine.updated_at >= e.updated_at ? mine : e);
     }
     for (const e of state.executions) {
       if (fetchedIds.has(e.agent_id)) continue;

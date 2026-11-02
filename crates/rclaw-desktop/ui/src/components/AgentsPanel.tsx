@@ -24,7 +24,7 @@ export default function AgentsPanel({
   /** 打开某条执行的详情。 */
   onOpen: (agentId: string) => void;
 }) {
-  const { executions, loaded, error } = useAgentExecutions(agentReady);
+  const { executions, loaded, error, truncated } = useAgentExecutions(agentReady);
   const [clearing, setClearing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const counts = countByState(executions);
@@ -107,6 +107,11 @@ export default function AgentsPanel({
           <ExecutionCard key={e.agent_id} e={e} now={now} index={i} onOpen={onOpen} />
         ))}
       </div>
+      {truncated && (
+        <p className="mt-3 text-center text-[11px] text-gray-600">
+          仅显示最近 {executions.length} 条；更早的已结束记录可用「清除历史」一并清掉。
+        </p>
+      )}
     </div>
   );
 }

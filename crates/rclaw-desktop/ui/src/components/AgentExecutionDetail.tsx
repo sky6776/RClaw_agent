@@ -35,9 +35,11 @@ import { ProgressBar, StateBadge, elapsedText } from "./ExecutionCard";
  * 与取消按钮。
  *
  * 数据流：列表级快照来自直播仓（`useAgentExecution`）；详情（事件尾、handoff、
- * inbox）在快照 `updated_at` 变化时重拉；活动记录首屏 `agentExecutionHistory`，之后按
+ * inbox、可取消）在快照里与详情有关的字段（状态 / 阶段 / 步数 / handoff / inbox /
+ * 错误 / 执行者）变化时重拉；活动记录首屏 `agentExecutionHistory`，之后按
  * `transcript` 事件游标增量续读；`tools_begun` 事件先以「进行中」行显示，落库行到达
- * 时按调用 id 序列对位替换，终态时仍未落库的标为「已中断」。
+ * 时按「调用 id 序列一致 + 行 id 大于该批的行 id 下界」在渲染期对位替换，终态时仍未
+ * 落库的标为「已中断」。
  */
 
 /** 活动记录条目（与 Chat 的 Entry 同形的子集）。 */
@@ -157,7 +159,8 @@ function entryFrom(m: HistoryMsg): TranscriptEntry {
 /** 直播批 ↔ 落库行对位：撤掉已有落库行的直播批（落库行带权威成败），并把用户展开着的
  *  行的开合状态搬到落库行上。匹配条件 = 调用 id 序列一致 且 行 id 大于该批的行 id 下界
  *  （不用墙钟：事件晚到多久都不影响，provider 复用调用 id 时也不会错配到更早的行）。
- *  对 `entries` 全量做、任意到达顺序都成立；幂等。 */
+ *  对 `entries` 全量做、任意到达顺序都成立；幂等（开合状态搬运是 map 写入，重复执行
+ *  无害）——所以可以在渲染期调用：落库行在同一帧首次挂载时才读得到搬过去的开合状态。 */
 function withoutCommitted(
   pending: PendingBatch[],
   entries: TranscriptEntry[],
@@ -215,8 +218,8 @@ function ThinkingBlock({ content, defaultOpen }: { content: string; defaultOpen:
 /** 交接（handoff）卡片。 */
 function HandoffCard({ handoff }: { handoff: NonNullable<DetailDto["execution"]["handoff"]> }) {
   const [open, setOpen] = useState(true);
-  const section = (title: string, items: string[] | undefined) =>
-    items !== undefined &&
+  // 四个数组字段后端总是序列化（Vec<String>，无 skip），这里不必判 undefined。
+  const section = (title: string, items: string[]) =>
     items.length > 0 && (
       <div>
         <div className="mb-0.5 text-[11px] text-gray-500">{title}</div>
@@ -344,8 +347,10 @@ export default function AgentExecutionDetail({
   const lastScrollTopRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const live = summary ? isLive(summary) : false;
   const terminal = summary ? isTerminal(summary) : detail ? isTerminal(detail.execution) : false;
+  // 列表级快照还没到、详情先到时，用详情的 cancellable（= 有执行者）顶上，避免取消按钮
+  // 可点而输入框却提示「没有执行者」。
+  const live = summary ? isLive(summary) : detail?.cancellable === true && !terminal;
   const transcriptKey = `agent:${agentId}`;
 
   // 详情（事件尾 / handoff / inbox / cancellable）：首次 + 快照里与详情有关的字段变化时重拉。
@@ -506,12 +511,21 @@ export default function AgentExecutionDetail({
     };
   }, [agentId, pullDelta]);
 
-  // 直播批 ↔ 落库行对位：行先到还是直播批先到都在这里收口（落库行到了就撤直播行）。
-  // 无变化时 withoutCommitted 返回原引用，React 跳过更新，不会循环。
+  // 直播批 ↔ 落库行对位，在【渲染期】做：落库行到达的那一帧，直播行就不再渲染、开合
+  // 状态已搬到落库行上——落库行首次挂载时读 openState 才拿得到（放在 effect 里会晚一帧：
+  // 落库行先以收起状态挂载、并与直播行并存一帧）。行先到还是直播批先到都在这里收口。
+  // 之后把裁剪结果写回 state 以免 pending 只增不减；无变化时返回原引用，不会循环。
+  const visiblePending = useMemo(
+    () => withoutCommitted(pending, entries, transcriptKey),
+    [pending, entries, transcriptKey],
+  );
   useEffect(() => {
-    if (pending.length === 0) return;
-    setPending((prev) => withoutCommitted(prev, entries, transcriptKey));
-  }, [entries, pending, transcriptKey]);
+    if (visiblePending === pending) return;
+    // 用 updater：渲染到 effect 之间若有新的 tools_begun 已入列，不能用渲染时的旧值覆盖掉。
+    setPending((prev) =>
+      prev === pending ? visiblePending : withoutCommitted(prev, entries, transcriptKey),
+    );
+  }, [visiblePending, pending, entries, transcriptKey]);
 
   // 终态：仍在「进行中」的直播工具行标为已中断（没有落库行会来替换它们）；
   // 同时再按游标补拉一次，兜底收尾阶段可能错过的 transcript 事件。
@@ -554,7 +568,7 @@ export default function AgentExecutionDetail({
   };
   useEffect(() => {
     if (stickToBottomRef.current) scrollToBottom();
-  }, [entries, pending, detail?.execution.handoff]);
+  }, [entries, visiblePending, detail?.execution.handoff]);
   // 尺寸变化（软键盘弹出收起、思考块 / 工具行展开折叠、图片加载）不产生 scroll 事件：
   // 跟随中就补拉底；脱离跟随但内容已不再溢出时恢复跟随（否则「回到底部」按钮残留）。
   useEffect(() => {
@@ -579,7 +593,7 @@ export default function AgentExecutionDetail({
     [agentId],
   );
 
-  // 活动记录 + 直播批按时间合并（直播批总在最后：它们一定晚于已落库的行）。
+  // 最后一块思考默认展开（其余收起）；直播批不参与——它们总渲染在落库行之后。
   const lastThinkingKey = useMemo(() => {
     for (let i = entries.length - 1; i >= 0; i -= 1) {
       if (entries[i].role === "thinking") return entries[i].key;
@@ -604,7 +618,7 @@ export default function AgentExecutionDetail({
       setDraft("");
       setActionNotice("已发送：子 agent 将在下一个安全点读到这条消息并回应。");
       jumpToBottom();
-      // inbox_pending 由随之而来的快照事件（updated_at 推进 → 详情重拉）带回，不在这里
+      // inbox_pending 由随之而来的快照事件带回（它在 detailKey 里 → 详情重拉），不在这里
       // 另发一次详情请求——两路响应乱序会让旧详情盖掉新的。
     } catch (e) {
       setActionError(String(e));
@@ -700,7 +714,7 @@ export default function AgentExecutionDetail({
               <span className="font-mono tabular-nums">
                 {headerSnapshot.progress?.completed_steps ?? 0}/{headerSnapshot.progress?.total_steps ?? 0} 步
               </span>
-              {headerSnapshot && <LiveElapsed e={headerSnapshot} />}
+              <LiveElapsed e={headerSnapshot} />
               <span
                 className="font-mono tabular-nums"
                 title={
@@ -777,7 +791,7 @@ export default function AgentExecutionDetail({
             </button>
           </div>
         )}
-        {entries.length === 0 && pending.length === 0 && !historyError && (
+        {entries.length === 0 && visiblePending.length === 0 && !historyError && (
           <div className="text-xs text-gray-500">
             {loading
               ? "加载活动记录…"
@@ -852,7 +866,7 @@ export default function AgentExecutionDetail({
             </div>
           );
         })}
-        {pending.map((p) => (
+        {visiblePending.map((p) => (
           <div key={p.key} className="flex justify-start">
             <div className="min-w-0 w-full max-w-[92%]">
               <ToolBatchRows chatId={transcriptKey} entryId={-p.iter} calls={p.tools} detailLoader={detailLoader} />

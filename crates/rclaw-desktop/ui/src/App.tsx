@@ -207,6 +207,42 @@ function ResizeHandle({ onDrag }: { onDrag: (clientX: number) => void }) {
   );
 }
 
+/** Agent / 任务概览页：列表面板（children）+ 盖在上面的执行详情。进详情时列表面板仍挂着
+ *  （只是隐藏），返回不重新加载、滚动位置不丢；详情按 agentId 作 key，切换执行时整页重建，
+ *  不复用旧记录的状态。返回时把焦点还给列表容器——详情卸载后焦点否则落到 body。 */
+function ExecutionPage({
+  selectedAgentId,
+  onSelect,
+  children,
+}: {
+  selectedAgentId: string | null;
+  onSelect: (agentId: string | null) => void;
+  children: ReactNode;
+}) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const back = () => {
+    onSelect(null);
+    // 列表容器在这次更新提交后才重新可见（visibility:hidden 的元素不可聚焦），下一帧再聚焦。
+    requestAnimationFrame(() => listRef.current?.focus({ preventScroll: true }));
+  };
+  const showingDetail = selectedAgentId !== null;
+  return (
+    <div className="relative h-full">
+      <div
+        ref={listRef}
+        tabIndex={-1}
+        className={`outline-none ${showingDetail ? "invisible absolute inset-0 overflow-hidden" : "h-full"}`}
+        aria-hidden={showingDetail}
+      >
+        {children}
+      </div>
+      {selectedAgentId !== null && (
+        <AgentExecutionDetail key={selectedAgentId} agentId={selectedAgentId} onBack={back} />
+      )}
+    </div>
+  );
+}
+
 /** 应用壳：向导模式 / agent 启动中 / 主界面三态。
  *
  * 会话转录与忙碌状态按 chat_id 提升到本层持有——切换页面 / 会话都不会丢失；
@@ -1794,8 +1830,12 @@ ${event.payload.command}
   useBackClose(recording !== null, () => void cancelRecording());
   // 子 agent 执行详情层：返回键先回到列表。抽屉盖在上面时不接管——抽屉开着按返回是
   // 「退出应用」（见 installBackNavigation），不该先把底下看不见的详情关掉。
+  // agent 未就绪时详情层根本没渲染，返回键不该被一个看不见的层吃掉。
   useBackClose(
-    selectedAgentId !== null && (page === "agents" || page === "taskview") && !drawerOpen,
+    agentState === "ready" &&
+      selectedAgentId !== null &&
+      (page === "agents" || page === "taskview") &&
+      !drawerOpen,
     () => setSelectedAgentId(null),
   );
 
@@ -2287,43 +2327,18 @@ ${event.payload.command}
         {agentState === "ready" && page === "tools" && <ToolsPanel agentReady />}
         {agentState === "ready" && page === "skills" && <SkillsPanel agentReady />}
         {agentState === "ready" && page === "files" && <FilePanel onError={setErrorToast} />}
-        {/* Agent / 任务概览：进详情时列表面板仍挂着（只是隐藏），返回不重新加载、滚动位置不丢；
-            详情按 agentId 作 key，切换执行时整页重建，不复用旧记录的状态。 */}
+        {/* Agent / 任务概览：列表 + 盖在上面的执行详情（见 ExecutionPage）。 */}
         {agentState === "ready" && page === "agents" && (
-          <div className="relative h-full">
-            <div
-              className={selectedAgentId !== null ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
-              aria-hidden={selectedAgentId !== null}
-            >
-              <AgentsPanel agentReady hidden={selectedAgentId !== null} onOpen={setSelectedAgentId} />
-            </div>
-            {selectedAgentId !== null && (
-              <AgentExecutionDetail
-                key={selectedAgentId}
-                agentId={selectedAgentId}
-                onBack={() => setSelectedAgentId(null)}
-              />
-            )}
-          </div>
+          <ExecutionPage selectedAgentId={selectedAgentId} onSelect={setSelectedAgentId}>
+            <AgentsPanel agentReady hidden={selectedAgentId !== null} onOpen={setSelectedAgentId} />
+          </ExecutionPage>
         )}
         {agentState === "ready" && page === "evolution" && <EvolutionPanel agentReady />}
         {agentState === "ready" && page === "cron" && <CronPanel agentReady />}
         {agentState === "ready" && page === "taskview" && (
-          <div className="relative h-full">
-            <div
-              className={selectedAgentId !== null ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
-              aria-hidden={selectedAgentId !== null}
-            >
-              <TaskOverviewPanel agentReady hidden={selectedAgentId !== null} onOpen={setSelectedAgentId} />
-            </div>
-            {selectedAgentId !== null && (
-              <AgentExecutionDetail
-                key={selectedAgentId}
-                agentId={selectedAgentId}
-                onBack={() => setSelectedAgentId(null)}
-              />
-            )}
-          </div>
+          <ExecutionPage selectedAgentId={selectedAgentId} onSelect={setSelectedAgentId}>
+            <TaskOverviewPanel agentReady hidden={selectedAgentId !== null} onOpen={setSelectedAgentId} />
+          </ExecutionPage>
         )}
         {agentState === "ready" && page === "config" && (
           <ConfigPanel
