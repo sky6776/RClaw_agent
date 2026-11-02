@@ -163,6 +163,8 @@ export interface ChatHistorySnapshot {
   entries: HistoryMsg[];
   /** 读取时会话的最大消息行 id（含被过滤行——它们被游标消费、不再投递）。 */
   cursor: number;
+  /** 首屏窗口（可能）裁掉了更早的行：entries 的首条不一定是会话开头。 */
+  truncated?: boolean;
 }
 
 /** 行级增量：游标之后新落库的条目 + 新游标；more = 按条数截断，应立即续拉。 */

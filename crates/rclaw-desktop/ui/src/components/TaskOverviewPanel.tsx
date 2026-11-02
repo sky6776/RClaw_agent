@@ -15,16 +15,19 @@ import ExecutionCard from "./ExecutionCard";
  * 可用但入口只在移动端抽屉。点任一条进入执行详情。 */
 export default function TaskOverviewPanel({
   agentReady,
+  hidden = false,
   onOpen,
 }: {
   agentReady: boolean;
+  /** 被详情页盖住（仍挂载以保住滚动位置）：停掉秒表，不白白每秒重渲。 */
+  hidden?: boolean;
   onOpen: (agentId: string) => void;
 }) {
   const { executions, loaded, error } = useAgentExecutions(agentReady);
   const [clearing, setClearing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const counts = countByState(executions);
-  const now = useNow(counts.active > 0);
+  const now = useNow(!hidden && counts.active > 0);
 
   const clearHistory = async () => {
     if (
@@ -66,10 +69,16 @@ export default function TaskOverviewPanel({
               }`}
             />
             实时
+            {counts.stalled > 0 && (
+              <span className="text-sky-500" title="进程重启后恢复的记录，没有执行者；在对话里用 AgentResume 续跑">
+                · {counts.stalled} 个待恢复
+              </span>
+            )}
           </span>
         </div>
       </div>
 
+      {/* 「进行中」只数本进程真在跑的；重启后待恢复的记录单列在右上角，不混进来。 */}
       <div className="mb-4 grid grid-cols-4 gap-2">
         {(
           [

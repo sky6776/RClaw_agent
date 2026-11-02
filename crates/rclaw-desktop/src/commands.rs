@@ -1534,6 +1534,8 @@ pub struct ChatHistorySnapshot {
     pub entries: Vec<HistoryMsgDto>,
     /// 读取时会话的最大消息行 id（含被过滤行——它们被游标消费、不再投递）。
     pub cursor: i64,
+    /// 首屏窗口（可能）裁掉了更早的行：`entries` 的首条不一定是会话开头。
+    pub truncated: bool,
 }
 
 /// 行级增量：游标之后新落库的条目 + 新游标。`more` = 本批按条数截断，调用方应立即续拉。
@@ -2087,17 +2089,18 @@ pub async fn chat_history(
     .await?;
     let mut entries = history_entries(&snap.messages, &metas);
     // 只保留最近 80 行，避免长会话首屏过载（游标不受影响：窗口外的旧行已消费）。
-    retain_last_rows(&mut entries, 80);
+    let cut = retain_last_rows(&mut entries, 80);
     Ok(ChatHistorySnapshot {
         entries,
         cursor: snap.cursor,
+        truncated: snap.truncated || cut > 0,
     })
 }
 
 /// 首屏截断按持久化行计而不按条目计：同一行派生的 thinking / status / 正文条目同进退，
 /// 思考 / 工具密集的会话也不会被派生条目挤掉对话本身（按条目截断时 80 条可能只剩
-/// 二三十轮对话，且会把一行的思考块留下、正文裁掉）。
-fn retain_last_rows(entries: &mut Vec<HistoryMsgDto>, rows: usize) {
+/// 二三十轮对话，且会把一行的思考块留下、正文裁掉）。返回裁掉的条目数。
+fn retain_last_rows(entries: &mut Vec<HistoryMsgDto>, rows: usize) -> usize {
     let mut distinct = 0usize;
     let mut last_id: Option<i64> = None;
     let mut cut = 0usize;
@@ -2112,6 +2115,7 @@ fn retain_last_rows(entries: &mut Vec<HistoryMsgDto>, rows: usize) {
         }
     }
     entries.drain(..cut);
+    cut
 }
 
 /// 行级增量：返回 `after`（前端持有的 `last_seen_row_id`）之后新落库的条目 + 新游标。
@@ -2340,10 +2344,12 @@ pub async fn agent_execution_history(
     let mut entries = history_entries(&snap.messages, &metas);
     // 子代理的记录以工具轮为主，首屏窗口比会话放宽（200 行）；更早的行只在游标之前，
     // 详情页不翻页——完整记录的事实源仍在库里。
-    retain_last_rows(&mut entries, 200);
+    let cut = retain_last_rows(&mut entries, 200);
     Ok(ChatHistorySnapshot {
         entries,
         cursor: snap.cursor,
+        // 窗口外还有更早的行：首行不一定是任务书（前端据此决定首行标注）。
+        truncated: snap.truncated || cut > 0,
     })
 }
 

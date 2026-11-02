@@ -10,7 +10,7 @@
  * 详情页另需的逐执行事件（在跑的工具批 / 活动记录新行游标）经 [`subscribeAgentEvents`]
  * 分发，不进全局状态。
  */
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { api, type AgentExecEvent, type AgentExecution } from "./api";
 
 export interface ExecutionsState {
@@ -32,9 +32,13 @@ const INFLIGHT_CREATED_SLACK_MS = 2_000;
 
 /** 活跃统计（侧边栏徽标 / 概览四格）。 */
 export interface ExecutionCounts {
+  /** 本进程里真在跑的（排队 / 运行 / 等待 / 取消中，且有执行者）：侧边栏徽标数、秒表开关。 */
   active: number;
+  /** 其中已开跑的（运行 / 等待 / 取消中，且有执行者）：徽标脉动、「N 个在运行」。 */
   running: number;
   queued: number;
+  /** 等待中但没有执行者（进程重启后恢复，需 AgentResume）：不算在跑，单独提示。 */
+  stalled: number;
   done: number;
   failed: number;
   finished: number;
@@ -45,6 +49,7 @@ const EMPTY_COUNTS: ExecutionCounts = {
   active: 0,
   running: 0,
   queued: 0,
+  stalled: 0,
   done: 0,
   failed: 0,
   finished: 0,
@@ -72,6 +77,7 @@ function sameCounts(a: ExecutionCounts, b: ExecutionCounts): boolean {
     a.active === b.active &&
     a.running === b.running &&
     a.queued === b.queued &&
+    a.stalled === b.stalled &&
     a.done === b.done &&
     a.failed === b.failed &&
     a.finished === b.finished &&
@@ -250,8 +256,15 @@ export function useAgentExecutionCounts(enabled: boolean): ExecutionCounts {
 
 /** 单条执行的列表级快照（不存在 / 已清除时 undefined）。 */
 export function useAgentExecution(agentId: string | null): AgentExecution | undefined {
-  const { executions } = useAgentExecutions(true);
-  return agentId === null ? undefined : executions.find((e) => e.agent_id === agentId);
+  useEffect(() => {
+    ensureStarted();
+  }, []);
+  // 选择器直接返回列表里的那个对象：其他执行的快照事件不改变它的引用，详情页不随之重渲。
+  const select = useCallback(
+    () => (agentId === null ? undefined : state.executions.find((e) => e.agent_id === agentId)),
+    [agentId],
+  );
+  return useSyncExternalStore(subscribe, select, select);
 }
 
 /** 订阅某条执行的逐执行事件（tools_begun / transcript / removed）。 */
@@ -415,17 +428,23 @@ export function countByState(list: AgentExecution[]): ExecutionCounts {
   let active = 0;
   let running = 0;
   let queued = 0;
+  let stalled = 0;
   let done = 0;
   let failed = 0;
   let finished = 0;
   for (const e of list) {
     const s = stateOf(e);
-    if (ACTIVE_STATES.has(s)) active += 1;
-    if (s === "running" || s === "waiting" || s === "cancelling") running += 1;
+    // 重启后恢复的 waiting 记录没有执行者：不是「在跑」，徽标不脉动、秒表不转。
+    const live = isLive(e);
+    if (ACTIVE_STATES.has(s)) {
+      if (live) active += 1;
+      else stalled += 1;
+    }
+    if ((s === "running" || s === "waiting" || s === "cancelling") && live) running += 1;
     if (s === "queued") queued += 1;
     if (s === "succeeded") done += 1;
     if (s === "failed") failed += 1;
     if (TERMINAL_STATES.has(s)) finished += 1;
   }
-  return { active, running, queued, done, failed, finished, total: list.length };
+  return { active, running, queued, stalled, done, failed, finished, total: list.length };
 }

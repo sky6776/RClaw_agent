@@ -300,6 +300,9 @@ pub struct SearchRow {
 pub struct ChatSnapshot {
     pub messages: Vec<Message>,
     pub cursor: i64,
+    /// 窗口是否（可能）裁掉了更早的行：按条数拉满、或按字节裁过。拉满恰好等于全部时也
+    /// 按「裁过」报——调用方据此只做保守判断（例如首行是否一定是会话开头）。
+    pub truncated: bool,
 }
 
 /// 会话历史行级增量：`after_id` 之后新落库的可回放行 + 消费游标。
@@ -631,11 +634,20 @@ impl SessionStore {
                 return Ok(ChatSnapshot {
                     messages: Vec::new(),
                     cursor: 0,
+                    truncated: false,
                 });
             };
-            let messages = trim_tail_by_bytes(transcript_tail_on(conn, sid, max_msgs)?, max_bytes);
+            let tail = transcript_tail_on(conn, sid, max_msgs)?;
+            let hit_rows = tail.len() >= max_msgs;
+            let tail_len = tail.len();
+            let messages = trim_tail_by_bytes(tail, max_bytes);
+            let truncated = hit_rows || messages.len() < tail_len;
             let cursor = max_message_id(conn, sid)?;
-            Ok(ChatSnapshot { messages, cursor })
+            Ok(ChatSnapshot {
+                messages,
+                cursor,
+                truncated,
+            })
         })
     }
 

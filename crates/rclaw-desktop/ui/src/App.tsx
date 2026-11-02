@@ -1792,9 +1792,10 @@ ${event.payload.command}
   useBackClose(photoEditor !== null, discardPhotoEditor);
   useBackClose(captureDialog !== null, () => setCaptureDialog(null));
   useBackClose(recording !== null, () => void cancelRecording());
-  // 子 agent 执行详情层：返回键先回到列表。
+  // 子 agent 执行详情层：返回键先回到列表。抽屉盖在上面时不接管——抽屉开着按返回是
+  // 「退出应用」（见 installBackNavigation），不该先把底下看不见的详情关掉。
   useBackClose(
-    selectedAgentId !== null && (page === "agents" || page === "taskview"),
+    selectedAgentId !== null && (page === "agents" || page === "taskview") && !drawerOpen,
     () => setSelectedAgentId(null),
   );
 
@@ -2294,7 +2295,7 @@ ${event.payload.command}
               className={selectedAgentId !== null ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
               aria-hidden={selectedAgentId !== null}
             >
-              <AgentsPanel agentReady onOpen={setSelectedAgentId} />
+              <AgentsPanel agentReady hidden={selectedAgentId !== null} onOpen={setSelectedAgentId} />
             </div>
             {selectedAgentId !== null && (
               <AgentExecutionDetail
@@ -2313,7 +2314,7 @@ ${event.payload.command}
               className={selectedAgentId !== null ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
               aria-hidden={selectedAgentId !== null}
             >
-              <TaskOverviewPanel agentReady onOpen={setSelectedAgentId} />
+              <TaskOverviewPanel agentReady hidden={selectedAgentId !== null} onOpen={setSelectedAgentId} />
             </div>
             {selectedAgentId !== null && (
               <AgentExecutionDetail

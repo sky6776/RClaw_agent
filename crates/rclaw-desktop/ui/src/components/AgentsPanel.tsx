@@ -15,9 +15,12 @@ import ExecutionCard from "./ExecutionCard";
  * 点任一条进入详情页（实时阶段 / 时长 / token、完整活动记录、与它对话、取消）。 */
 export default function AgentsPanel({
   agentReady,
+  hidden = false,
   onOpen,
 }: {
   agentReady: boolean;
+  /** 被详情页盖住（仍挂载以保住滚动位置）：停掉秒表，不白白每秒重渲。 */
+  hidden?: boolean;
   /** 打开某条执行的详情。 */
   onOpen: (agentId: string) => void;
 }) {
@@ -25,8 +28,8 @@ export default function AgentsPanel({
   const [clearing, setClearing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const counts = countByState(executions);
-  // 有在跑的任务才每秒刷新时长；全是终态时不跑定时器。
-  const now = useNow(counts.active > 0);
+  // 有在跑的任务才每秒刷新时长；全是终态 / 面板被盖住时不跑定时器。
+  const now = useNow(!hidden && counts.active > 0);
 
   const clearHistory = async () => {
     if (
@@ -68,6 +71,11 @@ export default function AgentsPanel({
               }`}
             />
             {counts.running > 0 ? `${counts.running} 个在运行 · 实时` : "实时"}
+            {counts.stalled > 0 && (
+              <span className="text-sky-500" title="进程重启后恢复的记录，没有执行者；在对话里用 AgentResume 续跑">
+                · {counts.stalled} 个待恢复
+              </span>
+            )}
           </span>
         </div>
       </div>

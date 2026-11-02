@@ -55,7 +55,9 @@ interface TranscriptEntry {
 interface PendingBatch {
   key: string;
   iter: number;
-  ts: number;
+  /** 行 id 下界：该批开始时已收到 transcript 事件的最大游标。它的落库行 id 一定更大；
+   *  id 不大于此值的同序行是更早的一批（provider 复用调用 id 时同序）。 */
+  floor: number;
   tools: ToolCallView[];
 }
 
@@ -152,26 +154,21 @@ function entryFrom(m: HistoryMsg): TranscriptEntry {
   };
 }
 
-/** 首屏窗口上限（与后端 `agent_execution_history` 的 retain_last_rows 同值）：拉满即视为
- *  被截断，最早的行（任务书）不在窗口里。 */
-const HISTORY_WINDOW_ROWS = 200;
-
-/** 落库行与直播批对位的时间余量：行 ts 是落库时刻取整到秒，一定不早于该批开始；
- *  比直播批开始时刻还早超过这个余量的行是更早的一批（provider 复用调用 id 时同序）。 */
-const COMMIT_MATCH_SLACK_MS = 1_500;
-
-/** 落库的工具批到达：撤掉对应的直播行（调用 id 序列一致且落库不早于该批开始；落库行带
- *  权威成败），并把用户展开着的行的开合状态搬到落库行上。幂等。 */
+/** 直播批 ↔ 落库行对位：撤掉已有落库行的直播批（落库行带权威成败），并把用户展开着的
+ *  行的开合状态搬到落库行上。匹配条件 = 调用 id 序列一致 且 行 id 大于该批的行 id 下界
+ *  （不用墙钟：事件晚到多久都不影响，provider 复用调用 id 时也不会错配到更早的行）。
+ *  对 `entries` 全量做、任意到达顺序都成立；幂等。 */
 function withoutCommitted(
   pending: PendingBatch[],
-  fresh: TranscriptEntry[],
+  entries: TranscriptEntry[],
   chatId: string,
 ): PendingBatch[] {
-  const committed = fresh.filter((e) => e.role === "status" && e.tools && e.tools.length > 0);
-  if (committed.length === 0 || pending.length === 0) return pending;
+  if (pending.length === 0) return pending;
+  const committed = entries.filter((e) => e.role === "status" && e.tools && e.tools.length > 0);
+  if (committed.length === 0) return pending;
   const next = pending.filter((p) => {
     const match = committed.find(
-      (c) => sameToolBatch(p.tools, c.tools) && (c.ts === 0 || c.ts >= p.ts - COMMIT_MATCH_SLACK_MS),
+      (c) => c.msgId !== undefined && c.msgId > p.floor && sameToolBatch(p.tools, c.tools),
     );
     if (!match) return true;
     if (match.msgId !== undefined) {
@@ -187,17 +184,20 @@ function withoutCommitted(
   return next.length === pending.length ? pending : next;
 }
 
-/** 思考块（折叠式；默认展开最后一块，其余收起）。 */
+/** 思考块（折叠式）：用户没点过时跟随「是否最后一块」——直播里新块到来，旧块自动收起，
+ *  只有最新的展开；用户点过的以用户为准。 */
 function ThinkingBlock({ content, defaultOpen }: { content: string; defaultOpen: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  const open = toggled ?? defaultOpen;
   const body = content.replace(/^💭\s*思考中\.\.\.\n?/, "").trim();
   return (
     <div className="flex justify-start">
       <div className="w-full overflow-hidden rounded-2xl rounded-bl-md border border-dashed border-[#3a4150] bg-[#141821]">
         <button
           type="button"
-          onClick={() => setOpen((v) => !v)}
-          className="flex w-full items-center justify-between gap-3 px-4 py-1.5 text-left text-xs text-gray-400 transition hover:text-gray-200"
+          onClick={() => setToggled(!open)}
+          aria-expanded={open}
+          className="flex w-full items-center justify-between gap-3 px-4 py-1.5 text-left text-xs text-gray-400 transition hover:text-gray-200 max-md:py-2.5"
         >
           <span>💭 思考过程</span>
           <span className="text-[10px] text-gray-600">{open ? "▾" : "▸"}</span>
@@ -215,7 +215,8 @@ function ThinkingBlock({ content, defaultOpen }: { content: string; defaultOpen:
 /** 交接（handoff）卡片。 */
 function HandoffCard({ handoff }: { handoff: NonNullable<DetailDto["execution"]["handoff"]> }) {
   const [open, setOpen] = useState(true);
-  const section = (title: string, items: string[]) =>
+  const section = (title: string, items: string[] | undefined) =>
+    items !== undefined &&
     items.length > 0 && (
       <div>
         <div className="mb-0.5 text-[11px] text-gray-500">{title}</div>
@@ -233,7 +234,8 @@ function HandoffCard({ handoff }: { handoff: NonNullable<DetailDto["execution"][
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between px-4 py-2 text-left text-xs font-medium text-emerald-300"
+        aria-expanded={open}
+        className="flex w-full items-center justify-between px-4 py-2 text-left text-xs font-medium text-emerald-300 max-md:py-2.5"
       >
         <span>📦 交接结果</span>
         <span className="text-[10px] text-gray-500">{open ? "▾" : "▸"}</span>
@@ -269,7 +271,8 @@ function EventsTimeline({ events }: { events: DetailDto["events"] }) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between px-4 py-2 text-left text-xs text-gray-400"
+        aria-expanded={open}
+        className="flex w-full items-center justify-between px-4 py-2 text-left text-xs text-gray-400 max-md:py-2.5"
       >
         <span>状态变迁（{events.length}）</span>
         <span className="text-[10px] text-gray-600">{open ? "▾" : "▸"}</span>
@@ -290,6 +293,15 @@ function EventsTimeline({ events }: { events: DetailDto["events"] }) {
   );
 }
 
+/** 头部的运行时长：自己走秒表，整页不必每秒重渲。 */
+function LiveElapsed({ e }: { e: AgentExecution }) {
+  const live = isLive(e);
+  const now = useNow(live || stateOf(e) === "queued");
+  const text = elapsedText(e, now);
+  if (!text) return null;
+  return <span className={`font-mono tabular-nums ${live ? "text-indigo-300" : ""}`}>{text}</span>;
+}
+
 export default function AgentExecutionDetail({
   agentId,
   onBack,
@@ -305,16 +317,20 @@ export default function AgentExecutionDetail({
   const [entries, setEntries] = useState<TranscriptEntry[]>([]);
   const [pending, setPending] = useState<PendingBatch[]>([]);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  /** 首屏拉取中（空列表先显示「加载中」，不闪「暂无活动记录」）。 */
+  const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
-  /** 首屏窗口被截断（最早的行不在屏上）：首行不再当「任务」标注。 */
+  /** 首屏窗口被截断（最早的行不在屏上，后端判定）：首行不再当「任务」标注。 */
   const [truncated, setTruncated] = useState(false);
   /** 列表是否在跟随底部（只用于显示「回到底部」按钮；判定本身在 ref 里，不触发重渲）。 */
   const [following, setFollowing] = useState(true);
   const cursorRef = useRef(0);
+  /** 已收到的 transcript 事件的最大游标（事件到达即记，不等拉取）：直播批的行 id 下界。 */
+  const lastEventCursorRef = useRef(0);
   /** 首屏快照已到（之后 transcript 事件才按游标续拉；之前到达的事件在首屏后补拉一次）。 */
   const loadedRef = useRef(false);
   const syncingRef = useRef(false);
@@ -322,17 +338,29 @@ export default function AgentExecutionDetail({
   /** 加载代际：切换执行 / 卸载时递增，在途的拉取回来后发现代际变了就丢弃结果。 */
   const genRef = useRef(0);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const headingRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const lastScrollTopRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const live = summary ? isLive(summary) : false;
   const terminal = summary ? isTerminal(summary) : detail ? isTerminal(detail.execution) : false;
-  const now = useNow(live || stateOf(summary ?? { state: "" }) === "queued");
   const transcriptKey = `agent:${agentId}`;
 
-  // 详情（事件尾 / handoff / inbox / cancellable）：首次 + 快照每次更新时重拉。
-  const updatedAt = summary?.updated_at;
+  // 详情（事件尾 / handoff / inbox / cancellable）：首次 + 快照里与详情有关的字段变化时重拉。
+  // token 记账快照每次模型调用都来一条、只改 updated_at / usage，不值得重拉整份详情。
+  const detailKey = summary
+    ? [
+        summary.state,
+        summary.progress?.stage ?? "",
+        summary.progress?.completed_steps ?? 0,
+        summary.has_handoff ? 1 : 0,
+        summary.inbox_pending ?? 0,
+        summary.error ?? "",
+        summary.live ? 1 : 0,
+      ].join("|")
+    : "";
   useEffect(() => {
     let cancelled = false;
     api
@@ -348,7 +376,12 @@ export default function AgentExecutionDetail({
     return () => {
       cancelled = true;
     };
-  }, [agentId, updatedAt]);
+  }, [agentId, detailKey]);
+
+  // 进入详情时把焦点移进来（列表面板只是被隐藏，焦点不该留在看不见的卡片上）。
+  useEffect(() => {
+    headingRef.current?.focus({ preventScroll: true });
+  }, [agentId]);
 
   // 活动记录：首屏快照 + 游标增量（串行化：同时只跑一个拉取，期间到达的事件合并为一次续拉；
   // 代际校验：切换执行后在途的旧拉取不得把旧记录的行与游标写进新记录）。
@@ -371,7 +404,6 @@ export default function AgentExecutionDetail({
             const add = fresh.filter((e) => !have.has(e.key));
             return add.length > 0 ? [...prev, ...add] : prev;
           });
-          setPending((prev) => withoutCommitted(prev, fresh, transcriptKey));
         }
         setHistoryError(null);
         if (!delta.more) break;
@@ -387,13 +419,14 @@ export default function AgentExecutionDetail({
         }
       }
     }
-  }, [agentId, transcriptKey]);
+  }, [agentId]);
 
   useEffect(() => {
     let cancelled = false;
     genRef.current += 1;
     const gen = genRef.current;
     cursorRef.current = 0;
+    lastEventCursorRef.current = 0;
     loadedRef.current = false;
     syncingRef.current = false;
     resyncQueuedRef.current = false;
@@ -402,6 +435,7 @@ export default function AgentExecutionDetail({
     setRemoved(false);
     setDetail(null);
     setHistoryError(null);
+    setLoading(true);
     setTruncated(false);
     stickToBottomRef.current = true;
     setFollowing(true);
@@ -411,16 +445,21 @@ export default function AgentExecutionDetail({
     const unsubscribe = subscribeAgentEvents(agentId, (event: AgentExecEvent) => {
       if (cancelled) return;
       if (event.kind === "transcript") {
+        // 事件到达即记游标（不等拉取）：之后开始的工具批，落库行 id 一定大于它。
+        lastEventCursorRef.current = Math.max(lastEventCursorRef.current, event.cursor);
         if (!loadedRef.current) {
           eventSeen = true;
         } else if (event.cursor > cursorRef.current) {
           void pullDelta();
         }
       } else if (event.kind === "tools_begun") {
+        // 行 id 下界只取事件游标，不取拉取游标：后台期间事件被攒着、回前台的补拉先把
+        // 行拿回来了，这批的行 id 也仍大于最后一条【事件】游标，对位不受影响。
         const tools = viewsFromBegun(event.batch.calls);
+        const floor = lastEventCursorRef.current;
         setPending((prev) => [
           ...prev.filter((p) => p.iter !== event.batch.iter),
-          { key: `p${event.batch.iter}:${Date.now()}`, iter: event.batch.iter, ts: Date.now(), tools },
+          { key: `p${event.batch.iter}:${Date.now()}`, iter: event.batch.iter, floor, tools },
         ]);
       } else if (event.kind === "removed") {
         setRemoved(true);
@@ -442,18 +481,20 @@ export default function AgentExecutionDetail({
       .then((snapshot) => {
         if (cancelled || gen !== genRef.current) return;
         cursorRef.current = Math.max(cursorRef.current, snapshot.cursor);
+        // 首屏窗口里的行都早于此后开始的任何工具批。
+        lastEventCursorRef.current = Math.max(lastEventCursorRef.current, snapshot.cursor);
         loadedRef.current = true;
-        const fresh = snapshot.entries.map(entryFrom);
-        setEntries(fresh);
-        setPending((prev) => withoutCommitted(prev, fresh, transcriptKey));
-        setTruncated(snapshot.entries.length >= HISTORY_WINDOW_ROWS);
+        setEntries(snapshot.entries.map(entryFrom));
+        setTruncated(snapshot.truncated === true);
         setHistoryError(null);
+        setLoading(false);
         if (eventSeen) void pullDelta();
       })
       .catch((e) => {
         if (cancelled || gen !== genRef.current) return;
         // 首屏失败也进入「已加载」：之后的事件 / 重试按游标 0 续拉能拿回全部行。
         loadedRef.current = true;
+        setLoading(false);
         setHistoryError(String(e));
       });
     return () => {
@@ -463,7 +504,14 @@ export default function AgentExecutionDetail({
       document.removeEventListener("visibilitychange", onVisibility);
       unsubscribe();
     };
-  }, [agentId, pullDelta, transcriptKey]);
+  }, [agentId, pullDelta]);
+
+  // 直播批 ↔ 落库行对位：行先到还是直播批先到都在这里收口（落库行到了就撤直播行）。
+  // 无变化时 withoutCommitted 返回原引用，React 跳过更新，不会循环。
+  useEffect(() => {
+    if (pending.length === 0) return;
+    setPending((prev) => withoutCommitted(prev, entries, transcriptKey));
+  }, [entries, pending, transcriptKey]);
 
   // 终态：仍在「进行中」的直播工具行标为已中断（没有落库行会来替换它们）；
   // 同时再按游标补拉一次，兜底收尾阶段可能错过的 transcript 事件。
@@ -475,6 +523,13 @@ export default function AgentExecutionDetail({
 
   // 自动跟随到底部。只有用户主动向上滚才解除跟随（软键盘弹出等布局变化引起的滚动事件
   // 不会让 scrollTop 变小）；回到底部附近 / 内容没溢出时恢复跟随。
+  const scrollToBottom = () => {
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    // 同步基线：程序拉底产生的 scroll 事件不该被当成用户上滑。
+    lastScrollTopRef.current = el.scrollTop;
+  };
   const handleScroll = () => {
     const el = listRef.current;
     if (!el) return;
@@ -495,13 +550,29 @@ export default function AgentExecutionDetail({
   const jumpToBottom = () => {
     stickToBottomRef.current = true;
     setFollowing(true);
-    const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    scrollToBottom();
   };
   useEffect(() => {
-    const el = listRef.current;
-    if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
+    if (stickToBottomRef.current) scrollToBottom();
   }, [entries, pending, detail?.execution.handoff]);
+  // 尺寸变化（软键盘弹出收起、思考块 / 工具行展开折叠、图片加载）不产生 scroll 事件：
+  // 跟随中就补拉底；脱离跟随但内容已不再溢出时恢复跟随（否则「回到底部」按钮残留）。
+  useEffect(() => {
+    const el = listRef.current;
+    const content = contentRef.current;
+    if (!el || !content || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (stickToBottomRef.current) {
+        scrollToBottom();
+      } else if (el.scrollHeight <= el.clientHeight) {
+        stickToBottomRef.current = true;
+        setFollowing(true);
+      }
+    });
+    observer.observe(el);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, []);
 
   const detailLoader = useMemo<ToolDetailLoader>(
     () => (msgId: number) => api.agentExecutionToolDetail(agentId, msgId),
@@ -520,7 +591,6 @@ export default function AgentExecutionDetail({
   const usage = summary?.usage ?? exec?.usage;
   const stage = summary?.progress?.stage ?? exec?.progress?.stage ?? "";
   const name = summary?.name?.trim() || exec?.spec.name?.trim() || agentId;
-  const elapsed = summary ? elapsedText(summary, now) : null;
   const canSend = live && !removed;
   const inboxPending = detail?.inbox_pending ?? summary?.inbox_pending ?? 0;
 
@@ -591,7 +661,7 @@ export default function AgentExecutionDetail({
           <button
             type="button"
             onClick={onBack}
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-gray-400 transition hover:bg-[#1a1f29] hover:text-gray-200"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-gray-400 transition hover:bg-[#1a1f29] hover:text-gray-200 max-md:h-10 max-md:w-10"
             title="返回列表"
             aria-label="返回列表"
           >
@@ -599,7 +669,7 @@ export default function AgentExecutionDetail({
               <path d="m15 6-6 6 6 6" />
             </svg>
           </button>
-          <div className="min-w-0 flex-1">
+          <div ref={headingRef} tabIndex={-1} className="min-w-0 flex-1 outline-none">
             <div className="flex min-w-0 items-center gap-2">
               <h1 className="truncate text-base font-semibold text-gray-100">{name}</h1>
               {headerSnapshot && <StateBadge e={headerSnapshot} size="md" />}
@@ -613,7 +683,7 @@ export default function AgentExecutionDetail({
               type="button"
               onClick={cancel}
               disabled={cancelling || stateOf(summary ?? { state: "" }) === "cancelling"}
-              className="shrink-0 rounded-lg border border-red-500/40 px-2.5 py-1 text-xs text-red-300 transition hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+              className="shrink-0 rounded-lg border border-red-500/40 px-2.5 py-1 text-xs text-red-300 transition hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40 max-md:px-3 max-md:py-2"
             >
               {cancelling ? "取消中…" : "取消执行"}
             </button>
@@ -630,9 +700,7 @@ export default function AgentExecutionDetail({
               <span className="font-mono tabular-nums">
                 {headerSnapshot.progress?.completed_steps ?? 0}/{headerSnapshot.progress?.total_steps ?? 0} 步
               </span>
-              {elapsed && (
-                <span className={`font-mono tabular-nums ${live ? "text-indigo-300" : ""}`}>{elapsed}</span>
-              )}
+              {headerSnapshot && <LiveElapsed e={headerSnapshot} />}
               <span
                 className="font-mono tabular-nums"
                 title={
@@ -682,9 +750,10 @@ export default function AgentExecutionDetail({
         )}
       </div>
 
-      {/* 活动记录 */}
+      {/* 活动记录（内层 contentRef 供 ResizeObserver 观察内容高度变化） */}
       <div className="relative min-h-0 flex-1">
-      <div ref={listRef} onScroll={handleScroll} className="h-full space-y-3 overflow-y-auto px-6 py-4 max-md:px-3">
+      <div ref={listRef} onScroll={handleScroll} className="h-full overflow-y-auto px-6 py-4 max-md:px-3">
+      <div ref={contentRef} className="space-y-3">
         {exec?.error && (
           <div className="whitespace-pre-wrap rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-2 text-xs text-red-300 [overflow-wrap:anywhere]">
             {stateOf(exec) === "cancelled" ? "取消原因：" : "失败原因："}
@@ -701,7 +770,7 @@ export default function AgentExecutionDetail({
             活动记录加载失败：{historyError}
             <button
               type="button"
-              className="ml-2 rounded border border-red-500/40 px-1.5 py-px text-red-200"
+              className="ml-2 rounded border border-red-500/40 px-1.5 py-px text-red-200 max-md:px-3 max-md:py-1.5"
               onClick={() => void pullDelta()}
             >
               重试
@@ -710,7 +779,11 @@ export default function AgentExecutionDetail({
         )}
         {entries.length === 0 && pending.length === 0 && !historyError && (
           <div className="text-xs text-gray-500">
-            {stateOf(summary ?? { state: "" }) === "queued" ? "排队中，尚未开始执行。" : "暂无活动记录。"}
+            {loading
+              ? "加载活动记录…"
+              : stateOf(summary ?? { state: "" }) === "queued"
+                ? "排队中，尚未开始执行。"
+                : "暂无活动记录。"}
           </div>
         )}
         {entries.map((e, index) => {
@@ -794,11 +867,12 @@ export default function AgentExecutionDetail({
         {exec?.handoff && <HandoffCard handoff={exec.handoff} />}
         {detail && <EventsTimeline events={detail.events} />}
       </div>
+      </div>
       {!following && (
         <button
           type="button"
           onClick={jumpToBottom}
-          className="absolute bottom-3 right-6 rounded-full border border-[#2a2f3a] bg-[#141821]/95 px-3 py-1 text-[11px] text-gray-300 shadow-lg transition hover:text-gray-100 max-md:right-3"
+          className="absolute bottom-3 right-6 rounded-full border border-[#2a2f3a] bg-[#141821]/95 px-3 py-1 text-[11px] text-gray-300 shadow-lg transition hover:text-gray-100 max-md:right-3 max-md:px-4 max-md:py-2 max-md:text-xs"
         >
           ↓ 回到底部
         </button>
