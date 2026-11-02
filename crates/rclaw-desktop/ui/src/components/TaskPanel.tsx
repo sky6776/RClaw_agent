@@ -92,7 +92,11 @@ export default function TaskPanel({
           <button
             onClick={clearHistory}
             disabled={!agentReady || clearing || (finishedCount === 0 && !truncated)}
-            title="清空已结束的后台任务记录（不影响会话与运行中的任务）"
+            title={
+              truncated
+                ? "清空已结束的后台任务记录（列表已截断，窗口外更早的已结束记录也会一并清除；不影响会话与运行中的任务）"
+                : "清空已结束的后台任务记录（不影响会话与运行中的任务）"
+            }
             className="rounded-md px-1.5 text-xs text-gray-500 transition hover:bg-[#1a1f29] hover:text-indigo-300 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {clearing ? "清除中…" : `清除${finishedCount > 0 ? `（${finishedCount}）` : ""}`}

@@ -211,7 +211,8 @@ function ResizeHandle({ onDrag }: { onDrag: (clientX: number) => void }) {
  *  进详情时列表面板仍挂着（只是隐藏），返回不重新加载、滚动位置不丢；详情按 agentId 作
  *  key，切换执行时整页重建，不复用旧记录的状态。返回时把焦点还给刚才点开的那张卡片
  *  （`data-agent-id`）：详情卸载后焦点否则落到 body；卡片在面板的滚动容器里，键盘翻页
- *  仍然可用——列表容器本身不做可聚焦（可聚焦祖先会截住键盘滚动）。卡片已被清掉就不聚焦。 */
+ *  仍然可用——列表容器本身不做可聚焦（可聚焦祖先会截住键盘滚动）。卡片已被清掉就退到
+ *  列表第一张；一张都没有则不聚焦。 */
 function ExecutionPage({
   selectedAgentId,
   onBack,
@@ -228,15 +229,16 @@ function ExecutionPage({
     if (agentId === null) return;
     // 列表容器在这次更新提交后才重新可见（visibility:hidden 的元素不可聚焦），下一帧再聚焦。
     // 那张卡片已被清掉（详情里看到「已被清除」后返回）就退到列表第一张，键盘翻页仍有锚点；
-    // 一张都没有则无处可聚焦，也无可滚动。preventScroll 保住列表滚动位置——卡片若被新入表
-    // 的执行顶出可视区，焦点环会暂时不可见，接受这个取舍。
+    // 一张都没有则无处可聚焦，也无可滚动。回到原卡片时 preventScroll 保住列表滚动位置
+    // （卡片若被新入表的执行顶出可视区，焦点环会暂时不可见，接受这个取舍）；退到第一张时
+    // 原锚点已不存在，让它滚进视口。
     requestAnimationFrame(() => {
       const list = listRef.current;
       if (!list) return;
       const card =
         list.querySelector<HTMLElement>(`[data-agent-id="${CSS.escape(agentId)}"]`) ??
         list.querySelector<HTMLElement>("[data-agent-id]");
-      card?.focus({ preventScroll: true });
+      card?.focus({ preventScroll: card.dataset.agentId === agentId });
     });
   };
   const showingDetail = selectedAgentId !== null;
