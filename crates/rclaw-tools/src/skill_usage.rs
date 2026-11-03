@@ -1004,11 +1004,15 @@ mod tests {
             .flatten()
             .filter_map(|entry| {
                 let path = entry.path();
+                // 可寻址 = 顶层 SKILL.md，或技能包（平铺 `skills/*.md` 如 ai-berkshire，
+                // 嵌套 `skills/<sub>/SKILL.md` 如 pick-funds / read-macro / watch-positions）。
                 let addressable = path.join("SKILL.md").is_file()
                     || path.join("skills").read_dir().is_ok_and(|mut entries| {
                         entries.any(|item| {
                             item.ok().is_some_and(|item| {
-                                item.path().extension().and_then(|ext| ext.to_str()) == Some("md")
+                                let item_path = item.path();
+                                item_path.extension().and_then(|ext| ext.to_str()) == Some("md")
+                                    || item_path.join("SKILL.md").is_file()
                             })
                         })
                     });
