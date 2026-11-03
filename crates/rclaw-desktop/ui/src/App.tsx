@@ -337,16 +337,34 @@ ${event.payload.command}
   });
 
   // 安卓返回键导航（原生侧 MainActivity 把返回键翻译成 __rclawBack 调用）：
-  // 弹层开着 = 关一层；抽屉开 = 退出应用；否则 = 呼出侧边栏（「返回回到侧边
-  // 栏，再按退出」）。向导/启动期不装载（走系统默认退出）。
+  // 弹层开着 = 关一层；抽屉开 = 退出应用；会话由「会话」列表点开 = 先回列表
+  // （钻取式回退）；否则 = 呼出侧边栏（「返回回到侧边栏，再按退出」）。向导/
+  // 启动期不装载（走系统默认退出）。
   const drawerOpenRef = useRef(drawerOpen);
   drawerOpenRef.current = drawerOpen;
+  const pageRef = useRef(page);
+  pageRef.current = page;
+  // 对话页的钻取来源：只有从「会话」列表点开会话（或在列表里新建 / 归档 /
+  // 删除后自动切换）才记。显式写在入口里、不靠 page 迁移推断——抽屉「对话」
+  // 等既非钻取又可能停在原页的入口不该被当成回列表。离开对话页即失效。
+  const chatReturnPageRef = useRef<Page | null>(null);
+  useEffect(() => {
+    if (page !== "chat") chatReturnPageRef.current = null;
+  }, [page]);
   const backNavArmed = isAndroidDevice() && isMobile && !!status && !status.wizard_needed;
   useEffect(() => {
     if (!backNavArmed) return;
     installBackNavigation(() => {
       if (drawerOpenRef.current) {
         void api.appExit().catch(() => {});
+        return true;
+      }
+      const returnPage = chatReturnPageRef.current;
+      if (pageRef.current === "chat" && returnPage) {
+        // 同步清目标并镜像 page：连按两次返回时第二下不该跳过列表直接开抽屉。
+        chatReturnPageRef.current = null;
+        pageRef.current = returnPage;
+        setPage(returnPage);
         return true;
       }
       setDrawerOpen(true);
@@ -937,8 +955,14 @@ ${event.payload.command}
   }, [agentState, applyStatus]);
 
   // 打开会话：内存没有转录时从持久化历史恢复（重启后会话历史仍在）。
+  // returnTo：「会话」列表钻取进来时传来源页（返回键据此先回列表，见
+  // chatReturnPageRef）；其余入口走默认 null，顺手清掉残留目标。
   const openChat = useCallback(
-    async (chatId: string) => {
+    async (chatId: string, returnTo: Page | null = null) => {
+      chatReturnPageRef.current = returnTo;
+      // 同步镜像页：原生返回事件可能早于本次 setState 的提交到达，返回处理器
+      // 必须立刻看到「已在对话页」，否则会误判成其它页而直接开抽屉。
+      pageRef.current = "chat";
       setActiveId(chatId);
       setPage("chat");
       setDrawerOpen(false);
@@ -1160,7 +1184,10 @@ ${event.payload.command}
 
   // 新建会话的公共部分：重置草稿/转录/占位标记并切换到对话页。是否在侧栏
   // 列表补条目由调用方决定（「＋」新建要补；删空后的裸工作会话不补）。
-  const prepareChat = useCallback((id: string) => {
+  // returnTo 同 openChat：在「会话」列表里新建时传来源页。
+  const prepareChat = useCallback((id: string, returnTo: Page | null = null) => {
+    chatReturnPageRef.current = returnTo;
+    pageRef.current = "chat";
     setChatDraft("");
     restoredChats.current.add(id);
     localChatIds.current.add(id);
@@ -1170,14 +1197,17 @@ ${event.payload.command}
     setPage("chat");
   }, []);
 
-  const newChat = useCallback(() => {
-    const id = freshChatId();
-    prepareChat(id);
-    setChats((prev) => [
-      { chat_id: id, title: "新对话", updated_at: Date.now(), archived: false },
-      ...prev.filter((c) => c.chat_id !== id),
-    ]);
-  }, [prepareChat]);
+  const newChat = useCallback(
+    (returnTo: Page | null = null) => {
+      const id = freshChatId();
+      prepareChat(id, returnTo);
+      setChats((prev) => [
+        { chat_id: id, title: "新对话", updated_at: Date.now(), archived: false },
+        ...prev.filter((c) => c.chat_id !== id),
+      ]);
+    },
+    [prepareChat],
+  );
 
   const archiveChat = useCallback(
     async (chatId: string) => {
@@ -1186,6 +1216,10 @@ ${event.payload.command}
         setErrorToast("会话正在工作中，请先停止任务再归档");
         return;
       }
+      // 自动切换到的会话继承钻取来源：在「会话」列表里操作恒为 chats；其它页面
+      // 操作沿用该对话页已有的来源。必须在任何 await 之前取（切页会改 pageRef）。
+      const from: Page | null =
+        pageRef.current === "chats" ? "chats" : chatReturnPageRef.current;
       try {
         await api.chatArchive(chatId);
       } catch (e) {
@@ -1197,9 +1231,9 @@ ${event.payload.command}
         setChats((list) => {
           const next = list.find((c) => !c.archived);
           if (next) {
-            void openChat(next.chat_id);
+            void openChat(next.chat_id, from);
           } else {
-            newChat();
+            newChat(from);
           }
           return list;
         });
@@ -1230,6 +1264,9 @@ ${event.payload.command}
         setErrorToast("会话正在工作中，请先停止任务再删除");
         return;
       }
+      // 同 archiveChat：自动切换到的会话继承钻取来源，且必须在 await 前取。
+      const from: Page | null =
+        pageRef.current === "chats" ? "chats" : chatReturnPageRef.current;
       try {
         await api.chatDelete(chatId);
       } catch (e) {
@@ -1252,11 +1289,11 @@ ${event.payload.command}
       if (chatId === activeId) {
         const next = chats.find((c) => !c.archived && c.chat_id !== chatId);
         if (next) {
-          void openChat(next.chat_id);
+          void openChat(next.chat_id, from);
         } else {
           // 全部删空：不再自动补「新对话」条目，侧栏显示「暂无会话」；主区挂
           // 一个不进列表的空白工作会话，发出首条消息时 handleSend 会补进列表。
-          prepareChat(freshChatId());
+          prepareChat(freshChatId(), from);
         }
       }
       await refreshChats();
@@ -2129,7 +2166,7 @@ ${event.payload.command}
           <h2 className="text-base font-semibold text-gray-100">会话</h2>
           <button
             onClick={() => {
-              newChat();
+              newChat("chats");
               setPage("chat");
             }}
             className="rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300"
@@ -2245,7 +2282,7 @@ ${event.payload.command}
                   ) : (
                     <button
                       onClick={() => {
-                        void openChat(c.chat_id);
+                        void openChat(c.chat_id, "chats");
                         setPage("chat");
                       }}
                       onDoubleClick={() => startRename(c.chat_id, c.title || c.chat_id)}
