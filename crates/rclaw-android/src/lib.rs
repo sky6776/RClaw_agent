@@ -1606,7 +1606,10 @@ pub mod jni_bridge {
             .l()
             .map_err(|error| anyhow!("读取 NativeBridge.verifyUpdateApk 返回值失败: {error}"))?;
         let value = JString::from(value);
-        Ok(env.get_string(&value)?.to_string_lossy().into_owned())
+        // 块尾表达式里的临时（JavaStr 的 ControlFlow drop 时序）会让 `value`
+        // 显得活不过本块——先落局部变量再返回（rustc E0597 建议）。
+        let text = env.get_string(&value)?.to_string_lossy().into_owned();
+        Ok(text)
     }
 
     /// 前台服务通知状态更新（Rust android_status 推送 → NativeBridge。
