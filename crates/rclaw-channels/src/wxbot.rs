@@ -1812,7 +1812,11 @@ fn humanize_segments(text: &str, target_chars: usize, hard_bytes: usize) -> Vec<
 
 /// 句末标点后的闭引号/括号跟随前一段，避免以 “）”“” 开头的碎片。
 fn extend_closing(text: &str, mut end: usize) -> usize {
-    while let Some(c) = text[end..].chars().next() {
+    // Bound the scan: a long run of closing brackets must not be re-scanned for
+    // every candidate break (O(n²)).
+    let limit = end.saturating_add(PROTECT_SCAN);
+    while end < limit {
+        let Some(c) = text[end..].chars().next() else { break };
         if matches!(c, '”' | '"' | '\'' | '）' | ')' | '】' | ']' | '}' | '》') {
             end += c.len_utf8();
         } else {
@@ -1827,49 +1831,63 @@ const PROTECT_SCAN: usize = 512;
 
 /// Whitespace-delimited token bounds around `end`, or None when the token is
 /// longer than PROTECT_SCAN (treated as protected by callers).
-fn token_bounds(text: &str, end: usize) -> Option<(usize, usize)> {
+fn token_bounds_with_limit(text: &str, end: usize, limit: usize) -> Option<(usize, usize)> {
     let before = &text[..end];
     let mut token_start = 0usize;
     let mut saw_ws = false;
-    for (i, c) in before.char_indices().rev().take(PROTECT_SCAN + 1) {
+    for (i, c) in before.char_indices().rev().take(limit + 1) {
         if c.is_whitespace() {
             token_start = i + c.len_utf8();
             saw_ws = true;
             break;
         }
     }
-    if !saw_ws && before.len() > PROTECT_SCAN {
+    if !saw_ws && before.len() > limit {
         return None;
     }
     let mut token_end = text.len();
-    for (i, c) in text[end..].char_indices().take(PROTECT_SCAN + 1) {
+    for (i, c) in text[end..].char_indices().take(limit + 1) {
         if c.is_whitespace() {
             token_end = end + i;
             break;
         }
     }
-    if token_end.saturating_sub(token_start) > PROTECT_SCAN {
+    if token_end.saturating_sub(token_start) > limit {
         return None;
     }
     Some((token_start, token_end))
 }
 
+fn token_bounds(text: &str, end: usize) -> Option<(usize, usize)> {
+    token_bounds_with_limit(text, end, PROTECT_SCAN)
+}
+
 /// Bounds of the `[0-9.]` run containing `end`, when it contains a decimal dot.
 fn numeric_run_bounds(text: &str, end: usize) -> Option<(usize, usize)> {
     let mut start = end;
+    let mut steps = 0usize;
     while start > 0 {
+        if steps > PROTECT_SCAN {
+            return None;
+        }
         let c = text[..start].chars().next_back()?;
         if c.is_ascii_digit() || c == '.' {
             start -= c.len_utf8();
+            steps += 1;
         } else {
             break;
         }
     }
     let mut stop = end;
+    let mut steps = 0usize;
     while stop < text.len() {
+        if steps > PROTECT_SCAN {
+            return None;
+        }
         let c = text[stop..].chars().next()?;
         if c.is_ascii_digit() || c == '.' {
             stop += c.len_utf8();
+            steps += 1;
         } else {
             break;
         }
@@ -1883,7 +1901,9 @@ fn numeric_run_bounds(text: &str, end: usize) -> Option<(usize, usize)> {
 
 /// If `end` is strictly inside a protected URL/number interval, return it.
 fn protected_interval(text: &str, end: usize) -> Option<(usize, usize)> {
-    if let Some((start, stop)) = token_bounds(text, end) {
+    // Allow a larger token for the hard-split path: a 620-byte URL that fits
+    // the hard limit must not be cut. Beyond 8x PROTECT_SCAN the hard limit wins.
+    if let Some((start, stop)) = token_bounds_with_limit(text, end, PROTECT_SCAN * 8) {
         if end > start && end < stop {
             let token = &text[start..stop];
             if token.contains("://")
@@ -1920,16 +1940,8 @@ fn inside_protected(text: &str, end: usize) -> bool {
         return true;
     }
     // Decimal embedded in a mixed token ("abc12345.6789元"): protect while the
-    // break sits inside the digit run that has a dot on either side.
-    let left = text[..end].trim_end_matches(|c: char| c.is_ascii_digit());
-    let right = text[end..].trim_start_matches(|c: char| c.is_ascii_digit());
-    let left_dot = left
-        .strip_suffix('.')
-        .is_some_and(|before_dot| before_dot.ends_with(|c: char| c.is_ascii_digit()));
-    let right_dot = right
-        .strip_prefix('.')
-        .is_some_and(|after_dot| after_dot.starts_with(|c: char| c.is_ascii_digit()));
-    left_dot || right_dot
+    // break sits inside the digit run that contains a dot (bounded scan).
+    numeric_run_bounds(text, end).is_some()
 }
 
 /// A planned send slot: `deadline` is when the POST may start.
