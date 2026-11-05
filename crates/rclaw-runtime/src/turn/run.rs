@@ -141,7 +141,7 @@ pub(crate) enum LoopDecision {
 /// URL 先整段摘除——主机名（example.com）不是文件点名，否则「总结发到 example.com
 /// 的部署」会误禁历史对账（codex r6）。已知边界：纯中文文件名（无 ASCII「名字.
 /// 后缀」形态）提取不到——守卫 fail-open（codex r4 #3），此时退化为类别级对账。
-fn filename_tokens(text: &str) -> Vec<String> {
+pub(super) fn filename_tokens(text: &str) -> Vec<String> {
     fn push_if_filename(tokens: &mut Vec<String>, token: &str) {
         let trimmed = token.trim_matches('-').trim_end_matches('.');
         if let Some((name, ext)) = trimmed.rsplit_once('.') {

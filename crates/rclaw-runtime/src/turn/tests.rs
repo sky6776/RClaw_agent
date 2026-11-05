@@ -3925,6 +3925,56 @@ impl Provider for CapturingProvider {
     }
 }
 
+/// 两阶段 provider：第一次 `chat` 阻塞到 `release`（模拟长任务），后续调用立即返回。
+/// 两次调用返回不同文本（`replies[0]` 是首轮候选、`replies[1]` 是重算结果），用于证明
+/// 「活动 turn 期间 `/goal` 插队 → 安全点 C 丢弃旧候选」而不是旧候选被采纳出站。
+struct FirstCallGateProvider {
+    requests: Arc<StdMutex<Vec<ChatRequest>>>,
+    entered_first: Arc<AtomicBool>,
+    release: Arc<Notify>,
+    calls: AtomicU32,
+    replies: Vec<String>,
+}
+
+impl FirstCallGateProvider {
+    fn reply_for(&self, call: usize) -> String {
+        self.replies
+            .get(call)
+            .or_else(|| self.replies.last())
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl Provider for FirstCallGateProvider {
+    fn name(&self) -> &str {
+        "first-call-gate"
+    }
+
+    async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome> {
+        self.requests.lock().unwrap().push(req);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) as usize;
+        if call == 0 {
+            self.entered_first.store(true, Ordering::SeqCst);
+            self.release.notified().await;
+        }
+        Ok(ChatOutcome {
+            text: self.reply_for(call),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            stop: Some(FinishReason::Stop),
+            usage: None,
+        })
+    }
+
+    async fn chat_stream(&self, req: ChatRequest, on_text: OnText) -> Result<ChatOutcome> {
+        let outcome = self.chat(req).await?;
+        on_text(&outcome.text);
+        Ok(outcome)
+    }
+}
+
 #[async_trait]
 impl Provider for RetryCapturingProvider {
     fn name(&self) -> &str {
@@ -4497,6 +4547,14 @@ async fn wait_idle(mgr: &TurnManager) {
     tokio::time::timeout(Duration::from_secs(10), mgr.wait_turns_idle())
         .await
         .unwrap_or_else(|_| panic!("turn 任务在预期时间内未结束"));
+}
+
+/// 带超时的 outbound recv：命令回归到「不再发回复」时测试应失败而不是挂起。
+async fn recv_outbound(rx: &mut mpsc::Receiver<BusMessage>) -> BusMessage {
+    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("等待 outbound 消息超时")
+        .expect("outbound 通道已关闭")
 }
 
 /// 轮询 session 历史直到条数 >= expected。
@@ -10035,6 +10093,58 @@ async fn fork_rejects_bot_sessions() {
 // /goal：会话长期目标（ZCode /goal 同款，第十二轮）
 // ---------------------------------------------------------------------------
 
+/// 取出只回执类结果（查询 / 清除 / 超长 / 写库失败）。
+fn goal_reply(outcome: GoalCommandOutcome) -> String {
+    match outcome {
+        GoalCommandOutcome::Reply(text) => text,
+        GoalCommandOutcome::Set { receipt, .. } => {
+            panic!("期望只回执，实际返回设定成功：{receipt}")
+        }
+    }
+}
+
+/// 取出设定成功结果 `(receipt, objective)`。
+fn goal_set(outcome: GoalCommandOutcome) -> (String, String) {
+    match outcome {
+        GoalCommandOutcome::Set { receipt, objective } => (receipt, objective),
+        GoalCommandOutcome::Reply(text) => panic!("期望设定成功，实际只回执：{text}"),
+    }
+}
+
+#[test]
+fn parse_goal_command_matches_command_head_rules() {
+    // 命令头与 RuntimeCommand::parse 同规则：`/` 后可有空白、命令名大小写不敏感。
+    assert!(matches!(parse_goal_command("/goal"), GoalCommand::Show));
+    assert!(matches!(
+        parse_goal_command("  /GOAL   "),
+        GoalCommand::Show
+    ));
+    // ASCII 别名大小写不敏感；中文别名精确匹配。
+    for input in [
+        "/goal clear",
+        "/GOAL CLEAR",
+        "/goal Done",
+        "/goal 完成",
+        "/goal 清除",
+    ] {
+        assert!(
+            matches!(parse_goal_command(input), GoalCommand::Clear),
+            "input={input}"
+        );
+    }
+    for (input, expected) in [
+        ("/goal 修复登录问题", "修复登录问题"),
+        ("/ GOAL 修复登录问题", "修复登录问题"),
+        // 非 /goal 头沿用 handle_goal 既有 fallback：整段作为目标文本。
+        ("/goalx 修复登录问题", "goalx 修复登录问题"),
+    ] {
+        match parse_goal_command(input) {
+            GoalCommand::Set(objective) => assert_eq!(objective, expected, "input={input}"),
+            _ => panic!("input={input} 应解析为 Set"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn goal_command_sets_shows_and_clears_session_goal() {
     let dir = tempfile::tempdir().unwrap();
@@ -10056,14 +10166,16 @@ async fn goal_command_sets_shows_and_clears_session_goal() {
     );
 
     // 未设定：提示用法。
-    let none = mgr.handle_goal("cli", "console", "/goal").await;
+    let none = goal_reply(mgr.handle_goal("cli", "console", "/goal").await);
     assert!(none.contains("未设定"), "{none}");
 
     // 设定：回执 + kv 落库，按会话隔离。
-    let set = mgr
-        .handle_goal("cli", "console", "/goal 把日志模块迁到新框架并通过全部测试")
-        .await;
+    let (set, objective) = goal_set(
+        mgr.handle_goal("cli", "console", "/goal 把日志模块迁到新框架并通过全部测试")
+            .await,
+    );
     assert!(set.contains("已设定"), "{set}");
+    assert_eq!(objective, "把日志模块迁到新框架并通过全部测试");
     let key = TurnManager::goal_key("cli", "console");
     let stored = mgr
         .session
@@ -10080,22 +10192,560 @@ async fn goal_command_sets_shows_and_clears_session_goal() {
         .is_none());
 
     // 查看：显示当前目标。
-    let show = mgr.handle_goal("cli", "console", "/goal").await;
+    let show = goal_reply(mgr.handle_goal("cli", "console", "/goal").await);
     assert!(show.contains("当前会话目标"), "{show}");
     assert!(show.contains("迁到新框架"), "{show}");
 
     // 超长目标拒绝。
-    let too_long = mgr
-        .handle_goal("cli", "console", &format!("/goal {}", "长".repeat(2001)))
-        .await;
+    let too_long = goal_reply(
+        mgr.handle_goal("cli", "console", &format!("/goal {}", "长".repeat(2001)))
+            .await,
+    );
     assert!(too_long.contains("过长"), "{too_long}");
 
-    // 收尾：清除（幂等）。
-    let cleared = mgr.handle_goal("cli", "console", "/goal clear").await;
+    // 收尾：清除（幂等）；ASCII 别名大小写不敏感。
+    let cleared = goal_reply(mgr.handle_goal("cli", "console", "/goal clear").await);
     assert!(cleared.contains("已清除"), "{cleared}");
     assert!(mgr.session.journal().kv_get(&key).unwrap().is_none());
-    let again = mgr.handle_goal("cli", "console", "/goal done").await;
+    let again = goal_reply(mgr.handle_goal("cli", "console", "/goal done").await);
     assert!(again.contains("已清除"), "{again}");
+
+    goal_set(mgr.handle_goal("cli", "console", "/goal 再设一次").await);
+    let upper = goal_reply(mgr.handle_goal("cli", "console", "/GOAL CLEAR").await);
+    assert!(upper.contains("已清除"), "{upper}");
+    assert!(mgr.session.journal().kv_get(&key).unwrap().is_none());
+}
+
+/// 展开文必须 gate 中立：`Run::new_with_base` 以它为本轮目标源，多引入一个动作词
+/// （写入 / 提交 / 部署 …）或「名字.后缀」token 都会让完成闸门凭空多出必须证明的动作。
+#[test]
+fn goal_command_expansion_is_gate_neutral() {
+    // 目标本身不带动作词：展开文不得新增任何动作类别，也不得出现点号（文件名 token）。
+    let plain = "完成迁移并通过测试";
+    let expanded = TurnManager::goal_command_expansion(plain);
+    assert!(expanded.contains("/goal"), "{expanded}");
+    assert!(expanded.contains(plain), "{expanded}");
+    assert!(expanded.contains("立即"), "{expanded}");
+    assert!(
+        !expanded.starts_with('/'),
+        "展开文不能以 / 开头：{expanded}"
+    );
+    assert!(
+        !expanded.contains('.'),
+        "展开文不得引入点号 token：{expanded}"
+    );
+    assert!(
+        super::run::filename_tokens(&expanded).is_empty(),
+        "无文件名的目标不应产生文件名 token：{expanded}"
+    );
+    assert_eq!(
+        super::external_action::requested_external_actions(&expanded),
+        super::external_action::requested_external_actions(plain),
+        "展开文不得新增动作类别"
+    );
+    assert!(
+        super::external_action::requested_external_actions(&expanded).is_empty(),
+        "无动作词的目标不应产生动作要求"
+    );
+
+    // 目标本身带动作词 / 文件名：展开文只能原样保留，不得额外放大。
+    let action = "写入 new.csv 并提交代码";
+    let expanded = TurnManager::goal_command_expansion(action);
+    assert_eq!(
+        super::run::filename_tokens(&expanded),
+        super::run::filename_tokens(action),
+        "展开文改变文件名 token：{expanded}"
+    );
+    assert_eq!(
+        super::external_action::requested_external_actions(&expanded),
+        super::external_action::requested_external_actions(action),
+        "展开文改变动作类别：{expanded}"
+    );
+    assert!(
+        !super::external_action::requested_external_actions(&expanded).is_empty(),
+        "目标自带的动作类别必须保留"
+    );
+}
+
+#[tokio::test]
+async fn route_goal_during_active_turn_interjects_into_same_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let entered_first = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(Notify::new());
+    let provider: Arc<dyn Provider> = Arc::new(FirstCallGateProvider {
+        requests: requests.clone(),
+        entered_first: entered_first.clone(),
+        release: release.clone(),
+        calls: AtomicU32::new(0),
+        replies: vec!["旧候选，不得出站。".into(), "长任务完成。".into()],
+    });
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        session.clone(),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            stream_enabled: false,
+            send_working_status: false,
+            goal_audit_enabled: false,
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+
+    // 启动长任务 turn，等它抵达第一次 LLM 调用（阻塞中）。
+    mgr.route(BusMessage::new(CHANNEL_CLI, "console", "长任务"))
+        .await;
+    for _ in 0..2000 {
+        if entered_first.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(
+        entered_first.load(Ordering::SeqCst),
+        "长任务未在预期时间内抵达 LLM 调用"
+    );
+    assert!(mgr.is_session_busy(CHANNEL_CLI, "console"));
+
+    // 活动 turn 期间发送 /goal：回执强制 intermediate、目标落库、插队被接受。
+    mgr.route(BusMessage::new(
+        CHANNEL_CLI,
+        "console",
+        "/goal 完成迁移并通过测试",
+    ))
+    .await;
+    let receipt = tokio::time::timeout(Duration::from_secs(10), outbound_rx.recv())
+        .await
+        .expect("等待 goal 回执超时")
+        .unwrap();
+    assert!(
+        receipt.is_intermediate(),
+        "忙碌会话的 goal 回执必须 intermediate"
+    );
+    assert!(receipt.content.contains("已设定"), "{}", receipt.content);
+    assert!(mgr.is_session_busy(CHANNEL_CLI, "console"));
+    let stored = session
+        .journal()
+        .kv_get(&TurnManager::goal_key(CHANNEL_CLI, "console"))
+        .unwrap()
+        .expect("目标应已落库");
+    assert_eq!(stored["objective"], "完成迁移并通过测试");
+
+    // 放行首轮：候选在安全点 C 发现插队 → 丢弃旧候选、带展开文重算，不新开 turn。
+    release.notify_one();
+    let final_reply = loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), outbound_rx.recv())
+            .await
+            .expect("等待最终回复超时")
+            .unwrap();
+        if !message.is_intermediate() {
+            break message;
+        }
+    };
+    assert_eq!(final_reply.content, "长任务完成。");
+    wait_idle(&mgr).await;
+    // 首轮候选（不同文本）既不出站也不落盘：额外 outbound / assistant 都算回归。
+    assert!(
+        outbound_rx.try_recv().is_err(),
+        "旧候选不得额外出现在 outbound"
+    );
+
+    let reqs = requests.lock().unwrap();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "首轮候选被插队丢弃后应在同一 turn 内重算一次"
+    );
+    assert!(
+        reqs[1].messages.iter().any(|message| {
+            message.role == Role::User
+                && message.content.iter().any(|block| {
+                    block
+                        .as_text()
+                        .is_some_and(|text| text.contains("用户刚刚用 `/goal`"))
+                })
+        }),
+        "重算请求应包含 /goal 展开文"
+    );
+    assert!(
+        !reqs[1].messages.iter().any(|message| {
+            message.role == Role::User
+                && message.content.len() == 1
+                && message.content[0].as_text() == Some("/goal 完成迁移并通过测试")
+        }),
+        "重算请求不应包含 raw /goal 原文"
+    );
+    assert!(
+        reqs[1].messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                block
+                    .as_text()
+                    .is_some_and(|text| text.contains("[Session goal]"))
+            })
+        }),
+        "重算请求尾部应包含目标提醒"
+    );
+
+    // 历史：raw /goal 作为补充 user 落盘；旧候选不落盘，assistant 只有最终回复。
+    let history = session
+        .load_history(CHANNEL_CLI, "console", 10, 1024 * 1024)
+        .unwrap();
+    let users: Vec<&Message> = history.iter().filter(|m| m.role == Role::User).collect();
+    let assistants: Vec<&Message> = history
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .collect();
+    assert_eq!(users.len(), 2, "{history:?}");
+    assert_eq!(users[0].content[0].as_text().unwrap(), "长任务");
+    assert_eq!(
+        users[1].content[0].as_text().unwrap(),
+        "/goal 完成迁移并通过测试"
+    );
+    assert_eq!(assistants.len(), 1, "{history:?}");
+    assert_eq!(assistants[0].content[0].as_text().unwrap(), "长任务完成。");
+    assert!(
+        !history.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| block.as_text().is_some_and(|text| text.contains("旧候选")))
+        }),
+        "旧候选不得落盘：{history:?}"
+    );
+    assert!(!mgr.is_session_busy(CHANNEL_CLI, "console"));
+}
+
+#[tokio::test]
+async fn route_goal_set_starts_turn_with_expanded_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(CapturingProvider {
+        requests: requests.clone(),
+        reply: "开始处理目标。".into(),
+    });
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        session.clone(),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            stream_enabled: false,
+            send_working_status: false,
+            goal_audit_enabled: false,
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+
+    mgr.route(BusMessage::new(
+        CHANNEL_CLI,
+        "console",
+        "/goal 完成迁移并通过测试",
+    ))
+    .await;
+
+    // 回执必须先到且强制 intermediate：turn 还没启动，普通消息会提前解除桌面忙碌态。
+    // 用带超时的 recv：turn 回归到「不产生任何回复」时测试应失败而不是挂起。
+    let receipt = tokio::time::timeout(Duration::from_secs(10), outbound_rx.recv())
+        .await
+        .expect("等待 goal 回执超时")
+        .unwrap();
+    assert!(receipt.is_intermediate(), "goal 回执必须是 intermediate");
+    assert!(receipt.content.contains("已设定"), "{}", receipt.content);
+
+    // 最终回复（跳过过程消息）解除忙碌态。
+    let final_reply = loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), outbound_rx.recv())
+            .await
+            .expect("等待最终回复超时")
+            .unwrap();
+        if !message.is_intermediate() {
+            break message;
+        }
+    };
+    assert_eq!(final_reply.content, "开始处理目标。");
+
+    wait_idle(&mgr).await;
+
+    let stored = session
+        .journal()
+        .kv_get(&TurnManager::goal_key(CHANNEL_CLI, "console"))
+        .unwrap()
+        .expect("目标应已落库");
+    assert_eq!(stored["objective"], "完成迁移并通过测试");
+
+    // 本轮直接跑了一次 LLM（审计已关），模型看到的是展开文而不是 raw /goal。
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 1, "设定成功后应立即且只跑一个 turn");
+    let req = &reqs[0];
+    let expansion = req
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == Role::User
+                && message.content.iter().any(|block| {
+                    block
+                        .as_text()
+                        .is_some_and(|text| text.contains("用户刚刚用 `/goal`"))
+                })
+        })
+        .expect("请求里应有 /goal 展开文");
+    let expansion_text = expansion
+        .content
+        .iter()
+        .filter_map(|block| block.as_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        expansion_text.contains("完成迁移并通过测试"),
+        "{expansion_text}"
+    );
+    assert!(
+        !req.messages.iter().any(|message| {
+            message.role == Role::User
+                && message.content.len() == 1
+                && message.content[0].as_text() == Some("/goal 完成迁移并通过测试")
+        }),
+        "模型请求不应收到 raw /goal 原文"
+    );
+    assert!(
+        req.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                block.as_text().is_some_and(|text| {
+                    text.contains("[Session goal]") && text.contains("完成迁移并通过测试")
+                })
+            })
+        }),
+        "首轮推理尾部应注入目标提醒"
+    );
+
+    // 历史 / UI 保留用户原文。
+    let history = session
+        .load_history(CHANNEL_CLI, "console", 10, 1024 * 1024)
+        .unwrap();
+    assert_eq!(history.len(), 2, "{history:?}");
+    assert_eq!(history[0].role, Role::User);
+    assert_eq!(
+        history[0].content[0].as_text().unwrap(),
+        "/goal 完成迁移并通过测试"
+    );
+    assert_eq!(history[1].role, Role::Assistant);
+    assert_eq!(history[1].content[0].as_text().unwrap(), "开始处理目标。");
+}
+
+#[tokio::test]
+async fn route_goal_query_and_clear_do_not_start_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(CapturingProvider {
+        requests: requests.clone(),
+        reply: "unused".into(),
+    });
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        session.clone(),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            stream_enabled: false,
+            send_working_status: false,
+            goal_audit_enabled: false,
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+    let key = TurnManager::goal_key(CHANNEL_CLI, "console");
+
+    // 查询：只回执、不进入 turn。
+    mgr.route(BusMessage::new(CHANNEL_CLI, "console", "/goal"))
+        .await;
+    let show = recv_outbound(&mut outbound_rx).await;
+    assert!(!show.is_intermediate());
+    assert!(show.content.contains("未设定"), "{}", show.content);
+
+    // 清除：只回执、不进入 turn（先直接写 kv，避免用 /goal 设定本身开 turn）。
+    session
+        .journal()
+        .kv_set(&key, &serde_json::json!({"objective": "旧目标"}))
+        .unwrap();
+    mgr.route(BusMessage::new(CHANNEL_CLI, "console", "/goal clear"))
+        .await;
+    let cleared = recv_outbound(&mut outbound_rx).await;
+    assert!(!cleared.is_intermediate());
+    assert!(cleared.content.contains("已清除"), "{}", cleared.content);
+    assert!(session.journal().kv_get(&key).unwrap().is_none());
+
+    // 大小写不敏感的 ASCII 别名同样只清除、不开工。
+    session
+        .journal()
+        .kv_set(&key, &serde_json::json!({"objective": "旧目标"}))
+        .unwrap();
+    mgr.route(BusMessage::new(CHANNEL_CLI, "console", "/GOAL CLEAR"))
+        .await;
+    let upper = recv_outbound(&mut outbound_rx).await;
+    assert!(!upper.is_intermediate());
+    assert!(upper.content.contains("已清除"), "{}", upper.content);
+
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "查询 / 清除不得调用 LLM"
+    );
+    assert!(
+        session.load_all(CHANNEL_CLI, "console").unwrap().is_empty(),
+        "查询 / 清除不得写入会话历史"
+    );
+}
+
+#[tokio::test]
+async fn route_goal_too_long_does_not_start_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(CapturingProvider {
+        requests: requests.clone(),
+        reply: "unused".into(),
+    });
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        session.clone(),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            stream_enabled: false,
+            send_working_status: false,
+            goal_audit_enabled: false,
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+
+    mgr.route(BusMessage::new(
+        CHANNEL_CLI,
+        "console",
+        format!("/goal {}", "长".repeat(2001)),
+    ))
+    .await;
+    let reply = recv_outbound(&mut outbound_rx).await;
+    assert!(!reply.is_intermediate());
+    assert!(reply.content.contains("过长"), "{}", reply.content);
+
+    assert!(requests.lock().unwrap().is_empty(), "超长目标不得调用 LLM");
+    assert!(session
+        .journal()
+        .kv_get(&TurnManager::goal_key(CHANNEL_CLI, "console"))
+        .unwrap()
+        .is_none());
+    assert!(session.load_all(CHANNEL_CLI, "console").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cron_goal_looking_message_is_not_a_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+    let session = SessionStore::new(layout.clone());
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider: Arc<dyn Provider> = Arc::new(CapturingProvider {
+        requests: requests.clone(),
+        reply: "cron 完成".into(),
+    });
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    let mgr = Arc::new(TurnManager::new(
+        provider,
+        None,
+        session.clone(),
+        MemoryStore::new(layout.clone()),
+        layout,
+        Arc::new(ToolRegistry::new()),
+        AgentOptions {
+            stream_enabled: false,
+            send_working_status: false,
+            ..AgentOptions::default()
+        },
+        outbound_tx,
+        None,
+        RuntimeChannelInfo::default(),
+        empty_bot_registry(),
+        None,
+    ));
+
+    mgr.route(BusMessage::new_cron(
+        CHANNEL_WEIXIN,
+        "u1",
+        "/goal 完成迁移并通过测试",
+    ))
+    .await;
+    wait_idle(&mgr).await;
+
+    // source 门：非用户来源不得被当成 /goal 命令。
+    assert!(session
+        .journal()
+        .kv_get(&TurnManager::goal_key(CHANNEL_WEIXIN, "u1"))
+        .unwrap()
+        .is_none());
+    let mut outbound = Vec::new();
+    while let Ok(message) = outbound_rx.try_recv() {
+        outbound.push(message);
+    }
+    assert!(
+        outbound
+            .iter()
+            .any(|message| message.content == "cron 完成" && !message.is_intermediate()),
+        "cron turn 应正常发出最终回复：{outbound:?}"
+    );
+    assert!(
+        !outbound
+            .iter()
+            .any(|message| message.content.contains("已设定")),
+        "cron 消息不得产生 /goal 回执：{outbound:?}"
+    );
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert!(
+        reqs[0].messages.iter().any(|message| {
+            message.role == Role::User
+                && message.content[0].as_text() == Some("/goal 完成迁移并通过测试")
+        }),
+        "cron 消息应按原文进入模型"
+    );
+    // cron turn 不持久化外部会话历史。
+    assert!(session.load_all(CHANNEL_WEIXIN, "u1").unwrap().is_empty());
 }
 
 #[test]

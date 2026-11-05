@@ -2,7 +2,7 @@
 
 [← 返回 README](../README.md)
 
-会话内以 `/` 开头的已知命令由路由层直接处理、不进入 LLM（`/workflow` 例外：展开为提示词后进入 LLM；未知的 `/xxx` 原样交给模型）。所有通道与图形界面输入框通用，但影响全局的命令——`/clear`、`/log`、`/rewind`、`/export all`、`/skills` 的 `pin|unpin|adopt|restore|curate`——只对 CLI / 桌面会话或已提升为 `Unrestricted` 的会话开放，外部通道普通用户收到「权限不足」；`/clear`、`/rewind <id>`、`/fork <id>`、`/skills` 变更子命令在有 turn 或后台 review 运行时直接拒绝。`/help` 列出全部。实现位于 `crates/rclaw-runtime/src/slash.rs`、`turn.rs` 与 `turn/commands.rs`。
+会话内以 `/` 开头的已知命令由路由层直接处理、不进入 LLM（`/workflow` 与 `/goal <文本>` 例外：展开为提示词后进入 LLM；未知的 `/xxx` 原样交给模型）。所有通道与图形界面输入框通用，但影响全局的命令——`/clear`、`/log`、`/rewind`、`/export all`、`/skills` 的 `pin|unpin|adopt|restore|curate`——只对 CLI / 桌面会话或已提升为 `Unrestricted` 的会话开放，外部通道普通用户收到「权限不足」；`/clear`、`/rewind <id>`、`/fork <id>`、`/skills` 变更子命令在有 turn 或后台 review 运行时直接拒绝。`/help` 列出全部。实现位于 `crates/rclaw-runtime/src/slash.rs`、`turn.rs` 与 `turn/commands.rs`。
 
 | 命令 | 说明 | 详细文档 |
 |---|---|---|
@@ -17,7 +17,7 @@
 | `/compact` | 立即压缩当前会话历史（忽略阈值与防抖；有任务运行时拒绝） | 同上 |
 | `/rewind [回滚点 id]` | 不带参数列出最近 20 组可回滚的文件 checkpoint；带 id 回滚该点及之后的文件写入（hash 校验，被外部改动过则整组拒绝） | [长程会话](context-management.md#文件回滚rewind) |
 | `/fork [消息 id]` | 不带参数列出最近 15 条可作锚点的用户消息；带 id 从该消息分叉出新会话并把锚点之后的文件改动回滚到该时刻 | [长程会话](context-management.md#fork-会话分叉) |
-| `/goal [目标文本\|clear]` | 设定 / 查看 / 清除会话级长期目标（≤ 2000 字符；`clear` / `done` / `完成` / `清除` 等价；每轮注入提醒，成功收尾后小审计确认达成即自动清除） | [长程会话](context-management.md#goal-目标提醒) |
+| `/goal [目标文本\|clear]` | 设定后立即作为本轮任务开始执行 / 查看 / 清除会话级长期目标（≤ 2000 字符；`clear` / `done` / `完成` / `清除` 等价（ASCII 别名大小写不敏感）；每轮注入提醒，成功收尾后小审计确认达成即自动清除） | [长程会话](context-management.md#goal-目标提醒) |
 | `/export [all]` | 导出当前会话（或全部会话）完整记录为 JSONL 到 `agent/exports/`，含已压缩进摘要的消息 | [长程会话](context-management.md#export-导出) |
 | `/workflow <请求>` | 设计并运行一个动态工作流（展开为 prompt，历史保留原文） | [多智能体协作](multi-agent.md#动态工作流) |
 | `/log [list\|get <名>\|del <名>\|del all confirm]` | 列出 / 读取 / 删除 `agent/logs` 日志文件；`get` 在控制台超过 20 KB 只显示尾部，在媒体通道以附件发送 | [快速开始](getting-started.md#日志) |

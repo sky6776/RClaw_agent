@@ -35,7 +35,7 @@
 
 ### 运维与安全
 
-- **斜杠命令**：`/llmodel` `/search` `/skills` `/tools` `/context` `/compact` `/rewind` `/fork` `/goal` `/export` `/log` `/clear` `/cancel` 等，由路由层直接处理、不进入 LLM（`/workflow` 例外：展开为提示词交给模型）；影响全局的命令仅限本机或已授权会话。→ [斜杠命令](docs/slash-commands.md)
+- **斜杠命令**：`/llmodel` `/search` `/skills` `/tools` `/context` `/compact` `/rewind` `/fork` `/goal` `/export` `/log` `/clear` `/cancel` 等，由路由层直接处理、不进入 LLM（`/workflow` 与 `/goal <文本>` 例外：展开为提示词交给模型，`/goal <文本>` 设定后立即开始执行）；影响全局的命令仅限本机或已授权会话。→ [斜杠命令](docs/slash-commands.md)
 - **数据与持久化**：一切运行数据集中在 `agent/`（会话 / 回滚点 / journal 在 `state.sqlite`，记忆、技能、日志、导出、媒体各有目录，定时任务在 `cron.json`）；`/clear` 的精确语义与备份建议。→ [数据目录与持久化](docs/storage.md)
 - **安全设计**：文件工具 fail-safe 沙箱与路径规则、通道身份 → 权限单向链、工具结果 / 摘要 / 记忆写入的密钥脱敏、记忆与技能写入的注入 / 隐形字符防护、密钥只落本地文件。→ [安全设计](docs/security.md)
 - **架构**：11 个 crate 的 workspace，`rclaw-core` 为无环依赖的根，`rclaw-cli` 产出主二进制 `rclaw`（另有桌面 exe 与 `rclaw-weixin-login` 两个 bin），`rclaw-desktop` 三态 crate（桌面 GUI / Termux 桩 / APK 宿主）。→ [架构与 Workspace 布局](docs/architecture.md)
