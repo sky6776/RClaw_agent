@@ -18,8 +18,9 @@
 //! - **账号绑定**：启动时经 `/api/self/info` 绑定微信账号；运行中收到其他账号的事件
 //!   一律丢弃（换号需重启通道，防跨账号复用历史 / 误发）。
 //!
-//! 白名单 = **回复**门槛（记录与回复解耦）：私聊 `allow_from` 空 = 放行全部（与
-//! weixin 通道一致）；群聊 `allow_groups` 空 = 所有群不回复（即使被 @）。群消息
+//! 白名单 = **回复**门槛（记录与回复解耦）：私聊 `allow_from` 空 = 不响应任何私聊
+//! （fail-closed；weixin 通道仍为空 = 放行全部，不在本通道范围）；群聊
+//! `allow_groups` 空 = 所有群不回复（即使被 @）。群消息
 //! 一律静默落库，媒体与白名单内同链路下载（图片/语音/表情/文件；视频暂仅标注
 //! ——wcx raw 端点暂不支持 type=video），未触发回复的归档（`archived=1`）。
 //! 回复才按 `group_reply_policy`（默认 `"mention"`，仅精确 @ 本账号）触发。
@@ -93,7 +94,7 @@ pub struct WxbotConfig {
     pub webhook_path: String,
     /// webhook secret（与 wcx WebhookPush 一致）；启用时必须非空。
     pub webhook_secret: String,
-    /// 私聊白名单：空 = 放行全部；非空 = 仅名单内。逗号分隔 wxid。
+    /// 私聊白名单：空 = 不响应任何私聊（fail-closed）；非空 = 仅名单内。逗号分隔 wxid。
     pub allow_from: String,
     /// 群回复白名单：空 = 所有群不回复（消息仍全量落库）。逗号分隔群 id（xxx@chatroom）。
     pub allow_groups: String,
@@ -114,6 +115,18 @@ pub struct WxbotConfig {
     pub send_window_max: usize,
     /// 出站熔断：连续 `send_failure_fuse` 次发送失败后锁停通道；0 = 关闭熔断。
     pub send_failure_fuse: u32,
+    /// 拟人化分段：开启后长回复按句子拆成多条（默认关）。
+    pub humanize_enabled: bool,
+    /// 拟人化：首条前的“思考”停顿（毫秒）。
+    pub humanize_think_ms: u64,
+    /// 拟人化：单段目标字符数（软上限）。
+    pub humanize_segment_chars: usize,
+    /// 拟人化：期望段数（软上限；超长文本允许更多段）。
+    pub humanize_segment_max: usize,
+    /// 拟人化：段间停顿下限（毫秒）。
+    pub humanize_segment_interval_min_ms: u64,
+    /// 拟人化：段间停顿上限（毫秒）。
+    pub humanize_segment_interval_max_ms: u64,
     /// 入站媒体落盘根目录（通常 `<agent_base>/media`）；为空时禁用下载，入站仅标注。
     pub media_dir: PathBuf,
 }
@@ -140,6 +153,12 @@ impl Default for WxbotConfig {
             send_jitter_sec: 3,
             send_window_max: 10,
             send_failure_fuse: 5,
+            humanize_enabled: false,
+            humanize_think_ms: 600,
+            humanize_segment_chars: 60,
+            humanize_segment_max: 3,
+            humanize_segment_interval_min_ms: 700,
+            humanize_segment_interval_max_ms: 1500,
             media_dir: PathBuf::new(),
         }
     }
@@ -428,8 +447,10 @@ impl Wxbot {
                 .iter()
                 .any(|s| *s == ev.talker)
         } else {
+            // fail-closed：私聊白名单为空 = 不响应任何私聊（与群聊白名单空 = 所有群
+            // 不回复同口径）。记录/归档与回复解耦，未命中只影响是否投递 LLM。
             if self.cfg.allow_from.is_empty() {
-                return true;
+                return false;
             }
             Self::split_list(&self.cfg.allow_from)
                 .iter()
@@ -572,8 +593,12 @@ impl Wxbot {
         Ok((status, body))
     }
 
-    /// POST JSON（带 Bearer），返回 `(status, body)`。
-    async fn post_json(&self, path: &str, body: &Value) -> Result<(u16, Value), ()> {
+    /// POST JSON（带 Bearer），返回 `(status, parsed body)`。
+    ///
+    /// `Err(())` 只表示传输层失败（连接/超时），**不代表服务端没收到**；调用方
+    /// 需要据此区分“可重试的业务失败”和“未知结果（不重发正文）”。
+    /// 2xx + 空体/非 JSON 视为成功（wcx 部分端点无 body），body 为 None。
+    async fn post_json_raw(&self, path: &str, body: &Value) -> Result<(u16, Option<Value>), ()> {
         let url = self.api_url(path);
         match self
             .http
@@ -585,11 +610,21 @@ impl Wxbot {
         {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                match resp.json::<Value>().await {
-                    Ok(val) => Ok((status, val)),
+                let text = match resp.text().await {
+                    Ok(t) => t,
                     Err(e) => {
-                        tracing::warn!("wxbot 响应 JSON 解析失败 {url}: {e}");
-                        Err(())
+                        tracing::warn!("wxbot 响应读取失败 {url}: {e}");
+                        return Ok((status, None));
+                    }
+                };
+                if text.trim().is_empty() {
+                    return Ok((status, None));
+                }
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(v) => Ok((status, Some(v))),
+                    Err(e) => {
+                        tracing::debug!("wxbot 响应非 JSON {url}: {e}");
+                        Ok((status, None))
                     }
                 }
             }
@@ -600,10 +635,22 @@ impl Wxbot {
         }
     }
 
+    /// Convenience wrapper: missing body becomes `Value::Null`.
+    async fn post_json(&self, path: &str, body: &Value) -> Result<(u16, Value), ()> {
+        let (status, val) = self.post_json_raw(path, body).await?;
+        Ok((status, val.unwrap_or(Value::Null)))
+    }
+
     /// 业务 POST（2xx 即成功），分片级有限重试（成功过的不重发）。
     ///
     /// **每次实际发送/重试前都过发送闸门**：换号锁停可能发生在一条回复的分片之间、
     /// 媒体上传/转码之后——闸门是所有发送路径的公共咽喉点，保证锁停立即生效。
+    ///
+    /// 结果语义（v5 §3.5）：
+    ///   - 2xx → 成功；
+    ///   - 非 2xx → 服务端已应答，重试安全（有限次）；
+    ///   - 传输层失败 → **结果未知**，消息可能已送达；保守计一次尝试并停止，
+    ///     不自动重试正文，避免重复消息。
     ///
     /// `pace=false` 仅用于语音转码等非消息请求：不占用发送间隔/窗口，但失败仍计入熔断。
     async fn post_json_ok(
@@ -614,17 +661,40 @@ impl Wxbot {
         pacer: &mut SendPacer,
         pace: bool,
     ) -> Result<(), ()> {
+        self.post_json_ok_at(path, body, label, pacer, pace, None)
+            .await
+    }
+
+    /// Like [`Self::post_json_ok`], but additionally never starts before
+    /// `not_before` (used by humanized segments). Both the pacer deadline and
+    /// the humanize deadline are combined with `max` so the caller waits once,
+    /// not twice (v4 §4.1).
+    async fn post_json_ok_at(
+        &self,
+        path: &str,
+        body: &Value,
+        label: &str,
+        pacer: &mut SendPacer,
+        pace: bool,
+        not_before: Option<Instant>,
+    ) -> Result<(), ()> {
         use tokio::time::sleep;
         for attempt in 1..=self.cfg.max_failures {
             self.send_gate()?;
             if pace {
-                // 重试也是一次真实出站动作：每次尝试都先过节流器（含间隔与窗口）。
-                pacer.wait().await;
-                // P0：节流可能睡数秒到一分钟，期间并发事件可能已换号锁停；
-                // 必须重新过闸门，否则旧会话回复会从新绑定的账号发出去。
+                // Plan the slot first, combine with the humanize deadline,
+                // re-check the account gate after any sleep, then commit
+                // exactly once before the real POST.
+                let permit = pacer.plan(Instant::now());
+                let deadline = match not_before {
+                    Some(t) => permit.deadline.max(t),
+                    None => permit.deadline,
+                };
+                pacer.wait_until(deadline).await;
                 self.send_gate()?;
+                pacer.commit(Instant::now(), &permit);
             }
-            match self.post_json(path, body).await {
+            match self.post_json_raw(path, body).await {
                 Ok((status, _)) if (200..300).contains(&status) => {
                     // 只有真正的消息发送成功才清零失败连击；转码成功不算消息送达。
                     if pace {
@@ -639,10 +709,14 @@ impl Wxbot {
                     );
                 }
                 Err(()) => {
+                    // Unknown outcome: the request may have reached wcx. Retrying
+                    // would duplicate the message, so stop here.
                     tracing::warn!(
-                        "wxbot {label} 请求失败 (第 {attempt}/{max} 次)",
+                        "wxbot {label} 传输失败（结果未知，不重发）(第 {attempt}/{max} 次)",
                         max = self.cfg.max_failures,
                     );
+                    self.record_send_failure(pacer);
+                    return Err(());
                 }
             }
             if attempt < self.cfg.max_failures {
@@ -1253,16 +1327,78 @@ impl Wxbot {
     }
 
     /// 发送一条文本回复（UTF-8 安全分段，分片级重试——成功过的分片不重发）。
+    ///
+    /// `humanize_enabled` 时按句子切成多条（硬上限仍是 `send_chunk_bytes`），
+    /// 首条前有“思考”停顿，段间有随机停顿；拼接结果与原文逐字节一致。
     async fn send_text(&self, conv_id: &str, text: &str, pacer: &mut SendPacer) -> Result<(), ()> {
-        for chunk in utf8_chunks(text, self.cfg.send_chunk_bytes) {
-            self.post_json_ok(
+        let segments: Vec<String> = if self.cfg.humanize_enabled {
+            let mut segs = humanize_segments(
+                text,
+                self.cfg.humanize_segment_chars,
+                self.cfg.send_chunk_bytes,
+            );
+            // Soft guard: beyond this many segments stop humanizing and fall
+            // back to plain byte chunks (same behaviour as before humanize).
+            // This is not an absolute bubble cap; very long text can still
+            // produce more chunks, but humanization no longer adds bubbles.
+            const MAX_HUMANIZE_SEGMENTS: usize = 12;
+            if segs.len() > MAX_HUMANIZE_SEGMENTS {
+                tracing::warn!(
+                    "wxbot 拟人化分段 {} 段超过软上限 {}，关闭拟人化回退普通分片",
+                    segs.len(),
+                    MAX_HUMANIZE_SEGMENTS
+                );
+                segs = utf8_chunks(text, self.cfg.send_chunk_bytes)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+            } else if segs.len() > self.cfg.humanize_segment_max {
+                tracing::debug!(
+                    "wxbot 拟人化分段 {} 段 > 期望 {} 段（超长文本允许增加段数）",
+                    segs.len(),
+                    self.cfg.humanize_segment_max
+                );
+            }
+            segs
+        } else {
+            utf8_chunks(text, self.cfg.send_chunk_bytes)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+
+        let mut last_emit: Option<Instant> = None;
+        for (index, chunk) in segments.iter().enumerate() {
+            let not_before = if self.cfg.humanize_enabled {
+                let base_ms = if index == 0 {
+                    self.cfg.humanize_think_ms
+                } else {
+                    let lo = self.cfg.humanize_segment_interval_min_ms;
+                    let hi = self.cfg.humanize_segment_interval_max_ms.max(lo);
+                    if hi == lo {
+                        lo
+                    } else {
+                        rand::thread_rng().gen_range(lo..=hi)
+                    }
+                };
+                let mut deadline = Instant::now() + Duration::from_millis(base_ms);
+                if let Some(last) = last_emit {
+                    deadline = deadline.max(last + Duration::from_millis(base_ms));
+                }
+                Some(deadline)
+            } else {
+                None
+            };
+            self.post_json_ok_at(
                 "messages/text",
                 &json!({ "type": "text", "convId": conv_id, "content": chunk }),
                 &format!("文本发送 → {conv_id}"),
                 pacer,
                 true,
+                not_before,
             )
             .await?;
+            last_emit = Some(Instant::now());
         }
         Ok(())
     }
@@ -1561,9 +1697,252 @@ fn idle_retry_delay(retry_sec: u64) -> Duration {
 /// 出站拟人化限速器的滚动窗口长度：60s。
 const PACER_WINDOW: Duration = Duration::from_secs(60);
 
+/// Split `piece` to `hard` bytes while preferring whitespace boundaries that
+/// are not inside a protected URL/number token. A token longer than `hard`
+/// itself still has to be cut (hard limit wins).
+fn hard_chunks(piece: &str, hard: usize) -> Vec<String> {
+    let hard = hard.max(4); // avoid end/cut == 0 and a non-advancing loop
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = piece;
+    while rest.len() > hard {
+        let mut end = hard;
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut cut = end;
+        for (i, c) in rest[..end].char_indices().rev() {
+            if c.is_whitespace() {
+                let candidate = i + c.len_utf8();
+                if !inside_protected(rest, candidate) {
+                    cut = candidate;
+                    break;
+                }
+            }
+        }
+        // Hard limit falls inside a protected URL/number interval: prefer the
+        // interval boundary (before it, or after it when it fits) instead of
+        // cutting the token.
+        if cut == end {
+            if let Some((start, stop)) = protected_interval(rest, end) {
+                if start > 0 {
+                    cut = start;
+                } else if stop <= hard {
+                    cut = stop;
+                }
+            }
+        }
+        if cut == 0 {
+            cut = end;
+        }
+        out.push(rest[..cut].to_string());
+        rest = &rest[cut..];
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
+}
+
+/// 拟人化分段（plan v3 §6.4）。
+///
+/// 规则：优先在句末标点断开，其次达到目标字符数；代码围栏内只在换行断开；
+/// URL / 小数 / 句末闭引号不切开；最后按 `hard_bytes` 做 UTF-8 安全兜底。
+/// **硬字节上限优先于“代码只按换行切”**：超过上限的代码行仍会被兜底切开。
+/// **保证 `segments.concat() == text`**（逐字节相等，不 trim、不丢换行）。
+fn humanize_segments(text: &str, target_chars: usize, hard_bytes: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let target = target_chars.max(8);
+    let hard = hard_bytes.max(4);
+    let mut bounds: Vec<usize> = Vec::new();
+    let mut seg_start = 0usize;
+    let mut chars_in_seg = 0usize;
+    let mut in_code = false;
+    let mut i = 0usize;
+
+    while i < text.len() {
+        if text[i..].starts_with("```") {
+            in_code = !in_code;
+            i += 3;
+            chars_in_seg += 3;
+            continue;
+        }
+        let Some(ch) = text[i..].chars().next() else { break };
+        chars_in_seg += 1;
+        let next_i = i + ch.len_utf8();
+        let sentence_end = !in_code && matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';' | '…' | '\n');
+        let code_newline = in_code && ch == '\n';
+        // Inside a fenced block only line breaks may split; the hard byte
+        // limit still applies later via utf8_chunks.
+        let over = !in_code && chars_in_seg >= target;
+        let soft = !in_code && chars_in_seg * 2 >= target;
+        if (over || (soft && sentence_end) || code_newline) && next_i < text.len() {
+            let end = extend_closing(text, next_i);
+            if end > seg_start && !inside_protected(text, end) {
+                bounds.push(end);
+                seg_start = end;
+                chars_in_seg = 0;
+                i = end;
+                continue;
+            }
+        }
+        i = next_i;
+    }
+    if seg_start < text.len() {
+        bounds.push(text.len());
+    }
+    if bounds.is_empty() {
+        return hard_chunks(text, hard);
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut prev = 0usize;
+    for b in bounds {
+        let piece = &text[prev..b];
+        if piece.len() <= hard {
+            out.push(piece.to_string());
+        } else {
+            out.extend(hard_chunks(piece, hard));
+        }
+        prev = b;
+    }
+    out
+}
+
+/// 句末标点后的闭引号/括号跟随前一段，避免以 “）”“” 开头的碎片。
+fn extend_closing(text: &str, mut end: usize) -> usize {
+    while let Some(c) = text[end..].chars().next() {
+        if matches!(c, '”' | '"' | '\'' | '）' | ')' | '】' | ']' | '}' | '》') {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// Upper bound for token scans in the segmenter (bounds worst-case cost).
+const PROTECT_SCAN: usize = 512;
+
+/// Whitespace-delimited token bounds around `end`, or None when the token is
+/// longer than PROTECT_SCAN (treated as protected by callers).
+fn token_bounds(text: &str, end: usize) -> Option<(usize, usize)> {
+    let before = &text[..end];
+    let mut token_start = 0usize;
+    let mut saw_ws = false;
+    for (i, c) in before.char_indices().rev().take(PROTECT_SCAN + 1) {
+        if c.is_whitespace() {
+            token_start = i + c.len_utf8();
+            saw_ws = true;
+            break;
+        }
+    }
+    if !saw_ws && before.len() > PROTECT_SCAN {
+        return None;
+    }
+    let mut token_end = text.len();
+    for (i, c) in text[end..].char_indices().take(PROTECT_SCAN + 1) {
+        if c.is_whitespace() {
+            token_end = end + i;
+            break;
+        }
+    }
+    if token_end.saturating_sub(token_start) > PROTECT_SCAN {
+        return None;
+    }
+    Some((token_start, token_end))
+}
+
+/// Bounds of the `[0-9.]` run containing `end`, when it contains a decimal dot.
+fn numeric_run_bounds(text: &str, end: usize) -> Option<(usize, usize)> {
+    let mut start = end;
+    while start > 0 {
+        let c = text[..start].chars().next_back()?;
+        if c.is_ascii_digit() || c == '.' {
+            start -= c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let mut stop = end;
+    while stop < text.len() {
+        let c = text[stop..].chars().next()?;
+        if c.is_ascii_digit() || c == '.' {
+            stop += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if start < stop && text[start..stop].contains('.') {
+        Some((start, stop))
+    } else {
+        None
+    }
+}
+
+/// If `end` is strictly inside a protected URL/number interval, return it.
+fn protected_interval(text: &str, end: usize) -> Option<(usize, usize)> {
+    if let Some((start, stop)) = token_bounds(text, end) {
+        if end > start && end < stop {
+            let token = &text[start..stop];
+            if token.contains("://")
+                || token.starts_with("www.")
+                || (token.contains('.')
+                    && token.chars().all(|c| c.is_ascii_digit() || c == '.'))
+            {
+                return Some((start, stop));
+            }
+        }
+    }
+    numeric_run_bounds(text, end)
+}
+
+/// 断点是否落在 URL / 小数中间（这些位置不允许切）。
+fn inside_protected(text: &str, end: usize) -> bool {
+    let Some((start, stop)) = token_bounds(text, end) else {
+        // Oversized token: treat as protected (bounded scan).
+        return true;
+    };
+    // A break exactly at the start of a token is outside it (safe).
+    if end <= start {
+        return false;
+    }
+    let full_token = &text[start..stop];
+    if full_token.contains("://") || full_token.starts_with("www.") {
+        return true;
+    }
+    if full_token.contains('.')
+        && full_token
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')
+    {
+        return true;
+    }
+    // Decimal embedded in a mixed token ("abc12345.6789元"): protect while the
+    // break sits inside the digit run that has a dot on either side.
+    let left = text[..end].trim_end_matches(|c: char| c.is_ascii_digit());
+    let right = text[end..].trim_start_matches(|c: char| c.is_ascii_digit());
+    let left_dot = left
+        .strip_suffix('.')
+        .is_some_and(|before_dot| before_dot.ends_with(|c: char| c.is_ascii_digit()));
+    let right_dot = right
+        .strip_prefix('.')
+        .is_some_and(|after_dot| after_dot.starts_with(|c: char| c.is_ascii_digit()));
+    left_dot || right_dot
+}
+
+/// A planned send slot: `deadline` is when the POST may start.
+struct SendPermit {
+    deadline: Instant,
+    #[allow(dead_code)]
+    jitter_sample: u64,
+}
+
 /// wxbot 出站限速器：单消费者（send_loop）持有的局部状态，无锁。
 ///
-/// 每次实际发送（文本分片/媒体/语音，含重试）前调用 [`Self::wait`]：
+/// 每次实际发送（文本分片/媒体/语音，含重试）前调用
+/// [`Self::plan`] → [`Self::wait_until`] → [`Self::commit`]：
 /// 1. 相邻发送最小间隔 + 随机抖动（首条不等待）；
 /// 2. 60s 滑动窗口内最多 `send_window_max` 条，超限等到最早一条出窗；
 /// 3. 连续发送失败达到 `send_failure_fuse` 后由调用方触发账号锁停（0=禁用）。
@@ -1635,18 +2014,30 @@ impl SendPacer {
         delay
     }
 
-    /// 等到允许发送，并把本次发送时间记入窗口。首条不等待。
-    async fn wait(&mut self) {
-        let sample = if self.jitter_sec == 0 {
+    /// Compute (without waiting or recording) when the next send may start.
+    fn plan(&self, now: Instant) -> SendPermit {
+        let jitter_sample = if self.jitter_sec == 0 {
             0
         } else {
             rand::thread_rng().gen_range(0..=self.jitter_sec)
         };
-        let delay = self.next_delay(Instant::now(), sample);
+        let delay = self.next_delay(now, jitter_sample);
+        SendPermit {
+            deadline: now + delay,
+            jitter_sample,
+        }
+    }
+
+    async fn wait_until(&self, deadline: Instant) {
+        let delay = deadline.saturating_duration_since(Instant::now());
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        self.record(Instant::now());
+    }
+
+    /// Record the attempt immediately before the HTTP request is executed.
+    fn commit(&mut self, now: Instant, _permit: &SendPermit) {
+        self.record(now);
     }
 
     fn record(&mut self, now: Instant) {

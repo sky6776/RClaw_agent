@@ -709,6 +709,24 @@ pub struct WxbotSection {
     /// 连续发送失败熔断阈值；0 = 关闭熔断。
     #[serde(default = "default_wxbot_send_failure_fuse")]
     pub send_failure_fuse: u32,
+    /// 拟人化分段总开关（默认关）。
+    #[serde(default = "default_wxbot_humanize_enabled")]
+    pub humanize_enabled: bool,
+    /// 首条前的“思考”停顿（毫秒）。
+    #[serde(default = "default_wxbot_humanize_think_ms")]
+    pub humanize_think_ms: u64,
+    /// 单段目标字符数（软上限；硬上限仍是 chunk_bytes）。
+    #[serde(default = "default_wxbot_humanize_segment_chars")]
+    pub humanize_segment_chars: usize,
+    /// 期望段数（软上限；超长文本允许更多）。
+    #[serde(default = "default_wxbot_humanize_segment_max")]
+    pub humanize_segment_max: usize,
+    /// 段间停顿下限（毫秒）。
+    #[serde(default = "default_wxbot_humanize_interval_min_ms")]
+    pub humanize_segment_interval_min_ms: u64,
+    /// 段间停顿上限（毫秒）。
+    #[serde(default = "default_wxbot_humanize_interval_max_ms")]
+    pub humanize_segment_interval_max_ms: u64,
 }
 
 impl Default for WxbotSection {
@@ -733,6 +751,12 @@ impl Default for WxbotSection {
             send_jitter_sec: default_wxbot_send_jitter(),
             send_window_max: default_wxbot_send_window_max(),
             send_failure_fuse: default_wxbot_send_failure_fuse(),
+            humanize_enabled: default_wxbot_humanize_enabled(),
+            humanize_think_ms: default_wxbot_humanize_think_ms(),
+            humanize_segment_chars: default_wxbot_humanize_segment_chars(),
+            humanize_segment_max: default_wxbot_humanize_segment_max(),
+            humanize_segment_interval_min_ms: default_wxbot_humanize_interval_min_ms(),
+            humanize_segment_interval_max_ms: default_wxbot_humanize_interval_max_ms(),
         }
     }
 }
@@ -775,6 +799,24 @@ fn default_wxbot_send_window_max() -> usize {
 }
 fn default_wxbot_send_failure_fuse() -> u32 {
     5
+}
+fn default_wxbot_humanize_enabled() -> bool {
+    false
+}
+fn default_wxbot_humanize_think_ms() -> u64 {
+    600
+}
+fn default_wxbot_humanize_segment_chars() -> usize {
+    60
+}
+fn default_wxbot_humanize_segment_max() -> usize {
+    3
+}
+fn default_wxbot_humanize_interval_min_ms() -> u64 {
+    700
+}
+fn default_wxbot_humanize_interval_max_ms() -> u64 {
+    1500
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,11 +1509,27 @@ impl Config {
             retry_sec: self.wxbot.retry_sec.max(1),
             backoff_sec: self.wxbot.backoff_sec.max(1),
             max_failures: self.wxbot.max_failures.max(1),
-            send_chunk_bytes: self.wxbot.chunk_bytes.max(1),
+            // UTF-8 最小 4 字节：小于 4 的硬上限无法容纳任意字符。
+            send_chunk_bytes: self.wxbot.chunk_bytes.max(4),
             send_min_gap_sec: self.wxbot.send_min_gap_sec,
             send_jitter_sec: self.wxbot.send_jitter_sec,
             send_window_max: self.wxbot.send_window_max,
             send_failure_fuse: self.wxbot.send_failure_fuse,
+            humanize_enabled: self.wxbot.humanize_enabled,
+            // Hard upper bounds: a stray u64::MAX must not park a send loop in
+            // tokio::sleep for weeks.
+            humanize_think_ms: self.wxbot.humanize_think_ms.min(10_000),
+            humanize_segment_chars: self.wxbot.humanize_segment_chars.clamp(8, 2_000),
+            humanize_segment_max: self.wxbot.humanize_segment_max.clamp(1, 32),
+            humanize_segment_interval_min_ms: self
+                .wxbot
+                .humanize_segment_interval_min_ms
+                .min(30_000),
+            humanize_segment_interval_max_ms: self
+                .wxbot
+                .humanize_segment_interval_max_ms
+                .max(self.wxbot.humanize_segment_interval_min_ms)
+                .min(30_000),
             // media_dir 为运行期路径，默认留空；由 main.rs / host_glue 注入（agent/media）。
             media_dir: std::path::PathBuf::new(),
         }

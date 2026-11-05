@@ -605,6 +605,43 @@ fn wxbot_send_pacer_config_defaults_and_zero_clamps() {
 }
 
 #[test]
+fn wxbot_humanize_defaults_and_clamps() {
+    let cfg = Config::default();
+    let w = cfg.wxbot_channel_config();
+    assert!(!w.humanize_enabled, "拟人化默认关闭");
+    assert_eq!(w.humanize_think_ms, 600);
+    assert_eq!(w.humanize_segment_chars, 60);
+    assert_eq!(w.humanize_segment_max, 3);
+    assert_eq!(w.humanize_segment_interval_min_ms, 700);
+    assert_eq!(w.humanize_segment_interval_max_ms, 1500);
+
+    let mut cfg = Config::default();
+    cfg.wxbot.humanize_segment_chars = 0;
+    cfg.wxbot.humanize_segment_max = 0;
+    cfg.wxbot.humanize_segment_interval_min_ms = 2000;
+    cfg.wxbot.humanize_segment_interval_max_ms = 100;
+    cfg.wxbot.humanize_think_ms = u64::MAX;
+    let w = cfg.wxbot_channel_config();
+    assert!(w.humanize_segment_chars >= 8, "目标字符数过小会切碎任意 UTF-8 字符");
+    assert!(w.humanize_segment_max >= 1, "段数下限 1");
+    assert!(
+        w.humanize_segment_interval_max_ms >= w.humanize_segment_interval_min_ms,
+        "段间停顿上限不得小于下限"
+    );
+    assert!(w.humanize_think_ms <= 10_000, "think 必须有硬上限，避免长期挂起");
+    assert!(
+        w.humanize_segment_interval_max_ms <= 30_000,
+        "interval 必须有硬上限，避免长期挂起"
+    );
+    let mut cfg = Config::default();
+    cfg.wxbot.chunk_bytes = 1;
+    assert!(
+        cfg.wxbot_channel_config().send_chunk_bytes >= 4,
+        "UTF-8 最小 4 字节，chunk 不得小于 4"
+    );
+}
+
+#[test]
 fn strip_removed_legacy_sections_reports_and_preserves_rest() {
     let text = "# 顶部注释\n[llm]\nprovider = \"deepseek\"\n\n[web_browser]\nengine = \"baidu\"\n";
     let (stripped, removed) = strip_removed_legacy_sections(text);

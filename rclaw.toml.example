@@ -217,7 +217,7 @@ api_token = "your-wcx-api-token"            # wcx「API + MCP 服务器」里的
 webhook_listen = "127.0.0.1:38081"          # 本机 webhook 监听（必须 loopback）
 webhook_path = "/wxbot/webhook"             # 须与 wcx WebhookPush 的 URL 路径一致
 webhook_secret = "your-webhook-secret"      # 与 wcx WebhookPush 一致；留空则通道不启动
-# allow_from = ""                           # 逗号分隔的允许私聊 wxid；空 = 放行全部私聊
+# allow_from = ""                           # 逗号分隔的允许私聊 wxid；空 = 不响应所有私聊（fail-closed）
 # allow_groups = ""                         # 逗号分隔的允许回复群 id（xxx@chatroom）；空 = 所有群不回复（即使被 @）。
 #                                           #   注意：群消息「记录」不受此名单约束——所有群（含白名单外）的入站
 #                                           #   消息都会尽力落库到 media_dir/wxbot/message_index.db，媒体与白名单内
@@ -228,6 +228,12 @@ group_reply_policy = "mention"              # 白名单群的回复触发：ment
 # send_jitter_sec = 3                       # 随机抖动上限（秒）；实际间隔 = min + rand(0..=jitter)
 # send_window_max = 10                      # 60s 滑动窗口内最大发送条数；0 = 关闭窗口限制
 # send_failure_fuse = 5                     # 连续发送失败熔断阈值；0 = 关闭熔断
+# humanize_enabled = false                  # 拟人化分段：长回复按句子拆成多条（默认关）
+# humanize_think_ms = 600                   # 首条前的“思考”停顿（毫秒）
+# humanize_segment_chars = 60               # 单段目标字符数（软上限；硬上限仍是 chunk_bytes）
+# humanize_segment_max = 3                  # 期望段数（软上限；超长文本允许更多）
+# humanize_segment_interval_min_ms = 700    # 段间停顿下限（毫秒）
+# humanize_segment_interval_max_ms = 1500   # 段间停顿上限（毫秒）
 # 换微信账号后需重启 RClaw 才会重新绑定（防跨账号复用历史/误发）。
 # 媒体：收到的图片/语音/表情/文件会下载到 agent/media/wxbot/；要把本地文件发给用户，
 #   用 write_file 写到 agent/media/out/ 后由 publish_media 回执生成 `[:wxbot-media ...]`
