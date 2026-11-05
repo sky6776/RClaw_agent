@@ -498,6 +498,40 @@ export interface ConfigEdit {
   value: string;
 }
 
+// ---- wxbot 联系人查询（配置页「选择群 / 选择联系人」）----
+// 字段 camelCase 与 wcx 域语言对齐（wxId 等），与配置面板其余 DTO 的 snake_case 无关。
+
+export interface WxbotContact {
+  wxId: string;
+  nickname: string;
+  customWxId: string;
+  remarkName: string;
+}
+
+export interface WxbotRecentChat {
+  /** 记录归属的微信账号；带账号过滤查询时不返回 legacy 空账号行，无过滤时空串=账号未知 */
+  account: string;
+  /** 纯会话 id：私聊 wxid / 群 xxx@chatroom */
+  convId: string;
+  isGroup: boolean;
+  msgCount: number;
+  /** 最近消息时间（Unix 秒；0 = 未知） */
+  lastTs: number;
+}
+
+export interface WxbotContactsErrorDto {
+  code: string;
+  message: string;
+}
+
+/** invoke 拒绝值 → 结构化错误（后端约定 {code,message}；其余兜底 unknown）。 */
+export function wxbotContactsError(e: unknown): WxbotContactsErrorDto {
+  if (e && typeof e === "object" && "code" in e && "message" in e) {
+    return e as WxbotContactsErrorDto;
+  }
+  return { code: "unknown", message: String(e) };
+}
+
 export interface SloganPrefs {
   slogans: string[];
   interval_secs: number;
@@ -782,6 +816,39 @@ export const api = {
 
   configImportRaw: (content: string) =>
     invoke<void>("config_import_raw", { content }),
+
+  /** wxbot 联系人查询（连接参数用表单当前值：草稿 ?? 基线；reject 抛 {code,message}）。 */
+  wxbotContactsList: (apiBase: string, apiToken: string, kind: "friends" | "groups") =>
+    invoke<WxbotContact[]>("wxbot_contacts_list", { apiBase, apiToken, kind }),
+
+  wxbotContactsLookup: (
+    apiBase: string,
+    apiToken: string,
+    displayName: string,
+    groupId: string | null,
+  ) =>
+    invoke<string>("wxbot_contacts_lookup", {
+      apiBase,
+      apiToken,
+      displayName,
+      groupId,
+    }),
+
+  /** WCX 当前登录账号；未登录/返回为空 → null（不当作绑定确认）。 */
+  wxbotContactsSelf: (apiBase: string, apiToken: string) =>
+    invoke<string | null>("wxbot_contacts_self", { apiBase, apiToken }),
+
+  /** 本机 wxbot 消息索引只读聚合（无记录返回空数组，不算错误）。 */
+  wxbotContactsRecent: (
+    isGroup: boolean,
+    account: string | null,
+    limit: number | null,
+  ) =>
+    invoke<WxbotRecentChat[]>("wxbot_contacts_recent", {
+      isGroup,
+      account,
+      limit,
+    }),
 
   slogansGet: () => invoke<SloganPrefs>("slogans_get"),
 

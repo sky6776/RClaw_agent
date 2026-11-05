@@ -10,6 +10,7 @@ import {
 } from "../lib/api";
 import { isAndroidDevice } from "../lib/useIsMobile";
 import SkillOpsCard from "./SkillOpsCard";
+import WxbotContactPicker, { type PickerKind } from "./WxbotContactPicker";
 
 /** 示例默认值 → 输入框基线（str 去引号、数组转逗号串）。 */
 function baselineOf(item: ConfigItem): string {
@@ -30,14 +31,18 @@ function ItemRow({
   item,
   draft,
   onChange,
+  picker,
 }: {
   item: ConfigItem;
   draft: string;
   onChange: (value: string) => void;
+  /** wxbot 白名单点选入口（仅 allow_groups / allow_from 两项非空）。 */
+  picker?: { kind: PickerKind; apiBase: string; apiToken: string };
 }) {
   const baseline = baselineOf(item);
   const dirty = draft !== baseline;
   const options = item.options;
+  const [pickerOpen, setPickerOpen] = useState(false);
   const input =
     item.kind === "bool" ? (
       <input
@@ -105,6 +110,28 @@ function ItemRow({
         </div>
         <div className="min-w-0 flex-1 space-y-1.5">
           {input}
+          {picker && (
+            <>
+              <div>
+                <button
+                  onClick={() => setPickerOpen(true)}
+                  className="rounded-md border border-[#2a2f3a] px-2 py-1 text-[10px] text-indigo-300 transition hover:border-indigo-500/50 hover:text-indigo-200"
+                >
+                  {picker.kind === "groups" ? "从 WCX 选择群" : "从 WCX 选择联系人"}
+                </button>
+              </div>
+              {pickerOpen && (
+                <WxbotContactPicker
+                  kind={picker.kind}
+                  currentValue={draft}
+                  apiBase={picker.apiBase}
+                  apiToken={picker.apiToken}
+                  onConfirm={onChange}
+                  onClose={() => setPickerOpen(false)}
+                />
+              )}
+            </>
+          )}
           {item.doc.length > 0 && (
             <p className="whitespace-pre-wrap text-[10px] leading-relaxed text-gray-500">
               {item.doc.join("\n")}
@@ -123,6 +150,27 @@ function ItemRow({
       </div>
     </div>
   );
+}
+
+/** wxbot 白名单两项的点选入口：仅 [wxbot] 段的 allow_groups / allow_from 挂 picker，
+ *  连接参数（api_base / api_token）取「草稿 ?? 基线」——查询即用表单当前值。 */
+function wxbotPickerOf(
+  section: ConfigSection,
+  item: ConfigItem,
+  drafts: Record<string, string>,
+): { kind: PickerKind; apiBase: string; apiToken: string } | undefined {
+  const kind: PickerKind | null =
+    section.path === "wxbot" && item.path === "wxbot.allow_groups"
+      ? "groups"
+      : section.path === "wxbot" && item.path === "wxbot.allow_from"
+        ? "contacts"
+        : null;
+  if (!kind) return undefined;
+  const conn = (path: string): string => {
+    const it = section.items.find((i) => i.path === path);
+    return it ? (drafts[path] ?? baselineOf(it)) : "";
+  };
+  return { kind, apiBase: conn("wxbot.api_base"), apiToken: conn("wxbot.api_token") };
 }
 
 function SectionCard({
@@ -175,6 +223,7 @@ function SectionCard({
                   item={item}
                   draft={drafts[item.path] ?? baselineOf(item)}
                   onChange={(v) => onDraft(item.path, item.kind, v)}
+                  picker={wxbotPickerOf(section, item, drafts)}
                 />
               ))}
             </>

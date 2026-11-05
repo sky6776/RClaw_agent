@@ -2122,5 +2122,8 @@ impl Channel for Wxbot {
 mod media;
 use media::*;
 
+pub mod contacts;
+pub use contacts::{list_recent_chats, ContactInfoDto, ContactsError, RecentChat, WxbotApiClient};
+
 #[cfg(test)]
 mod tests;

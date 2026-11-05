@@ -14,7 +14,7 @@
 # apk-host 绝不进 default——否则 Termux 构建直接拉 tauri（D7，v1.7 review #3）。
 default = []
 # APK 宿主：tauri/android 表可选依赖 + rclaw-android(rlib) + jni。
-apk-host = ["dep:tauri", "dep:rclaw-android", "dep:rclaw-channels", "dep:jni"]
+apk-host = ["dep:tauri", "dep:rclaw-android", "dep:jni"]
 [lib]
 name = "rclaw_desktop"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -33,10 +33,11 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 
 # APK 宿主（可选）：tauri 无托盘 feature；jni 供 android_host 导出符号。
+# （rclaw-channels 原在此表按 apk-host 可选；wxbot 联系人查询命令需要在所有
+# 目标直接引用它，而 rclaw-cli 本就无条件依赖同一 crate——移入 [dependencies] 零新增编译量。）
 [target.'cfg(target_os = "android")'.dependencies]
 tauri = { version = "2", features = [], optional = true }
 rclaw-android = { path = "../rclaw-android", optional = true }
-rclaw-channels = { path = "../rclaw-channels", optional = true }
 jni = { version = "0.21", optional = true }
 
 # build script 在 APK 构建（--features apk-host）时也要跑 tauri-build 生成
@@ -79,6 +80,8 @@ rclaw-runtime = { workspace = true }
 rclaw-store = { workspace = true }
 rclaw-tools = { workspace = true }
 rclaw-cli = { path = "../rclaw-cli" }
+# wxbot 联系人查询（配置页选择群/联系人）：直接引用 contacts 客户端与只读兜底。
+rclaw-channels = { path = "../rclaw-channels" }
 # 检查更新（GitHub releases API）。外部链接打开：桌面走系统 shell，
 # Android 经 rclaw-android 的 JNI Intent（不用 opener 插件——其版本矩阵与
 # tauri-runtime/tauri-plugin 强耦合，曾致 JNI 面/Kotlin 类错配）。

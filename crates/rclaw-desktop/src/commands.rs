@@ -2955,6 +2955,109 @@ pub async fn config_import_raw(
 }
 
 // ---------------------------------------------------------------------------
+// wxbot 联系人查询：配置页「选择群 / 选择联系人」数据源（只读，无副作用）。
+//
+// 连接参数（api_base / api_token）由前端把表单当前值（草稿 ?? 基线）作为参数传入
+// ——查询即用所见连接，无配置写回副作用，也不存在「改了 token 未保存查不到」的
+// 陈旧窗口。安全前置（loopback + 非空 token + no_proxy + 禁重定向 + 10s 超时）在
+// WxbotApiClient 构造期统一生效，不要求 wxbot 通道在运行。联系人数据不落日志。
+// ---------------------------------------------------------------------------
+
+/// 结构化错误（裸字符串会丢错误分类，前端按 code 精确提示）。
+#[derive(Debug, serde::Serialize)]
+pub struct WxbotContactsError {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<rclaw_channels::wxbot::ContactsError> for WxbotContactsError {
+    fn from(e: rclaw_channels::wxbot::ContactsError) -> Self {
+        WxbotContactsError {
+            code: e.code().to_string(),
+            message: e.to_string(),
+        }
+    }
+}
+
+fn wxbot_contacts_client(
+    api_base: &str,
+    api_token: &str,
+) -> Result<rclaw_channels::wxbot::WxbotApiClient, WxbotContactsError> {
+    rclaw_channels::wxbot::WxbotApiClient::new(api_base, api_token).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn wxbot_contacts_list(
+    api_base: String,
+    api_token: String,
+    kind: String,
+) -> Result<Vec<rclaw_channels::wxbot::ContactInfoDto>, WxbotContactsError> {
+    // kind 只放行列表接口的合法取值，其余在本地拦下（不给 WCX 发无意义请求）。
+    if !matches!(kind.as_str(), "friends" | "groups" | "official_accounts" | "all") {
+        return Err(WxbotContactsError {
+            code: "bad_kind".into(),
+            message: format!("不支持的联系人类型：{kind}"),
+        });
+    }
+    let client = wxbot_contacts_client(&api_base, &api_token)?;
+    Ok(client.list_contacts(&kind).await?)
+}
+
+#[tauri::command]
+pub async fn wxbot_contacts_lookup(
+    api_base: String,
+    api_token: String,
+    display_name: String,
+    group_id: Option<String>,
+) -> Result<String, WxbotContactsError> {
+    // 按昵称/备注精确反查 wxid；无命中 → code="not_found"，端点缺失 → "unsupported_endpoint"。
+    let client = wxbot_contacts_client(&api_base, &api_token)?;
+    Ok(client
+        .lookup_contact(&display_name, group_id.as_deref())
+        .await?)
+}
+
+#[tauri::command]
+pub async fn wxbot_contacts_self(
+    api_base: String,
+    api_token: String,
+) -> Result<Option<String>, WxbotContactsError> {
+    let client = wxbot_contacts_client(&api_base, &api_token)?;
+    Ok(client.self_wxid().await?)
+}
+
+#[tauri::command]
+pub async fn wxbot_contacts_recent(
+    state: State<'_, AppState>,
+    is_group: bool,
+    account: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<rclaw_channels::wxbot::RecentChat>, WxbotContactsError> {
+    // 桌面宿主布局：base_dir 固定 home/agent（agent.rs），媒体沙箱 = base/media，
+    // 索引库 = media/wxbot/message_index.db。
+    let db_path = state
+        .home
+        .join("agent")
+        .join("media")
+        .join("wxbot")
+        .join("message_index.db");
+    tauri::async_runtime::spawn_blocking(move || {
+        rclaw_channels::wxbot::list_recent_chats(
+            &db_path,
+            is_group,
+            account.as_deref(),
+            limit.unwrap_or(100),
+        )
+    })
+    .await
+    .map_err(|e| WxbotContactsError {
+        code: "join".into(),
+        message: format!("本地查询任务失败：{e}"),
+    })?
+    .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
 // 标题栏循环标语：界面偏好（agent/desktop_prefs.json），不写入 rclaw.toml
 // ---------------------------------------------------------------------------
 
@@ -5761,16 +5864,9 @@ pub async fn app_versions() -> AppVersionsDto {
         agent_store: rclaw_store::VERSION.to_string(),
         agent_cli: rclaw_cli::VERSION.to_string(),
         agent_channels: {
-            // rclaw-channels 挂在 android 目标依赖表（apk-host 才链入）：
-            // host/desktop 构建无此 crate，通道行留空。
-            #[cfg(all(feature = "apk-host", target_os = "android"))]
-            {
-                Some(rclaw_channels::VERSION.to_string())
-            }
-            #[cfg(not(all(feature = "apk-host", target_os = "android")))]
-            {
-                None
-            }
+            // rclaw-channels 已无条件依赖（wxbot 联系人查询命令需要，rclaw-cli 本就
+            // 传递依赖同一 crate），版本行恒有值。
+            Some(rclaw_channels::VERSION.to_string())
         },
         tauri: tauri::VERSION.to_string(),
         rustc: env!("RCLAW_RUSTC").to_string(),
