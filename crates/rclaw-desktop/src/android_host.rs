@@ -169,6 +169,33 @@ pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeIsHealthy(
     }
 }
 
+/// MainActivity 在 nativeInit 后推送当前 APK 版本（与内置 skill marker 同源，
+/// `PackageManager.lastUpdateTime`）；版本握手期望值的 GUI 路径来源。空串 = 清除。
+/// 返回 void（Java 侧声明一致）：读串失败只落日志——版本缺失会让 Rust 退旧语义
+/// （resolve 侧已有 boot log），不能因返回串协议不一致引入未定义行为。
+#[no_mangle]
+pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeSetBundledSkillsVersion(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    version: JString<'_>,
+) {
+    let received = match env.get_string(&version) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(error) => {
+            // 此刻 tracing 订阅器尚未初始化（init_tracing 在 prepare_environment
+            // 之后），boot_debug.log 是唯一可靠通道。
+            rclaw_android::log_boot(&format!("nativeSetBundledSkillsVersion 读串失败: {error}"));
+            return;
+        }
+    };
+    let received = received.trim();
+    if received.is_empty() {
+        rclaw_android::set_bundled_skills_version(None);
+    } else {
+        rclaw_android::set_bundled_skills_version(Some(received.to_string()));
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeResolveAgentRoot(
     mut env: JNIEnv<'_>,

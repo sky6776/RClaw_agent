@@ -18,6 +18,10 @@ class MainActivity : TauriActivity() {
     // 服务负责安装内置 skill、组装启动配置并 nativeStart（含无头共享运行时）。
     NativeBridge.setContext(application)
     NativeBridge.init(filesDir)
+    // 版本握手：GUI 装配（tauri setup 的 start_agent）可能早于服务的解包完成，
+    // Rust 侧需要期望版本才能区分「旧 marker（覆盖安装）」与「解包完成」——
+    // 必须在拉起服务与 super.onCreate（tauri setup）之前推送。
+    NativeBridge.setBundledSkillsVersion(RuntimeAssets.currentVersion(this))
     CaptureBridge.activity = this
     // 浏览器面板（应用内原生视图，盖在聊天 UI 上）的宿主窗口：panel 加进本
     // Activity 的视图树，无需悬浮窗权限。setActivity 会复位 attached 并把

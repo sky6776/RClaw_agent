@@ -17,8 +17,8 @@ pub mod keep_alive;
 pub use bridge_executor::{BridgePythonExecutor, PendingApproval, SkillApprovalStore};
 pub use host_glue::prepare_gbrain;
 pub use host_glue::{
-    approval_gate, build_channels, install_skill_gate, prepare_environment, ApkChannels,
-    ApprovalGateHandle, PreparedEnvironment,
+    approval_gate, build_channels, install_skill_gate, prepare_environment, read_marker_prefix,
+    ApkChannels, ApprovalGateHandle, PreparedEnvironment,
 };
 
 #[cfg(target_os = "android")]
@@ -33,7 +33,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 const RUNTIME_HEARTBEAT_STALE_AFTER_MS: u64 = 150_000;
@@ -55,6 +55,10 @@ pub struct AndroidConfig {
     pub bundled_skills_dir: Option<String>,
     /// App-private, non-backed-up directory for APK-managed skill config files.
     pub skill_configs_dir: Option<String>,
+    /// Java 侧 `PackageManager.lastUpdateTime`（与内置 skill marker 同源的版本号）：
+    /// 版本握手用——Rust 只在 marker 等于该值时才认为解包完成，避免与 Java 原地
+    /// 重解包并发遍历同一棵树（覆盖安装后旧 marker 会让只查存在性的等待秒过）。
+    pub bundled_skills_version: Option<String>,
     /// APK 管理的独立 skill 配置：相对 `agent/skills` 的路径 -> 完整文件内容。
     #[serde(default)]
     pub skill_configs: HashMap<String, String>,
@@ -111,9 +115,49 @@ pub struct ResolvedAndroidConfig {
     pub workspace_dir: PathBuf,
     pub bundled_skills_dir: PathBuf,
     pub skill_configs_dir: PathBuf,
+    /// 版本握手期望值（launch JSON 与 JNI 缓存取先 non-empty 者；均缺 = None，退旧语义）。
+    pub bundled_skills_version: Option<String>,
     pub skill_configs: HashMap<String, String>,
     pub approved_skill_scripts: HashMap<String, String>,
     pub config: RClawConfig,
+}
+
+// ---- 内置 skill 版本握手：Java（MainActivity/AppConfig.toJson）→ Rust 的同源版本号 ----
+
+/// Java 侧经 `nativeSetBundledSkillsVersion` 推送的当前 APK 版本（可覆盖更新，
+/// 不用 OnceLock：同进程 instrumentation / 异常时序下二次 set 必须生效）。
+static BUNDLED_SKILLS_VERSION: RwLock<Option<String>> = RwLock::new(None);
+
+/// 记录 Java 推送的版本号；空串/空白视为清除。
+/// 锁中毒时沿用 `into_inner` 恢复（与读路径一致）：版本握手不能因前一个 panic
+/// 静默失效——失效会退回「只查 marker 存在」的旧语义，正是本次事故的成因。
+pub fn set_bundled_skills_version(version: Option<String>) {
+    let v = version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut slot = BUNDLED_SKILLS_VERSION
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = v;
+}
+
+pub fn cached_bundled_skills_version() -> Option<String> {
+    BUNDLED_SKILLS_VERSION
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// 版本握手期望值：launch JSON 字段优先，JNI 缓存兜底；两边的空白串都按缺省处理。
+fn effective_bundled_skills_version(launch: Option<&str>, cached: Option<&str>) -> Option<String> {
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    clean(launch).or_else(|| clean(cached))
 }
 
 /// v2（GUI 共享运行时）健康信号：`assemble_apk_agent` 成功后置位并周期喂心跳；
@@ -819,11 +863,23 @@ pub fn resolve_android_config(launch: AndroidConfig) -> Result<ResolvedAndroidCo
     validate_skill_configs(&launch.skill_configs)?;
     validate_approved_skill_scripts(&launch.approved_skill_scripts)?;
 
+    // 版本握手期望值：launch JSON（服务全量路径）优先，JNI 缓存（MainActivity setter，
+    // 覆盖 GUI-minimal 路径）兜底。都缺时退化为旧语义（只等 marker 存在）——调用方
+    // 会打 boot log 提示「可能与解包并发」，不静默。
+    let bundled_skills_version = effective_bundled_skills_version(
+        launch.bundled_skills_version.as_deref(),
+        cached_bundled_skills_version().as_deref(),
+    );
+    if bundled_skills_version.is_none() {
+        log_boot("未收到内置 skill 版本号，按旧语义等待 marker（可能与解包并发）");
+    }
+
     Ok(ResolvedAndroidConfig {
         files_dir,
         workspace_dir,
         bundled_skills_dir,
         skill_configs_dir,
+        bundled_skills_version,
         skill_configs: launch.skill_configs,
         approved_skill_scripts: launch.approved_skill_scripts,
         config,
@@ -1057,7 +1113,8 @@ fn apply_skill_configs(configs: &HashMap<String, String>, destination: &Path) ->
                     temporary.display()
                 ));
             }
-            std::fs::remove_file(&temporary)?;
+            std::fs::remove_file(&temporary)
+                .with_context(|| format!("清理 skill 配置临时文件失败: {}", temporary.display()))?;
         }
         let mut output = std::fs::OpenOptions::new()
             .write(true)
@@ -1078,7 +1135,8 @@ fn apply_skill_configs(configs: &HashMap<String, String>, destination: &Path) ->
         // best available non-atomic fallback there.
         #[cfg(windows)]
         if target.is_file() {
-            std::fs::remove_file(&target)?;
+            std::fs::remove_file(&target)
+                .with_context(|| format!("替换 skill 配置文件失败: {relative}"))?;
         }
         std::fs::rename(&temporary, &target)
             .with_context(|| format!("提交 skill 配置失败: {relative}"))?;
@@ -1092,13 +1150,17 @@ fn prune_stale_bundled_tree(source: &Path, destination: &Path, baseline: &Path) 
     if !baseline.is_dir() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(baseline)? {
-        let entry = entry?;
+    let entries = std::fs::read_dir(baseline)
+        .with_context(|| format!("读取 APK skill 基线目录失败: {}", baseline.display()))?;
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("遍历 APK skill 基线目录失败: {}", baseline.display()))?;
         let baseline_path = entry.path();
         let source_path = source.join(entry.file_name());
         let destination_path = destination.join(entry.file_name());
         reject_symlink(&source_path, "APK skill 资源")?;
-        let metadata = std::fs::symlink_metadata(&baseline_path)?;
+        let metadata = std::fs::symlink_metadata(&baseline_path)
+            .with_context(|| format!("读取 APK skill 基线条目失败: {}", baseline_path.display()))?;
         if metadata.file_type().is_symlink() {
             return Err(anyhow!(
                 "APK skill 基线不允许包含符号链接: {}",
@@ -1122,9 +1184,16 @@ fn prune_stale_bundled_tree(source: &Path, destination: &Path, baseline: &Path) 
         } else if metadata.is_file() && !source_path.is_file() {
             reject_symlink(&destination_path, "skill 目标")?;
             if destination_path.is_file() && files_equal(&destination_path, &baseline_path)? {
-                std::fs::remove_file(&destination_path)?;
+                std::fs::remove_file(&destination_path).with_context(|| {
+                    format!(
+                        "清理过期 APK skill 文件失败: {}",
+                        destination_path.display()
+                    )
+                })?;
             }
-            std::fs::remove_file(&baseline_path)?;
+            std::fs::remove_file(&baseline_path).with_context(|| {
+                format!("清理过期 APK skill 基线失败: {}", baseline_path.display())
+            })?;
         }
     }
     Ok(())
@@ -1137,7 +1206,9 @@ fn reject_symlink(path: &Path, label: &str) -> Result<()> {
         }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context(format!("检查 {label} 失败: {}", path.display())))
+        }
     }
 }
 
@@ -1155,15 +1226,25 @@ fn reject_symlink_ancestors(root: &Path, path: &Path, label: &str) -> Result<()>
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("检查 {label} 路径失败: {}", current.display())))
+            }
         }
     }
     Ok(())
 }
 
 fn remove_if_empty(path: &Path) -> Result<()> {
-    if path.is_dir() && std::fs::read_dir(path)?.next().is_none() {
-        std::fs::remove_dir(path)?;
+    if path.is_dir() {
+        let empty = std::fs::read_dir(path)
+            .with_context(|| format!("读取 APK skill 目录失败: {}", path.display()))?
+            .next()
+            .is_none();
+        if empty {
+            std::fs::remove_dir(path)
+                .with_context(|| format!("移除空 APK skill 目录失败: {}", path.display()))?;
+        }
     }
     Ok(())
 }
@@ -1171,19 +1252,25 @@ fn remove_if_empty(path: &Path) -> Result<()> {
 fn merge_bundled_tree(source: &Path, destination: &Path, baseline: &Path) -> Result<()> {
     reject_symlink(destination, "skill 目标")?;
     reject_symlink(baseline, "skill 基线")?;
-    std::fs::create_dir_all(destination)?;
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("创建 skill 目标目录失败: {}", destination.display()))?;
     if baseline.exists() && !baseline.is_dir() {
         remove_managed_node(baseline, "skill 基线")?;
     }
-    std::fs::create_dir_all(baseline)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
+    std::fs::create_dir_all(baseline)
+        .with_context(|| format!("创建 skill 基线目录失败: {}", baseline.display()))?;
+    let entries = std::fs::read_dir(source)
+        .with_context(|| format!("读取 APK skill 资源目录失败: {}", source.display()))?;
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("遍历 APK skill 资源目录失败: {}", source.display()))?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         let baseline_path = baseline.join(entry.file_name());
         reject_symlink(&destination_path, "skill 目标")?;
         reject_symlink(&baseline_path, "skill 基线")?;
-        let metadata = std::fs::symlink_metadata(&source_path)?;
+        let metadata = std::fs::symlink_metadata(&source_path)
+            .with_context(|| format!("读取 APK skill 资源条目失败: {}", source_path.display()))?;
         if metadata.file_type().is_symlink() {
             return Err(anyhow!(
                 "APK skill 资源不允许包含符号链接: {}",
@@ -1233,7 +1320,8 @@ fn replace_baseline_tree(source: &Path, baseline: &Path) -> Result<()> {
 }
 
 fn copy_bundled_tree(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(source)?;
+    let metadata = std::fs::symlink_metadata(source)
+        .with_context(|| format!("读取 APK skill 资源失败: {}", source.display()))?;
     if metadata.file_type().is_symlink() {
         return Err(anyhow!(
             "APK skill 资源不允许包含符号链接: {}",
@@ -1241,16 +1329,26 @@ fn copy_bundled_tree(source: &Path, destination: &Path) -> Result<()> {
         ));
     }
     if metadata.is_file() {
-        std::fs::copy(source, destination)?;
+        std::fs::copy(source, destination).with_context(|| {
+            format!(
+                "复制 APK skill 资源失败: {} -> {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
         return Ok(());
     }
     if !metadata.is_dir() {
         return Err(anyhow!("APK skill 资源类型不受支持: {}", source.display()));
     }
 
-    std::fs::create_dir_all(destination)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
+    std::fs::create_dir_all(destination)
+        .with_context(|| format!("创建 APK skill 基线目录失败: {}", destination.display()))?;
+    let entries = std::fs::read_dir(source)
+        .with_context(|| format!("读取 APK skill 资源目录失败: {}", source.display()))?;
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("遍历 APK skill 资源目录失败: {}", source.display()))?;
         let source_path = entry.path();
         copy_bundled_tree(&source_path, &destination.join(entry.file_name()))?;
     }
@@ -1261,35 +1359,52 @@ fn remove_managed_node(path: &Path, label: &str) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(
+                anyhow::Error::new(error).context(format!("读取 {label} 失败: {}", path.display()))
+            )
+        }
     };
     if metadata.file_type().is_symlink() {
         return Err(anyhow!("{label}不允许是符号链接: {}", path.display()));
     }
     if metadata.is_file() {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(path)
+            .with_context(|| format!("移除 {label} 失败: {}", path.display()))?;
         return Ok(());
     }
     if !metadata.is_dir() {
         return Err(anyhow!("{label}类型不受支持: {}", path.display()));
     }
-    for entry in std::fs::read_dir(path)? {
-        remove_managed_node(&entry?.path(), label)?;
+    let entries = std::fs::read_dir(path)
+        .with_context(|| format!("读取 {label} 目录失败: {}", path.display()))?;
+    for entry in entries {
+        let child = entry
+            .with_context(|| format!("遍历 {label} 目录失败: {}", path.display()))?
+            .path();
+        remove_managed_node(&child, label)?;
     }
-    std::fs::remove_dir(path)?;
+    std::fs::remove_dir(path)
+        .with_context(|| format!("移除 {label} 目录失败: {}", path.display()))?;
     Ok(())
 }
 
 fn files_equal(left: &Path, right: &Path) -> Result<bool> {
-    let left_metadata = std::fs::metadata(left)?;
-    let right_metadata = std::fs::metadata(right)?;
+    let left_metadata = std::fs::metadata(left)
+        .with_context(|| format!("读取 APK skill 文件失败: {}", left.display()))?;
+    let right_metadata = std::fs::metadata(right)
+        .with_context(|| format!("读取 APK skill 文件失败: {}", right.display()))?;
     if !left_metadata.is_file()
         || !right_metadata.is_file()
         || left_metadata.len() != right_metadata.len()
     {
         return Ok(false);
     }
-    Ok(std::fs::read(left)? == std::fs::read(right)?)
+    let left_bytes = std::fs::read(left)
+        .with_context(|| format!("读取 APK skill 文件失败: {}", left.display()))?;
+    let right_bytes = std::fs::read(right)
+        .with_context(|| format!("读取 APK skill 文件失败: {}", right.display()))?;
+    Ok(left_bytes == right_bytes)
 }
 
 pub(crate) fn open_gbrain(
@@ -2394,6 +2509,16 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// 进程级 skill 版本缓存是全局状态：读写它的测试必须串行（测试默认并行）。
+    /// 模块级 static，供本文件内所有触碰缓存的测试共用。
+    static VERSION_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_version_cache() -> std::sync::MutexGuard<'static, ()> {
+        VERSION_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn runtime_heartbeat_expires_after_stale_threshold() {
         assert!(!heartbeat_is_fresh(1_000, 0));
@@ -2407,6 +2532,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn complete_app_toml_maps_all_sections_and_switches_to_private_paths() {
+        // 本测试会走 resolve_android_config → 读进程级版本缓存；与写缓存的测试串行。
+        let _guard = lock_version_cache();
         let toml = r#"
 [agent]
 base_dir = 'D:\\desktop\\rclaw'
@@ -2723,5 +2850,47 @@ file_name = "agent.log"
             "user edit"
         );
         assert_eq!(fs::read_to_string(baseline.join("custom")).unwrap(), "v3");
+    }
+    #[test]
+    fn effective_bundled_skills_version_prefers_launch_then_cached() {
+        // launch 优先于缓存
+        assert_eq!(
+            effective_bundled_skills_version(Some("111"), Some("222")),
+            Some("111".to_string())
+        );
+        // launch 为空白时取缓存
+        assert_eq!(
+            effective_bundled_skills_version(Some("  "), Some("222")),
+            Some("222".to_string())
+        );
+        // 两者皆空 = None
+        assert_eq!(effective_bundled_skills_version(Some(""), None), None);
+        assert_eq!(effective_bundled_skills_version(None, Some("  ")), None);
+        assert_eq!(effective_bundled_skills_version(None, None), None);
+    }
+
+    #[test]
+    fn bundled_skills_version_cache_overwrites() {
+        // 进程级 RwLock：本测试会改全局状态，与其它读缓存的测试串行（测试默认并行）。
+        let _guard = lock_version_cache();
+        set_bundled_skills_version(Some("100".into()));
+        assert_eq!(cached_bundled_skills_version().as_deref(), Some("100"));
+        // 空串 = 清除
+        set_bundled_skills_version(Some("   ".into()));
+        assert_eq!(cached_bundled_skills_version(), None);
+        set_bundled_skills_version(Some("200".into()));
+        assert_eq!(cached_bundled_skills_version().as_deref(), Some("200"));
+        set_bundled_skills_version(None);
+        assert_eq!(cached_bundled_skills_version(), None);
+    }
+
+    #[test]
+    fn android_config_toml_without_version_field_defaults_to_none() {
+        // 旧启动 JSON（无 bundled_skills_version）反序列化不受 deny_unknown_fields 影响
+        let launch: AndroidConfig = serde_json::from_str(r#"{"files_dir":"/data"}"#).unwrap();
+        assert_eq!(launch.bundled_skills_version, None);
+        let launch: AndroidConfig =
+            serde_json::from_str(r#"{"files_dir":"/data","bundled_skills_version":"42"}"#).unwrap();
+        assert_eq!(launch.bundled_skills_version.as_deref(), Some("42"));
     }
 }

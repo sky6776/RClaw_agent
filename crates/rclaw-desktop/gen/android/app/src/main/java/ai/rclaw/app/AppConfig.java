@@ -55,6 +55,12 @@ public final class AppConfig {
             json.put("workspace_dir", new File(filesDir, "rclaw").getAbsolutePath());
             json.put("bundled_skills_dir",
                     new File(filesDir, "runtime/bundled-skills").getAbsolutePath());
+            // 版本握手：Rust 只在 marker 等于该值时才认为解包完成（防止与原地
+            // 重解包并发遍历同一棵树）。读不到版本号不写字段（Rust 退旧语义）。
+            String bundledSkillsVersion = RuntimeAssets.currentVersion(context);
+            if (bundledSkillsVersion != null) {
+                json.put("bundled_skills_version", bundledSkillsVersion);
+            }
             json.put("skill_configs_dir", skillConfigsDir.getAbsolutePath());
             File tomlFile = new File(filesDir, "rclaw.toml");
             if (tomlFile.isFile()) {

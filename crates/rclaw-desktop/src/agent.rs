@@ -839,8 +839,25 @@ pub(crate) async fn assemble_apk_agent(
         .map_err(|e| format!("Android 配置解析失败: {e}"))?;
     let home = resolved.files_dir.clone();
 
-    let prepared = rclaw_android::prepare_environment(&mut resolved)
-        .map_err(|e| format!("APK 环境准备失败: {e}"))?;
+    let prepared = match rclaw_android::prepare_environment(&mut resolved) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // 错误全链 + 现场落 boot_debug.log（此刻 tracing 未初始化，boot log 是
+            // 唯一可靠取证通道）；UI 只显示 {e:#} 首行也能定位到具体路径。
+            crate::android_boot_log(&format!(
+                "prepare_environment 失败: {error:#}\n  files_dir={}\n  base_dir={}\n  bundled={}\n  marker={:?}\n  skill_configs_dir={}",
+                resolved.files_dir.display(),
+                resolved.config.agent.base_dir,
+                resolved.bundled_skills_dir.display(),
+                // 与握手判定同源的前缀读取（短读安全、异常大文件判未知）。
+                rclaw_android::read_marker_prefix(&resolved
+                    .bundled_skills_dir
+                    .with_file_name("bundled-skills.version")),
+                resolved.skill_configs_dir.display(),
+            ));
+            return Err(format!("APK 环境准备失败: {error:#}"));
+        }
+    };
     let layout = prepared.layout;
     let _ = rclaw_cli::logging::init_tracing(&resolved.config.log, &layout.logs_dir);
     rclaw_android::install_skill_gate(&layout, &resolved)

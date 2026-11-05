@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use rclaw_core::RuntimeChannelInfo;
 use rclaw_llm::{Provider, SwappableProvider};
@@ -36,7 +36,8 @@ use crate::config::Config;
 /// 必须先于日志初始化（日志默认写入 `agent/logs`）。CLI 与桌面版共用。
 pub fn prepare_storage(cfg: &Config) -> Result<Layout> {
     let layout = Layout::new(&cfg.agent.base_dir);
-    rclaw_store::fs::init_layout(&layout)?;
+    rclaw_store::fs::init_layout(&layout)
+        .with_context(|| format!("初始化存储布局失败: {}", layout.base.display()))?;
     SkillUsageStore::new(layout.skills_dir.clone())
         .install_repository_manifest()
         .map_err(anyhow::Error::msg)?;

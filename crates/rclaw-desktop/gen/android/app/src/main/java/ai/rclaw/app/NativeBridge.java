@@ -794,6 +794,20 @@ public final class NativeBridge {
         }
     }
 
+    /** MainActivity 在 init 后推送当前 APK 版本（PackageManager.lastUpdateTime，
+     *  与内置 skill marker 同源）：Rust 版本握手用——marker 匹配才认为解包完成，
+     *  避免覆盖安装后 Rust 与 Java 原地重解包并发遍历同一棵树（裸 ENOENT 事故）。
+     *  必须在可能触发 GUI 装配（tauri setup / startForegroundService）之前调用。 */
+    static void setBundledSkillsVersion(String version) {
+        try {
+            nativeSetBundledSkillsVersion(version == null ? "" : version);
+        } catch (UnsatisfiedLinkError | RuntimeException error) {
+            android.util.Log.e("NativeBridge", "setBundledSkillsVersion failed", error);
+        }
+    }
+
+    static native void nativeSetBundledSkillsVersion(String version);
+
     static native String nativeStart(String configJson, PythonRuntime pythonRuntime);
 
     static native String nativeStop();

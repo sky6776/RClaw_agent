@@ -115,6 +115,20 @@ final class RuntimeAssets {
         }
     }
 
+    /**
+     * 与内置 skill marker 完全同源的版本号（lastUpdateTime），供 Rust 版本握手：
+     * marker 等于该值即代表解包完成。读不到返回 null（不阻断启动配置组装——
+     * 启动关键路径不能因包信息查询抛出的任何异常而失败）。
+     */
+    static String currentVersion(Context context) {
+        try {
+            return packageVersion(context);
+        } catch (IOException | RuntimeException error) {
+            android.util.Log.w("RuntimeAssets", "读取 APK 版本失败", error);
+            return null;
+        }
+    }
+
     private static void writeMarker(
             File marker,
             String version,
