@@ -46,6 +46,7 @@ position = 0                    # 位置参数；或 flag = "--type" 声明具�
 - **参数属性**：`name` `type` `description` `required` `position` `flag` `values`（enum 白名单）`minimum` / `maximum` `min_items` / `max_items` `repeat_flag` `must_exist`。
 - **运行时**：`python` 优先用 Manifest 指定的 venv（Windows 查 `Scripts/python.exe` → `bin/python`，其它平台反序），否则从 PATH 查找；`node`；`platform_shell`。安卓 APK 注入 Chaquopy 桥，**只注册 Python 入口**，Node / shell 入口被过滤。
 - **执行**：运行时直接构造 argv 启动进程，不经过 shell；默认超时 300000 ms；stdout / stderr 各默认 64 KiB 截断（`[skills] max_output_bytes` 可调），结果明确携带两路「输出截断」布尔标志。
+- **中间态约定**：查询类入口（如 `check-task`）在任务仍在排队/运行时应返回退出码 0 + `{"ok": true, "pending": true, ...}`，表示「查询成功、结果尚未产出」；非零退出码用于硬失败（配置/鉴权/下载失败）、未确认完成的副作用（如 `POLL_TIMEOUT`）或中断（`0xC000013A`）。查询类入口观察到任务 `failed` 且未请求下载时仍返回 0——失败状态本身是查询结果。runtime 只按退出码判定工具成败、不解析 `pending` 字段，因此 pending 结果不会进入完成闸门的未解决错误账本。
 
 ## 动态工具与激活生命周期
 

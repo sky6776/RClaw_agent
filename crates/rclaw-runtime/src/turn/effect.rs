@@ -1,3 +1,5 @@
+use sha2::{Digest, Sha256};
+
 use super::*;
 
 pub(super) fn truncate_status_text(value: &str, max_chars: usize) -> String {
@@ -39,6 +41,13 @@ pub(super) fn tool_call_fingerprint(call: &rclaw_core::ToolCall) -> String {
     format!("{}\0{normalized}", call.name)
 }
 
+/// Skill 专用工具的 effect identity 哈希：canonical JSON 的 SHA-256 前 128 bit。
+/// `DefaultHasher` 不保证跨 Rust 版本稳定，而该 key 语义上要求可复算。
+fn skill_input_fingerprint(input: &Value) -> String {
+    let digest = Sha256::digest(canonicalize_json(input).to_string().as_bytes());
+    format!("{digest:x}")[..32].to_string()
+}
+
 pub(super) fn is_blocking_mailbox_wait(call: &rclaw_core::ToolCall) -> bool {
     call.name == "TaskList"
         && serde_json::from_str::<Value>(&call.input)
@@ -65,6 +74,13 @@ pub(super) fn tool_effect_key(call: &rclaw_core::ToolCall, effect_base: &Path) -
     let Some(input) = parsed_input else {
         return effect_kind;
     };
+    // Skill 专用工具的参数是技能自定义的：目标字段（task_id 等）覆盖不到
+    // prompt / save 输出路径等 effect identity。统一并入 canonical input 的
+    // 128-bit 稳定哈希——同参数重试仍清除旧错误，不同 prompt / 输出路径的
+    // 失败不再互相覆盖。只存哈希，不存原文。
+    if call.name.starts_with("skill__") {
+        return format!("{effect_kind}\0{}", skill_input_fingerprint(&input));
+    }
     let Some(object) = input.as_object() else {
         return effect_kind;
     };
@@ -789,10 +805,32 @@ pub(super) fn tool_call_is_effectful(call: &rclaw_core::ToolCall) -> bool {
         .is_some_and(|kind| kind != "shell:none")
 }
 
+/// wrapper 自己生成的退出码行（`专用工具:` 渲染块的第一段）。只在这个位置识别
+/// 中断，不扫描 `[stdout]` 之后的脚本输出——脚本正文里恰好打印 `退出码:` 不应
+/// 把普通失败误分类为中断。
+fn rendered_exit_code(content: &str) -> Option<&str> {
+    for line in content.lines() {
+        let line = line.trim_start();
+        if line == "[stdout]" {
+            break;
+        }
+        if let Some(code) = line.strip_prefix("退出码: ") {
+            return Some(code.trim());
+        }
+    }
+    None
+}
+
 pub(super) fn classify_tool_error(content: &str) -> &'static str {
     let lower = content.to_ascii_lowercase();
     if lower.contains("loop_circuit_open") || lower.contains("重复工具调用") {
         "loop_repetition"
+    } else if rendered_exit_code(content).is_some_and(|code| {
+        let code = code.to_ascii_lowercase();
+        code == "signal" || code.contains("0xc000013a") || code.contains("status_control_c_exit")
+    }) {
+        // 控制台关闭 / Ctrl+C / 信号终止：进程没有正常退出，与脚本主动 fail 区分。
+        "interrupted"
     } else if lower.contains("permission")
         || lower.contains("权限")
         || lower.contains("拒绝")

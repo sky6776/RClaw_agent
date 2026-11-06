@@ -56,9 +56,9 @@
 
 ## `/goal` 目标提醒
 
-- `/goal <文本>` 设定会话级长期目标（上限 2000 字符），存于 `kv` 键 `session-goal/<channel>/<chat_id>`。
+- `/goal <文本>` 设定会话级长期目标（上限 2000 字符），存于 `kv` 键 `session-goal/<channel>/<chat_id>`；设定成功后同一条消息展开为「立即开工」的模型指令继续走 turn 路由，不需要用户再补发一条消息（历史 / UI 保留 `/goal <文本>` 原文）。
 - 此后每次推理以非持久化尾部元消息注入目标、证据核对与持续工作提醒（按证据核对、不自行宣告完成）。
-- `/goal` 查看；`/goal clear`（或 `done` / `完成` / `清除`）清除。`goal_audit_enabled = true` 时，成功用户回合后还会运行一次最多 200 token 的无工具完成审计，确认达成即自动清除并回执。
+- `/goal` 查看；`/goal clear`（或 `done` / `完成` / `清除`，ASCII 别名大小写不敏感）清除。`goal_audit_enabled = true` 时，成功用户回合后还会运行一次最多 200 token 的无工具完成审计，确认达成即自动清除并回执。
 
 ## `/export` 导出
 

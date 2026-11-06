@@ -982,6 +982,55 @@ pub(crate) fn expand_persisted_workflow_message(text: &str) -> Option<String> {
     }
 }
 
+/// `/goal` 子命令解析结果。
+enum GoalCommand<'a> {
+    /// 无参：查看当前目标。
+    Show,
+    /// `clear` / `done` / `完成` / `清除`：清除目标。
+    Clear,
+    /// 其余文本：设定（覆盖旧目标）。
+    Set(&'a str),
+}
+
+/// `/goal` 命令分发结果：是否需要把这条消息继续交给 turn 路由。
+enum GoalCommandOutcome {
+    /// 查询 / 清除 / 超长 / 写库失败：只回执，不进入 LLM。
+    Reply(String),
+    /// 目标已成功写入 kv：回执要求调用方先投递，再让消息继续进入 turn。
+    Set { receipt: String, objective: String },
+}
+
+/// 解析 `/goal ...`。命令头规则与 `RuntimeCommand::parse` 一致：`/` 后可有空白、
+/// 命令名大小写不敏感、`/goalx` 不是本命令。非 `/goal` 头沿用 `handle_goal` 的既有
+/// fallback（把整段当作目标文本）——`dispatch` 已保证只有命令才调用到这里，fallback
+/// 只服务于直接调用 `handle_goal` 的测试与防御性路径，避免出现第三套命令头口径。
+fn parse_goal_command(content: &str) -> GoalCommand<'_> {
+    let after_slash = content
+        .trim()
+        .strip_prefix('/')
+        .map(str::trim_start)
+        .unwrap_or_else(|| content.trim());
+    let mut tokens = after_slash.splitn(2, char::is_whitespace);
+    let name = tokens.next().unwrap_or("");
+    let arg = if name.eq_ignore_ascii_case("goal") {
+        tokens.next().unwrap_or("").trim()
+    } else {
+        after_slash.trim()
+    };
+    if arg.is_empty() {
+        return GoalCommand::Show;
+    }
+    // ASCII 别名大小写不敏感（与命令名一致）；中文别名保持精确匹配。
+    if arg.eq_ignore_ascii_case("clear")
+        || arg.eq_ignore_ascii_case("done")
+        || arg == "完成"
+        || arg == "清除"
+    {
+        return GoalCommand::Clear;
+    }
+    GoalCommand::Set(arg)
+}
+
 /// turn 生命周期观察者（宿主侧状态展示用，如安卓前台服务通知的忙碌 / 完成提醒）。
 ///
 /// 回调由运行时在**权威点**同步触发，宿主无需再从 outbound 文本或投递动作反推 turn
@@ -1480,11 +1529,14 @@ impl TurnManager {
     /// 顺序：
     /// 1. `/cancel`（仅真实用户消息）→ 取消当前会话 running turn 或回送「无任务」提示；
     /// 2. 其它已知斜杠命令（`/skills` / `/llmodel` / `/help` 等）→ 路由层即时处理，不进 LLM / session；
+    ///    例外：`/workflow <请求>` 展开为 prompt、`/goal <目标>` 先落库再展开为「立即开工」
+    ///    指令，两者都把同一条消息继续交给下面的 turn 路由；
     /// 3. 已有活动 turn → 把新输入作为插队事件投递给该 turn（在下一个安全点处理）；
     /// 4. 无活动 turn → 为该会话启动一个新 turn 任务。
     ///
-    /// 注意：本方法在 agent loop 里被 `await` 串行调用，**不会并发**，因此「检查 active →
-    /// 插入 active」之间无需担心另一个 route 介入；但仍需与 turn 任务的自移除互斥。
+    /// 注意：agent loop 里对 `route` 的调用是串行的，但 leftover 重路由可能从 turn 外壳
+    /// 任务再次进入（见 `run_turn` 收尾）；「检查 active → 插入 active」的竞态由
+    /// `spawn_turn` 的 double-check 兜底，因此仍需与 turn 任务的自移除互斥。
     pub async fn route(self: &Arc<Self>, msg: BusMessage) {
         if msg.source() == MessageSource::User {
             tracing::info!(
@@ -1513,9 +1565,14 @@ impl TurnManager {
             WorkflowExpansion::Expanded(model) => msg.expand_model_content(model),
         };
 
-        if commands::dispatch(self, &msg).await {
-            return;
-        }
+        // `/goal <目标>` 设定成功后由 `dispatch` 返回 [`commands::DispatchOutcome::StartTurn`]：
+        // 命令的副作用（写 kv + 回执）已完成，但这条消息本身要作为 turn 输入继续路由，
+        // 用户不再需要补发一条消息才开工。
+        let msg = match commands::dispatch(self, &msg).await {
+            commands::DispatchOutcome::NotHandled => msg,
+            commands::DispatchOutcome::Handled => return,
+            commands::DispatchOutcome::StartTurn(msg) => msg,
+        };
 
         let key = TurnKey::from_msg(&msg);
 
@@ -1920,6 +1977,9 @@ impl TurnManager {
     /// 回复若按最终回复形态到达，桌面端会把它当成收尾（busy 翻 false、停止按钮消失、
     /// 排队消息被提前放行）。空闲会话照常非 intermediate：命令消息自身的忙碌态靠
     /// 这条回复解除。
+    ///
+    /// 例外：`/goal <文本>` 设定成功走 [`Self::send_goal_receipt`]——回执后必然尝试一次
+    /// turn，空闲会话用本方法会把忙碌态提前解除，必须强制 intermediate。
     async fn send_command_reply(&self, channel: &str, chat_id: &str, response: String) {
         let mut reply = BusMessage::new(channel.to_string(), chat_id.to_string(), response);
         if self.turn_pending_delivery(channel, chat_id) {
@@ -2058,26 +2118,14 @@ impl TurnManager {
     /// 工作 + 逐项核对证据 + 不自行宣告完成），对齐 ZCode 的 goal reminder 语义。
     /// RClaw 没有运行时完成校验器：完成判定靠模型按证据自评 + 用户 `/goal clear`
     /// 收尾（提醒文案明说「提醒用户收尾」，不擅自宣告达成）。
-    async fn handle_goal(&self, channel: &str, chat_id: &str, content: &str) -> String {
+    ///
+    /// 返回 [`GoalCommandOutcome::Set`] 时目标已落库，调用方必须把同一条消息展开为
+    /// 模型指令继续交给 turn 路由（`/goal <文本>` 设定后立即开工，不需要用户补发）。
+    async fn handle_goal(&self, channel: &str, chat_id: &str, content: &str) -> GoalCommandOutcome {
         let journal = self.session.journal();
         let key = Self::goal_key(channel, chat_id);
-        // 命令头消费与 [`RuntimeCommand::parse`] 同规则（`/` 后可有空白、命令名大小写
-        // 不敏感）：dispatch 把整条原文传进来，`/GOAL clear`、`/ goal clear` 若按
-        // 大小写敏感的前缀剥离，命令名剥不掉，会被当成设定目标「GOAL clear」。
-        let after_slash = content
-            .trim()
-            .strip_prefix('/')
-            .map(str::trim_start)
-            .unwrap_or_else(|| content.trim());
-        let mut tokens = after_slash.splitn(2, char::is_whitespace);
-        let name = tokens.next().unwrap_or("");
-        let arg = if name.eq_ignore_ascii_case("goal") {
-            tokens.next().unwrap_or("").trim()
-        } else {
-            after_slash.trim()
-        };
-        match arg {
-            "" => match journal.kv_get(&key) {
+        match parse_goal_command(content) {
+            GoalCommand::Show => GoalCommandOutcome::Reply(match journal.kv_get(&key) {
                 Ok(Some(value)) => {
                     let objective = value
                         .get("objective")
@@ -2088,31 +2136,71 @@ impl TurnManager {
                     )
                 }
                 _ => "当前会话未设定目标。用法：/goal <目标文本> 设定；/goal 查看现状；/goal clear 收尾。".to_string(),
-            },
-            "clear" | "done" | "完成" | "清除" => {
+            }),
+            GoalCommand::Clear => {
                 // 未设定时也按成功回执（幂等，不制造错误噪音）。
                 let _ = journal.kv_delete(&key);
-                "✅ 会话目标已清除。".to_string()
+                GoalCommandOutcome::Reply("✅ 会话目标已清除。".to_string())
             }
-            objective => {
+            GoalCommand::Set(objective) => {
                 let objective = objective.trim();
                 if objective.chars().count() > 2000 {
-                    return "目标文本过长（上限 2000 字符）；请提炼为可核对的结果性描述。".to_string();
+                    return GoalCommandOutcome::Reply(
+                        "目标文本过长（上限 2000 字符）；请提炼为可核对的结果性描述。"
+                            .to_string(),
+                    );
                 }
                 let payload = serde_json::json!({
                     "objective": objective,
                     "created_at": chrono::Utc::now().timestamp_millis(),
                 });
                 match journal.kv_set(&key, &payload) {
-                    Ok(()) => format!(
-                        "🎯 会话目标已设定：{objective}\n\n此后本会话每次回复都会收到该目标提醒，\
-                         在目标达成前请持续朝它工作并按证据核对；每次成功收尾系统会用一次小审计\
-                         核对证据，确认达成后自动清除目标（也可随时 /goal clear 手动收尾）。"
-                    ),
-                    Err(error) => format!("⚠️ 目标写入失败: {error}"),
+                    Ok(()) => GoalCommandOutcome::Set {
+                        receipt: format!(
+                            "🎯 会话目标已设定：{objective}\n\n此后本会话每次回复都会收到该目标提醒，\
+                             在目标达成前请持续朝它工作并按证据核对；每次成功收尾系统会用一次小审计\
+                             核对证据，确认达成后自动清除目标（也可随时 /goal clear 手动收尾）。"
+                        ),
+                        objective: objective.to_string(),
+                    },
+                    Err(error) => {
+                        GoalCommandOutcome::Reply(format!("⚠️ 目标写入失败: {error}"))
+                    }
                 }
             }
         }
+    }
+
+    /// `/goal` 设定回执：强制 intermediate。设定成功后调用方必然**尝试**一次 turn
+    /// （spawn 或插队）；`spawn_turn` 被静默门拒绝时由 `route` 的维护提示兜底（目标
+    /// 已落库，下一轮提醒继续驱动）。回执若按普通最终消息投递，桌面端会在 turn 真正
+    /// 开始前解除忙碌态（停止按钮消失、排队消息被提前放行、工具行被 settle），正是
+    /// `send_command_reply` 注释里描述的「把命令回执当成收尾」误判。
+    async fn send_goal_receipt(&self, channel: &str, chat_id: &str, receipt: String) {
+        let _ = self
+            .outbound_tx
+            .send(
+                BusMessage::new(channel.to_string(), chat_id.to_string(), receipt)
+                    .with_intermediate(),
+            )
+            .await;
+    }
+
+    /// `/goal <目标>` 设定成功后的模型侧展开文。
+    ///
+    /// 必须 gate 中立：`Run::new_with_base` 用展开文作为本轮目标源
+    /// （`requested_external_actions` / `filename_tokens`），所以这里只做纯中文陈述，
+    /// 不引入任何动作关键词（写入 / 保存 / 部署 / 安装 / 提交 / 推送 / 合并 …）与
+    /// 「名字.后缀」形态的 token，避免完成闸门凭空多出「本 turn 必须证明的动作」。
+    /// 也不能以 `/` 开头：leftover 重路由会把展开文再次交给 `route` → `dispatch`，
+    /// 以斜杠开头且恰好是已知命令时会被误当命令执行。
+    fn goal_command_expansion(objective: &str) -> String {
+        format!(
+            "用户刚刚用 `/goal` 命令把下面这段文字设为本会话的长期目标（已记录，直到目标达成或被清除）：\n\n\
+             「{objective}」\n\n\
+             请立即围绕这个目标开始实际工作：先确认当前状态与已有进展，再直接推进目标要求的\
+             实际任务并运行必要的验证；不要只回复确认，也不要停留在计划上。"
+        )
     }
 
     /// 统一的分叉入口（桌面 `chat_fork` 命令与 `/fork <id>` 斜杠命令共用）：复制可见
@@ -3389,9 +3477,9 @@ impl TurnManager {
         // 方案 B：完成闸门拒绝耗尽后「警告 + 候选回复」一并投递的轮。投递走成功
         // 分支（内容要出去），记账按失败（completed_successfully 在收尾处降级）。
         let mut warned_delivery = false;
-        // 闸门接受的交付正文末尾附带了运行时披露块（仍有未解决的副作用工具错误）。
-        // 只影响 cron 状态符：披露块明写「请勿视为已完成」，不能再打 ✅；记账与
-        // 目标审计仍按 Supported（内容已受支持地交付，未解决错误已向用户公开）。
+        // 闸门接受的交付正文末尾附带了运行时披露块（仍有未确认完成的工具调用）。
+        // 只影响 cron 状态符：披露块明写「核实前不要描述为已完成」，不能再打 ✅；记账与
+        // 目标审计仍按 Supported（内容已受支持地交付，未确认项已向用户公开）。
         let mut disclosed_delivery = false;
         // B1：工具执行期间被 /cancel 打断时，记录尚未持久化的 assistant(tool_calls)
         // （连同其迭代号，清理阶段上报面板结束事件要用），清理阶段连同 aborted 占位
@@ -4287,8 +4375,8 @@ impl TurnManager {
             // 正常结束：持久化最终 assistant + 推送 outbound（与旧 handle_turn 一致）。
             let reply_text = if is_cron {
                 // Unverified（警告投递）轮不打 ✅ 成功符（codex r9）；Supported 但正文
-                // 附带运行时披露块（未解决的副作用错误）同样不打 ✅——披露块明写
-                // 「请勿视为已完成」，状态符不能与之相左。
+                // 附带运行时披露块（尚未确认完成的工具调用）同样不打 ✅——披露块明写
+                // 「核实前不要描述为已完成」，状态符不能与之相左。
                 cron_report(
                     &msg,
                     &text,

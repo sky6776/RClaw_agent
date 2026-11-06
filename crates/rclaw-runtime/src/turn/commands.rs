@@ -76,13 +76,29 @@ fn is_privileged(msg: &BusMessage) -> bool {
         || msg.channel == "desktop"
 }
 
+/// 路由层命令分发结果。
+pub(super) enum DispatchOutcome {
+    /// 未知斜杠 / 普通消息：继续走插队或新 turn。
+    NotHandled,
+    /// 命令已执行并完成结果分发：`route` 直接返回。
+    Handled,
+    /// 命令已产生状态副作用，但这条消息还要作为 turn 输入继续路由（`/goal <文本>`：
+    /// 目标已落库，消息已展开为「立即开工」的模型输入）。
+    StartTurn(BusMessage),
+}
+
 /// 在进入活动 turn 路由前处理所有即时命令。
 ///
-/// 返回 `true` 表示命令已执行并完成结果分发；未知斜杠和普通消息返回 `false`，继续走
-/// 插队或新 turn。状态依赖、优先级与 outbound 语义全部封装在这里。
-pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bool {
+/// [`DispatchOutcome::Handled`] 表示命令已执行并完成结果分发；[`NotHandled`] 表示未知
+/// 斜杠或普通消息，继续走插队或新 turn；[`StartTurn`] 表示命令的副作用已完成，但当前
+/// 消息要作为 turn 输入继续交给 `route` 的既有 active/spawn 逻辑。状态依赖、优先级与
+/// outbound 语义全部封装在这里。
+///
+/// [`NotHandled`]: DispatchOutcome::NotHandled
+/// [`StartTurn`]: DispatchOutcome::StartTurn
+pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> DispatchOutcome {
     if msg.source() != MessageSource::User {
-        return false;
+        return DispatchOutcome::NotHandled;
     }
 
     if let Some(command) = RuntimeCommand::parse(&msg.content) {
@@ -101,12 +117,12 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                         .to_string(),
                 )
                 .await;
-            return true;
+            return DispatchOutcome::Handled;
         }
         let response = match command {
             RuntimeCommand::Cancel => {
                 manager.route_cancel(TurnKey::from_msg(msg)).await;
-                return true;
+                return DispatchOutcome::Handled;
             }
             RuntimeCommand::Context => manager.handle_context(&msg.channel, &msg.chat_id),
             RuntimeCommand::Skills => manager.handle_skills_command(&msg.content),
@@ -125,7 +141,7 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                         .send_command_reply(&channel, &chat_id, response)
                         .await;
                 });
-                return true;
+                return DispatchOutcome::Handled;
             }
             RuntimeCommand::Rewind => {
                 manager
@@ -145,12 +161,38 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                         .send_command_reply(&channel, &chat_id, response)
                         .await;
                 });
-                return true;
+                return DispatchOutcome::Handled;
             }
             RuntimeCommand::Goal => {
-                manager
+                match manager
                     .handle_goal(&msg.channel, &msg.chat_id, &msg.content)
                     .await
+                {
+                    // 查询 / 清除 / 超长 / 写库失败：只回执，不进入 turn。
+                    GoalCommandOutcome::Reply(text) => {
+                        manager
+                            .send_command_reply(&msg.channel, &msg.chat_id, text)
+                            .await;
+                        return DispatchOutcome::Handled;
+                    }
+                    // 目标已落库：先发强制 intermediate 的回执（turn 还没启动，非
+                    // intermediate 会提前解除桌面忙碌态、放行排队消息），再把同一条
+                    // 消息展开成交给 turn 的指令继续路由。原文保留在 display_content。
+                    GoalCommandOutcome::Set { receipt, objective } => {
+                        manager
+                            .send_goal_receipt(&msg.channel, &msg.chat_id, receipt)
+                            .await;
+                        tracing::info!(
+                            channel = ?msg.channel,
+                            chat_id = ?msg.chat_id,
+                            objective_chars = objective.chars().count(),
+                            "/goal 已写入，作为 turn 输入继续路由"
+                        );
+                        return DispatchOutcome::StartTurn(msg.clone().expand_model_content(
+                            TurnManager::goal_command_expansion(&objective),
+                        ));
+                    }
+                }
             }
             RuntimeCommand::Export => {
                 // 导出要把整段 transcript（可能上千条）读出来并渲染、落盘：虽然走的是
@@ -166,20 +208,20 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
                         .send_command_reply(&channel, &chat_id, response)
                         .await;
                 });
-                return true;
+                return DispatchOutcome::Handled;
             }
         };
         manager
             .send_command_reply(&msg.channel, &msg.chat_id, response)
             .await;
-        return true;
+        return DispatchOutcome::Handled;
     }
 
     let Some(registry) = &manager.slash else {
-        return false;
+        return DispatchOutcome::NotHandled;
     };
     let CommandOutcome::Handled(response) = registry.try_handle(&msg.content) else {
-        return false;
+        return DispatchOutcome::NotHandled;
     };
     tracing::info!(
         "斜杠命令命中 {}:{}，路由层跳过 LLM",
@@ -189,7 +231,7 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> bo
     manager
         .send_command_reply(&msg.channel, &msg.chat_id, response)
         .await;
-    true
+    DispatchOutcome::Handled
 }
 
 #[cfg(test)]
@@ -208,6 +250,8 @@ mod tests {
             ("/LOG list", RuntimeCommand::Log),
             ("/compact", RuntimeCommand::Compact),
             ("/rewind 1791753207350478000", RuntimeCommand::Rewind),
+            ("/goal", RuntimeCommand::Goal),
+            ("/ GOAL 完成迁移", RuntimeCommand::Goal),
             ("/export", RuntimeCommand::Export),
             ("/export all", RuntimeCommand::Export),
         ] {
@@ -222,6 +266,7 @@ mod tests {
             "/login",
             "/clearing",
             "/exports",
+            "/goalx",
             "/llmodel glm-5.3",
         ] {
             assert_eq!(RuntimeCommand::parse(input), None, "input={input}");

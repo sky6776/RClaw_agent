@@ -309,6 +309,13 @@ fn shell_command(command: &str) -> TokioCommand {
         // 中文或 emoji 既可能乱码，也可能在写 stdout 时直接抛 UnicodeEncodeError。
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1");
+    // GUI 宿主没有控制台：本次直接创建的 `cmd.exe` 会新分配可见窗口。
+    // CREATE_NO_WINDOW 只作用于本次 CreateProcess，不是可继承属性——`cmd` 再启动的
+    // python/node 等 console 子孙进程仍可能新建窗口（完整进程树隐藏需要隐藏 console，
+    // 属已知边界）。CLI 自带控制台时不加，保留 Ctrl+C 语义。
+    if let Some(flags) = crate::no_window_creation_flags(crate::has_attached_console()) {
+        cmd.creation_flags(flags);
+    }
     cmd
 }
 
@@ -395,14 +402,12 @@ fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：桌面版下不闪控制台。
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(crate::CREATE_NO_WINDOW)
             .status();
     }
     #[cfg(unix)]

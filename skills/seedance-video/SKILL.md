@@ -143,6 +143,12 @@ priority/execution_expires_after/safety_identifier；不支持 web_search/mute�
 轮询超时（`POLL_TIMEOUT`）后任务仍在服务端运行，稍后用 `check_task` 补查并下载；
 排队中的任务可用 `cancel_task` 取消。
 
+任务仍在 `queued` / `running` 时，`check_task` 返回 `ok: true, pending: true,
+saved: false`（退出码 0）——这是正常的中间态，不是工具执行失败；按返回的
+`message` 稍后再次查询即可。任务 `failed`/`cancelled`/`expired` 且要求下载时
+才返回非零错误。任务成功且要求下载时返回 `saved: true` + `saved_file`；`saved`
+字段只在 pending（false）与成功下载（true）两种结果出现，未请求下载时不出现。
+
 ### 联网搜索（时效性内容）
 
 ```json

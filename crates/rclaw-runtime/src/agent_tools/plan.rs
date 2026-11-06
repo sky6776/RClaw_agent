@@ -3483,7 +3483,7 @@ mod tests {
         // codex 第 5 轮反例：残缺 JSON 超过放弃阈值时中和会裁掉后文——披露在
         // 中和与总量截断全部结束之后追加，不随之丢失。
         let flood = r#"{"a" "#.repeat(MAX_JSON_RESCANS + 6);
-        let disclosure = "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）";
+        let disclosure = "⚠️ 尚未确认完成的工具调用（运行时记录，请核对；核实前不要描述为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）";
         let brief = verification_brief(&flood, Some(disclosure), &handoff);
         assert!(
             brief.ends_with(disclosure),

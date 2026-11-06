@@ -214,8 +214,9 @@ pub(crate) fn spill_if_over_budget(
         spill.threshold_bytes, PREVIEW_BYTES, preview.text,
     );
     if !disclosure_suffix.is_empty() {
-        content
-            .push_str("\n\n未解决工具错误的运行时披露（原文位于被省略的中段，随预览保留）：\n\n");
+        content.push_str(
+            "\n\n尚未确认完成的工具调用的运行时记录（原文位于被省略的中段，随预览保留）：\n\n",
+        );
         content.push_str(&disclosure_suffix);
     }
     Some(path)
@@ -310,7 +311,7 @@ fn disclosure_block_from_text(text: &str) -> Option<String> {
 /// 从交付正文剥掉模型复述的运行时披露块（行首标题 + 连续条目行，形态同
 /// [`disclosure_block_from_text`]）。披露块已随上一轮回复进入历史与父代理的工具结果，
 /// 模型照抄时其回执号指向别的轮、条目可能早已解决；运行时在交付前按当前账本重新附加
-/// 披露，不剥掉照抄块用户就会看到两份互相矛盾的「请勿视为已完成」。只剥行首明文块
+/// 披露，不剥掉照抄块用户就会看到两份互相矛盾的披露。只剥行首明文块
 /// （句中引用的标题、孤立标题不动），块两侧的空行只留一组分隔。
 pub(super) fn strip_runtime_disclosure_blocks(text: &str) -> String {
     let header = super::run::RUNTIME_DISCLOSURE_HEADER;
@@ -732,6 +733,39 @@ mod tests {
         assert!(content.len() < PREVIEW_BYTES + 900, "{}", content.len());
         // 句柄必须给出读取指引（read 行分页；文件已分行，单行内容也能取回）。
         assert!(content.contains("offset/limit"), "{content}");
+    }
+
+    #[test]
+    fn spill_preview_keeps_disclosure_with_current_wording() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = spill_on(1024);
+        let header = super::super::run::RUNTIME_DISCLOSURE_HEADER;
+        let disclosure = format!(
+            "{}{}- write（回执 r0-1-11111111，类别 timeout）",
+            header, "\n"
+        );
+        // 披露块放在会被省略的中段：头/尾预览都看不到它，只能由 suffix 回填。
+        let head = "H".repeat(600);
+        let middle = "m".repeat(8192);
+        let tail = "T".repeat(4096);
+        let mut content = format!("{head}{middle}\n{disclosure}\n{tail}");
+        let path = spill_if_over_budget(
+            &spill,
+            dir.path(),
+            "cli",
+            "console",
+            "read",
+            "{}",
+            &mut content,
+        );
+        assert!(path.is_some());
+        assert!(
+            content
+                .contains("尚未确认完成的工具调用的运行时记录（原文位于被省略的中段，随预览保留）"),
+            "{content}"
+        );
+        assert!(content.contains(&disclosure), "{content}");
+        assert_eq!(content.matches(header).count(), 1, "{content}");
     }
 
     #[test]

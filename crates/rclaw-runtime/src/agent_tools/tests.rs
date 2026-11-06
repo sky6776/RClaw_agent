@@ -63,7 +63,7 @@ fn background_rendering_survives_disclosure_and_content_loss() {
     // codex 第 2 轮 #1：结构化 handoff 渲染不输出 content、content 可能被截断——
     // 未解决错误披露作为独立状态在渲染层最后附加，保证父代理一定看到。
     let disclosure =
-        "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
+        "⚠️ 尚未确认完成的工具调用（运行时记录，请核对；核实前不要描述为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
             .to_string();
     let result = AgentTaskResult {
         name: "analyst".to_string(),
@@ -99,7 +99,7 @@ fn disclosure_survives_content_truncation_in_both_renderers() {
     // codex 第 3 轮 nice-to-have：真实 truncate_chars 截断切掉尾部披露后，
     // 前后台渲染仍各恰好出现一次披露（经独立字段补挂）。
     let disclosure =
-        "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
+        "⚠️ 尚未确认完成的工具调用（运行时记录，请核对；核实前不要描述为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
             .to_string();
     let truncated = truncate_chars(&format!("{}\n\n{disclosure}", "x".repeat(4096)), 512);
     assert!(!truncated.contains(&disclosure), "前置：截断确实切掉了披露");
@@ -203,7 +203,7 @@ fn cancellation_before_terminal_commit_revokes_media_delivery() {
         ],
         media_publish_attempted: false,
         unresolved_disclosure:
-            "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
+            "⚠️ 尚未确认完成的工具调用（运行时记录，请核对；核实前不要描述为已完成）：\n- memory（回执 r0-1-027e4bd5，类别 tool_execution）"
                 .to_string(),
     };
 

@@ -868,7 +868,9 @@ anchor_message_id}`（请求里最后一条已持久化消息的 `Message.id`）
      不变，重写确定性复现）；askJson 的 Rust 校验器扩展 const/enum/anyOf。
      tsc 可选类型检查与 lint 跑重写后的脚本（exec script）。
 6. **/goal 会话长期目标**：`/goal <目标文本>` 设定（kv `session-goal/<channel>/<chat_id>`，
-   按会话隔离）、`/goal` 查看、`/goal clear|done` 收尾。设定后本会话【每次推理的尾部
+   按会话隔离）、`/goal` 查看、`/goal clear|done` 收尾。设定成功后同一条消息展开为
+   「立即开工」的模型指令并继续走 turn 路由（无需用户补发第二条；历史保留 `/goal` 原文），
+   活动 turn 期间则作为插队输入并入当前 turn。设定后本会话【每次推理的尾部
    上下文】注入 `[Session goal]` 提醒块（`TurnManager::goal_reminder_block`）：目标原文
    + 持续工作 + 收尾前按证据逐项核对 + 不把计划当完成 + 提醒用户收尾——对齐 ZCode
    goal reminder 的关键语义；RClaw 无运行时完成校验器，完成判定 = 模型按证据自评 +

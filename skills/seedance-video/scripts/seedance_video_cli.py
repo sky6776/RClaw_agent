@@ -43,6 +43,9 @@ MAX_SAFETY_ID_LEN = 64
 MAX_PROMPT_CHARS = 5000
 TERMINAL_OK = "succeeded"
 TERMINAL_FAIL = ("failed", "cancelled", "expired")
+# 非终态：任务还在排队/运行。查询成功但尚未产出视频，用 pending 表达中间态，
+# 不用 fail()——退出码 0 表示「查询这个工具调用成功」，pending 是业务字段。
+PENDING_STATUS = ("queued", "running")
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 # 本地图片转 Base64 的格式映射；视频不支持 Base64（仅 URL / 素材 ID）。
 IMAGE_MIMES = {
@@ -628,18 +631,69 @@ def run_generate(args, config: dict):
 
 
 def run_check(args, config: dict):
-    result = request_json(config, task_url(config, args.task_id.strip()))
+    task_id = args.task_id.strip()
+    result = request_json(config, task_url(config, task_id))
     summary = summarize_task(result)
-    output = {"ok": True, **summary}
-    if args.save:
-        if summary["status"] != TERMINAL_OK or not summary["video_url"]:
-            fail("NOT_READY", f"任务状态为 {summary['status']}，尚无可下载视频（task_id={args.task_id}）")
-        save_path = Path(args.save)
-        ext = "." + str(summary.get("output_format") or "mp4")
-        target = save_path if save_path.suffix.lower() == ext else save_path.with_suffix(ext)
-        output["saved_file"] = str(
-            download_media(summary["video_url"], target, config["download_timeout_sec"], config["max_download_bytes"], "video")
+    status = summary.get("status")
+    output = {"ok": True, **summary, "task_id": task_id}
+    if not status:
+        fail("POLL_FAILED", f"任务查询响应缺少 status（task_id={task_id}）")
+
+    # 排队/运行中：查询成功、下载尚未发生。exit 0 + pending:true 是正常中间态，
+    # 不是工具执行失败；稍后再次调用 check_task 即可。
+    if status in PENDING_STATUS:
+        output.update(
+            {
+                "pending": True,
+                "saved": False,
+                "message": (
+                    f"任务状态为 {status}，尚无可下载视频（task_id={task_id}）；"
+                    "这不是执行错误，稍后可再次调用 check_task"
+                ),
+            }
         )
+        print(json.dumps(output, ensure_ascii=False))
+        return
+
+    if status in TERMINAL_FAIL:
+        # 纯查询（未要求下载）：任务失败本身是查询结果，exit 0 让模型读取
+        # status/error 后决定是否重新生成；要求下载时才是本次调用失败。
+        if not args.save:
+            print(json.dumps(output, ensure_ascii=False))
+            return
+        fail(
+            "TASK_" + status.upper(),
+            f"任务状态为 {status}，无法下载视频（task_id={task_id}）",
+            task_id=task_id,
+            task_status=status,
+        )
+
+    if status != TERMINAL_OK:
+        # 未知状态保守按硬失败处理，避免把新状态静默成 pending。
+        fail(
+            "POLL_FAILED",
+            f"未知任务状态 {status}（task_id={task_id}）",
+            task_id=task_id,
+            task_status=status,
+        )
+
+    if not args.save:
+        print(json.dumps(output, ensure_ascii=False))
+        return
+
+    if not summary["video_url"]:
+        fail(
+            "MISSING_VIDEO_URL",
+            f"任务成功但响应中没有 video_url（task_id={task_id}）",
+            task_id=task_id,
+        )
+    save_path = Path(args.save)
+    ext = "." + str(summary.get("output_format") or "mp4")
+    target = save_path if save_path.suffix.lower() == ext else save_path.with_suffix(ext)
+    output["saved_file"] = str(
+        download_media(summary["video_url"], target, config["download_timeout_sec"], config["max_download_bytes"], "video")
+    )
+    output["saved"] = True
     print(json.dumps(output, ensure_ascii=False))
 
 
