@@ -713,11 +713,8 @@ fn write_export_file(
     };
     let stamp = chrono::Local::now();
     let agent_root = home.join("agent");
-    let rel = crate::export::export_rel_path(
-        &title,
-        &stamp.format("%Y%m%d-%H%M%S").to_string(),
-        fmt,
-    );
+    let rel =
+        crate::export::export_rel_path(&title, &stamp.format("%Y%m%d-%H%M%S").to_string(), fmt);
     let bytes = match fmt {
         "docx" => crate::export::render_docx(
             &title,
@@ -1871,8 +1868,7 @@ fn attach_html_tool_details(
                     let (input, _) = truncate_tool_field(&input, TOOL_INPUT_MAX_BYTES);
                     let mut used = input.len();
                     let result = if let Some(r) = &c.result {
-                        let (content, _) =
-                            truncate_tool_result(&r.content, TOOL_RESULT_MAX_BYTES);
+                        let (content, _) = truncate_tool_result(&r.content, TOOL_RESULT_MAX_BYTES);
                         used += content.len();
                         Some(ExportToolResult {
                             content,
@@ -2993,7 +2989,10 @@ pub async fn wxbot_contacts_list(
     kind: String,
 ) -> Result<Vec<rclaw_channels::wxbot::ContactInfoDto>, WxbotContactsError> {
     // kind 只放行列表接口的合法取值，其余在本地拦下（不给 WCX 发无意义请求）。
-    if !matches!(kind.as_str(), "friends" | "groups" | "official_accounts" | "all") {
+    if !matches!(
+        kind.as_str(),
+        "friends" | "groups" | "official_accounts" | "all"
+    ) {
         return Err(WxbotContactsError {
             code: "bad_kind".into(),
             message: format!("不支持的联系人类型：{kind}"),
@@ -3599,10 +3598,8 @@ mod tests {
                 tool_detail_error: None,
             })
             .collect();
-        let rel_md =
-            super::write_export_file(dir.path(), "", "md", messages.clone()).unwrap();
-        let rel_docx =
-            super::write_export_file(dir.path(), "测试导出", "docx", messages).unwrap();
+        let rel_md = super::write_export_file(dir.path(), "", "md", messages.clone()).unwrap();
+        let rel_docx = super::write_export_file(dir.path(), "测试导出", "docx", messages).unwrap();
         // title 空白兜底「会话导出」在 helper 内统一完成（前端传空也安全）。
         assert!(rel_md.contains("会话导出"));
         assert!(rel_md.starts_with("output/exports/") && rel_md.ends_with(".md"));
@@ -3801,23 +3798,16 @@ mod tests {
         let session = test_session(dir.path());
         let agent_root = dir.path().join("agent");
         std::fs::create_dir_all(&agent_root).unwrap();
-        let mut messages: Vec<crate::export::ExportMessage> =
-            vec![crate::export::ExportMessage {
-                role: "status".into(),
-                content: "🔧 调用工具: read".into(),
-                ts: 0,
-                seg_complete: true,
-                msg_id: 999_999,
-                tools: Vec::new(),
-                tool_detail_error: None,
-            }];
-        super::attach_html_tool_details(
-            &session,
-            "no-such-chat",
-            &agent_root,
-            &mut messages,
-            4096,
-        );
+        let mut messages: Vec<crate::export::ExportMessage> = vec![crate::export::ExportMessage {
+            role: "status".into(),
+            content: "🔧 调用工具: read".into(),
+            ts: 0,
+            seg_complete: true,
+            msg_id: 999_999,
+            tools: Vec::new(),
+            tool_detail_error: None,
+        }];
+        super::attach_html_tool_details(&session, "no-such-chat", &agent_root, &mut messages, 4096);
         assert_eq!(
             messages[0].tool_detail_error.as_deref(),
             Some("未找到工具详情（可能不是工具调用行或已被清理）")

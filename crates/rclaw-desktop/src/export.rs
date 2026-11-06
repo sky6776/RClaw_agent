@@ -380,11 +380,7 @@ fn validate_image_rel(rel: &str) -> Result<(), String> {
     {
         return Err("路径越界".into());
     }
-    let ext = rel
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ext = rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp") {
         return Err("扩展名不在图片白名单".into());
     }
@@ -1053,7 +1049,11 @@ fn render_tool_details(out: &mut String, tools: &[ExportToolCall], budget: &mut 
             html_escape(&call.name)
         );
         if let Some(skill) = &call.skill {
-            let _ = write!(out, "<span class=\"tool-skill\">🧩 {}</span>", html_escape(skill));
+            let _ = write!(
+                out,
+                "<span class=\"tool-skill\">🧩 {}</span>",
+                html_escape(skill)
+            );
         }
         if let Some(ms) = call.duration_ms {
             let _ = write!(
@@ -1090,7 +1090,11 @@ fn render_tool_details(out: &mut String, tools: &[ExportToolCall], budget: &mut 
                 out,
                 "<div class=\"tool-field\"><h5>文件写入前快照 · {}{}</h5>",
                 html_escape(&cp.path),
-                if cp.deleted { "（该次操作删除了文件）" } else { "" }
+                if cp.deleted {
+                    "（该次操作删除了文件）"
+                } else {
+                    ""
+                }
             );
             match &cp.before {
                 Some(before) => {
@@ -1143,7 +1147,11 @@ fn render_html_message(
     match msg.role.as_str() {
         "thinking" => {
             out.push_str("<details class=\"thinking\"><summary>💭 思考过程</summary>");
-            let body = if trimmed.is_empty() { "（媒体消息）" } else { trimmed };
+            let body = if trimmed.is_empty() {
+                "（媒体消息）"
+            } else {
+                trimmed
+            };
             let _ = write!(out, "<div class=\"body\">{}</div>", html_escape(body));
             budget.render_images(out, &msg.content, false);
             out.push_str("</details>");
@@ -1154,8 +1162,15 @@ fn render_html_message(
             } else {
                 ("助手", "assistant")
             };
-            let _ = write!(out, "<article class=\"msg {cls}\"><div class=\"who\">{who}</div>");
-            let body = if trimmed.is_empty() { "（媒体消息）" } else { trimmed };
+            let _ = write!(
+                out,
+                "<article class=\"msg {cls}\"><div class=\"who\">{who}</div>"
+            );
+            let body = if trimmed.is_empty() {
+                "（媒体消息）"
+            } else {
+                trimmed
+            };
             let _ = write!(out, "<div class=\"body\">{}</div>", html_escape(body));
             budget.render_images(out, &msg.content, allow_backlink_target);
             out.push_str("</article>");
@@ -1165,7 +1180,11 @@ fn render_html_message(
         // 现状注记/原文。
         _ => {
             let summary = html_summary_line(&msg.content, 120);
-            let summary = if summary.is_empty() { "🔧 工具调用".to_string() } else { summary };
+            let summary = if summary.is_empty() {
+                "🔧 工具调用".to_string()
+            } else {
+                summary
+            };
             let _ = write!(
                 out,
                 "<details class=\"tool\"><summary>{}</summary>",
@@ -1253,10 +1272,7 @@ fn estimate_html_capacity(
     // 调用方可能传未 canonicalize 的路径（测试直传临时目录）——根内校验
     // 要求两侧同形，内部统一 canonicalize（与 render_html_with_budget 一致）。
     let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let rounds = messages
-        .iter()
-        .filter(|m| m.role == "user")
-        .count();
+    let rounds = messages.iter().filter(|m| m.role == "user").count();
     let text_bytes: usize = messages
         .iter()
         .map(|m| {
@@ -1388,8 +1404,12 @@ fn render_html_with_budget(
     let (preamble, rounds) = split_html_rounds(messages);
 
     // 容量预估（预扫与实际内嵌同口径：只计 resolve 成功的候选）。
-    let (estimate, _) =
-        estimate_html_capacity(messages, &root_canon, policy.total_budget, policy.max_image_bytes);
+    let (estimate, _) = estimate_html_capacity(
+        messages,
+        &root_canon,
+        policy.total_budget,
+        policy.max_image_bytes,
+    );
     let mut out = String::with_capacity(estimate);
 
     out.push_str("<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n");
@@ -1399,7 +1419,11 @@ fn render_html_with_budget(
     out.push_str("<link rel=\"icon\" href=\"data:,\">\n");
     let _ = write!(out, "<title>{}</title>\n", html_escape(title));
     let _ = write!(out, "<style>{}</style>\n</head>\n<body>\n", HTML_CSS);
-    let _ = write!(out, "<header class=\"doc-head\"><h1>{}</h1>", html_escape(title));
+    let _ = write!(
+        out,
+        "<header class=\"doc-head\"><h1>{}</h1>",
+        html_escape(title)
+    );
     // 头部统计先占位，消息主体渲染完后回填（轮次/条目数已知，张数未知）。
     // 0 轮（没有 user 条目）时「N 轮」省略，与导航 ≥2 才渲染的口径一致。
     let rounds_label = if rounds.is_empty() {
@@ -1676,9 +1700,7 @@ mod tests {
     fn extract_image_paths_respects_export_count_cap() {
         // 250 条内联路径（路径置于行尾：内联提取会吃进尾部空格与文字）→
         // 去重后截到 EXPORT_IMAGE_MAX_COUNT（200）。
-        let contents: Vec<String> = (0..250)
-            .map(|i| format!("图 media/out/{i}.png"))
-            .collect();
+        let contents: Vec<String> = (0..250).map(|i| format!("图 media/out/{i}.png")).collect();
         let paths = extract_image_paths(&contents);
         assert_eq!(paths.len(), EXPORT_IMAGE_MAX_COUNT);
     }
@@ -1719,8 +1741,8 @@ mod tests {
                 tool_detail_error: None,
             },
         ];
-        let html = render_html("标\"题", "2026-11-01", &messages, Path::new("/nonexistent"))
-            .unwrap();
+        let html =
+            render_html("标\"题", "2026-11-01", &messages, Path::new("/nonexistent")).unwrap();
         // 原始标签/属性不出现；onerror 文本作为已转义正文存活是安全预期。
         assert!(!html.contains("<script>"));
         assert!(!html.contains("<img"));
@@ -2063,8 +2085,14 @@ mod tests {
 
     #[test]
     fn sniff_image_mime_recognizes_magic_and_rejects_svg() {
-        assert_eq!(sniff_image_mime(&[0x89, b'P', b'N', b'G']), Some("image/png"));
-        assert_eq!(sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(
+            sniff_image_mime(&[0x89, b'P', b'N', b'G']),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
         assert_eq!(sniff_image_mime(b"GIF89a"), Some("image/gif"));
         assert_eq!(sniff_image_mime(b"BM\x00\x00"), Some("image/bmp"));
         // SVG 有脚本面，即使扩展名叫 .png 也拒绝。
@@ -2276,10 +2304,7 @@ mod tests {
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();
         // 前 20 条占位，之后只累计：头部统计仍准确（22 张未内嵌）。
         // 注：匹配 div 开标签而非类名——<style> 里的 .media-skip 规则也会命中。
-        assert_eq!(
-            html.matches("<div class=\"media-skip\">").count(),
-            20
-        );
+        assert_eq!(html.matches("<div class=\"media-skip\">").count(), 20);
         assert!(html.contains("22 张未内嵌"));
     }
 
@@ -2307,7 +2332,11 @@ mod tests {
     fn html_rejects_svg_content_in_png_name() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("media/out")).unwrap();
-        std::fs::write(dir.path().join("media/out/evil.png"), b"<svg xmlns='x'></svg>").unwrap();
+        std::fs::write(
+            dir.path().join("media/out/evil.png"),
+            b"<svg xmlns='x'></svg>",
+        )
+        .unwrap();
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "看 media/out/evil.png".into(),
@@ -2374,12 +2403,10 @@ mod tests {
             tool_detail_error: None,
         }];
         // 单张上限 50：big 超限 → 只有 ok 可内嵌。
-        let (_, image_bytes) =
-            estimate_html_capacity(&messages, dir.path(), u64::MAX, 50);
+        let (_, image_bytes) = estimate_html_capacity(&messages, dir.path(), u64::MAX, 50);
         assert_eq!(image_bytes, 24);
         // 放宽上限：big（合法 PNG 魔数）计入；empty/bad 仍被排除。
-        let (_, image_bytes) =
-            estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
+        let (_, image_bytes) = estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
         assert_eq!(image_bytes, 24 + 124);
     }
 
@@ -2402,8 +2429,7 @@ mod tests {
         }];
         // 预扫用「读至多 4 字节」口径，与渲染全量 sniff 一致：2/3 字节魔数
         // 可内嵌（计 2+3 字节），1 字节 x.png 不计。
-        let (_, image_bytes) =
-            estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
+        let (_, image_bytes) = estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
         assert_eq!(image_bytes, 5);
     }
 
@@ -2427,8 +2453,7 @@ mod tests {
         }];
         // 尝试预算被 2000 个缺失路径耗尽：预扫与渲染同口径，late.png 两边
         // 都不计/不嵌（文档化的产品取舍——超长坏路径列表截断处理）。
-        let (_, image_bytes) =
-            estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
+        let (_, image_bytes) = estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
         assert_eq!(image_bytes, 0);
     }
 
@@ -2564,8 +2589,7 @@ mod tests {
             tool_detail_error: None,
         }];
         // 前 200 个缺失候选不占名额：有效图仍被计数并进入容量预估。
-        let (_, image_bytes) =
-            estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
+        let (_, image_bytes) = estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
         assert_eq!(image_bytes, 24);
         // 全无效时图片贡献为 0。
         let bad_only = vec![ExportMessage {
@@ -2577,8 +2601,7 @@ mod tests {
             tools: Vec::new(),
             tool_detail_error: None,
         }];
-        let (_, image_bytes) =
-            estimate_html_capacity(&bad_only, dir.path(), u64::MAX, u64::MAX);
+        let (_, image_bytes) = estimate_html_capacity(&bad_only, dir.path(), u64::MAX, u64::MAX);
         assert_eq!(image_bytes, 0);
     }
 
@@ -3246,8 +3269,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.png"), b"secret-bytes").unwrap();
         std::fs::create_dir_all(dir.path().join("media/out")).unwrap();
-        symlink(outside.path().join("secret.png"), dir.path().join("media/out/link.png"))
-            .unwrap();
+        symlink(
+            outside.path().join("secret.png"),
+            dir.path().join("media/out/link.png"),
+        )
+        .unwrap();
         let messages = vec![ExportMessage {
             role: "user".into(),
             content: "图 media/out/link.png".into(),
@@ -3258,8 +3284,7 @@ mod tests {
             tool_detail_error: None,
         }];
         // 预扫：symlink 指向根外 → resolve 拒绝 → 不计数不 stat。
-        let (_, image_bytes) =
-            estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
+        let (_, image_bytes) = estimate_html_capacity(&messages, dir.path(), u64::MAX, u64::MAX);
         assert_eq!(image_bytes, 0);
         // 渲染：占位「路径越出工作区」，内容不进产物。
         let html = render_html("t", "2026-11-01", &messages, dir.path()).unwrap();

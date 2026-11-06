@@ -187,15 +187,15 @@ impl WxbotApiClient {
             .ok()
             .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
         match status {
-            400 | 403 => Err(ContactsError::BadRequest(
-                server_message.unwrap_or_else(|| {
+            400 | 403 => Err(ContactsError::BadRequest(server_message.unwrap_or_else(
+                || {
                     if status == 403 {
                         "WCX 拒绝访问".into()
                     } else {
                         "WCX 拒绝了请求".into()
                     }
-                }),
-            )),
+                },
+            ))),
             // 重定向已被 client 禁用，出现 3xx 说明代理/网关异常插手，按端点不可用处理。
             s if (300..400).contains(&s) => Err(ContactsError::UnsupportedEndpoint),
             401 => Err(ContactsError::TokenMismatch),
@@ -324,7 +324,11 @@ pub fn list_recent_chats(
     // 且跨账号同 conv_id 天然是两行，与 UI 的 account+convId 复合键对应。
     // user：`user:%_` 排除空前缀行（"user:"），`NOT LIKE '%:'` 排除空 id 行
     // （"user::"/"user:acc:"）；group 的 `@chatroom` 后缀已排除这两类。
-    let chat_id_like = if is_group { "group:%@chatroom" } else { "user:%_" };
+    let chat_id_like = if is_group {
+        "group:%@chatroom"
+    } else {
+        "user:%_"
+    };
     let mut sql = format!(
         "SELECT account, chat_id, COUNT(*) AS n, MAX(create_time) AS last_ts \
          FROM inbound_messages WHERE is_group = ?1 AND chat_id LIKE '{chat_id_like}'"
@@ -339,7 +343,9 @@ pub fn list_recent_chats(
     } else {
         2
     };
-    sql.push_str(&format!(" GROUP BY account, chat_id ORDER BY last_ts DESC LIMIT ?{limit_idx}"));
+    sql.push_str(&format!(
+        " GROUP BY account, chat_id ORDER BY last_ts DESC LIMIT ?{limit_idx}"
+    ));
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| ContactsError::LocalDb(format!("查询失败：{e}")))?;
@@ -372,7 +378,8 @@ pub fn list_recent_chats(
 
     let mut out = Vec::new();
     for row in rows {
-        if let Some(chat) = row.map_err(|e| ContactsError::LocalDb(format!("读取失败：{e}")))? {
+        if let Some(chat) = row.map_err(|e| ContactsError::LocalDb(format!("读取失败：{e}")))?
+        {
             out.push(chat);
         }
     }
@@ -401,13 +408,27 @@ mod tests {
 
     #[test]
     fn new_rejects_blank_token() {
-        assert_eq!(WxbotApiClient::new("http://127.0.0.1:3001", "  ").unwrap_err().code(), "config");
-        assert_eq!(WxbotApiClient::new("http://localhost:3001", "").unwrap_err().code(), "config");
+        assert_eq!(
+            WxbotApiClient::new("http://127.0.0.1:3001", "  ")
+                .unwrap_err()
+                .code(),
+            "config"
+        );
+        assert_eq!(
+            WxbotApiClient::new("http://localhost:3001", "")
+                .unwrap_err()
+                .code(),
+            "config"
+        );
     }
 
     #[test]
     fn new_accepts_loopback_and_trims_base() {
-        for base in ["http://127.0.0.1:3001/", " http://[::1]:3001 ", "http://LOCALHOST:3001"] {
+        for base in [
+            "http://127.0.0.1:3001/",
+            " http://[::1]:3001 ",
+            "http://LOCALHOST:3001",
+        ] {
             assert!(WxbotApiClient::new(base, "tok").is_ok(), "{base} 应可构造");
         }
     }
@@ -444,19 +465,23 @@ mod tests {
 
     #[test]
     fn parse_contacts_rejects_garbage() {
-        assert_eq!(parse_contacts_body("not json").unwrap_err().code(), "decode");
-        assert_eq!(parse_contacts_body(r#"{"other":1}"#).unwrap_err().code(), "decode");
+        assert_eq!(
+            parse_contacts_body("not json").unwrap_err().code(),
+            "decode"
+        );
+        assert_eq!(
+            parse_contacts_body(r#"{"other":1}"#).unwrap_err().code(),
+            "decode"
+        );
     }
 
     // ---- HTTP 状态分类 ----
 
     #[test]
     fn status_400_maps_bad_request_with_server_error_text() {
-        let err = WxbotApiClient::check_status(
-            400,
-            r#"{"error":"WeChat database not ready"}"#.into(),
-        )
-        .unwrap_err();
+        let err =
+            WxbotApiClient::check_status(400, r#"{"error":"WeChat database not ready"}"#.into())
+                .unwrap_err();
         assert_eq!(err.code(), "bad_request");
         assert!(err.to_string().contains("database not ready"));
     }
@@ -476,11 +501,9 @@ mod tests {
 
     #[test]
     fn status_404_json_body_maps_not_found() {
-        let err = WxbotApiClient::check_status(
-            404,
-            r#"{"error":"search matched 0 contact"}"#.into(),
-        )
-        .unwrap_err();
+        let err =
+            WxbotApiClient::check_status(404, r#"{"error":"search matched 0 contact"}"#.into())
+                .unwrap_err();
         assert_eq!(err.code(), "not_found");
     }
 
@@ -488,15 +511,21 @@ mod tests {
     fn status_3xx_maps_unsupported_and_429_5xx_maps_server_error() {
         // 重定向被 client 禁用，3xx = 代理/网关插手 → 端点不可用；429/5xx → 服务端侧。
         assert_eq!(
-            WxbotApiClient::check_status(302, String::new()).unwrap_err().code(),
+            WxbotApiClient::check_status(302, String::new())
+                .unwrap_err()
+                .code(),
             "unsupported_endpoint"
         );
         assert_eq!(
-            WxbotApiClient::check_status(429, String::new()).unwrap_err().code(),
+            WxbotApiClient::check_status(429, String::new())
+                .unwrap_err()
+                .code(),
             "server_error"
         );
         assert_eq!(
-            WxbotApiClient::check_status(503, String::new()).unwrap_err().code(),
+            WxbotApiClient::check_status(503, String::new())
+                .unwrap_err()
+                .code(),
             "server_error"
         );
     }
@@ -511,14 +540,19 @@ mod tests {
     fn debug_never_leaks_token() {
         let client = WxbotApiClient::new("http://127.0.0.1:3001", "super-secret-token").unwrap();
         let rendered = format!("{client:?}");
-        assert!(!rendered.contains("super-secret-token"), "token 不得进 Debug 输出");
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "token 不得进 Debug 输出"
+        );
         assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
     fn new_rejects_non_http_scheme() {
         assert_eq!(
-            WxbotApiClient::new("file://127.0.0.1", "tok").unwrap_err().code(),
+            WxbotApiClient::new("file://127.0.0.1", "tok")
+                .unwrap_err()
+                .code(),
             "config"
         );
     }
@@ -603,7 +637,10 @@ mod tests {
         seed_db(&db);
         let list = list_recent_chats(&db, true, None, 100).unwrap();
         // acc2 的 a@chatroom 与 acc1 的 a@chatroom 是不同行（account 字段保留隔离键）。
-        let ids: Vec<(String, String)> = list.iter().map(|c| (c.account.clone(), c.conv_id.clone())).collect();
+        let ids: Vec<(String, String)> = list
+            .iter()
+            .map(|c| (c.account.clone(), c.conv_id.clone()))
+            .collect();
         assert!(ids.contains(&("acc2".into(), "a@chatroom".into())));
         assert!(ids.contains(&("".into(), "legacy@chatroom".into())));
         assert_eq!(list.len(), 4);
