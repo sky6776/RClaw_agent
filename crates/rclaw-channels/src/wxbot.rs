@@ -1920,27 +1920,25 @@ fn protected_interval(text: &str, end: usize) -> Option<(usize, usize)> {
 
 /// 断点是否落在 URL / 小数中间（这些位置不允许切）。
 fn inside_protected(text: &str, end: usize) -> bool {
-    let Some((start, stop)) = token_bounds(text, end) else {
-        // Oversized token: treat as protected (bounded scan).
-        return true;
-    };
-    // A break exactly at the start of a token is outside it (safe).
-    if end <= start {
-        return false;
+    if let Some((start, stop)) = token_bounds_with_limit(text, end, PROTECT_SCAN * 8) {
+        // A break exactly at the start of a token is outside it (safe).
+        if end <= start {
+            return false;
+        }
+        let full_token = &text[start..stop];
+        if full_token.contains("://") || full_token.starts_with("www.") {
+            return true;
+        }
+        if full_token.contains('.')
+            && full_token
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.')
+        {
+            return true;
+        }
     }
-    let full_token = &text[start..stop];
-    if full_token.contains("://") || full_token.starts_with("www.") {
-        return true;
-    }
-    if full_token.contains('.')
-        && full_token
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.')
-    {
-        return true;
-    }
-    // Decimal embedded in a mixed token ("abc12345.6789元"): protect while the
-    // break sits inside the digit run that contains a dot (bounded scan).
+    // Beyond the URL window a non-URL token must not freeze segmentation, but
+    // a short decimal run at the break still must be protected.
     numeric_run_bounds(text, end).is_some()
 }
 
