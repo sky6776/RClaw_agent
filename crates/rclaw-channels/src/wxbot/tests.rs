@@ -21,6 +21,12 @@ fn cfg() -> WxbotConfig {
         send_jitter_sec: 4,
         send_window_max: 10,
         send_failure_fuse: 5,
+        humanize_enabled: false,
+        humanize_think_ms: 0,
+        humanize_segment_chars: 60,
+        humanize_segment_max: 3,
+        humanize_segment_interval_min_ms: 0,
+        humanize_segment_interval_max_ms: 0,
         media_dir: PathBuf::new(),
     }
 }
@@ -63,7 +69,10 @@ fn chat_id_account_scoping_and_conv_roundtrip() {
     // 账号未知：退化为 legacy 形态（无账号段），出站无法做归属校验但可发送。
     let ev = event(json!({ "type": "text", "talker": "wxid_friend" }));
     assert_eq!(inbound_chat_id(&ev), "user:wxid_friend");
-    assert_eq!(parse_chat_id("user:wxid_friend"), Some((None, "wxid_friend")));
+    assert_eq!(
+        parse_chat_id("user:wxid_friend"),
+        Some((None, "wxid_friend"))
+    );
 
     // 非 wxbot 前缀拒绝。
     assert_eq!(parse_chat_id("other:x"), None);
@@ -77,10 +86,18 @@ fn outbound_ownership_rejects_foreign_account_chat_ids() {
         st.bind("wxid_self");
     }
     // chat_id 账号段 = 绑定账号 → 归属校验通过（模拟 send_loop 的判定）。
-    let owned = b.state.lock().map(|st| st.account == "wxid_self").unwrap_or(false);
+    let owned = b
+        .state
+        .lock()
+        .map(|st| st.account == "wxid_self")
+        .unwrap_or(false);
     assert!(owned, "同账号会话应放行");
     // 账号段是别的账号（换号后旧定时任务找上门）→ 拒发。
-    let foreign = b.state.lock().map(|st| st.account == "wxid_other").unwrap_or(false);
+    let foreign = b
+        .state
+        .lock()
+        .map(|st| st.account == "wxid_other")
+        .unwrap_or(false);
     assert!(!foreign, "跨账号会话必须拒绝发送");
 }
 
@@ -135,10 +152,13 @@ fn loopback_detection() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn private_allow_empty_means_allow_all() {
+fn private_allow_empty_denies_all() {
     let b = bot();
     let ev = event(json!({ "talker": "wxid_stranger", "type": "text" }));
-    assert!(b.allowed(&ev), "allow_from 为空 = 放行全部私聊");
+    assert!(
+        !b.allowed(&ev),
+        "allow_from 为空 = 不响应所有私聊（fail-closed）"
+    );
 
     let mut c = cfg();
     c.allow_from = "wxid_a, wxid_b".into();
@@ -154,11 +174,15 @@ fn group_requires_allowlist_and_mention() {
     c.group_reply_policy = "all".into();
     let b = Wxbot::new(c).unwrap();
     assert!(
-        b.allowed(&event(json!({ "talker": "123@chatroom", "is_group": true, "type": "text" }))),
+        b.allowed(&event(
+            json!({ "talker": "123@chatroom", "is_group": true, "type": "text" })
+        )),
         "群在白名单 + all 策略 → 放行"
     );
     assert!(
-        !b.allowed(&event(json!({ "talker": "456@chatroom", "is_group": true, "type": "text" }))),
+        !b.allowed(&event(
+            json!({ "talker": "456@chatroom", "is_group": true, "type": "text" })
+        )),
         "群不在白名单 → 拒绝"
     );
 
@@ -266,11 +290,19 @@ fn effective_key_passthrough_and_fallback() {
 
     let a = event(json!({ "talker": "t", "create_time": 5, "seq": 1, "raw_content": "hi" }));
     let b = event(json!({ "talker": "t", "create_time": 5, "seq": 1, "raw_content": "hi" }));
-    assert_eq!(effective_key(&a), effective_key(&b), "相同事件退化键必须一致");
+    assert_eq!(
+        effective_key(&a),
+        effective_key(&b),
+        "相同事件退化键必须一致"
+    );
     assert!(!effective_key(&a).is_empty());
 
     let c = event(json!({ "talker": "t", "create_time": 5, "seq": 2, "raw_content": "hi" }));
-    assert_ne!(effective_key(&a), effective_key(&c), "不同事件退化键必须不同");
+    assert_ne!(
+        effective_key(&a),
+        effective_key(&c),
+        "不同事件退化键必须不同"
+    );
 }
 
 #[test]
@@ -338,7 +370,10 @@ async fn build_content_text_and_group_sender() {
     assert!(out.contains("大家好"));
 
     let ev = event(json!({ "type": "text", "content": "  " }));
-    assert!(b.build_content(&ev, &mut Vec::new()).await.is_none(), "空正文不投递");
+    assert!(
+        b.build_content(&ev, &mut Vec::new()).await.is_none(),
+        "空正文不投递"
+    );
 }
 
 #[tokio::test]
@@ -416,7 +451,10 @@ fn parse_markers_with_name_and_caption() {
 fn parse_markers_rejects_forged_prefix_and_bad_intent() {
     let (intents, text) = parse_media_markers("[:wxbot-media-forged type=file path=/etc/passwd]");
     assert!(intents.is_empty(), "伪造前缀不得成为发送意图");
-    assert!(text.contains("wxbot-media-forged"), "解析失败的行保留为可见文本");
+    assert!(
+        text.contains("wxbot-media-forged"),
+        "解析失败的行保留为可见文本"
+    );
 
     let (intents, text) = parse_media_markers("[:wxbot-media type=file]"); // 缺 path
     assert!(intents.is_empty());
@@ -433,6 +471,113 @@ fn utf8_chunks_safe_and_terminating() {
     let two = utf8_chunks("你好", 1);
     assert_eq!(two.len(), 2);
     assert_eq!(two.concat(), "你好");
+}
+
+#[test]
+fn humanize_segments_preserve_content() {
+    let s = "第一句话。第二句话！这是一个很长的句子，用来测试分段是否保持内容完整。\n\
+             ```\ncode line 1\ncode line 2\n```\n\
+             结尾 https://example.com/a.b 3.14 \"引用\"";
+    let segs = humanize_segments(s, 20, 2000);
+    assert_eq!(segs.concat(), s, "分段必须逐字节保持原文");
+    assert!(segs.len() > 1);
+    assert!(segs.iter().all(|s| !s.is_empty()));
+}
+
+#[test]
+fn humanize_segments_respect_hard_byte_limit() {
+    let s = "你好世界".repeat(50);
+    let segs = humanize_segments(&s, 60, 20);
+    assert_eq!(segs.concat(), s);
+    assert!(segs.iter().all(|s| s.len() <= 20));
+}
+
+#[test]
+fn humanize_segments_long_chinese_without_whitespace() {
+    let s = "你好。".repeat(60); // 540 bytes, no whitespace
+    let segs = humanize_segments(&s, 60, 2000);
+    assert_eq!(segs.concat(), s);
+    assert!(segs.len() > 1, "普通中文长文本不应被当成受保护 token: {segs:?}");
+}
+
+#[test]
+fn humanize_segments_long_mixed_text_keeps_decimal() {
+    let s = format!("{}12.34{}", "中".repeat(999), "中".repeat(500));
+    let segs = humanize_segments(&s, 1000, 2000);
+    assert_eq!(segs.concat(), s);
+    assert!(
+        segs.join("|").contains("12.34"),
+        "超窗混合文本中的小数被切开: {segs:?}"
+    );
+}
+
+#[test]
+fn humanize_segments_keep_url_and_decimal() {
+    let s = "请访问 https://example.com/path?x=1.5 查看，价格是 12.34 元，不要切坏。";
+    let segs = humanize_segments(s, 16, 2000);
+    assert_eq!(segs.concat(), s);
+    let joined = segs.join("|");
+    assert!(joined.contains("https://example.com/path?x=1.5"), "URL 被切开: {joined}");
+    assert!(joined.contains("12.34"), "小数被切开: {joined}");
+}
+
+#[test]
+fn humanize_segments_code_fence_only_splits_on_newline() {
+    let long_code = "x".repeat(120);
+    let s = format!("说明。\n```\n{long_code}\n```\n结尾。");
+    let segs = humanize_segments(&s, 20, 2000);
+    assert_eq!(segs.concat(), s);
+    assert!(
+        segs.iter().any(|seg| seg.contains(&long_code)),
+        "代码围栏内的长行不应在字符中间被切开: {segs:?}"
+    );
+}
+
+#[test]
+fn humanize_segments_long_url_without_space_still_hard_splits() {
+    let url = format!("https://example.com/{}", "a".repeat(100));
+    let s = format!("链接 {url} 结束");
+    let segs = humanize_segments(&s, 20, 32);
+    assert_eq!(segs.concat(), s);
+    assert!(segs.iter().all(|seg| seg.len() <= 32), "硬字节上限必须生效");
+}
+
+#[test]
+fn humanize_segments_never_empty() {
+    let s = "。".repeat(40);
+    let segs = humanize_segments(&s, 8, 16);
+    assert_eq!(segs.concat(), s);
+    assert!(segs.iter().all(|seg| !seg.is_empty()));
+}
+
+#[test]
+fn humanize_protects_url_and_decimal_tokens() {
+    let s = "aaaaaaa https://ex.co end";
+    let segs = humanize_segments(s, 8, 20);
+    assert_eq!(segs.concat(), s);
+    let joined = segs.join("|");
+    assert!(joined.contains("https://ex.co"), "URL 被切开: {joined}");
+
+    let s2 = "abc12345.6789元";
+    let segs2 = humanize_segments(s2, 8, 2000);
+    assert_eq!(segs2.concat(), s2);
+    let j2 = segs2.join("|");
+    assert!(j2.contains("12345.6789"), "小数被切开: {j2}");
+
+    // Hard limit inside the decimal: fall back to the interval boundary.
+    let s3 = "abc12345.6789元";
+    let segs3 = humanize_segments(s3, 8, 12);
+    assert_eq!(segs3.concat(), s3);
+    let j3 = segs3.join("|");
+    assert!(j3.contains("12345.6789"), "硬切拆开小数: {j3}");
+
+    // Long URL (>512 bytes) that still fits the hard limit must stay intact.
+    let url = format!("https://example.com/{}", "a".repeat(600));
+    let long = format!("abc {url} end");
+    let segs4 = humanize_segments(&long, 8, 622);
+    assert_eq!(segs4.concat(), long);
+    let j4 = segs4.join("|");
+    assert!(j4.contains(&url), "长 URL 被切开");
 }
 
 // ---------------------------------------------------------------------------
@@ -475,10 +620,14 @@ fn webhook_path_normalization() {
 // ---------------------------------------------------------------------------
 
 /// 带持久化库的通道（tempdir media_dir）。
+///
+/// 私聊 `allow_from` 与群 `allow_groups` 都显式给一条白名单：空 `allow_from` 是
+/// fail-closed（不响应任何私聊），落库/引用回填用例需要白名单命中才会进入处理管线。
 fn bot_with_db() -> (Wxbot, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut c = cfg();
     c.media_dir = dir.path().to_path_buf();
+    c.allow_from = "wxid_friend".into();
     c.allow_groups = "123@chatroom".into();
     let b = Wxbot::new(c).expect("合法配置应构造成功");
     (b, dir)
@@ -496,9 +645,20 @@ async fn db_persists_private_and_group_messages() {
     b.ingest_one(ev, &tx).await;
     let msg = rx.try_recv().expect("私聊消息应投递");
     assert_eq!(msg.chat_id, "user:wxid_friend");
-    assert_eq!(b.db.as_ref().unwrap().lock().unwrap()
-        .query_row("SELECT archived FROM inbound_messages WHERE dedup_key = 'k1'", [], |r| r.get::<_, i64>(0))
-        .unwrap(), 0, "私聊投递消息 archived=0");
+    assert_eq!(
+        b.db.as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT archived FROM inbound_messages WHERE dedup_key = 'k1'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "私聊投递消息 archived=0"
+    );
 
     // 群聊 mention 未命中：静默接收，archived=1，且不投递。
     {
@@ -512,9 +672,20 @@ async fn db_persists_private_and_group_messages() {
     }));
     b.ingest_one(ev, &tx).await;
     assert!(rx.try_recv().is_err(), "mention 未命中的群消息不得投递");
-    assert_eq!(b.db.as_ref().unwrap().lock().unwrap()
-        .query_row("SELECT archived FROM inbound_messages WHERE dedup_key = 'k2'", [], |r| r.get::<_, i64>(0))
-        .unwrap(), 1, "静默接收的群消息 archived=1");
+    assert_eq!(
+        b.db.as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT archived FROM inbound_messages WHERE dedup_key = 'k2'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "静默接收的群消息 archived=1"
+    );
     // 静默接收完成后同样提交去重账本：双路（webhook/wait）重复事件不再重复处理。
     assert!(
         b.state.lock().unwrap().contains("k2"),
@@ -530,9 +701,20 @@ async fn db_persists_private_and_group_messages() {
         "content": "", "at_users": [],
     }));
     b.ingest_one(ev, &tx).await;
-    assert_eq!(b.db.as_ref().unwrap().lock().unwrap()
-        .query_row("SELECT text FROM inbound_messages WHERE dedup_key = 'k3'", [], |r| r.get::<_, String>(0))
-        .unwrap(), "[图片]", "白名单内图片落类型标注而非空文本");
+    assert_eq!(
+        b.db.as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT text FROM inbound_messages WHERE dedup_key = 'k3'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "[图片]",
+        "白名单内图片落类型标注而非空文本"
+    );
     drop(dir);
 }
 
@@ -558,7 +740,12 @@ async fn ingest_outside_allowlist_group_silently_records() {
     b.ingest_one(ev, &tx).await;
     assert!(rx.try_recv().is_err(), "白名单外群消息不得投递");
     assert_eq!(
-        db().query_row("SELECT archived FROM inbound_messages WHERE dedup_key = 'o1'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        db().query_row(
+            "SELECT archived FROM inbound_messages WHERE dedup_key = 'o1'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         1,
         "白名单外群消息 archived=1"
     );
@@ -577,7 +764,12 @@ async fn ingest_outside_allowlist_group_silently_records() {
     }));
     b.ingest_one(ev, &tx).await;
     assert_eq!(
-        db().query_row("SELECT text FROM inbound_messages WHERE dedup_key = 'o2'", [], |r| r.get::<_, String>(0)).unwrap(),
+        db().query_row(
+            "SELECT text FROM inbound_messages WHERE dedup_key = 'o2'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
         "[图片]",
         "图片落类型标注而非空文本"
     );
@@ -587,11 +779,13 @@ async fn ingest_outside_allowlist_group_silently_records() {
         // 索引库本体 + SQLite 边车（-wal/-shm）都算库文件；下载失败降级后不得有
         // 任何媒体文件/临时文件残留。
         assert!(
-            media_files.iter().all(|p| p.file_name().map(|n| {
-                let n = n.to_string_lossy();
-                n == "message_index.db"
-                    || n.starts_with("message_index.db-")
-            }).unwrap_or(false)),
+            media_files.iter().all(|p| p
+                .file_name()
+                .map(|n| {
+                    let n = n.to_string_lossy();
+                    n == "message_index.db" || n.starts_with("message_index.db-")
+                })
+                .unwrap_or(false)),
             "下载失败降级后不得有媒体文件/临时文件残留: {media_files:?}"
         );
     }
@@ -603,7 +797,12 @@ async fn ingest_outside_allowlist_group_silently_records() {
     }));
     b.ingest_one(ev, &tx).await;
     assert_eq!(
-        db().query_row("SELECT text FROM inbound_messages WHERE dedup_key = 'o3'", [], |r| r.get::<_, String>(0)).unwrap(),
+        db().query_row(
+            "SELECT text FROM inbound_messages WHERE dedup_key = 'o3'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
         "[链接] 某篇文章 https://example.com/a 摘要",
         "链接落标题+URL+摘要"
     );
@@ -620,9 +819,20 @@ async fn ingest_outside_allowlist_group_silently_records() {
     let (tx2, mut rx2) = tokio::sync::mpsc::channel::<BusMessage>(8);
     b2.ingest_one(ev, &tx2).await;
     assert!(rx2.try_recv().is_err());
-    assert!(b2.db.as_ref().unwrap().lock().unwrap()
-        .query_row("SELECT 1 FROM inbound_messages WHERE dedup_key = 'o4'", [], |r| r.get::<_, i64>(0))
-        .is_ok(), "allow_groups 为空的群消息仍落库");
+    assert!(
+        b2.db
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM inbound_messages WHERE dedup_key = 'o4'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_ok(),
+        "allow_groups 为空的群消息仍落库"
+    );
 
     // 4) 私聊白名单未命中：不落库不投递（连库都不进）。
     let mut c = cfg();
@@ -636,9 +846,20 @@ async fn ingest_outside_allowlist_group_silently_records() {
     let (tx3, mut rx3) = tokio::sync::mpsc::channel::<BusMessage>(8);
     b3.ingest_one(ev, &tx3).await;
     assert!(rx3.try_recv().is_err());
-    assert!(b3.db.as_ref().unwrap().lock().unwrap()
-        .query_row("SELECT 1 FROM inbound_messages WHERE dedup_key = 'o5'", [], |r| r.get::<_, i64>(0))
-        .is_err(), "私聊白名单未命中不得落库");
+    assert!(
+        b3.db
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM inbound_messages WHERE dedup_key = 'o5'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err(),
+        "私聊白名单未命中不得落库"
+    );
 
     // 5) 同 dedup_key 重投：仍只有一行（INSERT OR IGNORE 幂等）。
     let ev = event(json!({
@@ -648,7 +869,12 @@ async fn ingest_outside_allowlist_group_silently_records() {
     }));
     b.ingest_one(ev, &tx).await;
     assert_eq!(
-        db().query_row("SELECT COUNT(*) FROM inbound_messages WHERE dedup_key = 'o1'", [], |r| r.get::<_, i64>(0)).unwrap(),
+        db().query_row(
+            "SELECT COUNT(*) FROM inbound_messages WHERE dedup_key = 'o1'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         1,
         "重复事件只落一行"
     );
@@ -656,7 +882,9 @@ async fn ingest_outside_allowlist_group_silently_records() {
 
 /// 递归收集目录下的全部文件路径（媒体下载断言用）。
 fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() {
@@ -703,7 +931,11 @@ fn inbound_media_params_table() {
     );
     assert_eq!(
         inbound_media_params("file", "", "t").unwrap(),
-        ("file".to_string(), "[文件]".to_string(), Some("t".to_string()))
+        (
+            "file".to_string(),
+            "[文件]".to_string(),
+            Some("t".to_string())
+        )
     );
     assert_eq!(
         inbound_media_params("file", "报告.pdf", "t").unwrap(),
@@ -724,7 +956,10 @@ fn inbound_media_params_table() {
 /// 流式计数（saturating 加法防溢出回绕）。
 #[test]
 fn media_size_gate_basics() {
-    assert!(precheck_content_length(None, 100), "未知长度放行（流式兜底）");
+    assert!(
+        precheck_content_length(None, 100),
+        "未知长度放行（流式兜底）"
+    );
     assert!(precheck_content_length(Some(100), 100), "恰好等于上限放行");
     assert!(!precheck_content_length(Some(101), 100), "超上限拒绝");
     assert!(!exceeds_cap(90, 10, 100), "累计恰好到上限仍放行");
@@ -740,41 +975,69 @@ fn record_text_mappings() {
         record_text(&mk(json!({ "type": "text", "content": "你好" }))),
         "你好"
     );
-    assert_eq!(record_text(&mk(json!({ "type": "image", "content": "" }))), "[图片]");
     assert_eq!(
-        record_text(&mk(json!({ "type": "image", "title": "截图.png", "content": "" }))),
+        record_text(&mk(json!({ "type": "image", "content": "" }))),
+        "[图片]"
+    );
+    assert_eq!(
+        record_text(&mk(
+            json!({ "type": "image", "title": "截图.png", "content": "" })
+        )),
         "[图片] 截图.png"
     );
-    assert_eq!(record_text(&mk(json!({ "type": "voice", "content": "" }))), "[语音]");
-    assert_eq!(record_text(&mk(json!({ "type": "sticker", "content": "" }))), "[表情]");
-    assert_eq!(record_text(&mk(json!({ "type": "video", "content": "" }))), "[视频]");
     assert_eq!(
-        record_text(&mk(json!({ "type": "file", "title": "报告.pdf", "content": "" }))),
+        record_text(&mk(json!({ "type": "voice", "content": "" }))),
+        "[语音]"
+    );
+    assert_eq!(
+        record_text(&mk(json!({ "type": "sticker", "content": "" }))),
+        "[表情]"
+    );
+    assert_eq!(
+        record_text(&mk(json!({ "type": "video", "content": "" }))),
+        "[视频]"
+    );
+    assert_eq!(
+        record_text(&mk(
+            json!({ "type": "file", "title": "报告.pdf", "content": "" })
+        )),
         "[文件: 报告.pdf]"
     );
     assert_eq!(
-        record_text(&mk(json!({ "type": "link", "title": "t", "url": "https://e.com", "des": "d", "content": "" }))),
+        record_text(&mk(
+            json!({ "type": "link", "title": "t", "url": "https://e.com", "des": "d", "content": "" })
+        )),
         "[链接] t https://e.com d"
     );
     assert_eq!(
-        record_text(&mk(json!({ "type": "quote", "title": "wxid_p: 原发言", "content": "回复" }))),
+        record_text(&mk(
+            json!({ "type": "quote", "title": "wxid_p: 原发言", "content": "回复" })
+        )),
         "[引用] wxid_p: 原发言 回复"
     );
     assert_eq!(
-        record_text(&mk(json!({ "type": "miniprogram", "title": "小程序", "content": "" }))),
+        record_text(&mk(
+            json!({ "type": "miniprogram", "title": "小程序", "content": "" })
+        )),
         "[小程序] 小程序"
     );
     assert_eq!(
-        record_text(&mk(json!({ "type": "recall", "content": "x 撤回了一条消息" }))),
+        record_text(&mk(
+            json!({ "type": "recall", "content": "x 撤回了一条消息" })
+        )),
         "[撤回] x 撤回了一条消息"
     );
     assert_eq!(
-        record_text(&mk(json!({ "type": "system", "title": "进群", "content": "x 加入了群聊" }))),
+        record_text(&mk(
+            json!({ "type": "system", "title": "进群", "content": "x 加入了群聊" })
+        )),
         "[系统] 进群 x 加入了群聊"
     );
     // 未知类型：type_code + raw 截断（与投递路径同款兜底）。
     assert_eq!(
-        record_text(&mk(json!({ "type_code": 51, "type": "other", "raw_content": "raw" }))),
+        record_text(&mk(
+            json!({ "type_code": 51, "type": "other", "raw_content": "raw" })
+        )),
         "[消息 type_code=51] raw"
     );
     // 与 inbound_media_params 参数表的标签口径交叉断言（防三处漂移：record_text /
@@ -788,7 +1051,9 @@ fn record_text_mappings() {
         );
     }
     assert_eq!(
-        record_text(&mk(json!({ "type": "file", "title": "a.pdf", "content": "" }))),
+        record_text(&mk(
+            json!({ "type": "file", "title": "a.pdf", "content": "" })
+        )),
         inbound_media_params("file", "a.pdf", "t").unwrap().1,
         "file 落库标签与参数表口径不一致"
     );
@@ -824,7 +1089,10 @@ async fn quote_backfill_from_db_private_and_group() {
     let mut notes = Vec::new();
     let out = b.build_content(&quote, &mut notes).await.unwrap();
     assert!(out.contains("[引用]"), "引用标注应在: {out}");
-    assert!(out.contains("[引用消息] 被引用的原始发言"), "应从库回填被引用正文: {out}");
+    assert!(
+        out.contains("[引用消息] 被引用的原始发言"),
+        "应从库回填被引用正文: {out}"
+    );
 
     // 私聊同样回填。
     let priv0 = event(json!({
@@ -840,7 +1108,10 @@ async fn quote_backfill_from_db_private_and_group() {
         "quote_svrid": 9003,
     }));
     let out = b.build_content(&priv_quote, &mut notes).await.unwrap();
-    assert!(out.contains("[引用消息] 私聊历史"), "私聊引用也应回填: {out}");
+    assert!(
+        out.contains("[引用消息] 私聊历史"),
+        "私聊引用也应回填: {out}"
+    );
 }
 
 #[tokio::test]
@@ -890,16 +1161,26 @@ async fn quote_backfill_is_account_scoped() {
 #[tokio::test]
 async fn db_record_is_idempotent_on_duplicate_dedup_key() {
     let (b, _dir) = bot_with_db();
-    let mk = |seq: u64| event(json!({
-        "event": "message", "seq": seq, "dedup_key": "dup", "msg_svr_id": 77,
-        "type": "text", "talker": "wxid_friend", "content": "同一条",
-    }));
+    let mk = |seq: u64| {
+        event(json!({
+            "event": "message", "seq": seq, "dedup_key": "dup", "msg_svr_id": 77,
+            "type": "text", "talker": "wxid_friend", "content": "同一条",
+        }))
+    };
     let (tx, _rx) = tokio::sync::mpsc::channel::<BusMessage>(8);
     b.ingest_one(mk(1), &tx).await;
     b.ingest_one(mk(2), &tx).await; // 同 dedup_key 双投（webhook+wait）
-    let n: i64 = b.db.as_ref().unwrap().lock().unwrap()
-        .query_row("SELECT COUNT(*) FROM inbound_messages WHERE dedup_key = 'dup'", [], |r| r.get(0))
-        .unwrap();
+    let n: i64 =
+        b.db.as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM inbound_messages WHERE dedup_key = 'dup'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
     assert_eq!(n, 1, "dedup_key 唯一约束保证只落一行");
 }
 
@@ -977,7 +1258,10 @@ fn sanitize_filename_caps_bytes_on_utf8_boundary() {
     let long = "文".repeat(80);
     let out = super::media::sanitize_filename(&long);
     assert!(out.len() <= 100, "stem 应限字节: {}", out.len());
-    assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "必须仍是合法 UTF-8");
+    assert!(
+        std::str::from_utf8(out.as_bytes()).is_ok(),
+        "必须仍是合法 UTF-8"
+    );
     // ASCII 长名同样受限。
     let ascii = "a".repeat(300);
     assert_eq!(super::media::sanitize_filename(&ascii).len(), 100);

@@ -91,7 +91,7 @@ api_token = "..."                 # 留空则通道不启动
 webhook_listen = "127.0.0.1:38081"
 webhook_path = "/wxbot/webhook"
 webhook_secret = "..."            # 留空则通道不启动（Webhook 以 Bearer secret 校验）
-# allow_from = ""                 # 允许私聊 wxid；空 = 全部
+# allow_from = ""                 # 允许私聊 wxid；空 = 不响应所有私聊（fail-closed）
 # allow_groups = ""               # 允许回复的群；空 = 所有群不回复（即使被 @）
 group_reply_policy = "mention"    # mention / all / none
 ```
