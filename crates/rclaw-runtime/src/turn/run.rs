@@ -37,8 +37,12 @@ pub(crate) const MAX_COMPLETION_GATE_REJECTIONS: u32 = 2;
 
 /// 运行时披露块的固定首行（见 [`AgentStatus::render_unresolved_error_disclosure`]）。
 /// spill 预览据此识别并保留披露块（codex 第 7 轮 P1）。
+///
+/// 账本里只有「未确认完成/未成功」的工具调用（中间态查询已由技能侧 exit 0 表达，
+/// 不会进入账本）；文案不再把全部条目称为「未解决的工具错误」。旧版标题不保留
+/// 别名——用户确认这是新程序、没有旧数据（2026-11-06）。
 pub(crate) const RUNTIME_DISCLOSURE_HEADER: &str =
-    "⚠️ 未解决的工具错误（运行时披露，请勿视为已完成）：";
+    "⚠️ 尚未确认完成的工具调用（运行时记录，请核对；核实前不要描述为已完成）：";
 
 /// 披露条目里的工具名净化：工具名来自模型侧 ToolCall（兼容接口只校验非空，未知
 /// 工具失败也会进入账本），原样输出可注入换行把媒体控制行（`[:weixin-media …]`）
@@ -540,7 +544,7 @@ impl AgentStatus {
             || unresolved_auto_disclosed;
         if !process_ok {
             reasons.push(format!(
-                "过程验证失败：仍有未解决的副作用工具错误：{}。修正可恢复的问题；被安全策略拦截时不要重复或绕过，交付时运行时会列明未解决项。",
+                "过程验证失败：仍有尚未确认完成的副作用工具调用：{}。修正可恢复的问题；被安全策略拦截时不要重复或绕过，交付时运行时会列明未确认项。",
                 self.unresolved_effect_errors
                     .values()
                     .map(|receipt| format!("{}:{}", receipt.tool, receipt.id))
@@ -608,7 +612,7 @@ impl AgentStatus {
         let mut todo = vec!["完成当前用户目标，并只在验证通过后结束".to_string()];
         if !self.unresolved_effect_errors.is_empty() {
             todo.push(
-                "解决尚未解决的工具错误；被安全策略等拦截时不要重复或绕过，如实说明即可（交付时运行时会列明未解决项）"
+                "处理尚未确认完成的工具调用；被安全策略等拦截时不要重复或绕过，如实说明即可（交付时运行时会列明未确认项）"
                     .to_string(),
             );
         }

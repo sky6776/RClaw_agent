@@ -26,12 +26,8 @@ use super::McpTransport;
 /// Drop 时给 server 自行退出的宽限时间：关闭 stdin 后最多等这么久，再强杀。
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(2000);
 
-/// 自身进程是否附着了控制台（CLI 为 true；GUI 子系统桌面版为 false）。
 #[cfg(windows)]
-fn has_attached_console() -> bool {
-    // SAFETY: 纯查询，无副作用；返回的伪句柄不需关闭。
-    unsafe { !windows_sys::Win32::System::Console::GetConsoleWindow().is_null() }
-}
+use crate::has_attached_console;
 
 pub struct StdioTransport {
     name: String,
@@ -66,10 +62,9 @@ impl StdioTransport {
         // 让 server 静默后台运行。CLI（自带控制台）不加：子进程继承控制台，
         // stderr 日志仍直接可见。
         #[cfg(windows)]
-        if !has_attached_console() {
+        if let Some(flags) = crate::no_window_creation_flags(has_attached_console()) {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.creation_flags(flags);
         }
 
         for (k, v) in env {

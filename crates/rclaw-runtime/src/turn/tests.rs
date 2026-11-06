@@ -856,6 +856,162 @@ fn team_effect_key_uses_runtime_team_name_normalization() {
 }
 
 #[test]
+fn skill_effect_key_separates_skill_specific_inputs() {
+    let check_a = tool_outcome(
+        "skill__seedance_video__check_task",
+        json!({"task_id": "cgt-a", "save": "output/part2.mp4"}),
+    );
+    // 键序不同但内容相同 → canonical JSON 相同 → 同一 key。
+    let check_a_retry = tool_outcome(
+        "skill__seedance_video__check_task",
+        json!({"save": "output/part2.mp4", "task_id": "cgt-a"}),
+    );
+    // 同一 task 的不同输出路径是不同 effect。
+    let check_other_save = tool_outcome(
+        "skill__seedance_video__check_task",
+        json!({"task_id": "cgt-a", "save": "output/part3.mp4"}),
+    );
+    // 无目标字段（prompt/save）的 skill 工具靠输入哈希区分。
+    let generate_a = tool_outcome(
+        "skill__seedance_video__generate_video",
+        json!({"prompt": "part2", "save": "output/part2.mp4"}),
+    );
+    let generate_b = tool_outcome(
+        "skill__seedance_video__generate_video",
+        json!({"prompt": "part3", "save": "output/part3.mp4"}),
+    );
+
+    assert_eq!(
+        tool_effect_key(&check_a.tool_calls[0], Path::new("agent")),
+        tool_effect_key(&check_a_retry.tool_calls[0], Path::new("agent")),
+        "同一输入的键序变化不得改变 effect key"
+    );
+    assert_ne!(
+        tool_effect_key(&check_a.tool_calls[0], Path::new("agent")),
+        tool_effect_key(&check_other_save.tool_calls[0], Path::new("agent")),
+        "同一 task 的不同输出路径必须视为不同 effect"
+    );
+    assert_ne!(
+        tool_effect_key(&generate_a.tool_calls[0], Path::new("agent")),
+        tool_effect_key(&generate_b.tool_calls[0], Path::new("agent")),
+        "不同 prompt 的生成失败不得互相覆盖"
+    );
+}
+
+#[test]
+fn skill_failure_is_not_cleared_by_different_input_success() {
+    let mut status = Run::new("生成视频", 8);
+    let mut failed = tool_outcome(
+        "skill__seedance_video__generate_video",
+        json!({"prompt": "part2", "save": "output/part2.mp4"}),
+    );
+    failed.tool_calls[0].id = "call-failed".to_string();
+    status.record_tool_results(
+        &failed,
+        &tool_result_message("call-failed", "下载失败", true),
+    );
+    assert!(status.has_unresolved_effect_errors());
+
+    let mut other_success = tool_outcome(
+        "skill__seedance_video__generate_video",
+        json!({"prompt": "part3", "save": "output/part3.mp4"}),
+    );
+    other_success.tool_calls[0].id = "call-other".to_string();
+    status.record_tool_results(
+        &other_success,
+        &tool_result_message("call-other", "ok", false),
+    );
+    assert!(
+        status.has_unresolved_effect_errors(),
+        "不同 prompt 的成功不得清掉 part2 的未解决失败"
+    );
+
+    // 同参数重试成功才清除。
+    let mut retry = tool_outcome(
+        "skill__seedance_video__generate_video",
+        json!({"save": "output/part2.mp4", "prompt": "part2"}),
+    );
+    retry.tool_calls[0].id = "call-retry".to_string();
+    status.record_tool_results(&retry, &tool_result_message("call-retry", "ok", false));
+    assert!(!status.has_unresolved_effect_errors());
+}
+
+#[test]
+fn check_task_failure_is_not_cleared_by_other_output_success() {
+    let mut status = Run::new("保存视频", 8);
+    let mut failed = tool_outcome(
+        "skill__seedance_video__check_task",
+        json!({"task_id": "cgt-a", "save": "output/part2.mp4"}),
+    );
+    failed.tool_calls[0].id = "call-failed".to_string();
+    status.record_tool_results(
+        &failed,
+        &tool_result_message("call-failed", "下载失败", true),
+    );
+    assert!(status.has_unresolved_effect_errors());
+
+    // 同一 task、不同输出路径：成功的是另一个 effect，不得清掉 part2 的失败。
+    let mut other = tool_outcome(
+        "skill__seedance_video__check_task",
+        json!({"task_id": "cgt-a", "save": "output/part3.mp4"}),
+    );
+    other.tool_calls[0].id = "call-other".to_string();
+    status.record_tool_results(&other, &tool_result_message("call-other", "ok", false));
+    assert!(
+        status.has_unresolved_effect_errors(),
+        "同 task 不同输出路径的成功不得清掉 part2 的未解决失败"
+    );
+
+    // 同 task、同输出路径重试成功才清除。
+    let mut retry = tool_outcome(
+        "skill__seedance_video__check_task",
+        json!({"save": "output/part2.mp4", "task_id": "cgt-a"}),
+    );
+    retry.tool_calls[0].id = "call-retry".to_string();
+    status.record_tool_results(&retry, &tool_result_message("call-retry", "ok", false));
+    assert!(!status.has_unresolved_effect_errors());
+}
+
+#[test]
+fn skill_input_hash_does_not_change_shell_or_builtin_target_keys() {
+    let shell = tool_outcome("shell", json!({"command": "rm -rf build"}));
+    let shell_key = tool_effect_key(&shell.tool_calls[0], Path::new("agent"));
+    assert!(shell_key.starts_with("shell:"), "{shell_key}");
+    assert!(
+        !shell_key.contains('\0'),
+        "shell key 不应并入 skill 输入哈希: {shell_key}"
+    );
+
+    let task = tool_outcome(
+        "TaskUpdate",
+        json!({"team_name": "ai-berkshire", "taskId": "1", "status": "running"}),
+    );
+    let task_key = tool_effect_key(&task.tool_calls[0], Path::new("agent"));
+    assert!(task_key.starts_with("TaskUpdate\0"), "{task_key}");
+    assert!(task_key.contains("taskId=\"1\""), "{task_key}");
+
+    let send = tool_outcome("SendMessage", json!({"to": "analyst", "message": "report"}));
+    let send_key = tool_effect_key(&send.tool_calls[0], Path::new("agent"));
+    assert!(send_key.starts_with("SendMessage\0"), "{send_key}");
+    assert!(send_key.contains("to=\"analyst\""), "{send_key}");
+}
+
+#[test]
+fn classify_tool_error_marks_control_c_exit_as_interrupted() {
+    let rendered = "专用工具: skill__seedance_video__generate_video\n\
+退出码: -1073741510 (0xC000013A)\n\
+输出截断: stdout=false, stderr=false\n[stdout]\n\n[stderr]\n";
+    assert_eq!(super::effect::classify_tool_error(rendered), "interrupted");
+    let signal =
+        "专用工具: x\n退出码: signal\n输出截断: stdout=false, stderr=false\n[stdout]\n\n[stderr]\n";
+    assert_eq!(super::effect::classify_tool_error(signal), "interrupted");
+    // [stdout] 之后的同名文本不参与分类（防止脚本输出伪造中断）。
+    let spoof = "专用工具: x\n退出码: 1\n输出截断: stdout=false, stderr=false\n\
+[stdout]\n0xC000013A\n[stderr]\n";
+    assert_eq!(super::effect::classify_tool_error(spoof), "tool_execution");
+}
+
+#[test]
 fn successful_agent_relative_retry_resolves_absolute_path_error() {
     let mut status = Run::new("write a report", 8);
     let absolute_path = std::env::current_dir()
@@ -1558,7 +1714,7 @@ fn runtime_disclosure_carries_unresolved_errors_through_delivery() {
     assert!(report.accepted());
     assert!(report.result_ok);
     assert!(report.process_ok);
-    assert!(delivered.starts_with("报告已写入。\n\n⚠️ 未解决的工具错误（运行时披露"));
+    assert!(delivered.starts_with("报告已写入。\n\n⚠️ 尚未确认完成的工具调用（运行时记录"));
     // 回执号去 `r` 前缀：披露块进入父代理 / 下一 turn 上下文后，模型复述它不得被
     // `cited_receipt_ids` 当成引用而收窄完成门。
     assert!(delivered.contains("- memory（回执 0-1-"));
@@ -1757,7 +1913,7 @@ fn media_marker_content_never_enters_receipt_citation_scope() {
     );
     assert!(report.accepted());
     assert!(report.result_ok);
-    assert!(delivered.starts_with("报告已写入。\n\n⚠️ 未解决的工具错误（运行时披露"));
+    assert!(delivered.starts_with("报告已写入。\n\n⚠️ 尚未确认完成的工具调用（运行时记录"));
     assert!(!delivered.contains("r9-1-1a2b3c4d"));
 }
 
@@ -6941,7 +7097,7 @@ async fn weixin_channel_receives_only_final_reply() {
     assert!(
         final_msg
             .content
-            .starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
+            .starts_with("完成了\n\n⚠️ 尚未确认完成的工具调用（运行时记录"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7018,7 +7174,7 @@ async fn non_weixin_external_channel_receives_per_iteration_progress() {
     assert!(
         final_msg
             .content
-            .starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
+            .starts_with("完成了\n\n⚠️ 尚未确认完成的工具调用（运行时记录"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7143,7 +7299,7 @@ async fn napcat_tool_round_sends_text_and_final_round_sends_reasoning() {
     assert!(
         final_msg
             .content
-            .starts_with("完成了\n\n⚠️ 未解决的工具错误（运行时披露"),
+            .starts_with("完成了\n\n⚠️ 尚未确认完成的工具调用（运行时记录"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7267,7 +7423,7 @@ async fn napcat_tool_round_text_empty_falls_back_to_reasoning() {
     assert!(
         final_msg
             .content
-            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+            .starts_with("done\n\n⚠️ 尚未确认完成的工具调用（运行时记录"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7290,7 +7446,7 @@ async fn napcat_tool_round_text_and_reasoning_both_empty_sends_nothing() {
     assert!(
         final_msg
             .content
-            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+            .starts_with("done\n\n⚠️ 尚未确认完成的工具调用（运行时记录"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7319,7 +7475,7 @@ async fn napcat_streamed_tool_round_parallel_calls_send_aggregate_text_once() {
     assert!(
         final_msg
             .content
-            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+            .starts_with("done\n\n⚠️ 尚未确认完成的工具调用（运行时记录"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7351,7 +7507,7 @@ async fn napcat_tool_round_text_with_state_frame_falls_back_to_reasoning() {
     assert!(
         final_msg
             .content
-            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+            .starts_with("done\n\n⚠️ 尚未确认完成的工具调用（运行时记录"),
         "交付正文应带披露块: {}",
         final_msg.content
     );
@@ -7387,7 +7543,7 @@ async fn napcat_tool_round_text_with_forged_media_marker_is_blocked() {
         final_msg.content.starts_with(
             "done
 
-⚠️ 未解决的工具错误（运行时披露"
+⚠️ 尚未确认完成的工具调用（运行时记录"
         ),
         "交付正文应带披露块: {}",
         final_msg.content
@@ -7422,7 +7578,7 @@ async fn napcat_consecutive_tool_rounds_each_send_text_once() {
     assert!(
         final_msg
             .content
-            .starts_with("done\n\n⚠️ 未解决的工具错误（运行时披露"),
+            .starts_with("done\n\n⚠️ 尚未确认完成的工具调用（运行时记录"),
         "交付正文应带披露块: {}",
         final_msg.content
     );

@@ -15,6 +15,9 @@
   「编辑视频/增加/删除/去掉/替换/改成」等关键词,延长须含「向前/向后延长/延续/续写」。
 - 参考视频仅接受 http(s) URL 或 `asset://` 素材 ID(本地视频先传公网存储);
   不支持含真人人脸的参考素材。轮询超时用 check_task 补查,排队中可 cancel_task。
+  任务仍在 queued/running 时 check_task 返回 `ok:true, pending:true, saved:false`
+  (退出码 0),是正常中间态而非执行失败,稍后重查即可;成功下载时返回
+  `saved:true` + `saved_file`,未请求下载时不出现 saved 字段。
 - video_url 24 小时有效且限下载 100 次,只作诊断;主交付物是本地视频文件。
 
 整理日期:2026-09-23

@@ -293,5 +293,40 @@ impl Default for ToolRegistry {
     }
 }
 
+/// 自身进程是否附着了 Windows 控制台（CLI 为 true；GUI 子系统桌面版为 false）。
+///
+/// 控制台子系统程序（`python.exe` / `node.exe` / `cmd.exe`）从无控制台的 GUI
+/// 宿主启动时，Windows 会为它新分配一个可见控制台窗口；MCP stdio server、Skill
+/// 脚本与 shell 命令共用此判定决定是否加 `CREATE_NO_WINDOW`。
+#[cfg(windows)]
+pub(crate) fn has_attached_console() -> bool {
+    // SAFETY: 纯查询，无副作用；返回的伪句柄不需关闭。
+    unsafe { !windows_sys::Win32::System::Console::GetConsoleWindow().is_null() }
+}
+
+/// Windows `CREATE_NO_WINDOW`：只去掉控制台窗口，不改变进程组/作业语义。
+#[cfg(windows)]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 无控制台宿主（GUI 桌面版）启动控制台子系统程序时返回 `CREATE_NO_WINDOW`；
+/// 自带控制台的 CLI 返回 `None`，保留控制台继承与 Ctrl+C 语义。MCP stdio server、
+/// Skill 脚本与 shell 命令三处 spawn 共用；只影响本次 CreateProcess 的直接子进程。
+#[cfg(windows)]
+pub(crate) fn no_window_creation_flags(has_attached_console: bool) -> Option<u32> {
+    (!has_attached_console).then_some(CREATE_NO_WINDOW)
+}
+
 /// Crate 版本(关于页「版本信息」用)。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_window_flags_only_for_consoleless_hosts() {
+        assert_eq!(no_window_creation_flags(false), Some(CREATE_NO_WINDOW));
+        assert_eq!(no_window_creation_flags(true), None);
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+    }
+}

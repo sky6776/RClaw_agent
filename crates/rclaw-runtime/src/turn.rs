@@ -3477,9 +3477,9 @@ impl TurnManager {
         // 方案 B：完成闸门拒绝耗尽后「警告 + 候选回复」一并投递的轮。投递走成功
         // 分支（内容要出去），记账按失败（completed_successfully 在收尾处降级）。
         let mut warned_delivery = false;
-        // 闸门接受的交付正文末尾附带了运行时披露块（仍有未解决的副作用工具错误）。
-        // 只影响 cron 状态符：披露块明写「请勿视为已完成」，不能再打 ✅；记账与
-        // 目标审计仍按 Supported（内容已受支持地交付，未解决错误已向用户公开）。
+        // 闸门接受的交付正文末尾附带了运行时披露块（仍有未确认完成的工具调用）。
+        // 只影响 cron 状态符：披露块明写「核实前不要描述为已完成」，不能再打 ✅；记账与
+        // 目标审计仍按 Supported（内容已受支持地交付，未确认项已向用户公开）。
         let mut disclosed_delivery = false;
         // B1：工具执行期间被 /cancel 打断时，记录尚未持久化的 assistant(tool_calls)
         // （连同其迭代号，清理阶段上报面板结束事件要用），清理阶段连同 aborted 占位
@@ -4375,8 +4375,8 @@ impl TurnManager {
             // 正常结束：持久化最终 assistant + 推送 outbound（与旧 handle_turn 一致）。
             let reply_text = if is_cron {
                 // Unverified（警告投递）轮不打 ✅ 成功符（codex r9）；Supported 但正文
-                // 附带运行时披露块（未解决的副作用错误）同样不打 ✅——披露块明写
-                // 「请勿视为已完成」，状态符不能与之相左。
+                // 附带运行时披露块（尚未确认完成的工具调用）同样不打 ✅——披露块明写
+                // 「核实前不要描述为已完成」，状态符不能与之相左。
                 cron_report(
                     &msg,
                     &text,

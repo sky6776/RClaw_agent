@@ -1232,14 +1232,24 @@ impl SkillEntrypointTool {
         }
     }
 
-    /// 把执行结果渲染成与拆分前逐字节一致的工具输出。
+    /// 退出码标签：负值按 Windows NTSTATUS 惯例补十六进制
+    /// （`-1073741510 (0xC000013A)`），便于区分正常非零退出与控制台/信号终止。
+    /// `ScriptOutcome::exit_code` 是 `i32`：0xC000013A 只能以负数形式到达，
+    /// `as u32` 仅用于还原十六进制展示；无符号正数形态在该类型下不可表示。
+    fn format_exit_code(code: Option<i32>) -> String {
+        match code {
+            None => "signal".to_string(),
+            Some(code) if code < 0 => format!("{code} (0x{:08X})", code as u32),
+            Some(code) => code.to_string(),
+        }
+    }
+
+    /// 把执行结果渲染成工具输出（与拆分前一致；负退出码额外补十六进制）。
     fn render_outcome(&self, outcome: &ScriptOutcome) -> ToolResult {
         let content = format!(
             "专用工具: {}\n退出码: {}\n输出截断: stdout={}, stderr={}\n[stdout]\n{}\n[stderr]\n{}",
             self.name,
-            outcome
-                .exit_code
-                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            Self::format_exit_code(outcome.exit_code),
             outcome.stdout_truncated,
             outcome.stderr_truncated,
             outcome.stdout,
@@ -1307,6 +1317,16 @@ async fn spawn_and_collect(spec: ProcessSpawnSpec<'_>) -> Result<ScriptOutcome, 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // GUI 子系统宿主（桌面版）没有控制台：直接 spawn 控制台子系统程序
+    // （python.exe / node.exe / powershell.exe）会让 Windows 新分配一个可见
+    // 控制台窗口——用户看到「Python 控制台」弹窗，关闭它还会向子进程发送
+    // CTRL_CLOSE_EVENT，使之以 0xC000013A 终止。CREATE_NO_WINDOW 只去掉窗口，
+    // 不影响管道读取与 kill_on_drop / child.kill。CLI 自带控制台时不加：
+    // 子进程继承控制台，Ctrl+C 等控制台语义保持不变。
+    #[cfg(windows)]
+    if let Some(flags) = crate::no_window_creation_flags(crate::has_attached_console()) {
+        command.creation_flags(flags);
+    }
     if spec.python_utf8_env {
         // Windows 系统 Python 常默认使用本地代码页；动态工具结果、JSON
         // 与 MEDIA_MARKER 都按 UTF-8 解码，因此显式固定子进程编码。
@@ -2857,6 +2877,17 @@ flag = "--file"
         assert!(result.content.contains("退出码: 3"));
         let seen = executor.seen.lock().unwrap().clone().unwrap();
         assert_eq!(seen.4, 2048, "限额槽位值必须透传到执行请求");
+    }
+
+    #[test]
+    fn exit_code_label_renders_windows_negative_code_as_hex() {
+        assert_eq!(SkillEntrypointTool::format_exit_code(Some(0)), "0");
+        assert_eq!(SkillEntrypointTool::format_exit_code(Some(3)), "3");
+        assert_eq!(
+            SkillEntrypointTool::format_exit_code(Some(-1073741510)),
+            "-1073741510 (0xC000013A)"
+        );
+        assert_eq!(SkillEntrypointTool::format_exit_code(None), "signal");
     }
 
     /// 缺省进程执行器：真实 python 上验证参数/编码 env/来源通道透传与字节截断。
