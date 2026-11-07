@@ -622,13 +622,19 @@ fn wxbot_humanize_defaults_and_clamps() {
     cfg.wxbot.humanize_segment_interval_max_ms = 100;
     cfg.wxbot.humanize_think_ms = u64::MAX;
     let w = cfg.wxbot_channel_config();
-    assert!(w.humanize_segment_chars >= 8, "目标字符数过小会切碎任意 UTF-8 字符");
+    assert!(
+        w.humanize_segment_chars >= 8,
+        "目标字符数过小会切碎任意 UTF-8 字符"
+    );
     assert!(w.humanize_segment_max >= 1, "段数下限 1");
     assert!(
         w.humanize_segment_interval_max_ms >= w.humanize_segment_interval_min_ms,
         "段间停顿上限不得小于下限"
     );
-    assert!(w.humanize_think_ms <= 10_000, "think 必须有硬上限，避免长期挂起");
+    assert!(
+        w.humanize_think_ms <= 10_000,
+        "think 必须有硬上限，避免长期挂起"
+    );
     assert!(
         w.humanize_segment_interval_max_ms <= 30_000,
         "interval 必须有硬上限，避免长期挂起"

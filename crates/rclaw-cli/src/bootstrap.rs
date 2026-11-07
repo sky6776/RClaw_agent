@@ -32,6 +32,16 @@ use rclaw_tools::{
 
 use crate::config::Config;
 
+/// 同根不变量判定：宿主上报的 `RuntimeChannelInfo.media_dir`（Some 时）必须与
+/// bootstrap 从 layout.base 派生的媒体目录字符串一致。None（未启用媒体）放行。
+/// 抽成独立函数让单测可覆盖（debug_assert 在 release 编译掉）。
+fn media_dir_consistent(channel_media_dir: Option<&str>, derived_media_dir: &str) -> bool {
+    match channel_media_dir {
+        None => true,
+        Some(m) => m == derived_media_dir,
+    }
+}
+
 /// 存储布局准备：建目录 + 安装技能仓库 Manifest。
 ///
 /// 必须先于日志初始化（日志默认写入 `agent/logs`）。CLI 与桌面版共用。
@@ -119,6 +129,14 @@ pub async fn assemble_core_with(
         std::env::current_dir()?.join(&layout.base).join("media")
     };
     let media_dir_str = media_dir.to_string_lossy().replace('\\', "/");
+    // 同根不变量（dsh R2 约束 5）：宿主上报的媒体目录与本处从 layout 派生的路径
+    // 必须一致——三宿主（CLI/桌面/APK）当前都从 layout.base/media 构造，漂移即宿主
+    // 装配 bug。debug_assert 之外还提供 [`media_dir_consistent`] 供单测直接覆盖。
+    debug_assert!(
+        media_dir_consistent(channel_info.media_dir.as_deref(), &media_dir_str),
+        "channel_info.media_dir({:?}) 与 bootstrap 派生 media_dir({media_dir_str}) 不一致",
+        channel_info.media_dir,
+    );
     // 子进程契约：技能脚本（publish_media.py / md2html.py 等）经 os.environ 读取。
     std::env::set_var("RCLAW_MEDIA_DIR", &media_dir_str);
     // 子进程契约：对声明了媒体能力的 channel 导出 RCLAW_<NAME>_ENABLED=1，
@@ -529,4 +547,22 @@ pub async fn assemble_core_with(
         web_search_control,
         _mcp_manager,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::media_dir_consistent;
+
+    #[test]
+    fn media_dir_consistency_invariant() {
+        // 同根：宿主上报 == bootstrap 派生（三宿主的现行构造）。
+        assert!(media_dir_consistent(
+            Some("/data/app/files/agent/media"),
+            "/data/app/files/agent/media"
+        ));
+        // None = 宿主未上报（未启用媒体），放行。
+        assert!(media_dir_consistent(None, "/x/media"));
+        // 不一致 = 宿主装配漂移，debug_assert 会炸。
+        assert!(!media_dir_consistent(Some("/other/media"), "/x/media"));
+    }
 }

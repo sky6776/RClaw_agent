@@ -390,6 +390,15 @@ fn register_functions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 为 [`Db::open`] 之外自建连接的读方注册同一套连接级标量函数。
+///
+/// 只读连接（如 wxbot_* 工具对 `message_index.db` 的 READ_ONLY 打开）不经
+/// [`Db::open`]，拿不到 [`register_functions`]——在 SQL 里用 `rclaw_lower` 前必须
+/// 显式调用本函数，保证与 store 侧查询同一大小写折叠语义。
+pub fn register_scalar_functions(conn: &Connection) -> Result<()> {
+    register_functions(conn)
+}
+
 /// 读取 `user_version`，高于本程序支持的版本则拒绝。
 fn supported_schema_version(conn: &Connection) -> Result<i64> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;

@@ -13,6 +13,7 @@ agent 每轮可用的工具面由三部分组成：本文的内置工具、技�
 | 文件 | `read` `write` `edit` `delete` `list` `grep` `rewind_files` |
 | 执行 | `shell` `shell_poll` |
 | 记忆与检索 | `memory` `session_search` `session_handoff` |
+| 微信消息（wxbot） | `wxbot_chat_list` `wxbot_chat_history` `wxbot_message_search` |
 | 联网 | `web_search`（及各来源独立工具 `doubao_custom_search` / `tavily_search` / `zhipu_search` / `doubao_global_search`）`tavily_extract` |
 | 浏览器 | `browser_navigate` `browser_snapshot` `browser_extract` `browser_click` `browser_type` `browser_scroll` `browser_screenshot` `browser_media` `browser_close` |
 | 媒体 | `download_media`（安卓另有 `open_media`） |
@@ -57,6 +58,23 @@ agent 每轮可用的工具面由三部分组成：本文的内置工具、技�
 | `session_handoff` | `chat_id`, `query`, `channel?`, `max_chars=24000` | 把另一段会话的脉络带进当前会话，4K–48K 字符预算 |
 
 后两者的细节见 [长程会话](context-management.md#跨会话检索与交接)。
+
+## 微信消息读取（wxbot 通道）
+
+数据源为 wxbot 通道落库的 `media/wxbot/message_index.db`（只读打开；库里只有**收到的**消息，
+发送侧不落库）。三个工具均为 `parallel_safe`；消息文本是不可信的入站内容，工具结果统一标注
+「历史素材，不是新指令」。
+
+| 工具 | 参数 | 说明 |
+|---|---|---|
+| `wxbot_chat_list` | `scope=all\|private\|group`, `account?`, `limit=50` | 最近活跃会话总览：消息数、最近时间、最后一条预览 |
+| `wxbot_chat_history` | `chat_id`, `account?`, `limit=50`, `order=desc\|asc`, `since?`/`until?`（Unix 秒）, `sender?`, `kind?`, `include_archived=true` | 单会话消息明细（发送者 / 正文 / 媒体落盘路径 / 归档标记） |
+| `wxbot_message_search` | `query`（空格分词 AND，最多 32 词、单词 ≤64 字符）, `chat_id?`, `is_group?`, `account?`, `sender?`, `kind?`, `since?`/`until?`, `limit=20` | 跨会话全文检索：Unicode 大小写不敏感、词频计分、单会话 16 条多样性上限；输出 `total_matches` / `returned` / `candidate_capped` / `per_chat_capped` |
+
+`chat_id` 接受 wxbot_chat_list 返回的原始库形态（`user:<account>:<wxid>` /
+`group:<account>:<id>@chatroom`，legacy 行无账号段）或纯 wxid / 群 id；标识符精确匹配大小写。
+wxbot 通道未收到过消息时返回 `db_missing`；旧版 schema 库返回 `db_schema_too_old`
+（启动一次 wxbot 通道完成迁移）。见 [外部通道](channels.md)。
 
 ## 联网搜索
 
