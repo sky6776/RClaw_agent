@@ -29,6 +29,7 @@ pub mod skill_usage;
 pub mod truncate;
 pub mod turn_state;
 pub mod web_search;
+pub mod wxbot_history;
 
 pub use cron_controller::CronController;
 pub use files::{DeleteFile, EditFile, Grep, ListDir, Read, WriteFile};
@@ -63,6 +64,7 @@ pub use web_search::{
     SearchHit, SearchRequest, SearchResponse, TavilyClient, TavilyExtract, TavilySearchConfig,
     WebSearch, WebSearchConfig, WebSearchControl, ZhipuBackend, ZhipuSearchConfig,
 };
+pub use wxbot_history::{WxbotChatHistoryTool, WxbotChatListTool, WxbotMessageSearchTool};
 
 use std::path::PathBuf;
 use std::sync::Arc;

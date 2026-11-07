@@ -42,6 +42,9 @@ walkdir = "2"
 # read 工具 PDF 透明路由（ADR-0003）：检测 PDF 类型 + 本地提取文本。
 # 绝不开 ocr feature——拉 PDFium/ONNX C 依赖，破坏 Termux。
 pdf-inspector = { workspace = true }
+# wxbot_* 工具：只读查询 wxbot 通道消息库（media_dir/wxbot/message_index.db）。
+# workspace 唯一版本（libsqlite3-sys links 约束），bundled 特性与 rclaw-channels 同源。
+rusqlite = { workspace = true }
 
 # MCP stdio 子进程（Windows）：GUI 宿主下用 GetConsoleWindow 判定是否附着控制台，
 # 决定是否给控制台子进程加 CREATE_NO_WINDOW（版本对齐依赖树已有条目，不引新包）。

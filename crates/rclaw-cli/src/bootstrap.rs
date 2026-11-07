@@ -26,7 +26,8 @@ use rclaw_store::session::SessionStore;
 use rclaw_tools::{
     CronController, DoubaoBackend, MemoryTool, ProviderSearchTool, ReaderBackend, SearchBackend,
     SessionSearchTool, SkillListTool, SkillManageTool, SkillUsageStore, TavilyClient,
-    TavilyExtract, ToolRegistry, WebSearch, WebSearchControl, ZhipuBackend,
+    TavilyExtract, ToolRegistry, WebSearch, WebSearchControl, WxbotChatHistoryTool,
+    WxbotChatListTool, WxbotMessageSearchTool, ZhipuBackend,
 };
 
 use crate::config::Config;
@@ -185,6 +186,12 @@ pub async fn assemble_core_with(
     tools.register(Box::new(
         rclaw_runtime::session_handoff::SessionHandoffTool::new(session.clone()),
     ));
+    // wxbot_* 工具：读 wxbot 通道落库的微信消息（私聊/群聊全量入库，只读）。库由
+    // 通道启动时创建——通道未启用/未收到消息时工具返回友好提示，不影响装配。
+    let wxbot_db_path = media_dir.join("wxbot").join("message_index.db");
+    tools.register(Box::new(WxbotChatListTool::new(wxbot_db_path.clone())));
+    tools.register(Box::new(WxbotChatHistoryTool::new(wxbot_db_path.clone())));
+    tools.register(Box::new(WxbotMessageSearchTool::new(wxbot_db_path)));
 
     // 浏览器能力统一为 CDP browser_* 工具面，由宿主装配钩子注册（桌面/APK 的
     // customize 调 rclaw_tools::cdp_browser::register）；CLI/Termux 无浏览器工具。
