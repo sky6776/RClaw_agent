@@ -218,7 +218,10 @@ pub fn build_system_prompt_with(
         host,
     );
     // SOUL 是身份的一部分，作为启动期稳定前缀。USER/memory/daily/skills 必须动态加载。
-    append_file(&mut s, &layout.soul_file, "Personality");
+    // `[agent] soul_enabled = false` 时不注入（文件仍保留，供随时开回来）。
+    if soul_enabled() {
+        append_file(&mut s, &layout.soul_file, "Personality");
+    }
     s
 }
 
@@ -600,6 +603,33 @@ pub fn build_dynamic_context_snapshot(
     let version = short_hash(&version_material);
     let body = format!("{runtime_meta}\n{live}");
     DynamicContextSnapshot { version, body }
+}
+
+/// 进程级「是否注入 SOUL 人格」开关。
+///
+/// 范式同 `rclaw-tools` 的 `SKILL_OUTPUT_LIMIT`：bootstrap 从 `[agent] soul_enabled`
+/// 写入；缺省（None）= 开启，保持既有行为（golden 系统提示逐字节比对不受影响）。
+static SOUL_ENABLED: std::sync::OnceLock<std::sync::RwLock<Option<bool>>> =
+    std::sync::OnceLock::new();
+
+/// 设置是否注入 SOUL（重复调用以最后一次为准；进程内全局）。
+pub fn set_soul_enabled(enabled: bool) {
+    let slot = SOUL_ENABLED.get_or_init(|| std::sync::RwLock::new(None));
+    *slot.write().unwrap_or_else(|poison| poison.into_inner()) = Some(enabled);
+}
+
+/// 清除进程级设置（测试/宿主停机还原缺省行为）。
+pub fn clear_soul_enabled() {
+    let slot = SOUL_ENABLED.get_or_init(|| std::sync::RwLock::new(None));
+    *slot.write().unwrap_or_else(|poison| poison.into_inner()) = None;
+}
+
+fn soul_enabled() -> bool {
+    SOUL_ENABLED
+        .get_or_init(|| std::sync::RwLock::new(None))
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .unwrap_or(true)
 }
 
 /// 把文件内容追加到系统提示（无则静默跳过）。
@@ -1287,6 +1317,36 @@ mod tests {
         assert!(note.contains("## Bot Mode"));
         assert!(note.contains("`@a`"));
         assert!(note.contains("message_agent"));
+    }
+
+    /// `[agent] soul_enabled = false` 时不注入 Personality（文件仍保留）。
+    ///
+    /// 进程级开关是全局的：这里用最短窗口 set→build→clear，且本用例只断言
+    /// 「有关/无关」两种状态，不改文件内容，和其他并发 prompt 测试互不影响
+    /// （它们的布局里没有真实 SOUL 正文）。
+    #[test]
+    fn soul_gate_controls_personality_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path().join("agent"));
+        rclaw_store::fs::init_layout(&layout).unwrap();
+        std::fs::write(&layout.soul_file, "# 人格测试标记\n只在这一份人格里出现\n").unwrap();
+        let memory = MemoryStore::new(layout.clone());
+
+        clear_soul_enabled();
+        let with_soul = build_system_prompt(&layout, &memory, 0, None);
+        assert!(with_soul.contains("## Personality"), "{with_soul}");
+        assert!(with_soul.contains("人格测试标记"));
+
+        set_soul_enabled(false);
+        let without_soul = build_system_prompt(&layout, &memory, 0, None);
+        clear_soul_enabled();
+        assert!(
+            !without_soul.contains("## Personality"),
+            "关闭后不得注入人格段: {without_soul}"
+        );
+        assert!(!without_soul.contains("人格测试标记"));
+        // 文件本身保留（关闭只是不注入）。
+        assert!(layout.soul_file.is_file());
     }
 
     #[test]

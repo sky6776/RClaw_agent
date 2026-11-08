@@ -26,6 +26,7 @@ pub mod path_util;
 pub mod redact;
 pub mod session;
 pub mod skills;
+pub mod soul;
 pub mod toml_file;
 pub mod workflow_home;
 
@@ -50,6 +51,12 @@ pub use session::{
     ToolResultDetail, UsageAnchorRecord, ABORTED_TOOL_RESULT_PLACEHOLDER,
 };
 pub use skills::SkillSummary;
+pub use soul::{
+    apply_persona, default_soul, import_from_files, is_active_edited, list_personas,
+    personas_state, prepare_souls, seed_default_soul, souls_dir, ApplyOutcome, ImportItem,
+    ImportReport, ImportResult, PersonaEntry, SoulPersona, BUILTIN_SOULS, MAX_IMPORT_BYTES,
+    MAX_IMPORT_FILES,
+};
 pub use toml_file::{EditValue, RclawToml};
 pub use workflow_home::{workflow_home, workflows_dir};
 

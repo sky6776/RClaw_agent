@@ -10,6 +10,13 @@
 # 改这个值相当于切换一套独立的记忆、会话、技能和定时任务数据。
 base_dir = "agent"
 
+# 人格（SOUL）：是否把 `config/SOUL.md` 注入系统提示（默认开）。
+# 人格库在 `config/souls/`：内置「微信真人口吻 / 苏轼 / 东北老铁 / 李逵」四份，
+# 可在桌面/安卓「配置 → 人格（SOUL）」里选择启用，也可在文件面板直接编辑；
+# 选中的人格会被复制为 `config/SOUL.md`（覆盖前自动备份为 SOUL.md.bak.<时间戳>）。
+# 关闭后人格文件仍保留，只是不再进提示词。改动需重启生效。
+soul_enabled = true
+
 # 动态工作流（/workflow）：
 #   workflow_background = true  后台执行，CreateWorkflow 立即返回 backgrounded；
 #                               false = 同步契约（调用返回时已终态），仍写 state.sqlite 投影表。

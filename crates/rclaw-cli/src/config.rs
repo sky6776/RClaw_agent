@@ -59,6 +59,10 @@ pub struct Config {
 pub struct AgentSection {
     #[serde(default = "default_base_dir")]
     pub base_dir: String,
+    /// 是否把 `config/SOUL.md` 注入 system prompt（默认开启）。关闭后人格文件仍会
+    /// 被播种/保留，只是不再进提示词；改动需重启生效。
+    #[serde(default = "default_true")]
+    pub soul_enabled: bool,
     /// 可同时执行的顶层 turn 数量；同一普通会话仍保持串行。缺省 8，0 在运行时按 1 处理。
     #[serde(default = "default_max_concurrent_turns")]
     pub max_concurrent_turns: usize,
@@ -156,6 +160,7 @@ impl Default for AgentSection {
     fn default() -> Self {
         AgentSection {
             base_dir: default_base_dir(),
+            soul_enabled: true,
             max_concurrent_turns: default_max_concurrent_turns(),
             session_compression: true,
             compression_protect_first: default_compression_protect_first(),

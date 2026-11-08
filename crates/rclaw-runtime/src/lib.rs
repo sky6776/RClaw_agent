@@ -35,7 +35,7 @@ pub use bots::{
 pub use context::{
     build_bot_system_prompt, build_bot_system_prompt_with, build_dynamic_context_snapshot,
     build_system_prompt, build_system_prompt_for_tools, build_system_prompt_with,
-    turn_context_suffix, DynamicContextSnapshot, HostKind,
+    clear_soul_enabled, set_soul_enabled, turn_context_suffix, DynamicContextSnapshot, HostKind,
 };
 pub use cron::CronService;
 pub use heartbeat::Heartbeat;

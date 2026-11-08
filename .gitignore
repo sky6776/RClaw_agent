@@ -63,3 +63,8 @@ agent/workflow.lock
 
 # wxbot 通道实施文档（本地工作文档，不入库）
 docs/wxbot-channel.md
+
+# SOUL 人格库由程序在启动时物化（内置人格 + 用户导入），不进仓库。
+/agent/config/souls/
+/agent/config/SOUL.md.bak.*
+/agent/config/SOUL.md

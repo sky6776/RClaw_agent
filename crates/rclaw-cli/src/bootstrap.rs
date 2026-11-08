@@ -52,6 +52,21 @@ pub fn prepare_storage(cfg: &Config) -> Result<Layout> {
     SkillUsageStore::new(layout.skills_dir.clone())
         .install_repository_manifest()
         .map_err(anyhow::Error::msg)?;
+    // SOUL 人格库：物化内置人格 + 播种默认人格。失败不阻断启动（人格缺失只会
+    // 让 system prompt 少一段，比启动失败轻）；但必须留日志便于排查。
+    match rclaw_store::soul::prepare_souls(&layout) {
+        Ok(report) => {
+            if !report.written.is_empty() || report.seeded_default || !report.preserved.is_empty() {
+                tracing::info!(
+                    written = ?report.written,
+                    preserved_user_edited = ?report.preserved,
+                    seeded_default = report.seeded_default,
+                    "SOUL 人格库已就绪"
+                );
+            }
+        }
+        Err(error) => tracing::warn!("SOUL 人格库准备失败（继续启动）: {error}"),
+    }
     Ok(layout)
 }
 
@@ -160,6 +175,12 @@ pub async fn assemble_core_with(
     match cfg.skills.max_output_bytes {
         Some(bytes) => rclaw_tools::set_skill_output_limit(bytes),
         None => rclaw_tools::clear_skill_output_limit(),
+    }
+
+    // [agent] soul_enabled：SOUL 人格是否注入 system prompt（进程级开关，三宿主同源）。
+    rclaw_runtime::context::set_soul_enabled(cfg.agent.soul_enabled);
+    if !cfg.agent.soul_enabled {
+        tracing::info!("SOUL 已禁用（[agent] soul_enabled = false）：人格文件保留但不注入系统提示");
     }
 
     // Provider（DeepSeek / 智谱等 OpenAI 兼容）。SwappableProvider 支持 /llmodel 热切换。

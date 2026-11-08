@@ -7353,6 +7353,244 @@ pub async fn whisper_transcribe(
     }
 }
 
+// ---------------------------------------------------------------------------
+// SOUL 人格库（配置页「人格（SOUL）」卡片）
+// ---------------------------------------------------------------------------
+
+/// 一个人格条目（内置或用户导入）。
+#[derive(serde::Serialize)]
+pub struct SoulPersonaDto {
+    /// 稳定标识：内置人格用 `BUILTIN_SOULS[].id`，导入文件用文件名（去掉扩展名）。
+    pub id: String,
+    /// 展示名：内置用中文标签，导入用文件名。
+    pub label: String,
+    pub file_name: String,
+    pub builtin: bool,
+    /// 是否为当前生效人格（按内容比对）。
+    pub active: bool,
+    pub bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct SoulStateDto {
+    pub personas: Vec<SoulPersonaDto>,
+    /// 生效人格 `config/SOUL.md` 是否被用户编辑过（不等于库内任何文件）。
+    pub active_edited: bool,
+    pub active_path: String,
+    pub souls_dir: String,
+    /// `[agent] soul_enabled`：false 时人格文件仍会写入，但重启后不注入提示词。
+    pub soul_enabled: bool,
+    /// 生效人格有内容、但库内有多份同内容且缺少选择标记——无法唯一确定是哪份。
+    pub active_ambiguous: bool,
+    /// 生效人格缺失/为空/仍是占位（还没播种或被清空）。与「歧义」分开报，
+    /// UI 不能用「同内容多份」的文案去解释空状态。
+    pub active_empty: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct SoulApplyDto {
+    /// applied / needs_confirm / already_active / not_found
+    pub status: String,
+    pub persona: Option<String>,
+    /// 覆盖前的备份路径（仅当旧人格被编辑过并覆盖时）。
+    pub backup: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SoulImportItemIn {
+    pub file_name: String,
+    /// 文件内容（base64；后端解码后做 UTF-8/NUL/大小校验）。
+    pub content_b64: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct SoulImportResultDto {
+    pub file_name: String,
+    pub saved_as: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 解析人格库所在的 Layout：优先用已启动 agent 的解析结果（Android 的 base_dir
+/// 由宿主改写为绝对路径），未启动时退回 `home/agent`（与文件面板口径一致）。
+fn soul_layout(state: &State<'_, AppState>) -> rclaw_store::Layout {
+    if let Some(layout) = state.layout() {
+        return layout;
+    }
+    // agent 未启动：按 rclaw.toml 的 base_dir 解析（相对路径按 home 解析，
+    // 与桌面启动时的工作目录口径一致），否则人格会写进错误的 agent 目录。
+    let base_dir = rclaw_cli::config::Config::load_from_dir(&state.home)
+        .ok()
+        .map(|cfg| {
+            let configured = std::path::PathBuf::from(&cfg.agent.base_dir);
+            if configured.is_absolute() {
+                configured
+            } else {
+                state.home.join(configured)
+            }
+        })
+        .unwrap_or_else(|| state.home.join("agent"));
+    rclaw_store::Layout::new(base_dir)
+}
+
+/// 读取 `[agent] soul_enabled`（配置读不到时按默认 true，与 Config 缺省一致）。
+fn soul_enabled_from_config(home: &std::path::Path) -> bool {
+    rclaw_cli::config::Config::load_from_dir(home)
+        .map(|cfg| cfg.agent.soul_enabled)
+        .unwrap_or(true)
+}
+
+fn persona_dto(entry: &rclaw_store::PersonaEntry) -> SoulPersonaDto {
+    let builtin = rclaw_store::BUILTIN_SOULS
+        .iter()
+        .find(|p| p.file_name == entry.file_name);
+    SoulPersonaDto {
+        id: builtin
+            .map(|p| p.id.to_string())
+            .unwrap_or_else(|| entry.file_name.clone()),
+        label: builtin
+            .map(|p| p.label.to_string())
+            .unwrap_or_else(|| entry.file_name.clone()),
+        file_name: entry.file_name.clone(),
+        builtin: builtin.is_some(),
+        active: entry.active,
+        bytes: entry.bytes,
+    }
+}
+
+#[tauri::command]
+pub async fn soul_personas(state: State<'_, AppState>) -> Result<SoulStateDto, String> {
+    let layout = soul_layout(&state);
+    let enabled = soul_enabled_from_config(&state.home);
+    tauri::async_runtime::spawn_blocking(move || {
+        // 一次持锁取完整状态（列表 + 已编辑 + 空 + 歧义），避免多次快照之间
+        // 插入 apply/import 导致「当前人格徽标」与其他提示互相矛盾。
+        let soul_state = rclaw_store::personas_state(&layout).map_err(|e| e.to_string())?;
+        Ok(SoulStateDto {
+            personas: soul_state.entries.iter().map(persona_dto).collect(),
+            active_edited: soul_state.active_edited,
+            active_ambiguous: soul_state.active_ambiguous,
+            active_empty: soul_state.active_empty,
+            active_path: layout.soul_file.display().to_string(),
+            souls_dir: rclaw_store::souls_dir(&layout).display().to_string(),
+            soul_enabled: enabled,
+        })
+    })
+    .await
+    .map_err(|e| format!("读取人格库失败: {e}"))?
+}
+
+/// 应用人格。`personaId` 接受内置 id 或库内文件名（两者都映射到库内文件名）。
+///
+/// 信任边界：`force=true` 只是「用户在 UI 上点过确认」的传声筒——能调用本
+/// command 的前端脚本都能传 true。本应用 WebView 只加载本地打包页面、不接受
+/// 远程内容，所以确认放前端可接受；真正的数据保护在 store 层：覆盖前**必然**
+/// 先写 `<timestamp>` 备份（`soul.rs::backup_active_soul`）。
+#[tauri::command]
+pub async fn soul_apply(
+    state: State<'_, AppState>,
+    persona_id: String,
+    force: bool,
+) -> Result<SoulApplyDto, String> {
+    let layout = soul_layout(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let file_name = rclaw_store::BUILTIN_SOULS
+            .iter()
+            .find(|p| p.id == persona_id || p.file_name == persona_id)
+            .map(|p| p.file_name.to_string())
+            .unwrap_or(persona_id);
+        let outcome =
+            rclaw_store::apply_persona(&layout, &file_name, force).map_err(|e| e.to_string())?;
+        Ok(match outcome {
+            rclaw_store::ApplyOutcome::Applied { persona, backup } => SoulApplyDto {
+                status: "applied".into(),
+                persona: Some(persona),
+                backup: backup.map(|p| p.display().to_string()),
+            },
+            rclaw_store::ApplyOutcome::NeedsConfirm => SoulApplyDto {
+                status: "needs_confirm".into(),
+                persona: None,
+                backup: None,
+            },
+            rclaw_store::ApplyOutcome::AlreadyActive => SoulApplyDto {
+                status: "already_active".into(),
+                persona: None,
+                backup: None,
+            },
+            rclaw_store::ApplyOutcome::NotFound => SoulApplyDto {
+                status: "not_found".into(),
+                persona: None,
+                backup: None,
+            },
+        })
+    })
+    .await
+    .map_err(|e| format!("应用人格失败: {e}"))?
+}
+
+/// 批量导入人格文件（手机/本机文件选择器多选后一次提交）。
+#[tauri::command]
+pub async fn soul_import(
+    state: State<'_, AppState>,
+    items: Vec<SoulImportItemIn>,
+) -> Result<Vec<SoulImportResultDto>, String> {
+    use base64::Engine as _;
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 解码前先挡住超批请求：不能先为一万个文件分配 Vec/解码再拒绝（Android 会 OOM）。
+    if items.len() > rclaw_store::MAX_IMPORT_FILES {
+        return Err(format!(
+            "一次最多导入 {} 个文件（收到 {} 个）",
+            rclaw_store::MAX_IMPORT_FILES,
+            items.len()
+        ));
+    }
+    // base64 长度上界（含填充余量）：超长样本直接判失败，不分配解码缓冲。
+    let max_b64_len = rclaw_store::MAX_IMPORT_BYTES / 3 * 4 + 8;
+    let layout = soul_layout(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut decoded = Vec::with_capacity(items.len());
+        let mut results: Vec<SoulImportResultDto> = Vec::new();
+        for item in items {
+            if item.content_b64.len() > max_b64_len {
+                results.push(SoulImportResultDto {
+                    file_name: item.file_name,
+                    saved_as: None,
+                    error: Some(format!(
+                        "文件过大（上限 {} 字节）",
+                        rclaw_store::MAX_IMPORT_BYTES
+                    )),
+                });
+                continue;
+            }
+            match base64::engine::general_purpose::STANDARD.decode(item.content_b64.as_bytes()) {
+                Ok(bytes) => decoded.push(rclaw_store::ImportItem {
+                    file_name: item.file_name,
+                    content: bytes,
+                }),
+                // 单项解码失败只影响该项：其余文件照常导入。
+                Err(e) => results.push(SoulImportResultDto {
+                    file_name: item.file_name,
+                    saved_as: None,
+                    error: Some(format!("内容解码失败: {e}")),
+                }),
+            }
+        }
+        let imported =
+            rclaw_store::import_from_files(&layout, &decoded).map_err(|e| e.to_string())?;
+        results.extend(imported.into_iter().map(|r| SoulImportResultDto {
+            file_name: r.file_name,
+            saved_as: r.saved_as,
+            error: r.error,
+        }));
+        // 成功项排前面，UI 汇总更好读。
+        results.sort_by_key(|r| r.saved_as.is_none());
+        Ok(results)
+    })
+    .await
+    .map_err(|e| format!("导入人格失败: {e}"))?
+}
+
 #[cfg(test)]
 mod plan_projection_tests {
     use super::*;

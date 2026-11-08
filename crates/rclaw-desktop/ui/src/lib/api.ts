@@ -498,6 +498,46 @@ export interface ConfigEdit {
   value: string;
 }
 
+// ---- SOUL 人格库（配置页「人格（SOUL）」）----
+
+export interface SoulPersonaDto {
+  /** 内置人格 id；导入文件为文件名。 */
+  id: string;
+  label: string;
+  file_name: string;
+  builtin: boolean;
+  /** 是否当前生效（后端按内容比对）。 */
+  active: boolean;
+  bytes: number;
+}
+
+export interface SoulStateDto {
+  personas: SoulPersonaDto[];
+  /** 生效人格是否被用户编辑过（不等于库内任何文件）。 */
+  active_edited: boolean;
+  active_path: string;
+  souls_dir: string;
+  /** [agent] soul_enabled：false 时人格不会被注入提示词（文件仍会写入）。 */
+  soul_enabled: boolean;
+  /** 生效人格有内容但库内多份同内容且无选择标记——无法唯一确定「当前」。 */
+  active_ambiguous: boolean;
+  /** 生效人格缺失/为空/仍是占位（还没播种或被清空）。 */
+  active_empty: boolean;
+}
+
+export interface SoulApplyDto {
+  status: "applied" | "needs_confirm" | "already_active" | "not_found";
+  persona: string | null;
+  /** 覆盖前的备份路径（仅旧人格被编辑过并覆盖时）。 */
+  backup: string | null;
+}
+
+export interface SoulImportResultDto {
+  file_name: string;
+  saved_as: string | null;
+  error: string | null;
+}
+
 // ---- wxbot 联系人查询（配置页「选择群 / 选择联系人」）----
 // 字段 camelCase 与 wcx 域语言对齐（wxId 等），与配置面板其余 DTO 的 snake_case 无关。
 
@@ -810,6 +850,11 @@ export const api = {
   evolutionInfo: () => invoke<EvolutionInfo>("evolution_info"),
 
   configState: () => invoke<ConfigStateDto>("config_state"),
+  soulPersonas: () => invoke<SoulStateDto>("soul_personas"),
+  soulApply: (personaId: string, force: boolean) =>
+    invoke<SoulApplyDto>("soul_apply", { personaId, force }),
+  soulImport: (items: { file_name: string; content_b64: string }[]) =>
+    invoke<SoulImportResultDto[]>("soul_import", { items }),
 
   configSave: (edits: ConfigEdit[]) =>
     invoke<void>("config_save", { edits }),

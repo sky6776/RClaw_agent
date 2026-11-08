@@ -158,9 +158,12 @@ export default function FilePanel({ onError }: { onError?: (m: string) => void }
       .workspaceWrite(editor.path, editor.content)
       .then(() => {
         setEditor((prev) => (prev ? { ...prev, dirty: false } : prev));
-        // 主配置是冷配置：文件已更新，但运行中的 agent 要重启才按新值装配。
+        // 主配置与 SOUL 人格都是冷配置：文件已更新，但运行中的 agent 要重启
+        // 才按新值装配（SOUL 在启动期拼进 system prompt）。
         if (editor.path === "rclaw.toml") {
           flashNotice("✓ 已保存主配置（重启应用后生效）");
+        } else if (editor.path === "config/SOUL.md") {
+          flashNotice("✓ 已保存人格文件（重启应用后生效）");
         }
         refresh(dir);
       })

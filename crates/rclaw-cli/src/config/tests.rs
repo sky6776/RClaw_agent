@@ -661,3 +661,18 @@ fn strip_removed_legacy_sections_reports_and_preserves_rest() {
     assert!(none.is_empty());
     assert_eq!(same, "[llm]\nprovider = \"x\"\n");
 }
+
+#[test]
+fn soul_enabled_defaults_true_and_example_round_trips() {
+    // 缺省开启（既有行为不变）。
+    assert!(Config::default().agent.soul_enabled);
+    // 显式关闭可解析。
+    let cfg: Config = toml::from_str("[agent]\nsoul_enabled = false\n").unwrap();
+    assert!(!cfg.agent.soul_enabled);
+    // example 里写了这个键且为 true（配置页据此渲染勾选框）。
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("rclaw.toml.example");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("soul_enabled = true"));
+}

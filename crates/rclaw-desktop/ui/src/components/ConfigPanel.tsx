@@ -7,6 +7,8 @@ import {
   type ConfigStateDto,
   type PermissionMode,
   type SloganPrefs,
+  type SoulPersonaDto,
+  type SoulStateDto,
 } from "../lib/api";
 import { isAndroidDevice } from "../lib/useIsMobile";
 import SkillOpsCard from "./SkillOpsCard";
@@ -171,6 +173,247 @@ function wxbotPickerOf(
     return it ? (drafts[path] ?? baselineOf(it)) : "";
   };
   return { kind, apiBase: conn("wxbot.api_base"), apiToken: conn("wxbot.api_token") };
+}
+
+const SOUL_MAX_BYTES = 256 * 1024;
+/** 与 rclaw_store::MAX_IMPORT_FILES 对齐（后端会再校验一次）。 */
+const SOUL_MAX_FILES = 20;
+
+function formatSoulBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < buf.length; i += chunk) {
+    binary += String.fromCharCode(...buf.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+/** 人格（SOUL）：选择启用 / 批量导入。切换后需重启应用才注入新人格。 */
+function SoulCard() {
+  const [state, setState] = useState<SoulStateDto | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ text: string; error?: boolean } | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setState(await api.soulPersonas());
+    } catch (e) {
+      setMsg({ text: String(e), error: true });
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const apply = useCallback(
+    async (persona: SoulPersonaDto, force: boolean) => {
+      setBusy(true);
+      setMsg(null);
+      try {
+        let res = await api.soulApply(persona.id, force);
+        if (res.status === "needs_confirm") {
+          const ok = window.confirm(
+            "当前生效人格 SOUL.md 已被修改。\n\n" +
+              "覆盖后原内容会自动备份为 config/SOUL.md.bak.<时间戳>，可随时找回。\n\n继续覆盖？",
+          );
+          if (!ok) {
+            setBusy(false);
+            return;
+          }
+          res = await api.soulApply(persona.id, true);
+        }
+        if (res.status === "applied") {
+          setMsg({
+            text:
+              `已应用「${persona.label}」（重启应用后生效）` +
+              (res.backup ? `；旧人格已备份到 ${res.backup}` : ""),
+          });
+        } else if (res.status === "already_active") {
+          setMsg({ text: "已是当前人格" });
+        } else {
+          setMsg({ text: "人格文件不存在，请刷新后重试", error: true });
+        }
+        await refresh();
+      } catch (e) {
+        setMsg({ text: String(e), error: true });
+        // 失败也可能已经把 SOUL.md 写进去了（例如仅标记写入失败）：刷新列表，
+        // 让用户看到「当前未知/已修改」等真实状态，而不是停在旧快照。
+        await refresh();
+      } finally {
+        setBusy(false);
+      }
+    },
+    [refresh],
+  );
+
+  const importFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return;
+      setBusy(true);
+      setMsg(null);
+      const localErrors: string[] = [];
+      const items: { file_name: string; content_b64: string }[] = [];
+      if (files.length > SOUL_MAX_FILES) {
+        setBusy(false);
+        setMsg({
+          text: `一次最多导入 ${SOUL_MAX_FILES} 个文件（选中 ${files.length} 个），请分批导入`,
+          error: true,
+        });
+        return;
+      }
+      for (const file of files) {
+        if (file.size > SOUL_MAX_BYTES) {
+          localErrors.push(`${file.name}：文件过大（${formatSoulBytes(file.size)}，上限 256 KB）`);
+          continue;
+        }
+        try {
+          items.push({ file_name: file.name, content_b64: await fileToBase64(file) });
+        } catch (e) {
+          localErrors.push(`${file.name}：读取失败（${String(e)}）`);
+        }
+      }
+      try {
+        const results = items.length > 0 ? await api.soulImport(items) : [];
+        const saved = results.filter((r) => r.saved_as).length;
+        const failed = results.filter((r) => !r.saved_as);
+        const reasons = [
+          ...failed.map((r) => `${r.file_name}：${r.error ?? "未知原因"}`),
+          ...localErrors,
+        ];
+        const totalFailed = failed.length + localErrors.length;
+        if (saved === 0 && totalFailed === 0) {
+          setMsg({ text: "没有可导入的文件" });
+        } else if (totalFailed === 0) {
+          setMsg({ text: `已导入 ${saved} 个文件，可在下方选择使用` });
+        } else {
+          setMsg({
+            text: `已导入 ${saved} 个，失败 ${totalFailed} 个：${reasons.join("；")}`,
+            error: true,
+          });
+        }
+        await refresh();
+      } catch (e) {
+        setMsg({ text: String(e), error: true });
+      } finally {
+        setBusy(false);
+      }
+    },
+    [refresh],
+  );
+
+  return (
+    <div className="mb-4 rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">
+      <div className="mb-1 flex items-center justify-between">
+        <h2 className="text-sm font-medium text-gray-200">人格（SOUL）</h2>
+        <button
+          onClick={() => fileRef.current?.click()}
+          disabled={busy}
+          className="text-xs text-gray-500 transition hover:text-gray-300 disabled:opacity-50"
+        >
+          从文件导入
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          multiple
+          accept=".md,.markdown,.txt,text/markdown,text/plain"
+          className="hidden"
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = "";
+            void importFiles(files);
+          }}
+        />
+      </div>
+      <p className="mb-2 text-[10px] leading-relaxed text-gray-600">
+        人格库在 <span className="font-mono">{state?.souls_dir ?? "config/souls"}</span>；
+        「使用」会把选中文件复制为{" "}
+        <span className="font-mono">{state?.active_path ?? "config/SOUL.md"}</span>
+        。当前人格被编辑过时，覆盖前会先弹确认并自动备份为{" "}
+        <span className="font-mono">SOUL.md.bak.&lt;时间戳&gt;</span>。切换后需重启应用生效；
+        可在「文件」面板直接编辑人格文本。
+      </p>
+      {state && !state.soul_enabled && (
+        <p className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[10px] text-amber-400/90">
+          人格已全局禁用（[agent] soul_enabled = false）：选择/导入仍会写入文件，但重启后不会注入提示词。
+          到上方「Agent」配置把 soul_enabled 打开即可启用。
+        </p>
+      )}
+      {state?.active_empty && (
+        <p className="mb-2 text-[10px] text-amber-400/90">
+          当前没有生效人格（config/SOUL.md 缺失、为空或仍是占位）。
+          {(state?.personas.length ?? 0) > 0
+            ? '点下方任意一份的「使用」即可写入，重启应用后生效。'
+            : '请先「从文件导入」人格，或重启应用让内置人格重新播种。'}
+        </p>
+      )}
+      {state?.active_ambiguous && (
+        <p className="mb-2 text-[10px] text-amber-400/90">
+          当前人格无法唯一确定：人格库里有内容相同的多份文件，且没有选择标记。
+          点任意一份的「使用」即可重新指定。
+        </p>
+      )}
+      {state?.active_edited && (
+        <p className="mb-2 text-[10px] text-amber-400/90">
+          当前生效人格已被修改（不等于人格库内任何文件）。
+        </p>
+      )}
+      <div className="space-y-1.5">
+        {(state?.personas ?? []).map((persona) => (
+          <div
+            key={persona.file_name}
+            className="flex items-center justify-between gap-2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1.5"
+          >
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="truncate text-xs text-gray-200">{persona.label}</span>
+                {persona.builtin && (
+                  <span className="shrink-0 rounded bg-[#232936] px-1 text-[9px] text-gray-500">
+                    内置
+                  </span>
+                )}
+                {persona.active && (
+                  <span className="shrink-0 rounded bg-indigo-500/20 px-1 text-[9px] text-indigo-300">
+                    当前
+                  </span>
+                )}
+              </div>
+              <div className="truncate font-mono text-[9px] text-gray-600">
+                {persona.file_name} · {formatSoulBytes(persona.bytes)}
+              </div>
+            </div>
+            <button
+              onClick={() => void apply(persona, false)}
+              disabled={busy || persona.active}
+              className="shrink-0 rounded border border-[#2a2f3a] px-2 py-0.5 text-[10px] text-gray-400 transition hover:text-gray-200 disabled:opacity-40"
+            >
+              {persona.active ? "使用中" : "使用"}
+            </button>
+          </div>
+        ))}
+        {state && state.personas.length === 0 && (
+          <p className="text-[10px] text-gray-600">人格库为空（重启应用会自动导入内置人格）。</p>
+        )}
+      </div>
+      {msg && (
+        <p
+          className={`mt-2 whitespace-pre-wrap break-all text-[10px] ${
+            msg.error ? "text-red-400/90" : "text-emerald-400/90"
+          }`}
+        >
+          {msg.text}
+        </p>
+      )}
+    </div>
+  );
 }
 
 function SectionCard({
@@ -446,6 +689,8 @@ export default function ConfigPanel({
             {state.doc.preamble.join("\n")}
           </p>
         )}
+
+        <SoulCard />
 
         <SkillOpsCard />
 
