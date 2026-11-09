@@ -21,13 +21,13 @@
 
 - **ReAct 内核**：主 turn 与子代理共享同一套循环策略机器——工具批次按 `parallel_safe` 并行、重复调用软 / 硬熔断、失败重试退避、**完成闸门**（结果声明必须有副作用回执、禁止空回复与内部帧泄露）、**媒体认领闸门**（未验证的媒体标记不得宣称交付）、用户插话在协议安全点注入、取消时补写 aborted 结果闭合历史链。→ [ReAct 内核](docs/react-core.md)
 - **长程会话与上下文管理**：三层压缩（加载期压缩 + 轮内 microcompact / auto / reactive）、超预算工具结果落盘为「预览 + 路径」引用句柄、文件写入 checkpoint 与 `/rewind` 回滚、任意用户消息锚点 `/fork` 分叉、`/goal` 会话级目标提醒与完成审计、`/export` 完整导出、跨会话检索与交接（`session_search` / `session_handoff`）。→ [长程会话与上下文管理](docs/context-management.md)
-- **内置工具**：文件读写 / 编辑 / 删除 / 列举 / grep（默认沙箱在数据目录内，越界需确认或显式提权）、shell 与后台任务轮询、记忆、跨会话检索、多来源高可用联网搜索池（熔断 / 额度降级 / 多 Key 轮换）、拟人化 CDP 浏览器（仅桌面 / APK）、媒体下载。→ [内置工具](docs/tools.md)
+- **内置工具**：文件读写 / 编辑 / 删除 / 列举 / grep（默认沙箱在数据目录内，越界需确认或显式提权）、shell 与后台任务轮询、记忆、跨会话检索、多来源高可用联网搜索池（熔断 / 额度降级 / 多 Key 轮换）、拟人化 CDP 浏览器（仅桌面 / APK）、媒体下载、wxbot 微信消息读取（`wxbot_chat_list` / `wxbot_chat_history` / `wxbot_message_search`，本地消息库只读检索）。→ [内置工具](docs/tools.md)
 
 ### 能力扩展
 
 - **技能系统**：`SKILL.md` 渐进披露、读取即激活；`skill.toml` 声明式 Manifest 编译成结构化动态工具 `skill__<skill>__<entrypoint>`（14 种参数类型、约束、固定子命令，参数以 argv 直达进程、不经 shell），从源头消除路径幻觉、命令注入与 Key 泄漏。→ [技能系统](docs/skills.md)
 - **内置技能目录**：仓库自带 40 个顶层技能——智谱 GLM 官方族（OCR / 多模态 / 文生图等 16 个）、图像视频生成 7 个、投研金融 7 个（含 4 个多子技能包）、办公文档 4 个（docx / pdf / pptx / xlsx）、电商与社媒抓取 4 个、工具类 2 个。→ [内置技能目录](docs/skills-catalog.md)
-- **记忆与自进化**：`MEMORY.md` / `USER.md` / 每日笔记三层记忆（预算制、写入脱敏与提示注入防护）、`SOUL.md` 人格、turn 结束后的后台 review（token 预算 + 辅助模型）、技能结果记账、进化信号、`EXPERIENCE.md` 热经验层、curator 策展器的 Active → Stale → Archived 生命周期、sha256 台账逐变更回滚。→ [记忆与自进化](docs/self-evolution.md)
+- **记忆与自进化**：`MEMORY.md` / `USER.md` / 每日笔记三层记忆（预算制、写入脱敏与提示注入防护）、`SOUL.md` 人格库（四份内置人格——微信真人口吻 / 苏轼 / 东北老铁 / 李逵——配置页可切换、可从本机或手机存储批量导入；覆盖前确认并自动备份为 `SOUL.md.bak.<时间戳>`，`[agent] soul_enabled` 可整体停用）、turn 结束后的后台 review（token 预算 + 辅助模型）、技能结果记账、进化信号、`EXPERIENCE.md` 热经验层、curator 策展器的 Active → Stale → Archived 生命周期、sha256 台账逐变更回滚。→ [记忆与自进化](docs/self-evolution.md)
 - **多智能体协作**：`Agent` 子代理委派（拆分理由门控、前台 / 后台、结构化交接）、团队共享任务表与成员邮箱、子代理实时进度面板（状态 / 阶段 / 时长 / token，详情含完整活动记录并可对话）、`PlanRun` 依赖序多步计划（并行波次、对抗验证环、暂停 / 续跑、`escalate` 提问）、确定性 QuickJS **动态工作流**（`.ask<T>()` 类型编译、journal 零调用重放、amend 热修）、持久身份 **bot** 与 2–6 bot 群聊房间、`message_agent` 不可伪造交接链。→ [多智能体协作](docs/multi-agent.md)
 - **定时任务与心跳**：`after / at / clock / every` 与日 / 周 / 月 / 年 / 农历日历规则，一次性或重复；到期任务走完整 ReAct turn 并投递到指定通道；`HEARTBEAT.md` 周期自检。→ [定时任务](docs/cron.md)
 - **gbrain 知识库**（Android APK 进程内集成）：SQLite + sqlite-vec + FTS5 的混合检索、文档解析与 GLM-OCR 管线、RAPTOR 递归摘要树、制品路由与审核队列，18 个工具。→ [gbrain 知识库](docs/gbrain.md)
@@ -113,7 +113,7 @@ auth = "bearer"
 ```
 crates/
 ├── rclaw-core        消息总线与领域类型（无环依赖规则的根）
-├── rclaw-store       会话 / 记忆 / journal 持久化 + 敏感信息 redact
+├── rclaw-store       会话 / 记忆 / journal 持久化 + 人格库（SOUL）+ 敏感信息 redact
 ├── rclaw-llm         Provider 两层抽象（协议层 + 方言层）、SSE 流式解析
 ├── rclaw-tools       内置工具、技能运行时、MCP 客户端、搜索池、浏览器
 ├── rclaw-gbrain      知识库子系统（lib-only，仅 APK 进程内集成）
