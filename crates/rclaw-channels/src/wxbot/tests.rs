@@ -322,6 +322,200 @@ fn account_mismatch_latches_send_gate() {
     assert!(!st.account_ok(""), "锁停后空账号事件同样拒绝");
 }
 
+#[test]
+fn unbound_state_admits_events_but_never_binds_from_them() {
+    // 2026-11-13 定稿 R1 fail-closed 回归（评审 R5 P3-4 修正覆盖声明）：本测试只锁
+    // `account_ok` 的纯函数语义——unbound 放行且不绑定。三个入口（wait_once /
+    // ingest_one / webhook_handler）的实际路径覆盖由下方 `webhook_message_on_unbound_*`、
+    // `ingest_one_on_unbound_*`、`wait_once_on_unbound_*` 三个测试共同承担；任一入口
+    // 重新加回 bind 调用，对应入口的测试必炸。
+    let mut st = WxbotState::default();
+
+    // unbound 时 account_ok 放行（收发任务照常运行，投递不丢）。
+    assert!(st.account_ok("wxid_a"), "unbound 时事件放行投递");
+    // 但放行不得隐式绑定——发送闸门必须保持关闭。
+    assert!(!st.account_bound, "account_ok 不得改变绑定状态");
+    assert!(!st.account_locked, "unbound 放行不得触发锁停");
+
+    // 多个不同账号事件依次放行，同样不得绑定。
+    assert!(st.account_ok("wxid_b"));
+    assert!(st.account_ok(""));
+    assert!(!st.account_bound, "多次事件后仍不得绑定");
+}
+
+#[tokio::test]
+async fn webhook_message_on_unbound_does_not_bind_account() {
+    // 黄金标准（直调 handler）：unbound 状态下收一条带账号的消息事件——必须放行
+    // 入队，但 account_bound 必须保持 false（发送闸门关闭）。若把 handler 里移除
+    // 的 s.bind(&ev.account) 加回来，本测试必炸。
+    let b = bot();
+    assert!(!b.state.lock().unwrap().account_bound, "前置：unbound");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<CollectorEvent>(8);
+    let st = super::WebhookState {
+        queue: tx,
+        secret: Arc::new("sec".to_string()),
+        account: b.state.clone(),
+    };
+    let body = json!({
+        "event": "message", "seq": 1, "dedup_key": "s:wxid_a:1",
+        "account": "wxid_a", "type": "text", "type_code": 1,
+        "msg_svr_id": 0, "talker": "wxid_peer", "sender": "wxid_peer",
+        "is_group": false, "content": "hello", "at_users": [],
+        "create_time": 1,
+    })
+    .to_string();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer sec"),
+    );
+    let res = super::webhook_handler(
+        axum::extract::State(st),
+        headers,
+        body,
+    )
+    .await;
+    assert_eq!(res.status(), axum::http::StatusCode::OK, "unbound 事件应放行入队");
+
+    // 事件确实进了队列（不静默丢）。
+    let got = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .expect("事件应在队列里")
+        .expect("队列未关闭");
+    assert_eq!(got.account, "wxid_a");
+
+    // 关键断言：事件不得绑定账号——发送闸门保持关闭。
+    let s = b.state.lock().unwrap();
+    assert!(!s.account_bound, "webhook 事件不得绑定账号（fail-closed）");
+    assert!(!s.account_locked, "放行不得触发锁停");
+}
+
+#[test]
+fn constant_time_eq_basic_cases() {
+    // 评审 R4 P2-3：best-effort CT 的三组行为锁定（非形式化 constant-time，只挡
+    // 朴素逐字节时序侧信道；长度差异提前返回是记录在案的取舍）。
+    assert!(super::constant_time_eq(b"sec", b"sec"), "等长等值必须为真");
+    assert!(
+        !super::constant_time_eq(b"sec", b"sed"),
+        "等长差值必须为假"
+    );
+    assert!(!super::constant_time_eq(b"sec", b"secretx"), "长度不同必须为假");
+    assert!(super::constant_time_eq(b"", b""), "空对空为真");
+    assert!(!super::constant_time_eq(b"", b"x"), "空与非空为假");
+}
+
+#[tokio::test]
+async fn webhook_body_over_limit_rejected_413() {
+    // 评审 R5 P3-1：DefaultBodyLimit(1MB) 生效验证——超限 body 在进入 handler
+    // （含 Bearer 校验）之前就被 axum 层拒绝为 413 PAYLOAD_TOO_LARGE。
+    // 复刻 webhook_server 的路由层叠（route + state + layer），直连 oneshot。
+    let (tx, _rx) = tokio::sync::mpsc::channel::<CollectorEvent>(1);
+    let st = super::WebhookState {
+        queue: tx,
+        secret: Arc::new("sec".to_string()),
+        account: Arc::new(std::sync::Mutex::new(WxbotState::default())),
+    };
+    let app = axum::Router::new()
+        .route("/wxbot/webhook", axum::routing::post(super::webhook_handler))
+        .with_state(st)
+        .layer(axum::extract::DefaultBodyLimit::max(1_000_000));
+
+    // 故意错误 Bearer + 超限 body：413 必须先于 401（body 限制在提取阶段生效）。
+    let oversized = vec![b'a'; 1_000_001];
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/wxbot/webhook")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer wrong")
+        .body(axum::body::Body::from(oversized))
+        .unwrap();
+    use tower::ServiceExt;
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        "超限 body 必须在鉴权前被 413 拒绝"
+    );
+}
+
+#[tokio::test]
+async fn ingest_one_on_unbound_does_not_bind_account() {
+    // 黄金标准（ingest 路径）：unbound + 带账号事件 → 正常投递/落库，但
+    // account_bound 必须保持 false、send_gate 保持拒绝。若把 ingest_one 里移除的
+    // st.bind(&ev.account) 加回来，本测试必炸。
+    let (b, dir) = bot_with_db(); // allow_from = "wxid_friend"
+    assert!(!b.state.lock().unwrap().account_bound, "前置：unbound");
+
+    let ev = event(json!({
+        "event": "message", "seq": 1, "dedup_key": "kf1", "msg_svr_id": 11,
+        "account": "wxid_self", "type": "text",
+        "talker": "wxid_friend", "content": "hello",
+    }));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<BusMessage>(8);
+    b.ingest_one(ev, &tx).await;
+    assert!(
+        rx.try_recv().is_ok(),
+        "unbound 时事件照常投递（收发任务运行、仅发送闸关闭）"
+    );
+
+    let s = b.state.lock().unwrap();
+    assert!(!s.account_bound, "ingest_one 不得绑定账号（fail-closed）");
+    assert!(!s.account_locked, "放行不得触发锁停");
+    drop(s);
+    assert!(
+        b.send_gate().is_err(),
+        "unbound 时发送闸门必须保持拒绝（防跨账号误发）"
+    );
+    drop(dir);
+}
+
+#[tokio::test]
+async fn wait_once_on_unbound_does_not_bind_account() {
+    // 黄金标准（wait 路径）：mock /api/messages/wait 返回带账号的事件 →
+    // wait_once 入队成功，但 account_bound 必须保持 false。若把 wait_once 里移除的
+    // s.bind(&ev.account) 加回来，本测试必炸。
+    async fn hit() -> axum::Json<serde_json::Value> {
+        axum::Json(json!({
+            "event": {
+                "event": "message", "seq": 7, "dedup_key": "kw1",
+                "account": "wxid_self", "type": "text", "type_code": 1,
+                "msg_svr_id": 0, "talker": "wxid_friend", "sender": "wxid_friend",
+                "is_group": false, "content": "hi", "at_users": [],
+                "create_time": 1
+            }
+        }))
+    }
+
+    let app = axum::Router::new().route("/api/messages/wait", axum::routing::get(hit));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock server");
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut c = cfg();
+    c.api_base = format!("http://{addr}");
+    let b = Wxbot::new(c).expect("mock 配置合法");
+    assert!(!b.state.lock().unwrap().account_bound, "前置：unbound");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<CollectorEvent>(8);
+    let outcome = b.wait_once(None, &tx).await.expect("wait 应成功");
+    match outcome {
+        super::WaitOutcome::Got(seq) => assert_eq!(seq, 7),
+        super::WaitOutcome::Idle(_) => panic!("带事件的响应不得按 Idle 处理"),
+    }
+    let ev = rx.try_recv().expect("事件应入队");
+    assert_eq!(ev.account, "wxid_self");
+
+    let s = b.state.lock().unwrap();
+    assert!(!s.account_bound, "wait_once 不得绑定账号（fail-closed）");
+    assert!(!s.account_locked, "放行不得触发锁停");
+    server.abort();
+}
+
 // ---------------------------------------------------------------------------
 // 事件解析（serde 契约）
 // ---------------------------------------------------------------------------

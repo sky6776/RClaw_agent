@@ -4437,6 +4437,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
+ "tower",
  "tracing",
 ]
 

@@ -15,8 +15,12 @@
 //!   mp3 → `utils/audio/mp3-to-silk`（WCX 本地路径）→ `utils/audio/duration` → 发送。
 //! - **安全**：`api_base` / `webhook_listen` 强制回环，`api_token` / `webhook_secret`
 //!   强制非空，reqwest 禁重定向——全部在 [`Wxbot::new`] 校验，任一不满足即不启动。
-//! - **账号绑定**：启动时经 `/api/self/info` 绑定微信账号；运行中收到其他账号的事件
-//!   一律丢弃（换号需重启通道，防跨账号复用历史 / 误发）。
+//! - **账号绑定（fail-closed，2026-11-13 R1）**：账号**只来自**启动后 `GET
+//!   /api/self/info` 的探测（独立短超时 + 有界退避重试）；事件数据一律不绑定账号。
+//!   unbound 期间收发任务照常运行、事件照常投递（**多账号事件可能进入同一 agent
+//!   上下文——产品接受的取舍**，回复门槛与落库按事件自带账号隔离），但发送闸门
+//!   拒绝（含原因日志，不静默丢）；绑定后收到其他账号的事件一律丢弃并锁停
+//!   （换号需重启通道，防跨账号复用历史 / 误发）。
 //!
 //! 白名单 = **回复**门槛（记录与回复解耦）：私聊 `allow_from` 空 = 不响应任何私聊
 //! （fail-closed；weixin 通道仍为空 = 放行全部，不在本通道范围）；群聊
@@ -247,9 +251,10 @@ struct CachedMediaNote {
 /// handler 之外的 bind_account 首访竞争。
 #[derive(Default)]
 struct WxbotState {
-    /// 启动绑定的微信账号（wxid）。空 = 尚未绑定。
+    /// 绑定的微信账号（wxid）。空 = 尚未绑定。
     account: String,
-    /// 账号是否已显式绑定（区分「未绑定」与「绑定成功但 wxid 为空」）。
+    /// 账号是否已显式绑定。**只允许来自 self/info 探测**（2026-11-13 定稿 R1
+    /// fail-closed）：事件数据不得绑定账号，否则「未绑定拒发」会被事件重新打开。
     account_bound: bool,
     /// 换号锁停闩：检测到账号不匹配后置位，收发全部拒绝直到进程重启
     /// （防止切换账号后，旧会话的待发回复经新账号发出造成跨账号泄露）。
@@ -541,26 +546,102 @@ impl Wxbot {
                 || ev.url.as_deref().is_some_and(mentions_weixin110))
     }
 
-    /// 启动时绑定微信账号（best-effort；失败由首个事件的 account 兜底绑定）。
+    /// 单次 self/info 绑定尝试（成功返回 true）。
     ///
-    /// 只信 `self/info` 的真实 `wxId`，不回退 `customWxId`（两字段独立读取，前者可为空
-    /// 而后者有值；绑定到非真实账号会让后续正常事件被误判为换号而永久锁停）。
-    async fn bind_account(&self) {
-        match self.get_json("self/info", &[]).await {
-            Ok((status, val)) if (200..300).contains(&status) => {
-                let wxid = val
-                    .get("wxId")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty());
-                if let Some(wxid) = wxid {
-                    if let Ok(mut st) = self.state.lock() {
-                        st.bind(wxid);
+    /// 只信 `self/info` 的真实 `wxId`，不回退 `customWxId`（两字段独立读取，前者可为空）。
+    ///
+    /// 2026-11-13 定稿 R1 fail-closed：绑定**只来自本探测**；事件数据不再兜底绑定
+    /// （wait_once / ingest_one / webhook_handler 三处已移除 bind 调用）。探测失败
+    /// 不阻塞收发任务——由 [bind_loop] 带退避重试，unbound 期间 send_gate 拒发
+    /// （每次拒发都有含原因的日志，不静默丢）。
+    ///
+    /// 评审 R4 修订：身份探测用**独立短超时**（5s，per-request override；主 client
+    /// 的总超时是 poll_timeout+15s，默认会把探测挂 75s）；HTTP 状态在 JSON 解析前
+    /// 记录（401/502 的文本响应不再被误报成「不可达」）；锁中毒返回 false 让
+    /// [bind_loop] 继续重试，不谎报成功。
+    async fn bind_account(&self) -> bool {
+        let url = self.api_url("self/info");
+        let req = self
+            .http
+            .get(&url)
+            .header("Authorization", self.bearer())
+            .timeout(Duration::from_secs(5));
+        let (status, body) = match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = match resp.text().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::info!("wxbot：self/info HTTP {status} 但读 body 失败（{e}），保持 unbound");
+                        return false;
                     }
-                } else {
-                    tracing::info!("wxbot：self/info 的 wxId 为空，将由首个事件绑定真实账号");
-                }
+                };
+                (status, body)
             }
-            _ => tracing::info!("wxbot：启动绑定账号失败（self/info 不可达），将由首个事件绑定"),
+            Err(e) => {
+                tracing::info!("wxbot：self/info 不可达（ApiServer 未启动/端口未监听：{e}），保持 unbound，稍后重试");
+                return false;
+            }
+        };
+        // 状态先于解析记录（评审 R4 P2）：任何 HTTP 状态都有迹可查。
+        if !(200..300).contains(&status) {
+            tracing::info!("wxbot：self/info HTTP {status}，保持 unbound，稍后重试");
+            return false;
+        }
+        let val: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::info!("wxbot：self/info HTTP {status} 但 JSON 解析失败（{e}），保持 unbound");
+                return false;
+            }
+        };
+        let wxid = val
+            .get("wxId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        match wxid {
+            Some(wxid) => match self.state.lock() {
+                Ok(mut st) => {
+                    st.bind(wxid);
+                    // 记录绑定后的实际账号（bind 是 first-bind-wins；若已绑定则不变）。
+                    let bound_now = st.account.clone();
+                    tracing::info!("wxbot：self/info HTTP {status} 绑定成功 account={bound_now}");
+                    true
+                }
+                Err(_) => {
+                    // 锁中毒：绑定没发生，不得谎报成功（评审 R4 P2/P3），让 bind_loop 重试。
+                    tracing::warn!("wxbot：状态锁中毒，绑定未完成，稍后重试");
+                    false
+                }
+            },
+            None => {
+                tracing::info!("wxbot：self/info HTTP {status} 但 wxId 为空（微信未登录/DB 未就绪），保持 unbound");
+                false
+            }
+        }
+    }
+
+    /// 账号绑定重试循环（有界退避：5s 起，每次 ×2 封顶 60s，带抖动；绑定成功即退出）。
+    ///
+    /// join 语义说明（评审 R4 P2-2 记录项）：`run()` 的 join! 本就是「全部无限任务」
+    /// 模型（webhook/poll/ingest/send 都不正常返回），bind_loop 绑定成功后退出反而
+    /// 先于其它任务结束，不改变 run 的生命周期；因此不引入额外的取消原语。
+    async fn bind_loop(self: Arc<Self>) {
+        let mut delay = 5u64;
+        loop {
+            if self.bind_account().await {
+                return;
+            }
+            // 抖动（评审 R5 codex P3）：在 0..=delay/4 均匀抽样，避免「先取 0..999 再
+            // min 钳顶」导致绝大多数值落在同一上限、错峰效果失效。
+            let quarter = (delay / 4).max(1);
+            let jitter = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| (d.subsec_nanos() as u64) % (quarter + 1))
+                .unwrap_or(0))
+                .min(quarter);
+            tokio::time::sleep(Duration::from_secs(delay.saturating_add(jitter))).await;
+            delay = (delay * 2).min(60);
         }
     }
 
@@ -770,11 +851,12 @@ impl Wxbot {
             tracing::warn!("wxbot messages/wait 事件解析失败: {e}");
         })?;
         let seq = ev.seq;
-        // 入队前账号准入（同 webhook 路径）：锁停立即置位；被拒事件直接丢弃，
-        // 游标照常推进（通道已锁停，该事件永远不会被投递）。
+        // 账号核对（2026-11-13 定稿 R1 fail-closed：**事件数据不绑定账号**——unbound
+        // 时 account_ok 放行投递，但发送闸门在绑定前保持关闭；绑定只来自 self/info）。
+        // 锁停立即置位的语义保留：被拒事件直接丢弃，游标照常推进（通道已锁停，
+        // 该事件永远不会被投递）。
         match self.state.lock() {
             Ok(mut s) => {
-                s.bind(&ev.account);
                 if !s.account_ok(&ev.account) {
                     return Ok(WaitOutcome::Got(seq));
                 }
@@ -842,7 +924,11 @@ impl Wxbot {
         };
         let app = axum::Router::new()
             .route(&self.cfg.webhook_path, post(webhook_handler))
-            .with_state(state);
+            .with_state(state)
+            // 2026-11-13 定稿 R2：显式 body 上限（1MB）。axum 0.8 默认 2MB 只是
+            // 提取器隐含行为，显式声明才能在超限时稳定返回 413，且不被未来默认值
+            // 变化影响；事件体积远小于此（消息文本 + XML），超大 body 只可能是异常。
+            .layer(axum::extract::DefaultBodyLimit::max(1_000_000));
         let listener = match tokio::net::TcpListener::bind(&self.cfg.webhook_listen).await {
             Ok(l) => l,
             Err(e) => {
@@ -890,8 +976,9 @@ impl Wxbot {
                 tracing::debug!("wxbot：重复事件已丢弃 seq={} key={key}", ev.seq);
                 return;
             }
-            // 2) 账号绑定（启动 self/info 不可达时由首个带账号的事件兜底）+ 账号核对。
-            st.bind(&ev.account);
+            // 2) 账号核对（2026-11-13 定稿 R1 fail-closed：**事件数据不绑定账号**；
+            //    绑定只来自 self/info 探测。unbound 时 account_ok 放行，发送闸门在
+            //    绑定前保持关闭）。
             if !st.account_ok(&ev.account) {
                 return;
             }
@@ -2080,6 +2167,22 @@ struct WebhookState {
     account: Arc<Mutex<WxbotState>>,
 }
 
+/// Constant-time 字节比较（best-effort，评审 R4 P2-3 记录项）：
+/// - **长度差异提前返回**：secret 长度会被泄露——本通道威胁模型是同机 loopback 上
+///   的恶意本机进程，长度不视为秘密；若威胁模型升级需换 `subtle::ConstantTimeEq`。
+/// - 等长路径全量累计 diff，无提前退出；未用 `black_box`，release 下编译器理论上
+///   可向量化——非形式化 constant-time，只挡朴素的逐字节时序侧信道。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn webhook_handler(
     axum::extract::State(st): axum::extract::State<WebhookState>,
     headers: axum::http::HeaderMap,
@@ -2092,7 +2195,8 @@ async fn webhook_handler(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or_default();
-    if presented != st.secret.as_str() {
+    // 2026-11-13 定稿 R2：constant-time 比较（防时序侧信道逐字节猜测 secret）。
+    if !constant_time_eq(presented.as_bytes(), st.secret.as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     let ev: CollectorEvent = match serde_json::from_str(&body) {
@@ -2111,11 +2215,10 @@ async fn webhook_handler(
             // 入队前账号准入：串行 ingest 可能被媒体下载阻塞数十秒，换号锁停必须
             // 在这里（锁内）立即置位，让并发发送分支的 send_gate 马上看到。
             // ingest 内保留复核（防准入后、入队前的窗口外变化）。
+            // 2026-11-13 定稿 R1 fail-closed：**事件数据不绑定账号**——unbound 时
+            // 放行入队（account_ok 对 unbound 返回 true），发送闸门在绑定前保持关闭。
             let admitted = match st.account.lock() {
-                Ok(mut s) => {
-                    s.bind(&ev.account);
-                    s.account_ok(&ev.account)
-                }
+                Ok(mut s) => s.account_ok(&ev.account),
                 Err(_) => true, // 毒锁：交由 ingest 复核兜底
             };
             if !admitted {
@@ -2481,8 +2584,11 @@ impl Channel for Wxbot {
 
     async fn run(self, inbound: crate::InboundSender, outbound: OutboundReceiver) {
         let me = Arc::new(self);
-        // 启动即尝试绑定账号（best-effort；失败由首个事件兜底绑定）。
-        me.bind_account().await;
+        // 2026-11-13 定稿 R1：绑定改为独立重试任务（有界退避），**不再阻塞收发任务
+        // 启动**——webhook 监听 / 长轮询 / ingest 立即起；unbound 期间 send_gate 拒发
+        // （含原因日志），事件数据不绑定账号。
+        let binder = me.clone();
+        let bind_task = async move { binder.bind_loop().await };
         // 群消息全量落库的显式提示（隐私边界：记录不受 allow_groups 约束，回复才
         // 受）。尽力而为口径——落库失败仅告警不重投；db 缺失时明示不会落库。
         // 注意措辞：白名单外群消息媒体与白名单内同链路下载；视频暂不支持。
@@ -2510,8 +2616,9 @@ impl Channel for Wxbot {
                 std::future::pending::<()>().await;
             }
         };
-        // 四个并发任务：webhook 监听 / 兜底长轮询 / 单一 ingest / 出站发送。
+        // 五个并发任务：账号绑定重试 / webhook 监听 / 兜底长轮询 / 单一 ingest / 出站发送。
         let _ = tokio::join!(
+            bind_task,
             webhook.webhook_server(queue_tx.clone()),
             poll_task,
             ingester.ingest_loop(queue_rx, inbound),
