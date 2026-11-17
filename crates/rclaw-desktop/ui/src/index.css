@@ -324,6 +324,60 @@ html.theme-light #root {
 .theme-light .hover\:border-\[\#3a4150\]:hover {
   border-color: #c9cfda;
 }
+/* 工具调用面板（ToolCallRow）：展开详情底、文本块底与边框。这三个字面量只有
+   ToolCallRow 用，此前漏了浅色覆盖——浅色主题下展开详情区整块保持深底。 */
+.theme-light .bg-\[\#11151d\] {
+  background-color: #eceef2;
+}
+.theme-light .bg-\[\#0d1117\] {
+  background-color: #f6f7f9;
+}
+.theme-light .border-\[\#242a36\] {
+  border-color: #d8dce4;
+}
+/* 工具调用面板 diff 行：200 档浅色文字反转（200 档此前无覆盖，浅底下不可读）；
+   /10 高亮底在浅色下几乎不可见，换浅色实色。后两条限定在 .toolcall-panel
+   （ToolBatchRows 根）内——/10 类全应用大量共用，全局翻转超出本次范围。 */
+.theme-light .text-emerald-200 {
+  color: #047857;
+}
+.theme-light .text-red-200 {
+  color: #b91c1c;
+}
+.theme-light .toolcall-panel .bg-emerald-500\/10 {
+  background-color: #d1fae5;
+}
+.theme-light .toolcall-panel .bg-red-500\/10 {
+  background-color: #fee2e2;
+}
+/* 「重试」等按钮的 hover 提亮（hover:text-gray-100，全应用 30+ 处）：hover 变体被
+   编进样式表末尾的 @media(hover:hover)，同权重下压过前面的 theme-light 覆盖，
+   浅色 hover 会变近白字（#f3f4f6 on #eceef2 ≈ 1.06:1，标签消失）。用 3 类选择器
+   压过它；必须与下一条 /95 底色修复同批——那条是唯一容器底没有浅色覆盖的使用点。 */
+.theme-light .hover\:text-gray-100:hover {
+  color: #111827;
+}
+/* 「回到底部」悬浮钮的 /95 半透明深底：/95 修饰符编译成独立类名，既有的
+   .bg-\[\#141821\] 覆盖匹配不到它（与 bg-[#1a2030]/90 同病），浅色下深底配深字。 */
+.theme-light .bg-\[\#141821\]\/95 {
+  background-color: #ffffffef;
+}
+/* 工具面板内的低对比文字（限 .toolcall-panel，不动全局档位）：面板底变浅后，
+   diff 计数与状态字形（400 档）跌到 3.2–4.3:1，Section 标题 / 行号 / 截断提示
+   （gray-600）只有 2.2:1，加载失败提示（amber-400）4.3:1。色值取与现有 300 档
+   浅色映射一致（emerald-300/red-300 同值）或按 4.5:1 线加深。 */
+.theme-light .toolcall-panel .text-emerald-400 {
+  color: #047857;
+}
+.theme-light .toolcall-panel .text-red-400 {
+  color: #b91c1c;
+}
+.theme-light .toolcall-panel .text-amber-400 {
+  color: #92400e;
+}
+.theme-light .toolcall-panel .text-gray-600 {
+  color: #5f6773;
+}
 
 /* 双用途补丁：gray-200 变量已按文本色翻转，用户气泡背景保持浅灰。 */
 .theme-light .bg-gray-200 {

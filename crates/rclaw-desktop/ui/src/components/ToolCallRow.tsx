@@ -146,8 +146,9 @@ export default function ToolBatchRows({
   /** 自定义详情加载器（缺省按 chatId 读前台会话）。 */
   detailLoader?: ToolDetailLoader;
 }) {
+  // toolcall-panel：浅色主题的 diff 行 tint 覆盖以它为作用域（index.css），只影响工具面板。
   return (
-    <div className="flex w-full flex-col gap-1">
+    <div className="toolcall-panel flex w-full flex-col gap-1">
       {calls.map((call, index) => (
         <ToolCallRow
           key={`${call.id}:${index}`}
