@@ -670,6 +670,9 @@ impl Worker {
         if self.session.is_some() {
             return;
         }
+        // 上次切换可能把提交入口关着就失败了：只要不在切换中，入口就该开着（连不上时
+        // 阶段本就无从开始，接上之后自然有效）。
+        self.shared.ctx.space.reopen();
         self.reopen_at = None;
         let shared = self.shared.clone();
         let paths = shared.ctx.paths.clone();
@@ -1213,7 +1216,11 @@ impl Worker {
             let mut next = self.secrets.clone();
             let joined = space::apply_pairing(&self.config, &mut next, &parsed);
             if joined == self.config && next == self.secrets {
-                // 完全没变化：什么都不用做。
+                // 完全没变化：不用换凭据；但如果当前没连着（断网后重试同一配对码），
+                // 顺手重连一次。
+                if self.session.is_none() {
+                    self.open().await;
+                }
                 return Ok(joined);
             }
             // 配对码可能带了更新的存储地址/凭据：换凭据必须重建连接，先确认能换（在途
