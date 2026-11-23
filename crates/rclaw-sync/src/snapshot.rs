@@ -1406,6 +1406,14 @@ impl Writer {
                     );
                     let mut log = db::log_state(tx)?;
                     let published = log.snap.as_ref().map(|snap| snap.name.as_str());
+                    // 新快照对这些旧对象的替代证据：删除押在「新的这份能完整读回」上；
+                    // 覆盖不到旧对象那份范围的，不排删除（旧对象还能恢复更多历史）。
+                    let new_key = snap_key(&dev, &name);
+                    let new_digest = snap.digest.clone();
+                    let covers = record.covers.clone();
+                    let replaces = |owner: &str| {
+                        covers.get(&snap_key(&dev, owner)).copied().unwrap_or(0) <= covered
+                    };
                     if published.is_some() && published != Some(name.as_str()) {
                         // 候选保留独立指针：head 与上一份快照都先不动。
                         record.snap_pending = Some(snap);
@@ -1413,12 +1421,12 @@ impl Writer {
                             after_ms: now + SNAP_GRACE_MS,
                             floor: None,
                             snap: None,
-                            basis: None,
+                            basis: Some((new_key, new_digest)),
                             pack: None,
                             retry_ms: 0,
                         };
                         for (owner, path) in &stale {
-                            if Some(owner.as_str()) != published {
+                            if Some(owner.as_str()) != published && replaces(owner) {
                                 queue_delete(tx, path, &when)?;
                             }
                         }
@@ -1431,12 +1439,14 @@ impl Writer {
                         after_ms: now + SNAP_GRACE_MS,
                         floor: None,
                         snap: Some(name.clone()),
-                        basis: None,
+                        basis: Some((new_key, new_digest)),
                         pack: None,
                         retry_ms: 0,
                     };
-                    for (_, path) in &stale {
-                        queue_delete(tx, path, &when)?;
+                    for (owner, path) in &stale {
+                        if replaces(owner) {
+                            queue_delete(tx, path, &when)?;
+                        }
                     }
                     log.snap = Some(snap);
                     log.head_dirty = true;
