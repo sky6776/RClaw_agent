@@ -109,9 +109,10 @@ const GC_RETRY_MS: i64 = 5 * 60 * 1000;
 /// 升级前留下的、推不出恢复依据的日志对象：退到很久以后再看（对象不删）。不退避的话
 /// 它们每轮都占满批次，后面的正常删除记录永远轮不到。
 const GC_PARK_MS: i64 = 30 * 24 * 3600 * 1000;
-/// 晋升（候选快照 / 候选回收位置）前的完整复核一次走完的时限。必须与删除时的复核
-/// 份额一致：晋升时 30 秒核完、删除时 6 秒核不完，会留下“floor 已前进、对象永远删不掉”
-/// 的中间状态。单份依据的 sweep 份额是 `SWEEP_BUDGET * 0.75`（6 秒），这里就用同一个数。
+/// 一次「完整复核」的时限（晋升判定与删除前复核共用）。sweep 每轮只把复核额度给一份
+/// 依据/包，所以删除时的期限也是这个数——晋升时核得完的依据，删除时同样核得完。
+/// 更大（或更慢）的快照在弱版本存储上永远核不完：floor 不前进、旧对象保留，未引用的
+/// 旧候选快照由 `orphan` 清理，不会无界累积。
 const PROMOTE_BUDGET: Duration = Duration::from_secs(6);
 /// 一份依据连续这么多次没能在一次判定里核完，就不再重试（保留旧边界与对象）。
 const PROMOTE_TRIES: u32 = 3;
@@ -403,6 +404,10 @@ struct GcWhen {
     /// 前面的坏依据每轮都占满批次，后面的对象永远轮不到。
     #[serde(default, skip_serializing_if = "is_zero")]
     retry_ms: i64,
+    /// 本机自己写下、已经没有任何 head 引用、且被更新候选完整覆盖的旧快照对象：它们在
+    /// 写入时就比对过完整向量，删掉不需要再核验一份新快照（宽限期后即可删）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    orphan: bool,
 }
 
 fn is_zero(value: &i64) -> bool {
@@ -1432,8 +1437,27 @@ impl Writer {
         let parts = self.parts.len();
         // 旧对象的排删要能证明「新快照覆盖不少于旧快照的每一台设备」：只看本机那一格
         // 不够——别的设备的历史可能只有旧快照覆盖着。读不出旧清单或向量不支配时保留。
+        // 其他设备的 head 里还指着的快照不能当「无人引用」删：新设备会按那台设备的
+        // head 去找它。
+        let peer_snaps: HashSet<String> = offload(ctx, {
+            let dev = self.dev.clone();
+            move |ctx| {
+                db::read(ctx.db(), |conn| {
+                    Ok(db::peers(conn)?
+                        .into_iter()
+                        .filter_map(|(_, peer)| {
+                            peer.snap.map(|snap| snap_key(&dev, &snap.name))
+                        })
+                        .collect())
+                })
+            }
+        })
+        .await?;
         let mut replaceable: Vec<(String, String)> = Vec::new();
         for (owner, path) in &stale {
+            if peer_snaps.contains(&snap_key(&self.dev, owner)) {
+                continue;
+            }
             match open_manifest(transport, &self.keys, &self.dev, owner, None).await {
                 Ok(old) if covers_dominates(&manifest_for_check, &old) => {
                     replaceable.push((owner.clone(), path.clone()));
@@ -1483,19 +1507,20 @@ impl Writer {
                     let published = log.snap.as_ref().map(|snap| snap.name.as_str());
                     // 新快照对这些旧对象的替代证据：删除押在「新的这份能完整读回」上；
                     // 覆盖不到旧对象那份范围的，不排删除（旧对象还能恢复更多历史）。
-                    let new_key = snap_key(&dev, &name);
-                    let new_digest = snap.digest.clone();
                     if published.is_some() && published != Some(name.as_str()) {
                         // 候选保留独立指针：head 与上一份快照都先不动。
                         record.snap_attempts = 0;
                         record.snap_pending = Some(snap);
+                        // 这些旧对象没有任何 head 引用，且刚刚用完整向量证明被新候选
+                        // 覆盖：删除不需要再核验一份可能永远核不完的新快照。
                         let when = GcWhen {
                             after_ms: now + SNAP_GRACE_MS,
                             floor: None,
                             snap: None,
-                            basis: Some((new_key, new_digest)),
+                            basis: None,
                             pack: None,
                             retry_ms: 0,
+                            orphan: true,
                         };
                         for (owner, path) in &replaceable {
                             if Some(owner.as_str()) != published {
@@ -1512,9 +1537,10 @@ impl Writer {
                         after_ms: now + SNAP_GRACE_MS,
                         floor: None,
                         snap: Some(name.clone()),
-                        basis: Some((new_key, new_digest)),
+                        basis: None,
                         pack: None,
                         retry_ms: 0,
+                        orphan: true,
                     };
                     for (_, path) in &replaceable {
                         queue_delete(tx, path, &when)?;
@@ -2103,19 +2129,35 @@ pub async fn collect_garbage(
     Ok(report)
 }
 
+/// 依据/包退避记录（`sync_state` 的 `gc-retry`）：键 `b|<依据>|<摘要>` / `p|<包>|<摘要>`，
+/// 值是不早于它再核的时刻（毫秒）。按**依据**记而不是给几千行逐行写：一次失败只写一条。
+const SCOPE_GC_RETRY: &str = "gc-retry";
+
+fn retry_key_basis(basis: &(String, String)) -> String {
+    format!("b|{}|{}", basis.0, basis.1)
+}
+
+fn retry_key_pack(pack: &PackGuard) -> String {
+    format!("p|{}|{}", pack.name, pack.digest)
+}
+
 /// 删掉登记过、条件已经满足的对象。带回收依据的先确认依据还能完整读到——作为依据的
 /// 快照要是在删除前消失了（第三方目录只同步了一半、被人动过），这一批留着等下一轮。
 /// 押在汇总包上的同理：零散段删掉之后，包里是这段日志唯一的副本。
 ///
 /// 日志对象（段、汇总包、快照）没有恢复依据的一律不删：升级前留下的旧记录没有 `pack`
-/// 字段，不能因此获得直接删除资格。附件对象（`blobs/`）的回收本来就不依赖快照依据。
+/// 字段，不能因此获得直接删除资格。附件对象（`blobs/`）和 `orphan` 标记的旧候选快照
+/// （本机自己写下、无 head 引用、且被新候选完整覆盖）不需要快照依据。
+///
+/// 每轮只把复核额度给**一份**依据/包（`PROMOTE_BUDGET` 与晋升判定一致）：多份依据同时
+/// 到期时按依据退避轮转，避免「晋升时 6 秒核完、删除时被均分成 3 秒永远核不完」。
 async fn sweep_due(
     ctx: &Ctx,
     transport: &dyn SyncTransport,
     keys: &Arc<Keys>,
     now: i64,
 ) -> Result<usize> {
-    type Due = (String, Option<(String, String)>, Option<PackGuard>);
+    type Due = (String, Option<(String, String)>, Option<PackGuard>, bool);
     let (due, seeds): (Vec<Due>, HashMap<String, Vec<String>>) = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
             let rows = db::state_scan(conn, scope::GC, "")?;
@@ -2128,17 +2170,31 @@ async fn sweep_due(
                 .into_iter()
                 .map(|(key, entry)| (key, entry.versions))
                 .collect();
+            // 依据/包的退避记录（小表）：被退避的依据下所有行一起跳过，不逐行改。
+            let retry_until: HashMap<String, i64> = db::state_scan(conn, SCOPE_GC_RETRY, "")?
+                .into_iter()
+                .filter_map(|(key, row)| row.json::<i64>().map(|until| (key, until)))
+                .collect();
+            let blocked = |basis: &Option<(String, String)>, pack: &Option<PackGuard>| {
+                let key = basis
+                    .as_ref()
+                    .map(retry_key_basis)
+                    .or_else(|| pack.as_ref().map(retry_key_pack));
+                key.and_then(|key| retry_until.get(&key).copied())
+                    .is_some_and(|until| until > now)
+            };
             let due: Vec<Due> = rows
                 .into_iter()
                 .filter_map(|(path, row)| {
                     let when = row.json::<GcWhen>()?;
                     (now >= when.after_ms
                         && now >= when.retry_ms
+                        && !blocked(&when.basis, &when.pack)
                         && when.floor.is_none_or(|floor| log.head_floor >= floor)
                         && when
                             .snap
                             .is_none_or(|snap| log.head_snap.as_ref() == Some(&snap)))
-                    .then(|| (path, when.basis, when.pack))
+                    .then(|| (path, when.basis, when.pack, when.orphan))
                 })
                 .take(SWEEP_BATCH)
                 .collect();
@@ -2150,33 +2206,19 @@ async fn sweep_due(
         return Ok(0);
     }
     let started = Instant::now();
-    // 复核（下载、核对摘要）与删除共享这一轮的时间预算：总预算再按依据份数均分，排在
-    // 后面的依据也分得到一份；每份在自己的份额里核对。删除阶段固定留四分之一，复核把
-    // 预算吃光时至少还能删掉已经确认过的那些（且每批至少尝试删一个）。
+    // 复核（下载、核对摘要）与删除共享这一轮的时间预算：删除阶段固定留四分之一；
+    // 复核部分每轮只给**一份**依据/包，期限与晋升判定用同一个 `PROMOTE_BUDGET`。
     let verify_end = started + SWEEP_BUDGET.mul_f64(0.75);
     let mut checked: HashMap<(String, String), BasisCheck> = HashMap::new();
     let mut packs_ok: HashMap<(String, String), bool> = HashMap::new();
-    let distinct: Vec<(String, String)> = {
-        let mut seen = HashSet::new();
-        due.iter()
-            .filter_map(|(_, basis, _)| basis.clone())
-            .filter(|basis| seen.insert(basis.clone()))
-            .collect()
-    };
-    let mut share = SWEEP_BUDGET.mul_f64(0.75) / distinct.len().max(1) as u32;
-    share = share.max(Duration::from_millis(500));
+    let mut evidence_used = false;
     let mut deletable: Vec<String> = Vec::new();
     let mut due_left: Vec<Due> = Vec::new();
-    // 这轮核验不过（不是预算不够）的行：退避一会儿，别让排在前面的坏依据每轮占满批次。
-    let mut retry: Vec<String> = Vec::new();
-    // 按**依据/包**退避：同一份依据下可能有一百条以上的行；只给这一批的行写 retry_ms，
-    // 下一轮批次轮转会把同一依据的下一批取出来、又完整复核一遍。这里记住这轮失败的
-    // 依据与包，事务里把所有押在它们上的行一起推后。
-    let mut retry_bases: HashSet<(String, String)> = HashSet::new();
-    let mut retry_packs: HashSet<(String, String)> = HashSet::new();
+    // 这轮核验不过 / 轮不到的：按依据或包记一条退避（不逐行改）。
+    let mut retry_keys: HashSet<String> = HashSet::new();
     let mut parked: Vec<String> = Vec::new();
-    for (path, basis, pack) in due {
-        if basis.is_none() && pack.is_none() && !path.starts_with("blobs/") {
+    for (path, basis, pack, orphan) in due {
+        if basis.is_none() && pack.is_none() && !orphan && !path.starts_with("blobs/") {
             // 升级前留下的旧记录：没有恢复依据的日志对象不能删。退到很久以后，
             // 别让它一直占着批次把后面的正常记录挡住。
             tracing::debug!("{path} 没有恢复依据（旧格式的回收记录），先不删");
@@ -2185,6 +2227,7 @@ async fn sweep_due(
         }
         let Some(basis) = basis else {
             let Some(pack) = pack else {
+                // blobs/ 或 orphan：不需要复核。
                 deletable.push(path);
                 continue;
             };
@@ -2192,12 +2235,18 @@ async fn sweep_due(
             let ok = match packs_ok.get(&key) {
                 Some(&ok) => ok,
                 None => {
-                    let slice = share.min(verify_end.saturating_duration_since(Instant::now()));
-                    if slice.is_zero() {
-                        due_left.push((path, None, Some(pack)));
+                    if evidence_used {
+                        retry_keys.insert(retry_key_pack(&pack));
+                        due_left.push((path, None, Some(pack), orphan));
                         continue;
                     }
-                    let ok = pack_intact(transport, keys, &pack, Instant::now() + slice).await;
+                    let deadline = (Instant::now() + PROMOTE_BUDGET).min(verify_end);
+                    if deadline <= Instant::now() {
+                        due_left.push((path, None, Some(pack), orphan));
+                        continue;
+                    }
+                    evidence_used = true;
+                    let ok = pack_intact(transport, keys, &pack, deadline).await;
                     packs_ok.insert(key, ok);
                     ok
                 }
@@ -2206,29 +2255,27 @@ async fn sweep_due(
                 deletable.push(path);
             } else {
                 tracing::debug!("汇总包 {} 这轮读不回来，押着它的零散段先不删", pack.name);
-                retry_packs.insert((pack.name.clone(), pack.digest.clone()));
-                retry.push(path.clone());
-                due_left.push((path, None, Some(pack)));
+                retry_keys.insert(retry_key_pack(&pack));
+                due_left.push((path, None, Some(pack), orphan));
             }
             continue;
         };
         let verdict = match checked.get(&basis) {
             Some(&verdict) => verdict,
             None => {
-                let slice = share.min(verify_end.saturating_duration_since(Instant::now()));
-                if slice.is_zero() {
-                    due_left.push((path, Some(basis), pack));
+                if evidence_used {
+                    retry_keys.insert(retry_key_basis(&basis));
+                    due_left.push((path, Some(basis), pack, orphan));
                     continue;
                 }
+                let deadline = (Instant::now() + PROMOTE_BUDGET).min(verify_end);
+                if deadline <= Instant::now() {
+                    due_left.push((path, Some(basis), pack, orphan));
+                    continue;
+                }
+                evidence_used = true;
                 let seed = seeds.get(&basis.0).cloned().unwrap_or_default();
-                let verdict = basis_intact(
-                    transport,
-                    keys,
-                    &basis,
-                    &seed,
-                    Instant::now() + slice,
-                )
-                .await;
+                let verdict = basis_intact(transport, keys, &basis, &seed, deadline).await;
                 checked.insert(basis.clone(), verdict);
                 verdict
             }
@@ -2237,17 +2284,13 @@ async fn sweep_due(
             BasisCheck::Intact => deletable.push(path),
             BasisCheck::Deferred => {
                 tracing::debug!("回收依据 {} 这轮没核验完，押着它的对象先不删", basis.0);
-                // 和核验不过一样退避：否则排在批头的慢依据每 60 秒重读一遍，后面的
-                // 行永远轮不到（一次判定必须连续走完，不能跨轮续用前缀）。
-                retry_bases.insert(basis.clone());
-                retry.push(path.clone());
-                due_left.push((path, Some(basis), pack));
+                retry_keys.insert(retry_key_basis(&basis));
+                due_left.push((path, Some(basis), pack, orphan));
             }
             BasisCheck::Broken => {
                 tracing::debug!("回收依据 {} 这轮核验不过，押着它的对象先不删", basis.0);
-                retry_bases.insert(basis.clone());
-                retry.push(path.clone());
-                due_left.push((path, Some(basis), pack));
+                retry_keys.insert(retry_key_basis(&basis));
+                due_left.push((path, Some(basis), pack, orphan));
             }
         }
     }
@@ -2266,40 +2309,17 @@ async fn sweep_due(
         }
     }
     let deleted = done.len();
+    let retry_until = now + GC_RETRY_MS;
     offload(ctx, move |ctx| {
         db::write(ctx.db(), |tx| {
             for path in &done {
                 db::state_del(tx, scope::GC, path)?;
             }
-            // 这轮失败/放弃的行与它们所在依据（或包）下的**全部**行一起推后。
-            let mut delayed: HashSet<String> = retry.iter().cloned().collect();
-            if !retry_bases.is_empty() || !retry_packs.is_empty() {
-                for (path, row) in db::state_scan(tx, scope::GC, "")? {
-                    let Some(when) = row.json::<GcWhen>() else {
-                        continue;
-                    };
-                    let hit = when
-                        .basis
-                        .as_ref()
-                        .is_some_and(|basis| retry_bases.contains(basis))
-                        || when
-                            .pack
-                            .as_ref()
-                            .is_some_and(|pack| retry_packs.contains(&(pack.name.clone(), pack.digest.clone())));
-                    if hit {
-                        delayed.insert(path);
-                    }
-                }
+            // 依据/包级退避：一条记录管住它下面的全部行。
+            for key in &retry_keys {
+                db::state_put_json(tx, SCOPE_GC_RETRY, key, db::HLC_ZERO, &retry_until)?;
             }
-            for path in &delayed {
-                let Some(mut when) =
-                    db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
-                else {
-                    continue;
-                };
-                when.retry_ms = now + GC_RETRY_MS;
-                db::state_put_json(tx, scope::GC, path, db::HLC_ZERO, &when)?;
-            }
+            // 升级前的无依据旧行：逐行退到很久以后（数量少，且只做一次）。
             for path in &parked {
                 let Some(mut when) =
                     db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
@@ -2621,6 +2641,7 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
                     basis: None,
                     pack: Some(guard),
                     retry_ms: 0,
+                    orphan: false,
                 };
                 queue_delete(tx, &codec::segment_path(&s.device, &entry.name), &when)?;
                 entry.gone = true;
@@ -2692,6 +2713,7 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
             basis: Some(basis.clone()),
             pack: None,
             retry_ms: 0,
+            orphan: false,
         };
         for entry in entries.iter().filter(|entry| entry.to <= floor) {
             if !entry.gone {
@@ -3052,6 +3074,7 @@ async fn promote_snap(
                     basis: Some((new_key.clone(), pending.digest.clone())),
                     pack: None,
                     retry_ms: 0,
+                    orphan: false,
                 };
                 for path in old_paths {
                     queue_delete(tx, &path, &when)?;
@@ -3239,6 +3262,7 @@ fn note_unreferenced(
                     basis: None,
                     pack: None,
                     retry_ms: 0,
+                    orphan: false,
                 },
             )?;
             // 文件还在本机：以后又有人要的话（`blob.want`）重新上传。
