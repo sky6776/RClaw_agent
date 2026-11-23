@@ -352,10 +352,12 @@ impl SyncEngine {
     /// 引擎线程收到之后会再试一次。线程自己退出了的话重新起一条。
     pub fn apply_config(&self, config: SyncConfig) {
         let mut running = lock(&self.inner.running);
-        *lock(&self.inner.config) = config.clone();
-        self.inner
-            .config_version
-            .fetch_add(1, Ordering::Relaxed);
+        {
+            // 值与版本在同一把锁里提交：引擎线程只会在锁内看到成对的「新值 + 新版本」。
+            let mut guard = lock(&self.inner.config);
+            *guard = config.clone();
+            self.inner.config_version.fetch_add(1, Ordering::Relaxed);
+        }
         if !config.enabled {
             if let Some(running) = running.take() {
                 let _ = running.commands.send(Cmd::Stop);
@@ -572,11 +574,17 @@ impl SyncEngine {
     /// 不同，宿主负责把它写回 `rclaw.toml`（不必再调 [`SyncEngine::apply_config`]）。
     pub async fn join_space(&self, code: &str) -> Result<SyncConfig> {
         let code = code.trim().to_string();
+        let version = self.inner.config_version.load(Ordering::Relaxed);
         let joined = self.call(|reply| Cmd::JoinSpace { code, reply }).await?;
-        *lock(&self.inner.config) = joined.clone();
-        self.inner
-            .config_version
-            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut guard = lock(&self.inner.config);
+            if self.inner.config_version.load(Ordering::Relaxed) == version {
+                *guard = joined.clone();
+                self.inner.config_version.fetch_add(1, Ordering::Relaxed);
+            } else {
+                tracing::warn!("加入空间的回执迟到：期间已有更新的配置发布，保留较新的那一份");
+            }
+        }
         Ok(joined)
     }
 
@@ -587,25 +595,19 @@ impl SyncEngine {
     /// 同步的话，不能在它脚下把密钥和同步状态清掉。
     pub async fn leave_space(&self) -> Result<()> {
         if self.live(true).is_some() {
-            match self.call(Cmd::LeaveSpace).await {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    // 引擎线程可能正在退场（确认关闭后接收端已关）：改走离线路径，
-                    // 先取引擎锁再退出——另一个进程真正持锁时那里会返回可重试错误。
-                    tracing::warn!("在线退出同步空间失败，改走离线退出: {error}");
-                }
-            }
+            // 在线路径把结果（成功或业务错误）原样交回：已经执行过的退出不能再走
+            // 离线路径重复清理。关闭态的 worker 会在命令里自己走离线退出。
+            return self.call(Cmd::LeaveSpace).await;
         }
+        // 离线（同步从启动起就关着，没有引擎线程）：先取引擎锁，再读 secrets 与待恢复
+        // 记录——另一个进程正在退出/重建的中途，不能在它脚下清理本机状态。
         let ctx = self.inner.ctx.clone();
         let paths = ctx.paths.clone();
         let (lock, mut secrets) = blocking(move || {
-            let secrets = Secrets::load(&paths)?;
-            if !secrets.is_paired() {
-                return Ok((None, secrets));
-            }
             let lock =
                 worker::take_lock(&paths)?.ok_or_else(|| SyncError::other(worker::STANDBY_HINT))?;
-            Ok((Some(lock), secrets))
+            let secrets = Secrets::load(&paths)?;
+            Ok((lock, secrets))
         })
         .await?;
         let config = self.config();
@@ -676,6 +678,9 @@ impl SyncEngine {
             let _ = worker::storage_intent_clear_if(&paths, &id);
             return Err(error);
         }
+        // 这条保存的 TOML 已经写在协议锁里；回执回来时如果期间已有更新的宿主发布
+        // （导入、另一份保存），不要把较早的这份整份盖回去——在配置锁里凭版本判定。
+        let version = self.inner.config_version.load(Ordering::Relaxed);
         self.call(|reply| Cmd::SaveStorage {
             config: config.clone(),
             secret,
@@ -683,10 +688,15 @@ impl SyncEngine {
         })
         .await?;
         worker::storage_intent_clear_if(&paths, &id)?;
-        *lock(&self.inner.config) = config;
-        self.inner
-            .config_version
-            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut guard = lock(&self.inner.config);
+            if self.inner.config_version.load(Ordering::Relaxed) == version {
+                *guard = config;
+                self.inner.config_version.fetch_add(1, Ordering::Relaxed);
+            } else {
+                tracing::warn!("保存存储设置的回执迟到：期间已有更新的配置发布，保留较新的那一份");
+            }
+        }
         Ok(())
     }
 

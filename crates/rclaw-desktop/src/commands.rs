@@ -2976,6 +2976,20 @@ pub async fn config_save(state: State<'_, AppState>, edits: Vec<ConfigEdit>) -> 
     let touches_sync = edits
         .iter()
         .any(|edit| edit.path == "sync" || edit.path.starts_with("sync."));
+    let lock_home = home.clone();
+    let _lock = if touches_sync {
+        Some(
+            tauri::async_runtime::spawn_blocking(move || {
+                let paths = rclaw_sync::SyncPaths::new(&lock_home);
+                rclaw_sync::StorageLock::acquire(&paths)
+                    .map_err(|error| format!("保存配置失败（取同步存储锁）: {error}"))
+            })
+            .await
+            .map_err(|e| format!("保存配置失败: {e}"))??,
+        )
+    } else {
+        None
+    };
     tauri::async_runtime::spawn_blocking(move || config_save_edits(&home, &edits))
         .await
         .map_err(|e| format!("保存配置失败: {e}"))??;
@@ -3008,6 +3022,16 @@ pub async fn config_import_raw(
     content: String,
 ) -> Result<(), String> {
     let home = state.home.clone();
+    // 和保存存储设置走同一把协议锁写 TOML：两次写与各自随后的发布有明确的先后，
+    // 不会出现「较早的存储保存回执迟到、把刚导入的设置盖回去」。
+    let lock_home = home.clone();
+    let _lock = tauri::async_runtime::spawn_blocking(move || {
+        let paths = rclaw_sync::SyncPaths::new(&lock_home);
+        rclaw_sync::StorageLock::acquire(&paths)
+            .map_err(|error| format!("导入配置失败（取同步存储锁）: {error}"))
+    })
+    .await
+    .map_err(|e| format!("导入配置失败: {e}"))??;
     tauri::async_runtime::spawn_blocking(move || config_import_raw_for(&home, &content))
         .await
         .map_err(|e| format!("导入配置失败: {e}"))??;

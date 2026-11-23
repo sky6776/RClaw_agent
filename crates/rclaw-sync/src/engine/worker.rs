@@ -409,8 +409,6 @@ struct Worker {
     switch_tries: u32,
     /// 切换已放弃（等不到在途提交）：状态要粘住，不能被之后普通轮次的 idle 覆盖。
     switch_failed: bool,
-    /// 从磁盘确认同步已经关闭（或宿主停止）：worker 退出，剩下的交给宿主。
-    stop: bool,
     /// 上一次打开没连上的原因（协议锁竞争/确认失败/引擎锁被占）：给「立即同步」等
     /// 等着结果的命令一个和状态面板一致的说法。
     open_note: Option<String>,
@@ -447,7 +445,6 @@ impl Worker {
             pending_switch: false,
             switch_tries: 0,
             switch_failed: false,
-            stop: false,
             open_note: None,
         }
     }
@@ -456,25 +453,6 @@ impl Worker {
         // 打开连接时会在协议锁里确认磁盘上的同步设置（见 [`Worker::open`]）。
         self.open(true).await;
         loop {
-            if self.stop {
-                // 退场前把已经排队的命令处理掉：宿主可能在「确认关闭」与「接收端
-                // 关闭」之间刚发了重新开启/退出空间。处理到重新开启配置就清掉
-                // stop，继续跑；否则关掉接收端再退出——之后再发来的配置命令会
-                // 发送失败，宿主会启动继任 worker 或走离线退出。
-                let mut reopened = false;
-                while let Ok(cmd) = self.commands.try_recv() {
-                    self.handle(cmd).await;
-                    if !self.stop {
-                        reopened = true;
-                        break;
-                    }
-                }
-                if reopened {
-                    continue;
-                }
-                self.commands.close();
-                break;
-            }
             self.revive_transfers();
             let wake = self.deadline();
             tokio::select! {
@@ -726,6 +704,7 @@ impl Worker {
 
     fn fail_open(&mut self, message: String, retry: Option<Duration>) {
         tracing::warn!("同步没有启动: {message}");
+        self.open_note = Some(message.clone());
         self.shared.set_state("error", Some(message));
         self.reopen_at = retry.map(|after| Instant::now() + after);
     }
@@ -793,9 +772,9 @@ impl Worker {
             match blocking(move || StorageLock::try_acquire(&lock_paths)).await {
                 Ok(Some(lock)) => protocol_lock = Some(lock),
                 Ok(None) => {
-                    self.open_note = Some(
-                        "另一个进程正在保存同步设置，确认后再连接（稍后自动重试）".into(),
-                    );
+                    let note = "另一个进程正在保存同步设置，确认后再连接（稍后自动重试）";
+                    self.open_note = Some(note.into());
+                    self.shared.set_state("syncing", Some(note.into()));
                     self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
                     return;
                 }
@@ -809,9 +788,9 @@ impl Worker {
                             "syncing",
                             Some("等待确认同步存储设置（锁不可用），稍后重试".into()),
                         );
-                        self.open_note = Some(
-                            "确认同步存储设置失败（存储锁不可用），稍后自动重试".into(),
-                        );
+                        let note = "确认同步存储设置失败（存储锁不可用），稍后自动重试";
+                        self.open_note = Some(note.into());
+                        self.shared.set_state("syncing", Some(note.into()));
                         self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
                         return;
                     }
@@ -820,17 +799,22 @@ impl Worker {
             }
             if protocol_lock.is_some() {
                 if self.adopt_disk_config().is_err() {
+                    let note = "读取同步设置失败（稍后自动重试）";
+                    self.open_note = Some(note.into());
+                    self.shared.set_state("syncing", Some(note.into()));
                     self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
                     return;
                 }
                 if !self.config.enabled {
                     // 另一个进程把同步关了：不接手引擎所有权，状态以磁盘为准。worker
-                    // 自己也退出——留着它会让「关闭同步后只清本机」走在线命令路径，
-                    // 却因为没有引擎锁而被拒绝。
+                    // 留着（不退出）：重新开启的配置命令与「关闭后只清本机」的退出
+                    // 请求都还要由它接住——退场与宿主派发之间的交接窗口反而会丢命令。
                     self.lock = None;
+                    self.open_note = Some(
+                        "同步已经关闭，请在「多端同步」设置里重新开启".into(),
+                    );
                     self.shared.set_state("off", None);
                     self.reopen_at = None;
-                    self.stop = true;
                     return;
                 }
             }
@@ -902,6 +886,7 @@ impl Worker {
             self.secret_saved(),
         );
         if !paired {
+            self.open_note = None;
             shared.set_state("setup", None);
             return;
         }
@@ -1241,10 +1226,6 @@ impl Worker {
 
     async fn reconfigure(&mut self, config: SyncConfig) {
         let old = std::mem::replace(&mut self.config, config);
-        if self.config.enabled {
-            // 重新开启（可能发生在退场清理期间）：不再退出。
-            self.stop = false;
-        }
         let new = &self.config;
         self.shared
             .attachment_max
@@ -1470,6 +1451,28 @@ impl Worker {
     }
 
     async fn leave_space(&mut self) -> Result<()> {
+        if !self.config.enabled {
+            // 同步已在磁盘上关闭（worker 不持引擎锁）：按离线退出。先取引擎锁、再重读
+            // secrets——另一个进程可能刚做完退出的一半，不能凭本机旧副本清任何东西。
+            let paths = self.shared.ctx.paths.clone();
+            let (lock, mut secrets) = blocking(move || {
+                let lock =
+                    take_lock(&paths)?.ok_or_else(|| SyncError::other(STANDBY_HINT))?;
+                let secrets = Secrets::load(&paths)?;
+                Ok((lock, secrets))
+            })
+            .await?;
+            let result = space::leave(&self.shared.ctx, &self.config, &mut secrets).await;
+            drop(lock);
+            result?;
+            self.secrets = secrets;
+            self.loaded = true;
+            self.shared.paired.store(false, Ordering::Relaxed);
+            self.shared.set_space(None, false);
+            self.open_note = None;
+            self.shared.set_state("setup", None);
+            return Ok(());
+        }
         self.require_owner()?;
         if !self.teardown().await {
             return Err(SyncError::other("还有在途的附件提交，稍后再退出"));
@@ -1561,9 +1564,6 @@ impl Worker {
         }
         self.secrets = next;
         self.config = config;
-        if self.config.enabled {
-            self.stop = false;
-        }
         self.shared.set_space(
             self.secrets
                 .is_paired()

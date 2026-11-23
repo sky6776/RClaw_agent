@@ -2380,6 +2380,9 @@ async fn sweep_due(
     let mut target_key: Option<String> = None;
     let mut checked_basis: Option<BasisCheck> = None;
     let mut checked_pack: Option<bool> = None;
+    // 这一轮选中的依据有没有可删行、有没有真的拿到一次 DELETE 尝试（见循环末尾）。
+    let mut target_had_rows = false;
+    let mut target_attempted = false;
     if let Some((key, basis, pack)) = evidences.get(turn) {
         let deadline = (Instant::now() + PROMOTE_BUDGET).min(verify_end);
         if deadline > Instant::now() {
@@ -2390,8 +2393,6 @@ async fn sweep_due(
                 checked_pack = Some(pack_intact(transport, keys, pack, deadline).await);
             }
             target_key = Some(key.clone());
-            // 轮转起点：下一轮从这一份之后接着选（失败退避不会让它独占队头）。
-            memo.gc_turn = Some(key.clone());
         }
     }
     // (对象路径, 依据退避键, 包退避键)：删除失败时按依据/包退避，避免同一份依据
@@ -2439,6 +2440,9 @@ async fn sweep_due(
                 // 下一轮接着轮转。
                 continue;
             }
+            if checked_pack == Some(true) && target_key.as_deref() == Some(key.as_str()) {
+                target_had_rows = true;
+            }
             match checked_pack {
                 Some(true) => {
                     if deletable.len() < SWEEP_BATCH / 2 {
@@ -2458,6 +2462,11 @@ async fn sweep_due(
         let key = retry_key_basis(&basis);
         if target_key.as_deref() != Some(key.as_str()) {
             continue;
+        }
+        if checked_basis == Some(BasisCheck::Intact)
+            && target_key.as_deref() == Some(key.as_str())
+        {
+            target_had_rows = true;
         }
         match checked_basis {
             Some(BasisCheck::Intact) => {
@@ -2509,6 +2518,12 @@ async fn sweep_due(
         if is_plain {
             plain_attempted = true;
         }
+        if target_key
+            .as_deref()
+            .is_some_and(|key| basis_key.as_deref() == Some(key) || pack_key.as_deref() == Some(key))
+        {
+            target_attempted = true;
+        }
         match transport.delete(&path).await {
             Ok(()) | Err(TransportError::NotFound(_)) => {
                 if let Some(key) = snap_key_of_path(&path) {
@@ -2534,6 +2549,14 @@ async fn sweep_due(
     }
     // 下一轮先给这一轮一次机会都没拿到的那一类。
     memo.gc_plain_first = had_plain && (!plain_attempted || !had_evidence);
+    // 健康依据只有真的拿到一次 DELETE 尝试才推进游标：仅复核成功、却因普通先删或
+    // 网络慢没删到任何一行的，下一轮仍选它（否则它会与首删类别固定同相、一直轮空）。
+    // 核验失败/没有可删行的依据照常推进（失败由退避挡着）。
+    if let Some(key) = &target_key {
+        if !target_had_rows || target_attempted {
+            memo.gc_turn = Some(key.clone());
+        }
+    }
     let deleted = done.len();
     // 删除已经发生（对象没了），结算按总行数封顶：没轮到的下一轮按 NotFound 收尾。
     let settle_cap = SWEEP_BATCH.saturating_sub(parked.len());

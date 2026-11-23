@@ -567,6 +567,11 @@ pub(crate) async fn leave(
     // 丢掉恢复记录：它的目标（新空间）本机不再使用，留着会让下次启动又把本机拉回
     // 配对状态。远端可能仍保留原空间的状态，在状态页交代清楚。
     if let Err(error) = resume_pending(ctx, config, secrets).await {
+        // 失败的是「上一次退出」的记录：清库可能只做了一半，记录必须留着（下次打开
+        // 或重试接着收尾），错误交给调用方——不能丢掉记录再报成功。
+        if pending_load(&ctx.paths)?.is_some_and(|pending| pending.action == SpaceAction::Leave) {
+            return Err(error);
+        }
         tracing::warn!("退出前收尾未完成的切换失败，按本机退出继续: {error}");
         status::notice(
             &ctx.paths,
