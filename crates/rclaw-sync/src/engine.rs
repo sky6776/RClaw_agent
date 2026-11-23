@@ -60,6 +60,11 @@ const ROUND_BUSY_MS: i64 = 3_000;
 /// 引擎线程自己退出之后，距它启动满这么久才自动重新起一条（见 [`SyncEngine::live`]）。
 const REVIVE_AFTER: Duration = Duration::from_secs(60);
 
+/// 从宿主的配置文件重读 `[sync]`（见 [`SyncDeps::refresh_config`]）。`Err` = 文件在但
+/// 这次读不出来（稍后重试）；`Ok(None)` = 还没有这个文件（按当前配置，与首次运行一致）。
+pub type ConfigRefresh =
+    Arc<dyn Fn() -> std::result::Result<Option<SyncConfig>, ()> + Send + Sync>;
+
 /// 宿主注入的依赖。
 pub struct SyncDeps {
     pub sessions: SessionStore,
@@ -77,9 +82,9 @@ pub struct SyncDeps {
     pub sessions_supported: bool,
     /// 内存紧张的设备（手机）：一次读写的批量小一些。
     pub low_memory: bool,
-    /// 宿主的 `rclaw.toml` 路径（有的话）：启动/待机接手前引擎会从磁盘重读 `[sync]`，
-    /// 确认没有被同一数据目录里的另一个进程改掉。
-    pub host_config: Option<PathBuf>,
+    /// 宿主侧的重读入口（有的话）：启动/待机接手前引擎会按磁盘上的 `rclaw.toml`
+    /// 重读 `[sync]`，确认没有被同一数据目录里的另一个进程改掉。
+    pub refresh_config: Option<ConfigRefresh>,
 }
 
 /// 宿主告诉引擎「发生了什么」，引擎自己决定要不要同步、什么时候同步。
@@ -115,9 +120,10 @@ pub(crate) struct Shared {
     pub version: String,
     pub sessions_supported: bool,
     pub low_memory: bool,
-    /// 宿主的 `rclaw.toml`（有的话）：启动/待机接手前从磁盘重读 `[sync]`，确认配置
-    /// 没有被同一数据目录里的另一个进程改掉。
-    pub host_config: Option<PathBuf>,
+    /// 宿主侧的重读入口（有的话）：启动/待机接手前按磁盘上的 `rclaw.toml` 重新取一份
+    /// `[sync]`，确认配置没有被同一数据目录里的另一个进程改掉。`Err` = 文件在但这次
+    /// 读不出来（稍后重试），`Ok(None)` = 还没有这个文件（按当前配置，与首次运行一致）。
+    pub refresh_config: Option<ConfigRefresh>,
     /// 宿主与引擎线程共用的一份配置（桌面 + CLI 共用一个数据目录时，启动那一刻的
     /// 配置可能已被另一个进程更新；引擎线程从磁盘确认后会写回这里，宿主读到的就是
     /// 同一份）。
@@ -156,7 +162,7 @@ impl Shared {
             version: inner.version.clone(),
             sessions_supported: inner.sessions_supported,
             low_memory: inner.low_memory,
-            host_config: inner.host_config.clone(),
+            refresh_config: inner.refresh_config.clone(),
             config: inner.config.clone(),
             view: Mutex::new(local::View {
                 state: "syncing",
@@ -271,8 +277,8 @@ struct Inner {
     version: String,
     sessions_supported: bool,
     low_memory: bool,
-    /// 宿主的 `rclaw.toml`（有的话）：引擎线程在打开连接前从这里重读 `[sync]`。
-    host_config: Option<PathBuf>,
+    /// 宿主侧的重读入口：引擎线程在打开连接前按磁盘确认 `[sync]`。
+    refresh_config: Option<ConfigRefresh>,
     config: Arc<Mutex<SyncConfig>>,
     running: Mutex<Option<Running>>,
 }
@@ -308,7 +314,7 @@ impl SyncEngine {
                 version: deps.version,
                 sessions_supported: deps.sessions_supported,
                 low_memory: deps.low_memory,
-                host_config: deps.host_config,
+                refresh_config: deps.refresh_config,
                 config: Arc::new(Mutex::new(config)),
                 running: Mutex::new(None),
             }),
@@ -782,8 +788,11 @@ impl SyncEngine {
     /// 里留一份，并登记「正在清理」的意图，返回条目标识与这次登记的操作标识。没有可发布
     /// 的副作用：意图先耐久落库，调用方才删本机文件。
     pub fn stash_memory_for_clear(&self) -> Result<(Vec<String>, String)> {
-        let keep_trash = self.config().trash_days > 0;
-        local::stash_memory_clear(&self.inner.ctx, keep_trash)
+        let config = self.config();
+        let keep_trash = config.trash_days > 0;
+        // 同步关着时「等同步连上再清」永远等不到：按没加入空间处理（本机删除不传播）。
+        let in_space = config.enabled && self.in_space()?;
+        local::stash_memory_clear(&self.inner.ctx, keep_trash, in_space)
     }
 
     /// `/clear confirm all`（§7.5）第二半的后一步：本地清空已成功，把清空登记成发给所有

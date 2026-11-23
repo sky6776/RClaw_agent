@@ -417,6 +417,10 @@ pub(crate) fn forget_own(conn: &Connection) -> Result<()> {
     record.blob_snap = None;
     record.floor_pending = None;
     record.snap_pending = None;
+    // 旧身份的来历与放弃记录都只对本机目录有意义：对象留在存储上给别的设备用，
+    // 本机不再回收它们，记录留着只会随换代累积。
+    record.snap_origin.clear();
+    record.floor_abandoned.clear();
     put_maint(conn, &record)
 }
 
@@ -499,6 +503,9 @@ pub struct Memo {
     /// 上一次实际核验的依据/包（键同上）：下一轮从它之后接着轮转。没有游标时固定按
     /// 键排序选第一份，持续失败的那几份会把后面的（健康的）依据永久挡住。
     gc_turn: Option<String>,
+    /// 上一轮的首删给了哪一类（true = 无依据的普通对象）：下一轮从另一类开始，
+    /// 预算只够一次删除尝试时两类都能轮到。
+    gc_plain_first: bool,
 }
 
 impl Memo {
@@ -1590,10 +1597,16 @@ impl Writer {
                             candidate: true,
                         };
                         for (owner, path) in &replaceable {
+                            let owner_key = snap_key(&dev, owner);
+                            let pending_basis = record
+                                .floor_pending
+                                .as_ref()
+                                .is_some_and(|pending| pending.basis.0 == owner_key);
                             if Some(owner.as_str()) != published
                                 && head_snap.as_deref() != Some(owner.as_str())
+                                && !pending_basis
                                 && !protected_retired(tx, path)?
-                                && record.snap_origin.get(&snap_key(&dev, owner)) == Some(&false)
+                                && record.snap_origin.get(&owner_key) == Some(&false)
                             {
                                 queue_delete(tx, path, &when)?;
                             }
@@ -1618,9 +1631,15 @@ impl Writer {
                         candidate: true,
                     };
                     for (owner, path) in &replaceable {
+                        let owner_key = snap_key(&dev, owner);
+                        let pending_basis = record
+                            .floor_pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.basis.0 == owner_key);
                         if head_snap.as_deref() != Some(owner.as_str())
+                            && !pending_basis
                             && !protected_retired(tx, path)?
-                            && record.snap_origin.get(&snap_key(&dev, owner)) == Some(&false)
+                            && record.snap_origin.get(&owner_key) == Some(&false)
                         {
                             queue_delete(tx, path, &when)?;
                         }
@@ -2247,11 +2266,15 @@ async fn sweep_due(
     );
     // 退避表是进程内记忆（规模有限，重启后清零只会多核一次）。
     let retry_until = memo.gc_retry.clone();
-    let (due, seeds): (Vec<Due>, HashMap<String, Vec<String>>) = offload(ctx, move |ctx| {
+    let (due, seeds, mut snap_rows): (
+        Vec<Due>,
+        HashMap<String, Vec<String>>,
+        HashMap<String, usize>,
+    ) = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
             let rows = db::state_scan(conn, scope::GC, "")?;
             if rows.is_empty() {
-                return Ok((Vec::new(), HashMap::new()));
+                return Ok((Vec::new(), HashMap::new(), HashMap::new()));
             }
             let log = db::log_state(conn)?;
             let record = maint(conn)?;
@@ -2261,6 +2284,15 @@ async fn sweep_due(
                 .map(|(key, entry)| (key, entry.versions))
                 .collect();
             let origins = record.snap_origin;
+            // 每份快照还有多少行在 GC 队列里（含未到期/退避的）：删清单对象前要求
+            // 其余行都处理完，否则「这次列举漏掉的分片」会得到更晚的到期时刻，清单
+            // 先删、来历先清，剩下的分片就成了来历不明的停放行。
+            let mut snap_rows: HashMap<String, usize> = HashMap::new();
+            for (path, _) in &rows {
+                if let Some(key) = snap_key_of_path(path) {
+                    *snap_rows.entry(key).or_insert(0) += 1;
+                }
+            }
             let blocked = |basis: &Option<(String, String)>, pack: &Option<PackGuard>| {
                 let key = basis
                     .as_ref()
@@ -2301,7 +2333,7 @@ async fn sweep_due(
                     .then(|| (path, when.basis, when.pack, when.orphan, candidate))
                 })
                 .collect();
-            Ok((due, seeds))
+            Ok((due, seeds, snap_rows))
         })
     })
     .await?;
@@ -2365,7 +2397,7 @@ async fn sweep_due(
             // 旧版本排下的 orphan 行：来源证明不了是「从未公布过的候选」，按受保护快照
             // 处理（不删）。新写快照排的行带 `candidate` 证明，不会覆盖带依据的旧行。
             tracing::debug!("{path} 没有候选证明（旧格式的回收记录），先不删");
-            if parked.len() < SWEEP_BATCH {
+            if parked.len() < SWEEP_BATCH / 2 {
                 parked.push(path);
             }
             continue;
@@ -2374,7 +2406,7 @@ async fn sweep_due(
             // 升级前留下的旧记录：没有恢复依据的日志对象不能删。退到很久以后，
             // 别让它一直占着批次把后面的正常记录挡住。
             tracing::debug!("{path} 没有恢复依据（旧格式的回收记录），先不删");
-            if parked.len() < SWEEP_BATCH {
+            if parked.len() < SWEEP_BATCH / 2 {
                 parked.push(path);
             }
             continue;
@@ -2395,7 +2427,7 @@ async fn sweep_due(
             }
             match checked_pack {
                 Some(true) => {
-                    if deletable.len() < SWEEP_BATCH {
+                    if deletable.len() < SWEEP_BATCH / 2 {
                         deletable.push((path, None, Some(key)));
                     }
                 }
@@ -2415,7 +2447,7 @@ async fn sweep_due(
         }
         match checked_basis {
             Some(BasisCheck::Intact) => {
-                if deletable.len() < SWEEP_BATCH {
+                if deletable.len() < SWEEP_BATCH / 2 {
                     deletable.push((path, Some(key), None));
                 }
             }
@@ -2429,19 +2461,42 @@ async fn sweep_due(
             None => {}
         }
     }
-    // 无依据的行用剩下的名额：一轮的删除/结算量有界（其余下一轮继续），依据押着的
-    // 行也不会被排在前面的成批 blob 永久挤掉。
+    // 两类各占一半名额（有依据的最多 `SWEEP_BATCH/2`，其余给普通对象）：积压一直
+    // 补入时两类都能推进。首删位置按轮次在两类之间交替——核验逼近 6 秒或第一个
+    // DELETE 很慢时，总预算只够一次尝试，不让同一类永远抢到那个位置。
     let room = SWEEP_BATCH.saturating_sub(deletable.len());
     plain.truncate(room);
-    deletable.extend(plain);
+    let mut sequence: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    if memo.gc_plain_first && !plain.is_empty() {
+        sequence.push(plain.remove(0));
+    }
+    memo.gc_plain_first = !memo.gc_plain_first;
+    sequence.extend(deletable);
+    sequence.extend(plain);
     let mut done: Vec<String> = Vec::new();
-    for (index, (path, basis_key, pack_key)) in deletable.into_iter().enumerate() {
+    for (index, (path, basis_key, pack_key)) in sequence.into_iter().enumerate() {
         // 总预算用完也要给这一批留一次删除机会：一次慢复核不该让回收永远零进展。
         if index > 0 && started.elapsed() > SWEEP_BUDGET {
             break;
         }
+        // 同一快照还有别的 GC 行（未到期/退避/本轮没轮到）：清单先留着，等它们都
+        // 处理完再删（分片名里的 '-' 排在清单 '.' 前，正常批次里清单本来最后删）。
+        if path.ends_with(".snap") {
+            if let Some(key) = snap_key_of_path(&path) {
+                if snap_rows.get(&key).copied().unwrap_or(0) > 1 {
+                    continue;
+                }
+            }
+        }
         match transport.delete(&path).await {
-            Ok(()) | Err(TransportError::NotFound(_)) => done.push(path),
+            Ok(()) | Err(TransportError::NotFound(_)) => {
+                if let Some(key) = snap_key_of_path(&path) {
+                    if let Some(left) = snap_rows.get_mut(&key) {
+                        *left = left.saturating_sub(1);
+                    }
+                }
+                done.push(path)
+            }
             Err(error) => {
                 tracing::debug!("删除 {path} 失败（下次再试）: {error}");
                 // 这份依据/包退避一轮：否则它每轮都排在队头、核验成功却删不掉，
@@ -2457,6 +2512,8 @@ async fn sweep_due(
         }
     }
     let deleted = done.len();
+    // 删除已经发生（对象没了），结算按总行数封顶：没轮到的下一轮按 NotFound 收尾。
+    let settle_cap = SWEEP_BATCH.saturating_sub(parked.len());
     for key in &retry_keys {
         memo.gc_retry.insert(key.clone(), now + GC_RETRY_MS);
     }
@@ -2466,7 +2523,7 @@ async fn sweep_due(
         db::write(ctx.db(), |tx| {
             let mut record = maint(tx)?;
             let mut origin_changed = false;
-            for path in &done {
+            for path in done.iter().take(settle_cap) {
                 db::state_del(tx, scope::GC, path)?;
                 // 快照的清单对象（`.snap`）删掉才算这份快照处理完（分片名排在清单
                 // 前面，清单最后删）：这时才清来历记录。半途清掉的话，剩下的分片行
@@ -2776,6 +2833,20 @@ async fn refresh_covers(
 /// 当前存储上完整复核通过之后进行。
 /// 另一件独立的事照旧直接做：已经打进汇总包、head 也改用汇总包的零散段对象，排队删除。
 fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
+    // 先把失效的放弃记录清掉并落库：不管这一轮能不能推进 floor，表都不该留下已经
+    // 退出候选集合的条目（否则文件存储回滚出旧 head 时，旧放弃决定会重新生效）。
+    db::write(ctx.db(), |tx| {
+        let mut record = maint(tx)?;
+        let before = record.floor_abandoned.len();
+        let covers = &record.covers_checked;
+        record
+            .floor_abandoned
+            .retain(|(key, digest)| covers.get(key).is_some_and(|entry| &entry.digest == digest));
+        if record.floor_abandoned.len() != before {
+            put_maint(tx, &record)?;
+        }
+        Ok(())
+    })?;
     db::write(ctx.db(), |tx| {
         let log = db::log_state(tx)?;
         let mut entries = seal::seg_entries(tx)?;
@@ -2827,11 +2898,8 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
         // 没核验完的不算数）。挑覆盖得最远的那一份，把它钉在候选记录里，公布与删除之前
         // 都会在当前存储上再复核。已经放弃过的依据（一次判定核不完）先排除：它可能覆盖
         // 更远，但永远过不了复核，挡在这里会把能在 6 秒内核完的次优依据一直压住。
-        // 依据被换掉/内容变了（摘要不同）的旧放弃记录顺手清掉，表不随快照数量增长。
-        let covers = &record.covers_checked;
-        record
-            .floor_abandoned
-            .retain(|(key, digest)| covers.get(key).is_some_and(|entry| &entry.digest == digest));
+        // 已经放弃过的依据（一次判定核不完）先排除。失效条目的持久清理在上面单独
+        // 一个事务里做（这里提前返回也不能留下失效记录）。
         let abandoned = &record.floor_abandoned;
         let basis = record
             .covers_checked
@@ -2895,9 +2963,6 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
         for pack in packs.iter().filter(|pack| pack.to <= floor) {
             queue_delete(tx, &codec::rollup_path(&s.device, &pack.name), &when)?;
         }
-        // 这份快照成了回收依据：来历记成「用过」，即使它从没当过本机 head（对端写下的
-        // 快照），也不能被别的候选当成来历不明的候选删掉。
-        record.snap_origin.insert(basis.0.clone(), true);
         record.floor_pending = Some(PendingFloor {
             floor,
             basis,
@@ -2929,6 +2994,8 @@ async fn promote_floor(
     // 依据的快照还有没有设备提着（谁的 head 里还有它）？
     let key = pending.basis.0.clone();
     let device = device.to_string();
+    // 本机设备前缀：只有本机目录里的快照需要来历记录（对端目录不归本机回收）。
+    let own_prefix = format!("{device}/");
     let referenced = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
             let own = db::log_state(conn)?
@@ -3069,6 +3136,13 @@ async fn promote_floor(
             log.floor = floor;
             log.head_dirty = true;
             db::put_log_state(tx, &log)?;
+            // 这份快照确实支撑了公布的回收边界：来历记成「用过」。只在推进成功的
+            // 事务里记——登记候选后被撤销/放弃的不算（否则一份从没公布、也没支撑
+            // 任何已公布边界的候选会永久失去回收资格）。对端设备的快照不记：本机
+            // 永远不删对端目录里的对象，记了只会随对端换代无限增长。
+            if pending.basis.0.starts_with(&own_prefix) {
+                record.snap_origin.insert(pending.basis.0.clone(), true);
+            }
             record.floor_pending = None;
             put_maint(tx, &record)?;
             Ok(Some(floor))

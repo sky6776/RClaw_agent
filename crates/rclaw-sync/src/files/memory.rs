@@ -153,7 +153,9 @@ pub(crate) struct ClearLock {
 }
 
 impl ClearLock {
-    pub(crate) fn acquire(ctx: &Ctx) -> Result<ClearLock> {
+    /// 非阻塞取锁：被另一个进程占着返回 `None`（调用方让行），真正的锁/文件错误原样
+    /// 返回（不能把「锁不可用」静默当成成功，否则文件落地会永远停住而且没有原因）。
+    pub(crate) fn try_acquire(ctx: &Ctx) -> Result<Option<ClearLock>> {
         ctx.paths.ensure_root()?;
         let path = ctx.paths.root.join("memory-clear.lock");
         let file = std::fs::OpenOptions::new()
@@ -161,8 +163,11 @@ impl ClearLock {
             .read(true)
             .write(true)
             .open(path)?;
-        fs2::FileExt::lock_exclusive(&file)?;
-        Ok(ClearLock { file })
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(ClearLock { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -796,14 +801,21 @@ fn reconcile_target(
         // 整轮作废，不把清空前读到的远端条目写回文件（下一轮它们会被当成新的再发布）。
         let mut outcome = None;
         let mut stale = false;
+        let mut lock_error = None;
         let quiet = ctx.gate.when_quiet(&mut || {
-            // 跨进程边界：另一个进程的清空在读条目之前也拿这把锁。拿不到（正被占用）
-            // 就整轮让路，下一轮再对比。
-            let clear_lock = ClearLock::acquire(ctx);
-            if clear_lock.is_err() {
-                stale = true;
-                return;
-            }
+            // 跨进程边界：另一个进程的清空在读条目之前也拿这把锁。正被占用就整轮
+            // 让路（下一轮再对比）；锁/文件本身出错则交给上层记日志，不能静默跳过。
+            let clear_lock = match ClearLock::try_acquire(ctx) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    stale = true;
+                    return;
+                }
+                Err(error) => {
+                    lock_error = Some(error);
+                    return;
+                }
+            };
             let same = db::read(ctx.db(), clear_gen).is_ok_and(|now| now == gen);
             if !same {
                 stale = true;
@@ -813,6 +825,9 @@ fn reconcile_target(
             outcome = Some(apply_plan(ctx, s, target, first_origin, &adds, &dels));
             drop(clear_lock);
         });
+        if let Some(error) = lock_error {
+            return Err(error);
+        }
         if !quiet || stale {
             return Ok(());
         }

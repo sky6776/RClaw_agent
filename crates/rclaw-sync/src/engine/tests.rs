@@ -66,7 +66,7 @@ fn engine_on(
             version: "0.0.0".into(),
             sessions_supported: true,
             low_memory: false,
-            host_config: None,
+            refresh_config: None,
         },
         config,
     )

@@ -365,11 +365,36 @@ pub(crate) fn delete_published(
 /// 操作标识。这一步本身没有任何可发布的副作用——意图先耐久落库，调用方才删本机文件；
 /// 把清空登记成发给所有设备的删除（[`commit_memory_clear`]）留给调用方在本地清空成功
 /// 之后做。
-pub(crate) fn stash_memory_clear(ctx: &Ctx, keep_trash: bool) -> Result<(Vec<String>, String)> {
+pub(crate) fn stash_memory_clear(
+    ctx: &Ctx,
+    keep_trash: bool,
+    in_space: bool,
+) -> Result<(Vec<String>, String)> {
+    let tables = db::read(ctx.db(), |conn| Ok(sync_db::sync_tables_exist(conn)?))?;
+    // 已配对、但同步表还没建好（首次装配、重建库）：意图登记不进去，本地删除就没有
+    // 任何可结算的凭据——另一进程初始化后拉到旧条目，会在文件删掉之后写回、被当成
+    // 新的再发布。让用户等同步连上再清，不能在删文件前跳过意图。
+    if in_space && !tables {
+        return Err(SyncError::other(
+            "同步状态正在初始化，请等同步连上后再执行 /clear confirm all",
+        ));
+    }
     // 与后台对比的落地共用一把跨进程锁（见 [`memory::ClearLock`]）：读条目与登记意图
     // 必须原子，否则另一进程可能在这两步之间把清空前读到的远端条目写回文件——它们
-    // 不在这次登记的删除集合里，随后会被当成「本机新写的」再发出去。
-    let _clear_lock = memory::ClearLock::acquire(ctx)?;
+    // 不在这次登记的删除集合里，随后会被当成「本机新写的」再发出去。没开过同步的
+    // 库里没有同步表，也没有对比要串行：不建同步目录、不拿锁。
+    let _clear_lock = if tables {
+        match memory::ClearLock::try_acquire(ctx)? {
+            Some(lock) => Some(lock),
+            None => {
+                return Err(SyncError::other(
+                    "另一个进程正在对比或清理记忆文件，请稍后再试 /clear confirm all",
+                ))
+            }
+        }
+    } else {
+        None
+    };
     let entries = match ctx.memory.list_entries(MemoryTarget::Memory) {
         Ok(entries) => entries,
         Err(error) => {

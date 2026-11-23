@@ -635,6 +635,31 @@ pub async fn assemble_core_with(
             tracing::warn!("拿同步存储设置的协议锁失败，本次启动不补写: {error}")
         }
     }
+    // 引擎在打开连接/待机接手前会调它，按磁盘确认同步设置（配置解析与宿主启动时
+    // 完全同一条路：Windows 路径字面量归一化、退役节剥离都在 `Config::parse_str` 里）。
+    let refresh_config: Option<rclaw_sync::ConfigRefresh> = Some(Arc::new({
+        let path = sync_config_path;
+        move || match std::fs::read_to_string(&path) {
+            Ok(text) => match Config::parse_str(&text) {
+                Ok(config) => Ok(Some(config.sync)),
+                Err(error) => {
+                    tracing::warn!(
+                        "重读 {} 确认同步设置失败（稍后再试）: {error}",
+                        path.display()
+                    );
+                    Err(())
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                tracing::warn!(
+                    "读 {} 确认同步设置失败（稍后再试）: {error}",
+                    path.display()
+                );
+                Err(())
+            }
+        }
+    }));
     let sync = crate::sync::SyncSeed::new(
         sync_config,
         data_root,
@@ -643,7 +668,7 @@ pub async fn assemble_core_with(
         cron.clone(),
         bots.clone(),
         web_search_control.clone(),
-        Some(sync_config_path),
+        refresh_config,
     );
 
     Ok(CoreComponents {
