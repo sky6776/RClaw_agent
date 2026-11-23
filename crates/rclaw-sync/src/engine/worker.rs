@@ -561,6 +561,10 @@ impl Worker {
 
     /// 跑一轮。失败时返回原因（给等着结果的调用方看）。
     async fn run_round(&mut self, kind: Kind) -> std::result::Result<(), String> {
+        // 已经约好的也算在这一轮里：先消费掉。留到后面再取的话，切换失败的早退会把
+        // 已到期的时刻留在 `next` 里——下一轮立刻又被唤醒，teardown 之间没有任何
+        // 间隙，其他命令只能等每一轮 teardown 让出。
+        let pending = self.next.take();
         // 上一刻没能重建的连接（换存储设置时有在途提交）：每轮开头再试。放弃之后
         // （switch_failed）也留在这条路上——「立即同步」/定时轮次都会再试一次切换，
         // 否则配置与连接会长期不一致而界面看起来正常。
@@ -574,31 +578,23 @@ impl Worker {
                 self.switch_tries = self.switch_tries.saturating_add(1);
                 if self.switch_tries >= SWITCH_GIVE_UP_TRIES {
                     // 一直等不到在途提交结束：把错误粘住（配置仍是新的、连接仍是旧的），
-                    // 不再每分钟静默重试；下一次「立即同步」或定时轮次会再试。
+                    // 不再自动重试；下一次「立即同步」或用户重新提交配置会再试。
                     self.switch_failed = true;
                     self.pending_switch = false;
-                    self.shared.set_state(
-                        "error",
-                        Some(
-                            "存储设置还没生效：有附件提交一直没有结束。当前仍在使用旧存储；                             点「立即同步」可重试切换"
-                                .into(),
-                        ),
-                    );
-                    return Ok(());
+                    let message = "存储设置还没生效：有附件提交一直没有结束。当前仍在使用旧存储；点「立即同步」可重试切换".to_string();
+                    self.shared.set_state("error", Some(message.clone()));
+                    return Err(message);
                 }
-                self.shared.set_state(
-                    "syncing",
-                    Some(format!(
-                        "等待在途的附件提交结束（第 {} 次重试）",
-                        self.switch_tries + 1
-                    )),
+                let message = format!(
+                    "等待在途的附件提交结束（第 {} 次重试）",
+                    self.switch_tries + 1
                 );
+                self.shared.set_state("syncing", Some(message.clone()));
+                // 明确安排下一次重试：下一次是新的到期时刻，不是旧的已到期时刻。
                 self.request(Kind::Full, RETRY_MIN);
-                return Ok(());
+                return Err(message);
             }
         }
-        // 已经约好的也算在这一轮里。
-        let pending = self.next.take();
         let Some(session) = self.session.as_mut() else {
             return Err("还没有连上同步空间".into());
         };
@@ -816,6 +812,10 @@ impl Worker {
         self.start_uploads(session.live.clone());
         self.start_downloads(session.live.clone());
         self.session = Some(session);
+        // 连接已经按当前配置（含新的存储设置）重建：切换标记与计数到这里就算完成。
+        self.pending_switch = false;
+        self.switch_failed = false;
+        self.switch_tries = 0;
         self.failures = 0;
         self.failed_at = None;
         self.hold_until = None;

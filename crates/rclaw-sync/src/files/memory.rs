@@ -40,6 +40,11 @@ const SCOPE_HOLD: &str = "mem-hold";
 const SCOPE_WIPE: &str = "mem-wipe";
 /// `/clear confirm all` 刚发出清空、文件还没删完的目标：键是目标，值是 [`Clearing`]。
 const SCOPE_CLEARING: &str = "mem-clearing";
+/// 清空流程的版本号：与清空登记放在同一个 scope 下的保留键（普通目标名不会以控制字符
+/// 开头）。登记、提交、撤销、基线重放都 +1。对比在静默门外读到的计划只有在版本没变时
+/// 才允许落地——清空可能在那两步之间完整跑完（登记→删文件→提交→撤标记），标记已经
+/// 没了，只有版本还认得出这是一份过期的计划。
+const CLEAR_GEN_KEY: &str = "\u{1}gen";
 /// 一条条目的文本上限（字节）。本机工具写不出这么长的条目，这里只是给线上内容封顶。
 const TEXT_MAX: usize = 8 * 1024;
 /// 别的设备一次删掉本机这么多条记忆时，在待处理事项里说一声（副本在回收站里）。平时
@@ -84,6 +89,7 @@ pub(crate) fn mark_clearing(conn: &Connection, target: &str, ids: &[String]) -> 
     };
     let op = clearing.op.clone();
     db::state_put_json(conn, SCOPE_CLEARING, target, db::HLC_ZERO, &clearing)?;
+    bump_clear_gen(conn)?;
     Ok(op)
 }
 
@@ -97,6 +103,7 @@ pub(crate) fn abort_clearing(conn: &Connection, target: &str, op: &str) -> Resul
     match current {
         Some(clearing) if clearing.op == op => {
             db::state_del(conn, SCOPE_CLEARING, target)?;
+            bump_clear_gen(conn)?;
             Ok(true)
         }
         _ => Ok(false),
@@ -121,6 +128,19 @@ pub(crate) fn settle_clearing(conn: &Connection, target: &str, op: &str) -> Resu
         }
         _ => Ok(false),
     }
+}
+
+/// 清空流程的版本号（见 [`CLEAR_GEN_KEY`]）：对比拿门后要复核它没变。
+fn clear_gen(conn: &Connection) -> Result<u64> {
+    Ok(db::state_get(conn, SCOPE_CLEARING, CLEAR_GEN_KEY)?
+        .and_then(|row| row.json::<u64>())
+        .unwrap_or(0))
+}
+
+/// 每次会改变「哪些条目算清空对象 / 基线」的清空动作都要 +1（与动作在同一个事务里）。
+fn bump_clear_gen(conn: &Connection) -> Result<()> {
+    let next = clear_gen(conn)?.saturating_add(1);
+    db::state_put_json(conn, SCOPE_CLEARING, CLEAR_GEN_KEY, db::HLC_ZERO, &next)
 }
 
 /// 等用户回答：文件里原有的条目都不见了，是不是有意删的。
@@ -343,6 +363,8 @@ pub(crate) fn forget_bot(conn: &Connection, bot: &str) -> Result<()> {
 /// 已知的条目会（重新）补进本机的文件。
 fn replay(conn: &Connection, target: &str) -> Result<()> {
     db::state_del(conn, SCOPE_BASE, target)?;
+    // 基线整个换了：门外读到旧基线算出来的对比计划不能再落地。
+    bump_clear_gen(conn)?;
     let prefix = format!("{target}/");
     let upper = format!("{prefix}\u{10ffff}");
     conn.execute(
@@ -412,6 +434,7 @@ pub(crate) fn publish_clear(
         };
         db::state_put_json(conn, SCOPE_CLEARING, target, db::HLC_ZERO, &clearing)?;
     }
+    bump_clear_gen(conn)?;
     Ok(known.len())
 }
 
@@ -598,7 +621,7 @@ fn reconcile_target(
     // 指纹在读文件之前取：读完之后文件又变了的话，下一轮指纹对不上，会再读一次。
     let (len, mtime) = file_stamp(&target.path);
     let stamp = vec![(String::new(), len, mtime)];
-    let (rows, base_row, held, wipe, clearing) = db::read(ctx.db(), |conn| {
+    let (rows, base_row, held, wipe, clearing, gen) = db::read(ctx.db(), |conn| {
         Ok((
             unhandled(conn, scope::MEM, &prefix)?,
             db::state_get(conn, SCOPE_BASE, &target.name)?,
@@ -607,6 +630,7 @@ fn reconcile_target(
                 .map(|row| row.json::<Wipe>().unwrap_or_default()),
             db::state_get(conn, SCOPE_CLEARING, &target.name)?
                 .map(|row| row.json::<Clearing>().unwrap_or_default()),
+            clear_gen(conn)?,
         ))
     })?;
     // 有事悬着（在等用户回答、在等清空做完）的时候每次都重新看：那件事的进展记在库里，
@@ -734,15 +758,27 @@ fn reconcile_target(
         // 删本机文件到提交，全程持门。对比在这期间把文件写回去的话，清空刚删掉的条目
         // 下一轮会被当成「本机新写的」再发出去，盖过它发布的删除；反过来，对比持门时
         // `/clear` 拿不到门，会中止让用户重试。拿不到门就整轮不做，下一轮再对比。
+        // 拿到门后再复核一次清空版本：上面那次标记检查到拿门之间，`/clear` 可能已经
+        // 完整跑完（登记→删文件→提交→撤标记）。标记没了也认得出旧计划——版本变了就
+        // 整轮作废，不把清空前读到的远端条目写回文件（下一轮它们会被当成新的再发布）。
         let mut outcome = None;
+        let mut stale = false;
         let quiet = ctx.gate.when_quiet(&mut || {
+            let same = db::read(ctx.db(), clear_gen).is_ok_and(|now| now == gen);
+            if !same {
+                stale = true;
+                return;
+            }
             let first_origin = plan.dels.first().map(|(change, _)| change.origin.as_str());
             outcome = Some(apply_plan(ctx, s, target, first_origin, &adds, &dels));
         });
-        if !quiet {
+        if !quiet || stale {
             return Ok(());
         }
-        let (applied, backup) = outcome.expect("持门时闭包执行了一次")?;
+        let Some(outcome) = outcome else {
+            return Ok(());
+        };
+        let (applied, backup) = outcome?;
         if let Some((name, label)) = backup.filter(|_| applied.removed.len() >= REMOVED_NOTICE_MIN)
         {
             status::notice(

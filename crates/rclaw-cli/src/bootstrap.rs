@@ -566,24 +566,70 @@ pub async fn assemble_core_with(
     // ——它靠运行时的会话生命周期句柄与 turn 互斥。
     // 上次保存存储设置只写了一半（TOML 还没换上）：按落盘的更新意图把 `[sync]` 补齐，
     // 再交给引擎；secrets 由引擎按同一条意图收尾。两个文件最终收敛到同一套。
+    // 补写必须和保存走同一把协议锁，并在锁内重读意图与磁盘上的配置：另一个进程可能
+    // 刚好在这期间提交了另一套存储设置（TOML、凭据、连接都换了，意图也清了），拿锁外
+    // 读到的旧意图或旧 TOML 写盘，会把已经生效的新设置回退。拿不到锁就整次让行。
     let mut sync_config = cfg.sync.clone();
     let sync_paths = rclaw_sync::SyncPaths::new(&data_root);
-    match rclaw_sync::storage_intent_config(&sync_paths) {
-        Ok(Some(intent)) => {
-            // 意图只补存储设置：这期间别处改过的范围/通道不能被一份旧意图回退。
-            let mut merged = sync_config.clone();
-            merged.apply_storage_from(&intent);
-            if merged != sync_config {
-                match crate::sync::save_sync_config(&sync_config_path, &sync_config, &merged) {
-                    Ok(()) => sync_config = merged,
+    match rclaw_sync::StorageLock::try_acquire(&sync_paths) {
+        Ok(Some(_lock)) => {
+            let on_disk = match std::fs::read_to_string(&sync_config_path) {
+                Ok(text) => match Config::parse_str(&text) {
+                    Ok(config) => Some(config.sync),
                     Err(error) => {
-                        tracing::warn!("补齐没存完的存储设置失败（下次启动再试）: {error}")
+                        tracing::warn!(
+                            "重读 {} 失败，本次启动不补写存储设置: {error}",
+                            sync_config_path.display()
+                        );
+                        None
                     }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // 还没有 rclaw.toml：以这次启动读到的配置为基准。
+                    Some(sync_config.clone())
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "读 {} 失败，本次启动不补写存储设置: {error}",
+                        sync_config_path.display()
+                    );
+                    None
+                }
+            };
+            if let Some(base) = on_disk {
+                match rclaw_sync::storage_intent_config(&sync_paths) {
+                    Ok(Some(intent)) => {
+                        // 意图只补存储设置：这期间别处改过的范围/通道不能被一份旧意图回退。
+                        let mut merged = base.clone();
+                        merged.apply_storage_from(&intent);
+                        if merged != base {
+                            match crate::sync::save_sync_config(
+                                &sync_config_path,
+                                &base,
+                                &merged,
+                            ) {
+                                Ok(()) => sync_config = merged,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "补齐没存完的存储设置失败（下次启动再试）: {error}"
+                                    )
+                                }
+                            }
+                        } else {
+                            sync_config = base;
+                        }
+                    }
+                    Ok(None) => sync_config = base,
+                    Err(error) => tracing::warn!("读取没存完的存储设置失败: {error}"),
                 }
             }
         }
-        Ok(None) => {}
-        Err(error) => tracing::warn!("读取没存完的存储设置失败: {error}"),
+        Ok(None) => {
+            tracing::info!("另一个进程正在保存同步存储设置，启动补写让行（下次启动再试）")
+        }
+        Err(error) => {
+            tracing::warn!("拿同步存储设置的协议锁失败，本次启动不补写: {error}")
+        }
     }
     let sync = crate::sync::SyncSeed::new(
         sync_config,

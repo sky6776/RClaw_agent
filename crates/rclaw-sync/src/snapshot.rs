@@ -100,14 +100,11 @@ const BLOB_GRACE_MS: i64 = 24 * 3600 * 1000;
 /// 最近这么多个段始终不回收（换身份时重新发布要用，§9.6）。
 const KEEP_SEGMENTS: usize = 8;
 
-/// 两次「删到期对象」至少隔这么久；一次最多删这么多个、这么久。
+/// 两次「删到期对象」至少隔这么久；一轮的删除预算。
 const SWEEP_SPACING_MS: i64 = 60 * 1000;
-const SWEEP_BATCH: usize = 100;
 const SWEEP_BUDGET: Duration = Duration::from_secs(8);
 /// 依据这轮核验不过（不是预算不够）后的退避：排在后面的对象才轮得到。
 const GC_RETRY_MS: i64 = 5 * 60 * 1000;
-/// 「这轮额度给了别的依据」的短暂让行：下一分钟就能轮到，不用等 5 分钟。
-const GC_SKIP_MS: i64 = 60 * 1000;
 /// 升级前留下的、推不出恢复依据的日志对象：退到很久以后再看（对象不删）。不退避的话
 /// 它们每轮都占满批次，后面的正常删除记录永远轮不到。
 const GC_PARK_MS: i64 = 30 * 24 * 3600 * 1000;
@@ -410,6 +407,11 @@ struct GcWhen {
     /// 写入时就比对过完整向量，删掉不需要再核验一份新快照（宽限期后即可删）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     orphan: bool,
+    /// `orphan` 的资格证明：写这份对象时它从未公布过（不是任何一轮的 head、也没当过
+    /// 回收依据）。曾公布的快照退位时排的是带依据的行，不能被同路径的 orphan 行覆盖；
+    /// 老记录没有这个字段（false），一律按受保护快照处理——来源证明不了就不删。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    candidate: bool,
 }
 
 fn is_zero(value: &i64) -> bool {
@@ -430,6 +432,15 @@ fn queue_delete(conn: &Connection, path: &str, when: &GcWhen) -> Result<()> {
     db::state_put_json(conn, scope::GC, path, db::HLC_ZERO, when)
 }
 
+/// 这个对象已经有带依据的删除安排（某一份快照退位时排的）：不能再被无依据的候选行
+/// 覆盖。替代它的新快照之后要是坏了（分片丢失、读不回来），这份旧快照就是已回收历史
+/// 最后的可读副本——只能等新快照完整复核通过后按原依据删，不能凭「候选覆盖更远」直接删。
+fn protected_retired(conn: &Connection, path: &str) -> Result<bool> {
+    Ok(db::state_get(conn, scope::GC, path)?
+        .and_then(|row| row.json::<GcWhen>())
+        .is_some_and(|when| !when.orphan))
+}
+
 /// 引擎跨轮留着的一点记忆（不落库）。
 #[derive(Default)]
 pub struct Memo {
@@ -444,6 +455,9 @@ pub struct Memo {
     /// 依据/包的复核退避（不落库：重启后立即重试一次是可接受的）。键见
     /// [`retry_key_basis`]/[`retry_key_pack`]，值是不早于它再核的时刻。
     gc_retry: HashMap<String, i64>,
+    /// 上一次实际核验的依据/包（键同上）：下一轮从它之后接着轮转。没有游标时固定按
+    /// 键排序选第一份，持续失败的那几份会把后面的（健康的）依据永久挡住。
+    gc_turn: Option<String>,
 }
 
 impl Memo {
@@ -1528,10 +1542,12 @@ impl Writer {
                             pack: None,
                             retry_ms: 0,
                             orphan: true,
+                            candidate: true,
                         };
                         for (owner, path) in &replaceable {
                             if Some(owner.as_str()) != published
                                 && head_snap.as_deref() != Some(owner.as_str())
+                                && !protected_retired(tx, path)?
                             {
                                 queue_delete(tx, path, &when)?;
                             }
@@ -1550,9 +1566,12 @@ impl Writer {
                         pack: None,
                         retry_ms: 0,
                         orphan: true,
+                        candidate: true,
                     };
                     for (owner, path) in &replaceable {
-                        if head_snap.as_deref() != Some(owner.as_str()) {
+                        if head_snap.as_deref() != Some(owner.as_str())
+                            && !protected_retired(tx, path)?
+                        {
                             queue_delete(tx, path, &when)?;
                         }
                     }
@@ -2153,11 +2172,15 @@ fn retry_key_pack(pack: &PackGuard) -> String {
 /// 押在汇总包上的同理：零散段删掉之后，包里是这段日志唯一的副本。
 ///
 /// 日志对象（段、汇总包、快照）没有恢复依据的一律不删：升级前留下的旧记录没有 `pack`
-/// 字段，不能因此获得直接删除资格。附件对象（`blobs/`）和 `orphan` 标记的旧候选快照
-/// （本机自己写下、无 head 引用、且被新候选完整覆盖）不需要快照依据。
+/// 字段，不能因此获得直接删除资格。附件对象（`blobs/`）和带候选证明的 `orphan` 旧候选
+/// 快照（本机自己写下、从未公布过、无 head 引用、且被新候选完整覆盖）不需要快照依据。
 ///
 /// 每轮只把复核额度给**一份**依据/包（`PROMOTE_BUDGET` 与晋升判定一致）：多份依据同时
 /// 到期时按依据退避轮转，避免「晋升时 6 秒核完、删除时被均分成 3 秒永远核不完」。
+/// 轮到哪一份由进程内游标决定（在**全部**到期行里按证据键轮转），不按对象路径排序从头
+/// 选：几份持续失败的依据各自退避 5 分钟后会重新排到队头，固定从头选会让它们轮流占满
+/// 每分钟唯一的额度，排在后面的健康依据永远轮不到；某一份依据行数很多时也不会把别的
+/// 依据挤出批次。
 async fn sweep_due(
     ctx: &Ctx,
     transport: &dyn SyncTransport,
@@ -2165,7 +2188,13 @@ async fn sweep_due(
     memo: &mut Memo,
     now: i64,
 ) -> Result<usize> {
-    type Due = (String, Option<(String, String)>, Option<PackGuard>, bool);
+    type Due = (
+        String,
+        Option<(String, String)>,
+        Option<PackGuard>,
+        bool,
+        bool,
+    );
     // 退避表是进程内记忆（规模有限，重启后清零只会多核一次）。
     let retry_until = memo.gc_retry.clone();
     let (due, seeds): (Vec<Due>, HashMap<String, Vec<String>>) = offload(ctx, move |ctx| {
@@ -2209,9 +2238,8 @@ async fn sweep_due(
                         && when
                             .snap
                             .is_none_or(|snap| log.head_snap.as_ref() == Some(&snap)))
-                    .then(|| (path, when.basis, when.pack, when.orphan))
+                    .then(|| (path, when.basis, when.pack, when.orphan, when.candidate))
                 })
-                .take(SWEEP_BATCH)
                 .collect();
             Ok((due, seeds))
         })
@@ -2220,23 +2248,64 @@ async fn sweep_due(
     if due.is_empty() {
         return Ok(0);
     }
+    // 这一轮核验哪一份依据/包：把到期行里的证据去重、按证据键排序，从游标之后的第一份
+    // 接着选（没有游标或已经到末尾就回绕到第一份）。
+    let mut evidences: Vec<(String, Option<(String, String)>, Option<PackGuard>)> = Vec::new();
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        for (_, basis, pack, _, _) in &due {
+            let key = basis
+                .as_ref()
+                .map(retry_key_basis)
+                .or_else(|| pack.as_ref().map(retry_key_pack));
+            if let Some(key) = key {
+                if seen.insert(key.clone()) {
+                    evidences.push((key, basis.clone(), pack.clone()));
+                }
+            }
+        }
+        evidences.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    let turn = memo
+        .gc_turn
+        .as_ref()
+        .and_then(|cursor| evidences.iter().position(|(key, ..)| key > cursor))
+        .unwrap_or(0);
     let started = Instant::now();
     // 复核（下载、核对摘要）与删除共享这一轮的时间预算：删除阶段固定留四分之一；
     // 复核部分每轮只给**一份**依据/包，期限与晋升判定用同一个 `PROMOTE_BUDGET`。
     let verify_end = started + SWEEP_BUDGET.mul_f64(0.75);
-    let mut checked: HashMap<(String, String), BasisCheck> = HashMap::new();
-    let mut packs_ok: HashMap<(String, String), bool> = HashMap::new();
-    let mut evidence_used = false;
+    let mut target_key: Option<String> = None;
+    let mut checked_basis: Option<BasisCheck> = None;
+    let mut checked_pack: Option<bool> = None;
+    if let Some((key, basis, pack)) = evidences.get(turn) {
+        let deadline = (Instant::now() + PROMOTE_BUDGET).min(verify_end);
+        if deadline > Instant::now() {
+            if let Some(basis) = basis {
+                let seed = seeds.get(&basis.0).cloned().unwrap_or_default();
+                checked_basis = Some(basis_intact(transport, keys, basis, &seed, deadline).await);
+            } else if let Some(pack) = pack {
+                checked_pack = Some(pack_intact(transport, keys, pack, deadline).await);
+            }
+            target_key = Some(key.clone());
+            // 轮转起点：下一轮从这一份之后接着选（失败退避不会让它独占队头）。
+            memo.gc_turn = Some(key.clone());
+        }
+    }
     // (对象路径, 依据退避键, 包退避键)：删除失败时按依据/包退避，避免同一份依据
     // 「核验成功但第一个 DELETE 一直失败」把排在后面的依据永久挡住。
     let mut deletable: Vec<(String, Option<String>, Option<String>)> = Vec::new();
-    let mut due_left: Vec<Due> = Vec::new();
-    // 这轮核验不过 / 轮不到的：按依据或包记一条退避（不逐行改）。
-    // 失败与「轮到别人了」的退避分开：失败等久一点，排队等下一小组只等一小会儿。
+    // 这轮核验不过的：按依据或包记一条退避（不逐行改）。
     let mut retry_keys: HashSet<String> = HashSet::new();
-    let mut skipped_keys: HashSet<String> = HashSet::new();
     let mut parked: Vec<String> = Vec::new();
-    for (path, basis, pack, orphan) in due {
+    for (path, basis, pack, orphan, candidate) in due {
+        if orphan && !candidate {
+            // 旧版本排下的 orphan 行：来源证明不了是「从未公布过的候选」，按受保护快照
+            // 处理（不删）。新写快照排的行带 `candidate` 证明，不会覆盖带依据的旧行。
+            tracing::debug!("{path} 没有候选证明（旧格式的回收记录），先不删");
+            parked.push(path);
+            continue;
+        }
         if basis.is_none() && pack.is_none() && !orphan && !path.starts_with("blobs/") {
             // 升级前留下的旧记录：没有恢复依据的日志对象不能删。退到很久以后，
             // 别让它一直占着批次把后面的正常记录挡住。
@@ -2250,69 +2319,38 @@ async fn sweep_due(
                 deletable.push((path, None, None));
                 continue;
             };
-            let key = (pack.name.clone(), pack.digest.clone());
-            let ok = match packs_ok.get(&key) {
-                Some(&ok) => ok,
-                None => {
-                    if evidence_used {
-                        skipped_keys.insert(retry_key_pack(&pack));
-                        due_left.push((path, None, Some(pack), orphan));
-                        continue;
-                    }
-                    let deadline = (Instant::now() + PROMOTE_BUDGET).min(verify_end);
-                    if deadline <= Instant::now() {
-                        due_left.push((path, None, Some(pack), orphan));
-                        continue;
-                    }
-                    evidence_used = true;
-                    let ok = pack_intact(transport, keys, &pack, deadline).await;
-                    packs_ok.insert(key, ok);
-                    ok
+            let key = retry_key_pack(&pack);
+            if target_key.as_deref() != Some(key.as_str()) {
+                // 这一轮轮到别的依据/包：不写退避（健康的依据不该被无谓推迟），
+                // 下一轮接着轮转。
+                continue;
+            }
+            match checked_pack {
+                Some(true) => deletable.push((path, None, Some(key))),
+                _ => {
+                    tracing::debug!(
+                        "汇总包 {} 这轮读不回来，押着它的零散段先不删",
+                        pack.name
+                    );
+                    retry_keys.insert(key);
                 }
-            };
-            if ok {
-                deletable.push((path, None, Some(retry_key_pack(&pack))));
-            } else {
-                tracing::debug!("汇总包 {} 这轮读不回来，押着它的零散段先不删", pack.name);
-                retry_keys.insert(retry_key_pack(&pack));
-                due_left.push((path, None, Some(pack), orphan));
             }
             continue;
         };
-        let verdict = match checked.get(&basis) {
-            Some(&verdict) => verdict,
-            None => {
-                if evidence_used {
-                    skipped_keys.insert(retry_key_basis(&basis));
-                    due_left.push((path, Some(basis), pack, orphan));
-                    continue;
-                }
-                let deadline = (Instant::now() + PROMOTE_BUDGET).min(verify_end);
-                if deadline <= Instant::now() {
-                    due_left.push((path, Some(basis), pack, orphan));
-                    continue;
-                }
-                evidence_used = true;
-                let seed = seeds.get(&basis.0).cloned().unwrap_or_default();
-                let verdict = basis_intact(transport, keys, &basis, &seed, deadline).await;
-                checked.insert(basis.clone(), verdict);
-                verdict
+        let key = retry_key_basis(&basis);
+        if target_key.as_deref() != Some(key.as_str()) {
+            continue;
+        }
+        match checked_basis {
+            Some(BasisCheck::Intact) => deletable.push((path, Some(key), None)),
+            Some(check) => {
+                tracing::debug!(
+                    "回收依据 {} 这轮核验不过（{check:?}），押着它的对象先不删",
+                    basis.0
+                );
+                retry_keys.insert(key);
             }
-        };
-        match verdict {
-            BasisCheck::Intact => {
-                deletable.push((path, Some(retry_key_basis(&basis)), None))
-            }
-            BasisCheck::Deferred => {
-                tracing::debug!("回收依据 {} 这轮没核验完，押着它的对象先不删", basis.0);
-                retry_keys.insert(retry_key_basis(&basis));
-                due_left.push((path, Some(basis), pack, orphan));
-            }
-            BasisCheck::Broken => {
-                tracing::debug!("回收依据 {} 这轮核验不过，押着它的对象先不删", basis.0);
-                retry_keys.insert(retry_key_basis(&basis));
-                due_left.push((path, Some(basis), pack, orphan));
-            }
+            None => {}
         }
     }
     let mut done: Vec<String> = Vec::new();
@@ -2341,9 +2379,6 @@ async fn sweep_due(
     for key in &retry_keys {
         memo.gc_retry.insert(key.clone(), now + GC_RETRY_MS);
     }
-    for key in &skipped_keys {
-        memo.gc_retry.insert(key.clone(), now + GC_SKIP_MS);
-    }
     // 表只增不减没有意义：过期条目顺手清掉（规模是依据/包的个数，很小）。
     memo.gc_retry.retain(|_, until| *until > now);
     offload(ctx, move |ctx| {
@@ -2351,7 +2386,7 @@ async fn sweep_due(
             for path in &done {
                 db::state_del(tx, scope::GC, path)?;
             }
-            // 升级前的无依据旧行：逐行退到很久以后（数量少，且只做一次）。
+            // 升级前的无依据/无候选证明旧行：逐行退到很久以后（数量少，且只做一次）。
             for path in &parked {
                 let Some(mut when) =
                     db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
@@ -2674,6 +2709,7 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
                     pack: Some(guard),
                     retry_ms: 0,
                     orphan: false,
+                    candidate: false,
                 };
                 queue_delete(tx, &codec::segment_path(&s.device, &entry.name), &when)?;
                 entry.gone = true;
@@ -2694,11 +2730,18 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
         };
         // 回收依据只能是完整核验过的快照：清单和它声明的每个分片都对上了（分批核验，
         // 没核验完的不算数）。挑覆盖得最远的那一份，把它钉在候选记录里，公布与删除之前
-        // 都会在当前存储上再复核。
+        // 都会在当前存储上再复核。已经放弃过的依据（一次判定核不完）先排除：它可能覆盖
+        // 更远，但永远过不了复核，挡在这里会把能在 6 秒内核完的次优依据一直压住。
         let basis = record
             .covers_checked
             .iter()
             .filter(|(_, entry)| entry.complete())
+            .filter(|(key, entry)| {
+                record
+                    .floor_abandoned
+                    .as_ref()
+                    .is_none_or(|(who, digest)| who != *key || digest != &entry.digest)
+            })
             .max_by_key(|(_, entry)| entry.seq)
             .map(|(key, entry)| (key.clone(), entry.digest.clone(), entry.seq));
         let covered = basis.as_ref().map_or(0, |(_, _, seq)| *seq);
@@ -2732,10 +2775,6 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
         let Some(basis) = basis else {
             return Ok(());
         };
-        // 这份依据已经放弃（一次判定核不完）：不再登记，别每周重新排上、每小时空转。
-        if record.floor_abandoned.as_ref() == Some(&basis) {
-            return Ok(());
-        }
         // 删除要等带着新回收位置的 head 写出去之后才动手（`floor` 守卫）；删之前与公布
         // 之前都还会按 basis 复核一次。
         let when = GcWhen {
@@ -2746,6 +2785,7 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
             pack: None,
             retry_ms: 0,
             orphan: false,
+            candidate: false,
         };
         for entry in entries.iter().filter(|entry| entry.to <= floor) {
             if !entry.gone {
@@ -3107,6 +3147,7 @@ async fn promote_snap(
                     pack: None,
                     retry_ms: 0,
                     orphan: false,
+                    candidate: false,
                 };
                 for path in old_paths {
                     queue_delete(tx, &path, &when)?;
@@ -3295,6 +3336,7 @@ fn note_unreferenced(
                     pack: None,
                     retry_ms: 0,
                     orphan: false,
+                    candidate: false,
                 },
             )?;
             // 文件还在本机：以后又有人要的话（`blob.want`）重新上传。
