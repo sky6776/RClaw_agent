@@ -177,141 +177,38 @@ fn write_blocking(
 /// 把已经写满并 fsync 的临时文件以「目标存在即失败」的方式发布。
 ///
 /// Windows 用同卷 `MoveFileExW`（不设 `MOVEFILE_REPLACE_EXISTING`）：重命名原子、
-/// 目标已存在则失败，exFAT/FAT32 也支持。其它平台先试硬链接；卷不支持硬链接时退回
-/// 「create_new + 复制」，复制失败会删掉刚创建的半成品，避免半个 space.json 卡住
-/// 重置恢复。
+/// 目标已存在则失败，exFAT/FAT32 也支持。发布前把父目录规范化成 verbatim（扩展
+/// 长度）绝对路径，只拼叶子；规范化失败就明确报错，不猜路径（手工归一在 UNC、
+/// 根上 `..`、尾点/空格、未配对代理单元上都有语义陷阱）。
+///
+/// 其它平台先试硬链接；卷不支持硬链接时退回「create_new + 复制」，复制失败会删掉
+/// 刚创建的半成品，避免半个 space.json 卡住重置恢复。
 #[cfg(windows)]
 fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     extern "system" {
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     }
-    // Win32 的 MoveFileExW 默认受 MAX_PATH 限制：用扩展长度路径（本地盘
-    // `\\?\C:...`、UNC `\\?\UNC\server...`）让深层目录也能发布（Rust 的临时文件/
-    // 目录 API 已经走扩展路径）。
-    fn wide_long(path: &Path) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        // 规范化父目录得到 verbatim（扩展长度）绝对路径，消掉正斜杠、`.`/`..` 与
-        // 相对路径；目标文件名可能还不存在，只拼叶子。成功分支直接按 UTF-16
-        // 编码（无损，含未配对代理单元也不会被替换）。
-        if let Some(parent) = path.parent() {
-            if let Ok(parent) = std::fs::canonicalize(parent) {
-                let full = match path.file_name() {
-                    Some(name) => parent.join(name),
-                    None => parent,
-                };
-                return full
-                    .as_os_str()
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-            }
-        }
-        // 规范化失败（SMB 权限、卷暂不可访问等）：先做词法归一化（扩展路径不解释
-        // `.`/`..`），再按绝对盘符/UNC 形式补扩展前缀；全程 OsStr/UTF-16，
-        // 不走 to_string_lossy。
-        let normalized = lexical_normalize(path);
-        let mut wide: Vec<u16> = Vec::new();
-        let mut components = normalized.components();
-        let prefix = components.next();
-        // 宽字符前缀：\\?\UNC\ 与 \\?\（用码点常量，避免转义歧义）。
-        const UNC_PREFIX: [u16; 8] = [0x5c, 0x5c, 0x3f, 0x5c, 0x55, 0x4e, 0x43, 0x5c];
-        const DISK_PREFIX: [u16; 4] = [0x5c, 0x5c, 0x3f, 0x5c];
-        let already_extended = matches!(
-            prefix,
-            Some(std::path::Component::Prefix(prefix))
-                if matches!(
-                    prefix.kind(),
-                    std::path::Prefix::VerbatimDisk(_)
-                        | std::path::Prefix::VerbatimUNC(_, _)
-                        | std::path::Prefix::Verbatim(_)
-                )
-        );
-        if !already_extended && path.is_absolute() {
-            if let Some(std::path::Component::Prefix(prefix)) = prefix {
-                if let std::path::Prefix::UNC(server, share) = prefix.kind() {
-                    wide.extend(UNC_PREFIX);
-                    wide.extend(server.encode_wide());
-                    wide.push(0x5c);
-                    wide.extend(share.encode_wide());
-                    for component in components {
-                        match component {
-                            std::path::Component::RootDir
-                            | std::path::Component::CurDir => {}
-                            other => {
-                                wide.push(0x5c);
-                                wide.extend(other.as_os_str().encode_wide());
-                            }
-                        }
-                    }
-                    wide.push(0);
-                    return wide;
-                }
-            }
-            wide.extend(DISK_PREFIX);
-        }
-        wide.extend(normalized.as_os_str().encode_wide());
-        wide.push(0);
-        wide
+    fn wide_long(path: &Path) -> Option<Vec<u16>> {
+        let parent = std::fs::canonicalize(path.parent()?).ok()?;
+        let full = match path.file_name() {
+            Some(name) => parent.join(name),
+            None => parent,
+        };
+        Some(
+            full.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect(),
+        )
     }
-
-    /// 词法归一化：去掉 `.`、消解 `..`（扩展长度路径不解释点分量）。
-    fn lexical_normalize(path: &Path) -> PathBuf {
-        use std::os::windows::ffi::OsStrExt;
-        use std::path::Component;
-        let mut out = PathBuf::new();
-        // 还没落到路径里的前导 `..`（`out` 里已经没有可弹出的组件时累积）。
-        let mut leading_parents = 0usize;
-        for component in path.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    if leading_parents > 0 {
-                        leading_parents += 1;
-                    } else if !out.pop() {
-                        // 根上再 `..`：Win32 的普通路径也会保留（不能丢，否则指向别处）。
-                        leading_parents = 1;
-                    }
-                }
-                other => {
-                    for _ in 0..leading_parents {
-                        out.push("..");
-                    }
-                    leading_parents = 0;
-                    let name = other.as_os_str();
-                    // 普通 Win32 会去掉每个分量结尾的点与空格；扩展路径不会——两边
-                    // 混用时（Rust 创建临时文件、这里发布）必须自己按普通语义归一。
-                    let trimmed = if matches!(other, Component::Normal(_)) {
-                        trim_trailing_dots_and_spaces(name)
-                    } else {
-                        name.to_os_string()
-                    };
-                    out.push(trimmed);
-                }
-            }
-        }
-        for _ in 0..leading_parents {
-            out.push("..");
-        }
-        out
-    }
-
-    /// 去掉文件名分量结尾的点与空格（Win32 普通路径语义），按 UTF-16 处理，保留
-    /// 未配对代理单元。
-    fn trim_trailing_dots_and_spaces(name: &std::ffi::OsStr) -> std::ffi::OsString {
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        let mut wide: Vec<u16> = name.encode_wide().collect();
-        while matches!(wide.last(), Some(0x2e) | Some(0x20)) {
-            wide.pop();
-        }
-        if wide.is_empty() {
-            name.to_os_string()
-        } else {
-            std::ffi::OsString::from_wide(&wide)
-        }
-    }
-    let from: Vec<u16> = wide_long(tmp);
-    let to: Vec<u16> = wide_long(path);
+    let from = wide_long(tmp).ok_or_else(|| {
+        std::io::Error::other(format!("无法规范化临时文件路径 {}", tmp.display()))
+    })?;
+    let to = wide_long(path).ok_or_else(|| {
+        std::io::Error::other(format!("无法规范化目标路径 {}", path.display()))
+    })?;
     let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
     if ok == 0 {
         Err(std::io::Error::last_os_error())
