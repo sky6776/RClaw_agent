@@ -360,10 +360,16 @@ impl SyncEngine {
     /// 没变的配置也交过去：面板上的「重试」就是把现有的配置再存一遍，没连上同步空间的
     /// 引擎线程收到之后会再试一次。线程自己退出了的话重新起一条。
     pub fn apply_config(&self, config: SyncConfig) {
-        // 先拿存储协议锁：宿主的配置发布和存储保存/加入提交串行，关闭同步之后
-        // 旧 worker 就不能再装回开启配置（锁序与保存协议一致：StorageLock → running）。
+        // 兼容入口（测试/无文件协议）：直接发布。宿主侧应调用
+        // [`Self::apply_config_locked`]——由它在协议锁内读盘得到权威配置再发布。
+        self.apply_config_locked(config);
+    }
+
+    /// 在**已持有存储协议锁**时发布配置：写盘、读盘与发布在同一临界区里，较早读到的
+    /// 快照不会盖过之后完成的保存。发布存储段变化会推进提交代次（旧意图失效）。
+    pub fn apply_config_locked(&self, config: SyncConfig) {
         let paths = self.inner.ctx.paths.clone();
-        let _storage_lock = worker::StorageLock::acquire(&paths).ok();
+        let _ = worker::storage_commit_ensure(&paths, &config);
         let mut running = lock(&self.inner.running);
         let host_seq = {
             // 值与版本、安装序号在同一把锁里提交：引擎线程只会在锁内看到成对的
@@ -742,7 +748,7 @@ impl SyncEngine {
         });
         // 最后一份 TOML 已提交的记录先放进备份：新请求在这之后任何一步失败，启动
         // 都能按磁盘存储段找回它；备份都写不成就别动任何东西。
-        if let Some(prev) = worker::storage_intent_last_written(&paths)? {
+        if let Some(prev) = worker::storage_intent_last_written(&paths, &merged)? {
             worker::storage_intent_backup_save(&paths, &prev)?;
         }
         let id =

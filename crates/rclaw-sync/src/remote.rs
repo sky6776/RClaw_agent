@@ -30,7 +30,19 @@ pub async fn open_space(
     space_id: &str,
     create: bool,
 ) -> Result<()> {
-    match read_space(transport).await? {
+    let existing = match read_space(transport).await {
+        Ok(existing) => existing,
+        // 创建路径上读到损坏的标记（例如旧版「仅创建回退」在复制中途被打断留下的
+        // 半个 space.json）：这个空间本来就用不了，重建它，别让重置恢复永远卡住。
+        Err(SyncError::Corrupt(error)) if create => {
+            tracing::warn!("空间标记损坏（{error}），按创建路径重建");
+            let file = SpaceFile::new(keys, space_id);
+            transport::put_checked(transport, SPACE_FILE, file.encode()?).await?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    match existing {
         Some(file) => {
             file.verify(keys, space_id)?;
             if file.closed {

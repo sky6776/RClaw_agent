@@ -81,16 +81,21 @@ pub(crate) struct StorageIntent {
     /// 要绑定的密码；`None` 或空 = 不改密码。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) secret: Option<String>,
-    /// 这次请求**明确修改**的设备名 `(原值, 目标值)`（向导里编辑过）：启动回补与
-    /// worker 收尾只在当前名字仍是原值/目标值之一时采用目标值。
+    /// 这次请求**明确修改**的设备名 `(原值, 目标值)`（向导里编辑过）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) device_name_edit: Option<DeviceNameEdit>,
-    /// 这份记录的配置是否已经写进 `rclaw.toml`（跨重启判断主/备归属）。
+    /// 这份记录属于哪一次「存储段提交」（见 [`StorageCommitFile`]）。磁盘存储段被
+    /// 任何入口换过一次，代次就 +1，旧代次的记录失去恢复资格。
+    #[serde(default)]
+    pub(crate) commit: u64,
+    /// 同一存储段内的请求序号（协议锁内单调分配）：密码修改这类不换存储的请求靠它
+    /// 定先后，不依赖墙钟（同毫秒/时钟回拨都不会选错）。
+    #[serde(default)]
+    pub(crate) req: u64,
+    /// 这份记录的配置是否已经写进 `rclaw.toml`。旧版本没有这个字段（`false`），
+    /// 恢复时按「同代次里最大的 req」判定，不单看这个标记。
     #[serde(default)]
     pub(crate) toml_written: bool,
-    /// 记录创建时刻（毫秒）：同存储段的多条记录里选较新的一笔。
-    #[serde(default)]
-    pub(crate) at_ms: i64,
     /// 旧版本（round19/20）的「明确设备名」字段：读进来避免解析失败。归属有歧义时
     /// 不应用（保留磁盘现值），凭据照常结算。
     #[serde(default, alias = "device_name", skip_serializing_if = "Option::is_none")]
@@ -114,56 +119,72 @@ fn storage_intent_path(paths: &SyncPaths) -> PathBuf {
     paths.root.join("pending-storage.json")
 }
 
-/// 存储保存协议的跨进程锁：意图、`rclaw.toml`、secrets 的整套提交必须串行——两次保存
-/// 交错时会留下 TOML 与运行配置各一套、且没有恢复记录的状态。
-pub struct StorageLock {
-    file: std::fs::File,
-}
-
-impl StorageLock {
-    fn lock_path(paths: &SyncPaths) -> PathBuf {
-        paths.root.join("storage.lock")
-    }
-
-    /// 拿锁（阻塞到别的保存/恢复结束）。
-    pub fn acquire(paths: &SyncPaths) -> Result<StorageLock> {
-        paths.ensure_root()?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(Self::lock_path(paths))?;
-        fs2::FileExt::lock_exclusive(&file)?;
-        Ok(StorageLock { file })
-    }
-
-    /// 试拿锁：别的地方正拿着就返回 `None`（不等待）。
-    pub fn try_acquire(paths: &SyncPaths) -> Result<Option<StorageLock>> {
-        paths.ensure_root()?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(Self::lock_path(paths))?;
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(Some(StorageLock { file })),
-            Err(error) if crate::lock_is_contended(&error) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-}
-
-impl Drop for StorageLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
-    }
-}
-
-/// 备份 = 最后一份 TOML 已提交、但密码还没补上的记录。主记录 = 当前（可能写到一半
-/// 的）请求。替换主记录之前先把「最后一份已提交记录」放进备份；任何时刻都至少有一
-/// 条 TOML 已提交的记录可恢复。
+/// 备份 = 最后一份可恢复的记录。替换主记录之前先把当前有效的记录放进备份；任何
+/// 时刻都至少有一条「与磁盘存储段一致」的记录可恢复。
 fn storage_intent_backup_path(paths: &SyncPaths) -> PathBuf {
     paths.root.join("pending-storage.prev.json")
+}
+
+/// 持久化的存储提交状态：`commit` 标识当前磁盘存储段是哪一次提交；`req` 是协议锁内
+/// 单调的请求序号（同一存储段内的先后）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StorageCommitFile {
+    #[serde(default)]
+    commit: u64,
+    #[serde(default)]
+    req: u64,
+    #[serde(default)]
+    storage: SyncConfig,
+}
+
+fn storage_commit_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join("storage-commit.json")
+}
+
+fn storage_commit_read(paths: &SyncPaths) -> Result<StorageCommitFile> {
+    match std::fs::read(storage_commit_path(paths)) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(file) => Ok(file),
+            Err(error) => {
+                tracing::warn!("sync/storage-commit.json 损坏，按空状态处理: {error}");
+                Ok(StorageCommitFile::default())
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StorageCommitFile::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn storage_commit_write(paths: &SyncPaths, file: &StorageCommitFile) -> Result<()> {
+    paths.ensure_root()?;
+    rclaw_store::atomic_write_private(
+        &storage_commit_path(paths),
+        &serde_json::to_vec_pretty(file)?,
+    )?;
+    Ok(())
+}
+
+/// 存储段与此前记录的不同就推进提交代次，并让旧代次的意图全部失去恢复资格
+/// （切回旧存储时旧密码不会被复活）。应在持有存储协议锁时调用。
+pub(crate) fn storage_commit_ensure(paths: &SyncPaths, storage: &SyncConfig) -> Result<u64> {
+    let mut file = storage_commit_read(paths)?;
+    if file.commit == 0 {
+        // 第一次建立提交状态：旧版本的记录没有代次，不能被顺手清掉（它们仍按
+        // 「存储段与磁盘一致」兜底恢复）。
+        file.commit = 1;
+        file.storage = storage.clone();
+        storage_commit_write(paths, &file)?;
+        return Ok(file.commit);
+    }
+    if !same_storage_cfg(&file.storage, storage) {
+        file.commit = file.commit.saturating_add(1);
+        file.storage = storage.clone();
+        storage_commit_write(paths, &file)?;
+        // 旧提交的意图从此失去恢复资格（切回旧存储不会复活旧密码）。
+        let _ = std::fs::remove_file(storage_intent_path(paths));
+        let _ = std::fs::remove_file(storage_intent_backup_path(paths));
+    }
+    Ok(file.commit)
 }
 
 fn storage_intent_store(paths: &SyncPaths, intent: &StorageIntent) -> Result<()> {
@@ -218,7 +239,8 @@ fn storage_intent_backup_load(paths: &SyncPaths) -> Result<Option<StorageIntent>
 }
 
 /// 落盘「存储设置更新意图」，返回它的标识。同一套配置、密码与名称编辑重复调用
-/// （同一请求重试）沿用手上这条记录的标识与提交状态。
+/// （同一请求重试）沿用手上这条记录的标识与提交状态；否则在协议锁内分配新的请求
+/// 序号（同一存储段内的先后由此决定，不看墙钟）。
 pub fn storage_intent_save(
     paths: &SyncPaths,
     config: &SyncConfig,
@@ -227,30 +249,37 @@ pub fn storage_intent_save(
 ) -> Result<String> {
     let secret = secret.map(|secret| secret.to_string());
     let device_name_edit = device_name_edit.map(|(from, to)| DeviceNameEdit { from, to });
+    let commit = storage_commit_ensure(paths, config)?;
     if let Some(existing) = storage_intent_load(paths)? {
         if !existing.id.is_empty()
             && existing.config == *config
             && existing.secret == secret
             && existing.device_name_edit == device_name_edit
+            && existing.commit == commit
         {
             return Ok(existing.id);
         }
     }
+    let mut file = storage_commit_read(paths)?;
+    file.req = file.req.saturating_add(1);
+    storage_commit_write(paths, &file)?;
     let intent = StorageIntent {
         id: crate::ids::random_hex::<8>(),
         config: config.clone(),
         secret,
         device_name_edit,
+        commit,
+        req: file.req,
         toml_written: false,
-        at_ms: crate::attach::now_ms(),
         legacy_device_name: None,
     };
     storage_intent_store(paths, &intent)?;
     Ok(intent.id)
 }
 
-/// 把这条记录的配置标记成「TOML 已写成」：只有写成功之后才标记，启动选记录时只信
-/// 这个标记加磁盘存储段。
+/// 把这条记录的配置标记成「TOML 已写成」。标记失败不会阻止恢复：同一代次里请求
+/// 序号最大的记录即使没有标记，只要存储段与磁盘一致也算可恢复（覆盖「TOML 写完、
+/// 标记未写就崩溃」这一窗口）。
 pub(crate) fn storage_intent_mark_written(paths: &SyncPaths, id: &str) -> Result<()> {
     let Some(mut intent) = storage_intent_load(paths)? else {
         return Ok(());
@@ -259,22 +288,15 @@ pub(crate) fn storage_intent_mark_written(paths: &SyncPaths, id: &str) -> Result
         return Ok(());
     }
     intent.toml_written = true;
-    intent.at_ms = crate::attach::now_ms();
     storage_intent_store(paths, &intent)
 }
 
-/// 最后一份「TOML 已提交」的记录（主优先，其次备份；都有取较新的）。
+/// 最后一份可恢复的记录（给下一次保存做备份用）。
 pub(crate) fn storage_intent_last_written(
     paths: &SyncPaths,
+    disk: &SyncConfig,
 ) -> Result<Option<StorageIntent>> {
-    let main = storage_intent_load(paths)?.filter(|intent| intent.toml_written);
-    let backup = storage_intent_backup_load(paths)?.filter(|intent| intent.toml_written);
-    Ok(match (main, backup) {
-        (Some(main), Some(backup)) => {
-            Some(if main.at_ms >= backup.at_ms { main } else { backup })
-        }
-        (main, backup) => main.or(backup),
-    })
+    Ok(storage_intent_effective(paths, disk)?.map(|effective| effective.intent))
 }
 
 /// 两套配置的存储段是否指向同一处。
@@ -290,34 +312,48 @@ pub(crate) struct EffectiveIntent {
     pub(crate) from_backup: bool,
 }
 
-/// 启动/收尾要执行哪一条意图：只看 TOML 已提交的记录，且要求它的存储段与磁盘一致；
-/// 同存储段的多条记录取较新的一笔。都不匹配磁盘（已被第三笔写入替代）或没有已提交
-/// 记录时返回 `None`——保留磁盘现值，不拿主备任一条无条件覆盖。
+/// 启动/收尾要执行哪条意图：
+/// - 非旧格式记录必须属于当前存储提交代次且存储段与磁盘一致；
+/// - 同代次里请求序号最大的那笔胜出（即使 `toml_written` 还没写上——TOML 写完与
+///   标记之间崩溃时，磁盘存储段已经一致，这是唯一能恢复新密码的依据）；
+/// - 旧格式（没有序号）只在没有新格式候选时按主/备顺序兜底；
+/// - 都不匹配磁盘（已被第三笔写入替代）时返回 `None`，保留磁盘现值。
 pub(crate) fn storage_intent_effective(
     paths: &SyncPaths,
     disk: &SyncConfig,
 ) -> Result<Option<EffectiveIntent>> {
+    let commit = storage_commit_ensure(paths, disk)?;
     let main = storage_intent_load(paths)?;
     let backup = storage_intent_backup_load(paths)?;
-    let mut candidates: Vec<EffectiveIntent> = Vec::new();
-    if let Some(main) = main {
-        if main.toml_written && same_storage_cfg(disk, &main.config) {
-            candidates.push(EffectiveIntent {
-                intent: main,
-                from_backup: false,
+    let mut best: Option<EffectiveIntent> = None;
+    for (intent, from_backup) in [(main, false), (backup, true)] {
+        let Some(intent) = intent else {
+            continue;
+        };
+        if !same_storage_cfg(disk, &intent.config) {
+            continue;
+        }
+        let eligible = if intent.req == 0 {
+            // 旧格式：归属不可判定，只用来兜底
+            true
+        } else {
+            intent.commit == commit
+        };
+        if !eligible {
+            continue;
+        }
+        let replace = match &best {
+            None => true,
+            Some(current) => (intent.commit, intent.req) > (current.intent.commit, current.intent.req),
+        };
+        if replace {
+            best = Some(EffectiveIntent {
+                intent,
+                from_backup,
             });
         }
     }
-    if let Some(backup) = backup {
-        if backup.toml_written && same_storage_cfg(disk, &backup.config) {
-            candidates.push(EffectiveIntent {
-                intent: backup,
-                from_backup: true,
-            });
-        }
-    }
-    candidates.sort_by_key(|candidate| candidate.intent.at_ms);
-    Ok(candidates.pop())
+    Ok(best)
 }
 
 /// 结算：先删落选的那一份（它从此不能被恢复），再删胜出的那一份。中途中断时胜出
@@ -337,7 +373,7 @@ pub(crate) fn storage_intent_settle(paths: &SyncPaths, from_backup: bool) -> Res
 }
 
 /// 后续一次显式改名（通用配置保存/导入）发布到 `current_name` 时，取消仍在等待的
-/// 设备名编辑：那是一次更晚的改名，旧意图不能再把它改回去。凭据部分保留。
+/// 设备名编辑。凭据部分保留。
 pub(crate) fn storage_intent_cancel_name_edit(
     paths: &SyncPaths,
     current_name: &str,
@@ -346,28 +382,26 @@ pub(crate) fn storage_intent_cancel_name_edit(
         (storage_intent_path(paths), false),
         (storage_intent_backup_path(paths), true),
     ] {
-        let Some(mut intent) = storage_intent_read(path)? else {
-            continue;
-        };
-        let stale = intent
-            .device_name_edit
-            .as_ref()
-            .is_some_and(|edit| edit.to != current_name);
-        if !stale {
-            continue;
-        }
-        intent.device_name_edit = None;
-        if is_backup {
-            storage_intent_backup_save(paths, &intent)?;
-        } else {
-            storage_intent_store(paths, &intent)?;
+        if let Some(mut intent) = storage_intent_read(path)? {
+            let stale = intent
+                .device_name_edit
+                .as_ref()
+                .is_some_and(|edit| edit.to != current_name);
+            if !stale {
+                continue;
+            }
+            intent.device_name_edit = None;
+            if is_backup {
+                storage_intent_backup_save(paths, &intent)?;
+            } else {
+                storage_intent_store(paths, &intent)?;
+            }
         }
     }
     Ok(())
 }
 
-/// 给宿主启动回补用的计划：实际执行的意图 + 设备名编辑（如果这次要执行的那条记录
-/// 里有）。
+/// 给宿主启动回补用的计划。
 pub struct StorageIntentPlan {
     pub config: SyncConfig,
     pub device_name_edit: Option<IntentDeviceNameEdit>,
@@ -390,6 +424,51 @@ pub fn storage_intent_plan(
             }),
         from_backup: effective.from_backup,
     }))
+}
+
+/// 存储保存协议的跨进程锁：意图、`rclaw.toml`、secrets 与提交状态的整套提交必须
+/// 串行——两次保存交错时会留下 TOML 与运行配置各一套、且没有恢复记录的状态。
+pub struct StorageLock {
+    file: std::fs::File,
+}
+
+impl StorageLock {
+    fn lock_path(paths: &SyncPaths) -> PathBuf {
+        paths.root.join("storage.lock")
+    }
+
+    /// 拿锁（阻塞到别的保存/恢复结束）。
+    pub fn acquire(paths: &SyncPaths) -> Result<StorageLock> {
+        paths.ensure_root()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(Self::lock_path(paths))?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(StorageLock { file })
+    }
+
+    /// 试拿锁：别的地方正拿着就返回 `None`（不等待）。
+    pub fn try_acquire(paths: &SyncPaths) -> Result<Option<StorageLock>> {
+        paths.ensure_root()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(Self::lock_path(paths))?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(StorageLock { file })),
+            Err(error) if crate::lock_is_contended(&error) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for StorageLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 /// 只删自己那条意图：标识对不上说明它已经被后一个保存请求替换了，不能删。
@@ -639,6 +718,9 @@ struct Worker {
     /// 上一次安装前的共享配置：读盘确认时如果磁盘还是这一份，说明宿主的写回还没
     /// 发生（不能把它当更新的安装，把刚完成/正在等待写回的加入回执作废）。
     published_before: Option<SyncConfig>,
+    /// 只有「加入」安装需要等宿主写回 TOML：这段时间内磁盘等于安装前那一份是正常
+    /// 的。普通保存先写 TOML 再安装，不需要这个保护（否则真实回滚会被永久跳过）。
+    protect_before: bool,
 }
 
 impl Worker {
@@ -675,6 +757,7 @@ impl Worker {
             open_note: None,
             installed_seq: 0,
             published_before: None,
+            protect_before: false,
         }
     }
 
@@ -956,16 +1039,19 @@ impl Worker {
             // 磁盘上还是「上一次安装前」的那一份：宿主的写回还没发生（典型是本进程
             // 刚加入/保存、回执还没结算）。这时不能把它当更新的安装——否则等待写回
             // 的加入回执会被自己的旧 TOML 作废。
-            let stale = self.published_before.as_ref().is_some_and(|before| {
-                before.transport == fresh.transport
-                    && before.webdav == fresh.webdav
-                    && before.file == fresh.file
-                    && before.s3 == fresh.s3
-                    && before.enabled == fresh.enabled
-            });
+            let stale = self.protect_before
+                && self.published_before.as_ref().is_some_and(|before| {
+                    before.transport == fresh.transport
+                        && before.webdav == fresh.webdav
+                        && before.file == fresh.file
+                        && before.s3 == fresh.s3
+                        && before.enabled == fresh.enabled
+                });
             if stale {
                 return Ok(());
             }
+            // 看到任何别的磁盘值（或安装值已写回）就不再保留这个保护。
+            self.protect_before = false;
             let mut shared = lock(&self.shared.config);
             if self.shared.config_version.load(Ordering::Relaxed) != version {
                 drop(shared);
@@ -1526,6 +1612,7 @@ impl Worker {
                 *guard = self.config.clone();
                 let seq = self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1;
                 self.installed_seq = seq;
+                self.protect_before = false;
             }
             old
         };
@@ -1749,6 +1836,9 @@ impl Worker {
             }
             self.secrets = next;
             self.config = joined.clone();
+            self.protect_before = true;
+            // 存储段变化推进提交代次（切回旧存储时旧意图不会复活）。
+            let _ = storage_commit_ensure(&self.shared.ctx.paths, &joined);
             let seq = self.publish_local_config();
             self.open(false).await;
             return Ok((joined, seq));
@@ -1768,6 +1858,8 @@ impl Worker {
         // 配对码里带了存储设置的话，配置也跟着换：和同空间重加一样走同一次
         // 「安装 + 发布 + 推进序号」，回执带的就是这次安装的序号。
         self.config = joined.clone();
+        self.protect_before = true;
+        let _ = storage_commit_ensure(&self.shared.ctx.paths, &joined);
         let seq = self.publish_local_config();
         drop(_storage_lock);
         self.open(false).await;
@@ -1893,6 +1985,7 @@ impl Worker {
         }
         self.secrets = next;
         self.config = config;
+        self.protect_before = false;
         let seq = self.publish_local_config();
         self.shared.set_space(
             self.secrets

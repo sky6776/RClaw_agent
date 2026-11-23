@@ -174,8 +174,55 @@ fn write_blocking(
     Ok(())
 }
 
-/// 同 [`write_blocking`]，但目标已存在时失败：临时文件写满并 fsync 后用硬链接原子
-/// 落位（链接失败 = 目标已存在），迟到的「创建空间」写入不能覆盖已有的关闭标记。
+/// 把已经写满并 fsync 的临时文件以「目标存在即失败」的方式发布。
+///
+/// Windows 用同卷 `MoveFileExW`（不设 `MOVEFILE_REPLACE_EXISTING`）：重命名原子、
+/// 目标已存在则失败，exFAT/FAT32 也支持。其它平台先试硬链接；卷不支持硬链接时退回
+/// 「create_new + 复制」，复制失败会删掉刚创建的半成品，避免半个 space.json 卡住
+/// 重置恢复。
+#[cfg(windows)]
+fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+    let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let to: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            let copied = (|| {
+                let mut source = std::fs::File::open(tmp)?;
+                std::io::copy(&mut source, &mut target)?;
+                target.sync_all()
+            })();
+            if copied.is_err() {
+                // 正式路径上只留了一个刚创建的空/半截文件：删掉它，恢复「不存在」
+                // 状态，下一次重试还能重新走仅创建。
+                let _ = std::fs::remove_file(path);
+            }
+            copied
+        }
+    }
+}
+
+/// 同 [`write_blocking`]，但目标已存在时失败：临时文件写满并 fsync 后用平台原语
+/// 原子落位（目标已存在则失败），迟到的「创建空间」写入不能覆盖已有的关闭标记。
 fn write_blocking_new(
     root: &Path,
     path: PathBuf,
@@ -198,21 +245,7 @@ fn write_blocking_new(
         let written = write(&mut file).and_then(|()| file.sync_all());
         drop(file);
         written?;
-        match std::fs::hard_link(&tmp, &path) {
-            Ok(()) => Ok(()),
-            // 不支持硬链接的卷（exFAT/FAT32 的 U 盘）：退回「仅创建 + 直接写」。
-            // 仍然不覆盖已经存在的标记，只是失去整份原子落位（崩溃可能留下半个
-            // space.json，读回时校验不过会报错、由用户重试）。
-            Err(_) => {
-                let mut target = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)?;
-                let mut source = std::fs::File::open(&tmp)?;
-                std::io::copy(&mut source, &mut target)?;
-                target.sync_all()
-            }
-        }
+        publish_new(&tmp, &path)
     })();
     match result {
         Ok(()) => {

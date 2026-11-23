@@ -94,9 +94,10 @@ async fn save_and_apply(
     let saved = config.clone();
     let write_home = home.clone();
     run_blocking("保存同步设置", move || persist(&write_home, &saved)).await?;
-    // 发布要自己取协议锁（见 apply_config），先把这把放掉，别在同一个线程上重入。
+    // 写盘与发布在同一临界区：刚写的这份就是磁盘权威配置，放锁之后再发布会被期间
+    // 完成的更新保存盖过。
+    engine.apply_config_locked(config);
     drop(_lock);
-    engine.apply_config(config);
     crate::sync_host::emit_status();
     Ok(())
 }
@@ -154,9 +155,20 @@ pub(super) async fn reload_config(state: &AppState) {
         return;
     };
     let home = state.home.clone();
-    match run_blocking("读取同步设置", move || disk_config(&home)).await {
-        Ok(config) => {
-            engine.apply_config(config);
+    let paths = rclaw_sync::SyncPaths::new(&home);
+    // 读盘与发布在同一把存储协议锁内：读到的是当前磁盘的权威配置；别处刚完成的
+    // 保存不会被这次（较早发起的）重读覆盖。
+    match run_blocking("读取同步设置", move || {
+        let _lock = rclaw_sync::StorageLock::acquire(&paths)
+            .map_err(|error| format!("取同步存储锁失败: {error}"))?;
+        let config = disk_config(&home)?;
+        Ok((config, _lock))
+    })
+    .await
+    {
+        Ok((config, lock)) => {
+            engine.apply_config_locked(config);
+            drop(lock);
             crate::sync_host::emit_status();
         }
         Err(error) => tracing::warn!("重新读取 [sync] 设置失败: {error}"),
