@@ -546,6 +546,7 @@ pub(crate) async fn join(
     config: &SyncConfig,
     secrets: &mut Secrets,
     code: &str,
+    ready: &dyn Fn() -> bool,
 ) -> Result<SyncConfig> {
     if secrets.is_paired() {
         return Err(SyncError::other(
@@ -558,6 +559,11 @@ pub(crate) async fn join(
     joined.validate()?;
     let live = load_live(&joined, &next).await?;
     remote::open_space(live.transport(), &live.keys, &next.space_id, false).await?;
+    // 远端校验花掉的时间裡宿主可能已经发布了更新的配置（甚至关闭了同步）：
+    // 落凭据之前复核，过期的加入不能把凭据和配置装回去。
+    if !ready() {
+        return Err(SyncError::other("同步设置在加入过程中被改动，请重试加入"));
+    }
     let (paths, saved) = (paths.clone(), next.clone());
     blocking(move || saved.save(&paths)).await?;
     *secrets = next;

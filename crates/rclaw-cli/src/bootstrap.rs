@@ -597,14 +597,18 @@ pub async fn assemble_core_with(
                 }
             };
             if let Some(base) = on_disk {
-                match rclaw_sync::storage_intent_config(&sync_paths) {
+                match rclaw_sync::storage_intent_plan(&sync_paths, &base) {
                     Ok(Some(intent)) => {
                         // 意图只补存储设置（以及向导里明确编辑过的设备名）：这期间别处
                         // 改过的范围/通道不能被一份旧意图回退。
                         let mut merged = base.clone();
-                        merged.apply_storage_from(&intent);
-                        if let Ok(Some(name)) = rclaw_sync::storage_intent_device_name(&sync_paths) {
-                            merged.device_name = name;
+                        merged.apply_storage_from(&intent.config);
+                        if let Some(edit) = &intent.device_name_edit {
+                            // 只在名字仍是这次编辑的起点/终点时采用：之后别处已经改到
+                            // 第三个名字的话，这次编辑过期了。
+                            if merged.device_name == edit.from || merged.device_name == edit.to {
+                                merged.device_name = edit.to.clone();
+                            }
                         }
                         if merged != base {
                             match crate::sync::save_sync_config(

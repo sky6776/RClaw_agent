@@ -78,8 +78,9 @@ pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
 pub use bundle::{export_session, import_session, ImportOptions, Imported};
 pub use config::{Scopes, SyncConfig, SyncPaths};
 pub use engine::{
-    pairing_config, storage_intent_clear_if, storage_intent_config, storage_intent_device_name,
-    storage_intent_save, ConfigRefresh, StorageLock, SyncDeps, SyncEngine,
+    pairing_config, storage_intent_clear_if, storage_intent_config, storage_intent_plan,
+    storage_intent_save, ConfigRefresh, IntentDeviceNameEdit, StorageIntentPlan, StorageLock,
+    SyncDeps, SyncEngine,
 };
 pub use error::{Result, SyncError, TransportError};
 pub use pairing::PairingCode;

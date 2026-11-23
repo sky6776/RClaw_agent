@@ -109,6 +109,12 @@ pub trait SyncTransport: Send + Sync {
 
     async fn put(&self, key: &str, body: Vec<u8>) -> TransportResult<()>;
 
+    /// 仅创建：对象已经存在就失败（不覆盖）。用于「新建空间标记」这类一旦存在就不能
+    /// 被迟到写入改回开放的场合；后端不支持原子创建时退化为 [`Self::put`]。
+    async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+        self.put(key, body).await
+    }
+
     /// 删除对象；对象本来就不存在视为成功。
     async fn delete(&self, key: &str) -> TransportResult<()>;
 
@@ -178,6 +184,17 @@ pub async fn put_checked(
 ) -> TransportResult<()> {
     let len = body.len() as u64;
     transport.put(key, body).await?;
+    check_len(transport, key, len).await
+}
+
+/// 同 [`put_checked`]，但对象已存在时失败、不覆盖。
+pub async fn put_new_checked(
+    transport: &dyn SyncTransport,
+    key: &str,
+    body: Vec<u8>,
+) -> TransportResult<()> {
+    let len = body.len() as u64;
+    transport.put_new(key, body).await?;
     check_len(transport, key, len).await
 }
 

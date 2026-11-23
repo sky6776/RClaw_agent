@@ -174,6 +174,47 @@ fn write_blocking(
     Ok(())
 }
 
+/// 同 [`write_blocking`]，但目标已存在时失败：临时文件写满并 fsync 后用硬链接原子
+/// 落位（链接失败 = 目标已存在），迟到的「创建空间」写入不能覆盖已有的关闭标记。
+fn write_blocking_new(
+    root: &Path,
+    path: PathBuf,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> TransportResult<()> {
+    if let Some(parent) = path.parent() {
+        let relative = parent
+            .strip_prefix(root)
+            .map_err(|error| TransportError::Other(error.to_string()))?;
+        let mut current = root.to_path_buf();
+        for part in relative.components() {
+            current.push(part);
+            ensure_directory(&current)?;
+        }
+    }
+    let tmp = temp_path(&path);
+    let mut file =
+        std::fs::File::create_new(&tmp).map_err(|e| io_error("创建临时文件", &tmp, e))?;
+    let result = (|| {
+        let written = write(&mut file).and_then(|()| file.sync_all());
+        drop(file);
+        written?;
+        std::fs::hard_link(&tmp, &path)
+    })();
+    match result {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(TransportError::Other(format!(
+                "创建 {} 失败: {e}",
+                path.display()
+            )))
+        }
+    }
+}
+
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> TransportResult<T> + Send + 'static,
 ) -> TransportResult<T> {
@@ -219,6 +260,14 @@ impl SyncTransport for FileTransport {
         let root = self.root.clone();
         self.at(key, move |path| {
             write_blocking(&root, path, |file| file.write_all(&body))
+        })
+        .await
+    }
+
+    async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+        let root = self.root.clone();
+        self.at(key, move |path| {
+            write_blocking_new(&root, path, |file| file.write_all(&body))
         })
         .await
     }

@@ -40,8 +40,23 @@ pub async fn open_space(
         }
         None if create => {
             let file = SpaceFile::new(keys, space_id);
-            transport::put_checked(transport, SPACE_FILE, file.encode()?).await?;
-            Ok(())
+            let body = file.encode()?;
+            // 仅创建：读到这里「不存在」之后，另一个进程可能刚标了关闭/建了空间。
+            // 迟到（被取消的恢复任务、慢写入）的创建不能把已有的关闭标记改回开放。
+            if let Err(error) = transport::put_new_checked(transport, SPACE_FILE, body).await {
+                match read_space(transport).await {
+                    Ok(Some(file)) => {
+                        file.verify(keys, space_id)?;
+                        if file.closed {
+                            return Err(SyncError::SpaceClosed);
+                        }
+                        Ok(())
+                    }
+                    _ => Err(error.into()),
+                }
+            } else {
+                Ok(())
+            }
         }
         None => Err(SyncError::other(
             "存储目录里还没有这个同步空间（可能文件还没同步过来，或存储地址填的不是同一个目录）",

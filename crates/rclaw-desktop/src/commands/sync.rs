@@ -120,7 +120,8 @@ async fn save_with_secret(
     let write_home = home.clone();
     // 只有向导里真的编辑过（草稿与打开时的名字不同）才算这次请求明确改了设备名。
     let explicit_device_name = device_name_baseline.as_deref().and_then(|baseline| {
-        (config.device_name != baseline).then(|| config.device_name.clone())
+        (config.device_name != baseline)
+            .then(|| (baseline.to_string(), config.device_name.clone()))
     });
     engine
         .save_storage_with(

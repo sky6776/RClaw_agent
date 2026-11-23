@@ -52,8 +52,8 @@ pub use crate::trash::{MemoryTrashItem, TrashItem};
 pub use local::{AttachmentInfo, SessionMark};
 pub use space::{apply_pairing, pairing_config};
 pub use worker::{
-    storage_intent_clear_if, storage_intent_config, storage_intent_device_name,
-    storage_intent_save, StorageLock,
+    storage_intent_clear_if, storage_intent_config, storage_intent_plan, storage_intent_save,
+    IntentDeviceNameEdit, StorageIntentPlan, StorageLock,
 };
 
 /// 距上次拉取不到这么久就不再拉（发送前、窗口获得焦点、打开会话时）。
@@ -600,7 +600,14 @@ impl SyncEngine {
     /// `rclaw.toml` 前用它确认「这仍是最近一次安装」，迟到的回写不会盖掉更新的设置。
     pub async fn join_space_with_seq(&self, code: &str) -> Result<(SyncConfig, u64)> {
         let code = code.trim().to_string();
-        let (joined, seq) = self.call(|reply| Cmd::JoinSpace { code, reply }).await?;
+        let host_seq = self.inner.config_seq.load(Ordering::Relaxed);
+        let (joined, seq) = self
+            .call(|reply| Cmd::JoinSpace {
+                code,
+                host_seq,
+                reply,
+            })
+            .await?;
         {
             let mut guard = lock(&self.inner.config);
             if seq == self.inner.config_seq.load(Ordering::Relaxed) {
@@ -697,9 +704,9 @@ impl SyncEngine {
         &self,
         config: SyncConfig,
         secret: Option<String>,
-        // 这次请求**明确修改**的设备名（向导里编辑过）：写进更新意图，启动回补与
-        // worker 收尾时一并采用；`None` = 不负责设备名。
-        explicit_device_name: Option<String>,
+        // 这次请求**明确修改**的设备名 `(原值, 目标值)`（向导里编辑过）：写进更新
+        // 意图，启动回补与 worker 收尾按它一并采用；`None` = 不负责设备名。
+        explicit_device_name: Option<(String, String)>,
         merge: M,
         write: W,
     ) -> Result<()>
@@ -719,11 +726,16 @@ impl SyncEngine {
         // 先记下上一条仍可执行的意图：这次 TOML 确定没写成就把它原样恢复——新的
         // 这次没有生效，不能把上一次「TOML 已写、凭据还没补」的恢复依据带走。
         let previous = worker::storage_intent_load(&paths)?;
+        if let Some(prev) = &previous {
+            // 覆盖旧记录之前先留一份备份：新一次若在 TOML 落盘前失败、连回滚写也
+            // 失败，启动还能按磁盘上的实际存储段挑回旧记录。
+            let _ = worker::storage_intent_backup_save(&paths, prev);
+        }
         let id = worker::storage_intent_save(
             &paths,
             &merged,
             secret.as_deref(),
-            explicit_device_name.as_deref(),
+            explicit_device_name,
         )?;
         let written = {
             let target = merged.clone();
@@ -732,7 +744,10 @@ impl SyncEngine {
         if let Err(error) = written {
             match &previous {
                 Some(prev) if prev.id != id => {
-                    let _ = worker::storage_intent_restore(&paths, prev);
+                    // 回滚成功才清备份；写不回去就把它留给启动阶段判断。
+                    if worker::storage_intent_restore(&paths, prev).is_ok() {
+                        let _ = worker::storage_intent_backup_clear(&paths);
+                    }
                 }
                 // 同一请求重试复用了标识：记录仍是这一笔的，留着。
                 Some(_) => {}
@@ -751,6 +766,7 @@ impl SyncEngine {
             })
             .await?;
         worker::storage_intent_clear_if(&paths, &id)?;
+        let _ = worker::storage_intent_backup_clear(&paths);
         {
             // 发布顺序跟随 worker 的安装顺序：回执号不是当前最新的安装（期间又装了
             // 别的配置）就不发布这一份，让最后安装的那条路径去发布。
@@ -1102,7 +1118,7 @@ pub async fn join_space_offline(
             secrets.key.clear();
         }
     }
-    space::join(&paths, config, &mut secrets, code.trim()).await
+    space::join(&paths, config, &mut secrets, code.trim(), &|| true).await
 }
 
 #[cfg(test)]

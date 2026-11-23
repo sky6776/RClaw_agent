@@ -81,10 +81,24 @@ pub(crate) struct StorageIntent {
     /// 要绑定的密码；`None` 或空 = 不改密码。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) secret: Option<String>,
-    /// 这次请求**明确修改**的设备名（向导里编辑过的）。启动回补与 worker 收尾按它
-    /// 一并采用；`None` = 请求不负责设备名，保持磁盘/当前配置里的值。
+    /// 这次请求**明确修改**的设备名：`from` 是请求开始时的名字、`to` 是目标名字。
+    /// 启动回补与 worker 收尾只在当前名字仍是 `from` 或 `to` 时采用 `to`——之后
+    /// 别处已经改成第三个名字的话，这次编辑已经过期，不能覆盖。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) device_name: Option<String>,
+    pub(crate) device_name_edit: Option<DeviceNameEdit>,
+}
+
+/// 一次请求明确提交的设备名修改（见 [`StorageIntent::device_name_edit`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DeviceNameEdit {
+    pub(crate) from: String,
+    pub(crate) to: String,
+}
+
+/// 意图里与设备名有关的那一项（给宿主回补用）。
+pub struct IntentDeviceNameEdit {
+    pub from: String,
+    pub to: String,
 }
 
 fn storage_intent_path(paths: &SyncPaths) -> PathBuf {
@@ -143,15 +157,15 @@ pub fn storage_intent_save(
     paths: &SyncPaths,
     config: &SyncConfig,
     secret: Option<&str>,
-    device_name: Option<&str>,
+    device_name_edit: Option<(String, String)>,
 ) -> Result<String> {
     let secret = secret.map(|secret| secret.to_string());
-    let device_name = device_name.map(|name| name.to_string());
+    let device_name_edit = device_name_edit.map(|(from, to)| DeviceNameEdit { from, to });
     if let Some(existing) = storage_intent_load(paths)? {
         if !existing.id.is_empty()
             && existing.config == *config
             && existing.secret == secret
-            && existing.device_name == device_name
+            && existing.device_name_edit == device_name_edit
         {
             return Ok(existing.id);
         }
@@ -160,7 +174,7 @@ pub fn storage_intent_save(
         id: crate::ids::random_hex::<8>(),
         config: config.clone(),
         secret,
-        device_name,
+        device_name_edit,
     };
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
@@ -196,10 +210,99 @@ pub(crate) fn storage_intent_restore(paths: &SyncPaths, intent: &StorageIntent) 
     Ok(())
 }
 
-/// 更新意图里「这次请求明确修改过的设备名」（向导编辑过才有）：启动回补与 worker
-/// 收尾按它一并采用，其余字段仍以磁盘/当前配置为准。
-pub fn storage_intent_device_name(paths: &SyncPaths) -> Result<Option<String>> {
-    Ok(storage_intent_load(paths)?.and_then(|intent| intent.device_name))
+/// 备份文件：替换一条仍可执行的意图之前，把旧记录留在这里；新一次提交结算完成后
+/// 才删。回滚写入本身失败时，启动按磁盘状态在「新意图 / 备份」之间选择。
+fn storage_intent_backup_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join("pending-storage.prev.json")
+}
+
+pub(crate) fn storage_intent_backup_save(
+    paths: &SyncPaths,
+    intent: &StorageIntent,
+) -> Result<()> {
+    paths.ensure_root()?;
+    rclaw_store::atomic_write_private(
+        &storage_intent_backup_path(paths),
+        &serde_json::to_vec_pretty(intent)?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn storage_intent_backup_clear(paths: &SyncPaths) -> Result<()> {
+    match std::fs::remove_file(storage_intent_backup_path(paths)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn storage_intent_backup_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
+    match std::fs::read(storage_intent_backup_path(paths)) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(intent) => Ok(Some(intent)),
+            Err(error) => {
+                tracing::warn!("sync/pending-storage.prev.json 损坏，丢弃: {error}");
+                let _ = std::fs::remove_file(storage_intent_backup_path(paths));
+                Ok(None)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 两套配置的存储段是否指向同一处。
+fn same_storage_cfg(a: &SyncConfig, b: &SyncConfig) -> bool {
+    a.transport == b.transport
+        && a.webdav == b.webdav
+        && a.file == b.file
+        && a.s3 == b.s3
+}
+
+/// 启动/收尾要执行哪一条意图：同时存在主干与备份时，按磁盘 TOML 的实际存储段判断
+/// 哪一笔真正提交了；都与磁盘不符时退回备份（旧的可恢复记录）。没有主干但有备份时
+/// 也用备份（上一次回滚写失败留下的）。
+pub(crate) fn storage_intent_effective(
+    paths: &SyncPaths,
+    disk: &SyncConfig,
+) -> Result<Option<StorageIntent>> {
+    let main = storage_intent_load(paths)?;
+    let backup = storage_intent_backup_load(paths)?;
+    Ok(match (main, backup) {
+        (Some(main), Some(backup)) => {
+            if same_storage_cfg(disk, &main.config) {
+                Some(main)
+            } else if same_storage_cfg(disk, &backup.config) {
+                Some(backup)
+            } else {
+                Some(backup)
+            }
+        }
+        (Some(main), None) => Some(main),
+        (None, backup) => backup,
+    })
+}
+
+/// 给宿主启动回补用的计划：实际执行的意图 + 设备名编辑（如果这次要执行的那条记录
+/// 里有）。
+pub struct StorageIntentPlan {
+    pub config: SyncConfig,
+    pub device_name_edit: Option<IntentDeviceNameEdit>,
+}
+
+pub fn storage_intent_plan(
+    paths: &SyncPaths,
+    disk: &SyncConfig,
+) -> Result<Option<StorageIntentPlan>> {
+    Ok(storage_intent_effective(paths, disk)?.map(|intent| StorageIntentPlan {
+        config: intent.config,
+        device_name_edit: intent
+            .device_name_edit
+            .map(|edit| IntentDeviceNameEdit {
+                from: edit.from,
+                to: edit.to,
+            }),
+    }))
 }
 
 /// 只删自己那条意图：标识对不上说明它已经被后一个保存请求替换了，不能删。
@@ -271,6 +374,9 @@ pub(crate) enum Cmd {
     CreateSpace(Reply<()>),
     JoinSpace {
         code: String,
+        /// 宿主派发这次加入时的配置代次：远端校验完成、提交凭据之前复核，
+        /// 期间若有更新的发布（例如关闭同步）就作废这次加入。
+        host_seq: u64,
         reply: Reply<(SyncConfig, u64)>,
     },
     LeaveSpace(Reply<()>),
@@ -769,6 +875,13 @@ impl Worker {
             if merged != *shared {
                 tracing::info!("按磁盘上的 rclaw.toml 更新同步设置（另一进程保存过）");
                 *shared = merged.clone();
+                // 读盘采用新值也是一次安装：推进序号，更早派发的加入/保存回执与
+                // 重配不能再按旧序号通过检查。
+                let seq = self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                self.installed_seq = seq;
+            } else {
+                // 同一份配置：安装归属沿用共享值当前对应的那次提交。
+                self.installed_seq = self.shared.config_seq.load(Ordering::Relaxed);
             }
             drop(shared);
             if merged != self.config {
@@ -1112,9 +1225,13 @@ impl Worker {
                     let _ = reply.send(self.create_space().await);
                 }
             }
-            Cmd::JoinSpace { code, reply } => {
+            Cmd::JoinSpace {
+                code,
+                host_seq,
+                reply,
+            } => {
                 if wanted(&reply) {
-                    let _ = reply.send(self.join_space(&code).await);
+                    let _ = reply.send(self.join_space(&code, host_seq).await);
                 }
             }
             Cmd::LeaveSpace(reply) => {
@@ -1459,8 +1576,15 @@ impl Worker {
         Ok(())
     }
 
-    async fn join_space(&mut self, code: &str) -> Result<(SyncConfig, u64)> {
+    async fn join_space(&mut self, code: &str, host_seq: u64) -> Result<(SyncConfig, u64)> {
         self.require_owner()?;
+        let ready = {
+            let shared = self.shared.clone();
+            move || host_seq >= shared.config_seq.load(Ordering::Relaxed)
+        };
+        if !ready() {
+            return Err(SyncError::other("同步设置在加入过程中被改动，请重试加入"));
+        }
         // 已经在这个空间里（上次加入在把设置写回文件之前中断了）：重复加入是幂等的，
         // 只把配对码带来的存储设置对齐。别的空间的配对码仍然报错。
         if self.secrets.is_paired() {
@@ -1502,6 +1626,10 @@ impl Worker {
                 self.open(false).await;
                 return Err(error);
             }
+            if !ready() {
+                self.open(false).await;
+                return Err(SyncError::other("同步设置在加入过程中被改动，请重试加入"));
+            }
             let paths = self.shared.ctx.paths.clone();
             let saved = next.clone();
             if let Err(error) = blocking(move || saved.save(&paths)).await {
@@ -1519,6 +1647,7 @@ impl Worker {
             &self.config,
             &mut self.secrets,
             code,
+            &ready,
         )
         .await?;
         // 配对码里带了存储设置的话，配置也跟着换：和同空间重加一样走同一次
@@ -1678,7 +1807,8 @@ impl Worker {
             }
         };
         let paths = self.shared.ctx.paths.clone();
-        let Some(intent) = blocking(move || storage_intent_load(&paths)).await? else {
+        let disk = self.config.clone();
+        let Some(intent) = blocking(move || storage_intent_effective(&paths, &disk)).await? else {
             return Ok(());
         };
         // 宿主没能把 `rclaw.toml` 补写成意图里的目标：先别绑定 secrets、也别删意图，
@@ -1696,10 +1826,18 @@ impl Worker {
         let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
         blocking(move || saved.save(&paths)).await?;
         self.secrets = next;
-        // 只把存储设置搬过来：这期间别处改过的范围/通道以当前配置为准。
+        // 只把存储设置（以及这次请求明确改过的设备名）搬过来：这期间别处改过的
+        // 范围/通道以当前配置为准。
         self.config.apply_storage_from(&intent.config);
+        if let Some(edit) = &intent.device_name_edit {
+            if self.config.device_name == edit.from || self.config.device_name == edit.to {
+                self.config.device_name = edit.to.clone();
+            }
+        }
         let (paths, id) = (self.shared.ctx.paths.clone(), intent.id);
         blocking(move || storage_intent_clear_if(&paths, &id)).await?;
+        let paths = self.shared.ctx.paths.clone();
+        let _ = blocking(move || storage_intent_backup_clear(&paths)).await;
         self.shared.set_space(
             self.secrets
                 .is_paired()
