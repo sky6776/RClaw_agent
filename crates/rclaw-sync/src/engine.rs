@@ -77,6 +77,9 @@ pub struct SyncDeps {
     pub sessions_supported: bool,
     /// 内存紧张的设备（手机）：一次读写的批量小一些。
     pub low_memory: bool,
+    /// 宿主的 `rclaw.toml` 路径（有的话）：启动/待机接手前引擎会从磁盘重读 `[sync]`，
+    /// 确认没有被同一数据目录里的另一个进程改掉。
+    pub host_config: Option<PathBuf>,
 }
 
 /// 宿主告诉引擎「发生了什么」，引擎自己决定要不要同步、什么时候同步。
@@ -112,6 +115,13 @@ pub(crate) struct Shared {
     pub version: String,
     pub sessions_supported: bool,
     pub low_memory: bool,
+    /// 宿主的 `rclaw.toml`（有的话）：启动/待机接手前从磁盘重读 `[sync]`，确认配置
+    /// 没有被同一数据目录里的另一个进程改掉。
+    pub host_config: Option<PathBuf>,
+    /// 宿主与引擎线程共用的一份配置（桌面 + CLI 共用一个数据目录时，启动那一刻的
+    /// 配置可能已被另一个进程更新；引擎线程从磁盘确认后会写回这里，宿主读到的就是
+    /// 同一份）。
+    pub config: Arc<Mutex<SyncConfig>>,
     view: Mutex<local::View>,
     /// 上次拉取成功的时刻（Unix 毫秒）。
     pub last_pull_ms: AtomicI64,
@@ -146,6 +156,8 @@ impl Shared {
             version: inner.version.clone(),
             sessions_supported: inner.sessions_supported,
             low_memory: inner.low_memory,
+            host_config: inner.host_config.clone(),
+            config: inner.config.clone(),
             view: Mutex::new(local::View {
                 state: "syncing",
                 ..local::View::default()
@@ -259,7 +271,9 @@ struct Inner {
     version: String,
     sessions_supported: bool,
     low_memory: bool,
-    config: Mutex<SyncConfig>,
+    /// 宿主的 `rclaw.toml`（有的话）：引擎线程在打开连接前从这里重读 `[sync]`。
+    host_config: Option<PathBuf>,
+    config: Arc<Mutex<SyncConfig>>,
     running: Mutex<Option<Running>>,
 }
 
@@ -294,7 +308,8 @@ impl SyncEngine {
                 version: deps.version,
                 sessions_supported: deps.sessions_supported,
                 low_memory: deps.low_memory,
-                config: Mutex::new(config),
+                host_config: deps.host_config,
+                config: Arc::new(Mutex::new(config)),
                 running: Mutex::new(None),
             }),
         }

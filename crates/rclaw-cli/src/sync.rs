@@ -60,6 +60,9 @@ pub struct SyncSeed {
     cron: Arc<CronController>,
     bots: Arc<BotRegistry>,
     web_search: Option<Arc<WebSearchControl>>,
+    /// 宿主的 `rclaw.toml`：引擎打开连接前从磁盘重读 `[sync]`，确认启动配置没被同一
+    /// 数据目录里的另一个进程改掉。
+    host_config: Option<PathBuf>,
 }
 
 /// 宿主之间的差异。
@@ -90,6 +93,7 @@ impl SyncSeed {
         cron: Arc<CronController>,
         bots: Arc<BotRegistry>,
         web_search: Option<Arc<WebSearchControl>>,
+        host_config: Option<PathBuf>,
     ) -> SyncSeed {
         SyncSeed {
             config,
@@ -99,6 +103,7 @@ impl SyncSeed {
             cron,
             bots,
             web_search,
+            host_config,
         }
     }
 
@@ -124,6 +129,7 @@ impl SyncSeed {
                 sessions_supported: profile.sessions,
                 // 手机（APK 与 Termux）内存紧：一次读写的批量取小值。
                 low_memory: cfg!(target_os = "android"),
+                host_config: self.host_config,
             },
             self.config,
         );

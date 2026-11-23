@@ -366,6 +366,10 @@ pub(crate) fn delete_published(
 /// 把清空登记成发给所有设备的删除（[`commit_memory_clear`]）留给调用方在本地清空成功
 /// 之后做。
 pub(crate) fn stash_memory_clear(ctx: &Ctx, keep_trash: bool) -> Result<(Vec<String>, String)> {
+    // 与后台对比的落地共用一把跨进程锁（见 [`memory::ClearLock`]）：读条目与登记意图
+    // 必须原子，否则另一进程可能在这两步之间把清空前读到的远端条目写回文件——它们
+    // 不在这次登记的删除集合里，随后会被当成「本机新写的」再发出去。
+    let _clear_lock = memory::ClearLock::acquire(ctx)?;
     let entries = match ctx.memory.list_entries(MemoryTarget::Memory) {
         Ok(entries) => entries,
         Err(error) => {

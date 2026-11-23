@@ -610,9 +610,13 @@ pub async fn assemble_core_with(
                             ) {
                                 Ok(()) => sync_config = merged,
                                 Err(error) => {
+                                    // 没写成就按磁盘上这一份启动：意图留着，worker 的
+                                    // `same_storage` 会因目标与配置不一致而保留它，下次
+                                    // 启动再补。不能拿命令里的目标（还没落盘）去连存储。
                                     tracing::warn!(
                                         "补齐没存完的存储设置失败（下次启动再试）: {error}"
-                                    )
+                                    );
+                                    sync_config = base;
                                 }
                             }
                         } else {
@@ -639,6 +643,7 @@ pub async fn assemble_core_with(
         cron.clone(),
         bots.clone(),
         web_search_control.clone(),
+        Some(sync_config_path),
     );
 
     Ok(CoreComponents {

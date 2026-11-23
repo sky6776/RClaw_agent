@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::round::{Outcome, Session};
-use super::{local, space, transfer, Shared, Trigger, PULL_FRESH_MS};
+use super::{local, lock, space, transfer, Shared, Trigger, PULL_FRESH_MS};
 use crate::attach::{self, now_ms, Backlog};
 use crate::config::{SyncConfig, SyncPaths};
 use crate::db;
@@ -446,7 +446,12 @@ impl Worker {
     }
 
     async fn run(mut self) {
-        self.open().await;
+        // 打开连接之前先确认磁盘上的同步设置（见 [`Worker::confirm_config`]）。
+        if !self.confirm_config().await {
+            self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
+        } else {
+            self.open().await;
+        }
         loop {
             self.revive_transfers();
             let wake = self.deadline();
@@ -484,7 +489,13 @@ impl Worker {
         let now = Instant::now();
         if self.session.is_none() {
             if self.reopen_at.is_some_and(|at| at <= now) {
-                self.open().await;
+                self.reopen_at = None;
+                // 待机接手/重试打开前再确认一次配置：这期间另一个进程可能保存过设置。
+                if self.confirm_config().await {
+                    self.open().await;
+                } else {
+                    self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
+                }
             }
             return;
         }
@@ -574,6 +585,10 @@ impl Worker {
                 self.switch_failed = false;
                 self.switch_tries = 0;
                 self.open().await;
+                // open() 给新连接约了「立即一轮 Full」；这次调用接下来就会亲自跑它
+                // （新 session 没预热，kind 会被抬成 Full）。不消费的话同一轮会再跑
+                // 一次，残留的立即时刻还会把之后的延迟重试提前。
+                self.next = None;
             } else {
                 self.switch_tries = self.switch_tries.saturating_add(1);
                 if self.switch_tries >= SWITCH_GIVE_UP_TRIES {
@@ -699,6 +714,53 @@ impl Worker {
 
     /// 连上本机所在的同步空间：拿引擎锁、读密钥、组装存储、准备本机的同步数据、起附件
     /// 任务，然后约第一轮。哪一步不成就停在相应的状态上。
+    /// 从宿主的 `rclaw.toml` 重读 `[sync]`（只读这一节；宿主用原子写替换整个文件，
+    /// 读到的要么是旧的一套、要么是新的一套）。
+    fn disk_config(&self) -> Option<SyncConfig> {
+        let path = self.shared.host_config.as_ref()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        #[derive(Deserialize)]
+        struct HostFile {
+            #[serde(default)]
+            sync: SyncConfig,
+        }
+        toml::from_str::<HostFile>(&text).ok().map(|file| file.sync)
+    }
+
+    /// 打开连接前的配置确认：在保存协议锁里按磁盘重读 `[sync]` 并采用。启动那一刻读到
+    /// 的配置可能已被同一数据目录里的另一个进程改掉（保存协议先写 TOML 再结算意图）；
+    /// 拿不到锁说明别的进程正在保存，这次让行、稍后再来——不能拿可能过期的配置去连
+    /// 存储，也不能让 worker 拿旧配置把还没落盘的意图结算掉。
+    ///
+    /// 显式切换/粘住的错误状态里配置来自宿主的命令（已经写入 TOML），不用重读。
+    async fn confirm_config(&mut self) -> bool {
+        if self.pending_switch || self.switch_failed || self.shared.host_config.is_none() {
+            return true;
+        }
+        let paths = self.shared.ctx.paths.clone();
+        match blocking(move || StorageLock::try_acquire(&paths)).await {
+            Ok(Some(_lock)) => {
+                if let Some(fresh) = self.disk_config() {
+                    if fresh != self.config {
+                        tracing::info!("按磁盘上的 rclaw.toml 更新同步设置（另一进程保存过）");
+                        self.config = fresh;
+                        self.shared
+                            .attachment_max
+                            .store(self.config.attachment_max_bytes(), Ordering::Relaxed);
+                        *lock(&self.shared.config) = self.config.clone();
+                    }
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                // 锁文件都建不出来：保存协议本来也用不了，别让同步永远不启动。
+                tracing::warn!("确认同步设置时拿不到协议锁（按当前配置继续）: {error}");
+                true
+            }
+        }
+    }
+
     async fn open(&mut self) {
         if self.session.is_some() {
             return;
@@ -992,7 +1054,11 @@ impl Worker {
                 self.background = false;
                 self.hold_until = None;
                 if self.session.is_none() {
-                    self.open().await;
+                    if self.confirm_config().await {
+                        self.open().await;
+                    } else {
+                        self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
+                    }
                 }
                 self.next_tick = Instant::now() + self.tick_every();
                 self.schedule_poll();

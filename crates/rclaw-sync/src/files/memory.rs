@@ -143,6 +143,35 @@ fn bump_clear_gen(conn: &Connection) -> Result<()> {
     db::state_put_json(conn, SCOPE_CLEARING, CLEAR_GEN_KEY, db::HLC_ZERO, &next)
 }
 
+/// 与 `/clear` 的「读条目 → 留副本 → 登记清理意图」共用的跨进程锁
+/// （`sync/memory-clear.lock`）。静默门只串行本进程的 turn；桌面 + CLI 共用一个数据
+/// 目录时，另一进程不走这把门。对比在门内拿它、复核清空版本之后才写文件；清空在读
+/// 条目之前拿它——两条路径就不会交叉：要么对比先写完（清空读到的条目集合包含它写下
+/// 的），要么清空先登记（对比的版本复核失败、整轮作废）。
+pub(crate) struct ClearLock {
+    file: std::fs::File,
+}
+
+impl ClearLock {
+    pub(crate) fn acquire(ctx: &Ctx) -> Result<ClearLock> {
+        ctx.paths.ensure_root()?;
+        let path = ctx.paths.root.join("memory-clear.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(ClearLock { file })
+    }
+}
+
+impl Drop for ClearLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 /// 等用户回答：文件里原有的条目都不见了，是不是有意删的。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Wipe {
@@ -622,16 +651,20 @@ fn reconcile_target(
     let (len, mtime) = file_stamp(&target.path);
     let stamp = vec![(String::new(), len, mtime)];
     let (rows, base_row, held, wipe, clearing, gen) = db::read(ctx.db(), |conn| {
-        Ok((
-            unhandled(conn, scope::MEM, &prefix)?,
-            db::state_get(conn, SCOPE_BASE, &target.name)?,
-            db::state_get(conn, SCOPE_HOLD, &target.name)?.is_some(),
-            db::state_get(conn, SCOPE_WIPE, &target.name)?
-                .map(|row| row.json::<Wipe>().unwrap_or_default()),
-            db::state_get(conn, SCOPE_CLEARING, &target.name)?
-                .map(|row| row.json::<Clearing>().unwrap_or_default()),
-            clear_gen(conn)?,
-        ))
+        // 六段查询必须来自同一个读快照：同一数据目录里的另一进程可以在两条语句之间
+        // 提交一次清空，拼接出来的「清空前读到的远端条目 + 清空后的基线」会把已经
+        // 删除的条目当成新的再发布。
+        let tx = conn.unchecked_transaction()?;
+        let rows = unhandled(&tx, scope::MEM, &prefix)?;
+        let base_row = db::state_get(&tx, SCOPE_BASE, &target.name)?;
+        let held = db::state_get(&tx, SCOPE_HOLD, &target.name)?.is_some();
+        let wipe = db::state_get(&tx, SCOPE_WIPE, &target.name)?
+            .map(|row| row.json::<Wipe>().unwrap_or_default());
+        let clearing = db::state_get(&tx, SCOPE_CLEARING, &target.name)?
+            .map(|row| row.json::<Clearing>().unwrap_or_default());
+        let gen = clear_gen(&tx)?;
+        tx.finish()?;
+        Ok((rows, base_row, held, wipe, clearing, gen))
     })?;
     // 有事悬着（在等用户回答、在等清空做完）的时候每次都重新看：那件事的进展记在库里，
     // 从文件指纹上看不出来。
@@ -764,6 +797,13 @@ fn reconcile_target(
         let mut outcome = None;
         let mut stale = false;
         let quiet = ctx.gate.when_quiet(&mut || {
+            // 跨进程边界：另一个进程的清空在读条目之前也拿这把锁。拿不到（正被占用）
+            // 就整轮让路，下一轮再对比。
+            let clear_lock = ClearLock::acquire(ctx);
+            if clear_lock.is_err() {
+                stale = true;
+                return;
+            }
             let same = db::read(ctx.db(), clear_gen).is_ok_and(|now| now == gen);
             if !same {
                 stale = true;
@@ -771,6 +811,7 @@ fn reconcile_target(
             }
             let first_origin = plan.dels.first().map(|(change, _)| change.origin.as_str());
             outcome = Some(apply_plan(ctx, s, target, first_origin, &adds, &dels));
+            drop(clear_lock);
         });
         if !quiet || stale {
             return Ok(());
@@ -826,6 +867,11 @@ fn reconcile_target(
                 .and_then(|row| row.json::<Clearing>())
                 .map(|clearing| clearing.op);
             if current != expected_clearing {
+                return Ok(());
+            }
+            // 清空版本同样要复核：另一进程可能在这之间把清空登记、提交、再撤掉标记
+            // （标记已经没了），只有版本认得出这轮计划在清空之前读到、已经过期。
+            if clear_gen(tx)? != gen {
                 return Ok(());
             }
             if answered {

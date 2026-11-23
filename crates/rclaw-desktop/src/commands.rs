@@ -3983,6 +3983,7 @@ mod tests {
                 version: "0".into(),
                 sessions_supported: true,
                 low_memory: false,
+                host_config: None,
             },
             rclaw_sync::SyncConfig::default(),
         )
