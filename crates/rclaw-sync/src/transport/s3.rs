@@ -522,6 +522,22 @@ impl SyncTransport for S3Transport {
             .await
     }
 
+    async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+        // 仅创建：`If-None-Match: *`（S3 及兼容实现的新版 PutObject 支持）。不支持
+        // 该条件的后端会返回错误，调用方按「创建失败」读回并校验已有标记。
+        let path = self.object_path(key)?;
+        let hash = sha256_hex(&body);
+        let request = self
+            .request(Method::PUT, &path, "", &hash)?
+            .header("If-None-Match", "*");
+        let response = net::send_upload(request, Upload::Bytes(Bytes::from(body))).await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::fail(response, &format!("创建 {key}")).await)
+        }
+    }
+
     async fn delete(&self, key: &str) -> TransportResult<()> {
         let path = self.object_path(key)?;
         let response = net::send(self.request(Method::DELETE, &path, "", EMPTY_SHA256)?).await?;

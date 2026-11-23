@@ -71,10 +71,12 @@ pub async fn open_space(
                         return Ok(());
                     }
                     Err(_) => {
-                        tracing::warn!("空间标记损坏（{error}），按创建路径重建");
-                        let file = SpaceFile::new(keys, space_id);
-                        transport::put_checked(transport, SPACE_FILE, file.encode()?).await?;
-                        return Ok(());
+                        // 二次读仍损坏：不覆盖（另一设备可能刚写成有效的关闭标记，
+                        // 无条件重建会把它改回开放）。保留损坏状态、给出恢复路径。
+                        tracing::warn!("空间标记损坏（{error}）");
+                        return Err(SyncError::other(format!(
+                            "存储上的空间标记 {SPACE_FILE} 损坏（{error}）；请确认这不是别的设备正在写的标记后，删除或修复它再重试"
+                        )));
                     }
                 },
                 None => {

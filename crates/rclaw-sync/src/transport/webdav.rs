@@ -379,6 +379,22 @@ impl SyncTransport for WebdavTransport {
         self.put_upload(key, Upload::Bytes(Bytes::from(body))).await
     }
 
+    async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+        // 仅创建：`If-None-Match: *` 让已有的标记（尤其是另一设备刚写的关闭标记）
+        // 原样保留，迟到的创建写入拿不到覆盖机会。
+        let url = self.url(key)?;
+        self.ensure_dirs(key).await?;
+        let request = self
+            .request(Method::PUT, url)
+            .header("If-None-Match", "*");
+        let response = net::send_upload(request, Upload::Bytes(Bytes::from(body))).await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(net::status_error(&response, &format!("创建 {key}（PUT）")))
+        }
+    }
+
     async fn delete(&self, key: &str) -> TransportResult<()> {
         let response = net::send(self.request(Method::DELETE, self.url(key)?)).await?;
         let status = response.status();

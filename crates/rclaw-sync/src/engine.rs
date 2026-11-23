@@ -360,9 +360,16 @@ impl SyncEngine {
     /// 没变的配置也交过去：面板上的「重试」就是把现有的配置再存一遍，没连上同步空间的
     /// 引擎线程收到之后会再试一次。线程自己退出了的话重新起一条。
     pub fn apply_config(&self, config: SyncConfig) {
-        // 兼容入口（测试/无文件协议）：直接发布。宿主侧应调用
-        // [`Self::apply_config_locked`]——由它在协议锁内读盘得到权威配置再发布。
-        self.apply_config_locked(config);
+        // 兼容入口：也拿同一把存储协议锁（阻塞到别的保存结束），与桌面保存串行；
+        // 仓库内的测试调用没有并发，外部调用者并发保存同一数据目录也不会竞争。
+        let paths = self.inner.ctx.paths.clone();
+        match worker::StorageLock::acquire(&paths) {
+            Ok(_lock) => self.apply_config_locked(config),
+            Err(error) => {
+                tracing::warn!("发布配置时拿不到协议锁（直接发布）: {error}");
+                self.apply_config_locked(config);
+            }
+        }
     }
 
     /// 在**已持有存储协议锁**时发布配置：写盘、读盘与发布在同一临界区里，较早读到的

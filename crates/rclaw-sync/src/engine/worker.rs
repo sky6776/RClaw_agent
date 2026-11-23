@@ -227,14 +227,6 @@ pub(crate) fn storage_intent_backup_save(
     Ok(())
 }
 
-pub(crate) fn storage_intent_backup_clear(paths: &SyncPaths) -> Result<()> {
-    match std::fs::remove_file(storage_intent_backup_path(paths)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 fn storage_intent_read(path: PathBuf) -> Result<Option<StorageIntent>> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -384,16 +376,22 @@ pub(crate) fn storage_intent_effective(
 /// 结算：先删落选的那一份（它从此不能被恢复），再删胜出的那一份。中途中断时胜出
 /// 记录还在，下次启动会接着结算同一笔。
 pub(crate) fn storage_intent_settle(paths: &SyncPaths, from_backup: bool) -> Result<()> {
-    if from_backup {
-        let _ = std::fs::remove_file(storage_intent_path(paths));
-        storage_intent_backup_clear(paths)
-    } else {
-        let _ = storage_intent_backup_clear(paths);
-        match std::fs::remove_file(storage_intent_path(paths)) {
+    // 先删落选、再删胜出；任何一步失败都上报（胜出记录还留着，下次启动接着结算）。
+    // 不能吞掉落选的删除错误：胜出记录删掉后，留下的同存储段旧记录会被重新选中、
+    // 把旧密码写回去。
+    let remove = |path: PathBuf| -> Result<()> {
+        match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    };
+    if from_backup {
+        remove(storage_intent_path(paths))?;
+        remove(storage_intent_backup_path(paths))
+    } else {
+        remove(storage_intent_backup_path(paths))?;
+        remove(storage_intent_path(paths))
     }
 }
 
