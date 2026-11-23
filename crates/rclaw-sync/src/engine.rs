@@ -369,7 +369,7 @@ impl SyncEngine {
     /// 快照不会盖过之后完成的保存。发布存储段变化会推进提交代次（旧意图失效）。
     pub fn apply_config_locked(&self, config: SyncConfig) {
         let paths = self.inner.ctx.paths.clone();
-        let _ = worker::storage_commit_ensure(&paths, &config);
+        let _ = worker::storage_commit_advance_if_changed(&paths, &config);
         let mut running = lock(&self.inner.running);
         let host_seq = {
             // 值与版本、安装序号在同一把锁里提交：引擎线程只会在锁内看到成对的
@@ -763,7 +763,10 @@ impl SyncEngine {
             let _ = worker::storage_intent_clear_if(&paths, &id);
             return Err(error);
         }
-        // TOML 已写成：这一条从此有资格在启动时被采用（要等密码补上才结算）。
+        // TOML 已写成：存储段若变了，这里才推进提交代次并淘汰其它存储段的旧记录
+        // （登记意图时没有动过它们）。
+        let _ = worker::storage_commit_advance_if_changed(&paths, &merged);
+        // 这一条从此有资格在启动时被采用（要等密码补上才结算）。
         if let Err(error) = worker::storage_intent_mark_written(&paths, &id) {
             tracing::warn!("记录存储设置的提交状态失败: {error}");
         }

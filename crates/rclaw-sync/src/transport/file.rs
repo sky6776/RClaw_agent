@@ -182,13 +182,28 @@ fn write_blocking(
 /// 重置恢复。
 #[cfg(windows)]
 fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     extern "system" {
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     }
-    let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let to: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // Win32 的 MoveFileExW 默认受 MAX_PATH 限制：用扩展长度路径（本地盘
+    // `\\?\C:...`、UNC `\\?\UNC\server...`）让深层目录也能发布（Rust 的临时文件/
+    // 目录 API 已经走扩展路径）。
+    fn wide_long(path: &Path) -> Vec<u16> {
+        let text = path.to_string_lossy();
+        let text = if text.starts_with(r"\\?\") {
+            text.into_owned()
+        } else if let Some(rest) = text.strip_prefix(r"\\") {
+            format!(r"\\?\UNC\{rest}")
+        } else if path.is_absolute() {
+            format!(r"\\?\{text}")
+        } else {
+            text.into_owned()
+        };
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let from: Vec<u16> = wide_long(tmp);
+    let to: Vec<u16> = wide_long(path);
     let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
     if ok == 0 {
         Err(std::io::Error::last_os_error())

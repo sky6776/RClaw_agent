@@ -33,12 +33,33 @@ pub async fn open_space(
     let existing = match read_space(transport).await {
         Ok(existing) => existing,
         // 创建路径上读到损坏的标记（例如旧版「仅创建回退」在复制中途被打断留下的
-        // 半个 space.json）：这个空间本来就用不了，重建它，别让重置恢复永远卡住。
+        // 半个 space.json）。重建之前先重读并确认对象仍是刚读到的那份损坏内容：
+        // 这期间另一设备可能刚写成一个可验证的关闭标记，不能被迟到重建覆盖。
         Err(SyncError::Corrupt(error)) if create => {
-            tracing::warn!("空间标记损坏（{error}），按创建路径重建");
-            let file = SpaceFile::new(keys, space_id);
-            transport::put_checked(transport, SPACE_FILE, file.encode()?).await?;
-            return Ok(());
+            let now = transport::get_opt(transport, SPACE_FILE, SPACE_FILE_MAX as u64).await?;
+            match now {
+                Some(bytes) => match SpaceFile::decode(&bytes) {
+                    Ok(file) => {
+                        file.verify(keys, space_id)?;
+                        if file.closed {
+                            return Err(SyncError::SpaceClosed);
+                        }
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        tracing::warn!("空间标记损坏（{error}），按创建路径重建");
+                        let file = SpaceFile::new(keys, space_id);
+                        transport::put_checked(transport, SPACE_FILE, file.encode()?).await?;
+                        return Ok(());
+                    }
+                },
+                None => {
+                    // 已经被人删掉了：按缺失走仅创建。
+                    let file = SpaceFile::new(keys, space_id);
+                    transport::put_new_checked(transport, SPACE_FILE, file.encode()?).await?;
+                    return Ok(());
+                }
+            }
         }
         Err(error) => return Err(error),
     };

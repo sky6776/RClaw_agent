@@ -164,9 +164,10 @@ fn storage_commit_write(paths: &SyncPaths, file: &StorageCommitFile) -> Result<(
     Ok(())
 }
 
-/// 存储段与此前记录的不同就推进提交代次，并让旧代次的意图全部失去恢复资格
-/// （切回旧存储时旧密码不会被复活）。应在持有存储协议锁时调用。
-pub(crate) fn storage_commit_ensure(paths: &SyncPaths, storage: &SyncConfig) -> Result<u64> {
+/// 存储段**确已**换成 `storage`（新 TOML 写成、或权威发布完成）之后推进提交代次，
+/// 并让属于其它存储段的旧意图失去恢复资格（切回旧存储不会复活旧密码）。必须持有
+/// 存储协议锁调用，且只能在新状态真正生效之后调用——登记意图/读盘/断线重连都只读。
+pub(crate) fn storage_commit_advance(paths: &SyncPaths, storage: &SyncConfig) -> Result<u64> {
     let mut file = storage_commit_read(paths)?;
     if file.commit == 0 {
         // 第一次建立提交状态：旧版本的记录没有代次，不能被顺手清掉（它们仍按
@@ -180,11 +181,29 @@ pub(crate) fn storage_commit_ensure(paths: &SyncPaths, storage: &SyncConfig) -> 
         file.commit = file.commit.saturating_add(1);
         file.storage = storage.clone();
         storage_commit_write(paths, &file)?;
-        // 旧提交的意图从此失去恢复资格（切回旧存储不会复活旧密码）。
-        let _ = std::fs::remove_file(storage_intent_path(paths));
-        let _ = std::fs::remove_file(storage_intent_backup_path(paths));
+        // 只淘汰「存储段不同」的记录；同一存储段的待补密码保留。
+        for path in [storage_intent_path(paths), storage_intent_backup_path(paths)] {
+            if let Ok(Some(intent)) = storage_intent_read(path.clone()) {
+                if !same_storage_cfg(&intent.config, storage) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
     }
     Ok(file.commit)
+}
+
+/// 存储段已变时才推进（返回新的代次）；未变返回 `None`。调用方负责在协议锁内、
+/// 新状态真正生效之后调用。
+pub(crate) fn storage_commit_advance_if_changed(
+    paths: &SyncPaths,
+    storage: &SyncConfig,
+) -> Result<Option<u64>> {
+    let file = storage_commit_read(paths)?;
+    if file.commit == 0 || !same_storage_cfg(&file.storage, storage) {
+        return Ok(Some(storage_commit_advance(paths, storage)?));
+    }
+    Ok(None)
 }
 
 fn storage_intent_store(paths: &SyncPaths, intent: &StorageIntent) -> Result<()> {
@@ -249,7 +268,8 @@ pub fn storage_intent_save(
 ) -> Result<String> {
     let secret = secret.map(|secret| secret.to_string());
     let device_name_edit = device_name_edit.map(|(from, to)| DeviceNameEdit { from, to });
-    let commit = storage_commit_ensure(paths, config)?;
+    // 只读当前代次：登记意图不是一次存储提交，不能在这里推进/清理。
+    let commit = storage_commit_read(paths)?.commit;
     if let Some(existing) = storage_intent_load(paths)? {
         if !existing.id.is_empty()
             && existing.config == *config
@@ -261,7 +281,17 @@ pub fn storage_intent_save(
         }
     }
     let mut file = storage_commit_read(paths)?;
-    file.req = file.req.saturating_add(1);
+    // 提交文件缺失/损坏时不能从 0 重新发号：既有记录的序号可能更大，否则新请求
+    // 会被排到旧记录之前。以现有记录的最大序号为下限。
+    let floor = [
+        storage_intent_load(paths)?.map(|intent| intent.req),
+        storage_intent_backup_load(paths)?.map(|intent| intent.req),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0);
+    file.req = file.req.max(floor).saturating_add(1);
     storage_commit_write(paths, &file)?;
     let intent = StorageIntent {
         id: crate::ids::random_hex::<8>(),
@@ -322,7 +352,6 @@ pub(crate) fn storage_intent_effective(
     paths: &SyncPaths,
     disk: &SyncConfig,
 ) -> Result<Option<EffectiveIntent>> {
-    let commit = storage_commit_ensure(paths, disk)?;
     let main = storage_intent_load(paths)?;
     let backup = storage_intent_backup_load(paths)?;
     let mut best: Option<EffectiveIntent> = None;
@@ -333,15 +362,9 @@ pub(crate) fn storage_intent_effective(
         if !same_storage_cfg(disk, &intent.config) {
             continue;
         }
-        let eligible = if intent.req == 0 {
-            // 旧格式：归属不可判定，只用来兜底
-            true
-        } else {
-            intent.commit == commit
-        };
-        if !eligible {
-            continue;
-        }
+        // 只按「存储段与磁盘一致」判定归属：提交代次只用于先后排序与淘汰
+        // （旧代次的记录在存储段真正换掉时已被删除）。这样提交文件缺失/损坏、
+        // 或「TOML 已写、意图还没盖上代次」都不会把唯一可恢复的记录排除掉。
         let replace = match &best {
             None => true,
             Some(current) => (intent.commit, intent.req) > (current.intent.commit, current.intent.req),
@@ -1211,8 +1234,13 @@ impl Worker {
         // 上次没存完的存储设置先收尾（secrets 按 TOML 里的目标补写），两个文件才是一套。
         // 放在空间切换恢复之前：恢复要按「这个账户」的当前凭据去开存储，先让配置与
         // secrets 收敛到同一套。
-        if let Err(error) = self.resume_storage_intent(protocol_lock.is_some()).await {
-            tracing::warn!("没存完的存储设置收尾失败（下次打开再试）: {error}");
+        // 只有在协议锁内按磁盘权威配置打开时才收尾存储意图：`open(false)`（宿主持锁
+        // 保存后的重连、断线重连）用的是缓存配置，拿它推进代次/清意图会误删真正
+        // 落盘的那一笔；这些路径留给下一次权威打开或宿主结算。
+        if protocol_lock.is_some() {
+            if let Err(error) = self.resume_storage_intent(true).await {
+                tracing::warn!("没存完的存储设置收尾失败（下次打开再试）: {error}");
+            }
         }
         // 配置、密钥与意图都已经收敛到同一套：保存协议锁到这里就可以放了。
         drop(protocol_lock);
@@ -1824,6 +1852,15 @@ impl Worker {
                 self.open(false).await;
                 return Err(error);
             }
+            // 和首次加入一样：凭据提交与代次推进在存储协议锁内，不能挤出另一笔
+            // 正在持锁的保存（那笔的恢复依据会被这里推进代次时误删）。
+            let lock_paths = self.shared.ctx.paths.clone();
+            let Some(_storage_lock) =
+                blocking(move || StorageLock::try_acquire(&lock_paths)).await?
+            else {
+                self.open(false).await;
+                return Err(SyncError::other("存储设置正在保存，请稍后重试加入"));
+            };
             if !ready() {
                 self.open(false).await;
                 return Err(SyncError::other("同步设置在加入过程中被改动，请重试加入"));
@@ -1837,9 +1874,10 @@ impl Worker {
             self.secrets = next;
             self.config = joined.clone();
             self.protect_before = true;
-            // 存储段变化推进提交代次（切回旧存储时旧意图不会复活）。
-            let _ = storage_commit_ensure(&self.shared.ctx.paths, &joined);
+            // 凭据与配置已提交：这时才推进存储代次（淘汰其它存储段的旧意图）。
+            let _ = storage_commit_advance(&self.shared.ctx.paths, &joined);
             let seq = self.publish_local_config();
+            drop(_storage_lock);
             self.open(false).await;
             return Ok((joined, seq));
         }
@@ -1859,7 +1897,7 @@ impl Worker {
         // 「安装 + 发布 + 推进序号」，回执带的就是这次安装的序号。
         self.config = joined.clone();
         self.protect_before = true;
-        let _ = storage_commit_ensure(&self.shared.ctx.paths, &joined);
+        let _ = storage_commit_advance(&self.shared.ctx.paths, &joined);
         let seq = self.publish_local_config();
         drop(_storage_lock);
         self.open(false).await;
