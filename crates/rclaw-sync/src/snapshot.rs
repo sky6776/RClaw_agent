@@ -106,6 +106,9 @@ const SWEEP_BATCH: usize = 100;
 const SWEEP_BUDGET: Duration = Duration::from_secs(8);
 /// 依据这轮核验不过（不是预算不够）后的退避：排在后面的对象才轮得到。
 const GC_RETRY_MS: i64 = 5 * 60 * 1000;
+/// 升级前留下的、推不出恢复依据的日志对象：退到很久以后再看（对象不删）。不退避的话
+/// 它们每轮都占满批次，后面的正常删除记录永远轮不到。
+const GC_PARK_MS: i64 = 30 * 24 * 3600 * 1000;
 /// 晋升（候选快照 / 候选回收位置）前的完整复核一次走完的时限：这一步每小时最多一次，
 /// 给得比每轮的回收扫描宽，让大一点的快照也有机会一次核完（跨轮前缀不能当证据）。
 const PROMOTE_BUDGET: Duration = Duration::from_secs(30);
@@ -2148,10 +2151,13 @@ async fn sweep_due(
     let mut due_left: Vec<Due> = Vec::new();
     // 这轮核验不过（不是预算不够）的行：退避一会儿，别让排在前面的坏依据每轮占满批次。
     let mut retry: Vec<String> = Vec::new();
+    let mut parked: Vec<String> = Vec::new();
     for (path, basis, pack) in due {
         if basis.is_none() && pack.is_none() && !path.starts_with("blobs/") {
-            // 升级前留下的旧记录：没有恢复依据的日志对象不能删。
+            // 升级前留下的旧记录：没有恢复依据的日志对象不能删。退到很久以后，
+            // 别让它一直占着批次把后面的正常记录挡住。
             tracing::debug!("{path} 没有恢复依据（旧格式的回收记录），先不删");
+            parked.push(path);
             continue;
         }
         let Some(basis) = basis else {
@@ -2236,14 +2242,16 @@ async fn sweep_due(
             for path in &done {
                 db::state_del(tx, scope::GC, path)?;
             }
-            for path in &retry {
-                let Some(mut when) =
-                    db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
-                else {
-                    continue;
-                };
-                when.retry_ms = now + GC_RETRY_MS;
-                db::state_put_json(tx, scope::GC, path, db::HLC_ZERO, &when)?;
+            for (paths, retry_ms) in [(&retry, now + GC_RETRY_MS), (&parked, now + GC_PARK_MS)] {
+                for path in paths {
+                    let Some(mut when) =
+                        db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
+                    else {
+                        continue;
+                    };
+                    when.retry_ms = retry_ms;
+                    db::state_put_json(tx, scope::GC, path, db::HLC_ZERO, &when)?;
+                }
             }
             Ok(())
         })

@@ -812,10 +812,10 @@ impl Worker {
     /// 写入在进行时宣告换代完成，旧任务随后的改名会把旧字节落到可能被复用的路径上。
     /// 调用方据此中止这次切换（保持旧连接），稍后重试。
     async fn teardown(&mut self) -> bool {
-        self.shared.set_fetch(None);
         // 拆任务只拆得掉异步的那一层：已经开始的文件与记账阶段（`spawn_blocking`）拦不
         // 住。顺序是：先关提交入口（旧任务此后拿到的阶段一律作废）→ 等在途的阶段走完 →
-        // 再等最终写入段退场 → 换代。任何一步超时都不换代，恢复提交入口让调用方重试。
+        // 再等最终写入段退场 → 换代。任何一步超时都不换代，恢复提交入口让调用方重试
+        // （下载入口也原样留着，中止的切换不影响正在用的连接）。
         self.shared.ctx.space.seal();
         let idle = self
             .shared
@@ -835,6 +835,7 @@ impl Worker {
             self.shared.ctx.space.reopen();
             return false;
         }
+        self.shared.set_fetch(None);
         self.shared.ctx.space.bump();
         for task in [self.uploads.take(), self.downloads.take()]
             .into_iter()

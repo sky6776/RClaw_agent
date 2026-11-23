@@ -620,7 +620,8 @@ impl SyncEngine {
         F: FnOnce(&SyncConfig) -> std::result::Result<(), String> + Send + 'static,
     {
         let paths = self.inner.ctx.paths.clone();
-        let _lock = worker::StorageLock::acquire(&paths)?;
+        let lock_paths = paths.clone();
+        let _lock = blocking(move || worker::StorageLock::acquire(&lock_paths)).await?;
         let secret = secret.filter(|secret| !secret.is_empty());
         let id = worker::storage_intent_save(&paths, &config, secret.as_deref())?;
         let target = config.clone();

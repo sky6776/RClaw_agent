@@ -1086,6 +1086,9 @@ pub async fn pull(
         })
     })
     .await?;
+    // 一轮的总预算是所有设备共享的：每台只拿自己那一份，免得设备一多就整轮超支。
+    let devices = heads.iter().filter(|meta| meta.name != me).count().max(1);
+    let per_device = (budget / devices).max(1);
     for meta in heads {
         let device = meta.name.as_str();
         if device == me {
@@ -1123,7 +1126,7 @@ pub async fn pull(
             keys,
             device,
             &tag,
-            budget,
+            per_device,
             known,
             grace_ms,
             &mut memo.pack_chains,
