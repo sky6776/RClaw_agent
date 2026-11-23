@@ -2340,12 +2340,22 @@ async fn sweep_due(
     if due.is_empty() {
         return Ok(0);
     }
+    // 清单对象还有兄弟行（未到期/退避/本轮没轮到）：这一轮不尝试它。它不是可删对象，
+    // 既不该占删除名额，也不该让押着它的依据抢到唯一的复核额度（否则坏依据永远
+    // 轮不到失败退避）。
+    let manifest_deferred = |path: &str| {
+        path.ends_with(".snap")
+            && snap_key_of_path(path).is_some_and(|key| snap_rows.get(&key).copied().unwrap_or(0) > 1)
+    };
     // 这一轮核验哪一份依据/包：把到期行里的证据去重、按证据键排序，从游标之后的第一份
     // 接着选（没有游标或已经到末尾就回绕到第一份）。
     let mut evidences: Vec<(String, Option<(String, String)>, Option<PackGuard>)> = Vec::new();
     {
         let mut seen: HashSet<String> = HashSet::new();
-        for (_, basis, pack, _, _) in &due {
+        for (path, basis, pack, _, _) in &due {
+            if manifest_deferred(path) {
+                continue;
+            }
             let key = basis
                 .as_ref()
                 .map(retry_key_basis)
@@ -2393,15 +2403,9 @@ async fn sweep_due(
     let mut retry_keys: HashSet<String> = HashSet::new();
     let mut parked: Vec<String> = Vec::new();
     for (path, basis, pack, orphan, candidate) in due {
-        // 同一快照还有别的行（未到期/退避/本轮没轮到）：清单先不尝试——删掉清单就
-        // 意味着这份快照处理完了、来历也清了。整行跳过，不占这一类的名额，让后面的
-        // 可删对象先推进；等分片都结算完，清单自然只剩自己一行。
-        if path.ends_with(".snap") {
-            if let Some(key) = snap_key_of_path(&path) {
-                if snap_rows.get(&key).copied().unwrap_or(0) > 1 {
-                    continue;
-                }
-            }
+        // 暂缓的清单不占这一类的名额，让后面的可删对象先推进（见 `manifest_deferred`）。
+        if manifest_deferred(&path) {
+            continue;
         }
         if orphan && !candidate {
             // 旧版本排下的 orphan 行：来源证明不了是「从未公布过的候选」，按受保护快照
@@ -2472,19 +2476,23 @@ async fn sweep_due(
         }
     }
     // 两类各占一半名额（有依据的最多 `SWEEP_BATCH/2`，其余给普通对象）：积压一直
-    // 补入时两类都能推进。首删位置按轮次在两类之间交替——核验逼近 6 秒或第一个
-    // DELETE 很慢时，总预算只够一次尝试，不让同一类永远抢到那个位置。
+    // 补入时两类都能推进。首删位置按「上一轮谁真的没轮上」在两类之间交替——核验
+    // 逼近 6 秒或第一个 DELETE 很慢时总预算只够一次尝试，轮转按实际机会推进，别和
+    // 依据轮换固定同相（那会让某一份健康依据每次排在慢 DELETE 后面，一直轮空）。
     let room = SWEEP_BATCH.saturating_sub(deletable.len());
     plain.truncate(room);
-    let mut sequence: Vec<(String, Option<String>, Option<String>)> = Vec::new();
-    if memo.gc_plain_first && !plain.is_empty() {
-        sequence.push(plain.remove(0));
+    let had_evidence = !deletable.is_empty();
+    let had_plain = !plain.is_empty();
+    let mut sequence: Vec<(String, Option<String>, Option<String>, bool)> = Vec::new();
+    if memo.gc_plain_first && had_plain {
+        sequence.push((plain[0].0.clone(), plain[0].1.clone(), plain[0].2.clone(), true));
+        plain.remove(0);
     }
-    memo.gc_plain_first = !memo.gc_plain_first;
-    sequence.extend(deletable);
-    sequence.extend(plain);
+    sequence.extend(deletable.into_iter().map(|(path, b, p)| (path, b, p, false)));
+    sequence.extend(plain.into_iter().map(|(path, b, p)| (path, b, p, true)));
     let mut done: Vec<String> = Vec::new();
-    for (index, (path, basis_key, pack_key)) in sequence.into_iter().enumerate() {
+    let mut plain_attempted = false;
+    for (index, (path, basis_key, pack_key, is_plain)) in sequence.into_iter().enumerate() {
         // 总预算用完也要给这一批留一次删除机会：一次慢复核不该让回收永远零进展。
         if index > 0 && started.elapsed() > SWEEP_BUDGET {
             break;
@@ -2497,6 +2505,9 @@ async fn sweep_due(
                     continue;
                 }
             }
+        }
+        if is_plain {
+            plain_attempted = true;
         }
         match transport.delete(&path).await {
             Ok(()) | Err(TransportError::NotFound(_)) => {
@@ -2521,6 +2532,8 @@ async fn sweep_due(
             }
         }
     }
+    // 下一轮先给这一轮一次机会都没拿到的那一类。
+    memo.gc_plain_first = had_plain && (!plain_attempted || !had_evidence);
     let deleted = done.len();
     // 删除已经发生（对象没了），结算按总行数封顶：没轮到的下一轮按 NotFound 收尾。
     let settle_cap = SWEEP_BATCH.saturating_sub(parked.len());

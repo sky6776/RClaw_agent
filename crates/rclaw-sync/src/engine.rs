@@ -128,6 +128,8 @@ pub(crate) struct Shared {
     /// 配置可能已被另一个进程更新；引擎线程从磁盘确认后会写回这里，宿主读到的就是
     /// 同一份）。
     pub config: Arc<Mutex<SyncConfig>>,
+    /// 共享配置的版本（见 [`Inner::config_version`]）：引擎线程提交磁盘确认前复核。
+    pub config_version: Arc<std::sync::atomic::AtomicU64>,
     view: Mutex<local::View>,
     /// 上次拉取成功的时刻（Unix 毫秒）。
     pub last_pull_ms: AtomicI64,
@@ -164,6 +166,7 @@ impl Shared {
             low_memory: inner.low_memory,
             refresh_config: inner.refresh_config.clone(),
             config: inner.config.clone(),
+            config_version: inner.config_version.clone(),
             view: Mutex::new(local::View {
                 state: "syncing",
                 ..local::View::default()
@@ -280,6 +283,10 @@ struct Inner {
     /// 宿主侧的重读入口：引擎线程在打开连接前按磁盘确认 `[sync]`。
     refresh_config: Option<ConfigRefresh>,
     config: Arc<Mutex<SyncConfig>>,
+    /// 配置版本：宿主每次整份发布配置（`apply_config`、保存存储、加入空间）都 +1。
+    /// 引擎线程从磁盘确认存储段前记下版本，提交合并时发现变了就重读，避免把较早读到
+    /// 的存储段写回已经换了设置的那一份。
+    config_version: Arc<std::sync::atomic::AtomicU64>,
     running: Mutex<Option<Running>>,
 }
 
@@ -316,6 +323,7 @@ impl SyncEngine {
                 low_memory: deps.low_memory,
                 refresh_config: deps.refresh_config,
                 config: Arc::new(Mutex::new(config)),
+                config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 running: Mutex::new(None),
             }),
         }
@@ -345,6 +353,9 @@ impl SyncEngine {
     pub fn apply_config(&self, config: SyncConfig) {
         let mut running = lock(&self.inner.running);
         *lock(&self.inner.config) = config.clone();
+        self.inner
+            .config_version
+            .fetch_add(1, Ordering::Relaxed);
         if !config.enabled {
             if let Some(running) = running.take() {
                 let _ = running.commands.send(Cmd::Stop);
@@ -563,6 +574,9 @@ impl SyncEngine {
         let code = code.trim().to_string();
         let joined = self.call(|reply| Cmd::JoinSpace { code, reply }).await?;
         *lock(&self.inner.config) = joined.clone();
+        self.inner
+            .config_version
+            .fetch_add(1, Ordering::Relaxed);
         Ok(joined)
     }
 
@@ -573,7 +587,14 @@ impl SyncEngine {
     /// 同步的话，不能在它脚下把密钥和同步状态清掉。
     pub async fn leave_space(&self) -> Result<()> {
         if self.live(true).is_some() {
-            return self.call(Cmd::LeaveSpace).await;
+            match self.call(Cmd::LeaveSpace).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // 引擎线程可能正在退场（确认关闭后接收端已关）：改走离线路径，
+                    // 先取引擎锁再退出——另一个进程真正持锁时那里会返回可重试错误。
+                    tracing::warn!("在线退出同步空间失败，改走离线退出: {error}");
+                }
+            }
         }
         let ctx = self.inner.ctx.clone();
         let paths = ctx.paths.clone();
@@ -663,6 +684,9 @@ impl SyncEngine {
         .await?;
         worker::storage_intent_clear_if(&paths, &id)?;
         *lock(&self.inner.config) = config;
+        self.inner
+            .config_version
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

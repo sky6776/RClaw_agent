@@ -411,6 +411,9 @@ struct Worker {
     switch_failed: bool,
     /// 从磁盘确认同步已经关闭（或宿主停止）：worker 退出，剩下的交给宿主。
     stop: bool,
+    /// 上一次打开没连上的原因（协议锁竞争/确认失败/引擎锁被占）：给「立即同步」等
+    /// 等着结果的命令一个和状态面板一致的说法。
+    open_note: Option<String>,
 }
 
 impl Worker {
@@ -445,6 +448,7 @@ impl Worker {
             switch_tries: 0,
             switch_failed: false,
             stop: false,
+            open_note: None,
         }
     }
 
@@ -453,6 +457,22 @@ impl Worker {
         self.open(true).await;
         loop {
             if self.stop {
+                // 退场前把已经排队的命令处理掉：宿主可能在「确认关闭」与「接收端
+                // 关闭」之间刚发了重新开启/退出空间。处理到重新开启配置就清掉
+                // stop，继续跑；否则关掉接收端再退出——之后再发来的配置命令会
+                // 发送失败，宿主会启动继任 worker 或走离线退出。
+                let mut reopened = false;
+                while let Ok(cmd) = self.commands.try_recv() {
+                    self.handle(cmd).await;
+                    if !self.stop {
+                        reopened = true;
+                        break;
+                    }
+                }
+                if reopened {
+                    continue;
+                }
+                self.commands.close();
                 break;
             }
             self.revive_transfers();
@@ -717,27 +737,42 @@ impl Worker {
         let Some(refresh) = self.shared.refresh_config.clone() else {
             return Ok(());
         };
-        let Some(fresh) = refresh()? else {
+        // 磁盘确认与宿主发布共享同一顺序：读盘前记下共享配置版本，提交合并时还在
+        // 同一把锁里复核——版本变了说明宿主刚发布了新配置（可能正是这次回调读盘期间
+        // 写下去的 TOML），手上的存储段可能更旧，重读一遍再合并。
+        for _ in 0..3 {
+            let version = self.shared.config_version.load(Ordering::Relaxed);
+            let Some(fresh) = refresh()? else {
+                return Ok(());
+            };
+            let mut shared = lock(&self.shared.config);
+            if self.shared.config_version.load(Ordering::Relaxed) != version {
+                drop(shared);
+                continue;
+            }
+            // 只改「磁盘确认的字段」（存储段与开关），其余字段保留宿主最新的一份——
+            // 用 worker 自己的旧副本整份写回会把刚发表的范围/通道/设备名回退。
+            let mut merged = shared.clone();
+            merged.apply_storage_from(&fresh);
+            merged.enabled = fresh.enabled;
+            if merged != *shared {
+                tracing::info!("按磁盘上的 rclaw.toml 更新同步设置（另一进程保存过）");
+                *shared = merged.clone();
+            }
+            drop(shared);
+            if merged != self.config {
+                self.config = merged;
+                self.shared
+                    .attachment_max
+                    .store(self.config.attachment_max_bytes(), Ordering::Relaxed);
+            }
             return Ok(());
-        };
-        // 共享配置可能刚被宿主（导入、面板保存）更新过：在它的锁里只改「磁盘确认的
-        // 字段」（存储段与开关），其余字段保留宿主最新的一份——用 worker 自己的旧副本
-        // 整份写回会把刚发表的范围/通道/设备名回退。
-        let mut shared = lock(&self.shared.config);
-        let mut merged = shared.clone();
-        merged.apply_storage_from(&fresh);
-        merged.enabled = fresh.enabled;
-        if merged != *shared {
-            tracing::info!("按磁盘上的 rclaw.toml 更新同步设置（另一进程保存过）");
-            *shared = merged.clone();
         }
-        drop(shared);
-        if merged != self.config {
-            self.config = merged;
-            self.shared
-                .attachment_max
-                .store(self.config.attachment_max_bytes(), Ordering::Relaxed);
-        }
+        // 版本一直变：这一轮不覆盖共享配置，按宿主当前配置打开，下一次打开再确认。
+        self.config = lock(&self.shared.config).clone();
+        self.shared
+            .attachment_max
+            .store(self.config.attachment_max_bytes(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -758,6 +793,9 @@ impl Worker {
             match blocking(move || StorageLock::try_acquire(&lock_paths)).await {
                 Ok(Some(lock)) => protocol_lock = Some(lock),
                 Ok(None) => {
+                    self.open_note = Some(
+                        "另一个进程正在保存同步设置，确认后再连接（稍后自动重试）".into(),
+                    );
                     self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
                     return;
                 }
@@ -770,6 +808,9 @@ impl Worker {
                         self.shared.set_state(
                             "syncing",
                             Some("等待确认同步存储设置（锁不可用），稍后重试".into()),
+                        );
+                        self.open_note = Some(
+                            "确认同步存储设置失败（存储锁不可用），稍后自动重试".into(),
                         );
                         self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
                         return;
@@ -816,6 +857,7 @@ impl Worker {
                         STANDBY_RETRY
                     };
                     self.reopen_at = Some(Instant::now() + wait);
+                    self.open_note = Some(STANDBY_HINT.into());
                     shared.set_state("standby", Some(STANDBY_HINT.into()));
                     return;
                 }
@@ -905,6 +947,7 @@ impl Worker {
         self.start_uploads(session.live.clone());
         self.start_downloads(session.live.clone());
         self.session = Some(session);
+        self.open_note = None;
         // 连接已经按当前配置（含新的存储设置）重建：切换标记与计数到这里就算完成。
         self.pending_switch = false;
         self.switch_failed = false;
@@ -1150,6 +1193,9 @@ impl Worker {
 
     /// 没连上同步空间时，给等着结果的调用方一个说法。
     fn unavailable(&self) -> SyncError {
+        if let Some(note) = &self.open_note {
+            return SyncError::other(note.clone());
+        }
         if self.lock.is_none() {
             return SyncError::other(STANDBY_HINT);
         }
@@ -1195,6 +1241,10 @@ impl Worker {
 
     async fn reconfigure(&mut self, config: SyncConfig) {
         let old = std::mem::replace(&mut self.config, config);
+        if self.config.enabled {
+            // 重新开启（可能发生在退场清理期间）：不再退出。
+            self.stop = false;
+        }
         let new = &self.config;
         self.shared
             .attachment_max
@@ -1511,6 +1561,9 @@ impl Worker {
         }
         self.secrets = next;
         self.config = config;
+        if self.config.enabled {
+            self.stop = false;
+        }
         self.shared.set_space(
             self.secrets
                 .is_paired()
