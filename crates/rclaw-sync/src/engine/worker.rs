@@ -81,11 +81,20 @@ pub(crate) struct StorageIntent {
     /// 要绑定的密码；`None` 或空 = 不改密码。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) secret: Option<String>,
-    /// 这次请求**明确修改**的设备名：`from` 是请求开始时的名字、`to` 是目标名字。
-    /// 启动回补与 worker 收尾只在当前名字仍是 `from` 或 `to` 时采用 `to`——之后
-    /// 别处已经改成第三个名字的话，这次编辑已经过期，不能覆盖。
+    /// 这次请求**明确修改**的设备名 `(原值, 目标值)`（向导里编辑过）：启动回补与
+    /// worker 收尾只在当前名字仍是原值/目标值之一时采用目标值。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) device_name_edit: Option<DeviceNameEdit>,
+    /// 这份记录的配置是否已经写进 `rclaw.toml`（跨重启判断主/备归属）。
+    #[serde(default)]
+    pub(crate) toml_written: bool,
+    /// 记录创建时刻（毫秒）：同存储段的多条记录里选较新的一笔。
+    #[serde(default)]
+    pub(crate) at_ms: i64,
+    /// 旧版本（round19/20）的「明确设备名」字段：读进来避免解析失败。归属有歧义时
+    /// 不应用（保留磁盘现值），凭据照常结算。
+    #[serde(default, alias = "device_name", skip_serializing_if = "Option::is_none")]
+    pub(crate) legacy_device_name: Option<String>,
 }
 
 /// 一次请求明确提交的设备名修改（见 [`StorageIntent::device_name_edit`]）。
@@ -150,70 +159,20 @@ impl Drop for StorageLock {
     }
 }
 
-/// 落盘「存储设置更新意图」，返回它的标识。同一套配置与密码重复调用（桌面在写
-/// `rclaw.toml` 之前先落一次、引擎派发命令时再落一次）沿用手上这条记录的标识，不会
-/// 出现两条意图互相覆盖。
-pub fn storage_intent_save(
-    paths: &SyncPaths,
-    config: &SyncConfig,
-    secret: Option<&str>,
-    device_name_edit: Option<(String, String)>,
-) -> Result<String> {
-    let secret = secret.map(|secret| secret.to_string());
-    let device_name_edit = device_name_edit.map(|(from, to)| DeviceNameEdit { from, to });
-    if let Some(existing) = storage_intent_load(paths)? {
-        if !existing.id.is_empty()
-            && existing.config == *config
-            && existing.secret == secret
-            && existing.device_name_edit == device_name_edit
-        {
-            return Ok(existing.id);
-        }
-    }
-    let intent = StorageIntent {
-        id: crate::ids::random_hex::<8>(),
-        config: config.clone(),
-        secret,
-        device_name_edit,
-    };
-    paths.ensure_root()?;
-    rclaw_store::atomic_write_private(
-        &storage_intent_path(paths),
-        &serde_json::to_vec_pretty(&intent)?,
-    )?;
-    Ok(intent.id)
+/// 备份 = 最后一份 TOML 已提交、但密码还没补上的记录。主记录 = 当前（可能写到一半
+/// 的）请求。替换主记录之前先把「最后一份已提交记录」放进备份；任何时刻都至少有一
+/// 条 TOML 已提交的记录可恢复。
+fn storage_intent_backup_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join("pending-storage.prev.json")
 }
 
-pub(crate) fn storage_intent_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
-    match std::fs::read(storage_intent_path(paths)) {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(intent) => Ok(Some(intent)),
-            Err(error) => {
-                tracing::warn!("sync/pending-storage.json 损坏，丢弃: {error}");
-                let _ = std::fs::remove_file(storage_intent_path(paths));
-                Ok(None)
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// 把一条已经存在的意图原样写回（保存过程中 TOML 写入失败时，恢复上一条仍可执行的
-/// 恢复记录——新的那次没有生效，它的意图也不能把旧的一起带走）。
-pub(crate) fn storage_intent_restore(paths: &SyncPaths, intent: &StorageIntent) -> Result<()> {
+fn storage_intent_store(paths: &SyncPaths, intent: &StorageIntent) -> Result<()> {
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
         &storage_intent_path(paths),
         &serde_json::to_vec_pretty(intent)?,
     )?;
     Ok(())
-}
-
-/// 备份文件：替换一条仍可执行的意图之前，把旧记录留在这里；新一次提交结算完成后
-/// 才删。回滚写入本身失败时，启动按磁盘状态在「新意图 / 备份」之间选择。
-fn storage_intent_backup_path(paths: &SyncPaths) -> PathBuf {
-    paths.root.join("pending-storage.prev.json")
 }
 
 pub(crate) fn storage_intent_backup_save(
@@ -236,19 +195,86 @@ pub(crate) fn storage_intent_backup_clear(paths: &SyncPaths) -> Result<()> {
     }
 }
 
-fn storage_intent_backup_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
-    match std::fs::read(storage_intent_backup_path(paths)) {
+fn storage_intent_read(path: PathBuf) -> Result<Option<StorageIntent>> {
+    match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(intent) => Ok(Some(intent)),
             Err(error) => {
-                tracing::warn!("sync/pending-storage.prev.json 损坏，丢弃: {error}");
-                let _ = std::fs::remove_file(storage_intent_backup_path(paths));
+                tracing::warn!("同步设置更新意图损坏，丢弃: {error}");
                 Ok(None)
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+pub(crate) fn storage_intent_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
+    storage_intent_read(storage_intent_path(paths))
+}
+
+fn storage_intent_backup_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
+    storage_intent_read(storage_intent_backup_path(paths))
+}
+
+/// 落盘「存储设置更新意图」，返回它的标识。同一套配置、密码与名称编辑重复调用
+/// （同一请求重试）沿用手上这条记录的标识与提交状态。
+pub fn storage_intent_save(
+    paths: &SyncPaths,
+    config: &SyncConfig,
+    secret: Option<&str>,
+    device_name_edit: Option<(String, String)>,
+) -> Result<String> {
+    let secret = secret.map(|secret| secret.to_string());
+    let device_name_edit = device_name_edit.map(|(from, to)| DeviceNameEdit { from, to });
+    if let Some(existing) = storage_intent_load(paths)? {
+        if !existing.id.is_empty()
+            && existing.config == *config
+            && existing.secret == secret
+            && existing.device_name_edit == device_name_edit
+        {
+            return Ok(existing.id);
+        }
+    }
+    let intent = StorageIntent {
+        id: crate::ids::random_hex::<8>(),
+        config: config.clone(),
+        secret,
+        device_name_edit,
+        toml_written: false,
+        at_ms: crate::attach::now_ms(),
+        legacy_device_name: None,
+    };
+    storage_intent_store(paths, &intent)?;
+    Ok(intent.id)
+}
+
+/// 把这条记录的配置标记成「TOML 已写成」：只有写成功之后才标记，启动选记录时只信
+/// 这个标记加磁盘存储段。
+pub(crate) fn storage_intent_mark_written(paths: &SyncPaths, id: &str) -> Result<()> {
+    let Some(mut intent) = storage_intent_load(paths)? else {
+        return Ok(());
+    };
+    if intent.id != id {
+        return Ok(());
+    }
+    intent.toml_written = true;
+    intent.at_ms = crate::attach::now_ms();
+    storage_intent_store(paths, &intent)
+}
+
+/// 最后一份「TOML 已提交」的记录（主优先，其次备份；都有取较新的）。
+pub(crate) fn storage_intent_last_written(
+    paths: &SyncPaths,
+) -> Result<Option<StorageIntent>> {
+    let main = storage_intent_load(paths)?.filter(|intent| intent.toml_written);
+    let backup = storage_intent_backup_load(paths)?.filter(|intent| intent.toml_written);
+    Ok(match (main, backup) {
+        (Some(main), Some(backup)) => {
+            Some(if main.at_ms >= backup.at_ms { main } else { backup })
+        }
+        (main, backup) => main.or(backup),
+    })
 }
 
 /// 两套配置的存储段是否指向同一处。
@@ -259,28 +285,85 @@ fn same_storage_cfg(a: &SyncConfig, b: &SyncConfig) -> bool {
         && a.s3 == b.s3
 }
 
-/// 启动/收尾要执行哪一条意图：同时存在主干与备份时，按磁盘 TOML 的实际存储段判断
-/// 哪一笔真正提交了；都与磁盘不符时退回备份（旧的可恢复记录）。没有主干但有备份时
-/// 也用备份（上一次回滚写失败留下的）。
+pub(crate) struct EffectiveIntent {
+    pub(crate) intent: StorageIntent,
+    pub(crate) from_backup: bool,
+}
+
+/// 启动/收尾要执行哪一条意图：只看 TOML 已提交的记录，且要求它的存储段与磁盘一致；
+/// 同存储段的多条记录取较新的一笔。都不匹配磁盘（已被第三笔写入替代）或没有已提交
+/// 记录时返回 `None`——保留磁盘现值，不拿主备任一条无条件覆盖。
 pub(crate) fn storage_intent_effective(
     paths: &SyncPaths,
     disk: &SyncConfig,
-) -> Result<Option<StorageIntent>> {
+) -> Result<Option<EffectiveIntent>> {
     let main = storage_intent_load(paths)?;
     let backup = storage_intent_backup_load(paths)?;
-    Ok(match (main, backup) {
-        (Some(main), Some(backup)) => {
-            if same_storage_cfg(disk, &main.config) {
-                Some(main)
-            } else if same_storage_cfg(disk, &backup.config) {
-                Some(backup)
-            } else {
-                Some(backup)
-            }
+    let mut candidates: Vec<EffectiveIntent> = Vec::new();
+    if let Some(main) = main {
+        if main.toml_written && same_storage_cfg(disk, &main.config) {
+            candidates.push(EffectiveIntent {
+                intent: main,
+                from_backup: false,
+            });
         }
-        (Some(main), None) => Some(main),
-        (None, backup) => backup,
-    })
+    }
+    if let Some(backup) = backup {
+        if backup.toml_written && same_storage_cfg(disk, &backup.config) {
+            candidates.push(EffectiveIntent {
+                intent: backup,
+                from_backup: true,
+            });
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.intent.at_ms);
+    Ok(candidates.pop())
+}
+
+/// 结算：先删落选的那一份（它从此不能被恢复），再删胜出的那一份。中途中断时胜出
+/// 记录还在，下次启动会接着结算同一笔。
+pub(crate) fn storage_intent_settle(paths: &SyncPaths, from_backup: bool) -> Result<()> {
+    if from_backup {
+        let _ = std::fs::remove_file(storage_intent_path(paths));
+        storage_intent_backup_clear(paths)
+    } else {
+        let _ = storage_intent_backup_clear(paths);
+        match std::fs::remove_file(storage_intent_path(paths)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// 后续一次显式改名（通用配置保存/导入）发布到 `current_name` 时，取消仍在等待的
+/// 设备名编辑：那是一次更晚的改名，旧意图不能再把它改回去。凭据部分保留。
+pub(crate) fn storage_intent_cancel_name_edit(
+    paths: &SyncPaths,
+    current_name: &str,
+) -> Result<()> {
+    for (path, is_backup) in [
+        (storage_intent_path(paths), false),
+        (storage_intent_backup_path(paths), true),
+    ] {
+        let Some(mut intent) = storage_intent_read(path)? else {
+            continue;
+        };
+        let stale = intent
+            .device_name_edit
+            .as_ref()
+            .is_some_and(|edit| edit.to != current_name);
+        if !stale {
+            continue;
+        }
+        intent.device_name_edit = None;
+        if is_backup {
+            storage_intent_backup_save(paths, &intent)?;
+        } else {
+            storage_intent_store(paths, &intent)?;
+        }
+    }
+    Ok(())
 }
 
 /// 给宿主启动回补用的计划：实际执行的意图 + 设备名编辑（如果这次要执行的那条记录
@@ -288,20 +371,24 @@ pub(crate) fn storage_intent_effective(
 pub struct StorageIntentPlan {
     pub config: SyncConfig,
     pub device_name_edit: Option<IntentDeviceNameEdit>,
+    /// 选中的是备份记录（结算时按来源先删另一份）。
+    pub from_backup: bool,
 }
 
 pub fn storage_intent_plan(
     paths: &SyncPaths,
     disk: &SyncConfig,
 ) -> Result<Option<StorageIntentPlan>> {
-    Ok(storage_intent_effective(paths, disk)?.map(|intent| StorageIntentPlan {
-        config: intent.config,
-        device_name_edit: intent
+    Ok(storage_intent_effective(paths, disk)?.map(|effective| StorageIntentPlan {
+        config: effective.intent.config,
+        device_name_edit: effective
+            .intent
             .device_name_edit
             .map(|edit| IntentDeviceNameEdit {
                 from: edit.from,
                 to: edit.to,
             }),
+        from_backup: effective.from_backup,
     }))
 }
 
@@ -549,6 +636,9 @@ struct Worker {
     /// 当前 `self.config` 是哪一次安装的（`publish_local_config` 分配的序号）：
     /// 幂等加入要按「实际采用的那份配置所属的提交」给宿主写盘资格。
     installed_seq: u64,
+    /// 上一次安装前的共享配置：读盘确认时如果磁盘还是这一份，说明宿主的写回还没
+    /// 发生（不能把它当更新的安装，把刚完成/正在等待写回的加入回执作废）。
+    published_before: Option<SyncConfig>,
 }
 
 impl Worker {
@@ -584,6 +674,7 @@ impl Worker {
             switch_failed: false,
             open_note: None,
             installed_seq: 0,
+            published_before: None,
         }
     }
 
@@ -862,6 +953,19 @@ impl Worker {
             let Some(fresh) = refresh()? else {
                 return Ok(());
             };
+            // 磁盘上还是「上一次安装前」的那一份：宿主的写回还没发生（典型是本进程
+            // 刚加入/保存、回执还没结算）。这时不能把它当更新的安装——否则等待写回
+            // 的加入回执会被自己的旧 TOML 作废。
+            let stale = self.published_before.as_ref().is_some_and(|before| {
+                before.transport == fresh.transport
+                    && before.webdav == fresh.webdav
+                    && before.file == fresh.file
+                    && before.s3 == fresh.s3
+                    && before.enabled == fresh.enabled
+            });
+            if stale {
+                return Ok(());
+            }
             let mut shared = lock(&self.shared.config);
             if self.shared.config_version.load(Ordering::Relaxed) != version {
                 drop(shared);
@@ -1396,6 +1500,7 @@ impl Worker {
     fn publish_local_config(&mut self) -> u64 {
         // 值与序号在同一把锁里提交：回执方在锁内比较序号，不会看到「新值 + 旧序号」。
         let mut guard = lock(&self.shared.config);
+        self.published_before = Some(guard.clone());
         *guard = self.config.clone();
         let seq = self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1;
         self.installed_seq = seq;
@@ -1413,9 +1518,15 @@ impl Worker {
                 return;
             }
             let old = std::mem::replace(&mut self.config, config);
-            *guard = self.config.clone();
-            let seq = self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1;
-            self.installed_seq = seq;
+            if self.config == old {
+                // 同一份配置（面板「重试」、同代次排队的重配）：不重复安装、
+                // 不推进序号——否则会把同一代次派发的加入/保存误判为过期。
+                self.installed_seq = latest;
+            } else {
+                *guard = self.config.clone();
+                let seq = self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                self.installed_seq = seq;
+            }
             old
         };
         let new = &self.config;
@@ -1642,18 +1753,23 @@ impl Worker {
             self.open(false).await;
             return Ok((joined, seq));
         }
-        let joined = space::join(
-            &self.shared.ctx.paths,
-            &self.config,
-            &mut self.secrets,
-            code,
-            &ready,
-        )
-        .await?;
+        let plan =
+            space::join_verify(&self.shared.ctx.paths, &self.config, &self.secrets, code).await?;
+        let lock_paths = self.shared.ctx.paths.clone();
+        let Some(_storage_lock) =
+            blocking(move || StorageLock::try_acquire(&lock_paths)).await?
+        else {
+            return Err(SyncError::other("存储设置正在保存，请稍后重试加入"));
+        };
+        if !ready() {
+            return Err(SyncError::other("同步设置在加入过程中被改动，请重试加入"));
+        }
+        let joined = plan.commit(&mut self.secrets).await?;
         // 配对码里带了存储设置的话，配置也跟着换：和同空间重加一样走同一次
         // 「安装 + 发布 + 推进序号」，回执带的就是这次安装的序号。
         self.config = joined.clone();
         let seq = self.publish_local_config();
+        drop(_storage_lock);
         self.open(false).await;
         Ok((joined, seq))
     }
@@ -1813,14 +1929,14 @@ impl Worker {
         };
         // 宿主没能把 `rclaw.toml` 补写成意图里的目标：先别绑定 secrets、也别删意图，
         // 否则下次启动只剩一份和 TOML 不一致的凭据，恢复依据就没了。
-        if !same_storage(&self.config, &intent.config) {
+        if !same_storage(&self.config, &intent.intent.config) {
             tracing::warn!("存储更新意图与当前配置的存储段不一致（TOML 还没补写），先保留");
             return Ok(());
         }
         let mut next = self.secrets.clone();
-        if let Some(secret) = intent.secret.as_deref().filter(|secret| !secret.is_empty()) {
-            if intent.config.transport != "file" {
-                next.set_storage_secret(&intent.config, secret.to_string())?;
+        if let Some(secret) = intent.intent.secret.as_deref().filter(|secret| !secret.is_empty()) {
+            if intent.intent.config.transport != "file" {
+                next.set_storage_secret(&intent.intent.config, secret.to_string())?;
             }
         }
         let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
@@ -1828,16 +1944,14 @@ impl Worker {
         self.secrets = next;
         // 只把存储设置（以及这次请求明确改过的设备名）搬过来：这期间别处改过的
         // 范围/通道以当前配置为准。
-        self.config.apply_storage_from(&intent.config);
-        if let Some(edit) = &intent.device_name_edit {
+        self.config.apply_storage_from(&intent.intent.config);
+        if let Some(edit) = &intent.intent.device_name_edit {
             if self.config.device_name == edit.from || self.config.device_name == edit.to {
                 self.config.device_name = edit.to.clone();
             }
         }
-        let (paths, id) = (self.shared.ctx.paths.clone(), intent.id);
-        blocking(move || storage_intent_clear_if(&paths, &id)).await?;
-        let paths = self.shared.ctx.paths.clone();
-        let _ = blocking(move || storage_intent_backup_clear(&paths)).await;
+        let (paths, from_backup) = (self.shared.ctx.paths.clone(), intent.from_backup);
+        blocking(move || storage_intent_settle(&paths, from_backup)).await?;
         self.shared.set_space(
             self.secrets
                 .is_paired()

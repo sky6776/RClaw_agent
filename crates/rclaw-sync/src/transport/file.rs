@@ -198,7 +198,21 @@ fn write_blocking_new(
         let written = write(&mut file).and_then(|()| file.sync_all());
         drop(file);
         written?;
-        std::fs::hard_link(&tmp, &path)
+        match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => Ok(()),
+            // 不支持硬链接的卷（exFAT/FAT32 的 U 盘）：退回「仅创建 + 直接写」。
+            // 仍然不覆盖已经存在的标记，只是失去整份原子落位（崩溃可能留下半个
+            // space.json，读回时校验不过会报错、由用户重试）。
+            Err(_) => {
+                let mut target = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                let mut source = std::fs::File::open(&tmp)?;
+                std::io::copy(&mut source, &mut target)?;
+                target.sync_all()
+            }
+        }
     })();
     match result {
         Ok(()) => {

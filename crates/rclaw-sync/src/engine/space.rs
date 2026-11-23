@@ -541,13 +541,33 @@ pub(crate) async fn create(ctx: &Ctx, config: &SyncConfig, secrets: &mut Secrets
 /// 用配对码加入一个已有的同步空间。先到存储上核对这个空间确实在、密钥对得上，再保存。
 /// 返回加入之后的配置（配对码里带了存储设置的话与原来不同），宿主负责把它写进
 /// `rclaw.toml`。
-pub(crate) async fn join(
+/// 加入的校验结果：远端已经核对过，剩下的是本机提交（写凭据 + 采用配置）。
+pub(crate) struct JoinPlan {
+    paths: SyncPaths,
+    joined: SyncConfig,
+    next: Secrets,
+}
+
+impl JoinPlan {
+    /// 本机提交：只写 secrets 并返回采用后的配置。调用方负责在协议锁内完成这一步
+    /// 以及随后的安装/发布（远端校验不占协议锁）。
+    pub(crate) async fn commit(self, secrets: &mut Secrets) -> Result<SyncConfig> {
+        let (paths, joined, next) = (self.paths, self.joined, self.next);
+        let saved = next.clone();
+        blocking(move || saved.save(&paths)).await?;
+        *secrets = next;
+        Ok(joined)
+    }
+}
+
+/// 加入的第一步：核对远端确实是这个空间、密钥对得上（不写本机任何东西）。本机提交
+/// 由调用方在存储协议锁内做——校验期间可能有人保存/关闭设置。
+pub(crate) async fn join_verify(
     paths: &SyncPaths,
     config: &SyncConfig,
-    secrets: &mut Secrets,
+    secrets: &Secrets,
     code: &str,
-    ready: &dyn Fn() -> bool,
-) -> Result<SyncConfig> {
+) -> Result<JoinPlan> {
     if secrets.is_paired() {
         return Err(SyncError::other(
             "本机已经在一个同步空间里了；要加入另一个，请先退出当前的",
@@ -559,15 +579,11 @@ pub(crate) async fn join(
     joined.validate()?;
     let live = load_live(&joined, &next).await?;
     remote::open_space(live.transport(), &live.keys, &next.space_id, false).await?;
-    // 远端校验花掉的时间裡宿主可能已经发布了更新的配置（甚至关闭了同步）：
-    // 落凭据之前复核，过期的加入不能把凭据和配置装回去。
-    if !ready() {
-        return Err(SyncError::other("同步设置在加入过程中被改动，请重试加入"));
-    }
-    let (paths, saved) = (paths.clone(), next.clone());
-    blocking(move || saved.save(&paths)).await?;
-    *secrets = next;
-    Ok(joined)
+    Ok(JoinPlan {
+        paths: paths.clone(),
+        joined,
+        next,
+    })
 }
 
 /// 退出同步空间：密钥与存储凭据从本机清掉，本机的同步状态回到「没同步过」。会话、记忆

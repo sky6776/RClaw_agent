@@ -360,6 +360,10 @@ impl SyncEngine {
     /// 没变的配置也交过去：面板上的「重试」就是把现有的配置再存一遍，没连上同步空间的
     /// 引擎线程收到之后会再试一次。线程自己退出了的话重新起一条。
     pub fn apply_config(&self, config: SyncConfig) {
+        // 先拿存储协议锁：宿主的配置发布和存储保存/加入提交串行，关闭同步之后
+        // 旧 worker 就不能再装回开启配置（锁序与保存协议一致：StorageLock → running）。
+        let paths = self.inner.ctx.paths.clone();
+        let _storage_lock = worker::StorageLock::acquire(&paths).ok();
         let mut running = lock(&self.inner.running);
         let host_seq = {
             // 值与版本、安装序号在同一把锁里提交：引擎线程只会在锁内看到成对的
@@ -370,6 +374,8 @@ impl SyncEngine {
             self.inner.config_version.fetch_add(1, Ordering::Relaxed);
             self.inner.config_seq.fetch_add(1, Ordering::Relaxed) + 1
         };
+        // 这次发布是一次显式改名：取消仍在等待的旧设备名编辑（凭据部分保留）。
+        let _ = worker::storage_intent_cancel_name_edit(&paths, &config.device_name);
         if !config.enabled {
             if let Some(running) = running.take() {
                 let _ = running.commands.send(Cmd::Stop);
@@ -704,9 +710,9 @@ impl SyncEngine {
         &self,
         config: SyncConfig,
         secret: Option<String>,
-        // 这次请求**明确修改**的设备名 `(原值, 目标值)`（向导里编辑过）：写进更新
-        // 意图，启动回补与 worker 收尾按它一并采用；`None` = 不负责设备名。
-        explicit_device_name: Option<(String, String)>,
+        // 这次请求**明确修改**的设备名目标（向导里编辑过）：原值取锁内合并时磁盘上
+        // 的当前名——向导打开时的基线可能早已过期。`None` = 不负责设备名。
+        explicit_device_name: Option<String>,
         merge: M,
         write: W,
     ) -> Result<()>
@@ -722,40 +728,38 @@ impl SyncEngine {
         // 耐久登记「更新意图」（含这次要绑的密码），再写 TOML、派发命令。意图没写上
         // 就停下：不能出现「TOML 已经是新存储、凭据却还绑在旧账户」而重启后无从恢复
         // 的状态。
-        let merged = blocking(move || merge(&config).map_err(SyncError::other)).await?;
-        // 先记下上一条仍可执行的意图：这次 TOML 确定没写成就把它原样恢复——新的
-        // 这次没有生效，不能把上一次「TOML 已写、凭据还没补」的恢复依据带走。
-        let previous = worker::storage_intent_load(&paths)?;
-        if let Some(prev) = &previous {
-            // 覆盖旧记录之前先留一份备份：新一次若在 TOML 落盘前失败、连回滚写也
-            // 失败，启动还能按磁盘上的实际存储段挑回旧记录。
-            let _ = worker::storage_intent_backup_save(&paths, prev);
+        let mut merged = blocking(move || merge(&config).map_err(SyncError::other)).await?;
+        // 明确改名：原值取锁内读到的磁盘名（不是向导打开时的旧基线），再把目标写进
+        // 要落盘的配置。
+        let device_edit = explicit_device_name.and_then(|to| {
+            if merged.device_name == to {
+                None
+            } else {
+                let edit = (merged.device_name.clone(), to.clone());
+                merged.device_name = to;
+                Some(edit)
+            }
+        });
+        // 最后一份 TOML 已提交的记录先放进备份：新请求在这之后任何一步失败，启动
+        // 都能按磁盘存储段找回它；备份都写不成就别动任何东西。
+        if let Some(prev) = worker::storage_intent_last_written(&paths)? {
+            worker::storage_intent_backup_save(&paths, &prev)?;
         }
-        let id = worker::storage_intent_save(
-            &paths,
-            &merged,
-            secret.as_deref(),
-            explicit_device_name,
-        )?;
+        let id =
+            worker::storage_intent_save(&paths, &merged, secret.as_deref(), device_edit)?;
         let written = {
             let target = merged.clone();
             blocking(move || write(&target).map_err(SyncError::other)).await
         };
         if let Err(error) = written {
-            match &previous {
-                Some(prev) if prev.id != id => {
-                    // 回滚成功才清备份；写不回去就把它留给启动阶段判断。
-                    if worker::storage_intent_restore(&paths, prev).is_ok() {
-                        let _ = worker::storage_intent_backup_clear(&paths);
-                    }
-                }
-                // 同一请求重试复用了标识：记录仍是这一笔的，留着。
-                Some(_) => {}
-                None => {
-                    let _ = worker::storage_intent_clear_if(&paths, &id);
-                }
-            }
+            // 确定 TOML 没换成：删掉这次的主记录（它从没生效）；备份里的上一份仍
+            // 可按磁盘存储段恢复。
+            let _ = worker::storage_intent_clear_if(&paths, &id);
             return Err(error);
+        }
+        // TOML 已写成：这一条从此有资格在启动时被采用（要等密码补上才结算）。
+        if let Err(error) = worker::storage_intent_mark_written(&paths, &id) {
+            tracing::warn!("记录存储设置的提交状态失败: {error}");
         }
         let config = merged;
         let seq = self
@@ -765,8 +769,9 @@ impl SyncEngine {
                 reply,
             })
             .await?;
-        worker::storage_intent_clear_if(&paths, &id)?;
-        let _ = worker::storage_intent_backup_clear(&paths);
+        // 密码已经绑定、配置已经生效：先删落选的备份，再删主记录（中途中断时
+        // 胜出记录还在，下次启动接着结算同一笔）。
+        worker::storage_intent_settle(&paths, false)?;
         {
             // 发布顺序跟随 worker 的安装顺序：回执号不是当前最新的安装（期间又装了
             // 别的配置）就不发布这一份，让最后安装的那条路径去发布。
@@ -1118,7 +1123,10 @@ pub async fn join_space_offline(
             secrets.key.clear();
         }
     }
-    space::join(&paths, config, &mut secrets, code.trim(), &|| true).await
+    let plan = space::join_verify(&paths, config, &secrets, code.trim()).await?;
+    let lock_paths = paths.clone();
+    let _lock = blocking(move || worker::StorageLock::acquire(&lock_paths)).await?;
+    plan.commit(&mut secrets).await
 }
 
 #[cfg(test)]

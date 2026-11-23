@@ -2990,6 +2990,8 @@ pub async fn config_save(state: State<'_, AppState>, edits: Vec<ConfigEdit>) -> 
     tauri::async_runtime::spawn_blocking(move || config_save_edits(&home, &edits))
         .await
         .map_err(|e| format!("保存配置失败: {e}"))??;
+    // 发布要自己取协议锁（见 apply_config）：先把写盘用的锁放掉。
+    drop(_lock);
     // `[sync]` 的改动马上生效（开关、存储、范围……），不用等重启。
     if touches_sync {
         sync::reload_config(&state).await;
@@ -3032,6 +3034,8 @@ pub async fn config_import_raw(
     tauri::async_runtime::spawn_blocking(move || config_import_raw_for(&home, &content))
         .await
         .map_err(|e| format!("导入配置失败: {e}"))??;
+    // 配置发布要自己取协议锁（见 apply_config）：先把导入用的锁放掉。
+    drop(_lock);
     // 导入即完成配置落盘：与 wizard_save 同路径启动 agent。此前只写文件不
     // 启动——App 启动时无配置则 agent 不会被拉起，导入后 UI 永久卡「正在启动」。
     agent::start_agent(app, state.home.clone()).await?;

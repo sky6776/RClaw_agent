@@ -94,6 +94,8 @@ async fn save_and_apply(
     let saved = config.clone();
     let write_home = home.clone();
     run_blocking("保存同步设置", move || persist(&write_home, &saved)).await?;
+    // 发布要自己取协议锁（见 apply_config），先把这把放掉，别在同一个线程上重入。
+    drop(_lock);
     engine.apply_config(config);
     crate::sync_host::emit_status();
     Ok(())
@@ -119,9 +121,9 @@ async fn save_with_secret(
     let merge_home = home.clone();
     let write_home = home.clone();
     // 只有向导里真的编辑过（草稿与打开时的名字不同）才算这次请求明确改了设备名。
+    // 只传「用户明确改过名」的目标；原值由引擎在锁内按磁盘最新一名判定。
     let explicit_device_name = device_name_baseline.as_deref().and_then(|baseline| {
-        (config.device_name != baseline)
-            .then(|| (baseline.to_string(), config.device_name.clone()))
+        (config.device_name != baseline).then(|| config.device_name.clone())
     });
     engine
         .save_storage_with(
@@ -135,12 +137,6 @@ async fn save_with_secret(
                 let mut merged = before.clone();
                 merged.apply_storage_from(proposed);
                 merged.enabled = proposed.enabled;
-                if device_name_baseline
-                    .as_deref()
-                    .is_some_and(|baseline| proposed.device_name != baseline)
-                {
-                    merged.device_name = proposed.device_name.clone();
-                }
                 Ok(merged)
             },
             move |merged| persist(&write_home, merged),
