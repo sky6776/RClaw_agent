@@ -401,6 +401,8 @@ struct Worker {
     /// 没连上同步空间时，下次再试的时刻；`None` = 等用户动手（改配置、填密码、配对）。
     reopen_at: Option<Instant>,
     standby_tries: u32,
+    /// 换了存储设置但上一刻还有在途提交：连接还没重建，下一轮开头再试。
+    pending_switch: bool,
 }
 
 impl Worker {
@@ -431,6 +433,7 @@ impl Worker {
             next_tick: now,
             reopen_at: None,
             standby_tries: 0,
+            pending_switch: false,
         }
     }
 
@@ -550,6 +553,16 @@ impl Worker {
 
     /// 跑一轮。失败时返回原因（给等着结果的调用方看）。
     async fn run_round(&mut self, kind: Kind) -> std::result::Result<(), String> {
+        // 上一刻没能重建的连接（换存储设置时有在途提交）：每轮开头再试。
+        if self.pending_switch && self.session.is_some() {
+            if self.teardown().await {
+                self.pending_switch = false;
+                self.open().await;
+            } else {
+                self.request(Kind::Full, RETRY_MIN);
+                return Ok(());
+            }
+        }
         // 已经约好的也算在这一轮里。
         let pending = self.next.take();
         let Some(session) = self.session.as_mut() else {
@@ -1071,8 +1084,9 @@ impl Worker {
         }
         if storage {
             if !self.teardown().await {
-                // 没换成就退回旧配置：运行中的连接与配置保持一致，稍后再试。
-                self.config = old;
+                // 还有在途的提交阶段：配置已经是新的，连接留到下一轮开头再重建
+                // （不能退回旧配置——宿主与 TOML 都已经换成新的了）。
+                self.pending_switch = true;
                 self.request(Kind::Full, RETRY_MIN);
                 return;
             }
@@ -1207,17 +1221,28 @@ impl Worker {
             if !self.teardown().await {
                 return Err(SyncError::other("还有在途的附件提交，稍后再重新加入"));
             }
-            let live = space::load_live(&joined, &next).await?;
-            crate::remote::open_space(
-                live.transport(),
-                &live.keys,
-                &next.space_id,
-                false,
-            )
-            .await?;
+            let verified = match space::load_live(&joined, &next).await {
+                Ok(live) => {
+                    crate::remote::open_space(
+                        live.transport(),
+                        &live.keys,
+                        &next.space_id,
+                        false,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = verified {
+                self.open().await;
+                return Err(error);
+            }
             let paths = self.shared.ctx.paths.clone();
             let saved = next.clone();
-            blocking(move || saved.save(&paths)).await?;
+            if let Err(error) = blocking(move || saved.save(&paths)).await {
+                self.open().await;
+                return Err(error);
+            }
             self.secrets = next;
             self.config = joined.clone();
             self.open().await;
@@ -1270,10 +1295,21 @@ impl Worker {
 
     async fn set_secret(&mut self, secret: String) -> Result<()> {
         self.require_owner()?;
+        // 换密码要重建连接：先确认能换（在途提交会拒绝），换不成时本机什么都不改。
+        if self.secrets.is_paired() && !self.teardown().await {
+            return Err(SyncError::other("还有在途的附件提交，稍后重试保存"));
+        }
         let mut next = self.secrets.clone();
-        next.set_storage_secret(&self.config, secret)?;
+        if let Err(error) = next.set_storage_secret(&self.config, secret) {
+            self.open().await;
+            return Err(error);
+        }
         let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
-        blocking(move || saved.save(&paths)).await?;
+        if let Err(error) = blocking(move || saved.save(&paths)).await {
+            // 已经 teardown 过：把旧的连接恢复回来，别让同步停在 sealed 状态。
+            self.open().await;
+            return Err(error);
+        }
         self.secrets = next;
         self.shared.set_space(
             self.secrets
@@ -1282,10 +1318,6 @@ impl Worker {
             self.secret_saved(),
         );
         if self.secrets.is_paired() {
-            // 换了密码：存储的客户端要重新组装。
-            if !self.teardown().await {
-                return Err(SyncError::other("还有在途的附件提交，稍后重试保存"));
-            }
             self.open().await;
         }
         Ok(())
@@ -1300,14 +1332,25 @@ impl Worker {
     /// 按记录把剩下的一半补上，两边收敛到同一套。
     async fn save_storage(&mut self, config: SyncConfig, secret: Option<String>) -> Result<()> {
         self.require_owner()?;
+        // 换连接前先确认在途提交能退场：退不了时本机什么都不改（TOML 已经是新的，
+        // 意图还在，重启时由恢复流程收敛）。
+        if self.secrets.is_paired() && !self.teardown().await {
+            return Err(SyncError::other("还有在途的附件提交，稍后重试保存"));
+        }
         let mut next = self.secrets.clone();
         if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
             if config.transport != "file" {
-                next.set_storage_secret(&config, secret)?;
+                if let Err(error) = next.set_storage_secret(&config, secret) {
+                    self.open().await;
+                    return Err(error);
+                }
             }
         }
         let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
-        blocking(move || saved.save(&paths)).await?;
+        if let Err(error) = blocking(move || saved.save(&paths)).await {
+            self.open().await;
+            return Err(error);
+        }
         self.secrets = next;
         self.config = config;
         self.shared.set_space(
@@ -1317,9 +1360,6 @@ impl Worker {
             self.secret_saved(),
         );
         if self.secrets.is_paired() {
-            if !self.teardown().await {
-                return Err(SyncError::other("还有在途的附件提交，稍后重试保存"));
-            }
             self.open().await;
         }
         Ok(())
