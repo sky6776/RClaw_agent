@@ -1244,6 +1244,8 @@ impl Worker {
                 tracing::warn!("没存完的存储设置收尾失败（下次打开再试）: {error}");
             }
         } else if resume_intent {
+            // 宿主发布触发的重连：结算前必须按磁盘确认，不能用缓存配置（缓存可能
+            // 落后于另一进程刚写的 TOML，按它选意图会误删真正落盘那一笔）。
             match self.resume_storage_intent(false, true).await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -2054,8 +2056,9 @@ impl Worker {
             self.secret_saved(),
         );
         if self.secrets.is_paired() {
-            // 本次保存的 TOML/配置已装上：顺带结算可能存在的其它意图。
-            self.open(false, true).await;
+            // 用刚安装的配置和已落盘的凭据直接重开：这次保存的意图由持锁宿主在
+            // 回执后结算，不必在发回执前去抢宿主仍持有的协议锁（否则连接白断 30 秒）。
+            self.open(false, false).await;
         }
         Ok(seq)
     }
@@ -2079,7 +2082,23 @@ impl Worker {
             }
         };
         let paths = self.shared.ctx.paths.clone();
-        let disk = self.config.clone();
+        // 权威磁盘配置：锁内重读宿主配置文件（有回调时）。拿不到就保留意图、
+        // 等下一次确认——不能拿缓存配置当磁盘去选/结算。
+        let disk = if locked {
+            self.config.clone()
+        } else if let Some(refresh) = self.shared.refresh_config.clone() {
+            match blocking(move || {
+                refresh().map_err(|()| SyncError::other("读取同步设置失败"))
+            })
+            .await
+            {
+                Ok(Some(config)) => config,
+                // 文件暂时读不出来：保留意图，等下一次权威打开。
+                _ => return Ok(true),
+            }
+        } else {
+            self.config.clone()
+        };
         let Some(intent) = blocking(move || storage_intent_effective(&paths, &disk)).await? else {
             return Ok(true);
         };

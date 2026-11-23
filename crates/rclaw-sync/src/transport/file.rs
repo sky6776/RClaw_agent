@@ -190,34 +190,28 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
     // `\\?\C:...`、UNC `\\?\UNC\server...`）让深层目录也能发布（Rust 的临时文件/
     // 目录 API 已经走扩展路径）。
     fn wide_long(path: &Path) -> Vec<u16> {
-        // 先规范化父目录：Rust 在 Windows 上返回已带 `\\?\` 的规范绝对路径，
-        // 顺带消掉正斜杠、`.`/`..` 与相对路径。目标文件名可能还不存在，只拼叶子。
-        let canonical = path
-            .parent()
-            .and_then(|parent| std::fs::canonicalize(parent).ok())
-            .map(|parent| match path.file_name() {
-                Some(name) => parent.join(name),
-                None => parent,
-            });
-        let path = canonical.as_deref().unwrap_or(path);
-        let text = path.to_string_lossy();
-        // 规范化失败（极少数卷/权限情形）：至少把正斜杠换成原生分隔符，再按绝对/
-        // UNC 形式加扩展前缀。
-        let text = if canonical.is_none() && text.contains('/') {
-            std::borrow::Cow::Owned(text.replace('/', "\\"))
-        } else {
-            text
-        };
-        let text = if text.starts_with(r"\\?\") {
-            text.into_owned()
-        } else if let Some(rest) = text.strip_prefix(r"\\") {
-            format!(r"\\?\UNC\{rest}")
-        } else if path.is_absolute() {
-            format!(r"\\?\{text}")
-        } else {
-            text.into_owned()
-        };
-        text.encode_utf16().chain(std::iter::once(0)).collect()
+        use std::os::windows::ffi::OsStrExt;
+        // 规范化父目录得到 verbatim（`\?\`）绝对路径，消掉正斜杠、`.`/`..` 与
+        // 相对路径；目标文件名可能还不存在，只拼叶子。路径全程按 UTF-16 编码，
+        // 不做 to_string_lossy——否则含未配对代理单元的目录名会被替换成 U+FFFD，
+        // 找不到已写好的临时文件。
+        if let Some(parent) = path.parent() {
+            if let Ok(parent) = std::fs::canonicalize(parent) {
+                let full = match path.file_name() {
+                    Some(name) => parent.join(name),
+                    None => parent,
+                };
+                return full
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+            }
+        }
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
     let from: Vec<u16> = wide_long(tmp);
     let to: Vec<u16> = wide_long(path);
