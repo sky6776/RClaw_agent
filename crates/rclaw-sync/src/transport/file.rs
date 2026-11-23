@@ -190,7 +190,24 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
     // `\\?\C:...`、UNC `\\?\UNC\server...`）让深层目录也能发布（Rust 的临时文件/
     // 目录 API 已经走扩展路径）。
     fn wide_long(path: &Path) -> Vec<u16> {
+        // 先规范化父目录：Rust 在 Windows 上返回已带 `\\?\` 的规范绝对路径，
+        // 顺带消掉正斜杠、`.`/`..` 与相对路径。目标文件名可能还不存在，只拼叶子。
+        let canonical = path
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .map(|parent| match path.file_name() {
+                Some(name) => parent.join(name),
+                None => parent,
+            });
+        let path = canonical.as_deref().unwrap_or(path);
         let text = path.to_string_lossy();
+        // 规范化失败（极少数卷/权限情形）：至少把正斜杠换成原生分隔符，再按绝对/
+        // UNC 形式加扩展前缀。
+        let text = if canonical.is_none() && text.contains('/') {
+            std::borrow::Cow::Owned(text.replace('/', "\\"))
+        } else {
+            text
+        };
         let text = if text.starts_with(r"\\?\") {
             text.into_owned()
         } else if let Some(rest) = text.strip_prefix(r"\\") {

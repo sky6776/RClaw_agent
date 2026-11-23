@@ -23,6 +23,30 @@ pub async fn read_space(transport: &dyn SyncTransport) -> Result<Option<SpaceFil
     }
 }
 
+/// 仅创建空间标记；目标已存在（另一个进程刚写入）时读回并核对，而不是把底层
+/// 创建错误直接抛给调用方。
+async fn create_marker(
+    transport: &dyn SyncTransport,
+    keys: &Keys,
+    space_id: &str,
+) -> Result<()> {
+    let file = SpaceFile::new(keys, space_id);
+    if let Err(error) = transport::put_new_checked(transport, SPACE_FILE, file.encode()?).await {
+        match read_space(transport).await {
+            Ok(Some(existing)) => {
+                existing.verify(keys, space_id)?;
+                if existing.closed {
+                    return Err(SyncError::SpaceClosed);
+                }
+                Ok(())
+            }
+            _ => Err(error.into()),
+        }
+    } else {
+        Ok(())
+    }
+}
+
 /// 核对远端确实是本机所在的空间。`create` 为真时（本机创建了这个空间）不存在就写一个。
 pub async fn open_space(
     transport: &dyn SyncTransport,
@@ -54,10 +78,8 @@ pub async fn open_space(
                     }
                 },
                 None => {
-                    // 已经被人删掉了：按缺失走仅创建。
-                    let file = SpaceFile::new(keys, space_id);
-                    transport::put_new_checked(transport, SPACE_FILE, file.encode()?).await?;
-                    return Ok(());
+                    // 已经被人删掉了：按缺失走仅创建（冲突时读回校验）。
+                    return create_marker(transport, keys, space_id).await;
                 }
             }
         }
@@ -71,26 +93,7 @@ pub async fn open_space(
             }
             Ok(())
         }
-        None if create => {
-            let file = SpaceFile::new(keys, space_id);
-            let body = file.encode()?;
-            // 仅创建：读到这里「不存在」之后，另一个进程可能刚标了关闭/建了空间。
-            // 迟到（被取消的恢复任务、慢写入）的创建不能把已有的关闭标记改回开放。
-            if let Err(error) = transport::put_new_checked(transport, SPACE_FILE, body).await {
-                match read_space(transport).await {
-                    Ok(Some(file)) => {
-                        file.verify(keys, space_id)?;
-                        if file.closed {
-                            return Err(SyncError::SpaceClosed);
-                        }
-                        Ok(())
-                    }
-                    _ => Err(error.into()),
-                }
-            } else {
-                Ok(())
-            }
-        }
+        None if create => create_marker(transport, keys, space_id).await,
         None => Err(SyncError::other(
             "存储目录里还没有这个同步空间（可能文件还没同步过来，或存储地址填的不是同一个目录）",
         )),

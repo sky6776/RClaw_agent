@@ -367,7 +367,9 @@ pub(crate) fn storage_intent_effective(
         // 或「TOML 已写、意图还没盖上代次」都不会把唯一可恢复的记录排除掉。
         let replace = match &best {
             None => true,
-            Some(current) => (intent.commit, intent.req) > (current.intent.commit, current.intent.req),
+            // 请求序号是协议锁内全局单调的（跨存储代次也递增），先按它排；代次只做
+            // 平局时的次序。这样提交文件缺失（代次读成 0）时新请求不会输给旧备份。
+            Some(current) => (intent.req, intent.commit) > (current.intent.req, current.intent.commit),
         };
         if replace {
             best = Some(EffectiveIntent {
@@ -786,7 +788,7 @@ impl Worker {
 
     async fn run(mut self) {
         // 打开连接时会在协议锁里确认磁盘上的同步设置（见 [`Worker::open`]）。
-        self.open(true).await;
+        self.open(true, false).await;
         loop {
             self.revive_transfers();
             let wake = self.deadline();
@@ -826,7 +828,7 @@ impl Worker {
             if self.reopen_at.is_some_and(|at| at <= now) {
                 self.reopen_at = None;
                 // 待机接手/重试打开前再确认一次配置：这期间另一个进程可能保存过设置。
-                self.open(true).await;
+                self.open(true, false).await;
             }
             return;
         }
@@ -915,7 +917,7 @@ impl Worker {
                 self.pending_switch = false;
                 self.switch_failed = false;
                 self.switch_tries = 0;
-                self.open(false).await;
+                self.open(false, true).await;
                 // open() 给新连接约了「立即一轮 Full」；这次调用接下来就会亲自跑它
                 // （新 session 没预热，kind 会被抬成 Full）。不消费的话同一轮会再跑
                 // 一次，残留的立即时刻还会把之后的延迟重试提前。
@@ -1115,7 +1117,7 @@ impl Worker {
 
     /// 连上本机所在的同步空间：拿引擎锁、读密钥、组装存储、准备本机的同步数据、起附件
     /// 任务，然后约第一轮。哪一步不成就停在相应的状态上。
-    async fn open(&mut self, confirm: bool) {
+    async fn open(&mut self, confirm: bool, resume_intent: bool) {
         if self.session.is_some() {
             return;
         }
@@ -1234,12 +1236,23 @@ impl Worker {
         // 上次没存完的存储设置先收尾（secrets 按 TOML 里的目标补写），两个文件才是一套。
         // 放在空间切换恢复之前：恢复要按「这个账户」的当前凭据去开存储，先让配置与
         // secrets 收敛到同一套。
-        // 只有在协议锁内按磁盘权威配置打开时才收尾存储意图：`open(false)`（宿主持锁
-        // 保存后的重连、断线重连）用的是缓存配置，拿它推进代次/清意图会误删真正
-        // 落盘的那一笔；这些路径留给下一次权威打开或宿主结算。
+        // 收尾存储意图：协议锁内按磁盘权威配置打开时一定结算；宿主配置发布触发的
+        // 重连（`resume_intent`）也允许结算——但拿到锁失败就整次让行、安排下一次
+        // 权威打开，别拿缓存配置去连一个凭据还没补上的存储。
         if protocol_lock.is_some() {
-            if let Err(error) = self.resume_storage_intent(true).await {
+            if let Err(error) = self.resume_storage_intent(true, true).await {
                 tracing::warn!("没存完的存储设置收尾失败（下次打开再试）: {error}");
+            }
+        } else if resume_intent {
+            match self.resume_storage_intent(false, true).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!("没存完的存储设置收尾失败（下次打开再试）: {error}");
+                }
             }
         }
         // 配置、密钥与意图都已经收敛到同一套：保存协议锁到这里就可以放了。
@@ -1498,7 +1511,7 @@ impl Worker {
                 self.background = false;
                 self.hold_until = None;
                 if self.session.is_none() {
-                    self.open(true).await;
+                    self.open(true, false).await;
                 }
                 self.next_tick = Instant::now() + self.tick_every();
                 self.schedule_poll();
@@ -1586,7 +1599,7 @@ impl Worker {
 
     async fn sync_now(&mut self) -> Result<()> {
         if self.session.is_none() {
-            self.open(true).await;
+            self.open(true, false).await;
         }
         let Some(session) = self.session.as_mut() else {
             return Err(self.unavailable());
@@ -1657,8 +1670,9 @@ impl Worker {
             || old.device_name != new.device_name;
         if self.session.is_none() {
             // 之前没连上（设置不全、存储组装不起来、本机这边没准备好）：再试一次。配置没变
-            // 也试——面板上的「重试」就是把现有的配置再交过来一遍。
-            self.open(false).await;
+            // 也试——面板上的「重试」就是把现有的配置再交过来一遍。宿主发布来的配置
+            // 是从磁盘读的，允许顺带结算存储意图。
+            self.open(false, true).await;
             return;
         }
         if old == self.config {
@@ -1693,7 +1707,7 @@ impl Worker {
                 self.request(Kind::Full, RETRY_MIN);
                 return;
             }
-            self.open(false).await;
+            self.open(false, false).await;
             return;
         }
         if range {
@@ -1798,7 +1812,7 @@ impl Worker {
         self.require_owner()?;
         self.config.validate()?;
         space::create(&self.shared.ctx, &self.config, &mut self.secrets).await?;
-        self.open(false).await;
+        self.open(false, false).await;
         Ok(())
     }
 
@@ -1826,7 +1840,7 @@ impl Worker {
                 // 完全没变化：不用换凭据；但如果当前没连着（断网后重试同一配对码），
                 // 顺手重连一次。
                 if self.session.is_none() {
-                    self.open(false).await;
+                    self.open(false, false).await;
                 }
                 // 幂等：配置没变，写盘资格属于当初安装这份配置的那次提交。
                 return Ok((joined, self.installed_seq));
@@ -1849,26 +1863,34 @@ impl Worker {
                 Err(error) => Err(error),
             };
             if let Err(error) = verified {
-                self.open(false).await;
+                self.open(false, false).await;
                 return Err(error);
             }
             // 和首次加入一样：凭据提交与代次推进在存储协议锁内，不能挤出另一笔
             // 正在持锁的保存（那笔的恢复依据会被这里推进代次时误删）。
             let lock_paths = self.shared.ctx.paths.clone();
-            let Some(_storage_lock) =
-                blocking(move || StorageLock::try_acquire(&lock_paths)).await?
-            else {
-                self.open(false).await;
-                return Err(SyncError::other("存储设置正在保存，请稍后重试加入"));
+            let acquired = blocking(move || StorageLock::try_acquire(&lock_paths)).await;
+            let _storage_lock = match acquired {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    self.open(false, false).await;
+                    return Err(SyncError::other("存储设置正在保存，请稍后重试加入"));
+                }
+                Err(error) => {
+                    // 锁文件本身出错（I/O）：旧连接已经拆掉，恢复它并把这个错误
+                    // 如实交给加入方，别留下一个没有 session 的 worker。
+                    self.open(false, false).await;
+                    return Err(error);
+                }
             };
             if !ready() {
-                self.open(false).await;
+                self.open(false, false).await;
                 return Err(SyncError::other("同步设置在加入过程中被改动，请重试加入"));
             }
             let paths = self.shared.ctx.paths.clone();
             let saved = next.clone();
             if let Err(error) = blocking(move || saved.save(&paths)).await {
-                self.open(false).await;
+                self.open(false, false).await;
                 return Err(error);
             }
             self.secrets = next;
@@ -1878,7 +1900,7 @@ impl Worker {
             let _ = storage_commit_advance(&self.shared.ctx.paths, &joined);
             let seq = self.publish_local_config();
             drop(_storage_lock);
-            self.open(false).await;
+            self.open(false, false).await;
             return Ok((joined, seq));
         }
         let plan =
@@ -1900,7 +1922,7 @@ impl Worker {
         let _ = storage_commit_advance(&self.shared.ctx.paths, &joined);
         let seq = self.publish_local_config();
         drop(_storage_lock);
-        self.open(false).await;
+        self.open(false, false).await;
         Ok((joined, seq))
     }
 
@@ -1934,7 +1956,7 @@ impl Worker {
         }
         let result = space::leave(&self.shared.ctx, &self.config, &mut self.secrets, None).await;
         // 退出成功就停在「还没配对」；没成功就照旧连回去。
-        self.open(false).await;
+        self.open(false, false).await;
         result
     }
 
@@ -1945,7 +1967,7 @@ impl Worker {
             return Err(SyncError::other("还有在途的附件提交，稍后再重置"));
         }
         let result = space::reset(&self.shared.ctx, &self.config, &mut self.secrets).await;
-        self.open(false).await;
+        self.open(false, false).await;
         result
     }
 
@@ -1967,13 +1989,13 @@ impl Worker {
         }
         let mut next = self.secrets.clone();
         if let Err(error) = next.set_storage_secret(&self.config, secret) {
-            self.open(false).await;
+            self.open(false, false).await;
             return Err(error);
         }
         let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
         if let Err(error) = blocking(move || saved.save(&paths)).await {
             // 已经 teardown 过：把旧的连接恢复回来，别让同步停在 sealed 状态。
-            self.open(false).await;
+            self.open(false, false).await;
             return Err(error);
         }
         self.secrets = next;
@@ -1984,7 +2006,7 @@ impl Worker {
             self.secret_saved(),
         );
         if self.secrets.is_paired() {
-            self.open(false).await;
+            self.open(false, false).await;
         }
         Ok(())
     }
@@ -2011,14 +2033,14 @@ impl Worker {
         if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
             if config.transport != "file" {
                 if let Err(error) = next.set_storage_secret(&config, secret) {
-                    self.open(false).await;
+                    self.open(false, false).await;
                     return Err(error);
                 }
             }
         }
         let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
         if let Err(error) = blocking(move || saved.save(&paths)).await {
-            self.open(false).await;
+            self.open(false, false).await;
             return Err(error);
         }
         self.secrets = next;
@@ -2032,7 +2054,8 @@ impl Worker {
             self.secret_saved(),
         );
         if self.secrets.is_paired() {
-            self.open(false).await;
+            // 本次保存的 TOML/配置已装上：顺带结算可能存在的其它意图。
+            self.open(false, true).await;
         }
         Ok(seq)
     }
@@ -2040,7 +2063,8 @@ impl Worker {
     /// 上次没存完的存储设置：`rclaw.toml` 在保存时已经先写成新的一套，secrets 是命令
     /// 失败没写上的那一半。按记录的配置把密码绑上、落盘（配置以记录为准——密码是按它
     /// 绑的），两边收敛到同一套，然后删记录。
-    async fn resume_storage_intent(&mut self, locked: bool) -> Result<()> {
+    /// 返回 `Ok(false)` 表示「需要权威配置但我们拿不到协议锁」：调用方应让行。
+    async fn resume_storage_intent(&mut self, locked: bool, required: bool) -> Result<bool> {
         let paths = self.shared.ctx.paths.clone();
         // 调用方（打开连接时的配置确认）已经持着协议锁时不再重复拿：同一进程对同一
         // 把文件锁再拿一次会永远等自己。否则非阻塞地拿：宿主正拿着协议锁在保存时这次
@@ -2050,19 +2074,20 @@ impl Worker {
         } else {
             match blocking(move || StorageLock::try_acquire(&paths)).await? {
                 Some(lock) => Some(lock),
-                None => return Ok(()),
+                None if required => return Ok(false),
+                None => return Ok(true),
             }
         };
         let paths = self.shared.ctx.paths.clone();
         let disk = self.config.clone();
         let Some(intent) = blocking(move || storage_intent_effective(&paths, &disk)).await? else {
-            return Ok(());
+            return Ok(true);
         };
         // 宿主没能把 `rclaw.toml` 补写成意图里的目标：先别绑定 secrets、也别删意图，
         // 否则下次启动只剩一份和 TOML 不一致的凭据，恢复依据就没了。
         if !same_storage(&self.config, &intent.intent.config) {
             tracing::warn!("存储更新意图与当前配置的存储段不一致（TOML 还没补写），先保留");
-            return Ok(());
+            return Ok(true);
         }
         let mut next = self.secrets.clone();
         if let Some(secret) = intent.intent.secret.as_deref().filter(|secret| !secret.is_empty()) {
@@ -2089,7 +2114,7 @@ impl Worker {
                 .then(|| self.secrets.space_id.clone()),
             self.secret_saved(),
         );
-        Ok(())
+        Ok(true)
     }
 
     async fn confirm_metered(&mut self) -> Result<()> {
