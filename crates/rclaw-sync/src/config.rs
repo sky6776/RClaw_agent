@@ -207,6 +207,15 @@ impl Scopes {
 }
 
 impl SyncConfig {
+    /// 把另一份配置里的存储设置搬过来（范围、通道、设备名等不动）。存储更新意图只应该
+    /// 影响存储目标与凭据绑定：这期间别处改过的范围不能被一份旧意图回退。
+    pub fn apply_storage_from(&mut self, other: &SyncConfig) {
+        self.transport = other.transport.clone();
+        self.webdav = other.webdav.clone();
+        self.file = other.file.clone();
+        self.s3 = other.s3.clone();
+    }
+
     /// 结构校验：拼错的传输名、范围名、通道名在启动期就报出来。
     pub fn validate(&self) -> Result<()> {
         if !matches!(self.transport.as_str(), "webdav" | "file" | "s3") {

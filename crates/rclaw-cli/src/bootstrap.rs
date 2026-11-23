@@ -569,13 +569,20 @@ pub async fn assemble_core_with(
     let mut sync_config = cfg.sync.clone();
     let sync_paths = rclaw_sync::SyncPaths::new(&data_root);
     match rclaw_sync::storage_intent_config(&sync_paths) {
-        Ok(Some(intent)) if intent != sync_config => {
-            match crate::sync::save_sync_config(&sync_config_path, &sync_config, &intent) {
-                Ok(()) => sync_config = intent,
-                Err(error) => tracing::warn!("补齐没存完的存储设置失败（下次启动再试）: {error}"),
+        Ok(Some(intent)) => {
+            // 意图只补存储设置：这期间别处改过的范围/通道不能被一份旧意图回退。
+            let mut merged = sync_config.clone();
+            merged.apply_storage_from(&intent);
+            if merged != sync_config {
+                match crate::sync::save_sync_config(&sync_config_path, &sync_config, &merged) {
+                    Ok(()) => sync_config = merged,
+                    Err(error) => {
+                        tracing::warn!("补齐没存完的存储设置失败（下次启动再试）: {error}")
+                    }
+                }
             }
         }
-        Ok(_) => {}
+        Ok(None) => {}
         Err(error) => tracing::warn!("读取没存完的存储设置失败: {error}"),
     }
     let sync = crate::sync::SyncSeed::new(

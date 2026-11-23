@@ -1252,7 +1252,8 @@ impl Worker {
         let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
         blocking(move || saved.save(&paths)).await?;
         self.secrets = next;
-        self.config = intent.config;
+        // 只把存储设置搬过来：这期间别处改过的范围/通道以当前配置为准。
+        self.config.apply_storage_from(&intent.config);
         let (paths, id) = (self.shared.ctx.paths.clone(), intent.id);
         blocking(move || storage_intent_clear_if(&paths, &id)).await?;
         self.shared.set_space(
