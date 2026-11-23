@@ -130,6 +130,9 @@ pub(crate) struct Shared {
     pub config: Arc<Mutex<SyncConfig>>,
     /// 共享配置的版本（见 [`Inner::config_version`]）：引擎线程提交磁盘确认前复核。
     pub config_version: Arc<std::sync::atomic::AtomicU64>,
+    /// 引擎线程实际安装过的配置序号：保存/加入的回执带着它，宿主只在「没有更新的
+    /// 安装」时才发布自己那一份——发布顺序跟随 worker 的提交顺序，而不是回执到达顺序。
+    pub config_seq: Arc<std::sync::atomic::AtomicU64>,
     view: Mutex<local::View>,
     /// 上次拉取成功的时刻（Unix 毫秒）。
     pub last_pull_ms: AtomicI64,
@@ -167,6 +170,7 @@ impl Shared {
             refresh_config: inner.refresh_config.clone(),
             config: inner.config.clone(),
             config_version: inner.config_version.clone(),
+            config_seq: inner.config_seq.clone(),
             view: Mutex::new(local::View {
                 state: "syncing",
                 ..local::View::default()
@@ -287,6 +291,7 @@ struct Inner {
     /// 引擎线程从磁盘确认存储段前记下版本，提交合并时发现变了就重读，避免把较早读到
     /// 的存储段写回已经换了设置的那一份。
     config_version: Arc<std::sync::atomic::AtomicU64>,
+    config_seq: Arc<std::sync::atomic::AtomicU64>,
     running: Mutex<Option<Running>>,
 }
 
@@ -324,6 +329,7 @@ impl SyncEngine {
                 refresh_config: deps.refresh_config,
                 config: Arc::new(Mutex::new(config)),
                 config_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                config_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 running: Mutex::new(None),
             }),
         }
@@ -374,6 +380,12 @@ impl SyncEngine {
 
     pub fn config(&self) -> SyncConfig {
         lock(&self.inner.config).clone()
+    }
+
+    /// 引擎线程最近一次安装配置的序号（见 [`Inner::config_seq`]）。宿主用它判断
+    /// 「我这次加入/保存是不是最后一次安装」，免得迟到的回写盖掉更新的设置。
+    pub fn config_seq(&self) -> u64 {
+        self.inner.config_seq.load(Ordering::Relaxed)
     }
 
     fn spawn(&self, config: SyncConfig) -> Option<Running> {
@@ -573,19 +585,26 @@ impl SyncEngine {
     /// 用配对码加入一个同步空间。返回加入之后的配置——配对码里带了存储设置的话与原来
     /// 不同，宿主负责把它写回 `rclaw.toml`（不必再调 [`SyncEngine::apply_config`]）。
     pub async fn join_space(&self, code: &str) -> Result<SyncConfig> {
+        self.join_space_with_seq(code)
+            .await
+            .map(|(config, _)| config)
+    }
+
+    /// 同 [`Self::join_space`]，另外返回这次加入在引擎线程里的安装序号：宿主写回
+    /// `rclaw.toml` 前用它确认「这仍是最近一次安装」，迟到的回写不会盖掉更新的设置。
+    pub async fn join_space_with_seq(&self, code: &str) -> Result<(SyncConfig, u64)> {
         let code = code.trim().to_string();
-        let version = self.inner.config_version.load(Ordering::Relaxed);
-        let joined = self.call(|reply| Cmd::JoinSpace { code, reply }).await?;
+        let (joined, seq) = self.call(|reply| Cmd::JoinSpace { code, reply }).await?;
         {
             let mut guard = lock(&self.inner.config);
-            if self.inner.config_version.load(Ordering::Relaxed) == version {
+            if seq == self.inner.config_seq.load(Ordering::Relaxed) {
                 *guard = joined.clone();
                 self.inner.config_version.fetch_add(1, Ordering::Relaxed);
             } else {
-                tracing::warn!("加入空间的回执迟到：期间已有更新的配置发布，保留较新的那一份");
+                tracing::info!("加入空间的回执不是最新安装，跳过发布（由更新的那次提交发布）");
             }
         }
-        Ok(joined)
+        Ok((joined, seq))
     }
 
     /// 退出同步空间：本机的密钥与存储凭据清掉，会话、记忆等数据原样留着。
@@ -610,8 +629,11 @@ impl SyncEngine {
             Ok((lock, secrets))
         })
         .await?;
+        // 锁交给清理任务一起活到写完：运行时对这次等待有 5 秒上限，future 被丢弃时
+        // 已派发的阻塞写还在跑，锁不能跟着 future 一起放掉。
+        let lock = std::sync::Arc::new(lock);
         let config = self.config();
-        let result = space::leave(&ctx, &config, &mut secrets).await;
+        let result = space::leave(&ctx, &config, &mut secrets, Some(lock.clone())).await;
         drop(lock);
         result
     }
@@ -647,7 +669,8 @@ impl SyncEngine {
     /// 一半补上。命令成功才把新配置公布给宿主、清掉意图——失败时宿主内存里仍是旧配置，
     /// 界面上看到的与实际生效的一致。
     pub async fn save_storage(&self, config: SyncConfig, secret: Option<String>) -> Result<()> {
-        self.save_storage_with(config, secret, |_| Ok(())).await
+        self.save_storage_with(config, secret, |config| Ok(config.clone()))
+            .await
     }
 
     /// 保存存储设置与密码的完整协议：`persist` 在这一段里把设置写回宿主的配置文件
@@ -661,40 +684,37 @@ impl SyncEngine {
         persist: F,
     ) -> Result<()>
     where
-        F: FnOnce(&SyncConfig) -> std::result::Result<(), String> + Send + 'static,
+        F: FnOnce(&SyncConfig) -> std::result::Result<SyncConfig, String> + Send + 'static,
     {
         let paths = self.inner.ctx.paths.clone();
         let lock_paths = paths.clone();
         let _lock = blocking(move || worker::StorageLock::acquire(&lock_paths)).await?;
         let secret = secret.filter(|secret| !secret.is_empty());
+        // 宿主在协议锁内把要提交的配置收敛到磁盘上的最新一份（只采用这次表单的存储段
+        // 与开关），写回配置并返回真正生效的那一份：意图、worker、宿主发布用同一份。
+        let saved = blocking(move || persist(&config).map_err(SyncError::other)).await;
+        let config = match saved {
+            Ok(config) => config,
+            Err(error) => return Err(error),
+        };
         let id = worker::storage_intent_save(&paths, &config, secret.as_deref())?;
-        let target = config.clone();
-        let saved = blocking(move || -> Result<()> {
-            persist(&target).map_err(SyncError::other)
-        })
-        .await;
-        if let Err(error) = saved {
-            // 配置文件没写成就撤掉意图：这份设置没有生效。
-            let _ = worker::storage_intent_clear_if(&paths, &id);
-            return Err(error);
-        }
-        // 这条保存的 TOML 已经写在协议锁里；回执回来时如果期间已有更新的宿主发布
-        // （导入、另一份保存），不要把较早的这份整份盖回去——在配置锁里凭版本判定。
-        let version = self.inner.config_version.load(Ordering::Relaxed);
-        self.call(|reply| Cmd::SaveStorage {
-            config: config.clone(),
-            secret,
-            reply,
-        })
-        .await?;
+        let seq = self
+            .call(|reply| Cmd::SaveStorage {
+                config: config.clone(),
+                secret,
+                reply,
+            })
+            .await?;
         worker::storage_intent_clear_if(&paths, &id)?;
         {
+            // 发布顺序跟随 worker 的安装顺序：回执号不是当前最新的安装（期间又装了
+            // 别的配置）就不发布这一份，让最后安装的那条路径去发布。
             let mut guard = lock(&self.inner.config);
-            if self.inner.config_version.load(Ordering::Relaxed) == version {
+            if seq == self.inner.config_seq.load(Ordering::Relaxed) {
                 *guard = config;
                 self.inner.config_version.fetch_add(1, Ordering::Relaxed);
             } else {
-                tracing::warn!("保存存储设置的回执迟到：期间已有更新的配置发布，保留较新的那一份");
+                tracing::info!("保存存储设置的回执不是最新安装，跳过发布（由更新的那次提交发布）");
             }
         }
         Ok(())

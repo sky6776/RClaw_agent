@@ -356,6 +356,7 @@ pub(crate) async fn resume_pending(
     ctx: &Ctx,
     config: &SyncConfig,
     secrets: &mut Secrets,
+    keepalive: Option<std::sync::Arc<std::fs::File>>,
 ) -> Result<Option<SpaceAction>> {
     let Some(pending) = pending_load(&ctx.paths)? else {
         return Ok(None);
@@ -371,6 +372,9 @@ pub(crate) async fn resume_pending(
             let ctx_for_task = ctx.clone();
             let saved = next.clone();
             blocking(move || {
+                // 引擎锁跟着写入活到底：调用方的等待被取消时，已派发的阻塞写仍然
+                // 握着锁，别的进程不能在清理进行到一半时接手。
+                let _keep = keepalive;
                 saved.save(&ctx_for_task.paths)?;
                 reset_local_state(&ctx_for_task, None, None)
             })
@@ -561,12 +565,13 @@ pub(crate) async fn leave(
     ctx: &Ctx,
     config: &SyncConfig,
     secrets: &mut Secrets,
+    keepalive: Option<std::sync::Arc<std::fs::File>>,
 ) -> Result<()> {
     // 上次没做完的切换先做完（可能是一次重置：先收敛到新空间），再决定退不退。
     // 上次没做完的切换先试着收尾；收不了也不能挡住退出——用户就是要离开这个空间。
     // 丢掉恢复记录：它的目标（新空间）本机不再使用，留着会让下次启动又把本机拉回
     // 配对状态。远端可能仍保留原空间的状态，在状态页交代清楚。
-    if let Err(error) = resume_pending(ctx, config, secrets).await {
+    if let Err(error) = resume_pending(ctx, config, secrets, keepalive.clone()).await {
         // 失败的是「上一次退出」的记录：清库可能只做了一半，记录必须留着（下次打开
         // 或重试接着收尾），错误交给调用方——不能丢掉记录再报成功。
         if pending_load(&ctx.paths)?.is_some_and(|pending| pending.action == SpaceAction::Leave) {
@@ -602,6 +607,9 @@ pub(crate) async fn leave(
     let ctx_for_task = ctx.clone();
     let saved = next.clone();
     blocking(move || {
+        // 同 [`resume_pending`]：锁的生命周期覆盖这次阻塞写入（调用方被超时丢弃
+        // 时，别的进程仍不能进来接手）。
+        let _keep = keepalive;
         saved.save(&ctx_for_task.paths)?;
         reset_local_state(&ctx_for_task, None, None)
     })
@@ -622,7 +630,7 @@ pub(crate) async fn reset(ctx: &Ctx, config: &SyncConfig, secrets: &mut Secrets)
     // 上次没做完的重置 / 退出：先接着做完，收敛到同一次切换的结果。刚接完的是一次
     // 重置的话，本机已经在那次重置的替代空间里——这次调用到此为止，用户再点一次才是
     // 在新空间里再重置（不会接着又开出第二个新空间）。
-    if resume_pending(ctx, config, secrets).await? == Some(SpaceAction::Reset) {
+    if resume_pending(ctx, config, secrets, None).await? == Some(SpaceAction::Reset) {
         return Ok(());
     }
     if !secrets.is_paired() {

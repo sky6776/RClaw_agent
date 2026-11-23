@@ -2976,20 +2976,17 @@ pub async fn config_save(state: State<'_, AppState>, edits: Vec<ConfigEdit>) -> 
     let touches_sync = edits
         .iter()
         .any(|edit| edit.path == "sync" || edit.path.starts_with("sync."));
+    // 整份读改写都要和保存存储设置串行：即便这次只改非同步字段，写回也是按「读到的
+    // 旧全文 + 差异」原子替换——读完之后、写回之前另一进程关掉的同步会被这份旧预览
+    // 重新打开。
     let lock_home = home.clone();
-    let _lock = if touches_sync {
-        Some(
-            tauri::async_runtime::spawn_blocking(move || {
-                let paths = rclaw_sync::SyncPaths::new(&lock_home);
-                rclaw_sync::StorageLock::acquire(&paths)
-                    .map_err(|error| format!("保存配置失败（取同步存储锁）: {error}"))
-            })
-            .await
-            .map_err(|e| format!("保存配置失败: {e}"))??,
-        )
-    } else {
-        None
-    };
+    let _lock = tauri::async_runtime::spawn_blocking(move || {
+        let paths = rclaw_sync::SyncPaths::new(&lock_home);
+        rclaw_sync::StorageLock::acquire(&paths)
+            .map_err(|error| format!("保存配置失败（取同步存储锁）: {error}"))
+    })
+    .await
+    .map_err(|e| format!("保存配置失败: {e}"))??;
     tauri::async_runtime::spawn_blocking(move || config_save_edits(&home, &edits))
         .await
         .map_err(|e| format!("保存配置失败: {e}"))??;

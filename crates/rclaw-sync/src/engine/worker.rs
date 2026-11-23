@@ -28,6 +28,8 @@ use crate::merge;
 use crate::secrets::Secrets;
 use crate::{blocking, SyncEvent};
 
+/// 同步在磁盘上关着时给命令与面板的统一说法。
+const CLOSED_NOTE: &str = "同步已经关闭，请在「多端同步」设置里重新开启";
 /// 本机变更检查的间隔（§7.1）。后台放宽。
 const TICK: Duration = Duration::from_secs(5);
 const TICK_BACKGROUND: Duration = Duration::from_secs(30);
@@ -243,7 +245,7 @@ pub(crate) enum Cmd {
     CreateSpace(Reply<()>),
     JoinSpace {
         code: String,
-        reply: Reply<SyncConfig>,
+        reply: Reply<(SyncConfig, u64)>,
     },
     LeaveSpace(Reply<()>),
     ResetSpace(Reply<()>),
@@ -260,7 +262,7 @@ pub(crate) enum Cmd {
     SaveStorage {
         config: SyncConfig,
         secret: Option<String>,
-        reply: Reply<()>,
+        reply: Reply<u64>,
     },
     ConfirmMetered(Reply<()>),
     SetBacklog {
@@ -772,6 +774,12 @@ impl Worker {
             match blocking(move || StorageLock::try_acquire(&lock_paths)).await {
                 Ok(Some(lock)) => protocol_lock = Some(lock),
                 Ok(None) => {
+                    if !self.config.enabled {
+                        self.open_note = Some(CLOSED_NOTE.into());
+                        self.shared.set_state("off", None);
+                        self.reopen_at = None;
+                        return;
+                    }
                     let note = "另一个进程正在保存同步设置，确认后再连接（稍后自动重试）";
                     self.open_note = Some(note.into());
                     self.shared.set_state("syncing", Some(note.into()));
@@ -782,6 +790,12 @@ impl Worker {
                     // 有宿主回调时「确认」是打开的前提：锁文件坏了说明配置和凭据都
                     // 没法确认，不能拿可能过期的缓存去连存储——进入可见的重试状态。
                     // 没有回调（测试/无配置文件的宿主）时按当前配置继续。
+                    if !self.config.enabled {
+                        self.open_note = Some(CLOSED_NOTE.into());
+                        self.shared.set_state("off", None);
+                        self.reopen_at = None;
+                        return;
+                    }
                     if self.shared.refresh_config.is_some() {
                         tracing::warn!("确认同步设置时拿不到协议锁（稍后重试）: {error}");
                         self.shared.set_state(
@@ -810,9 +824,7 @@ impl Worker {
                     // 留着（不退出）：重新开启的配置命令与「关闭后只清本机」的退出
                     // 请求都还要由它接住——退场与宿主派发之间的交接窗口反而会丢命令。
                     self.lock = None;
-                    self.open_note = Some(
-                        "同步已经关闭，请在「多端同步」设置里重新开启".into(),
-                    );
+                    self.open_note = Some(CLOSED_NOTE.into());
                     self.shared.set_state("off", None);
                     self.reopen_at = None;
                     return;
@@ -872,7 +884,7 @@ impl Worker {
         // 上一次重置 / 退出没做完：按落盘的记录与远端的实际状态接着做（重置可能已经把
         // 本机换到了新空间），再按正常打开往下走。
         if let Err(error) =
-            space::resume_pending(&shared.ctx, &self.config, &mut self.secrets).await
+            space::resume_pending(&shared.ctx, &self.config, &mut self.secrets, None).await
         {
             return self.fail_open(
                 format!("上一次的空间切换没有做完: {error}（修好后会自动接着做）"),
@@ -986,6 +998,12 @@ impl Worker {
     /// 写入在进行时宣告换代完成，旧任务随后的改名会把旧字节落到可能被复用的路径上。
     /// 调用方据此中止这次切换（保持旧连接），稍后重试。
     async fn teardown(&mut self) -> bool {
+        // 没有连接、没有附件任务：没有需要封口的写入阶段，这一步无事可做。关闭态
+        // worker 被宿主显式停止时不能去碰共用的提交入口——继任者可能已经连上并
+        // 打开了它，旧收尾再 seal/bump 会把新连接一直关在门外。
+        if self.session.is_none() && self.uploads.is_none() && self.downloads.is_none() {
+            return true;
+        }
         // 拆任务只拆得掉异步的那一层：已经开始的文件与记账阶段（`spawn_blocking`）拦不
         // 住。顺序是：先关提交入口（旧任务此后拿到的阶段一律作废）→ 等在途的阶段走完 →
         // 再等最终写入段退场 → 换代。任何一步超时都不换代，恢复提交入口让调用方重试
@@ -1064,7 +1082,10 @@ impl Worker {
             }
             Cmd::JoinSpace { code, reply } => {
                 if wanted(&reply) {
-                    let _ = reply.send(self.join_space(&code).await);
+                    let result = self.join_space(&code).await.map(|config| {
+                        (config, self.shared.config_seq.load(Ordering::Relaxed))
+                    });
+                    let _ = reply.send(result);
                 }
             }
             Cmd::LeaveSpace(reply) => {
@@ -1091,7 +1112,11 @@ impl Worker {
                 secret,
                 reply,
             } => {
-                let _ = reply.send(self.save_storage(config, secret).await);
+                let result = self
+                    .save_storage(config, secret)
+                    .await
+                    .map(|()| self.shared.config_seq.load(Ordering::Relaxed));
+                let _ = reply.send(result);
             }
             Cmd::ConfirmMetered(reply) => {
                 let _ = reply.send(self.confirm_metered().await);
@@ -1224,8 +1249,16 @@ impl Worker {
         let _ = self.run_round(Kind::Pull).await;
     }
 
+    /// 把 worker 刚安装的配置发布到共享的那一份，并推进安装序号：保存/加入的回执
+    /// 带着这个序号，宿主按它决定谁该发布（发布顺序跟随安装顺序）。
+    fn publish_local_config(&mut self) {
+        *lock(&self.shared.config) = self.config.clone();
+        self.shared.config_seq.fetch_add(1, Ordering::Relaxed);
+    }
+
     async fn reconfigure(&mut self, config: SyncConfig) {
         let old = std::mem::replace(&mut self.config, config);
+        self.publish_local_config();
         let new = &self.config;
         self.shared
             .attachment_max
@@ -1434,6 +1467,7 @@ impl Worker {
             }
             self.secrets = next;
             self.config = joined.clone();
+            self.publish_local_config();
             self.open(false).await;
             return Ok(joined);
         }
@@ -1462,22 +1496,23 @@ impl Worker {
                 Ok((lock, secrets))
             })
             .await?;
-            let result = space::leave(&self.shared.ctx, &self.config, &mut secrets).await;
+            let result = space::leave(&self.shared.ctx, &self.config, &mut secrets, None).await;
             drop(lock);
             result?;
             self.secrets = secrets;
             self.loaded = true;
             self.shared.paired.store(false, Ordering::Relaxed);
             self.shared.set_space(None, false);
-            self.open_note = None;
-            self.shared.set_state("setup", None);
+            // 同步仍是关闭状态：面板按 off 显示，命令也报关闭（不报别的进程占锁）。
+            self.open_note = Some(CLOSED_NOTE.into());
+            self.shared.set_state("off", None);
             return Ok(());
         }
         self.require_owner()?;
         if !self.teardown().await {
             return Err(SyncError::other("还有在途的附件提交，稍后再退出"));
         }
-        let result = space::leave(&self.shared.ctx, &self.config, &mut self.secrets).await;
+        let result = space::leave(&self.shared.ctx, &self.config, &mut self.secrets, None).await;
         // 退出成功就停在「还没配对」；没成功就照旧连回去。
         self.open(false).await;
         result
@@ -1564,6 +1599,7 @@ impl Worker {
         }
         self.secrets = next;
         self.config = config;
+        self.publish_local_config();
         self.shared.set_space(
             self.secrets
                 .is_paired()

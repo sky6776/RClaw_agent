@@ -57,10 +57,15 @@ fn disk_config(home: &Path) -> Result<SyncConfig, String> {
 }
 
 /// 把 `[sync]` 写回 `rclaw.toml`：只动变了的键，其余内容与注释保真。
+fn persist_from(home: &Path, before: &SyncConfig, after: &SyncConfig) -> Result<(), String> {
+    rclaw_cli::sync::save_sync_config(&home::config_path(home), before, after)
+        .map_err(|e| format!("保存同步设置失败: {e:#}"))
+}
+
+/// 以磁盘上的最新一份为底写回 [`persist`]。
 fn persist(home: &Path, after: &SyncConfig) -> Result<(), String> {
     let before = disk_config(home)?;
-    rclaw_cli::sync::save_sync_config(&home::config_path(home), &before, after)
-        .map_err(|e| format!("保存同步设置失败: {e:#}"))
+    persist_from(home, &before, after)
 }
 
 /// 先落盘再交给引擎：文件没写成的设置不生效。
@@ -108,8 +113,15 @@ async fn save_with_secret(
 ) -> Result<(), String> {
     let home = state.home.clone();
     engine
-        .save_storage_with(config, secret.filter(|secret| !secret.is_empty()), move |saved| {
-            persist(&home, saved)
+        .save_storage_with(config, secret.filter(|secret| !secret.is_empty()), move |proposed| {
+            // 锁内以磁盘最新一份为底，只采用这次表单的存储段与开关：表单里可能带
+            // 着过期的范围/通道（填表之后别处刚改过），不能整份写回。
+            let before = disk_config(&home)?;
+            let mut merged = before.clone();
+            merged.apply_storage_from(proposed);
+            merged.enabled = proposed.enabled;
+            persist_from(&home, &before, &merged)?;
+            Ok(merged)
         })
         .await
         .map_err(fail)?;
@@ -305,17 +317,46 @@ pub async fn sync_join_space(
     if preview != engine.config() {
         let home = state.home.clone();
         let target = preview.clone();
-        run_blocking("保存同步设置", move || persist(&home, &target))
-            .await
-            .map_err(|error| format!("保存同步设置失败（还没加入同步空间）：{error}"))?;
+        let lock_home = home.clone();
+        // 预写也走协议锁 + 磁盘最新一份：配对码带来的只有存储段，范围/通道/开关
+        // 以磁盘当前值为准，别把填表之后别处改过的设置回退。
+        run_blocking("保存同步设置", move || {
+            let paths = rclaw_sync::SyncPaths::new(&lock_home);
+            let _lock = rclaw_sync::StorageLock::acquire(&paths)
+                .map_err(|error| format!("取同步存储锁失败: {error}"))?;
+            let before = disk_config(&home)?;
+            let mut merged = before.clone();
+            merged.apply_storage_from(&target);
+            persist_from(&home, &before, &merged)
+        })
+        .await
+        .map_err(|error| format!("保存同步设置失败（还没加入同步空间）：{error}"))?;
     }
-    let joined = engine.join_space(&code).await.map_err(|error| {
+    let (joined, join_seq) = engine.join_space_with_seq(&code).await.map_err(|error| {
         format!("{error}（配对码带来的存储设置已经写回 rclaw.toml；修好后可以重试同一配对码）")
     })?;
     // 加入之后以引擎实际采用的设置为准再写一次（配对码没带存储设置时与上一份相同）。
+    // 只有这次加入仍是引擎最近一次安装时才写：期间另一次存储保存/导入已经装上更新的
+    // 配置时，让那份提交去写盘，迟到的回写不能把它覆盖。
     if joined != preview {
         let home = state.home.clone();
-        let written = run_blocking("保存同步设置", move || persist(&home, &joined)).await;
+        let target = joined.clone();
+        let seq_check = engine.clone();
+        let lock_home = home.clone();
+        let written = run_blocking("保存同步设置", move || {
+            if seq_check.config_seq() != join_seq {
+                tracing::info!("加入空间的回写迟到：引擎已安装更新的配置，跳过写盘");
+                return Ok(());
+            }
+            let paths = rclaw_sync::SyncPaths::new(&lock_home);
+            let _lock = rclaw_sync::StorageLock::acquire(&paths)
+                .map_err(|error| format!("取同步存储锁失败: {error}"))?;
+            let before = disk_config(&home)?;
+            let mut merged = before.clone();
+            merged.apply_storage_from(&target);
+            persist_from(&home, &before, &merged)
+        })
+        .await;
         crate::sync_host::emit_status();
         return written.map_err(|error| {
             format!(
