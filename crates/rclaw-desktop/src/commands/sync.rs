@@ -64,14 +64,31 @@ fn persist(home: &Path, after: &SyncConfig) -> Result<(), String> {
 }
 
 /// 先落盘再交给引擎：文件没写成的设置不生效。
+///
+/// 存储设置只由保存存储的那条命令改（它在同一把锁里写 TOML）：这份表单草稿里的存储段
+/// 可能是旧的，落盘时以磁盘上的当前值为准，别把别处刚保存的存储设置回退。
 async fn save_and_apply(
     state: &AppState,
     engine: &SyncEngine,
-    config: SyncConfig,
+    mut config: SyncConfig,
 ) -> Result<(), String> {
     let home = state.home.clone();
+    let paths = rclaw_sync::SyncPaths::new(&home);
+    let lock_paths = paths.clone();
+    let _lock = run_blocking("保存同步设置", move || {
+        rclaw_sync::StorageLock::acquire(&lock_paths)
+            .map_err(|error| format!("保存同步设置失败: {error}"))
+    })
+    .await?;
+    let disk_home = home.clone();
+    let disk = run_blocking("读取同步设置", move || disk_config(&disk_home)).await?;
+    config.transport = disk.transport;
+    config.webdav = disk.webdav;
+    config.file = disk.file;
+    config.s3 = disk.s3;
     let saved = config.clone();
-    run_blocking("保存同步设置", move || persist(&home, &saved)).await?;
+    let write_home = home.clone();
+    run_blocking("保存同步设置", move || persist(&write_home, &saved)).await?;
     engine.apply_config(config);
     crate::sync_host::emit_status();
     Ok(())

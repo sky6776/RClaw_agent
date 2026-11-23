@@ -71,8 +71,8 @@ where
 pub use bundle::{export_session, import_session, ImportOptions, Imported};
 pub use config::{Scopes, SyncConfig, SyncPaths};
 pub use engine::{
-    pairing_config, storage_intent_clear_if, storage_intent_config, storage_intent_save, SyncDeps,
-    SyncEngine,
+    pairing_config, storage_intent_clear_if, storage_intent_config, storage_intent_save, StorageLock,
+    SyncDeps, SyncEngine,
 };
 pub use error::{Result, SyncError, TransportError};
 pub use pairing::PairingCode;

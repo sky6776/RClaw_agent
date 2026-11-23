@@ -483,7 +483,7 @@ impl SyncTransport for S3Transport {
             let page = parse_list(&String::from_utf8_lossy(&body), prefix)?;
             drop(body);
             walk.page(page.objects.len(), page.next_token.as_deref(), prefix)?;
-            for (key, size, version, stable_version) in page.objects {
+            for (key, size, version, etag_present) in page.objects {
                 let Some(name) = key.get(dir_len..) else {
                     continue;
                 };
@@ -494,7 +494,8 @@ impl SyncTransport for S3Transport {
                 {
                     continue;
                 }
-                let strong_version = stable_version && !version.is_empty();
+                // 只有 ETag 算强版本；只有修改时间的只是提示（周期实读）。
+                let strong_version = etag_present && !version.is_empty();
                 let stable_version = !version.is_empty();
                 out.push(ObjectMeta {
                     name: name.to_string(),

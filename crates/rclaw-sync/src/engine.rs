@@ -51,7 +51,7 @@ pub use crate::transport::SelfTestStep;
 pub use crate::trash::{MemoryTrashItem, TrashItem};
 pub use local::{AttachmentInfo, SessionMark};
 pub use space::{apply_pairing, pairing_config};
-pub use worker::{storage_intent_clear_if, storage_intent_config, storage_intent_save};
+pub use worker::{storage_intent_clear_if, storage_intent_config, storage_intent_save, StorageLock};
 
 /// 距上次拉取不到这么久就不再拉（发送前、窗口获得焦点、打开会话时）。
 pub(crate) const PULL_FRESH_MS: i64 = 5_000;
