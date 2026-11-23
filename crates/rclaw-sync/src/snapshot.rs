@@ -106,6 +106,8 @@ const SWEEP_BATCH: usize = 100;
 const SWEEP_BUDGET: Duration = Duration::from_secs(8);
 /// 依据这轮核验不过（不是预算不够）后的退避：排在后面的对象才轮得到。
 const GC_RETRY_MS: i64 = 5 * 60 * 1000;
+/// 「这轮额度给了别的依据」的短暂让行：下一分钟就能轮到，不用等 5 分钟。
+const GC_SKIP_MS: i64 = 60 * 1000;
 /// 升级前留下的、推不出恢复依据的日志对象：退到很久以后再看（对象不删）。不退避的话
 /// 它们每轮都占满批次，后面的正常删除记录永远轮不到。
 const GC_PARK_MS: i64 = 30 * 24 * 3600 * 1000;
@@ -439,6 +441,9 @@ pub struct Memo {
     pub tried_new: bool,
     /// 上次删到期对象的时刻。
     swept_ms: i64,
+    /// 依据/包的复核退避（不落库：重启后立即重试一次是可接受的）。键见
+    /// [`retry_key_basis`]/[`retry_key_pack`]，值是不早于它再核的时刻。
+    gc_retry: HashMap<String, i64>,
 }
 
 impl Memo {
@@ -1445,8 +1450,9 @@ impl Writer {
                 db::read(ctx.db(), |conn| {
                     Ok(db::peers(conn)?
                         .into_iter()
-                        .filter_map(|(_, peer)| {
-                            peer.snap.map(|snap| snap_key(&dev, &snap.name))
+                        .filter_map(|(device, peer)| {
+                            // head 里的快照属于写它的那台设备：键用它的设备 id。
+                            peer.snap.map(|snap| snap_key(&device, &snap.name))
                         })
                         .collect())
                 })
@@ -1505,6 +1511,8 @@ impl Writer {
                     );
                     let mut log = db::log_state(tx)?;
                     let published = log.snap.as_ref().map(|snap| snap.name.as_str());
+                    // 存储上的 head 还没换成新快照：它仍指着的那一份不能当「无引用」删。
+                    let head_snap = log.head_snap.clone();
                     // 新快照对这些旧对象的替代证据：删除押在「新的这份能完整读回」上；
                     // 覆盖不到旧对象那份范围的，不排删除（旧对象还能恢复更多历史）。
                     if published.is_some() && published != Some(name.as_str()) {
@@ -1523,7 +1531,9 @@ impl Writer {
                             orphan: true,
                         };
                         for (owner, path) in &replaceable {
-                            if Some(owner.as_str()) != published {
+                            if Some(owner.as_str()) != published
+                                && head_snap.as_deref() != Some(owner.as_str())
+                            {
                                 queue_delete(tx, path, &when)?;
                             }
                         }
@@ -1542,8 +1552,10 @@ impl Writer {
                         retry_ms: 0,
                         orphan: true,
                     };
-                    for (_, path) in &replaceable {
-                        queue_delete(tx, path, &when)?;
+                    for (owner, path) in &replaceable {
+                        if head_snap.as_deref() != Some(owner.as_str()) {
+                            queue_delete(tx, path, &when)?;
+                        }
                     }
                     log.snap = Some(snap);
                     log.head_dirty = true;
@@ -2093,7 +2105,7 @@ pub async fn collect_garbage(
     let mut report = GcReport::default();
     if !(0..SWEEP_SPACING_MS).contains(&(now - memo.swept_ms)) {
         memo.swept_ms = now;
-        report.deleted = sweep_due(ctx, transport, keys, now).await?;
+        report.deleted = sweep_due(ctx, transport, keys, memo, now).await?;
     }
     let scan = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
@@ -2129,10 +2141,6 @@ pub async fn collect_garbage(
     Ok(report)
 }
 
-/// 依据/包退避记录（`sync_state` 的 `gc-retry`）：键 `b|<依据>|<摘要>` / `p|<包>|<摘要>`，
-/// 值是不早于它再核的时刻（毫秒）。按**依据**记而不是给几千行逐行写：一次失败只写一条。
-const SCOPE_GC_RETRY: &str = "gc-retry";
-
 fn retry_key_basis(basis: &(String, String)) -> String {
     format!("b|{}|{}", basis.0, basis.1)
 }
@@ -2155,9 +2163,12 @@ async fn sweep_due(
     ctx: &Ctx,
     transport: &dyn SyncTransport,
     keys: &Arc<Keys>,
+    memo: &mut Memo,
     now: i64,
 ) -> Result<usize> {
     type Due = (String, Option<(String, String)>, Option<PackGuard>, bool);
+    // 退避表是进程内记忆（规模有限，重启后清零只会多核一次）。
+    let retry_until = memo.gc_retry.clone();
     let (due, seeds): (Vec<Due>, HashMap<String, Vec<String>>) = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
             let rows = db::state_scan(conn, scope::GC, "")?;
@@ -2169,11 +2180,6 @@ async fn sweep_due(
                 .covers_checked
                 .into_iter()
                 .map(|(key, entry)| (key, entry.versions))
-                .collect();
-            // 依据/包的退避记录（小表）：被退避的依据下所有行一起跳过，不逐行改。
-            let retry_until: HashMap<String, i64> = db::state_scan(conn, SCOPE_GC_RETRY, "")?
-                .into_iter()
-                .filter_map(|(key, row)| row.json::<i64>().map(|until| (key, until)))
                 .collect();
             let blocked = |basis: &Option<(String, String)>, pack: &Option<PackGuard>| {
                 let key = basis
@@ -2212,10 +2218,14 @@ async fn sweep_due(
     let mut checked: HashMap<(String, String), BasisCheck> = HashMap::new();
     let mut packs_ok: HashMap<(String, String), bool> = HashMap::new();
     let mut evidence_used = false;
-    let mut deletable: Vec<String> = Vec::new();
+    // (对象路径, 依据退避键, 包退避键)：删除失败时按依据/包退避，避免同一份依据
+    // 「核验成功但第一个 DELETE 一直失败」把排在后面的依据永久挡住。
+    let mut deletable: Vec<(String, Option<String>, Option<String>)> = Vec::new();
     let mut due_left: Vec<Due> = Vec::new();
     // 这轮核验不过 / 轮不到的：按依据或包记一条退避（不逐行改）。
+    // 失败与「轮到别人了」的退避分开：失败等久一点，排队等下一小组只等一小会儿。
     let mut retry_keys: HashSet<String> = HashSet::new();
+    let mut skipped_keys: HashSet<String> = HashSet::new();
     let mut parked: Vec<String> = Vec::new();
     for (path, basis, pack, orphan) in due {
         if basis.is_none() && pack.is_none() && !orphan && !path.starts_with("blobs/") {
@@ -2228,7 +2238,7 @@ async fn sweep_due(
         let Some(basis) = basis else {
             let Some(pack) = pack else {
                 // blobs/ 或 orphan：不需要复核。
-                deletable.push(path);
+                deletable.push((path, None, None));
                 continue;
             };
             let key = (pack.name.clone(), pack.digest.clone());
@@ -2236,7 +2246,7 @@ async fn sweep_due(
                 Some(&ok) => ok,
                 None => {
                     if evidence_used {
-                        retry_keys.insert(retry_key_pack(&pack));
+                        skipped_keys.insert(retry_key_pack(&pack));
                         due_left.push((path, None, Some(pack), orphan));
                         continue;
                     }
@@ -2252,7 +2262,7 @@ async fn sweep_due(
                 }
             };
             if ok {
-                deletable.push(path);
+                deletable.push((path, None, Some(retry_key_pack(&pack))));
             } else {
                 tracing::debug!("汇总包 {} 这轮读不回来，押着它的零散段先不删", pack.name);
                 retry_keys.insert(retry_key_pack(&pack));
@@ -2264,7 +2274,7 @@ async fn sweep_due(
             Some(&verdict) => verdict,
             None => {
                 if evidence_used {
-                    retry_keys.insert(retry_key_basis(&basis));
+                    skipped_keys.insert(retry_key_basis(&basis));
                     due_left.push((path, Some(basis), pack, orphan));
                     continue;
                 }
@@ -2281,7 +2291,9 @@ async fn sweep_due(
             }
         };
         match verdict {
-            BasisCheck::Intact => deletable.push(path),
+            BasisCheck::Intact => {
+                deletable.push((path, Some(retry_key_basis(&basis)), None))
+            }
             BasisCheck::Deferred => {
                 tracing::debug!("回收依据 {} 这轮没核验完，押着它的对象先不删", basis.0);
                 retry_keys.insert(retry_key_basis(&basis));
@@ -2295,7 +2307,7 @@ async fn sweep_due(
         }
     }
     let mut done: Vec<String> = Vec::new();
-    for (index, path) in deletable.into_iter().enumerate() {
+    for (index, (path, basis_key, pack_key)) in deletable.into_iter().enumerate() {
         // 总预算用完也要给这一批留一次删除机会：一次慢复核不该让回收永远零进展。
         if index > 0 && started.elapsed() > SWEEP_BUDGET {
             break;
@@ -2304,20 +2316,31 @@ async fn sweep_due(
             Ok(()) | Err(TransportError::NotFound(_)) => done.push(path),
             Err(error) => {
                 tracing::debug!("删除 {path} 失败（下次再试）: {error}");
+                // 这份依据/包退避一轮：否则它每轮都排在队头、核验成功却删不掉，
+                // 后面的依据永远轮不到。
+                if let Some(key) = basis_key {
+                    retry_keys.insert(key);
+                }
+                if let Some(key) = pack_key {
+                    retry_keys.insert(key);
+                }
                 break;
             }
         }
     }
     let deleted = done.len();
-    let retry_until = now + GC_RETRY_MS;
+    for key in &retry_keys {
+        memo.gc_retry.insert(key.clone(), now + GC_RETRY_MS);
+    }
+    for key in &skipped_keys {
+        memo.gc_retry.insert(key.clone(), now + GC_SKIP_MS);
+    }
+    // 表只增不减没有意义：过期条目顺手清掉（规模是依据/包的个数，很小）。
+    memo.gc_retry.retain(|_, until| *until > now);
     offload(ctx, move |ctx| {
         db::write(ctx.db(), |tx| {
             for path in &done {
                 db::state_del(tx, scope::GC, path)?;
-            }
-            // 依据/包级退避：一条记录管住它下面的全部行。
-            for key in &retry_keys {
-                db::state_put_json(tx, SCOPE_GC_RETRY, key, db::HLC_ZERO, &retry_until)?;
             }
             // 升级前的无依据旧行：逐行退到很久以后（数量少，且只做一次）。
             for path in &parked {
