@@ -208,10 +208,25 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
                     .collect();
             }
         }
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+        // 规范化失败（SMB 权限、卷暂不可访问等）：回退到基线行为——把正斜杠规范
+        // 成原生分隔符，再按绝对路径/UNC 形式补扩展前缀，避免长路径下 MoveFileExW
+        // 找不到源/目标。这条分支只在拿不到规范父目录时走到，罕见。
+        let text = path.to_string_lossy();
+        let text = if text.contains('/') {
+            std::borrow::Cow::Owned(text.replace('/', "\\"))
+        } else {
+            text
+        };
+        let text = if text.starts_with(r"\\?\") {
+            text.into_owned()
+        } else if let Some(rest) = text.strip_prefix(r"\\") {
+            format!(r"\\?\UNC\{rest}")
+        } else if path.is_absolute() {
+            format!(r"\\?\{text}")
+        } else {
+            text.into_owned()
+        };
+        text.encode_utf16().chain(std::iter::once(0)).collect()
     }
     let from: Vec<u16> = wide_long(tmp);
     let to: Vec<u16> = wide_long(path);
