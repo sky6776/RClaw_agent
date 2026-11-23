@@ -381,17 +381,28 @@ impl SyncTransport for WebdavTransport {
 
     async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
         // 仅创建：`If-None-Match: *` 让已有的标记（尤其是另一设备刚写的关闭标记）
-        // 原样保留，迟到的创建写入拿不到覆盖机会。
+        // 原样保留，迟到的创建写入拿不到覆盖机会。上级目录缓存可能已过期：409/404
+        // 时和普通上传一样清缓存、重建目录并重试一次。
         let url = self.url(key)?;
-        self.ensure_dirs(key).await?;
-        let request = self
-            .request(Method::PUT, url)
-            .header("If-None-Match", "*");
-        let response = net::send_upload(request, Upload::Bytes(Bytes::from(body))).await?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(net::status_error(&response, &format!("创建 {key}（PUT）")))
+        let upload = Upload::Bytes(Bytes::from(body));
+        let mut retried = false;
+        loop {
+            self.ensure_dirs(key).await?;
+            let request = self
+                .request(Method::PUT, url.clone())
+                .header("If-None-Match", "*");
+            let response = net::send_upload(request, upload.clone()).await?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(());
+            }
+            let dir_missing = matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND);
+            if dir_missing && !retried {
+                retried = true;
+                self.forget_dirs();
+                continue;
+            }
+            return Err(net::status_error(&response, &format!("创建 {key}（PUT）")));
         }
     }
 

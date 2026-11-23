@@ -367,6 +367,12 @@ impl<T: SyncTransport> SyncTransport for Scoped<T> {
         self.inner.put(&self.key(key), body).await
     }
 
+    async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+        // 必须转发到后端的「仅创建」实现：默认方法会落到 put，网络后端又变成
+        // 无条件覆盖，「新建空间标记」的保护就丢了。
+        self.inner.put_new(&self.key(key), body).await
+    }
+
     async fn delete(&self, key: &str) -> TransportResult<()> {
         self.inner.delete(&self.key(key)).await
     }
@@ -400,6 +406,10 @@ impl SyncTransport for Box<dyn SyncTransport> {
 
     async fn put(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
         (**self).put(key, body).await
+    }
+
+    async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+        (**self).put_new(key, body).await
     }
 
     async fn delete(&self, key: &str) -> TransportResult<()> {

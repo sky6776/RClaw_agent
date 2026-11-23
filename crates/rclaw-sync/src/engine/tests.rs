@@ -312,7 +312,7 @@ async fn retrying_reopens_and_replaces_an_engine_thread_that_died() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while second.status().state != "setup" {
         assert!(Instant::now() < deadline, "重试没有让待命的引擎接手");
-        second.apply_config(config.clone());
+        second.apply_config(config.clone()).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -335,7 +335,7 @@ async fn retrying_reopens_and_replaces_an_engine_thread_that_died() {
     second.presend("desktop", "c1", "你好").await;
     assert!(stopped(&second));
     // 「重试」换上一条新的线程。
-    second.apply_config(config.clone());
+    second.apply_config(config.clone()).unwrap();
     wait_for("新的引擎线程就绪", 10, || {
         second.status().state == "setup"
     })
