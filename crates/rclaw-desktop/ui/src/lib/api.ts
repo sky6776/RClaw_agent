@@ -1506,17 +1506,25 @@ export const api = {
   /** 取一个 HTTPS 地址出示的证书指纹（自签证书的「信任这张证书」）。 */
   syncProbeCertificate: (url: string) => invoke<string>("sync_probe_certificate", { url }),
 
-  /** 创建同步空间：保存设置（顺带开启同步）与密码，在存储上建出空间。 */
-  syncCreateSpace: (config: SyncConfig, secret: string | null) =>
-    invoke<void>("sync_create_space", { config, secret }),
+  /** 创建同步空间：保存设置（顺带开启同步）与密码，在存储上建出空间。
+   *  `deviceNameBaseline` 是向导打开时的设备名：只有和它不同才算这次明确改名。 */
+  syncCreateSpace: (
+    config: SyncConfig,
+    secret: string | null,
+    deviceNameBaseline: string,
+  ) => invoke<void>("sync_create_space", { config, secret, deviceNameBaseline }),
 
   /** 检查一段配对码，并说出它带了什么（不含密钥与密码）。 */
   syncPairingInfo: (code: string, config: SyncConfig | null) =>
     invoke<SyncPairingInfo>("sync_pairing_info", { code, config }),
 
   /** 用配对码加入同步空间。配对码带了存储设置的话以它为准。 */
-  syncJoinSpace: (code: string, config: SyncConfig | null, secret: string | null) =>
-    invoke<void>("sync_join_space", { code, config, secret }),
+  syncJoinSpace: (
+    code: string,
+    config: SyncConfig | null,
+    secret: string | null,
+    deviceNameBaseline: string,
+  ) => invoke<void>("sync_join_space", { code, config, secret, deviceNameBaseline }),
 
   /** 退出同步空间：本机的密钥与存储密码清掉，会话、记忆等数据原样留着。 */
   syncLeaveSpace: () => invoke<void>("sync_leave_space"),

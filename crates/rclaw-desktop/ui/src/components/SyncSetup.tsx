@@ -118,6 +118,9 @@ export default function SyncSetup({
   }, []);
   const [tab, setTab] = useState<"create" | "join">(android ? "join" : "create");
   const [draft, setDraft] = useState<SyncConfig>(config);
+  // 向导打开时的设备名：提交时交给后端判断「用户是否明确改过名」（表单后来被别处
+  // 的配置更新带动时，不能拿提交那一刻的磁盘值当基线）。
+  const initialDeviceName = useRef(config.device_name);
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const [secret, setSecret] = useState("");
@@ -315,7 +318,7 @@ export default function SyncSetup({
     setBusy(true);
     setError(null);
     try {
-      await api.syncCreateSpace(draft, secretOrNull(secret));
+      await api.syncCreateSpace(draft, secretOrNull(secret), initialDeviceName.current);
       setSecret("");
       onCreated();
     } catch (e) {
@@ -352,7 +355,7 @@ export default function SyncSetup({
     setBusy(true);
     setError(null);
     try {
-      await api.syncJoinSpace(trimmed, draft, secretOrNull(secret));
+      await api.syncJoinSpace(trimmed, draft, secretOrNull(secret), initialDeviceName.current);
       setCode("");
       setSecret("");
       setScanNote(null);

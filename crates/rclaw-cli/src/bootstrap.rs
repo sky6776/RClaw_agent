@@ -599,9 +599,13 @@ pub async fn assemble_core_with(
             if let Some(base) = on_disk {
                 match rclaw_sync::storage_intent_config(&sync_paths) {
                     Ok(Some(intent)) => {
-                        // 意图只补存储设置：这期间别处改过的范围/通道不能被一份旧意图回退。
+                        // 意图只补存储设置（以及向导里明确编辑过的设备名）：这期间别处
+                        // 改过的范围/通道不能被一份旧意图回退。
                         let mut merged = base.clone();
                         merged.apply_storage_from(&intent);
+                        if let Ok(Some(name)) = rclaw_sync::storage_intent_device_name(&sync_paths) {
+                            merged.device_name = name;
+                        }
                         if merged != base {
                             match crate::sync::save_sync_config(
                                 &sync_config_path,

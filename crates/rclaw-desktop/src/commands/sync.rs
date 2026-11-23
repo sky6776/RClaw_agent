@@ -118,10 +118,15 @@ async fn save_with_secret(
     let home = state.home.clone();
     let merge_home = home.clone();
     let write_home = home.clone();
+    // 只有向导里真的编辑过（草稿与打开时的名字不同）才算这次请求明确改了设备名。
+    let explicit_device_name = device_name_baseline.as_deref().and_then(|baseline| {
+        (config.device_name != baseline).then(|| config.device_name.clone())
+    });
     engine
         .save_storage_with(
             config,
             secret.filter(|secret| !secret.is_empty()),
+            explicit_device_name,
             move |proposed| {
                 // 锁内以磁盘最新一份为底，只采用这次表单的存储段与开关：表单里可能带
                 // 着过期的范围/通道（填表之后别处刚改过），不能整份写回。
@@ -257,10 +262,11 @@ pub async fn sync_create_space(
     state: State<'_, AppState>,
     mut config: SyncConfig,
     secret: Option<String>,
+    device_name_baseline: Option<String>,
 ) -> Result<(), String> {
     let engine = handle(&state)?;
     config.enabled = true;
-    let baseline = engine.config().device_name;
+    let baseline = device_name_baseline.unwrap_or_else(|| engine.config().device_name);
     save_with_secret(&state, &engine, config.clone(), secret, Some(baseline)).await?;
     engine.create_space().await.map_err(fail)
 }
@@ -322,9 +328,10 @@ pub async fn sync_join_space(
     code: String,
     config: Option<SyncConfig>,
     secret: Option<String>,
+    device_name_baseline: Option<String>,
 ) -> Result<(), String> {
     let engine = handle(&state)?;
-    let baseline = engine.config().device_name;
+    let baseline = device_name_baseline.unwrap_or_else(|| engine.config().device_name);
     let mut base = config.unwrap_or_else(|| engine.config());
     base.enabled = true;
     // 配对码可能带着自己的存储设置：加入之前先把最终目标写回文件。只在加入之后才写的话，

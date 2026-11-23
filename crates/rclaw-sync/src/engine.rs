@@ -51,7 +51,10 @@ pub use crate::transport::SelfTestStep;
 pub use crate::trash::{MemoryTrashItem, TrashItem};
 pub use local::{AttachmentInfo, SessionMark};
 pub use space::{apply_pairing, pairing_config};
-pub use worker::{storage_intent_clear_if, storage_intent_config, storage_intent_save, StorageLock};
+pub use worker::{
+    storage_intent_clear_if, storage_intent_config, storage_intent_device_name,
+    storage_intent_save, StorageLock,
+};
 
 /// 距上次拉取不到这么久就不再拉（发送前、窗口获得焦点、打开会话时）。
 pub(crate) const PULL_FRESH_MS: i64 = 5_000;
@@ -621,24 +624,34 @@ impl SyncEngine {
             // 离线路径重复清理。关闭态的 worker 会在命令里自己走离线退出。
             return self.call(Cmd::LeaveSpace).await;
         }
-        // 离线（同步从启动起就关着，没有引擎线程）：先取引擎锁，再读 secrets 与待恢复
-        // 记录——另一个进程正在退出/重建的中途，不能在它脚下清理本机状态。
+        // 离线（同步从启动起就关着，没有引擎线程）：整个退出放到独立任务里执行到
+        // 结算。先取引擎锁、再读 secrets 与待恢复记录——另一个进程正在退出/重建的
+        // 中途，不能在它脚下清理本机状态。调用方对这次等待有 5 秒上限：future 被
+        // 丢弃时任务仍在跑、仍持锁，远端标记（文件后端的 space.json）与本机写入都
+        // 不会在锁释放之后继续——否则迟到的「创建空间」写入会把后来标成关闭的空间
+        // 重新打开。
         let ctx = self.inner.ctx.clone();
-        let paths = ctx.paths.clone();
-        let (lock, mut secrets) = blocking(move || {
-            let lock =
-                worker::take_lock(&paths)?.ok_or_else(|| SyncError::other(worker::STANDBY_HINT))?;
-            let secrets = Secrets::load(&paths)?;
-            Ok((lock, secrets))
-        })
-        .await?;
-        // 锁交给清理任务一起活到写完：运行时对这次等待有 5 秒上限，future 被丢弃时
-        // 已派发的阻塞写还在跑，锁不能跟着 future 一起放掉。
-        let lock = std::sync::Arc::new(lock);
         let config = self.config();
-        let result = space::leave(&ctx, &config, &mut secrets, Some(lock.clone())).await;
-        drop(lock);
-        result
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = async {
+                let paths = ctx.paths.clone();
+                let (lock, mut secrets) = blocking(move || {
+                    let lock = worker::take_lock(&paths)?
+                        .ok_or_else(|| SyncError::other(worker::STANDBY_HINT))?;
+                    let secrets = Secrets::load(&paths)?;
+                    Ok((std::sync::Arc::new(lock), secrets))
+                })
+                .await?;
+                let result = space::leave(&ctx, &config, &mut secrets, Some(lock.clone())).await;
+                drop(lock);
+                result
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        rx.await
+            .unwrap_or_else(|_| Err(SyncError::other("退出同步空间的任务没有回话（稍后重试）")))
     }
 
     /// 重置同步空间（§11.2，设备丢失之后用）：换新空间、新密钥，其余设备要拿新的配对码
@@ -672,7 +685,7 @@ impl SyncEngine {
     /// 一半补上。命令成功才把新配置公布给宿主、清掉意图——失败时宿主内存里仍是旧配置，
     /// 界面上看到的与实际生效的一致。
     pub async fn save_storage(&self, config: SyncConfig, secret: Option<String>) -> Result<()> {
-        self.save_storage_with(config, secret, |config| Ok(config.clone()), |_| Ok(()))
+        self.save_storage_with(config, secret, None, |config| Ok(config.clone()), |_| Ok(()))
             .await
     }
 
@@ -684,6 +697,9 @@ impl SyncEngine {
         &self,
         config: SyncConfig,
         secret: Option<String>,
+        // 这次请求**明确修改**的设备名（向导里编辑过）：写进更新意图，启动回补与
+        // worker 收尾时一并采用；`None` = 不负责设备名。
+        explicit_device_name: Option<String>,
         merge: M,
         write: W,
     ) -> Result<()>
@@ -700,14 +716,30 @@ impl SyncEngine {
         // 就停下：不能出现「TOML 已经是新存储、凭据却还绑在旧账户」而重启后无从恢复
         // 的状态。
         let merged = blocking(move || merge(&config).map_err(SyncError::other)).await?;
-        let id = worker::storage_intent_save(&paths, &merged, secret.as_deref())?;
+        // 先记下上一条仍可执行的意图：这次 TOML 确定没写成就把它原样恢复——新的
+        // 这次没有生效，不能把上一次「TOML 已写、凭据还没补」的恢复依据带走。
+        let previous = worker::storage_intent_load(&paths)?;
+        let id = worker::storage_intent_save(
+            &paths,
+            &merged,
+            secret.as_deref(),
+            explicit_device_name.as_deref(),
+        )?;
         let written = {
             let target = merged.clone();
             blocking(move || write(&target).map_err(SyncError::other)).await
         };
         if let Err(error) = written {
-            // 确定 TOML 没换成：撤掉这次意图，什么都不生效。
-            let _ = worker::storage_intent_clear_if(&paths, &id);
+            match &previous {
+                Some(prev) if prev.id != id => {
+                    let _ = worker::storage_intent_restore(&paths, prev);
+                }
+                // 同一请求重试复用了标识：记录仍是这一笔的，留着。
+                Some(_) => {}
+                None => {
+                    let _ = worker::storage_intent_clear_if(&paths, &id);
+                }
+            }
             return Err(error);
         }
         let config = merged;

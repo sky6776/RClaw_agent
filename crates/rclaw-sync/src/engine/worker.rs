@@ -73,14 +73,18 @@ pub(crate) const STANDBY_HINT: &str = "另一个 RClaw 进程正在用这个数�
 /// 待机、secrets 写失败、进程中断）时这条记录留下：下一次引擎打开先把它做完，两边才
 /// 收敛到同一套配置，不会拿旧存储的凭据记录去试新目标。做完就删。与密钥同样的私有权限。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StorageIntent {
+pub(crate) struct StorageIntent {
     /// 这次保存请求的标识：两次保存交错时，先完成的一方不能把后一个请求的意图删掉。
     #[serde(default)]
-    id: String,
-    config: SyncConfig,
+    pub(crate) id: String,
+    pub(crate) config: SyncConfig,
     /// 要绑定的密码；`None` 或空 = 不改密码。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    secret: Option<String>,
+    pub(crate) secret: Option<String>,
+    /// 这次请求**明确修改**的设备名（向导里编辑过的）。启动回补与 worker 收尾按它
+    /// 一并采用；`None` = 请求不负责设备名，保持磁盘/当前配置里的值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) device_name: Option<String>,
 }
 
 fn storage_intent_path(paths: &SyncPaths) -> PathBuf {
@@ -139,12 +143,15 @@ pub fn storage_intent_save(
     paths: &SyncPaths,
     config: &SyncConfig,
     secret: Option<&str>,
+    device_name: Option<&str>,
 ) -> Result<String> {
     let secret = secret.map(|secret| secret.to_string());
+    let device_name = device_name.map(|name| name.to_string());
     if let Some(existing) = storage_intent_load(paths)? {
         if !existing.id.is_empty()
             && existing.config == *config
             && existing.secret == secret
+            && existing.device_name == device_name
         {
             return Ok(existing.id);
         }
@@ -153,6 +160,7 @@ pub fn storage_intent_save(
         id: crate::ids::random_hex::<8>(),
         config: config.clone(),
         secret,
+        device_name,
     };
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
@@ -162,7 +170,7 @@ pub fn storage_intent_save(
     Ok(intent.id)
 }
 
-fn storage_intent_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
+pub(crate) fn storage_intent_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
     match std::fs::read(storage_intent_path(paths)) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(intent) => Ok(Some(intent)),
@@ -175,6 +183,23 @@ fn storage_intent_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// 把一条已经存在的意图原样写回（保存过程中 TOML 写入失败时，恢复上一条仍可执行的
+/// 恢复记录——新的那次没有生效，它的意图也不能把旧的一起带走）。
+pub(crate) fn storage_intent_restore(paths: &SyncPaths, intent: &StorageIntent) -> Result<()> {
+    paths.ensure_root()?;
+    rclaw_store::atomic_write_private(
+        &storage_intent_path(paths),
+        &serde_json::to_vec_pretty(intent)?,
+    )?;
+    Ok(())
+}
+
+/// 更新意图里「这次请求明确修改过的设备名」（向导编辑过才有）：启动回补与 worker
+/// 收尾按它一并采用，其余字段仍以磁盘/当前配置为准。
+pub fn storage_intent_device_name(paths: &SyncPaths) -> Result<Option<String>> {
+    Ok(storage_intent_load(paths)?.and_then(|intent| intent.device_name))
 }
 
 /// 只删自己那条意图：标识对不上说明它已经被后一个保存请求替换了，不能删。
@@ -415,6 +440,9 @@ struct Worker {
     /// 上一次打开没连上的原因（协议锁竞争/确认失败/引擎锁被占）：给「立即同步」等
     /// 等着结果的命令一个和状态面板一致的说法。
     open_note: Option<String>,
+    /// 当前 `self.config` 是哪一次安装的（`publish_local_config` 分配的序号）：
+    /// 幂等加入要按「实际采用的那份配置所属的提交」给宿主写盘资格。
+    installed_seq: u64,
 }
 
 impl Worker {
@@ -449,6 +477,7 @@ impl Worker {
             switch_tries: 0,
             switch_failed: false,
             open_note: None,
+            installed_seq: 0,
         }
     }
 
@@ -948,9 +977,6 @@ impl Worker {
         self.start_downloads(session.live.clone());
         self.session = Some(session);
         self.open_note = None;
-        // 新一代连接建立 = 一次新的配置安装：推进安装序号，让更早的保存/加入回执
-        // 失效（它们不能把重建之后的状态再发布回去）。
-        self.publish_local_config();
         // 连接已经按当前配置（含新的存储设置）重建：切换标记与计数到这里就算完成。
         self.pending_switch = false;
         self.switch_failed = false;
@@ -1088,10 +1114,7 @@ impl Worker {
             }
             Cmd::JoinSpace { code, reply } => {
                 if wanted(&reply) {
-                    let result = self.join_space(&code).await.map(|config| {
-                        (config, self.shared.config_seq.load(Ordering::Relaxed))
-                    });
-                    let _ = reply.send(result);
+                    let _ = reply.send(self.join_space(&code).await);
                 }
             }
             Cmd::LeaveSpace(reply) => {
@@ -1118,11 +1141,7 @@ impl Worker {
                 secret,
                 reply,
             } => {
-                let result = self
-                    .save_storage(config, secret)
-                    .await
-                    .map(|()| self.shared.config_seq.load(Ordering::Relaxed));
-                let _ = reply.send(result);
+                let _ = reply.send(self.save_storage(config, secret).await);
             }
             Cmd::ConfirmMetered(reply) => {
                 let _ = reply.send(self.confirm_metered().await);
@@ -1261,19 +1280,27 @@ impl Worker {
         // 值与序号在同一把锁里提交：回执方在锁内比较序号，不会看到「新值 + 旧序号」。
         let mut guard = lock(&self.shared.config);
         *guard = self.config.clone();
-        self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1
+        let seq = self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        self.installed_seq = seq;
+        seq
     }
 
     async fn reconfigure(&mut self, config: SyncConfig, host_seq: u64) {
-        // 比共享序号旧的重配是宿主已经作废的发布（之后又关了同步/换了配置）：
-        // 装上去会把最新状态回退。
-        let latest = self.shared.config_seq.load(Ordering::Relaxed);
-        if host_seq < latest {
-            tracing::info!("收到过期的配置重配（#{host_seq} < #{latest}），忽略");
-            return;
-        }
-        let old = std::mem::replace(&mut self.config, config);
-        self.publish_local_config();
+        // 检查与发布在同一把配置锁里：宿主在两次动作之间发布新配置（包括关闭同步）
+        // 时，旧重配不能再把开启状态写回去；同时把这次安装记成共享配置的当前值。
+        let old = {
+            let mut guard = lock(&self.shared.config);
+            let latest = self.shared.config_seq.load(Ordering::Relaxed);
+            if host_seq < latest {
+                tracing::info!("收到过期的配置重配（#{host_seq} < #{latest}），忽略");
+                return;
+            }
+            let old = std::mem::replace(&mut self.config, config);
+            *guard = self.config.clone();
+            let seq = self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            self.installed_seq = seq;
+            old
+        };
         let new = &self.config;
         self.shared
             .attachment_max
@@ -1432,7 +1459,7 @@ impl Worker {
         Ok(())
     }
 
-    async fn join_space(&mut self, code: &str) -> Result<SyncConfig> {
+    async fn join_space(&mut self, code: &str) -> Result<(SyncConfig, u64)> {
         self.require_owner()?;
         // 已经在这个空间里（上次加入在把设置写回文件之前中断了）：重复加入是幂等的，
         // 只把配对码带来的存储设置对齐。别的空间的配对码仍然报错。
@@ -1451,7 +1478,8 @@ impl Worker {
                 if self.session.is_none() {
                     self.open(false).await;
                 }
-                return Ok(joined);
+                // 幂等：配置没变，写盘资格属于当初安装这份配置的那次提交。
+                return Ok((joined, self.installed_seq));
             }
             // 配对码可能带了更新的存储地址/凭据：换凭据必须重建连接，先确认能换（在途
             // 的提交阶段会拒绝），再按正常加入的规矩核对远端确实是这个空间、密钥对得上。
@@ -1482,9 +1510,9 @@ impl Worker {
             }
             self.secrets = next;
             self.config = joined.clone();
-            self.publish_local_config();
+            let seq = self.publish_local_config();
             self.open(false).await;
-            return Ok(joined);
+            return Ok((joined, seq));
         }
         let joined = space::join(
             &self.shared.ctx.paths,
@@ -1496,9 +1524,9 @@ impl Worker {
         // 配对码里带了存储设置的话，配置也跟着换：和同空间重加一样走同一次
         // 「安装 + 发布 + 推进序号」，回执带的就是这次安装的序号。
         self.config = joined.clone();
-        self.publish_local_config();
+        let seq = self.publish_local_config();
         self.open(false).await;
-        Ok(joined)
+        Ok((joined, seq))
     }
 
     async fn leave_space(&mut self) -> Result<()> {
@@ -1593,7 +1621,11 @@ impl Worker {
     /// 调用方在派发之前已把「更新意图」落盘（[`storage_intent_save`]）：本方法失败
     /// （worker 待机、secrets 写失败）时两个文件不会都换好，重启后的 [`Self::open`]
     /// 按记录把剩下的一半补上，两边收敛到同一套。
-    async fn save_storage(&mut self, config: SyncConfig, secret: Option<String>) -> Result<()> {
+    async fn save_storage(
+        &mut self,
+        config: SyncConfig,
+        secret: Option<String>,
+    ) -> Result<u64> {
         self.require_owner()?;
         // 换连接前先确认在途提交能退场：退不了时本机什么都不改（TOML 已经是新的，
         // 意图还在，重启时由恢复流程收敛）。
@@ -1616,7 +1648,7 @@ impl Worker {
         }
         self.secrets = next;
         self.config = config;
-        self.publish_local_config();
+        let seq = self.publish_local_config();
         self.shared.set_space(
             self.secrets
                 .is_paired()
@@ -1626,7 +1658,7 @@ impl Worker {
         if self.secrets.is_paired() {
             self.open(false).await;
         }
-        Ok(())
+        Ok(seq)
     }
 
     /// 上次没存完的存储设置：`rclaw.toml` 在保存时已经先写成新的一套，secrets 是命令
