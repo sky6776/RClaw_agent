@@ -1923,6 +1923,32 @@ fn fork_lineage_kv_is_cascaded_on_delete_and_clear() {
     );
 }
 
+#[test]
+fn fork_of_a_local_only_session_stays_local_only() {
+    // 多端同步的「仅本机」标记（kv）：分叉带着父会话的历史，标记不跟过去，这段历史就会被
+    // 发布到其他设备。
+    let (_g, s) = store();
+    let anchor = s
+        .append("cli", "c", &Message::plain(Role::User, "m"))
+        .unwrap();
+    let marked = |chat: &str| {
+        s.journal()
+            .kv_get(&crate::sync_db::local_only_key("cli", chat))
+            .unwrap()
+            .is_some()
+    };
+    s.fork_session("cli", "c", anchor, "c-plain").unwrap();
+    assert!(!marked("c-plain"), "没有标记的会话，分出来的也没有");
+    s.journal()
+        .kv_set(
+            &crate::sync_db::local_only_key("cli", "c"),
+            &serde_json::json!(true),
+        )
+        .unwrap();
+    s.fork_session("cli", "c", anchor, "c-private").unwrap();
+    assert!(marked("c-private"), "仅本机的会话，分出来的也是仅本机");
+}
+
 // ---------------------------------------------------------------------------
 // artifact 会话键（FNV 摘要防碰撞）与 fork 的 artifact 保全
 // ---------------------------------------------------------------------------

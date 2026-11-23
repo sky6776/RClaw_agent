@@ -379,7 +379,8 @@ impl SlashRegistry {
              - /fork [消息 id] — 列出可作锚点的用户消息，或从该消息分叉出新会话（并自动把锚点之后的文件改动回滚到该时刻；full / files 旗标已移除）\n\
              - /goal [目标文本|clear] — 设定并立即开始执行 / 查看 / 清除本会话的长期目标（设定后直接作为本轮任务开工；每轮注入提醒，成功收尾后小审计确认达成即自动清除）\n\
              - /export [all] — 把当前会话（或全部会话）的完整记录导出为 JSONL（agent/exports/，含已压缩的消息）\n\
-             - /clear [confirm] — 清空全部会话状态（agent/state.sqlite）、会话 artifact 落盘目录并删除 agent/memory 全部文件（需 /clear confirm）\n\
+             - /clear [confirm] — 清空全部会话状态（agent/state.sqlite）、会话 artifact 落盘目录并删除 agent/memory 全部文件（需 /clear confirm；设备在同步空间中时，即使同步已关闭，也要用 /clear confirm local 或 /clear confirm all）\n\
+             - /sync [status|now|pause|resume|show|accept|reject] — 查看多端同步状态、立即同步、暂停 / 恢复、处理待确认的改动\n\
              - /log [子命令] — 查看 / 发送 / 删除 agent/logs 日志文件（list / get / del）\n\
              - /workflow <请求> — 设计并运行一个动态工作流（展开为 prompt，历史保留原文）\n\
              - /cancel — 停止当前会话正在运行的任务（路由层即时生效，不进入 LLM）\n\

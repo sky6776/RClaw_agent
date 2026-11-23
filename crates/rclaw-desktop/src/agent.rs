@@ -165,6 +165,8 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     for name in read_disabled_tools(&home) {
         core.tools.set_enabled(&name, false);
     }
+    // 会话的自定义标题现在存在库里（跟着会话同步）：旧版本存在偏好文件里的搬一次。
+    migrate_chat_titles(&home, &core.session).await;
 
     let (inbound_tx, inbound_rx) = mpsc::channel::<BusMessage>(64);
     let (outbound_tx, outbound_rx) = mpsc::channel::<BusMessage>(64);
@@ -216,6 +218,10 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     // 回放）。
     crate::tool_events::attach_app();
     agent.set_turn_observer(Arc::new(crate::tool_events::ToolEventObserver::new()));
+    // 多端同步：引擎接到 agent 上（必须在 run 之前），事件推给这个窗口。同步没开时只是
+    // 一个空句柄——不起线程、不建同步表、不碰磁盘。
+    crate::sync_host::bind_app(app);
+    let sync = crate::sync_host::attach(core.sync, &agent);
     tauri::async_runtime::spawn(agent.run());
 
     // cron + heartbeat 后台服务（与 CLI 相同语义）。
@@ -260,6 +266,7 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
         bots: core.bots,
         bot_router,
         llm_providers,
+        sync,
     };
     *app.state::<AppState>()
         .agent
@@ -556,7 +563,26 @@ pub fn write_disabled_tools(home: &std::path::Path, disabled: &[String]) -> Resu
     })
 }
 
-/// 读取自定义会话名映射（chat_id -> 标题；文件缺失 / 损坏按空处理）。
+/// 启动时把旧版本存在偏好文件里的会话标题搬进库。读文件、读写库都是阻塞的，放到阻塞
+/// 线程上做；等它做完再往下走，界面第一次列会话时标题已经在库里。
+async fn migrate_chat_titles(
+    home: &std::path::Path,
+    sessions: &rclaw_store::session::SessionStore,
+) {
+    let home = home.to_path_buf();
+    let sessions = sessions.clone();
+    let moved = tauri::async_runtime::spawn_blocking(move || {
+        crate::sync_host::migrate_chat_titles(&home, &sessions);
+    })
+    .await;
+    if let Err(error) = moved {
+        tracing::warn!("会话标题迁移任务没有跑完（下次启动再试）: {error}");
+    }
+}
+
+/// 读取旧版本存在偏好文件里的自定义会话名映射（chat_id -> 标题；文件缺失 / 损坏按空
+/// 处理）。会话标题现在存在库里（`SessionStore::session_title`，跟着会话同步）；这里只剩
+/// 启动时的一次性迁移在读（`sync_host::migrate_chat_titles`）。
 pub fn read_chat_titles(home: &std::path::Path) -> std::collections::BTreeMap<String, String> {
     read_prefs(home)
         .get("chat_titles")
@@ -569,9 +595,10 @@ pub fn read_chat_titles(home: &std::path::Path) -> std::collections::BTreeMap<St
         .unwrap_or_default()
 }
 
-/// 写入 / 清除自定义会话名（标题去空白后为空 = 删除该键，恢复自动派生标题；
-/// 读-改-写保留偏好文件中的其它键）。归档 / 恢复只改会话标记、chat_id 不变，
-/// 自定义标题天然跟随会话。
+/// 往偏好文件里写入 / 清除自定义会话名（标题去空白后为空 = 删除该键；读-改-写保留偏好
+/// 文件中的其它键）。这是旧版本的存法，运行时已经不再写它——只有测试用它造出旧版本留下
+/// 的偏好文件。
+#[cfg(test)]
 pub fn write_chat_title(home: &std::path::Path, chat_id: &str, title: &str) -> Result<(), String> {
     let title = title.trim();
     update_prefs(home, |value| {
@@ -746,6 +773,9 @@ async fn start_agent_inner(app: &tauri::AppHandle, _home: PathBuf) -> Result<(),
     install_permission_hook(app.clone());
     install_command_confirm_hook(app.clone());
     install_session_access_hook(app.clone());
+    // 多端同步的事件出口：界面在场了。引擎可能早就由前台服务装配好了（无头期的事件没有
+    // 人看，直接丢掉；界面起来之后自己会整个取一遍数）。
+    crate::sync_host::bind_app(app);
     let context =
         rclaw_android::host_context().ok_or("Android 宿主上下文未初始化（nativeInit 未调用）")?;
     let mut slot = crate::android_host::apk_runtime_slot().lock().await;
@@ -809,6 +839,7 @@ fn clone_running_agent(running: &RunningAgent) -> RunningAgent {
         bots: running.bots.clone(),
         bot_router: running.bot_router.clone(),
         llm_providers: running.llm_providers.clone(),
+        sync: running.sync.clone(),
     }
 }
 
@@ -909,6 +940,8 @@ pub(crate) async fn assemble_apk_agent(
     for name in read_disabled_tools(&home) {
         core.tools.set_enabled(&name, false);
     }
+    // 会话的自定义标题现在存在库里（跟着会话同步）：旧版本存在偏好文件里的搬一次。
+    migrate_chat_titles(&home, &core.session).await;
 
     // 通知空闲态：安装估算输入并启动 30s 刷新（GUI 与无头服务两路都在这里，
     // 幂等）。放在禁用工具回放之后，估算看到的工具面与实际一致。
@@ -1029,6 +1062,9 @@ pub(crate) async fn assemble_apk_agent(
         Arc::new(crate::android_status::TurnStatusObserver),
         Arc::new(crate::tool_events::ToolEventObserver::new()),
     ])));
+    // 多端同步：引擎接到 agent 上（必须在 run 之前）。它跑在自己的线程上，前台服务常驻
+    // 期间一直在；界面没开时按后台的节奏轮询（§13）。同步没开时只是一个空句柄。
+    let sync = crate::sync_host::attach(core.sync, &agent);
     let agent_task = tokio::spawn(agent.run());
     tokio::spawn(
         CronService::new(
@@ -1104,6 +1140,7 @@ pub(crate) async fn assemble_apk_agent(
             bots: core.bots,
             bot_router,
             llm_providers,
+            sync,
         },
         pending_outbound,
     ))

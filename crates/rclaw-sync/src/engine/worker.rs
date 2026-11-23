@@ -1,0 +1,1087 @@
+//! 引擎线程：一条专用的系统线程，上面是单线程的 tokio 运行时。
+//!
+//! 它是一个 actor：命令（宿主的通知、面板上的操作）、定时器（定时轮询、本机变更检查、
+//! 约好的下一轮）依次处理，两轮同步不会同时进行，命令排在两轮之间执行。附件的上传下载
+//! 是同一个运行时上的两个本地任务（[`super::transfer`]），在轮次等网络的间隙里穿插。
+//!
+//! 一个数据目录同一时刻只有一个进程做同步：靠 `sync/engine.lock` 上的文件锁。拿不到锁
+//! 的进程处于 `standby`，隔一阵再试。
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use rclaw_store::sync_db;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+
+use super::round::{Outcome, Session};
+use super::{local, space, transfer, Shared, Trigger, PULL_FRESH_MS};
+use crate::attach::{self, now_ms, Backlog};
+use crate::config::{SyncConfig, SyncPaths};
+use crate::db;
+use crate::error::{Result, SyncError, TransportError};
+use crate::files;
+use crate::merge;
+use crate::secrets::Secrets;
+use crate::{blocking, SyncEvent};
+
+/// 本机变更检查的间隔（§7.1）。后台放宽。
+const TICK: Duration = Duration::from_secs(5);
+const TICK_BACKGROUND: Duration = Duration::from_secs(30);
+/// 属性变更、删除之后隔这么久发布（连着改几样时合成一轮）。
+const LOCAL_CHANGE_DELAY: Duration = Duration::from_millis(300);
+/// 只拉取的一轮有了收获，隔这么久补一轮完整的。
+const FOLLOW_UP_DELAY: Duration = Duration::from_millis(300);
+/// 出错之后的重试间隔：从 `RETRY_MIN` 起逐次翻倍，到 `RETRY_MAX` 为止。
+const RETRY_MIN: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(300);
+/// 要用户动手才能好的错误（密码不对、空间被重置、要升级）：慢慢重试。
+const RETRY_SLOW: Duration = Duration::from_secs(300);
+/// 存储限流时最多等这么久。
+const RATE_LIMIT_MAX: Duration = Duration::from_secs(900);
+/// 等用户确认（计费网络下的首次同步）期间，隔这么久看一眼网络是不是换了。
+const CONFIRM_RECHECK: Duration = Duration::from_secs(30);
+/// 窗口重新获得焦点时，上次失败已经过了这么久就不再等退避，马上试一次。
+const FOCUS_RETRY: Duration = Duration::from_secs(15);
+/// 拿不到引擎锁：第一次很快再试（多半是上一个引擎线程还在收尾），之后慢慢试。
+const STANDBY_FIRST: Duration = Duration::from_secs(2);
+const STANDBY_RETRY: Duration = Duration::from_secs(30);
+/// 本机这边没准备好（目录、数据库出错）：隔这么久再试。
+const OPEN_RETRY: Duration = Duration::from_secs(30);
+/// 连着马上再来一轮最多这么多次，然后歇一会儿（大批量的首次同步照样走得完，出了
+/// 「总觉得还有活」的毛病时也不至于空转）。
+const RERUN_MAX: u32 = 50;
+const RERUN_PAUSE: Duration = Duration::from_secs(30);
+/// 打开会话、续聊之前，补齐最后这么多条消息引用的附件。
+const TAIL_MESSAGES: usize = 30;
+
+pub(crate) const STANDBY_HINT: &str = "另一个 RClaw 进程正在用这个数据目录做同步，本进程先不同步。\
+     要在这里操作同步空间，请到那个进程里去，或者先退出它";
+
+pub(crate) type Reply<T> = oneshot::Sender<Result<T>>;
+
+/// 等着这个命令结果的一方还在不在。
+///
+/// 动同步空间的操作（创建、加入、退出、重置）要排到两轮同步之间才办；排到的时候对方已经
+/// 不等了就不办。`/clear confirm local` 等过上限时已经告诉用户「没有退出」；加入之后的
+/// 配置也要靠等着的那一方写回 `rclaw.toml`——没人接着做后半截的事，前半截就不该发生。
+fn wanted<T>(reply: &Reply<T>) -> bool {
+    !reply.is_closed()
+}
+
+/// 交给引擎线程的命令。
+pub(crate) enum Cmd {
+    Trigger(Trigger),
+    /// 续聊之前：把会话末尾引用的附件取回来（取不到要告诉界面）。
+    Prefetch {
+        channel: String,
+        chat_id: String,
+    },
+    SyncNow(Reply<()>),
+    /// 发送前的拉取：拉完（或者不需要拉）就回话。
+    Presend(oneshot::Sender<()>),
+    Reconfigure(SyncConfig),
+    Pause(bool, Reply<()>),
+    Resolve {
+        id: String,
+        action: String,
+        /// 用户看到的那一版（等确认的改动才有）。
+        reviewed: Option<String>,
+        reply: Reply<()>,
+    },
+    Takeover {
+        owner: String,
+        id: String,
+        force: bool,
+        /// 用户看到的那份任务定义的版本。
+        reviewed: String,
+        reply: Reply<()>,
+    },
+    CreateSpace(Reply<()>),
+    JoinSpace {
+        code: String,
+        reply: Reply<SyncConfig>,
+    },
+    LeaveSpace(Reply<()>),
+    ResetSpace(Reply<()>),
+    PairingCode {
+        include_storage: bool,
+        reply: Reply<String>,
+    },
+    SetSecret {
+        secret: String,
+        reply: Reply<()>,
+    },
+    ConfirmMetered(Reply<()>),
+    SetBacklog {
+        choice: Backlog,
+        reply: Reply<()>,
+    },
+    Stop,
+    /// 测试用：让引擎线程出一个没料到的错。
+    #[cfg(test)]
+    Crash,
+}
+
+/// 一轮的种类。完整的一轮包含拉取，所以约了两种时只跑完整的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    Pull,
+    Full,
+}
+
+/// 试着拿引擎单实例锁。拿到的文件句柄要一直留着；`None` = 别的进程（或本进程里上一个
+/// 还没退出的引擎线程）拿着。
+pub(crate) fn take_lock(paths: &SyncPaths) -> std::io::Result<Option<std::fs::File>> {
+    paths.ensure_root()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&paths.lock)?;
+    Ok(fs2::FileExt::try_lock_exclusive(&file)
+        .is_ok()
+        .then_some(file))
+}
+
+/// 启动引擎线程。
+///
+/// 线程里出了没料到的错（panic）时它就此退出，不带倒进程里别的东西：面板上说明白，句柄
+/// 发现命令通道关了，会重新起一条（[`super::SyncEngine::live`]）。同步的状态都在盘上，
+/// 断在哪一步都能接着来。
+pub(crate) fn spawn(
+    shared: Arc<Shared>,
+    config: SyncConfig,
+    commands: mpsc::UnboundedReceiver<Cmd>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("rclaw-sync".into())
+        .spawn(move || {
+            let view = shared.clone();
+            let run = std::panic::AssertUnwindSafe(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        shared.set_state("error", Some(format!("同步引擎没能启动: {error}")));
+                        return;
+                    }
+                };
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&runtime, Worker::new(shared, config, commands).run());
+            });
+            if std::panic::catch_unwind(run).is_err() {
+                tracing::error!("同步引擎的线程因为程序内部的错误退出了");
+                view.set_state(
+                    "error",
+                    Some(
+                        "同步引擎意外停止了（程序内部出错）。点「重试」重新启动；一再出现的话请\
+                         把日志反馈给开发者"
+                            .into(),
+                    ),
+                );
+            }
+        })
+        .map(|_| ())
+}
+
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 一轮失败之后：面板上显示成什么状态，多久之后再试。
+fn classify(error: &SyncError, failures: u32) -> (&'static str, Duration) {
+    let backoff = RETRY_MIN
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+        .min(RETRY_MAX);
+    match error {
+        SyncError::NeedsUser(_) => ("confirm", CONFIRM_RECHECK),
+        SyncError::SpaceClosed | SyncError::Upgrade(_) => ("error", RETRY_SLOW),
+        SyncError::Transport(error) => match error {
+            TransportError::Auth(_)
+            | TransportError::Insecure(_)
+            | TransportError::Config(_)
+            | TransportError::Unsupported(_)
+            | TransportError::TooLarge(_) => ("error", RETRY_SLOW),
+            TransportError::RateLimited { retry_after, .. } => (
+                "offline",
+                retry_after
+                    .unwrap_or(backoff)
+                    .clamp(RETRY_MIN, RATE_LIMIT_MAX),
+            ),
+            TransportError::NotFound(_) | TransportError::Timeout(_) | TransportError::Other(_) => {
+                ("offline", backoff)
+            }
+            // 正常到不了这里：转成 `SyncError` 时它已经算作「校验不过」了。
+            TransportError::Oversize(_) => ("error", backoff),
+        },
+        _ => ("error", backoff),
+    }
+}
+
+struct Worker {
+    shared: Arc<Shared>,
+    config: SyncConfig,
+    commands: mpsc::UnboundedReceiver<Cmd>,
+    /// 引擎单实例锁：拿着它的进程才动同步状态。
+    lock: Option<std::fs::File>,
+    secrets: Secrets,
+    /// 密钥文件读进来了。
+    loaded: bool,
+    /// 连着的同步空间。
+    session: Option<Session>,
+    /// 附件的上传、下载任务。
+    uploads: Option<JoinHandle<()>>,
+    downloads: Option<JoinHandle<()>>,
+    /// 约好的下一轮。
+    next: Option<(Kind, Instant)>,
+    /// 出错之后，在这之前不自动重试。
+    hold_until: Option<Instant>,
+    failures: u32,
+    failed_at: Option<Instant>,
+    /// 已经连着「马上再来一轮」多少次。
+    reruns: u32,
+    background: bool,
+    paused: bool,
+    next_poll: Instant,
+    next_tick: Instant,
+    /// 没连上同步空间时，下次再试的时刻；`None` = 等用户动手（改配置、填密码、配对）。
+    reopen_at: Option<Instant>,
+    standby_tries: u32,
+}
+
+impl Worker {
+    fn new(
+        shared: Arc<Shared>,
+        config: SyncConfig,
+        commands: mpsc::UnboundedReceiver<Cmd>,
+    ) -> Worker {
+        let now = Instant::now();
+        Worker {
+            shared,
+            config,
+            commands,
+            lock: None,
+            secrets: Secrets::default(),
+            loaded: false,
+            session: None,
+            uploads: None,
+            downloads: None,
+            next: None,
+            hold_until: None,
+            failures: 0,
+            failed_at: None,
+            reruns: 0,
+            background: false,
+            paused: false,
+            next_poll: now,
+            next_tick: now,
+            reopen_at: None,
+            standby_tries: 0,
+        }
+    }
+
+    async fn run(mut self) {
+        self.open().await;
+        loop {
+            self.revive_transfers();
+            let wake = self.deadline();
+            tokio::select! {
+                biased;
+                cmd = self.commands.recv() => match cmd {
+                    // 句柄都释放了，或者同步被关掉了。
+                    None | Some(Cmd::Stop) => break,
+                    Some(cmd) => self.handle(cmd).await,
+                },
+                _ = self.shared.kick.notified() => self.request(Kind::Full, Duration::ZERO),
+                _ = sleep_until(wake) => self.on_timer().await,
+            }
+        }
+        self.teardown().await;
+    }
+
+    // -- 定时 ---------------------------------------------------------------
+
+    /// 下一件定了时间的事。
+    fn deadline(&self) -> Option<Instant> {
+        let mut wake = self.reopen_at;
+        if self.session.is_some() && !self.paused {
+            let mut earliest = |at: Instant| wake = Some(wake.map_or(at, |old| old.min(at)));
+            earliest(self.next_poll);
+            earliest(self.next_tick);
+            if let Some((_, at)) = self.next {
+                earliest(at);
+            }
+        }
+        wake
+    }
+
+    async fn on_timer(&mut self) {
+        let now = Instant::now();
+        if self.session.is_none() {
+            if self.reopen_at.is_some_and(|at| at <= now) {
+                self.open().await;
+            }
+            return;
+        }
+        if self.paused {
+            return;
+        }
+        if self.next_poll <= now {
+            self.schedule_poll();
+            // 后台只在不按流量计费的网络下轮询（附件的传输不受这个限制）。
+            if !(self.background && self.shared.ctx.host.is_metered()) {
+                self.request(Kind::Full, Duration::ZERO);
+            }
+        }
+        if self.next_tick <= now {
+            self.tick().await;
+        }
+        if let Some((kind, at)) = self.next {
+            if at <= Instant::now() {
+                let _ = self.run_round(kind).await;
+            }
+        }
+    }
+
+    fn tick_every(&self) -> Duration {
+        if self.background {
+            TICK_BACKGROUND
+        } else {
+            TICK
+        }
+    }
+
+    fn schedule_poll(&mut self) {
+        let secs = if self.background {
+            self.config.background_interval_sec
+        } else {
+            self.config.poll_interval_sec
+        };
+        self.next_poll = Instant::now() + Duration::from_secs(secs.max(5));
+    }
+
+    /// 约一轮：`after` 之后跑。已经约了的话取更早的时刻、更完整的种类；出错之后的退避
+    /// 期内不提前。
+    fn request(&mut self, kind: Kind, after: Duration) {
+        let mut at = Instant::now() + after;
+        if let Some(hold) = self.hold_until {
+            at = at.max(hold);
+        }
+        self.next = Some(match self.next {
+            Some((old_kind, old_at)) => (old_kind.max(kind), old_at.min(at)),
+            None => (kind, at),
+        });
+    }
+
+    /// 本机变更检查：有新消息等着发布、运行提示变了，就约一轮。
+    async fn tick(&mut self) {
+        self.next_tick = Instant::now() + self.tick_every();
+        if self.paused {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if !session.warm {
+            return;
+        }
+        match session.tick(&self.shared, &self.config).await {
+            Ok(Some(after)) => self.request(Kind::Full, after),
+            Ok(None) => {}
+            Err(error) => tracing::debug!("检查本机变更失败: {error}"),
+        }
+    }
+
+    // -- 轮次 ---------------------------------------------------------------
+
+    /// 跑一轮。失败时返回原因（给等着结果的调用方看）。
+    async fn run_round(&mut self, kind: Kind) -> std::result::Result<(), String> {
+        // 已经约好的也算在这一轮里。
+        let pending = self.next.take();
+        let Some(session) = self.session.as_mut() else {
+            return Err("还没有连上同步空间".into());
+        };
+        // 还没完整跑过一轮（本机的存量、空间里现有的内容都没过一遍）时只跑完整的。
+        let kind = if session.warm { kind } else { Kind::Full };
+        if kind == Kind::Pull {
+            if let Some((Kind::Full, at)) = pending {
+                self.next = Some((Kind::Full, at));
+            }
+        }
+        let shared = self.shared.clone();
+        shared.round_since_ms.store(now_ms(), Ordering::Relaxed);
+        let result = match kind {
+            Kind::Full => {
+                session
+                    .full_round(&shared, &self.config, &mut self.secrets)
+                    .await
+            }
+            Kind::Pull => session.pull_round(&shared, &self.config).await,
+        };
+        shared.round_since_ms.store(0, Ordering::Relaxed);
+        match result {
+            Ok(outcome) => {
+                self.round_ok(kind, outcome);
+                Ok(())
+            }
+            Err(error) => {
+                self.round_failed(&error);
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn round_ok(&mut self, kind: Kind, outcome: Outcome) {
+        self.failures = 0;
+        self.failed_at = None;
+        self.hold_until = None;
+        self.shared.storage_ok.store(true, Ordering::Relaxed);
+        if kind == Kind::Full {
+            // 完整的一轮刚跑过：定时轮询从现在重新计时。
+            self.schedule_poll();
+        }
+        let busy = outcome.again
+            || outcome
+                .retry_after
+                .is_some_and(|after| after < Duration::from_secs(1));
+        self.shared
+            .set_state(if busy { "syncing" } else { "idle" }, None);
+        if outcome.again {
+            if self.reruns < RERUN_MAX {
+                self.reruns += 1;
+                self.request(Kind::Full, Duration::ZERO);
+            } else {
+                self.reruns = 0;
+                self.request(Kind::Full, RERUN_PAUSE);
+            }
+        } else if kind == Kind::Full {
+            self.reruns = 0;
+        }
+        if let Some(after) = outcome.retry_after {
+            self.request(Kind::Full, after);
+        }
+        if outcome.follow_up {
+            self.request(Kind::Full, FOLLOW_UP_DELAY);
+        }
+    }
+
+    fn round_failed(&mut self, error: &SyncError) {
+        self.failures = self.failures.saturating_add(1);
+        self.reruns = 0;
+        let now = Instant::now();
+        self.failed_at = Some(now);
+        let (state, wait) = classify(error, self.failures);
+        if state == "confirm" {
+            tracing::debug!("同步在等用户确认: {error}");
+        } else if self.failures <= 3 {
+            tracing::warn!("这一轮同步没有完成（{wait:?} 后再试）: {error}");
+        } else {
+            tracing::debug!("这一轮同步没有完成（{wait:?} 后再试）: {error}");
+        }
+        self.shared.storage_ok.store(false, Ordering::Relaxed);
+        self.shared.set_state(state, Some(error.to_string()));
+        self.hold_until = Some(now + wait);
+        self.next = None;
+        self.request(Kind::Full, Duration::ZERO);
+    }
+
+    // -- 连上 / 断开同步空间 --------------------------------------------------
+
+    fn secret_saved(&self) -> bool {
+        !self.secrets.storage_secret(&self.config).is_empty()
+    }
+
+    fn fail_open(&mut self, message: String, retry: Option<Duration>) {
+        tracing::warn!("同步没有启动: {message}");
+        self.shared.set_state("error", Some(message));
+        self.reopen_at = retry.map(|after| Instant::now() + after);
+    }
+
+    /// 连上本机所在的同步空间：拿引擎锁、读密钥、组装存储、准备本机的同步数据、起附件
+    /// 任务，然后约第一轮。哪一步不成就停在相应的状态上。
+    async fn open(&mut self) {
+        if self.session.is_some() {
+            return;
+        }
+        self.reopen_at = None;
+        let shared = self.shared.clone();
+        let paths = shared.ctx.paths.clone();
+
+        if self.lock.is_none() {
+            let lock_paths = paths.clone();
+            match blocking(move || Ok(take_lock(&lock_paths)?)).await {
+                Ok(Some(file)) => {
+                    self.lock = Some(file);
+                    self.standby_tries = 0;
+                }
+                Ok(None) => {
+                    self.standby_tries += 1;
+                    let wait = if self.standby_tries == 1 {
+                        STANDBY_FIRST
+                    } else {
+                        STANDBY_RETRY
+                    };
+                    self.reopen_at = Some(Instant::now() + wait);
+                    shared.set_state("standby", Some(STANDBY_HINT.into()));
+                    return;
+                }
+                Err(error) => {
+                    return self.fail_open(format!("同步目录用不了: {error}"), Some(OPEN_RETRY));
+                }
+            }
+        }
+
+        match blocking(move || Secrets::load(&paths)).await {
+            Ok(secrets) => {
+                self.secrets = secrets;
+                self.loaded = true;
+            }
+            Err(error) => {
+                self.loaded = false;
+                return self.fail_open(error.to_string(), Some(OPEN_RETRY));
+            }
+        }
+        let paired = self.secrets.is_paired();
+        shared.paired.store(paired, Ordering::Relaxed);
+        shared.set_space(
+            paired.then(|| self.secrets.space_id.clone()),
+            self.secret_saved(),
+        );
+        if !paired {
+            shared.set_state("setup", None);
+            return;
+        }
+
+        // 配置或存储设置不对：等用户改（改配置、填密码都会再来一次）。
+        if let Err(error) = self.config.validate() {
+            return self.fail_open(error.to_string(), None);
+        }
+        let live = match space::load_live(&self.config, &self.secrets).await {
+            Ok(live) => live,
+            Err(error) => return self.fail_open(error.to_string(), None),
+        };
+
+        let prepared = {
+            let (ctx, keys) = (shared.ctx.clone(), live.keys.clone());
+            let trash_days = self.config.trash_days;
+            let mut secrets = self.secrets.clone();
+            blocking(move || {
+                let identity = space::prepare_local(&ctx, &mut secrets, &keys, trash_days)?;
+                let paused = db::read(ctx.db(), |conn| {
+                    Ok(db::kv_json::<bool>(conn, db::KV_PAUSED)? == Some(true))
+                })?;
+                Ok((identity, secrets, paused))
+            })
+            .await
+        };
+        let (identity, secrets, paused) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return self
+                    .fail_open(format!("准备本机的同步数据失败: {error}"), Some(OPEN_RETRY));
+            }
+        };
+        self.secrets = secrets;
+        self.paused = paused;
+        shared.paused.store(paused, Ordering::Relaxed);
+        shared.storage_ok.store(true, Ordering::Relaxed);
+        shared.last_pull_ms.store(0, Ordering::Relaxed);
+
+        let session = Session::new(live, identity);
+        self.start_uploads(session.live.clone());
+        self.start_downloads(session.live.clone());
+        self.session = Some(session);
+        self.failures = 0;
+        self.failed_at = None;
+        self.hold_until = None;
+        self.reruns = 0;
+        self.next = None;
+        self.next_tick = Instant::now() + self.tick_every();
+        self.schedule_poll();
+        if paused {
+            shared.set_state("paused", None);
+        } else {
+            shared.set_state("syncing", None);
+            self.request(Kind::Full, Duration::ZERO);
+        }
+    }
+
+    fn start_uploads(&mut self, live: Arc<space::Live>) {
+        let task = transfer::upload_task(self.shared.clone(), live);
+        self.uploads = Some(tokio::task::spawn_local(task));
+    }
+
+    fn start_downloads(&mut self, live: Arc<space::Live>) {
+        let (fetch, requests) = mpsc::unbounded_channel();
+        self.shared.set_fetch(Some(fetch));
+        let task = transfer::download_task(self.shared.clone(), live, requests);
+        self.downloads = Some(tokio::task::spawn_local(task));
+    }
+
+    /// 附件任务不会自己结束：结束了就是里面出了没料到的错（运行时接住了 panic，只停了那
+    /// 一个任务）。把停了的那个重新起起来——上传任务等下一次被叫醒（一轮同步成功）再干活；
+    /// 下载任务手上排着的请求丢了，用户再点一次就又排上。
+    fn revive_transfers(&mut self) {
+        let Some(live) = self.session.as_ref().map(|session| session.live.clone()) else {
+            return;
+        };
+        if self.uploads.as_ref().is_some_and(JoinHandle::is_finished) {
+            tracing::error!("附件的上传任务因为程序内部的错误退出了，重新启动");
+            self.start_uploads(live.clone());
+        }
+        if self.downloads.as_ref().is_some_and(JoinHandle::is_finished) {
+            tracing::error!("附件的下载任务因为程序内部的错误退出了，重新启动");
+            self.start_downloads(live);
+        }
+    }
+
+    /// 断开同步空间：停掉附件任务。写到一半的快照留给下次清理（它的名字记在库里）。
+    async fn teardown(&mut self) {
+        self.shared.set_fetch(None);
+        for task in [self.uploads.take(), self.downloads.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        self.session = None;
+        self.next = None;
+    }
+
+    // -- 命令 ---------------------------------------------------------------
+
+    async fn handle(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Trigger(trigger) => self.on_trigger(trigger).await,
+            Cmd::Prefetch { channel, chat_id } => self.prefetch(channel, chat_id, true).await,
+            Cmd::SyncNow(reply) => {
+                let _ = reply.send(self.sync_now().await);
+            }
+            Cmd::Presend(reply) => {
+                self.presend().await;
+                let _ = reply.send(());
+            }
+            Cmd::Reconfigure(config) => self.reconfigure(config).await,
+            Cmd::Pause(paused, reply) => {
+                let _ = reply.send(self.set_paused(paused).await);
+            }
+            Cmd::Resolve {
+                id,
+                action,
+                reviewed,
+                reply,
+            } => {
+                let _ = reply.send(self.resolve(id, action, reviewed).await);
+            }
+            Cmd::Takeover {
+                owner,
+                id,
+                force,
+                reviewed,
+                reply,
+            } => {
+                let _ = reply.send(self.takeover(owner, id, force, reviewed).await);
+            }
+            Cmd::CreateSpace(reply) => {
+                if wanted(&reply) {
+                    let _ = reply.send(self.create_space().await);
+                }
+            }
+            Cmd::JoinSpace { code, reply } => {
+                if wanted(&reply) {
+                    let _ = reply.send(self.join_space(&code).await);
+                }
+            }
+            Cmd::LeaveSpace(reply) => {
+                if wanted(&reply) {
+                    let _ = reply.send(self.leave_space().await);
+                }
+            }
+            Cmd::ResetSpace(reply) => {
+                if wanted(&reply) {
+                    let _ = reply.send(self.reset_space().await);
+                }
+            }
+            Cmd::PairingCode {
+                include_storage,
+                reply,
+            } => {
+                let _ = reply.send(self.pairing_code(include_storage).await);
+            }
+            Cmd::SetSecret { secret, reply } => {
+                let _ = reply.send(self.set_secret(secret).await);
+            }
+            Cmd::ConfirmMetered(reply) => {
+                let _ = reply.send(self.confirm_metered().await);
+            }
+            Cmd::SetBacklog { choice, reply } => {
+                let _ = reply.send(self.set_backlog(choice).await);
+            }
+            Cmd::Stop => {}
+            #[cfg(test)]
+            Cmd::Crash => panic!("测试：引擎线程出错"),
+        }
+    }
+
+    async fn on_trigger(&mut self, trigger: Trigger) {
+        match trigger {
+            Trigger::LocalChange => self.request(Kind::Full, LOCAL_CHANGE_DELAY),
+            Trigger::TurnEnded => self.tick().await,
+            Trigger::Foreground => {
+                self.background = false;
+                self.hold_until = None;
+                if self.session.is_none() {
+                    self.open().await;
+                }
+                self.next_tick = Instant::now() + self.tick_every();
+                self.schedule_poll();
+                self.request(Kind::Full, Duration::ZERO);
+            }
+            Trigger::Background => {
+                self.background = true;
+                self.schedule_poll();
+                // 冲刷：攒着的回执也一并写出去。
+                if let Some(session) = self.session.as_mut() {
+                    session.force_head = true;
+                }
+                self.request(Kind::Full, Duration::ZERO);
+            }
+            Trigger::Focus => self.pull_if_stale(),
+            Trigger::OpenSession { channel, chat_id } => {
+                self.pull_if_stale();
+                self.prefetch(channel, chat_id, false).await;
+            }
+            Trigger::Imported => {
+                if let Some(session) = self.session.as_mut() {
+                    session.full = true;
+                }
+                self.request(Kind::Full, Duration::ZERO);
+            }
+        }
+    }
+
+    /// 用户回到了窗口 / 打开了会话：距上次拉取有一阵了就拉一次。
+    fn pull_if_stale(&mut self) {
+        if self.failed_at.is_some_and(|at| at.elapsed() >= FOCUS_RETRY) {
+            self.hold_until = None;
+        }
+        if now_ms() - self.shared.last_pull_ms.load(Ordering::Relaxed) >= PULL_FRESH_MS {
+            self.request(Kind::Pull, Duration::ZERO);
+        }
+    }
+
+    /// 把一个会话末尾引用的、还在别的设备上的附件排进下载队列（§8.7）。`user`：续聊要用，
+    /// 取不到要告诉界面。
+    async fn prefetch(&mut self, channel: String, chat_id: String, user: bool) {
+        let attachments =
+            local::scopes_of(&self.config, self.shared.sessions_supported).attachments;
+        if self.session.is_none() || self.paused || !attachments {
+            return;
+        }
+        let ctx = self.shared.ctx.clone();
+        let max_size = self.config.attachment_max_bytes();
+        let tail = blocking(move || {
+            local::tail_remote_blobs(&ctx, &channel, &chat_id, TAIL_MESSAGES, max_size, now_ms())
+        })
+        .await;
+        match tail {
+            Ok(blobs) => {
+                for blob in blobs {
+                    self.shared.request_fetch(blob, user);
+                }
+            }
+            Err(error) => tracing::debug!("查找会话引用的附件失败: {error}"),
+        }
+    }
+
+    /// 没连上同步空间时，给等着结果的调用方一个说法。
+    fn unavailable(&self) -> SyncError {
+        if self.lock.is_none() {
+            return SyncError::other(STANDBY_HINT);
+        }
+        if self.loaded && !self.secrets.is_paired() {
+            return SyncError::other("还没有创建或加入同步空间");
+        }
+        SyncError::other("还没有连上同步空间，请先看一下同步面板里的提示")
+    }
+
+    /// 本进程拿着引擎锁、密钥文件也读进来了：可以动同步空间。
+    fn require_owner(&self) -> Result<()> {
+        if self.lock.is_some() && self.loaded {
+            Ok(())
+        } else {
+            Err(self.unavailable())
+        }
+    }
+
+    async fn sync_now(&mut self) -> Result<()> {
+        if self.session.is_none() {
+            self.open().await;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return Err(self.unavailable());
+        };
+        if self.paused {
+            return Err(SyncError::other("同步已经暂停，恢复之后才会同步"));
+        }
+        session.force_head = true;
+        self.hold_until = None;
+        self.run_round(Kind::Full).await.map_err(SyncError::other)
+    }
+
+    async fn presend(&mut self) {
+        if self.session.is_none() || self.paused || self.hold_until.is_some() {
+            return;
+        }
+        if now_ms() - self.shared.last_pull_ms.load(Ordering::Relaxed) < PULL_FRESH_MS {
+            return;
+        }
+        let _ = self.run_round(Kind::Pull).await;
+    }
+
+    async fn reconfigure(&mut self, config: SyncConfig) {
+        let old = std::mem::replace(&mut self.config, config);
+        let new = &self.config;
+        self.shared
+            .attachment_max
+            .store(new.attachment_max_bytes(), Ordering::Relaxed);
+        let storage = old.transport != new.transport
+            || old.webdav != new.webdav
+            || old.file != new.file
+            || old.s3 != new.s3;
+        let range = old.scopes != new.scopes
+            || old.channels != new.channels
+            || old.device_name != new.device_name;
+        if self.session.is_none() {
+            // 之前没连上（设置不全、存储组装不起来、本机这边没准备好）：再试一次。配置没变
+            // 也试——面板上的「重试」就是把现有的配置再交过来一遍。
+            self.open().await;
+            return;
+        }
+        if old == self.config {
+            return;
+        }
+        if storage {
+            self.teardown().await;
+            self.open().await;
+            return;
+        }
+        if range {
+            // 范围、通道、设备名变了：全量扫描一遍，设备名重新公布。
+            if let Some(session) = self.session.as_mut() {
+                session.full = true;
+            }
+            self.request(Kind::Full, Duration::ZERO);
+        }
+        self.schedule_poll();
+    }
+
+    async fn set_paused(&mut self, paused: bool) -> Result<()> {
+        if self.session.is_none() {
+            return Err(self.unavailable());
+        }
+        let ctx = self.shared.ctx.clone();
+        blocking(move || {
+            db::write(ctx.db(), |tx| {
+                if paused {
+                    db::kv_put_json(tx, db::KV_PAUSED, &true)
+                } else {
+                    Ok(sync_db::kv_del(tx, db::KV_PAUSED)?)
+                }
+            })
+        })
+        .await?;
+        self.paused = paused;
+        self.shared.paused.store(paused, Ordering::Relaxed);
+        if paused {
+            self.shared.set_state("paused", None);
+        } else {
+            self.shared.set_state("syncing", None);
+            self.hold_until = None;
+            self.next_tick = Instant::now() + self.tick_every();
+            self.schedule_poll();
+            self.request(Kind::Full, Duration::ZERO);
+            self.shared.uploads.notify_one();
+        }
+        Ok(())
+    }
+
+    /// 处理待办事项、接管定时任务这类操作的前提：连着同步空间，而且没有暂停（决定要落到
+    /// 文件上、要发给其他设备，都得跑一轮）。
+    fn require_active(&self) -> Result<&Session> {
+        let Some(session) = self.session.as_ref() else {
+            return Err(self.unavailable());
+        };
+        if self.paused {
+            return Err(SyncError::other("同步已经暂停，恢复同步之后再处理"));
+        }
+        Ok(session)
+    }
+
+    async fn resolve(
+        &mut self,
+        id: String,
+        action: String,
+        reviewed: Option<String>,
+    ) -> Result<()> {
+        let s = self.require_active()?.settings(&self.shared, &self.config);
+        let ctx = self.shared.ctx.clone();
+        let reload = blocking(move || {
+            if let Some(sid) = id.strip_prefix("quarantine-") {
+                let retry = match action.as_str() {
+                    "retry" => true,
+                    "discard" => false,
+                    _ => return Err(SyncError::invalid("这条待处理事项不支持这个操作")),
+                };
+                merge::resolve_quarantine(&ctx, sid, retry)?;
+                return Ok(None);
+            }
+            files::decide(&ctx, &s, &id, &action, reviewed.as_deref())
+        })
+        .await?;
+        if let Some(what) = reload {
+            self.shared.ctx.host.reload(what);
+        }
+        self.shared.emit(SyncEvent::Status);
+        // 决定要落到本机文件上、要告诉其他设备：马上来一轮。
+        self.request(Kind::Full, Duration::ZERO);
+        Ok(())
+    }
+
+    async fn takeover(
+        &mut self,
+        owner: String,
+        id: String,
+        force: bool,
+        reviewed: String,
+    ) -> Result<()> {
+        let s = self.require_active()?.settings(&self.shared, &self.config);
+        let ctx = self.shared.ctx.clone();
+        blocking(move || files::cron::request_takeover(&ctx, &s, &owner, &id, force, &reviewed))
+            .await?;
+        self.shared.emit(SyncEvent::Status);
+        self.request(Kind::Full, Duration::ZERO);
+        Ok(())
+    }
+
+    async fn create_space(&mut self) -> Result<()> {
+        self.require_owner()?;
+        self.config.validate()?;
+        space::create(&self.shared.ctx, &self.config, &mut self.secrets).await?;
+        self.open().await;
+        Ok(())
+    }
+
+    async fn join_space(&mut self, code: &str) -> Result<SyncConfig> {
+        self.require_owner()?;
+        let joined = space::join(
+            &self.shared.ctx.paths,
+            &self.config,
+            &mut self.secrets,
+            code,
+        )
+        .await?;
+        // 配对码里带了存储设置的话，配置也跟着换。
+        self.config = joined.clone();
+        self.open().await;
+        Ok(joined)
+    }
+
+    async fn leave_space(&mut self) -> Result<()> {
+        self.require_owner()?;
+        self.teardown().await;
+        let result = space::leave(&self.shared.ctx, &mut self.secrets).await;
+        // 退出成功就停在「还没配对」；没成功就照旧连回去。
+        self.open().await;
+        result
+    }
+
+    async fn reset_space(&mut self) -> Result<()> {
+        self.require_owner()?;
+        self.config.validate()?;
+        self.teardown().await;
+        let result = space::reset(&self.shared.ctx, &self.config, &mut self.secrets).await;
+        self.open().await;
+        result
+    }
+
+    async fn pairing_code(&mut self, include_storage: bool) -> Result<String> {
+        if self.require_owner().is_ok() {
+            return space::pairing_code(&self.config, &self.secrets, include_storage);
+        }
+        // 本进程不是做同步的那个：密钥以磁盘上的为准（只读）。
+        let paths = self.shared.ctx.paths.clone();
+        let secrets = blocking(move || Secrets::load(&paths)).await?;
+        space::pairing_code(&self.config, &secrets, include_storage)
+    }
+
+    async fn set_secret(&mut self, secret: String) -> Result<()> {
+        self.require_owner()?;
+        let mut next = self.secrets.clone();
+        next.set_storage_secret(&self.config, secret)?;
+        let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
+        blocking(move || saved.save(&paths)).await?;
+        self.secrets = next;
+        self.shared.set_space(
+            self.secrets
+                .is_paired()
+                .then(|| self.secrets.space_id.clone()),
+            self.secret_saved(),
+        );
+        if self.secrets.is_paired() {
+            // 换了密码：存储的客户端要重新组装。
+            self.teardown().await;
+            self.open().await;
+        }
+        Ok(())
+    }
+
+    async fn confirm_metered(&mut self) -> Result<()> {
+        let Some(session) = self.session.as_ref() else {
+            return Err(self.unavailable());
+        };
+        let (ctx, space) = (self.shared.ctx.clone(), session.live.space_id.clone());
+        blocking(move || {
+            db::write(ctx.db(), |tx| {
+                db::kv_put_json(tx, db::KV_METERED_OK, &space)
+            })
+        })
+        .await?;
+        self.hold_until = None;
+        self.request(Kind::Full, Duration::ZERO);
+        Ok(())
+    }
+
+    async fn set_backlog(&mut self, choice: Backlog) -> Result<()> {
+        let Some(session) = self.session.as_ref() else {
+            return Err(self.unavailable());
+        };
+        if !local::scopes_of(&self.config, self.shared.sessions_supported).attachments {
+            return Err(SyncError::invalid("附件同步没有开启"));
+        }
+        let (ctx, space) = (self.shared.ctx.clone(), session.live.space_id.clone());
+        blocking(move || {
+            let initial = db::write(ctx.db(), |tx| {
+                db::kv_put_json(tx, db::KV_BACKLOG, &choice)?;
+                Ok(db::kv_json::<String>(tx, db::KV_INITIAL)?.as_deref() == Some(space.as_str()))
+            })?;
+            // 首次同步已经做完：现在就照选择排队。还没做完的话，收尾时再排。
+            if initial {
+                attach::queue_backlog(&ctx, choice)?;
+            }
+            Ok(())
+        })
+        .await?;
+        self.shared.uploads.notify_one();
+        self.shared.emit(SyncEvent::Status);
+        Ok(())
+    }
+}

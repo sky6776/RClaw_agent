@@ -80,6 +80,12 @@ rclaw-runtime = { workspace = true }
 rclaw-store = { workspace = true }
 rclaw-tools = { workspace = true }
 rclaw-cli = { path = "../rclaw-cli" }
+# 多端同步：引擎句柄、状态与事件的类型（装配在 rclaw-cli 的 sync 模块里）。
+rclaw-sync = { workspace = true }
+# 配对码二维码：qrcode 生成（设置页显示），rqrr 识别（应用内扫码：对拍下 / 选中的图片解码）。
+# rqrr 不要它的 image 适配层（那会再拉一份 image 的全部默认格式），灰度数据由本 crate 自己喂。
+qrcode = { workspace = true }
+rqrr = { version = "0.11", default-features = false }
 # wxbot 联系人查询（配置页选择群/联系人）：直接引用 contacts 客户端与只读兜底。
 rclaw-channels = { path = "../rclaw-channels" }
 # 检查更新（GitHub releases API）。外部链接打开：桌面走系统 shell，

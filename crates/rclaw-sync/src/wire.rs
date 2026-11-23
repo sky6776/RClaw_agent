@@ -1,0 +1,883 @@
+//! 本机消息行 ↔ 线上消息（[`WireMsg`]）。发布（封段）、合入、会话包的导出与导入共用。
+//!
+//! 线上形态不含任何本机的东西：路径换成标记，`meta` 里的本机 id 换成全局 id，分叉告知行
+//! 的正文换成规范文本（§7.2）。落库时再换成接收端自己的值。
+
+use std::path::{Path, PathBuf};
+
+use rclaw_core::{ContentBlock, Message};
+use rclaw_store::session::artifact_chat_key;
+use rclaw_store::session::raw::{self, RawMessageRow};
+use rclaw_store::{Db, SessionStore};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+
+use crate::crypto::{sha256_reader, Keys};
+use crate::db::{self, BLOB_REMOTE};
+use crate::error::{Result, SyncError};
+use crate::map::{self, MsgMap, SessionMap};
+use crate::op::{Artifact, FileRef, WireMsg};
+use crate::portable::{self, LocalRoot};
+
+/// 本机一侧的环境：会话库、agent 根与同步目录。
+#[derive(Debug, Clone)]
+pub struct Env {
+    pub sessions: SessionStore,
+    pub root: LocalRoot,
+    /// `<数据根>/sync`。
+    pub sync_root: PathBuf,
+}
+
+/// 附件相对路径里指向同步目录的前缀（其余都相对 agent 根）。
+pub const SYNC_DIR_PREFIX: &str = "sync/";
+
+impl Env {
+    /// `data_root` 是 `rclaw.toml` 所在目录（同步目录是它下面的 `sync/`）。
+    pub fn new(sessions: &SessionStore, data_root: &Path) -> Env {
+        Env {
+            root: LocalRoot::new(&sessions.layout().base),
+            sessions: sessions.clone(),
+            sync_root: data_root.join("sync"),
+        }
+    }
+
+    pub fn db(&self) -> &Db {
+        self.sessions.db()
+    }
+
+    /// agent 根（附件的相对路径都相对它）。
+    pub fn base(&self) -> &Path {
+        &self.sessions.layout().base
+    }
+
+    /// 附件的相对路径（正斜杠）→ 本机路径。`sync/…` 指同步目录（它在数据根下，与 agent
+    /// 根并列），其余相对 agent 根。
+    ///
+    /// 结果一定落在那个根的下面。相对路径可能出自别的设备，各处的检查是第一道关，这里是
+    /// 最后一道：每一段只当作一个普通的名字拼上去，本机上拼不得的段（见 [`local_part`]）
+    /// 换成改写后的名字，而不是照拼。
+    pub fn resolve(&self, rel_path: &str) -> PathBuf {
+        self.resolve_parts(rel_path, |part| match local_part(part) {
+            Some(part) => Some(part.to_string()),
+            None => Some(rclaw_store::portable_file_name(part)),
+        })
+        .expect("每一段都给出了名字")
+    }
+
+    /// 同 [`Env::resolve`]，但只在每一段都能原样拼上去时给出路径。读本机文件用：改写过
+    /// 的名字指向的是另一个文件。
+    pub fn resolve_exact(&self, rel_path: &str) -> Option<PathBuf> {
+        self.resolve_parts(rel_path, |part| local_part(part).map(str::to_string))
+    }
+
+    /// 访问附件前检查磁盘上的路径，避免工作区里的链接把读写重定向到别处。
+    pub(crate) fn checked_path(&self, rel_path: &str) -> Result<PathBuf> {
+        let path = self.resolve(rel_path);
+        self.check_path(rel_path, &path)?;
+        Ok(path)
+    }
+
+    pub(crate) fn check_path(&self, rel_path: &str, path: &Path) -> Result<()> {
+        let root = if rel_path.starts_with(SYNC_DIR_PREFIX) {
+            self.sync_root.parent().unwrap_or(&self.sync_root)
+        } else {
+            self.base()
+        };
+        check_no_links(root, path)
+            .map_err(|error| SyncError::other(format!("无法安全访问附件 {rel_path}：{error}")))
+    }
+
+    fn resolve_parts(
+        &self,
+        rel_path: &str,
+        name_of: impl Fn(&str) -> Option<String>,
+    ) -> Option<PathBuf> {
+        let (mut path, rest) = match rel_path.strip_prefix(SYNC_DIR_PREFIX) {
+            Some(rest) => (self.sync_root.clone(), rest),
+            None => (self.base().to_path_buf(), rel_path),
+        };
+        for part in rest.split('/').filter(|part| !part.is_empty()) {
+            path.push(name_of(part)?);
+        }
+        Some(path)
+    }
+}
+
+/// 根由本机设置；根以下每一级必须是普通目录或文件。Windows reparse point 也按链接处理。
+pub(crate) fn check_no_links(root: &Path, path: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| ErrorKind::InvalidInput)?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let meta = match std::fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
+        };
+        if is_link(&meta) || !(meta.is_dir() || meta.is_file()) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "路径经过链接或特殊文件",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x0400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.is_symlink()
+    }
+}
+
+/// 相对路径里的一段能不能原样当作本机路径的一段：拼上去之后还在原来的目录下面，指的
+/// 也就是叫这个名字的那个文件。
+///
+/// Windows 上只有可移植的名字（[`rclaw_store::is_portable_file_name`]）可以：`C:x` 会把
+/// 前面的目录整个换掉，`a:b` 是备用数据流，`NUL` 是设备，结尾的点和空格会被去掉。别的
+/// 系统上这些都是普通文件名（本机自己的文件可以叫这些名字），只有 `.`、`..` 和带 NUL 的
+/// 不行。
+fn local_part(part: &str) -> Option<&str> {
+    let plain = rclaw_store::is_portable_file_name(part)
+        || (cfg!(not(windows)) && part != "." && part != ".." && !part.contains('\0'));
+    plain.then_some(part)
+}
+
+/// 某会话 artifact 目录相对 agent 根的路径（带尾斜杠）。
+pub fn artifact_rel_dir(channel: &str, chat_id: &str) -> String {
+    format!("artifacts/{}/", artifact_chat_key(channel, chat_id))
+}
+
+/// 没有内联的工具结果全文。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub name: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
+/// `sync_msg.refs` 列的内容：这条消息引用的工作区文件，和没有内联的工具结果全文。
+/// 列为空 = 还没提取过（本机产生、尚未封段的行）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRefs {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactRef>,
+}
+
+impl StoredRefs {
+    pub fn parse(column: Option<&str>) -> Option<StoredRefs> {
+        serde_json::from_str(column?).ok()
+    }
+
+    pub fn to_column(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
+    }
+}
+
+fn first_text(data: &str) -> Option<String> {
+    let message: Message = serde_json::from_str(data).ok()?;
+    message
+        .content
+        .iter()
+        .find_map(|block| block.as_text())
+        .map(str::to_string)
+}
+
+fn with_text(data: &str, text: String) -> Option<String> {
+    let mut message: Message = serde_json::from_str(data).ok()?;
+    message.id = 0;
+    message.content = vec![ContentBlock::text(text)];
+    serde_json::to_string(&message).ok()
+}
+
+/// 本机形态的 `meta` → 线上形态。锚点换不成全局 id 时返回 `None`（这一行在线上是普通行）。
+fn local_meta_to_wire(
+    conn: &Connection,
+    session: &SessionMap,
+    meta: &str,
+) -> Result<Option<serde_json::Value>> {
+    if let Some((head_until, tail_from)) = raw::compaction_anchors(meta) {
+        let Some(tail) = map::gid_of(conn, session.session_id, tail_from)? else {
+            return Ok(None);
+        };
+        let head = match head_until {
+            Some(id) => match map::gid_of(conn, session.session_id, id)? {
+                Some(gid) => Some(gid),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        return Ok(Some(serde_json::json!({
+            "compaction": { "head_until": head, "tail_from": tail }
+        })));
+    }
+    if let Some((parent_chat, anchor)) = raw::fork_notice_anchor(meta) {
+        let mut parent_sid = None;
+        let mut anchor_gid = None;
+        if let Some(parent_chat) = parent_chat {
+            if let Some(parent) = map::session_map_by_key(conn, &session.channel, &parent_chat)? {
+                if let Some(anchor) = anchor {
+                    anchor_gid = map::gid_of(conn, parent.session_id, anchor)?;
+                }
+                parent_sid = Some(parent.sid);
+            }
+        }
+        return Ok(Some(serde_json::json!({
+            "fork_notice": { "parent": parent_sid, "anchor": anchor_gid }
+        })));
+    }
+    Ok(None)
+}
+
+/// 一行消息的线上形态（数据库阶段的产物）。artifact 全文还没读，见 [`fill_artifacts`]。
+#[derive(Debug, Clone)]
+pub struct RowWire {
+    pub message_id: i64,
+    pub channel: String,
+    pub chat_id: String,
+    pub msg: WireMsg,
+    /// `sync_msg.refs` 里记着的；`None` = 还没提取过。
+    pub stored: Option<StoredRefs>,
+    /// 全文不在本机的 artifact（来自别的设备，还没取回）：照原样转述，不读占位文件。
+    pub absent: Vec<ArtifactRef>,
+}
+
+/// 读出一行消息的线上形态。在调用方的事务（或读快照）里执行，不做文件 IO。
+pub fn row_to_wire(
+    conn: &Connection,
+    env: &Env,
+    session: &SessionMap,
+    row: &RawMessageRow,
+    mapped: &MsgMap,
+) -> Result<RowWire> {
+    let wire_meta = match (&mapped.wire_meta, &row.meta) {
+        // 来自远端的行：线上原件原样转述，各端的可移植转录才一致。
+        (Some(original), _) => serde_json::from_str(original).ok(),
+        (None, Some(local)) => local_meta_to_wire(conn, session, local)?,
+        (None, None) => None,
+    };
+    let mut data = portable::publishable_data(&row.data, &row.role, row.ts);
+    let is_fork_notice = wire_meta
+        .as_ref()
+        .is_some_and(|meta| meta.get("fork_notice").is_some());
+    if is_fork_notice {
+        // 正文里写着本机的 chat_id 与消息编号：换成规范文本。
+        if let Some(text) = first_text(&data) {
+            let canonical = raw::fork_notice_text(None, raw::fork_notice_files_note(&text));
+            if let Some(rewritten) = with_text(&data, canonical) {
+                data = rewritten;
+            }
+        }
+    }
+    let prefix = env
+        .sessions
+        .artifacts_dir_prefix(&session.channel, &session.chat_id);
+    let data = portable::to_portable(&data, &env.root, &prefix);
+    let stored = StoredRefs::parse(mapped.refs.as_deref());
+    let mut absent = Vec::new();
+    if let Some(stored) = &stored {
+        for artifact in &stored.artifacts {
+            let have = match &artifact.blob {
+                Some(blob) => db::blob_get(conn, blob)?.is_some_and(|row| row.state != BLOB_REMOTE),
+                None => false,
+            };
+            if !have {
+                absent.push(artifact.clone());
+            }
+        }
+    }
+    Ok(RowWire {
+        message_id: row.id,
+        channel: session.channel.clone(),
+        chat_id: session.chat_id.clone(),
+        msg: WireMsg {
+            gid: mapped.gid.clone(),
+            parent: mapped.parent.clone(),
+            role: row.role.clone(),
+            ts: row.ts,
+            data,
+            meta: wire_meta,
+            tools: raw::tool_call_metas(conn, row.session_id, row.id)?,
+            refs: stored
+                .as_ref()
+                .map(|stored| stored.files.clone())
+                .unwrap_or_default(),
+            artifacts: Vec::new(),
+        },
+        stored,
+        absent,
+    })
+}
+
+/// artifact 全文怎么带。
+#[derive(Clone, Copy)]
+pub struct ArtifactPolicy<'a> {
+    /// 单个全文内联的上限（字节）。
+    pub inline_max: usize,
+    /// 一条消息内联全文的总上限。
+    pub message_max: usize,
+    /// 有密钥时，超出上限的全文登记为附件对象；没有就只带名字与大小。
+    pub keys: Option<&'a Keys>,
+}
+
+impl ArtifactPolicy<'static> {
+    /// 手动导出的会话包与回收站：本机文件，全文都带上。
+    pub const BUNDLE: ArtifactPolicy<'static> = ArtifactPolicy {
+        inline_max: BUNDLE_ARTIFACT_MAX,
+        message_max: usize::MAX,
+        keys: None,
+    };
+}
+
+/// 会话包里单个 artifact 全文的上限。
+pub const BUNDLE_ARTIFACT_MAX: usize = 64 * 1024 * 1024;
+/// `msg` op 里内联全文的总上限。
+pub const OP_ARTIFACTS_MAX: usize = 4 * 1024 * 1024;
+
+/// 本机的一个待登记附件对象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBlob {
+    pub blob_id: String,
+    pub rel_path: String,
+    pub size: u64,
+}
+
+/// 把消息引用到的 artifact 全文读进来（文件 IO，不碰数据库）。返回需要登记的附件对象。
+pub fn fill_artifacts(env: &Env, row: &mut RowWire, policy: ArtifactPolicy<'_>) -> Vec<LocalBlob> {
+    let mut blobs = Vec::new();
+    let dir = env.sessions.artifacts_dir(&row.channel, &row.chat_id);
+    let rel_dir = artifact_rel_dir(&row.channel, &row.chat_id);
+    let mut inlined = 0usize;
+    for name in portable::artifact_names(&row.msg.data)
+        .into_iter()
+        .take(256)
+    {
+        if let Some(absent) = row.absent.iter().find(|artifact| artifact.name == name) {
+            row.msg.artifacts.push(Artifact {
+                name,
+                text: None,
+                size: absent.size,
+                blob: absent.blob.clone(),
+            });
+            continue;
+        }
+        let path = dir.join(&name);
+        if env.check_path(&format!("{rel_dir}{name}"), &path).is_err() {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let size = meta.len();
+        let fits = size <= policy.inline_max as u64
+            && (size as usize) <= policy.message_max.saturating_sub(inlined);
+        if fits {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                inlined += text.len();
+                row.msg.artifacts.push(Artifact {
+                    name,
+                    size: text.len() as u64,
+                    text: Some(text),
+                    blob: None,
+                });
+            }
+            continue;
+        }
+        let hashed = policy.keys.and_then(|keys| {
+            let mut file = std::fs::File::open(&path).ok()?;
+            let (digest, len) = sha256_reader(&mut file).ok()?;
+            Some((keys.blob_id(&digest), len))
+        });
+        // 有对象名时，长度取算摘要时实际读到的字节数：名字和长度出自同一份内容。
+        let size = hashed.as_ref().map_or(size, |(_, len)| *len);
+        let blob = hashed.map(|(blob_id, _)| blob_id);
+        if let Some(blob_id) = &blob {
+            blobs.push(LocalBlob {
+                blob_id: blob_id.clone(),
+                rel_path: format!("{rel_dir}{name}"),
+                size,
+            });
+        }
+        row.msg.artifacts.push(Artifact {
+            name,
+            text: None,
+            size,
+            blob,
+        });
+    }
+    blobs
+}
+
+/// 附件取回后的落点（相对 agent 根）。`uploads/` 按原路径；`media/`、`output/` 只进同步
+/// 缓存，不覆盖工作区（§8.7）。
+///
+/// `uploads/` 下的路径也只有每一段都是可移植的名字时才按原路径落：别的系统上的文件名
+/// 可以带 `:`、可以叫 `NUL`，在 Windows 上照着拼就不是那个文件了（甚至不在工作区里）。
+/// 这样的附件同样进同步缓存，文件名改写过。规则不分平台，同一条引用在各台设备上的
+/// 落点一致。
+pub fn landing_path(path: &str, blob: &str) -> String {
+    if path.starts_with("uploads/") && path.split('/').all(rclaw_store::is_portable_file_name) {
+        return path.to_string();
+    }
+    cache_path(path, blob)
+}
+
+/// 同步缓存里的位置：`sync/files/<前两位>/<blob_id>/<文件名>`。文件名取路径的最后一段，
+/// 改写成各个系统上都能原样存在的样子。
+pub fn cache_path(path: &str, blob: &str) -> String {
+    let name = rclaw_store::portable_file_name(path.rsplit('/').next().unwrap_or_default());
+    format!("sync/files/{}/{blob}/{name}", &blob[..2.min(blob.len())])
+}
+
+fn placeholder_text(size: u64) -> String {
+    format!(
+        "（这段工具结果全文共 {size} 字节，保存在另一台设备上，还没有下载到本机。\
+         可以在「多端同步」里下载附件后再读取。）\n"
+    )
+}
+
+/// 线上形态的 `meta` → 本机形态。返回 `(meta, 分叉告知行要换成的正文)`。
+fn wire_meta_to_local(
+    conn: &Connection,
+    session_id: i64,
+    channel: &str,
+    meta: &serde_json::Value,
+    data: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    if let Some(compaction) = meta.get("compaction") {
+        let Some(tail) = compaction.get("tail_from").and_then(|v| v.as_str()) else {
+            return Ok((None, None));
+        };
+        let Some(tail_from) = map::message_of(conn, session_id, tail)? else {
+            return Ok((None, None));
+        };
+        let head_until = match compaction.get("head_until").and_then(|v| v.as_str()) {
+            Some(head) => match map::message_of(conn, session_id, head)? {
+                Some(id) => Some(id),
+                None => return Ok((None, None)),
+            },
+            None => None,
+        };
+        // 按 `append_compaction` 同一套规则校验；不通过就降级为普通行。
+        return Ok((
+            raw::local_compaction_meta(conn, session_id, head_until, tail_from)?,
+            None,
+        ));
+    }
+    if let Some(notice) = meta.get("fork_notice") {
+        let parent_sid = notice.get("parent").and_then(|v| v.as_str());
+        let anchor_gid = notice.get("anchor").and_then(|v| v.as_str());
+        let mut parent: Option<(String, i64)> = None;
+        if let (Some(parent_sid), Some(anchor_gid)) = (parent_sid, anchor_gid) {
+            for (parent_session, anchor_message) in map::find_gid(conn, parent_sid, anchor_gid)? {
+                if let Some((parent_channel, parent_chat)) = raw::session_key(conn, parent_session)?
+                {
+                    if parent_channel == channel {
+                        parent = Some((parent_chat, anchor_message));
+                        break;
+                    }
+                }
+            }
+        }
+        let parent_ref = parent.as_ref().map(|(chat, id)| (chat.as_str(), *id));
+        let text = first_text(data).map(|canonical| {
+            raw::fork_notice_text(parent_ref, raw::fork_notice_files_note(&canonical))
+        });
+        return Ok((Some(raw::fork_notice_meta(parent_ref)), text));
+    }
+    Ok((None, None))
+}
+
+/// 一条远端消息落到哪个本地会话。
+#[derive(Debug, Clone, Copy)]
+pub struct Landing<'a> {
+    pub session_id: i64,
+    pub channel: &'a str,
+    pub chat_id: &'a str,
+    /// 新行的 `sealed`：来自远端日志的是「已封段」，导入会话包的是「只分配了身份」。
+    pub sealed: i64,
+}
+
+/// 把消息内联的 artifact 全文写进会话的 artifact 目录；没有内联的全文先放一个占位文件
+/// （本机已有或以后取回时由 [`settle_aliases`] 换成全文）。
+///
+/// 只做文件 IO，不碰数据库。调用方在开事务**之前**做完：事务里不做磁盘写入（库锁是
+/// 会话读写共用的），而且提交之后消息里的句柄一定指向存在的文件。重复执行结果相同。
+pub fn write_artifacts(env: &Env, channel: &str, chat_id: &str, msg: &WireMsg) -> Result<()> {
+    if msg.artifacts.is_empty() {
+        return Ok(());
+    }
+    let dir = env.sessions.artifacts_dir(channel, chat_id);
+    let rel_dir = artifact_rel_dir(channel, chat_id);
+    for artifact in &msg.artifacts {
+        let path = dir.join(&artifact.name);
+        env.check_path(&format!("{rel_dir}{}", artifact.name), &path)?;
+        match &artifact.text {
+            Some(text) => rclaw_store::atomic_write(&path, text.as_bytes())?,
+            None if !path.exists() => {
+                rclaw_store::atomic_write(&path, placeholder_text(artifact.size).as_bytes())?
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// 把一条（已通过检查的）线上消息追加到本地会话末尾：消息行、工具元数据、映射、附件
+/// 登记，并把分支末条推进到这条消息。在调用方的事务里执行，不做文件写入——artifact
+/// 全文由调用方事先用 [`write_artifacts`] 写好，要复制的附件提交后由 [`settle_aliases`] 补。
+pub fn land_msg(conn: &Connection, env: &Env, landing: Landing<'_>, msg: &WireMsg) -> Result<i64> {
+    let prefix = env
+        .sessions
+        .artifacts_dir_prefix(landing.channel, landing.chat_id);
+    let mut data = portable::to_local(&msg.data, &env.root, &prefix);
+    let mut meta = None;
+    if let Some(wire_meta) = &msg.meta {
+        let (local_meta, text) =
+            wire_meta_to_local(conn, landing.session_id, landing.channel, wire_meta, &data)?;
+        meta = local_meta;
+        if let Some(rewritten) = text.and_then(|text| with_text(&data, text)) {
+            data = rewritten;
+        }
+    }
+    let message_id = raw::insert_raw_message(
+        conn,
+        landing.session_id,
+        &msg.role,
+        msg.ts,
+        &data,
+        meta.as_deref(),
+        &msg.tools,
+    )?;
+
+    let mut stored = StoredRefs {
+        files: msg.refs.clone(),
+        artifacts: Vec::new(),
+    };
+    let rel_dir = artifact_rel_dir(landing.channel, landing.chat_id);
+    for artifact in &msg.artifacts {
+        if artifact.text.is_some() {
+            continue;
+        }
+        stored.artifacts.push(ArtifactRef {
+            name: artifact.name.clone(),
+            size: artifact.size,
+            blob: artifact.blob.clone(),
+        });
+        if let Some(blob) = &artifact.blob {
+            let rel_path = format!("{rel_dir}{}", artifact.name);
+            expect_blob(conn, env, blob, &rel_path, artifact.size)?;
+            // 一条新消息引用它：写下这条消息的设备当时有这份内容（§8.7）。
+            crate::attach::on_new_ref(conn, blob)?;
+        }
+    }
+    for file in &msg.refs {
+        let target = landing_path(&file.path, &file.blob);
+        expect_blob(conn, env, &file.blob, &target, file.size)?;
+        crate::attach::on_new_ref(conn, &file.blob)?;
+    }
+    map::insert_msg_map(
+        conn,
+        message_id,
+        landing.session_id,
+        &msg.gid,
+        msg.parent.as_deref(),
+        landing.sealed,
+        Some(&stored.to_column()),
+        msg.meta.as_ref().map(|meta| meta.to_string()).as_deref(),
+    )?;
+    map::set_tip(conn, landing.session_id, Some(&msg.gid))?;
+    Ok(message_id)
+}
+
+/// artifact 的占位文件可以被取回的全文覆盖；工作区里的文件不覆盖（§8.7）。
+fn may_overwrite(rel_path: &str) -> bool {
+    rel_path.starts_with("artifacts/")
+}
+
+fn copy_into_place(env: &Env, source_rel: &str, target_rel: &str) -> bool {
+    let (Ok(source), Ok(target)) = (env.checked_path(source_rel), env.checked_path(target_rel))
+    else {
+        return false;
+    };
+    if target.exists() && !may_overwrite(target_rel) {
+        return false;
+    }
+    if let Some(parent) = target.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    // 先写同目录的临时文件再改名：读者看不到复制了一半的文件。
+    let staging = target.with_extension(format!("part-{}", crate::ids::random_hex::<4>()));
+    if std::fs::copy(source, &staging).is_err() {
+        let _ = std::fs::remove_file(&staging);
+        return false;
+    }
+    if std::fs::rename(&staging, &target).is_err() {
+        let _ = std::fs::remove_file(&staging);
+        return false;
+    }
+    true
+}
+
+/// 登记一个本机应当有的附件对象，落点是 `rel_path`。本机还没有这个对象（内容寻址）就
+/// 登记为「等待取回」；已经有了、但在别的位置，就记下「还要落到这里」，由
+/// [`settle_aliases`] 在事务之外复制。这里不做文件写入。
+pub(crate) fn expect_blob(
+    conn: &Connection,
+    env: &Env,
+    blob: &str,
+    rel_path: &str,
+    size: u64,
+) -> Result<()> {
+    db::blob_register(conn, blob, rel_path, size, BLOB_REMOTE)?;
+    let Some(existing) = db::blob_get(conn, blob)? else {
+        return Ok(());
+    };
+    let local = existing.state != BLOB_REMOTE;
+    if local && !env.resolve(&existing.rel_path).is_file() {
+        // 登记说本机有，文件却不在了（会话被删、用户清理）：改回「等待取回」。
+        db::blob_set(conn, blob, rel_path, BLOB_REMOTE)?;
+        return Ok(());
+    }
+    if existing.rel_path == rel_path {
+        return Ok(());
+    }
+    // 落点在同步缓存里、而本机已有这个对象时不必再复制一份：界面按对象找到已有的文件。
+    if local && rel_path.starts_with(SYNC_FILES_PREFIX) {
+        return Ok(());
+    }
+    db::state_put(
+        conn,
+        SCOPE_BLOB_ALIAS,
+        &format!("{blob}|{rel_path}"),
+        db::HLC_ZERO,
+        None,
+        None,
+    )
+}
+
+const SYNC_FILES_PREFIX: &str = "sync/files/";
+
+/// 同一个附件对象的其他落点（`sync_state`，键 `<blob_id>|<相对路径>`）。
+pub const SCOPE_BLOB_ALIAS: &str = "blob-alias";
+
+/// 把登记过的「其他落点」补上：对象已经在本机的，复制到位并销掉登记；还在别的设备上的
+/// 留着，等取回之后再补。文件复制在库锁之外做。`blob` 给定时只看这一个对象。返回补上的
+/// 个数。
+pub fn settle_aliases(env: &Env, blob: Option<&str>) -> Result<usize> {
+    let prefix = blob.map(|blob| format!("{blob}|")).unwrap_or_default();
+    let todo: Vec<(String, String, String)> = db::read(env.db(), |conn| {
+        let mut todo = Vec::new();
+        for (key, _) in db::state_scan(conn, SCOPE_BLOB_ALIAS, &prefix)? {
+            let Some((blob_id, target)) = key.split_once('|') else {
+                continue;
+            };
+            let Some(row) = db::blob_get(conn, blob_id)? else {
+                // 对象的登记没了（附件被回收）：这条落点也不用留。
+                todo.push((key.clone(), String::new(), String::new()));
+                continue;
+            };
+            if row.state != BLOB_REMOTE {
+                todo.push((key.clone(), row.rel_path, target.to_string()));
+            }
+        }
+        Ok(todo)
+    })?;
+    if todo.is_empty() {
+        return Ok(0);
+    }
+    let mut done = 0usize;
+    for (_, source, target) in &todo {
+        if source.is_empty() || source == target {
+            continue;
+        }
+        if copy_into_place(env, source, target) {
+            done += 1;
+        } else {
+            tracing::debug!("附件没有补到 {target}（目标已有文件或写入失败）");
+        }
+    }
+    db::write(env.db(), |tx| {
+        for (key, _, _) in &todo {
+            db::state_del(tx, SCOPE_BLOB_ALIAS, key)?;
+        }
+        Ok(())
+    })?;
+    Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn landing_paths_follow_the_source_directory() {
+        let blob = "ab".repeat(32);
+        assert_eq!(landing_path("uploads/a b.png", &blob), "uploads/a b.png");
+        assert_eq!(
+            landing_path("output/报告.docx", &blob),
+            format!("sync/files/ab/{blob}/报告.docx")
+        );
+        assert_eq!(
+            landing_path("media/2026/x:y?.jpg", &blob),
+            format!("sync/files/ab/{blob}/x_y_.jpg")
+        );
+    }
+
+    /// `uploads/` 下的引用只有每一段都是可移植的名字才落回工作区；在 Windows 上会逃出
+    /// 工作区、指向设备或备用数据流的，一律进同步缓存，文件名改写过。
+    #[test]
+    fn non_portable_upload_paths_land_in_the_cache() {
+        let blob = "cd".repeat(32);
+        for (path, name) in [
+            ("uploads/D:evil/run.bat", "run.bat"),
+            ("uploads/C:version.dll", "C_version.dll"),
+            ("uploads/C:..", "C_"),
+            ("uploads/12:30.png", "12_30.png"),
+            ("uploads/a.png:stream", "a.png_stream"),
+            ("uploads/NUL", "_NUL"),
+            ("uploads/con.txt", "_con.txt"),
+            ("uploads/COM1/x.png", "x.png"),
+            ("uploads/a./x.png", "x.png"),
+            ("uploads/x.png.", "x.png"),
+            ("uploads/x.png ", "x.png"),
+        ] {
+            assert_eq!(
+                landing_path(path, &blob),
+                format!("sync/files/cd/{blob}/{name}"),
+                "{path}"
+            );
+        }
+        for path in [
+            "uploads/a.png",
+            "uploads/子目录/报告 (1).docx",
+            "uploads/.hidden/x",
+        ] {
+            assert_eq!(landing_path(path, &blob), path);
+        }
+    }
+
+    /// 不管相对路径写成什么样，解析结果都在根的下面。
+    #[test]
+    fn resolve_never_leaves_its_root() {
+        let (dir, ctx) = crate::testing::ctx();
+        let env = &ctx.env;
+        let base = env.base().to_path_buf();
+        let sync_root = dir.path().join("sync");
+        for rel in [
+            "uploads/D:evil/run.bat",
+            "uploads/C:version.dll",
+            "uploads/C:",
+            "uploads/../../etc/passwd",
+            "uploads/./x",
+            "uploads/..",
+            "uploads/NUL",
+            "uploads/a\0b",
+            "D:x",
+            "..",
+            "sync/../x",
+            "sync/C:x",
+        ] {
+            let path = env.resolve(rel);
+            let root = if rel.starts_with(SYNC_DIR_PREFIX) {
+                &sync_root
+            } else {
+                &base
+            };
+            assert!(path.starts_with(root), "{rel} → {}", path.display());
+            let inside = path.strip_prefix(root).unwrap();
+            assert!(
+                inside
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_))),
+                "{rel} → {}",
+                path.display()
+            );
+            assert_eq!(
+                inside.components().count(),
+                rel.strip_prefix(SYNC_DIR_PREFIX)
+                    .unwrap_or(rel)
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .count(),
+                "{rel} → {}",
+                path.display()
+            );
+        }
+        // 普通的路径原样拼上去，两种解析一致。
+        let plain = env.resolve("uploads/子目录/a b.png");
+        assert_eq!(plain, base.join("uploads").join("子目录").join("a b.png"));
+        assert_eq!(env.resolve_exact("uploads/子目录/a b.png"), Some(plain));
+        // 拼不得的段：`resolve_exact` 不给路径。
+        assert_eq!(env.resolve_exact("uploads/../x"), None);
+        assert_eq!(env.resolve_exact("uploads/a\0b"), None);
+        #[cfg(windows)]
+        for rel in [
+            "uploads/C:x",
+            "uploads/12:30.png",
+            "uploads/NUL",
+            "uploads/x.",
+        ] {
+            assert_eq!(env.resolve_exact(rel), None, "{rel}");
+        }
+        #[cfg(not(windows))]
+        assert_eq!(
+            env.resolve_exact("uploads/12:30.png"),
+            Some(base.join("uploads").join("12:30.png"))
+        );
+    }
+
+    #[test]
+    fn stored_refs_round_trip_and_tolerate_garbage() {
+        let refs = StoredRefs {
+            files: vec![FileRef {
+                path: "uploads/a.png".into(),
+                blob: "a".repeat(64),
+                size: 3,
+            }],
+            artifacts: vec![ArtifactRef {
+                name: "1-shell.txt".into(),
+                size: 9,
+                blob: None,
+            }],
+        };
+        assert_eq!(StoredRefs::parse(Some(&refs.to_column())), Some(refs));
+        assert_eq!(StoredRefs::parse(Some("{}")), Some(StoredRefs::default()));
+        assert_eq!(StoredRefs::parse(Some("garbage")), None);
+        assert_eq!(StoredRefs::parse(None), None);
+    }
+
+    #[test]
+    fn fork_notice_text_is_rewritten_without_touching_the_message_shape() {
+        let local = raw::fork_notice_text(Some(("c-parent", 42)), "（文件已回滚）");
+        let data = serde_json::to_string(&Message::plain(rclaw_core::Role::User, local)).unwrap();
+        let text = first_text(&data).unwrap();
+        let canonical = raw::fork_notice_text(None, raw::fork_notice_files_note(&text));
+        let rewritten = with_text(&data, canonical.clone()).unwrap();
+        assert!(!rewritten.contains("c-parent"));
+        assert!(rewritten.contains("（文件已回滚）"));
+        assert_eq!(first_text(&rewritten).unwrap(), canonical);
+        portable::check_message_data(&rewritten, "user").unwrap();
+    }
+}

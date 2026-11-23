@@ -267,6 +267,46 @@ file = true
 # dir = ""                  # 日志文件目录（相对 CWD 或绝对路径；留空=agent/logs，与 config/skills 平级；file=true 时使用，不存在自动创建）
 # file_name = "rclaw.log"  # 日志文件名前缀，按日轮转为 <file_name>.YYYY-MM-DD
 
+# ── 多端同步（[sync]）─────────────────────────────────────────────────────────
+# 让同一个人的多台设备（电脑、手机）之间同步会话、记忆、人格等数据（设计见 docs/multi-device-sync.md）。
+# 数据在本机加密后放到一个你自己的存储上（网盘或自建文件服务器的 WebDAV、对象存储、或一个由别的
+# 工具同步的本机文件夹），存储一侧不运行任何 RClaw 的代码，也看不到明文。
+# 桌面版 / 手机版请在设置里的「多端同步」面板操作（创建同步空间、显示 / 扫描配对码、测试连接）；
+# 命令行版用启动参数 `rclaw --sync-join` 粘贴配对码加入，`/sync status` 查看状态。
+# 存储的密码、同步空间的密钥、设备标识都不写在这里，存于 <rclaw.toml 所在目录>/sync/secrets.json。
+[sync]
+enabled = false                               # true 开启多端同步
+# device_name = ""                            # 这台设备在其他设备上显示的名字；留空用主机名
+# transport = "webdav"                        # 存储类型：webdav / file / s3
+# scopes = ["sessions", "memory", "persona"]  # 同步范围；可追加 attachments（会话里的图片与文件）/ skills / bots / cron
+#                                             #   命令行版没有会话列表，不同步 sessions 与 attachments（写了也不生效）
+# channels = ["desktop"]                      # 参与同步的会话通道
+# poll_interval_sec = 60                      # 前台轮询间隔（秒，不小于 5）；自建文件服务器没有配额，可以调小
+# background_interval_sec = 900               # 手机转入后台之后的轮询间隔（秒，不小于 60；仅在非计费网络下进行）
+# presend_pull_wait_ms = 1500                 # 发送消息前先拉取一次最多等多久（毫秒）；0 = 不拉取
+# attachment_max_mb = 50                      # 单个附件的大小上限（MB），更大的不同步
+# trash_days = 30                             # 被其他设备删除的会话在本机回收站保留的天数；0 = 不保留
+
+[sync.webdav]
+# 第三方网盘和自建文件服务器写法相同。公网地址必须是 https；明文 http 只对局域网地址有效。
+url = ""                                      # 例：https://dav.example.com/rclaw-sync/
+username = ""
+# allow_http = false                          # 允许明文 http（只对局域网地址有效）
+# pinned_cert_sha256 = ""                     # 自签证书的 SHA-256 指纹；留空信任系统与内置公共 CA
+
+# [sync.file]
+# dir = ""                                    # transport = "file"：一个本机文件夹的绝对路径（由网盘客户端、Syncthing 等负责同步）
+
+# [sync.s3]
+# transport = "s3"：S3 兼容的对象存储。Secret Key 在「多端同步」面板里填，不写在这里。
+# endpoint = ""                               # 例：https://oss-cn-hangzhou.aliyuncs.com
+# region = ""
+# bucket = ""
+# prefix = ""                                 # 存放同步数据的前缀（目录）
+# access_key_id = ""
+# path_style = false                          # true = 路径风格寻址（MinIO 等自建服务）
+# allow_http = false                          # 允许明文 http（只对局域网地址有效）
+
 
 [mcp]
 startup_timeout_secs = 20

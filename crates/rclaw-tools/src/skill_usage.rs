@@ -71,7 +71,7 @@ pub fn begin_skill_activity(skills_dir: &Path) -> Result<SkillActivityGuard, Str
     Ok(SkillActivityGuard { key })
 }
 
-fn has_active_skill_users(skills_dir: &Path) -> Result<bool, String> {
+pub(crate) fn has_active_skill_users(skills_dir: &Path) -> Result<bool, String> {
     let key = skill_activity_key(skills_dir);
     let users = ACTIVE_SKILL_USERS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let users = users
@@ -228,7 +228,7 @@ impl SkillUsageStore {
         self.skills_dir.join(USAGE_FILE)
     }
 
-    fn validate_name(name: &str) -> Result<(), String> {
+    pub(crate) fn validate_name(name: &str) -> Result<(), String> {
         if name.is_empty()
             || name.len() > 64
             || !name
@@ -276,6 +276,11 @@ impl SkillUsageStore {
             .map_err(|error| format!("serialize Skill telemetry failed: {error}"))?;
         rclaw_store::fs::atomic_write(&path, &bytes)
             .map_err(|error| format!("write {} failed: {error}", path.display()))
+    }
+
+    /// 随程序下发的内置技能名（内嵌清单，不读运行时文件）。
+    pub(crate) fn repository_names(&self) -> Result<BTreeSet<String>, String> {
+        self.bundled_names_unlocked()
     }
 
     fn bundled_names_unlocked(&self) -> Result<BTreeSet<String>, String> {

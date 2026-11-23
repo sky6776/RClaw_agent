@@ -232,6 +232,8 @@ fn options_of(path: &str) -> Vec<String> {
     let options: &[&str] = match path {
         // `rclaw_runtime::options::WorkflowActivation`（snake_case）。
         "agent.workflow_activation" => &["always", "command"],
+        // `rclaw_sync::SyncConfig::validate` 接受的存储类型。
+        "sync.transport" => &["webdav", "file", "s3"],
         _ => &[],
     };
     options.iter().map(|s| s.to_string()).collect()

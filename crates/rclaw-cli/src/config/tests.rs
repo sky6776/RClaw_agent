@@ -676,3 +676,109 @@ fn soul_enabled_defaults_true_and_example_round_trips() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("soul_enabled = true"));
 }
+
+// ── [sync] 多端同步 ───────────────────────────────────────────────────
+
+#[test]
+fn sync_section_defaults_when_absent() {
+    // 无 [sync] 段：同步关闭，其余取默认值（与 docs/multi-device-sync.md §12.3 一致）。
+    let cfg = parse_config_text("").unwrap();
+    assert!(!cfg.sync.enabled);
+    assert_eq!(cfg.sync.transport, "webdav");
+    assert_eq!(cfg.sync.scopes, ["sessions", "memory", "persona"]);
+    assert_eq!(cfg.sync.channels, ["desktop"]);
+    assert_eq!(cfg.sync.poll_interval_sec, 60);
+    assert_eq!(cfg.sync.background_interval_sec, 900);
+    assert_eq!(cfg.sync.presend_pull_wait_ms, 1500);
+    assert_eq!(cfg.sync.attachment_max_mb, 50);
+    assert_eq!(cfg.sync.trash_days, 30);
+    assert_eq!(cfg.sync, rclaw_sync::SyncConfig::default());
+    // 示例文件里的 [sync] 段是关着的，没注释掉的键与默认值一致。
+    let example = parse_config_text(include_str!("../../../../rclaw.toml.example")).unwrap();
+    assert_eq!(example.sync, rclaw_sync::SyncConfig::default());
+}
+
+#[test]
+fn sync_section_overrides_from_toml() {
+    let toml = r#"
+[sync]
+enabled = true
+device_name = "我的电脑"
+transport = "s3"
+scopes = ["memory", "persona", "skills"]
+channels = ["desktop", "weixin"]
+poll_interval_sec = 30
+background_interval_sec = 600
+presend_pull_wait_ms = 0
+attachment_max_mb = 20
+trash_days = 0
+
+[sync.webdav]
+url = "https://dav.example.com/rclaw-sync/"
+username = "me@example.com"
+allow_http = false
+pinned_cert_sha256 = "AB:CD"
+
+[sync.file]
+dir = "/srv/sync"
+
+[sync.s3]
+endpoint = "https://oss-cn-hangzhou.aliyuncs.com"
+region = "cn-hangzhou"
+bucket = "my-bucket"
+prefix = "rclaw"
+access_key_id = "AKID"
+path_style = true
+allow_http = false
+"#;
+    let cfg = Config::from_toml(toml).unwrap();
+    assert!(cfg.sync.enabled);
+    assert_eq!(cfg.sync.device_name, "我的电脑");
+    assert_eq!(cfg.sync.transport, "s3");
+    assert_eq!(cfg.sync.scopes, ["memory", "persona", "skills"]);
+    assert_eq!(cfg.sync.channels, ["desktop", "weixin"]);
+    assert_eq!(cfg.sync.poll_interval_sec, 30);
+    assert_eq!(cfg.sync.background_interval_sec, 600);
+    assert_eq!(cfg.sync.presend_pull_wait_ms, 0);
+    assert_eq!(cfg.sync.attachment_max_mb, 20);
+    assert_eq!(cfg.sync.trash_days, 0);
+    assert_eq!(cfg.sync.webdav.url, "https://dav.example.com/rclaw-sync/");
+    assert_eq!(cfg.sync.webdav.username, "me@example.com");
+    assert_eq!(cfg.sync.webdav.pinned_cert_sha256, "AB:CD");
+    assert_eq!(cfg.sync.file.dir, "/srv/sync");
+    assert_eq!(cfg.sync.s3.bucket, "my-bucket");
+    assert!(cfg.sync.s3.path_style);
+}
+
+#[test]
+fn sync_section_rejects_unknown_fields_and_bad_values() {
+    // deny_unknown_fields：拼错的键、不该写在这里的密码都在启动期暴露。
+    for toml in [
+        "[sync]\nenabeld = true\n",
+        "[sync]\nattachments_wifi_only = true\n",
+        "[sync.webdav]\npassword = \"hunter2\"\n",
+        "[sync.s3]\nsecret_key = \"x\"\n",
+    ] {
+        assert!(parse_config_text(toml).is_err(), "应拒绝: {toml}");
+    }
+    // 取值校验（存储类型、同步范围、通道名、轮询间隔）在加载收尾与面板保存前都做。
+    for toml in [
+        "[sync]\ntransport = \"ftp\"\n",
+        "[sync]\nscopes = [\"everything\"]\n",
+        "[sync]\nchannels = [\"Desktop\"]\n",
+        "[sync]\npoll_interval_sec = 1\n",
+        "[sync]\nbackground_interval_sec = 5\n",
+    ] {
+        assert!(Config::from_toml(toml).is_err(), "加载应拒绝: {toml}");
+        assert!(Config::parse_str(toml).is_err(), "面板保存前应拒绝: {toml}");
+    }
+    // 配置的 Debug 输出里没有任何凭据可言：密码与密钥根本不在这个结构里。
+    let cfg =
+        Config::from_toml("[sync.webdav]\nurl = \"https://dav.example.com/\"\nusername = \"me\"\n")
+            .unwrap();
+    let shown = format!("{:?}", cfg.sync);
+    assert!(
+        !shown.contains("password") && !shown.contains("secret"),
+        "{shown}"
+    );
+}

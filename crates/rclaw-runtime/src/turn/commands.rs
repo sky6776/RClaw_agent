@@ -15,6 +15,7 @@ enum RuntimeCommand {
     Fork,
     Goal,
     Export,
+    Sync,
 }
 
 impl RuntimeCommand {
@@ -22,6 +23,7 @@ impl RuntimeCommand {
         let rest = content.trim().strip_prefix('/')?.trim_start();
         let name = rest.split_whitespace().next().unwrap_or("");
         match name.to_ascii_lowercase().as_str() {
+            "sync" => Some(Self::Sync),
             "cancel" => Some(Self::Cancel),
             "context" => Some(Self::Context),
             "skills" => Some(Self::Skills),
@@ -38,9 +40,9 @@ impl RuntimeCommand {
     }
 
     /// 是否属于「影响全局 / 外泄数据」的命令：清空全部会话与长期记忆、读取或删除日志、
-    /// 回滚工作区文件、Skill 生命周期变更、导出全部会话。这些命令只认 [`is_privileged`]
-    /// 的会话。`/cancel`、`/context`、`/compact`、`/goal`、`/tools`、`/fork`、单会话
-    /// `/export`、只读 `/skills list|status|help` 仍对所有用户开放。
+    /// 回滚工作区文件、Skill 生命周期变更、导出全部会话、多端同步的状态与控制。这些命令
+    /// 只认 [`is_privileged`] 的会话。`/cancel`、`/context`、`/compact`、`/goal`、`/tools`、
+    /// `/fork`、单会话 `/export`、只读 `/skills list|status|help` 仍对所有用户开放。
     fn requires_privilege(self, content: &str) -> bool {
         let second = content
             .split_whitespace()
@@ -48,7 +50,7 @@ impl RuntimeCommand {
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
         match self {
-            Self::Clear | Self::Log | Self::Rewind => true,
+            Self::Clear | Self::Log | Self::Rewind | Self::Sync => true,
             Self::Skills => matches!(
                 second.as_str(),
                 "pin" | "unpin" | "adopt" | "restore" | "curate"
@@ -210,6 +212,20 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> Di
                 });
                 return DispatchOutcome::Handled;
             }
+            RuntimeCommand::Sync => {
+                // 「立即同步」要等一轮网络往返：同样放独立任务，不占路由任务。
+                let manager = manager.clone();
+                let channel = msg.channel.clone();
+                let chat_id = msg.chat_id.clone();
+                let content = msg.content.clone();
+                tokio::spawn(async move {
+                    let response = manager.handle_sync(&content).await;
+                    manager
+                        .send_command_reply(&channel, &chat_id, response)
+                        .await;
+                });
+                return DispatchOutcome::Handled;
+            }
         };
         manager
             .send_command_reply(&msg.channel, &msg.chat_id, response)
@@ -254,6 +270,8 @@ mod tests {
             ("/ GOAL 完成迁移", RuntimeCommand::Goal),
             ("/export", RuntimeCommand::Export),
             ("/export all", RuntimeCommand::Export),
+            ("/sync", RuntimeCommand::Sync),
+            ("/sync now", RuntimeCommand::Sync),
         ] {
             assert_eq!(RuntimeCommand::parse(input), Some(expected));
         }
@@ -266,6 +284,7 @@ mod tests {
             "/login",
             "/clearing",
             "/exports",
+            "/syncs",
             "/goalx",
             "/llmodel glm-5.3",
         ] {

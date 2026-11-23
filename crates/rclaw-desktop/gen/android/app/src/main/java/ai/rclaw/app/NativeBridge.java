@@ -617,11 +617,12 @@ public final class NativeBridge {
     // 返回值约定：boolean=成败；String 约定 "ok"/"permission_requested"/数据/错误。
     // ------------------------------------------------------------------
 
-    /** 拍照/录视频（kind: photo|video）：起系统相机，结果走 onActivityResult。
+    /** 拍照/录视频/扫配对码（kind: photo|video|scan）：起系统相机，结果走 onActivityResult。
      *  返回 "ok" / "permission_requested" / "error:<原因>"。 */
     static String capture(String kind) {
         if ("photo".equals(kind)) return CaptureBridge.capturePhoto();
         if ("video".equals(kind)) return CaptureBridge.captureVideo();
+        if ("scan".equals(kind)) return CaptureBridge.captureScan();
         return "error:未知采集类型";
     }
 
@@ -690,11 +691,48 @@ public final class NativeBridge {
 
     static void setForeground(boolean foreground) {
         appInForeground = foreground;
+        // 多端同步：界面退到后台时放宽轮询（且只在非计费网络下进行），回到前台立即同步。
+        // 只是往引擎线程投一条消息，不阻塞界面线程；引擎没装配或同步没开时什么都不做。
+        try {
+            nativeSetForeground(foreground);
+        } catch (UnsatisfiedLinkError | RuntimeException error) {
+            android.util.Log.w("NativeBridge", "nativeSetForeground failed", error);
+        }
     }
+
+    static native void nativeSetForeground(boolean foreground);
 
     /** 应用 GUI 是否在前台（Rust 侧完成通知的门闸）。 */
     static boolean isAppForeground() {
         return appInForeground;
+    }
+
+    /** 当前网络是否按流量计费（Rust 侧多端同步用：界面在后台时只在非计费网络下轮询、
+     *  计费网络下的首次同步要用户确认；附件的上传下载不看它）。没有 context、没有网络、
+     *  查询失败都按不计费算——没有网络时谈不上计费，同步本来也进行不了。 */
+    static boolean isNetworkMetered() {
+        android.content.Context context = appContext;
+        if (context == null) {
+            return false;
+        }
+        try {
+            android.net.ConnectivityManager manager =
+                    context.getSystemService(android.net.ConnectivityManager.class);
+            if (manager == null) {
+                return false;
+            }
+            android.net.Network network = manager.getActiveNetwork();
+            if (network == null) {
+                return false;
+            }
+            android.net.NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+            return capabilities != null
+                    && !capabilities.hasCapability(
+                            android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
+        } catch (RuntimeException error) {
+            android.util.Log.w("NativeBridge", "isNetworkMetered failed", error);
+            return false;
+        }
     }
 
     /** 前台服务通知状态更新：busy=true（任务运行中，绿色 accent + 进度

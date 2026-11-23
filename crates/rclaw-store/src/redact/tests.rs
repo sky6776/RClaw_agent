@@ -361,3 +361,113 @@ fn leaves_innocent_text_untouched() {
     let out = redact_sensitive_text(s);
     assert_eq!(out, s);
 }
+
+#[test]
+fn redacts_sync_pairing_codes_even_when_wrapped() {
+    let body = "eyJzIjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjMiLCJrIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIn0";
+    let out = redact_sensitive_text(&format!("配对码是 rclaw-pair-v1.{body}，别外传"));
+    assert_eq!(out, "配对码是 [REDACTED]，别外传");
+
+    // 粘贴时被折成几行：续行不能留下半截钥匙。
+    let wrapped = format!(
+        "rclaw-pair-v1.{}\r\n  {}\n{}\n下一行是正文 hello",
+        &body[..20],
+        &body[20..50],
+        &body[50..]
+    );
+    let out = redact_sensitive_text(&wrapped);
+    assert_eq!(out, "[REDACTED]\n下一行是正文 hello");
+
+    // 折法再怪也一样：缩进很深、带引用符、最后一行只剩几个字符。
+    let quoted = format!(
+        "> rclaw-pair-v1.{}\n>         {}\n> {}\n> \u{3000}{}\n> 以上",
+        &body[..30],
+        &body[30..60],
+        &body[60..75],
+        &body[75..]
+    );
+    assert_eq!(redact_sensitive_text(&quoted), "> [REDACTED]\n> 以上");
+    // 写在 `token:` 这类关键词后面：关键词规则只认到行尾，续行照样要遮掉。
+    let labelled = format!(
+        "token: rclaw-pair-v1.{}\n{}\n后面",
+        &body[..40],
+        &body[40..]
+    );
+    assert_eq!(redact_sensitive_text(&labelled), "token: [REDACTED]\n后面");
+    let bearer = format!("Bearer rclaw-pair-v1.{}\n  {}", &body[..40], &body[40..]);
+    assert_eq!(redact_sensitive_text(&bearer), "Bearer [REDACTED]");
+    // 配对码完整了就到此为止：下一行哪怕是一长串字母数字也不动。
+    let followed = format!("rclaw-pair-v1.{body}\n0123456789abcdef0123456789");
+    assert_eq!(
+        redact_sensitive_text(&followed),
+        "[REDACTED]\n0123456789abcdef0123456789"
+    );
+    // 被截断的配对码：剩下的几段都遮掉，到不是它的字符为止。
+    let cut = format!("rclaw-pair-v1.{}\n{}\n完", &body[..30], &body[30..40]);
+    assert_eq!(redact_sensitive_text(&cut), "[REDACTED]\n完");
+    // 一段文字里有两个。
+    let two = format!("rclaw-pair-v1.{body} 和 RCLAW-PAIR-V1.{body}。");
+    assert_eq!(redact_sensitive_text(&two), "[REDACTED] 和 [REDACTED]。");
+
+    // 前缀后面跟的短词、隔得远的长串都不算续行。
+    let out =
+        redact_sensitive_text("rclaw-pair-v1.abc 然后 short\n\n\n\n\n0123456789abcdef0123456789");
+    assert_eq!(
+        out,
+        "[REDACTED] 然后 short\n\n\n\n\n0123456789abcdef0123456789"
+    );
+    // 不是这个前缀的文字不动。
+    let s = "见 docs 里的 rclaw-pair 说明，版本 v1.2";
+    assert_eq!(redact_sensitive_text(s), s);
+}
+
+/// 运行时靠它把带配对码的消息拦在日志、会话和模型之外：真的配对码（折了行的、截断但已经
+/// 带着密钥的）都要认出来，提到前缀的普通文字不能误伤。
+#[test]
+fn pairing_codes_are_spotted_in_a_message() {
+    let body = "eyJzIjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjMiLCJrIjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIn0";
+    for text in [
+        format!("rclaw-pair-v1.{body}"),
+        format!("帮我加入同步空间 rclaw-pair-v1.{body} 谢谢"),
+        format!("RCLAW-PAIR-V1.{body}"),
+        // 折成几行、带引用符。
+        format!(
+            "rclaw-pair-v1.{}\r\n  {}\n{}",
+            &body[..20],
+            &body[20..50],
+            &body[50..]
+        ),
+        format!("> rclaw-pair-v1.\n> {body}"),
+        // 截断的：已经带着密钥的一部分。
+        format!("rclaw-pair-v1.{}", &body[..50]),
+        // 前面还提到过一次前缀。
+        format!("rclaw-pair-v1. 开头的那个：rclaw-pair-v1.{body}"),
+    ] {
+        assert!(contains_pairing_code(&text), "{text}");
+        assert!(
+            !redact_pairing_codes(&text).contains(&body[20..40]),
+            "{text}"
+        );
+    }
+    for text in [
+        "",
+        "配对码是 rclaw-pair-v1. 开头的一长串",
+        "形如 rclaw-pair-v1.eyJ… 的文本",
+        "rclaw-pair-v1.xxxxxxxx 这种？",
+        "见 docs 里的 rclaw-pair 说明，版本 v1.2",
+        // 前缀接在别的字母后面：不是配对码的开头。
+        "myrclaw-pair-v1.0123456789abcdef0123456789abcdef",
+    ] {
+        assert!(!contains_pairing_code(text), "{text}");
+    }
+    // 只遮配对码：别的密钥原样留着。
+    let mixed = format!("api_key=sk-0123456789abcdef0123 rclaw-pair-v1.{body}");
+    assert_eq!(
+        redact_pairing_codes(&mixed),
+        "api_key=sk-0123456789abcdef0123 [REDACTED]"
+    );
+    assert!(matches!(
+        redact_pairing_codes("没有配对码"),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 
 use rclaw_core::ToolAccess;
 
-use crate::files::helpers::{is_symlink_leaf, physical_normalize};
+use crate::files::helpers::{is_symlink_leaf, physical_normalize, same_name_folded, within_folded};
 use crate::ToolResult;
 
 tokio::task_local! {
@@ -98,6 +98,121 @@ pub fn session_access(channel: &str, chat_id: &str) -> Option<ToolAccess> {
         .unwrap_or_else(|poison| poison.into_inner())
         .clone()?;
     hook(channel, chat_id)
+}
+
+// ---------------------------------------------------------------------------
+// 文件工具的禁区目录。
+//
+// 多端同步的密钥、存储凭据、回收站与中间文件都在 `<数据根>/sync/` 下
+// （docs/multi-device-sync.md §11.4）。它在工作区之外：Sandboxed 下本来就要用户逐个放行，
+// Unrestricted 下文件工具却能到任意路径。所以单独登记成禁区——任何权限模式下，文件工具
+// 都不读、不写、不列、不搜、不删它，也不删包着它的目录；回滚点不捕获它里面的内容。
+// 这道禁区只管文件工具，管不了 shell（shell 不是沙箱，见 docs/security.md）。
+// ---------------------------------------------------------------------------
+
+static PROTECTED_DIRS: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
+
+/// 登记一个禁区目录。宿主装配工具时调用；目录不必已经存在（要拦的正包括「趁它还没建
+/// 出来先往里放东西」）；可以登记多个，重复登记无害。
+pub fn protect_dir(dir: &Path) {
+    let dir = absolute(dir);
+    let mut dirs = PROTECTED_DIRS
+        .get_or_init(Default::default)
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
+fn protected_dirs() -> Vec<PathBuf> {
+    match PROTECTED_DIRS.get() {
+        Some(dirs) => dirs
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone(),
+        None => Vec::new(),
+    }
+}
+
+/// 相对路径按进程当前目录补成绝对路径（纯词法，不碰文件系统）：CLI 的工作区根默认是
+/// 相对路径 `agent`，没有任何一段已存在时 [`physical_normalize`] 给不出绝对落点。
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `path` 的落点在某个禁区目录里（含目录本身）。按物理落点比：工作区里指向禁区的
+/// 链接、`..`、大小写与短文件名拼写都认。
+pub fn in_protected_dir(path: &Path) -> bool {
+    let dirs = protected_dirs();
+    if dirs.is_empty() {
+        return false;
+    }
+    let target = physical_normalize(&absolute(path));
+    dirs.iter()
+        .any(|dir| within_folded(&target, &physical_normalize(dir)))
+}
+
+/// `path` 上的 `op` 是否触及禁区目录。除了落点在禁区里，还有三种情况：
+/// - 删除一个包着禁区的目录（递归删除会把禁区一起带走）；
+/// - 删除一个符号链接：删的是链接条目本身，看条目在哪里，不看它指向哪里；
+/// - 拼写里带 `..` 且中途经过禁区（`sync/x/../../note.md`）：落点在外面，但写入前的
+///   `create_dir_all` 会按原拼写逐段建目录，先在禁区里建出东西来。
+pub(crate) fn touches_protected_dir(path: &Path, op: PathOp) -> bool {
+    let dirs = protected_dirs();
+    if dirs.is_empty() {
+        return false;
+    }
+    let dirs: Vec<PathBuf> = dirs.iter().map(|dir| physical_normalize(dir)).collect();
+    // Windows 的 absolute 会先折叠 ".."，中间经过的路径要从原拼写里检查。
+    let components: Vec<_> = path.components().collect();
+    let path = absolute(path);
+    let inside = |target: &Path| dirs.iter().any(|dir| within_folded(target, dir));
+    if op == PathOp::Delete && is_symlink_leaf(&path) {
+        return match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => inside(&physical_normalize(parent).join(name)),
+            _ => false,
+        };
+    }
+    let target = physical_normalize(&path);
+    if inside(&target) {
+        return true;
+    }
+    if op == PathOp::Delete && dirs.iter().any(|dir| within_folded(dir, &target)) {
+        return true;
+    }
+    components
+        .iter()
+        .any(|comp| matches!(comp, std::path::Component::ParentDir))
+        && (1..components.len()).any(|len| {
+            let prefix: PathBuf = components[..len]
+                .iter()
+                .map(|comp| comp.as_os_str())
+                .collect();
+            inside(&physical_normalize(&absolute(&prefix)))
+        })
+}
+
+/// 目录遍历（list / grep）用的廉价判定：遍历从不跟随符号链接目录，要进禁区只能经过禁区
+/// 目录这个条目本身，所以先比条目名，名字对得上的才去做带 `canonicalize` 的落点比对。
+pub(crate) fn walk_entry_is_protected(entry: &Path) -> bool {
+    let Some(name) = entry.file_name() else {
+        return false;
+    };
+    let dirs = protected_dirs();
+    dirs.iter().any(|dir| {
+        dir.file_name()
+            .is_some_and(|leaf| same_name_folded(leaf, name))
+    }) && in_protected_dir(entry)
+}
+
+/// 文件工具碰到禁区时的拒绝文案。
+pub(crate) fn protected_dir_denial(path: &Path) -> ToolResult {
+    ToolResult::err(format!(
+        "{} 涉及多端同步的私有目录（密钥、存储凭据与同步状态），文件工具禁止访问；\
+         同步状态请看设置里的「多端同步」或 /sync status",
+        path.display()
+    ))
 }
 
 // 工作区外路径的交互式授权（桌面版弹窗确认）。
@@ -318,6 +433,11 @@ fn folds_into_workspace(base: &Path, resolved: &Path, followed: &Path) -> bool {
 /// 用户还没点允许的路径，一个字节都不该读。只认对【对象】的授权：批准过删某个链接条目
 /// （[`GrantKind::Entry`]）不代表那个位置上现在的真实文件可以读。
 pub fn path_readable_now(base: &Path, resolved: &Path) -> bool {
+    // 禁区目录任何权限下都不读：回滚点会把读到的内容抄进库里，而工具自己的守卫要到
+    // 捕获之后才跑。
+    if in_protected_dir(resolved) {
+        return false;
+    }
     if current_access() == ToolAccess::Unrestricted {
         return true;
     }

@@ -45,8 +45,8 @@ pub use turn::tool_events::{
     brief_input, ToolBatchBegun, ToolBatchFinished, ToolCallBegun, ToolCallFinished,
 };
 pub use turn::{
-    estimate_context_usage, ContextUsageSnapshot, ForkChatOutcome, TurnKey, TurnManager,
-    TurnObserver,
+    estimate_context_usage, ContextUsageSnapshot, ForkChatOutcome, MergeGuard, SyncControl,
+    TurnKey, TurnManager, TurnObserver,
 };
 
 pub use background_wake::BackgroundWaker;

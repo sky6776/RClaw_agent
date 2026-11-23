@@ -7,10 +7,11 @@
 //! - `memory/session_summaries/<channel>_<chat_id>.md`：会话压缩摘要（整体写）。
 //! - `memory_read_recent`：读最近 N 天 daily，拼成一段。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Local;
 
@@ -69,13 +70,50 @@ pub struct MemoryBatchOp {
     pub old_text: Option<String>,
 }
 
+/// 多端同步导入记忆条目的结果（[`MemoryStore::sync_apply`]）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncApplied {
+    /// 与传入的新增一一对应：`Ok` 是文件里现在有的那条文本（校验、脱敏之后的；原来就
+    /// 有等价条目时也是 `Ok`），`Err` 是没通过检查的原因。
+    pub added: Vec<std::result::Result<String, String>>,
+    /// 实际删掉的条目。
+    pub removed: Vec<String>,
+}
+
+/// 一个每日笔记文件（[`MemoryStore::daily_files`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyFile {
+    /// `YYYY-MM-DD`。
+    pub date: String,
+    pub len: u64,
+    /// 修改时间（Unix 毫秒；取不到为 0）。
+    pub mtime_ms: i64,
+}
+
+/// 进程内同一个数据目录共用一把锁。同一个目录会有不止一个 `MemoryStore` 实例（bot 的
+/// 记忆在每个 turn 里各建一个，多端同步也有自己的一份），它们的读-改-写必须互斥。
+fn shared_lock(base: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    locks.entry(base.to_path_buf()).or_default().clone()
+}
+
+/// `YYYY-MM-DD` 形式的合法日期（每日笔记的文件名）。
+fn is_daily_date(date: &str) -> bool {
+    date.len() == 10 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+}
+
 /// 记忆存储。
 ///
 /// 除原有的 append-only 自动写入外，新增结构化 add/replace/remove：以 bullet（`- `）
 /// 为条目粒度，replace/remove 用子串定位，
 /// 写前做漂移检测、威胁扫描、脱敏与总字符上限校验。`lock` 保证前台 `memory`
 /// 工具与后台 review fork 并发写时的读-改-写原子性（RClaw 单进程，进程内互斥足矣；
-/// 跨进程仍由 [`crate::fs::atomic_write`] 的 tmp+rename 兜底）。
+/// 跨进程仍由 [`crate::fs::atomic_write`] 的 tmp+rename 兜底）。同一个数据目录的所有实例
+/// 共用同一把锁。
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
     layout: Layout,
@@ -87,10 +125,10 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn new(layout: Layout) -> Self {
         MemoryStore {
+            lock: shared_lock(&layout.base),
             layout,
             memory_char_limit: AUTO_MEMORY_CHAR_LIMIT,
             user_char_limit: AUTO_USER_CHAR_LIMIT,
-            lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -489,6 +527,8 @@ impl MemoryStore {
     /// 向今天的 daily 文件追加一段（无则创建并写日期标题）。
     pub fn append_today(&self, note: &str) -> Result<()> {
         let note = validate_auto_note(note)?;
+        // 与同步往每日笔记里追加（`sync_append_daily`）互斥：两边都是「看一眼再追加」。
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let today = today_str();
         let path = self.daily_path(&today);
         ensure_parent_dir(&path)?;
@@ -538,6 +578,148 @@ impl MemoryStore {
             }
         }
         Ok(out)
+    }
+
+    // ---- 多端同步的入口 ----
+
+    /// 该目标文件是否处于漂移状态（条目之后出现了非条目行）。漂移的文件结构化写入会
+    /// 拒绝，多端同步也暂停它，等用户修复。
+    pub fn is_drifted(&self, target: MemoryTarget) -> Result<bool> {
+        Ok(detect_drift(&read_memory_raw(self.file_for(target))?))
+    }
+
+    /// 多端同步导入：在一次读-改-写里删掉 `dels`（只删文本完全相同的条目）、补上
+    /// `adds`。
+    ///
+    /// 与 [`Self::add_entry`] 只差一处：**不做总字符数检查**。各端的条目合并之后可能
+    /// 超过上限，这里要是拒绝，各端就永远不一致；超限之后本机再新增条目照旧会被拒绝并
+    /// 提示整理。漂移检测、条目格式校验、注入扫描、脱敏、去重都保留。
+    pub fn sync_apply(
+        &self,
+        target: MemoryTarget,
+        adds: &[String],
+        dels: &[String],
+    ) -> Result<SyncApplied> {
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.file_for(target);
+        let raw = read_memory_raw(path)?;
+        if detect_drift(&raw) {
+            snapshot_drift_backup(path, &raw)?;
+            return Err(StoreError::Other(format!(
+                "drift detected: {} was modified outside the memory tool (snapshot saved)",
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("(file)")
+            )));
+        }
+        let (header, mut entries) = parse_entries(&raw);
+        let header = normalize_header(header, target);
+        let mut applied = SyncApplied::default();
+        let mut changed = false;
+        for text in dels {
+            let before = entries.len();
+            entries.retain(|entry| entry != text);
+            if entries.len() != before {
+                changed = true;
+                applied.removed.push(text.clone());
+            }
+        }
+        for text in adds {
+            match validate_bullet_entry(text) {
+                Ok(entry) => {
+                    if !entries.iter().any(|existing| existing == &entry) {
+                        entries.push(entry.clone());
+                        changed = true;
+                    }
+                    applied.added.push(Ok(entry));
+                }
+                Err(error) => applied.added.push(Err(error.to_string())),
+            }
+        }
+        if changed {
+            let serialized = serialize_entries(&header, &entries);
+            crate::fs::atomic_write(path, serialized.as_bytes())?;
+        }
+        Ok(applied)
+    }
+
+    /// 有哪些每日笔记文件（按日期升序）。目录不存在返回空。
+    pub fn daily_files(&self) -> Result<Vec<DailyFile>> {
+        let entries = match fs::read_dir(&self.layout.memory_daily_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(StoreError::Io(e)),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(date) = name.strip_suffix(".md").filter(|date| is_daily_date(date)) else {
+                continue;
+            };
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_millis() as i64);
+            out.push(DailyFile {
+                date: date.to_string(),
+                len: meta.len(),
+                mtime_ms,
+            });
+        }
+        out.sort_by(|a, b| a.date.cmp(&b.date));
+        Ok(out)
+    }
+
+    /// 读某一天的每日笔记全文。文件不存在返回 `None`。
+    pub fn read_daily(&self, date: &str) -> Result<Option<String>> {
+        if !is_daily_date(date) {
+            return Err(StoreError::InvalidPath(format!("非法日期: {date}")));
+        }
+        match fs::read_to_string(self.daily_path(date)) {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::Io(e)),
+        }
+    }
+
+    /// 多端同步往某一天的每日笔记末尾追加 `tail`（原样写入；文件不存在时调用方自己带上
+    /// 日期标题）。`expect_len` 是调用方刚读到的文件长度（`None` = 当时文件不存在）：
+    /// 只有文件没再变过才写，返回是否写入。各端合并后的内容可能超过单日上限，这里
+    /// 不检查——超限之后本机再往当天追加照旧会被拒绝。
+    pub fn sync_append_daily(
+        &self,
+        date: &str,
+        expect_len: Option<u64>,
+        tail: &str,
+    ) -> Result<bool> {
+        if !is_daily_date(date) {
+            return Err(StoreError::InvalidPath(format!("非法日期: {date}")));
+        }
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.daily_path(date);
+        let current = match fs::metadata(&path) {
+            Ok(meta) => Some(meta.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(StoreError::Io(e)),
+        };
+        if current != expect_len {
+            return Ok(false);
+        }
+        ensure_parent_dir(&path)?;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        f.write_all(tail.as_bytes())?;
+        f.sync_all()?;
+        Ok(true)
     }
 
     fn daily_path(&self, date: &str) -> PathBuf {
@@ -611,6 +793,26 @@ fn validate_auto_note(note: &str) -> Result<String> {
     }
     // 写入前脱敏：剥离密钥/令牌（与威胁扫描并列——威胁扫描挡注入，脱敏挡泄密）。
     Ok(crate::redact_sensitive_text(note))
+}
+
+/// 多端同步收到的每日笔记块在落文件之前的检查：与本机追加（[`MemoryStore::append_today`]）
+/// 一样做注入扫描与脱敏，不限长度。
+///
+/// 扫描逐行做：一个块可以是别的设备很多次追加的合集，整块一起扫会把分散在不同笔记里的
+/// 普通词句凑成误报；逐行扫则凡是本机追加时能通过的内容，这里一定也能通过。没通过的
+/// 行被去掉。返回 `(要写进文件的文本, 被去掉的行数)`，文本可能为空。
+pub fn sync_check_daily_block(text: &str) -> (String, usize) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = 0usize;
+    for line in text.trim().lines() {
+        if first_memory_threat(line).is_some() {
+            dropped += 1;
+        } else {
+            kept.push(line.trim_end());
+        }
+    }
+    let joined = kept.join("\n");
+    (crate::redact_sensitive_text(joined.trim()), dropped)
 }
 
 // ---- 结构化 add/replace/remove 的纯辅助函数 ----

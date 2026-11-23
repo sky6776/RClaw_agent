@@ -34,6 +34,12 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
+    // `--sync-join`：加入多端同步的同步空间后退出，不启动 agent。配对码从标准输入读、不
+    // 回显——它等同于全部同步数据的钥匙，不能出现在命令行参数、日志或会话里。
+    if std::env::args().any(|a| a == "--sync-join") {
+        return rclaw_cli::sync::join_from_stdin(std::path::Path::new("rclaw.toml")).await;
+    }
+
     // daemon 后台模式：runtime 内部经 AgentOptions.daemon 消费（C3）；
     // 环境变量仅保留为 shell/skill 子进程契约（技能脚本经 os.environ 读取）。
     let daemon = std::env::args().any(|a| a == "--daemon");
@@ -153,6 +159,11 @@ async fn async_main() -> Result<()> {
         core.bots,
         Some(bot_router),
     );
+    // 多端同步（[sync] 没开时只是接个空句柄）。命令行没有会话列表，只同步文件类数据：
+    // 记忆、人格、技能、bot、定时任务。句柄留到进程结束，退出之前用它再同步一次。
+    let sync_engine = core
+        .sync
+        .attach(&agent, rclaw_cli::sync::SyncProfile::headless());
     let agent_handle = tokio::spawn(agent.run());
 
     // 7) outbound 分发器 + 各通道路由与启动。
@@ -219,9 +230,20 @@ async fn async_main() -> Result<()> {
         }
     );
 
+    // SIGTERM（systemd / termux-services 停服务时发的）和 Ctrl+C 一样走下面的正常退出：
+    // 不接的话进程当场结束，退出之前的那次同步没有机会做。
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let terminated = async {
+        #[cfg(unix)]
+        sigterm.recv().await;
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    };
+
     // 9) 常驻：
-    //   - 前台：console EOF（Ctrl+D / stdin 关闭）、Ctrl+C、agent 结束任一发生即退出。
-    //   - daemon：忽略 console EOF，仅 Ctrl+C / agent 结束退出。
+    //   - 前台：console EOF（Ctrl+D / stdin 关闭）、Ctrl+C、SIGTERM、agent 结束任一发生即退出。
+    //   - daemon：忽略 console EOF，仅 Ctrl+C / SIGTERM / agent 结束退出。
     tokio::select! {
         _ = console_handle, if !daemon => {
             tracing::info!("console 已结束，退出");
@@ -229,9 +251,19 @@ async fn async_main() -> Result<()> {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("收到 Ctrl+C，退出");
         }
+        _ = terminated => {
+            tracing::info!("收到 SIGTERM，退出");
+        }
         _ = agent_handle => {
             tracing::info!("agent loop 已结束");
         }
+    }
+
+    // 多端同步：退出之前把最后这段时间的改动（记忆、技能、定时任务……）发布出去。有等待
+    // 上限；等不及的话再按一次 Ctrl+C 立即退出，没发出去的下次启动时补发。
+    tokio::select! {
+        _ = rclaw_cli::sync::sync_before_exit(&sync_engine) => {}
+        _ = tokio::signal::ctrl_c() => {}
     }
 
     Ok(())

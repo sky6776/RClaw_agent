@@ -14,6 +14,9 @@ use crate::home;
 use crate::state::AppState;
 use crate::wizard::{self, WizardParams};
 
+/// 多端同步：设置面板、会话包、配对码与扫码、附件占位（`docs/multi-device-sync.md`）。
+pub mod sync;
+
 // ---------------------------------------------------------------------------
 // 检查更新：GitHub releases（安卓装 APK、Windows 换单文件 exe，应用内直接
 // 下载并触发安装；进度经 update_progress 事件推给前端）。
@@ -594,7 +597,18 @@ pub async fn wizard_save(
 
 /// 发送一条对话消息到指定会话（以 `/` 开头即斜杠命令，复用既有 slash 管道）。
 #[tauri::command]
-pub async fn send_message(app: AppHandle, chat_id: String, content: String) -> Result<(), String> {
+pub async fn send_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    chat_id: String,
+    content: String,
+) -> Result<(), String> {
+    // 多端同步：这个会话在别的设备上刚写的内容先拉下来，尽量不分叉。不是每次发送都拉：
+    // 同步没开或暂停、会话不参与同步、五秒内刚拉过、斜杠命令、上次访问存储失败都直接
+    // 跳过；真要拉的时候最多等 `presend_pull_wait_ms`（默认 1.5 秒），到点照常发送。
+    if let Some(engine) = state.sync() {
+        engine.presend(CHANNEL_DESKTOP, &chat_id, &content).await;
+    }
     agent::send(&app, chat_id, content).await
 }
 
@@ -612,7 +626,7 @@ pub async fn cancel(app: AppHandle, chat_id: String) -> Result<(), String> {
 #[derive(Debug, Serialize)]
 pub struct ChatDto {
     pub chat_id: String,
-    /// 用户自定义名（desktop_prefs.json 的 chat_titles，经 /chat_rename 写入）优先；
+    /// 用户自定义名（存在库里，经 chat_rename 写入，跟着会话同步）优先；
     /// 无自定义名时 = 首条用户消息截断。
     pub title: String,
     /// 最后修改时间（unix 毫秒；每次追加消息时刷新）。
@@ -636,10 +650,11 @@ where
 pub async fn chat_list(state: State<'_, AppState>) -> Result<Vec<ChatDto>, String> {
     let session = state.session().ok_or("agent 尚未启动")?;
     let layout = state.layout();
-    let home = state.home.clone();
     run_blocking("读取会话列表", move || {
-        // 用户自定义会话名（desktop_prefs.json）优先于派生标题。
-        let custom_titles = agent::read_chat_titles(&home);
+        // 用户自定义会话名（存在库里）优先于派生标题。
+        let custom_titles = session
+            .session_titles(CHANNEL_DESKTOP)
+            .map_err(|e| format!("读取会话标题失败: {e}"))?;
         let summaries = session
             .list_sessions(Some(CHANNEL_DESKTOP))
             .map_err(|e| format!("读取会话列表失败: {e}"))?;
@@ -676,7 +691,7 @@ pub async fn chat_list(state: State<'_, AppState>) -> Result<Vec<ChatDto>, Strin
 }
 
 /// 重命名会话（双击 / 右键菜单触发行内编辑）。标题去空白后为空 = 恢复自动派生标题。
-/// 仅写 desktop_prefs.json 的 chat_titles 映射，不动 state.sqlite 里的会话记录。
+/// 标题存在库里（`kv`），不动会话记录本身；参与同步的会话，新名字随后传到其他设备。
 #[tauri::command]
 pub async fn chat_rename(
     state: State<'_, AppState>,
@@ -689,12 +704,23 @@ pub async fn chat_rename(
     if title.trim().chars().count() > 120 {
         return Err("会话名过长（上限 120 字符）".to_string());
     }
-    // desktop_prefs.json 的读-改-写是同步文件 IO，不占异步运行时线程。
-    let home = state.home.clone();
+    let session = state.session().ok_or("agent 尚未启动")?;
     run_blocking("重命名会话", move || {
-        agent::write_chat_title(&home, &chat_id, &title)
+        session
+            .set_session_title(CHANNEL_DESKTOP, &chat_id, title.trim())
+            .map_err(|e| format!("重命名会话失败: {e}"))
     })
-    .await
+    .await?;
+    notify_sync_local_change(&state);
+    Ok(())
+}
+
+/// 会话的属性（标题、归档）改了：告诉同步引擎去发布。引擎自己的定期检查只看有没有新
+/// 消息，属性的变化要宿主说一声。不阻塞；同步没开时什么都不做。
+fn notify_sync_local_change(state: &AppState) {
+    if let Some(engine) = state.sync() {
+        engine.notify(rclaw_sync::engine::Trigger::LocalChange);
+    }
 }
 
 /// 导出文档渲染 + 落盘的共用尾巴（`export_messages` / `chat_export_full` 同一条
@@ -2184,6 +2210,8 @@ async fn set_chat_archived(state: &AppState, chat_id: String, archive: bool) -> 
         set_session_archived(&session, &chat_id, archive)
     })
     .await?;
+    // 归档标记跟着会话同步。
+    notify_sync_local_change(state);
     // 归档即清场（与删除同语义）：该会话的后台执行记录（终态）一并从「Agent 状态 /
     // 任务概览」移除；恢复会话不回滚这一步。活任务保留——完成后成为终态记录，可被
     // 清除按钮清走。agent 未启动时不存在执行记录，跳过。
@@ -2215,18 +2243,26 @@ fn set_session_archived(
         .map_err(|e| format!("更新会话归档状态失败: {e}"))
 }
 
-/// 删除会话：删掉会话记录（消息、文件 checkpoint、用量锚点一并级联）并移除自定义标题，
+/// 删除会话：删掉会话记录（消息、文件 checkpoint、用量锚点、自定义标题一并级联），
 /// 再清掉 agent loop 里该会话的运行期状态（内存 usage 锚点、压缩防抖 / 冷却 / 地板）——
 /// 库与内存一起归零，不给同名会话留下旧历史形态的判断。
 /// 正在工作的会话由前端拦截（turn 收尾还会向该会话追加）；会话已不在 = 幂等成功。
+///
+/// 参与多端同步的会话：删除会传到其他设备（§7.5），各设备（包括本机）先留一份在回收站，
+/// 保留期内可以恢复。`purge`（「彻底删除」）不留：本机不进回收站，其他设备也直接删掉。
+/// 没开同步、或这个会话不参与同步时，两者都是普通的本机删除。
 #[tauri::command]
-pub async fn chat_delete(state: State<'_, AppState>, chat_id: String) -> Result<(), String> {
+pub async fn chat_delete(
+    state: State<'_, AppState>,
+    chat_id: String,
+    purge: Option<bool>,
+) -> Result<(), String> {
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
     }
-    let session = state.session().ok_or("agent 尚未启动")?;
+    let engine = state.sync().ok_or("agent 尚未启动")?;
     let lifecycle = state.session_lifecycle().ok_or("agent 尚未启动")?;
-    let home = state.home.clone();
+    let purge = purge.unwrap_or(false);
     let cascade_chat_id = chat_id.clone();
     run_blocking("删除会话", move || {
         // 正在跑的会话不删：turn 收尾会把消息 / 检查点写回刚清空的 chat，变成一个只有
@@ -2238,10 +2274,14 @@ pub async fn chat_delete(state: State<'_, AppState>, chat_id: String) -> Result<
         if lifecycle.is_session_busy(CHANNEL_DESKTOP, &chat_id) {
             return Err("该会话还有正在进行的回复，请先 /cancel 或等它结束再删除".into());
         }
-        delete_session_record(&session, &chat_id)?;
+        // 经同步引擎删：已经发布过的会话要先占住（同步正往里合入内容时最多等两秒）、
+        // 导出到回收站，再连同「删除」一起登记进待发队列。同步没开时它就是普通的删除。
+        // 自定义标题在同一个事务里随会话清掉。
+        engine
+            .delete_session(CHANNEL_DESKTOP, &chat_id, purge)
+            .map_err(|e| format!("删除会话失败: {e}"))?;
         lifecycle.forget_session(CHANNEL_DESKTOP, &chat_id);
-        // 自定义标题随会话一起清掉（空标题 = 删除该键）。
-        agent::write_chat_title(&home, &chat_id, "")
+        Ok(())
     })
     .await?;
     // 级联清掉源自该会话的后台执行记录（仅终态；活任务保留，完成后可被「清除历史」清走）。
@@ -2255,17 +2295,6 @@ pub async fn chat_delete(state: State<'_, AppState>, chat_id: String) -> Result<
         }
     }
     Ok(())
-}
-
-/// 删除的核心：只做会话记录删除（活动 / 归档同一张表），与 Tauri 状态解耦便于测试。
-fn delete_session_record(
-    session: &rclaw_store::session::SessionStore,
-    chat_id: &str,
-) -> Result<(), String> {
-    session
-        .delete_session(CHANNEL_DESKTOP, chat_id)
-        .map(|_existed| ())
-        .map_err(|e| format!("删除会话失败: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2623,7 +2652,36 @@ pub async fn skills_list(state: State<'_, AppState>) -> Result<serde_json::Value
     let mut value: serde_json::Value =
         serde_json::from_str(&result.content).map_err(|e| format!("解析技能清单失败: {e}"))?;
     merge_archived_skills(&mut value, &layout.skills_dir);
+    // 从别的设备同步来的技能标上来源设备（docs/multi-device-sync.md §8.4）。没开过同步时
+    // 是空的；读不出来不影响清单本身。
+    if let Some(engine) = state.sync() {
+        let origins = run_blocking("读取技能的同步来源", move || {
+            engine.skill_origins().map_err(|e| e.to_string())
+        })
+        .await;
+        match origins {
+            Ok(origins) => merge_skill_origins(&mut value, &origins),
+            Err(error) => tracing::debug!("读取技能的同步来源失败: {error}"),
+        }
+    }
     Ok(value)
+}
+
+/// 给 `{"skills":[...]}` 清单里从别的设备同步来的技能加上 `sync_origin`（来源设备的名字）。
+fn merge_skill_origins(value: &mut serde_json::Value, origins: &[(String, String)]) {
+    let Some(arr) = value.get_mut("skills").and_then(|s| s.as_array_mut()) else {
+        return;
+    };
+    for skill in arr {
+        let origin = skill
+            .get("name")
+            .and_then(|name| name.as_str())
+            .and_then(|name| origins.iter().find(|(skill, _)| skill == name))
+            .map(|(_, device)| device.clone());
+        if let (Some(device), Some(entry)) = (origin, skill.as_object_mut()) {
+            entry.insert("sync_origin".into(), serde_json::Value::String(device));
+        }
+    }
 }
 
 /// 把 lifecycle 元数据里 state=Archived 的技能合并进 `{"skills":[...]}` 清单。
@@ -2915,9 +2973,17 @@ pub async fn config_state(state: State<'_, AppState>) -> Result<ConfigStateDto, 
 #[tauri::command]
 pub async fn config_save(state: State<'_, AppState>, edits: Vec<ConfigEdit>) -> Result<(), String> {
     let home = state.home.clone();
+    let touches_sync = edits
+        .iter()
+        .any(|edit| edit.path == "sync" || edit.path.starts_with("sync."));
     tauri::async_runtime::spawn_blocking(move || config_save_edits(&home, &edits))
         .await
-        .map_err(|e| format!("保存配置失败: {e}"))?
+        .map_err(|e| format!("保存配置失败: {e}"))??;
+    // `[sync]` 的改动马上生效（开关、存储、范围……），不用等重启。
+    if touches_sync {
+        sync::reload_config(&state).await;
+    }
+    Ok(())
 }
 
 /// 导入整份 rclaw.toml（GUI「从文件导入」）：解析 + Config 校验 + provider 引用
@@ -2947,7 +3013,11 @@ pub async fn config_import_raw(
         .map_err(|e| format!("导入配置失败: {e}"))??;
     // 导入即完成配置落盘：与 wizard_save 同路径启动 agent。此前只写文件不
     // 启动——App 启动时无配置则 agent 不会被拉起，导入后 UI 永久卡「正在启动」。
-    agent::start_agent(app, state.home.clone()).await
+    agent::start_agent(app, state.home.clone()).await?;
+    // agent 本来就在跑的话上面什么都没做：导入的 `[sync]` 设置在这里交给同步引擎
+    // （刚启动的 agent 读到的已经是新文件，再交一次没有变化、不做任何事）。
+    sync::reload_config(&state).await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3895,8 +3965,31 @@ mod tests {
         assert!(md.contains("消息209"));
     }
 
+    /// 同步没开时的引擎句柄：`chat_delete` 经它删会话，这时就是普通的本机删除。
+    fn idle_sync_engine(
+        session: &rclaw_store::session::SessionStore,
+        data_root: &std::path::Path,
+    ) -> rclaw_sync::SyncEngine {
+        rclaw_sync::SyncEngine::new(
+            rclaw_sync::SyncDeps {
+                sessions: session.clone(),
+                data_root: data_root.to_path_buf(),
+                memory: rclaw_store::MemoryStore::new(session.layout().clone()),
+                gate: std::sync::Arc::new(rclaw_sync::NoGate),
+                host: std::sync::Arc::new(rclaw_sync::NoHost),
+                cron: None,
+                skills: None,
+                platform: "test".into(),
+                version: "0".into(),
+                sessions_supported: true,
+                low_memory: false,
+            },
+            rclaw_sync::SyncConfig::default(),
+        )
+    }
+
     #[test]
-    fn delete_session_record_removes_active_and_archived() {
+    fn deleting_through_the_sync_handle_removes_active_and_archived_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let session = test_session(dir.path());
         for chat_id in ["main", "old"] {
@@ -3911,13 +4004,34 @@ mod tests {
         session
             .set_archived(super::CHANNEL_DESKTOP, "old", true)
             .unwrap();
+        session
+            .set_session_title(super::CHANNEL_DESKTOP, "main", "自定义标题")
+            .unwrap();
+        let engine = idle_sync_engine(&session, dir.path());
 
-        // 活动与归档会话都能删；再删幂等成功。
-        assert!(super::delete_session_record(&session, "main").is_ok());
-        assert!(super::delete_session_record(&session, "old").is_ok());
+        // 活动与归档会话都能删（「删除」与「彻底删除」在同步没开时没有区别）。
+        assert!(engine
+            .delete_session(super::CHANNEL_DESKTOP, "main", false)
+            .unwrap());
+        assert!(engine
+            .delete_session(super::CHANNEL_DESKTOP, "old", true)
+            .unwrap());
         assert_eq!(archived_flag(&session, "main"), None);
         assert_eq!(archived_flag(&session, "old"), None);
-        assert!(super::delete_session_record(&session, "main").is_ok());
+        // 自定义标题随会话清掉；再删幂等成功（会话已不在）。
+        assert!(session
+            .session_titles(super::CHANNEL_DESKTOP)
+            .unwrap()
+            .is_empty());
+        assert!(!engine
+            .delete_session(super::CHANNEL_DESKTOP, "main", false)
+            .unwrap());
+        // 同步没开：没有同步目录，库里也没有建同步表。
+        assert!(!dir.path().join("sync").exists());
+        assert!(!session
+            .db()
+            .with(|conn| rclaw_store::sync_db::sync_tables_exist(conn))
+            .unwrap());
     }
 
     #[test]
@@ -5134,20 +5248,33 @@ fn media_preview_blocking(home: &std::path::Path, path: &str) -> Result<MediaPay
     if !full.starts_with(&root_canon) {
         return Err("媒体路径越出工作区".into());
     }
-    let meta = std::fs::metadata(&full).map_err(|e| format!("读取媒体失败: {e}"))?;
+    image_preview_payload(home, &full, path, &extension)
+}
+
+/// 预览图的核心：`full` 是调用方已经校验过的图片文件，`extension` 是它的小写扩展名
+/// （在 [`MEDIA_EXTENSIONS`] 里），`cache_seed` 参与缓存键——工作区文件用相对路径，同步
+/// 缓存里的文件快照用附件对象名（`commands::sync`）。缓存一律落在工作区的预览缓存目录。
+fn image_preview_payload(
+    home: &std::path::Path,
+    full: &std::path::Path,
+    cache_seed: &str,
+    extension: &str,
+) -> Result<MediaPayload, String> {
+    let root = home.join("agent");
+    let meta = std::fs::metadata(full).map_err(|e| format!("读取媒体失败: {e}"))?;
     if meta.len() > MEDIA_MAX_BYTES {
         return Err(format!(
             "媒体超过大小上限（{} MB）",
             MEDIA_MAX_BYTES / 1024 / 1024
         ));
     }
-    let mime = match extension.as_str() {
+    let mime = match extension {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         _ => "image/gif",
     };
-    let original = std::fs::read(&full).map_err(|e| format!("读取媒体失败: {e}"))?;
+    let original = std::fs::read(full).map_err(|e| format!("读取媒体失败: {e}"))?;
 
     // GIF 帧序列会被单帧解码丢掉动画：原样返回。
     if mime == "image/gif" {
@@ -5167,7 +5294,7 @@ fn media_preview_blocking(home: &std::path::Path, path: &str) -> Result<MediaPay
     let key: String = {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(path.as_bytes());
+        hasher.update(cache_seed.as_bytes());
         hasher.update(meta.len().to_le_bytes());
         hasher.update(mtime.to_le_bytes());
         hasher.finalize()[..12]
@@ -6909,8 +7036,16 @@ pub async fn capture_start(state: State<'_, AppState>, kind: String) -> Result<S
     if kind != "photo" && kind != "video" {
         return Err("不支持的采集类型".into());
     }
-    // 清掉上一次残留结果，防止旧结果被本轮误消费。
-    let _ = std::fs::remove_file(state.home.join("capture_result.json"));
+    let home = state.home.clone();
+    run_blocking("准备拍照", move || {
+        // 上一次扫配对码没走完（界面被系统回收）的话，先把它收拾掉：拍下的照片等同于
+        // 配对码，不能留着。
+        sync::discard_scan(&home);
+        // 清掉上一次残留结果，防止旧结果被本轮误消费。
+        let _ = std::fs::remove_file(home.join("capture_result.json"));
+        Ok(())
+    })
+    .await?;
     #[cfg(target_os = "android")]
     {
         // "ok" / "permission_requested"（授权后自动续跑）/ "error:<原因>"。
@@ -6936,6 +7071,14 @@ pub async fn consume_capture_result(
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return Ok(None);
         };
+        // 扫配对码的结果不交给会话：有扫码在进行就留给它（`commands::sync`）；没有的话是
+        // 一次没人要的扫码，连照片一起收拾掉。
+        if sync::is_scan_result(&raw) {
+            if !sync::scan_pending(&home) {
+                sync::discard_scan(&home);
+            }
+            return Ok(None);
+        }
         // 读到即删：结果只消费一次。
         let _ = std::fs::remove_file(&path);
         let value: serde_json::Value =

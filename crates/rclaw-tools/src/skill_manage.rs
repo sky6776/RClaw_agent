@@ -173,10 +173,17 @@ impl SkillManageTool {
             Err(error) => return ToolResult::err(error),
         };
         if let Err(error) = self.usage.mark_archived(name, &dest) {
-            return ToolResult::err(format!(
-                "archived to {} but lifecycle metadata could not be saved: {error}",
-                dest.display()
-            ));
+            // 没记上「已归档」就把目录移回去：留在归档里而没有记录的技能恢复不了，多设备
+            // 同步还会把它当成「删掉了」发给别的设备。
+            return match std::fs::rename(&dest, &skill_dir) {
+                Ok(()) => ToolResult::err(format!(
+                    "skill '{name}' was not disabled: lifecycle metadata could not be saved ({error})"
+                )),
+                Err(rollback) => ToolResult::err(format!(
+                    "archived to {} but lifecycle metadata could not be saved ({error}), and moving it back also failed: {rollback}",
+                    dest.display()
+                )),
+            };
         }
         ToolResult::ok(format!(
             "skill '{name}' disabled (archived under skills/.archive/); restore with skill_manage action=restore"

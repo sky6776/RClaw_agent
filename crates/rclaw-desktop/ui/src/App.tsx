@@ -21,6 +21,7 @@ import {
   type PermissionRequest,
   type PlanStatus,
   type Status,
+  type SyncSessionMark,
   type ToolCallsEvent,
   type UpdateInfo,
   type UsageSnapshot,
@@ -46,6 +47,10 @@ import SkillsPanel from "./components/SkillsPanel";
 import FilePanel from "./components/FilePanel";
 import EvolutionPanel from "./components/EvolutionPanel";
 import CronPanel from "./components/CronPanel";
+import SyncPanel from "./components/SyncPanel";
+import { SyncConfirm, SyncMarkTags } from "./components/SyncBits";
+import { SyncChatBar, useSyncAttachmentLoader } from "./components/SyncAttachments";
+import { syncTitle } from "./lib/syncUi";
 import ConfigPanel from "./components/ConfigPanel";
 import TaskOverviewPanel from "./components/TaskOverviewPanel";
 import TaskPanel from "./components/TaskPanel";
@@ -69,6 +74,7 @@ import {
   ExpandIcon,
   FolderIcon,
   SkillsIcon,
+  SyncIcon,
   TasksIcon,
   ToolsIcon,
 } from "./components/icons";
@@ -83,6 +89,7 @@ type Page =
   | "agents"
   | "evolution"
   | "cron"
+  | "sync"
   | "taskview"
   | "config"
   | "about";
@@ -108,6 +115,7 @@ const NAV: Array<[Page, string, () => ReactNode]> = [
   ["agents", "Agent", () => <AgentsIcon />],
   ["evolution", "自进化", () => <EvolutionIcon />],
   ["cron", "定时任务", () => <CronIcon />],
+  ["sync", "多端同步", () => <SyncIcon />],
   ["config", "配置", () => <ConfigIcon />],
   ["about", "关于", () => <AboutIcon />],
 ];
@@ -499,6 +507,40 @@ ${event.payload.command}
       // agent 未启动 / 首次运行时静默。
     }
   }, [activeId]);
+
+  // 多端同步：会话列表的角标（仅本机 / 已同步 / 分支 / 正在别的设备上运行，按 chat_id）
+  // 与「多端同步」栏目上的待处理事项数。没开同步时两者都很便宜：角标只扫「仅本机」标记，
+  // 状态直接返回 off。
+  const [syncMarks, setSyncMarks] = useState<Record<string, SyncSessionMark>>({});
+  const [syncPending, setSyncPending] = useState(0);
+  // 多端同步是不是开着：只对同步有意义的入口（「仅本机对话」）据此显示。
+  const [syncOn, setSyncOn] = useState(false);
+  // 上一份角标的内容：每轮同步都会重新取一遍，内容没变就不换状态（不白白重渲染）。
+  const syncMarksSig = useRef("");
+  const loadSyncMarks = useCallback(async () => {
+    try {
+      const marks = await api.syncSessionMarks();
+      const sig = JSON.stringify(marks);
+      if (sig === syncMarksSig.current) return;
+      syncMarksSig.current = sig;
+      const byChat: Record<string, SyncSessionMark> = {};
+      marks.forEach((mark) => {
+        byChat[mark.chat_id] = mark;
+      });
+      setSyncMarks(byChat);
+    } catch {
+      // agent 未启动时静默。
+    }
+  }, []);
+  const loadSyncPending = useCallback(async () => {
+    try {
+      const { status: sync } = await api.syncStatus();
+      setSyncOn(sync.state !== "off");
+      setSyncPending(sync.state === "off" ? 0 : sync.pending.length);
+    } catch {
+      // agent 未启动时静默。
+    }
+  }, []);
 
   // 思考消息流式合并：快照（「💭 思考中」前缀，轮末整段权威内容）覆盖当前思考块；
   // 流式增量（「💭\n」前缀，载荷为原始分片）追加进当前思考块；当前块不存在
@@ -936,11 +978,23 @@ ${event.payload.command}
   // 窗口重新可见（移动端切回 / 桌面最小化恢复）时给当前会话增量补一轮：隐藏期间
   // 收尾的 turn、后台会话的 outbound 事件可能被系统丢弃，按游标续读自愈。
   useEffect(() => {
+    // 多端同步：窗口回到前台时让引擎看一眼别的设备有没有新内容（距上次拉取不到 5 秒时
+    // 引擎自己会跳过；没开同步时这个通知什么都不做）。只是通知，不等结果。
+    const notifyFocus = () => {
+      api.syncNotify("focus").catch(() => {});
+    };
     const onVisible = () => {
-      if (document.visibilityState === "visible") void resyncChat(activeId);
+      if (document.visibilityState !== "visible") return;
+      void resyncChat(activeId);
+      notifyFocus();
     };
     document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
+    // 桌面上窗口重新获得焦点时不一定有 visibilitychange（没最小化，只是被别的窗口盖住）。
+    window.addEventListener("focus", notifyFocus);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", notifyFocus);
+    };
   }, [resyncChat, activeId]);
 
   // 「启动中」轮询兜底：agent ready/error 事件可能在事件监听器注册完成前发出
@@ -969,6 +1023,9 @@ ${event.payload.command}
       // 会话边界清草稿（入口同步清，不依赖 Chat 挂载后的 effect 时序——
       // 分享确认等"先切会话再并入草稿"的路径会被后跑的清空 effect 抵消）。
       setChatDraft("");
+      // 多端同步：打开会话时让引擎补一次拉取，并预取这个会话尾部引用的附件。只是通知，
+      // 不等结果，不耽误打开；已经装载过的会话再次打开时也通知。
+      api.syncNotify("open_session", chatId).catch(() => {});
       if (restoredChats.current.has(chatId) || snapshotLoading.current.has(chatId)) return;
       snapshotLoading.current.add(chatId);
       // 快照就绪闸门：装完（成功或失败都算解除）前到达的增量拉取在这里等，
@@ -1197,16 +1254,27 @@ ${event.payload.command}
     setPage("chat");
   }, []);
 
+  // localOnly（多端同步的「仅本机」）：在第一条消息落库之前就打上标记，发布扫描从一开始
+  // 就跳过这个会话（docs/multi-device-sync.md §7.9）。
   const newChat = useCallback(
-    (returnTo: Page | null = null) => {
+    (returnTo: Page | null = null, localOnly = false) => {
       const id = freshChatId();
       prepareChat(id, returnTo);
       setChats((prev) => [
         { chat_id: id, title: "新对话", updated_at: Date.now(), archived: false },
         ...prev.filter((c) => c.chat_id !== id),
       ]);
+      if (localOnly) {
+        api
+          .syncSetLocalOnly(id, true)
+          .then(() => loadSyncMarks())
+          // 标记没打上时必须让用户知道：否则他以为这个对话不会同步出去。
+          .catch((e) =>
+            setErrorToast(`没能把新对话标成「仅本机」，它会照常同步: ${String(e)}`),
+          );
+      }
     },
-    [prepareChat],
+    [prepareChat, loadSyncMarks],
   );
 
   const archiveChat = useCallback(
@@ -1258,8 +1326,9 @@ ${event.payload.command}
   // 删除会话（不可恢复，入口先弹确认）：正在工作的会话禁止删除（turn 收尾会
   // 向原路径追加，文件会被重建）。本地转录与恢复标记一并清掉，防止同 id 会话
   // 重开时拼回已删除的历史。
+  // purge（多端同步的「彻底删除」）：已同步的会话默认先进各台设备的回收站，purge 则都不留。
   const deleteChat = useCallback(
-    async (chatId: string) => {
+    async (chatId: string, purge = false) => {
       if (busyByChat[chatId]) {
         setErrorToast("会话正在工作中，请先停止任务再删除");
         return;
@@ -1268,7 +1337,7 @@ ${event.payload.command}
       const from: Page | null =
         pageRef.current === "chats" ? "chats" : chatReturnPageRef.current;
       try {
-        await api.chatDelete(chatId);
+        await api.chatDelete(chatId, purge);
       } catch (e) {
         setErrorToast(String(e));
         return;
@@ -1301,11 +1370,127 @@ ${event.payload.command}
     [activeId, busyByChat, chats, openChat, prepareChat, refreshChats],
   );
 
+  // ---- 多端同步：别的设备带来的变化 ----
+  // 事件回调要读最新的会话列表 / 当前会话，但不能把它们放进依赖（否则每次列表变化都
+  // 重新订阅一遍事件）：经 ref 读取。
+  const chatsRef = useRef(chats);
+  chatsRef.current = chats;
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+
+  // 一个会话在别的设备上被删掉了（合入之后本机库里已经没有它）：把它在内存里的转录、
+  // 游标和恢复标记清掉，与本机删除（deleteChat）清的是同一批东西。正开着它的话换到别的
+  // 会话，并告诉用户它去哪了。
+  const forgetChat = useCallback(
+    (chatId: string) => {
+      restoredChats.current.delete(chatId);
+      snapshotLoading.current.delete(chatId);
+      delete cursorByChat.current[chatId];
+      setEntriesByChat((prev) => {
+        if (!(chatId in prev)) return prev;
+        const next = { ...prev };
+        delete next[chatId];
+        return next;
+      });
+      setChats((prev) => prev.filter((c) => c.chat_id !== chatId));
+      if (chatId !== activeIdRef.current) return;
+      const from = chatReturnPageRef.current;
+      const next = chatsRef.current.find((c) => !c.archived && c.chat_id !== chatId);
+      if (next) {
+        void openChat(next.chat_id, from);
+      } else {
+        prepareChat(freshChatId(), from);
+      }
+      setErrorToast("这个会话已经在另一台设备上删除。需要的话，可以在「多端同步」的回收站里恢复。");
+    },
+    [openChat, prepareChat],
+  );
+
+  // 对话页开着时装载这个会话的附件清单（多端同步；没开同步时是空的）。
+  useSyncAttachmentLoader(agentState === "ready" && page === "chat" ? activeId : null);
+
+  // 同步事件的处理函数经 ref 取最新的，订阅只跟着 agent 的启停建一次。把它们直接列进
+  // 依赖的话，每次切会话（refreshChats 等跟着 activeId 变）都要退订再订阅，而订阅是
+  // 异步建立的，这中间到的事件就丢了。
+  const syncHandlers = useRef({
+    forgetChat,
+    loadSyncMarks,
+    loadSyncPending,
+    refreshChats,
+    resyncChat,
+  });
+  syncHandlers.current = { forgetChat, loadSyncMarks, loadSyncPending, refreshChats, resyncChat };
+  useEffect(() => {
+    if (agentState !== "ready") return;
+    const on = () => syncHandlers.current;
+    // 待办数与角标（「正在别的设备上运行」跟着每一轮同步变，它变了不一定有 sessions 事件，
+    // 所以状态事件来了也刷新角标）。
+    let timer: number | undefined;
+    let lastAt = 0;
+    const refresh = () => {
+      window.clearTimeout(timer);
+      timer = undefined;
+      lastAt = Date.now();
+      void on().loadSyncPending();
+      void on().loadSyncMarks();
+    };
+    refresh();
+    const un = api.onSync((event) => {
+      if (event.kind === "status") {
+        // 状态事件会连着来（一轮同步的开始和结束、附件一批批传完）：合并成一次查询；
+        // 一直不断的话，每 400 毫秒最多查一次。
+        if (Date.now() - lastAt > 3000) refresh();
+        else if (timer === undefined) timer = window.setTimeout(refresh, 400);
+        return;
+      }
+      if (event.kind !== "sessions") return;
+      void on().loadSyncMarks();
+      const named = event.chats.filter((c) => c.channel === "desktop").map((c) => c.chat_id);
+      // 已经在内存里装过转录的会话：按游标补读合入进来的新消息。
+      named.forEach((chatId) => {
+        if (restoredChats.current.has(chatId)) void on().resyncChat(chatId);
+      });
+      if (!event.list) {
+        // 别的设备续写了已有的会话：列表没增没减，但它按最后修改时间排，顺序变了。
+        if (named.length > 0) void on().refreshChats();
+        return;
+      }
+      void on().refreshChats().then(async () => {
+        if (named.length === 0) return;
+        let backend: ChatMeta[];
+        try {
+          backend = await api.chatList();
+        } catch {
+          return;
+        }
+        const alive = new Set(backend.map((c) => c.chat_id));
+        named.forEach((chatId) => {
+          // 本地刚新建、还没发首条消息的会话本来就不在后端列表里：不算被删。
+          if (alive.has(chatId) || localChatIds.current.has(chatId)) return;
+          const known =
+            restoredChats.current.has(chatId) ||
+            chatsRef.current.some((c) => c.chat_id === chatId);
+          if (known) on().forgetChat(chatId);
+        });
+      });
+    });
+    return () => {
+      window.clearTimeout(timer);
+      void un.then((fn) => fn());
+    };
+  }, [agentState]);
+
   // 删除确认弹窗载荷（WebView 无原生 confirm，不可恢复操作走应用内弹窗）。
   const [deleteConfirm, setDeleteConfirm] = useState<{
     chatId: string;
     title: string;
   } | null>(null);
+  // 删除已同步的会话时的「彻底删除」勾选。弹窗每次打开、关闭都复位（不管是怎么关的，
+  // 包括返回键）：这个勾选不能从上一次带到下一次删除。
+  const [deletePurge, setDeletePurge] = useState(false);
+  useEffect(() => {
+    setDeletePurge(false);
+  }, [deleteConfirm]);
 
   const [toast, setToast] = useState<string | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
@@ -1554,6 +1739,57 @@ ${event.payload.command}
       })
       .catch((e) => setErrorToast(`导出失败: ${String(e)}`))
       .finally(() => setExportFullBusy(false));
+  };
+
+  // ---- 多端同步：会话包与「仅本机」 ----
+  // 导出会话包：完整、可移植的一份（另一台设备上「导入会话包」能原样接回来）。落盘在
+  // output/exports/，结果条与「导出完整聊天记录」共用。不需要开启同步。
+  const exportBundle = (chatId: string, title: string) => {
+    api
+      .sessionExportBundle(chatId, title)
+      .then((rel) => {
+        setExportFullSaved(false);
+        setExportedFull(rel);
+      })
+      .catch((e) => setErrorToast(`导出会话包失败: ${String(e)}`));
+  };
+  // 「仅本机」：这个会话不同步到其他设备。给已经同步过的会话打标记等于在其他设备上把它
+  // 删掉，所以那种情况先弹应用内确认（localOnlyConfirm）。
+  const [localOnlyConfirm, setLocalOnlyConfirm] = useState<{
+    chatId: string;
+    title: string;
+  } | null>(null);
+  const setLocalOnly = (chatId: string, on: boolean) => {
+    api
+      .syncSetLocalOnly(chatId, on)
+      .then(() => loadSyncMarks())
+      .catch((e) => setErrorToast(String(e)));
+  };
+  // 导入会话包：选一个文件 → 读成文本 → 后端新建一个会话（从不覆盖已有的）→ 打开它。
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const importBundle = (file: File) => {
+    if (importBusy) return;
+    // 与后端的上限一致：超了就不往内存里读了。
+    if (file.size > 50 * 1024 * 1024) {
+      setErrorToast("会话包太大（超过 50 MB）");
+      return;
+    }
+    setImportBusy(true);
+    file
+      .text()
+      .then((text) => api.sessionImportBundle(text))
+      .then(async (imported) => {
+        await refreshChats();
+        void loadSyncMarks();
+        // 导入总是落在桌面通道；防御性地判断一下，别的通道的会话这里打不开。
+        if (imported.channel === "desktop") {
+          void openChat(imported.chat_id, "chats");
+          setPage("chat");
+        }
+      })
+      .catch((e) => setErrorToast(String(e)))
+      .finally(() => setImportBusy(false));
   };
 
   // 移动端抽屉的上下文/内存状态（桌面由右侧 TaskPanel 承担，互不影响）。
@@ -2006,8 +2242,14 @@ ${event.payload.command}
               : NAV.slice(0, -1)
           ).map(([key, label, Icon]) => {
             // Agent / 任务概览：实时徽标 = 活跃执行数（有在运行的带脉动；收起时只剩小圆点）。
-            const badge = key === "agents" || key === "taskview" ? liveCounts.active : 0;
-            const pulse = badge > 0 && liveCounts.running > 0;
+            // 多端同步：徽标 = 等用户处理的事项数（不脉动）。
+            const isSync = key === "sync";
+            const badge = isSync
+              ? syncPending
+              : key === "agents" || key === "taskview"
+                ? liveCounts.active
+                : 0;
+            const pulse = !isSync && badge > 0 && liveCounts.running > 0;
             return (
               <button
                 key={key}
@@ -2017,7 +2259,13 @@ ${event.payload.command}
                   setPage(key);
                   setDrawerOpen(false);
                 }}
-                title={badge > 0 ? `${label}：${badge} 个任务活跃` : label}
+                title={
+                  badge > 0
+                    ? isSync
+                      ? `${label}：${badge} 件事等你处理`
+                      : `${label}：${badge} 个任务活跃`
+                    : label
+                }
                 className={`relative flex w-full items-center rounded-lg text-sm transition max-md:text-[15px] ${
                   sidebarCollapsed ? "justify-center py-2" : "gap-2.5 px-3 py-2 text-left max-md:py-2"
                 } ${
@@ -2162,17 +2410,63 @@ ${event.payload.command}
           <div className="h-full overflow-y-auto bg-[#0f131b] px-5 py-4 max-md:px-3">
         {/* 会话列表（收起为图标栏时隐藏）；移动端保证最小可见高度，
             超出部分由侧栏整体滚动承接（导航/状态块不再挤占会话区）。 */}
-        <div className="mb-3 flex items-center justify-between">
+        <div className="mb-3 flex items-center justify-between gap-2">
           <h2 className="text-base font-semibold text-gray-100">会话</h2>
-          <button
-            onClick={() => {
-              newChat("chats");
-              setPage("chat");
-            }}
-            className="rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300"
-          >
-            ＋ 新建对话
-          </button>
+          <div className="flex min-w-0 items-center gap-2">
+            {/* 导入会话包：另一台设备（或这台设备以前）「导出会话包」得到的文件。总是新建
+                一个会话，从不覆盖已有的；不需要开启同步。 */}
+            <button
+              onClick={() => importInputRef.current?.click()}
+              disabled={importBusy}
+              title="导入一个会话包文件（.rclaw-session.jsonl），作为新会话加入列表"
+              className="shrink-0 whitespace-nowrap rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 disabled:opacity-40 max-md:px-2"
+            >
+              {/* 窄屏用短文案：三个按钮要排得下一行。 */}
+              {importBusy ? (
+                "导入中…"
+              ) : (
+                <>
+                  <span className="max-md:hidden">导入会话包</span>
+                  <span className="md:hidden">导入</span>
+                </>
+              )}
+            </button>
+            {/* 不设 accept：会话包的扩展名系统不认识，安卓的文件选择器会把它灰掉。 */}
+            <input
+              ref={importInputRef}
+              type="file"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files && e.target.files[0];
+                // 清空选择：同一个文件连续选两次也要触发 change。
+                e.target.value = "";
+                if (file) importBundle(file);
+              }}
+            />
+            {/* 多端同步开着时才有意义：新建一个从一开始就不同步的对话。 */}
+            {syncOn && (
+              <button
+                onClick={() => {
+                  newChat("chats", true);
+                  setPage("chat");
+                }}
+                title="新建一个只留在这台设备上、不同步到其他设备的对话"
+                className="shrink-0 whitespace-nowrap rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 max-md:px-2"
+              >
+                <span className="max-md:hidden">＋ 仅本机对话</span>
+                <span className="md:hidden">＋ 仅本机</span>
+              </button>
+            )}
+            <button
+              onClick={() => {
+                newChat("chats");
+                setPage("chat");
+              }}
+              className="shrink-0 whitespace-nowrap rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 max-md:px-2"
+            >
+              ＋ 新建对话
+            </button>
+          </div>
         </div>
           {/* todo（zcode 会话面板同款信息位）：最近一个未收尾计划的步骤清单，
               与消息流的「流程步骤」卡片同源数据。 */}
@@ -2293,16 +2587,20 @@ ${event.payload.command}
                           title: c.title || c.chat_id,
                           x: e.clientX,
                           // 靠底行向上弹，避免菜单溢出窗口。
-                          y: Math.min(e.clientY, window.innerHeight - 170),
+                          y: Math.min(e.clientY, window.innerHeight - 230),
                           trigger: e.currentTarget,
                         });
                       }}
                       className="min-w-0 flex-1 px-2 py-1.5 text-left max-md:py-2.5"
-                      title={`${c.title || c.chat_id}（双击重命名，右键更多操作）`}
+                      title={`${syncTitle(c.title || c.chat_id, syncMarks[c.chat_id])}（双击重命名，右键更多操作）`}
                     >
-                      <div className="truncate text-xs max-md:text-[13px]">
-                        {c.chat_id.startsWith("bot-") ? "🤖 " : ""}
-                        {c.title || c.chat_id}
+                      {/* 多端同步：分支 / 换键落地的会话标题带本机显示用的后缀，行尾是同步角标。 */}
+                      <div className="flex items-center gap-1.5">
+                        <span className="min-w-0 truncate text-xs max-md:text-[13px]">
+                          {c.chat_id.startsWith("bot-") ? "🤖 " : ""}
+                          {syncTitle(c.title || c.chat_id, syncMarks[c.chat_id])}
+                        </span>
+                        <SyncMarkTags mark={syncMarks[c.chat_id]} />
                       </div>
                     </button>
                   )}
@@ -2317,7 +2615,7 @@ ${event.payload.command}
                             chatId: c.chat_id,
                             title: c.title || c.chat_id,
                             x: Math.min(r.left, window.innerWidth - 176),
-                            y: Math.min(r.bottom + 4, window.innerHeight - 170),
+                            y: Math.min(r.bottom + 4, window.innerHeight - 230),
                             trigger: e.currentTarget,
                           });
                         }}
@@ -2350,28 +2648,41 @@ ${event.payload.command}
         )}
 
         {agentState === "ready" && page === "chat" && (
-          <Chat
-            entries={activeEntries}
-            busy={activeBusy}
-            onSend={handleSend}
-            onCancel={handleCancel}
-            onError={setErrorToast}
-            draft={chatDraft}
-            onDraftChange={setChatDraft}
-            onCapture={isMobile ? handleCaptureAction : undefined}
-            onForwardToChat={forwardToChat}
-            sessionKey={activeId}
-            onFork={handleFork}
-            plans={plans}
-            onPlanPause={handlePlanPause}
-            queue={queueByChat[activeId] ?? []}
-            onQueueEnqueue={(text) => enqueueQueued(activeId, text)}
-            onQueueRemove={(id) => removeQueued(activeId, id)}
-            futureThinkingCollapsed={futureThinkingCollapsed[activeId] ?? false}
-            onToggleThinking={(collapsed) =>
-              setFutureThinkingCollapsed((prev) => ({ ...prev, [activeId]: collapsed }))
-            }
-          />
+          // 多端同步的那一条在对话上方（没有要说的时候它什么都不渲染，对话页和原来一样）；
+          // 对话占满余下的高度——用绝对定位给 Chat 的 h-full 一个确定的高度。
+          <div className="flex h-full flex-col">
+            <SyncChatBar
+              chatId={activeId}
+              runningOn={syncMarks[activeId] ? syncMarks[activeId].running_on : undefined}
+              onError={setErrorToast}
+            />
+            <div className="relative min-h-0 flex-1">
+              <div className="absolute inset-0">
+                <Chat
+                  entries={activeEntries}
+                  busy={activeBusy}
+                  onSend={handleSend}
+                  onCancel={handleCancel}
+                  onError={setErrorToast}
+                  draft={chatDraft}
+                  onDraftChange={setChatDraft}
+                  onCapture={isMobile ? handleCaptureAction : undefined}
+                  onForwardToChat={forwardToChat}
+                  sessionKey={activeId}
+                  onFork={handleFork}
+                  plans={plans}
+                  onPlanPause={handlePlanPause}
+                  queue={queueByChat[activeId] ?? []}
+                  onQueueEnqueue={(text) => enqueueQueued(activeId, text)}
+                  onQueueRemove={(id) => removeQueued(activeId, id)}
+                  futureThinkingCollapsed={futureThinkingCollapsed[activeId] ?? false}
+                  onToggleThinking={(collapsed) =>
+                    setFutureThinkingCollapsed((prev) => ({ ...prev, [activeId]: collapsed }))
+                  }
+                />
+              </div>
+            </div>
+          </div>
         )}
         {agentState === "ready" && page === "bots" && (
           <BotsPanel agentReady onOpenChat={(id) => void openChat(id)} />
@@ -2387,6 +2698,20 @@ ${event.payload.command}
         )}
         {agentState === "ready" && page === "evolution" && <EvolutionPanel agentReady />}
         {agentState === "ready" && page === "cron" && <CronPanel agentReady />}
+        {agentState === "ready" && page === "sync" && (
+          <SyncPanel
+            agentReady
+            captureBusy={captureInFlight}
+            onError={setErrorToast}
+            onOpenChat={(id) => {
+              // 从回收站恢复出来的是一个新会话：先让它进会话列表（带上角标），再打开。
+              void refreshChats().then(() => {
+                void loadSyncMarks();
+                void openChat(id);
+              });
+            }}
+          />
+        )}
         {agentState === "ready" && page === "taskview" && (
           <ExecutionPage selectedAgentId={selectedAgentId} onBack={() => setSelectedAgentId(null)}>
             {(hidden) => <TaskOverviewPanel agentReady hidden={hidden} onOpen={setSelectedAgentId} />}
@@ -2614,6 +2939,38 @@ ${event.payload.command}
             onClick={() => {
               const m = chatMenu;
               setChatMenu(null);
+              exportBundle(m.chatId, m.title);
+            }}
+          >
+            导出会话包
+          </button>
+          {/* 仅本机：bot 收件会话与群聊内部会话本来就不同步，不给这一项。 */}
+          {!chatMenu.chatId.startsWith("bot-") && !chatMenu.chatId.startsWith("grp-") && (
+            <button
+              className={CHAT_MENU_ITEM}
+              onClick={() => {
+                const m = chatMenu;
+                const mark = syncMarks[m.chatId];
+                setChatMenu(null);
+                if (mark && mark.local_only) {
+                  setLocalOnly(m.chatId, false);
+                } else if (mark && mark.synced) {
+                  setLocalOnlyConfirm({ chatId: m.chatId, title: m.title });
+                } else {
+                  setLocalOnly(m.chatId, true);
+                }
+              }}
+            >
+              {syncMarks[chatMenu.chatId] && syncMarks[chatMenu.chatId].local_only
+                ? "取消仅本机"
+                : "设为仅本机"}
+            </button>
+          )}
+          <button
+            className={CHAT_MENU_ITEM}
+            onClick={() => {
+              const m = chatMenu;
+              setChatMenu(null);
               void archiveChat(m.chatId);
             }}
           >
@@ -2800,13 +3157,40 @@ ${event.payload.command}
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div className="mx-4 w-[24rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-5 shadow-2xl max-md:w-[calc(100%-2rem)]">
             <h2 className="text-sm font-semibold text-gray-100">删除会话</h2>
-            <p className="mt-2 text-xs leading-relaxed text-gray-400">
-              将永久删除「{deleteConfirm.title}」的完整聊天记录，不可恢复。
-              如只是暂时收起，请改用「归档」。
-            </p>
+            {syncMarks[deleteConfirm.chatId] && syncMarks[deleteConfirm.chatId].published ? (
+              <>
+                {/* 已经传出去过的会话：删除会传到其他设备，默认各台设备先留在回收站。
+                    只是排着队、还没传出去的（synced 而不是 published）删了就是本机的事，
+                    后端不留回收站副本，所以走下面「不可恢复」的那段话。 */}
+                <p className="mt-2 text-xs leading-relaxed text-gray-400">
+                  「{deleteConfirm.title}」已经同步到你的其他设备：删除后，其他设备上的也会删除。
+                  各台设备会先把它放进回收站（保留天数见「多端同步」的设置），期间可以在那里恢复。
+                  如只是暂时收起，请改用「归档」。
+                </p>
+                <label className="mt-3 flex cursor-pointer items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={deletePurge}
+                    onChange={(e) => setDeletePurge(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500"
+                  />
+                  <span className="text-xs leading-relaxed text-gray-300">
+                    彻底删除：各台设备都不进回收站，不可恢复。
+                  </span>
+                </label>
+              </>
+            ) : (
+              <p className="mt-2 text-xs leading-relaxed text-gray-400">
+                将永久删除「{deleteConfirm.title}」的完整聊天记录，不可恢复。
+                如只是暂时收起，请改用「归档」。
+              </p>
+            )}
             <div className="mt-4 flex justify-end gap-2">
               <button
-                onClick={() => setDeleteConfirm(null)}
+                onClick={() => {
+                  setDeleteConfirm(null);
+                  setDeletePurge(false);
+                }}
                 className="rounded-lg border border-[#2a2f3a] px-4 py-1.5 text-xs text-gray-300 transition hover:bg-[#1a1f29] hover:text-gray-100"
               >
                 取消
@@ -2814,8 +3198,12 @@ ${event.payload.command}
               <button
                 onClick={() => {
                   const m = deleteConfirm;
+                  const mark = syncMarks[m.chatId];
+                  // 勾选只对已经传出去过的会话有意义；其余照旧是普通的本机删除。
+                  const purge = deletePurge && Boolean(mark && mark.published);
                   setDeleteConfirm(null);
-                  void deleteChat(m.chatId);
+                  setDeletePurge(false);
+                  void deleteChat(m.chatId, purge);
                 }}
                 className="rounded-lg bg-red-600 px-4 py-1.5 text-xs font-medium text-white transition hover:bg-red-500"
               >
@@ -2824,6 +3212,30 @@ ${event.payload.command}
             </div>
           </div>
         </div>
+      )}
+
+      {/* 把已经同步过的会话设为「仅本机」：等于在其他设备上把它删掉，先确认。 */}
+      {localOnlyConfirm && (
+        <SyncConfirm
+          title="设为仅本机"
+          confirmText="设为仅本机"
+          danger
+          onConfirm={() => {
+            const m = localOnlyConfirm;
+            setLocalOnlyConfirm(null);
+            setLocalOnly(m.chatId, true);
+          }}
+          onCancel={() => setLocalOnlyConfirm(null)}
+        >
+          <p>
+            「{localOnlyConfirm.title}」已经同步到你的其他设备。
+            设为仅本机后，它会从其他设备上删除（那边不进回收站），只留在这台设备上，之后的内容也不再同步。
+          </p>
+          <p>
+            如果另一台设备此前续写过这个会话，那一支会保留，并作为一个普通的同步会话回到这台设备。
+          </p>
+          <p>以后取消「仅本机」时，这个会话会作为一个新会话重新同步出去。</p>
+        </SyncConfirm>
       )}
 
       {/* 录音中指示条：计时 + 完成 / 取消。 */}
@@ -3113,7 +3525,7 @@ function About({ home }: { home: string }) {
     api.appVersions().then(setVersions).catch(() => {});
   }, []);
   // WebView 实际内核版本（安卓上随系统 WebView 更新，与构建期的 wry 无关）。
-  const webviewVer = /Chrome\/([\d.]+)/.exec(navigator.userAgent)?.[1] ?? null;
+  const webviewVer = navigator.userAgent.match(/Chrome\/([\d.]+)/)?.[1] ?? null;
 
   const versionRows: Array<[string, string | null | undefined]> = versions
     ? [

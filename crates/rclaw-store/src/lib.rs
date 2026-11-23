@@ -27,6 +27,7 @@ pub mod redact;
 pub mod session;
 pub mod skills;
 pub mod soul;
+pub mod sync_db;
 pub mod toml_file;
 pub mod workflow_home;
 
@@ -36,19 +37,26 @@ pub use bots::{
 };
 pub use cron_store::{CronJob, CronKind};
 pub use db::Db;
-pub use fs::{atomic_write, ensure_dir, ensure_file, ensure_parent_dir, init_layout, Layout};
+pub use fs::{
+    atomic_write, atomic_write_private, ensure_dir, ensure_file, ensure_parent_dir, init_layout,
+    is_portable_file_name, portable_file_name, Layout,
+};
 pub use journal::{
     JournalStore, JOURNAL_EXEC_LOG, JOURNAL_PLAN, JOURNAL_TEAM_STATE, JOURNAL_WORKFLOW,
     KV_TEAM_INBOX,
 };
-pub use memory::{scan_skill_text, MemOpResult, MemoryBatchOp, MemoryStore, MemoryTarget};
+pub use memory::{
+    scan_skill_text, sync_check_daily_block, DailyFile, MemOpResult, MemoryBatchOp, MemoryStore,
+    MemoryTarget, SyncApplied,
+};
 pub use path_util::{percent_encode_key, resolve_within_base, validate_agent_path};
 pub use redact::{redact_sensitive_shell_command, redact_sensitive_text};
 pub use session::{
     append_message, append_tool_chain, clear_session, load_history, repair_tool_chains,
-    synthesize_aborted_tool_results, tool_use_counts, FileCheckpointRecord, SearchRow,
-    SessionStats, SessionStore, SessionSummary, ToolCallMetaRecord, ToolChainDetail,
-    ToolResultDetail, UsageAnchorRecord, ABORTED_TOOL_RESULT_PLACEHOLDER,
+    session_title_key, synthesize_aborted_tool_results, tool_use_counts, FileCheckpointRecord,
+    MessageOrigin, RawMessageRow, SearchRow, SessionDeleteSync, SessionStats, SessionStore,
+    SessionSummary, ToolCallMetaRecord, ToolChainDetail, ToolResultDetail, UsageAnchorRecord,
+    ABORTED_TOOL_RESULT_PLACEHOLDER,
 };
 pub use skills::SkillSummary;
 pub use soul::{

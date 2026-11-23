@@ -52,6 +52,9 @@ pub struct RunningAgent {
     pub bot_router: Arc<BotRouter>,
     /// 可选 provider 名列表（bot 编辑器固定模型用）。
     pub llm_providers: Vec<String>,
+    /// 多端同步引擎的句柄（同步没开时是空句柄：没有线程、不碰磁盘）。「多端同步」面板、
+    /// 会话的删除 / 改名 / 导入导出、发送前的拉取都经它。
+    pub sync: rclaw_sync::SyncEngine,
 }
 
 /// Tauri managed state。
@@ -212,5 +215,14 @@ impl AppState {
             .expect("AppState.agent 锁未被毒化")
             .as_ref()
             .and_then(|a| a.web_search.clone())
+    }
+
+    /// 多端同步引擎句柄克隆；agent 未启动时为 `None`。
+    pub fn sync(&self) -> Option<rclaw_sync::SyncEngine> {
+        self.agent
+            .read()
+            .expect("AppState.agent 锁未被毒化")
+            .as_ref()
+            .map(|a| a.sync.clone())
     }
 }

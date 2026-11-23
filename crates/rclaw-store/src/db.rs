@@ -263,6 +263,8 @@ CREATE TABLE IF NOT EXISTS kv (
 pub struct Db {
     inner: Arc<Mutex<Connection>>,
     path: PathBuf,
+    /// 这个库的 `-wal` 文件；没能进 WAL 模式时是 `None`。见 [`Db::flush`]。
+    wal: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Db {
@@ -283,11 +285,15 @@ impl Db {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(path, flags)?;
-        configure(&conn)?;
+        let wal = configure(&conn)?.then(|| wal_path(&conn, path));
         migrate(&conn, path)?;
+        // 同步表在不在，打开时看一眼（一次 kv 主键查询），结果记成进程里的一个记号：没开过
+        // 多端同步的进程，之后每个 turn 都不必再为这件事碰库（`sync_db::sync_tables_seen`）。
+        let _ = crate::sync_db::sync_tables_exist(&conn);
         Ok(Db {
             inner: Arc::new(Mutex::new(conn)),
             path: path.to_path_buf(),
+            wal,
         })
     }
 
@@ -330,6 +336,42 @@ impl Db {
         Ok(out)
     }
 
+    /// 「落盘点」：把这之前已经提交的事务真正落到盘上。**不持连接锁**。
+    ///
+    /// 库平时是 `synchronous=NORMAL`：提交只写进 WAL、不 fsync，断电 / 系统崩溃时最后几笔
+    /// 已提交的事务可能回滚。多端同步在把本机状态写到远端之前必须先越过这个落盘点，否则
+    /// 远端会比本机「新」。WAL 是顺序日志，对它 fsync 一次，此前的所有提交就都落盘了
+    /// （已经被 checkpoint 搬进主库文件的那部分，SQLite 搬之前同步过 WAL、搬完同步过主库
+    /// 文件）。
+    ///
+    /// 做法是另开一个句柄对 `-wal` 文件 fsync，而不是在连接上用 `synchronous=FULL` 提交：
+    /// 那样 fsync 发生在连接锁里，那几十毫秒里别的线程（turn 追加消息）都得等。fsync 管的
+    /// 是文件、不是句柄——SQLite 自己也靠这一点：一个进程做 checkpoint 时同步的 WAL 里就有
+    /// 别的进程写的帧。
+    ///
+    /// 只碰 `-wal`，**绝不另开主库文件**：Unix 上进程里任何一个句柄关闭，这个进程在那个
+    /// 文件上的 POSIX 锁就全部释放，SQLite 的锁就没了。`-wal` 上 SQLite 不加锁（WAL 模式
+    /// 的锁在主库文件和 `-shm` 上）。连接开着的时候 `-wal` 文件一定在（清空也只是截成 0
+    /// 字节），打不开就报错，不当成「没什么可同步」。
+    ///
+    /// 库没能进 WAL 模式时什么都不做：回滚日志模式下 `NORMAL` 的提交本身就同步了主库文件。
+    ///
+    /// 只有同步引擎调用它，关闭同步时没有额外的 fsync。
+    pub fn flush(&self) -> Result<()> {
+        let Some(wal) = &self.wal else {
+            return Ok(());
+        };
+        // 只打开，不创建、不截断。Windows 上 fsync（`FlushFileBuffers`）要求句柄有写权限。
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(wal)
+            .map_err(|e| {
+                crate::StoreError::Other(format!("打不开 state.sqlite 的 WAL 文件，没法落盘: {e}"))
+            })?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// `VACUUM` + `wal_checkpoint(TRUNCATE)`：`/clear` 等大批删除后回收文件体积。
     ///
     /// `secure_delete=ON` 只把【主库文件】里的删除页清零；WAL 模式下这些写入先落在
@@ -349,8 +391,20 @@ impl Db {
     }
 }
 
-/// 每个连接打开时的 PRAGMA。
-fn configure(conn: &Connection) -> Result<()> {
+/// SQLite 给这个库用的 `-wal` 文件：库文件的完整路径后面加 `-wal`。完整路径问 SQLite 要
+/// ——它在打开时解析（Unix 上还会跟着符号链接走到真正的文件），自己拼的可能不是同一个。
+fn wal_path(conn: &Connection, path: &Path) -> PathBuf {
+    let full = match conn.path() {
+        Some(full) if !full.is_empty() => PathBuf::from(full),
+        _ => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+    };
+    let mut wal = full.into_os_string();
+    wal.push("-wal");
+    PathBuf::from(wal)
+}
+
+/// 每个连接打开时的 PRAGMA。返回库是不是在 WAL 模式下。
+fn configure(conn: &Connection) -> Result<bool> {
     // busy_timeout 必须最先设：切换 journal_mode 需要独占锁，另一进程 / 连接（桌面 + CLI
     // 共用同一 agent/、测试里的第二连接）正持锁时，没有 busy handler 会立刻 SQLITE_BUSY
     // 导致打开失败（ZCode 的 migration-runner 同样先设 timeout 再跑 PRAGMA）。
@@ -358,7 +412,8 @@ fn configure(conn: &Connection) -> Result<()> {
     // WAL：跨连接 / 跨进程的读不被写阻塞（进程内本就共用一条连接、按互斥锁串行），
     // 追加路径只写 WAL 顺序页；崩溃一致性由 SQLite 保证。
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-    if !mode.eq_ignore_ascii_case("wal") {
+    let wal = mode.eq_ignore_ascii_case("wal");
+    if !wal {
         tracing::warn!("state.sqlite 未能启用 WAL（journal_mode={mode}），继续使用当前模式");
     }
     // NORMAL + WAL：提交只保证写入 WAL，掉电最多丢最后几笔已提交事务但不会损坏库；
@@ -368,7 +423,7 @@ fn configure(conn: &Connection) -> Result<()> {
     // `/clear` 承诺「永久删除」：删除页内容清零，而不是仅标记空闲。
     conn.pragma_update(None, "secure_delete", "ON")?;
     register_functions(conn)?;
-    Ok(())
+    Ok(wal)
 }
 
 /// 连接级 Rust 标量函数。
@@ -561,6 +616,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(tables, 6);
+    }
+
+    #[test]
+    fn flush_syncs_the_wal_without_taking_the_connection_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("state.sqlite")).unwrap();
+        db.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO kv(key, value, updated_at) VALUES ('a', '1', 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // 找的就是 SQLite 在用的那个 WAL 文件，刚才的提交在里面。
+        let wal = db.wal.clone().expect("库在 WAL 模式下");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        // 在持锁的回调里调：它要是也去拿连接锁，这里就死锁了。
+        db.with(|_| db.flush()).unwrap();
+        db.flush().unwrap();
+        let n: i64 = db
+            .with(|c| Ok(c.query_row("SELECT count(*) FROM kv", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

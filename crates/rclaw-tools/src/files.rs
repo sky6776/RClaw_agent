@@ -8,6 +8,8 @@
 //!   的解析层兜底。盘符相对路径（`C:foo`）任何权限下都拒绝；
 //! - 任何权限下都不经文件工具读写工作区根下的运行时数据库 `state.sqlite`（及伴生文件），
 //!   不删工作区根 / 文件系统根 / 挂载点；
+//! - 任何权限下都不碰宿主登记的禁区目录（[`crate::access::protect_dir`]：多端同步的
+//!   `<数据根>/sync/`，里面是密钥与存储凭据）——不读写、不列、不搜、不删；
 //! - `read` 分页流式读取（offset/limit），不再以 32KB 整篇上限硬拒大文件，改为按
 //!   「每次调用」的行数/字节预算保护上下文；
 //! - `edit` 需要完整原文才能安全替换，保留 128MB 整篇载入上限；
@@ -644,7 +646,8 @@ fn walk_depth(
         if prefix.is_empty() || full.starts_with(prefix) {
             out.push(full);
         }
-        if is_real_dir {
+        // 禁区目录（多端同步的密钥与状态）只列出这一条，不进去。
+        if is_real_dir && !crate::access::walk_entry_is_protected(&path) {
             walk_depth(base, &path, display_base, prefix, out, depth + 1)?;
         }
     }
@@ -754,6 +757,9 @@ impl Tool for Grep {
                 .follow_links(false)
                 .max_depth(MAX_GREP_DEPTH)
                 .into_iter()
+                // 禁区目录（多端同步的密钥与状态）整棵跳过：read 会拒绝它，从上级目录
+                // 搜下来也不能绕过。
+                .filter_entry(|entry| !crate::access::walk_entry_is_protected(entry.path()))
             {
                 if acc.full {
                     break;

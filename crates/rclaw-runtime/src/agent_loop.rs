@@ -28,7 +28,7 @@ use rclaw_tools::ToolRegistry;
 
 use crate::options::AgentOptions;
 use crate::slash::SlashRegistry;
-use crate::turn::{ForkChatOutcome, TurnManager, TurnObserver};
+use crate::turn::{ForkChatOutcome, MergeGuard, SyncControl, TurnManager, TurnObserver};
 
 /// agent 主循环：持有 [`TurnManager`]，循环把 inbound 消息路由出去。
 pub struct AgentLoop {
@@ -98,6 +98,12 @@ impl AgentLoop {
         self.turn_mgr.set_turn_observer(observer)
     }
 
+    /// 装入多端同步的控制入口（在 `run()` 之前调用；见 [`SyncControl`]）：`/sync`、带范围
+    /// 的 `/clear`、turn 结束时的发布通知都经它。每个 loop 只接受一次，重复安装返回 false。
+    pub fn set_sync_control(&self, sync: Arc<dyn SyncControl>) -> bool {
+        self.turn_mgr.set_sync_control(sync)
+    }
+
     /// 运行主循环：收到一条 inbound 就交给 [`TurnManager::route`]，直到 inbound 关闭。
     ///
     /// `route` 自身不阻塞在长 turn 上（turn 在独立任务里跑），因此 loop 能持续路由新消息。
@@ -154,5 +160,30 @@ impl SessionLifecycle {
     /// 清掉某会话的运行期状态（见 [`TurnManager::forget_session`]）。
     pub fn forget_session(&self, channel: &str, chat_id: &str) {
         self.turn_mgr.forget_session(channel, chat_id);
+    }
+
+    // ---- 多端同步用的入口（docs/multi-device-sync.md §7.3）----
+
+    /// 占住一个会话做合入（见 [`TurnManager::begin_merge`]）：会话上没有会改历史的活动
+    /// turn 时登记并返回守卫，守卫释放即注销；登记期间这个会话上不会启动会改历史的 turn。
+    pub fn begin_merge(&self, channel: &str, chat_id: &str) -> Option<MergeGuard> {
+        self.turn_mgr.begin_merge(channel, chat_id)
+    }
+
+    /// 会话上是否有会改历史的活动 turn（见 [`TurnManager::is_history_busy`]）。与
+    /// [`Self::is_session_busy`] 的区别：定时任务的轮次不读写会话历史，不算。
+    pub fn is_history_busy(&self, channel: &str, chat_id: &str) -> bool {
+        self.turn_mgr.is_history_busy(channel, chat_id)
+    }
+
+    /// turn 已经运行了至少 `at_least` 的会话（见 [`TurnManager::long_running_sessions`]）。
+    pub fn long_running_sessions(&self, at_least: std::time::Duration) -> Vec<(String, String)> {
+        self.turn_mgr.long_running_sessions(at_least)
+    }
+
+    /// 在没有任何 turn、后台 review 运行时执行 `f`（见 [`TurnManager::when_quiet`]）；现在
+    /// 不空闲就不执行，返回 false。
+    pub fn when_quiet(&self, f: &mut dyn FnMut()) -> bool {
+        self.turn_mgr.when_quiet(f)
     }
 }

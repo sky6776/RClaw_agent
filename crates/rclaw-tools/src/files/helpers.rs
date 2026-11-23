@@ -47,6 +47,12 @@ pub(super) async fn resolve_path_with(
         return Err(ToolResult::err("路径不能为空"));
     }
     let resolved = join_workspace_path(base, path)?;
+    // 禁区目录（多端同步的密钥与状态）任何权限模式下都拒绝，而且排在沙箱门之前：反正
+    // 不会放行，不该先弹窗问用户要不要授权。禁区的位置是固定的（数据根下的 `sync/`），
+    // 这条文案不泄露工作区外别的路径存在与否。
+    if crate::access::touches_protected_dir(&resolved, op) {
+        return Err(crate::access::protected_dir_denial(&resolved));
+    }
     // Unrestricted（max 权限）直放任意路径；工作区内直放；工作区外在宿主注册了
     // 确认钩子时（桌面版）弹窗询问用户，允许才放行——见 [`ensure_path_allowed`]。
     crate::access::ensure_path_allowed(
@@ -459,6 +465,37 @@ pub(crate) fn physical_normalize(path: &Path) -> PathBuf {
         push_lexical(&mut out, *comp);
     }
     out
+}
+
+/// `target` 是否落在 `dir` 里（含 `dir` 本身）。两边都必须已经是物理落点
+/// （[`physical_normalize`] 的结果）。
+///
+/// 逐段比，名字按大小写折叠比（见 [`same_name_folded`]）：`dir` 可能还不存在（禁区目录在
+/// 第一次用到之前没有建出来），不存在的尾巴没有经过 `canonicalize` 归一，大小写不敏感的
+/// 文件系统上 `SYNC/x` 与 `sync/x` 是同一个落点，按字面比就漏了。大小写敏感的文件系统上
+/// 这样会多拦一个只差大小写的兄弟目录，宁可多拦。
+pub(crate) fn within_folded(target: &Path, dir: &Path) -> bool {
+    let mut have = target.components();
+    dir.components().all(|want| {
+        have.next().is_some_and(|have| match (have, want) {
+            (std::path::Component::Normal(a), std::path::Component::Normal(b)) => {
+                same_name_folded(a, b)
+            }
+            (a, b) => a == b,
+        })
+    })
+}
+
+/// 两个文件名在大小写不敏感的文件系统上是否是同一个条目：ASCII 之外再按 Unicode 大小写
+/// 折叠各比一次（与 [`name_in`] 同口径），Windows 上先剥掉会被静默丢弃的尾随点 / 空格
+/// 与 `:stream` 后缀。
+pub(crate) fn same_name_folded(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    if a == b {
+        return true;
+    }
+    let (a, b) = (a.to_string_lossy(), b.to_string_lossy());
+    let (a, b) = (platform_plain_name(&a), platform_plain_name(&b));
+    a.to_lowercase() == b.to_lowercase() || a.to_uppercase() == b.to_uppercase()
 }
 
 /// 词法折叠一段：`.` 丢弃；`..` 回退一段普通分量，已到根 / 盘符就像内核一样原地不动

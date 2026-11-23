@@ -1417,3 +1417,142 @@ async fn write_edit_delete_notify_skill_script_change_hook() {
     assert_eq!(seen.len(), 3, "写/编辑/删除各通知一次: {seen:?}");
     assert!(seen.iter().all(|p| p.to_string_lossy().contains("skills")));
 }
+
+/// 宿主登记的禁区目录（多端同步的 `<数据根>/sync/`）：任何权限模式下文件工具都不读、
+/// 不写、不列、不搜、不删，也不删包着它的目录；回滚点用的 `path_readable_now` 同样拒绝。
+#[tokio::test]
+async fn file_tools_refuse_the_protected_sync_dir() {
+    let b = base();
+    let home = b.parent().unwrap().to_path_buf();
+    let zone = home.join("sync");
+    // 登记时目录还不存在：趁它没建出来往里写同样要拦（大小写变体也算）。
+    crate::access::protect_dir(&zone);
+    let slash = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    let secrets = slash(&zone.join("secrets.json"));
+
+    for access in [ToolAccess::Sandboxed, ToolAccess::Unrestricted] {
+        crate::access::scope_access(access, async {
+            for path in [
+                secrets.clone(),
+                slash(&home.join("SYNC").join("planted.json")),
+            ] {
+                let r = WriteFile::new(b.clone())
+                    .execute(json!({"path": path, "content": "{}"}))
+                    .await;
+                assert!(
+                    r.is_error && r.content.contains("多端同步"),
+                    "{access:?} {path}: {}",
+                    r.content
+                );
+            }
+        })
+        .await;
+    }
+    assert!(!zone.exists() && !home.join("SYNC").exists());
+
+    fs::create_dir_all(zone.join("trash")).unwrap();
+    fs::write(zone.join("secrets.json"), r#"{"key":"needle-secret"}"#).unwrap();
+    fs::write(zone.join("trash").join("old.json"), "needle-trash").unwrap();
+    fs::write(home.join("note.txt"), "needle-plain").unwrap();
+    fs::write(b.join("inside.txt"), "needle-inside").unwrap();
+
+    for access in [ToolAccess::Sandboxed, ToolAccess::Unrestricted] {
+        crate::access::scope_access(access, async {
+            let spellings = [
+                secrets.clone(),
+                // 相对工作区根、带 `..` 的拼写。
+                "../sync/secrets.json".to_string(),
+                // 落点在禁区外，但中途经过禁区。
+                slash(&zone.join("fresh").join("..").join("..").join("escaped.txt")),
+            ];
+            for path in &spellings {
+                let r = Read::new(b.clone()).execute(json!({"path": path})).await;
+                assert!(r.is_error, "{access:?} read {path}");
+                assert!(!r.content.contains("needle"), "{}", r.content);
+                let r = WriteFile::new(b.clone())
+                    .execute(json!({"path": path, "content": "x"}))
+                    .await;
+                assert!(r.is_error, "{access:?} write {path}");
+                let r = EditFile::new(b.clone())
+                    .execute(json!({"path": path, "old_string": "needle", "new_string": "x"}))
+                    .await;
+                assert!(r.is_error, "{access:?} edit {path}");
+                let r = DeleteFile::new(b.clone())
+                    .execute(json!({"path": path}))
+                    .await;
+                assert!(r.is_error, "{access:?} delete {path}");
+            }
+            for dir in [slash(&zone), slash(&zone.join("trash"))] {
+                let r = ListDir::new(b.clone()).execute(json!({"path": dir})).await;
+                assert!(r.is_error, "{access:?} list {dir}: {}", r.content);
+                let r = Grep::new(b.clone())
+                    .execute(json!({"pattern": "needle", "path": dir}))
+                    .await;
+                assert!(r.is_error, "{access:?} grep {dir}: {}", r.content);
+                let r = DeleteFile::new(b.clone())
+                    .execute(json!({"path": dir}))
+                    .await;
+                assert!(r.is_error, "{access:?} delete {dir}: {}", r.content);
+            }
+            assert!(!crate::access::path_readable_now(
+                &b,
+                &zone.join("secrets.json")
+            ));
+        })
+        .await;
+    }
+    assert!(!zone.join("fresh").exists(), "不能在禁区里建出目录");
+    assert_eq!(
+        fs::read_to_string(zone.join("secrets.json")).unwrap(),
+        r#"{"key":"needle-secret"}"#
+    );
+
+    // 从上级目录列 / 搜下来：禁区只露出目录名，里面的东西一概不出现；别处照常。
+    crate::access::scope_access(ToolAccess::Unrestricted, async {
+        let listed = ListDir::new(b.clone())
+            .execute(json!({"path": slash(&home)}))
+            .await;
+        assert!(!listed.is_error, "{}", listed.content);
+        assert!(listed.content.contains("note.txt") && listed.content.contains("inside.txt"));
+        assert!(!listed.content.contains("secrets.json") && !listed.content.contains("old.json"));
+        let found = Grep::new(b.clone())
+            .execute(json!({"pattern": "needle", "path": slash(&home)}))
+            .await;
+        assert!(!found.is_error, "{}", found.content);
+        assert!(found.content.contains("needle-plain") && found.content.contains("needle-inside"));
+        assert!(
+            !found.content.contains("needle-secret") && !found.content.contains("needle-trash")
+        );
+        // 数据根以外、与禁区无关的路径不受影响。
+        assert!(crate::access::path_readable_now(&b, &home.join("note.txt")));
+    })
+    .await;
+
+    // 工作区里指向禁区的链接：按落点拦。
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&zone, b.join("peek")).unwrap();
+        for access in [ToolAccess::Sandboxed, ToolAccess::Unrestricted] {
+            crate::access::scope_access(access, async {
+                let r = Read::new(b.clone())
+                    .execute(json!({"path": "peek/secrets.json"}))
+                    .await;
+                assert!(r.is_error && !r.content.contains("needle"), "{}", r.content);
+                let r = Grep::new(b.clone())
+                    .execute(json!({"pattern": "needle", "path": "peek"}))
+                    .await;
+                assert!(r.is_error, "{}", r.content);
+            })
+            .await;
+        }
+        // 删掉这条链接本身不算碰禁区（只摘条目）；沙箱下它指向工作区外，照旧要授权。
+        crate::access::scope_access(ToolAccess::Unrestricted, async {
+            let r = DeleteFile::new(b.clone())
+                .execute(json!({"path": "peek"}))
+                .await;
+            assert!(!r.is_error, "{}", r.content);
+        })
+        .await;
+        assert!(zone.join("secrets.json").exists());
+    }
+}

@@ -94,6 +94,16 @@ export function CronIcon() {
   );
 }
 
+/** 多端同步（两个相对的箭头，各自带箭头尖）。 */
+export function SyncIcon() {
+  return (
+    <Svg>
+      <path d="M2.5 5.5h10M10.3 3.3l2.2 2.2-2.2 2.2" />
+      <path d="M13.5 10.5h-10M5.7 8.3l-2.2 2.2 2.2 2.2" />
+    </Svg>
+  );
+}
+
 /** 任务概览（清单板）。 */
 export function TasksIcon() {
   return (

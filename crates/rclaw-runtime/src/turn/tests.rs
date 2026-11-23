@@ -4653,6 +4653,7 @@ impl ReplacementDuringChatProvider {
                     event_tx: replacement_tx.clone(),
                     touches_history: true,
                     final_delivered: false,
+                    started: std::time::Instant::now(),
                 },
             );
         *self.replacement_tx.lock().unwrap() = Some(replacement_tx);
@@ -4996,6 +4997,7 @@ async fn is_session_busy_counts_only_live_turns_of_that_session() {
             event_tx: live_tx,
             touches_history: false,
             final_delivered: false,
+            started: std::time::Instant::now(),
         },
     );
     assert!(
@@ -5022,6 +5024,7 @@ async fn is_session_busy_counts_only_live_turns_of_that_session() {
             event_tx: tx,
             touches_history: true,
             final_delivered: false,
+            started: std::time::Instant::now(),
         },
     );
     let mgr = Arc::new(mgr);
@@ -5070,6 +5073,7 @@ async fn finishing_old_turn_does_not_remove_replacement_active_turn() {
             event_tx: old_tx.clone(),
             touches_history: true,
             final_delivered: false,
+            started: std::time::Instant::now(),
         },
     );
 
@@ -5164,6 +5168,7 @@ async fn cancel_treats_closed_active_entry_as_no_task() {
             event_tx,
             touches_history: true,
             final_delivered: false,
+            started: std::time::Instant::now(),
         },
     );
 
@@ -9230,6 +9235,7 @@ async fn compact_prunes_persists_boundary_and_records_refill_floor() {
             event_tx: live_tx,
             touches_history: true,
             final_delivered: false,
+            started: std::time::Instant::now(),
         },
     );
     let refused = mgr.handle_compact(CHANNEL_CLI, "console").await;
@@ -9255,6 +9261,7 @@ async fn compact_prunes_persists_boundary_and_records_refill_floor() {
             event_tx: cron_tx,
             touches_history: false,
             final_delivered: false,
+            started: std::time::Instant::now(),
         },
     );
     assert!(

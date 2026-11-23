@@ -36,6 +36,8 @@ mod permissions;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod state;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
+mod sync_host;
+#[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod tool_events;
 #[cfg(any(not(target_os = "android"), feature = "apk-host"))]
 mod wizard;
@@ -237,12 +239,58 @@ pub fn run() {
             commands::whisper_model_status,
             commands::whisper_model_download,
             commands::whisper_transcribe,
+            commands::sync::sync_status,
+            commands::sync::sync_save_config,
+            commands::sync::sync_set_secret,
+            commands::sync::sync_test_connection,
+            commands::sync::sync_probe_certificate,
+            commands::sync::sync_create_space,
+            commands::sync::sync_pairing_info,
+            commands::sync::sync_join_space,
+            commands::sync::sync_leave_space,
+            commands::sync::sync_reset_space,
+            commands::sync::sync_pairing_code,
+            commands::sync::sync_now,
+            commands::sync::sync_set_paused,
+            commands::sync::sync_pending_detail,
+            commands::sync::sync_resolve,
+            commands::sync::sync_mark_lost,
+            commands::sync::sync_confirm_metered,
+            commands::sync::sync_set_backlog,
+            commands::sync::sync_notify,
+            commands::sync::sync_session_marks,
+            commands::sync::sync_set_local_only,
+            commands::sync::sync_trash_list,
+            commands::sync::sync_trash_restore,
+            commands::sync::sync_trash_remove,
+            commands::sync::sync_trash_memory_restore,
+            commands::sync::sync_trash_memory_remove,
+            commands::sync::sync_remote_cron,
+            commands::sync::sync_cron_takeover,
+            commands::sync::sync_attachments,
+            commands::sync::sync_fetch_attachment,
+            commands::sync::sync_attachment_preview,
+            commands::sync::sync_attachment_save,
+            commands::sync::session_export_bundle,
+            commands::sync::session_import_bundle,
+            commands::sync::sync_scan_qr_image,
+            commands::sync::sync_scan_qr_start,
+            commands::sync::sync_scan_qr_poll,
+            commands::sync::sync_scan_qr_cancel,
         ])
         .setup(move |app| {
             // 托盘仅桌面（手机无托盘）。
             #[cfg(not(target_os = "android"))]
             {
                 setup_tray(app)?;
+            }
+            // 上一次扫配对码没走完（拍照期间应用被系统回收）：拍下的照片等同于配对码，
+            // 一启动就删掉，不等 agent 装配、也不管它装不装配得起来。
+            {
+                let home = home.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    commands::sync::discard_scan(&home);
+                });
             }
             if home::has_config(&home) {
                 // 配置已存在：后台装配并启动 agent（向导模式则等 wizard_save 触发）。

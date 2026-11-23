@@ -8,6 +8,7 @@
 #   rclaw-cli ──► rclaw-runtime ──► { rclaw-core, rclaw-llm,
 #                                     rclaw-channels, rclaw-tools, rclaw-store }
 #   rclaw-llm / rclaw-channels / rclaw-tools / rclaw-store ──► rclaw-core
+#   rclaw-cli ──► rclaw-sync ──► { rclaw-core, rclaw-store }   （多端同步，不依赖 runtime）
 #
 # 这样设计的好处（双入口理念）：
 #   - rclaw-core 是无 IO 假设的领域内核，可被任意宿主复用；
@@ -26,6 +27,7 @@ members = [
     "crates/rclaw-android",
     "crates/rclaw-channels",
     "crates/rclaw-runtime",
+    "crates/rclaw-sync",
     "crates/rclaw-cli",
     "crates/rclaw-desktop",
     "crates/rclaw-weixin-login",
@@ -45,6 +47,7 @@ default-members = [
     "crates/rclaw-tools",
     "crates/rclaw-channels",
     "crates/rclaw-runtime",
+    "crates/rclaw-sync",
     "crates/rclaw-cli",
     "crates/rclaw-desktop",
     "crates/rclaw-weixin-login",
@@ -114,6 +117,7 @@ rclaw-gbrain   = { path = "crates/rclaw-gbrain" }
 rclaw-android  = { path = "crates/rclaw-android" }
 rclaw-channels = { path = "crates/rclaw-channels" }
 rclaw-runtime  = { path = "crates/rclaw-runtime" }
+rclaw-sync     = { path = "crates/rclaw-sync" }
 rclaw-cli      = { path = "crates/rclaw-cli" }
 
 # -----------------------------------------------------------------------------

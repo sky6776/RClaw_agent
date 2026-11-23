@@ -52,6 +52,10 @@ pub struct Config {
     /// 行为与历史版本一致。
     #[serde(default)]
     pub skills: SkillsSection,
+    /// `[sync]` 段：多端同步（`docs/multi-device-sync.md`）。缺省关闭。存储的密码、同步
+    /// 空间的密钥不在这里，存于 `<rclaw.toml 所在目录>/sync/secrets.json`。
+    #[serde(default)]
+    pub sync: rclaw_sync::SyncConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1202,6 +1206,14 @@ impl Config {
         Ok(())
     }
 
+    /// `[sync]` 段的取值校验：拼错的存储类型、同步范围、通道名在启动期（和面板保存前）就
+    /// 报出来，而不是让同步悄悄不工作。
+    fn validate_sync(&self) -> Result<()> {
+        self.sync
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
     /// 从 `rclaw.toml`（若存在）加载配置。
     pub fn load() -> Result<Self> {
         Self::load_from_dir(std::path::Path::new("."))
@@ -1210,7 +1222,9 @@ impl Config {
     /// 解析一段 TOML 文本为配置（桌面配置面板保存前的校验用；不做缺省 provider
     /// 注入与文件 IO，只做与加载一致的语法/结构校验）。
     pub fn parse_str(text: &str) -> Result<Self> {
-        parse_config_text(text).context("配置解析失败")
+        let cfg = parse_config_text(text).context("配置解析失败")?;
+        cfg.validate_sync().context("配置解析失败")?;
+        Ok(cfg)
     }
 
     /// 从指定目录的 `rclaw.toml` 加载配置。
@@ -1279,6 +1293,7 @@ impl Config {
         }
 
         cfg.validate_skill_curator()?;
+        cfg.validate_sync()?;
 
         Ok(cfg)
     }

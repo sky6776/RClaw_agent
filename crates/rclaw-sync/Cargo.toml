@@ -1,0 +1,55 @@
+# =============================================================================
+# rclaw-sync：多端同步（docs/multi-device-sync.md）
+# -----------------------------------------------------------------------------
+# 本地优先 + 每台设备一条只追加的、端到端加密的操作日志，经被动存储
+# （共享文件夹 / WebDAV / S3）交换。负责：
+#   - 引擎循环与一轮同步的九步、身份自检
+#   - 发布扫描、封段、拉取、合入（分支 / 排队 / 悬空 / 隔离）
+#   - op 定义、段 / 汇总包 / head 的编解码、加解密
+#   - 传输后端、配对码、会话包、回收站
+#   - 文件类数据（记忆 / 每日笔记 / 人格 / 技能 / bot / 定时任务）与附件
+# 依赖方向：rclaw-cli → { rclaw-runtime, rclaw-sync } → { rclaw-core, rclaw-store }。
+# 本 crate 不依赖 rclaw-runtime：运行时句柄由宿主以 trait 对象注入。
+# =============================================================================
+[package]
+name = "rclaw-sync"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rclaw-core = { workspace = true }
+rclaw-store = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+percent-encoding = { workspace = true }
+toml = { workspace = true }
+# 认证加密、密钥派生、HMAC：已随 rustls 在依赖图里，不新增编译单元。
+ring = "0.17"
+# 段压缩：纯 Rust 后端（miniz_oxide），Termux / NDK 一致。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# 引擎单实例锁（跨进程；rclaw-runtime 的 workflow.lock 同款）。
+fs2 = "0.4"
+# WebDAV / S3 的 XML 响应解析（版本沿用 rclaw-gbrain）。
+quick-xml = "0.37"
+# 自签证书按指纹固定：自定义证书校验器。与 reqwest 用同一个 rustls，只开 ring
+# （默认的 aws-lc-rs 要编 C，破坏 Termux）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+# 测试里用暂停的时钟（`start_paused`）：写 head 的最小间隔、退避等待不必真的等。
+tokio = { workspace = true, features = ["test-util"] }

@@ -44,6 +44,12 @@ pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeInit(
     let result = (|| -> anyhow::Result<()> {
         let vm = env.get_java_vm().map_err(anyhow::Error::from)?;
         rclaw_android::set_java_vm(vm);
+        // 本导出同样跑在 Java 线程上：这里也缓存一次 NativeBridge 类引用。界面先于前台
+        // 服务起来时（nativeStart 还没被调用），原生线程上的 JNI 查询（前后台、网络是否
+        // 按流量计费）才拿得到应用类。缓存失败不挡启动：nativeStart 里还会再试并报错。
+        if let Err(error) = rclaw_android::jni_bridge::cache_native_bridge_class(&mut env) {
+            rclaw_android::log_boot(&format!("nativeInit 缓存 NativeBridge 类失败: {error}"));
+        }
         let dir = env
             .get_string(&files_dir)
             .map(|s| s.to_string_lossy().into_owned())
@@ -167,6 +173,18 @@ pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeIsHealthy(
     } else {
         JNI_FALSE
     }
+}
+
+/// 界面进入 / 离开前台（`NativeBridge.setForeground`，由 MainActivity 的 onResume /
+/// onPause 调用）：通知多端同步引擎——后台放宽轮询且只在非计费网络下进行，回到前台立即
+/// 同步。引擎还没装配或同步没开时什么都不做；只是往引擎线程投一条消息，不阻塞界面线程。
+#[no_mangle]
+pub extern "system" fn Java_ai_rclaw_app_NativeBridge_nativeSetForeground(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    foreground: jboolean,
+) {
+    crate::sync_host::set_foreground(foreground != JNI_FALSE);
 }
 
 /// MainActivity 在 nativeInit 后推送当前 APK 版本（与内置 skill marker 同源，

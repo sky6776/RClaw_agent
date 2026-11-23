@@ -17,8 +17,14 @@
 /// - `keyword(:|=)value` / `"keyword":"value"` 形式：keyword 命中
 ///   password/secret/token/api_key/... 且 value ≥8 字节时，替换 value
 ///
+/// - 多端同步的配对码：`rclaw-pair-v1.` + base64url，折行的也整段遮掉
+///
 /// 不匹配的文本原样返回（含中文）。
 pub fn redact_sensitive_text(text: &str) -> String {
+    // 配对码先单独遮：它可能被折成几行，而下面的规则（`token: <值>`、`Bearer <值>`）碰到它
+    // 只会认到第一行为止。
+    let masked = mask_pairing_codes(text);
+    let text: &str = &masked;
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
@@ -227,6 +233,201 @@ fn match_redaction_at(text: &str, bytes: &[u8], i: usize) -> Option<(usize, Stri
     }
 
     None
+}
+
+/// 多端同步配对码的固定前缀（与 `rclaw_sync::pairing::PAIRING_PREFIX` 一致；rclaw-sync
+/// 依赖本 crate，所以这里单独写一份，rclaw-sync 的测试核对两边没有走样）。
+pub const PAIRING_CODE_PREFIX: &[u8] = b"rclaw-pair-v1.";
+/// 正文不是 JSON 对象的「配对码」（示例、残片）按长度猜续行：续行与上一段之间最多隔这么多
+/// 字节（`\r\n` 加缩进）。
+const PAIRING_CODE_WRAP_GAP: usize = 4;
+/// 同上：续行至少这么长才算（短词多半是正文）。
+const PAIRING_CODE_WRAP_MIN: usize = 16;
+/// 正文还没结束的配对码：续行与上一段之间最多隔这么多字节（换行、缩进、引用符）。
+const PAIRING_CODE_OPEN_GAP: usize = 64;
+/// 一段配对码最多往后找这么远（配对码本身不超过 8 KiB）。
+const PAIRING_CODE_SCAN_MAX: usize = 16 * 1024;
+/// 前缀后面至少跟着这么多个字符才当成真的配对码（[`contains_pairing_code`]）。正文是
+/// `{"s":"<20 位空间 id>","k":"<密钥>"…` 的 base64url，密钥从第 45 个字符起：比这短的
+/// （文档里的示例、只打了个开头）不带任何要保密的内容。
+const PAIRING_CODE_MIN_BODY: usize = 24;
+
+/// 文本里有没有多端同步的配对码——完整的，或者长到可能带着密钥的残片（折了行的也算）。
+///
+/// 用户把配对码打进对话里时，运行时靠它在记日志、落会话、交给模型之前把这条消息拦下来；
+/// [`redact_sensitive_text`] 管的是事后的遮盖。
+pub fn contains_pairing_code(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + PAIRING_CODE_PREFIX.len() <= bytes.len() {
+        if is_boundary_before(bytes, i) && ci_starts_with(bytes, i, PAIRING_CODE_PREFIX) {
+            let len = pairing_code_len(text, i);
+            let body = bytes[i + PAIRING_CODE_PREFIX.len()..i + len]
+                .iter()
+                .filter(|byte| is_word(**byte))
+                .count();
+            if body >= PAIRING_CODE_MIN_BODY {
+                return true;
+            }
+            i += len;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// 只把配对码换成 `[REDACTED]`，别的不动（[`redact_sensitive_text`] 还会遮掉各种密钥，
+/// 用在用户有意交给模型的文本上太宽了）。
+pub fn redact_pairing_codes(text: &str) -> std::borrow::Cow<'_, str> {
+    mask_pairing_codes(text)
+}
+
+/// 把文本里的多端同步配对码换成 `[REDACTED]`。配对码等同于全部同步数据的钥匙
+/// （docs/multi-device-sync.md §11.2），不该留在工具结果、摘要、记忆和日志里。
+fn mask_pairing_codes(text: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i + PAIRING_CODE_PREFIX.len() <= bytes.len() {
+        if is_boundary_before(bytes, i) && ci_starts_with(bytes, i, PAIRING_CODE_PREFIX) {
+            let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            out.push_str(&text[copied..i]);
+            out.push_str("[REDACTED]");
+            i += pairing_code_len(text, i);
+            copied = i;
+        } else {
+            i += 1;
+        }
+    }
+    match out {
+        Some(mut out) => {
+            out.push_str(&text[copied..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+/// `start` 处（前缀的第一个字节）的配对码占多少字节，折行的续行也算进去。
+///
+/// 配对码的正文是一个 JSON 对象的 base64url：边读边解，这个对象闭合的地方就是配对码结束
+/// 的地方。结束之前，断行、缩进、引用符（`> `）后面接着的字符都还是它的一部分，哪怕最后
+/// 一行只剩几个字符；结束之后的内容一个字节也不多遮。正文不是这个形状（解出来不以 `{`
+/// 开头：示例、残片）时退回按长度猜——隔着一小段空白、紧跟着的长串同类字符才算续行。
+fn pairing_code_len(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = start + PAIRING_CODE_PREFIX.len();
+    let mut body = PairingBody::default();
+    loop {
+        let run = run_len(bytes, end, is_word);
+        body.feed(&bytes[end..end + run]);
+        end += run;
+        if body.shape == BodyShape::Closed || end - start > PAIRING_CODE_SCAN_MAX {
+            break;
+        }
+        // 解析配对码时空白都会被去掉（`char::is_whitespace`），这里按同样的口径跳过。
+        let gap: usize = text[end..]
+            .chars()
+            .take_while(|c| c.is_whitespace() || *c == '>')
+            .map(char::len_utf8)
+            .sum();
+        let next = run_len(bytes, end + gap, is_word);
+        let wrapped = if body.shape == BodyShape::Open {
+            gap > 0 && gap <= PAIRING_CODE_OPEN_GAP && next > 0
+        } else {
+            gap > 0 && gap <= PAIRING_CODE_WRAP_GAP && next >= PAIRING_CODE_WRAP_MIN
+        };
+        if !wrapped {
+            break;
+        }
+        end += gap;
+    }
+    end - start
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum BodyShape {
+    /// 还没解出第一个字节。
+    #[default]
+    Unknown,
+    /// 是一个还没闭合的 JSON 对象。
+    Open,
+    /// 对象闭合了：配对码到此为止。
+    Closed,
+    /// 不是 JSON 对象。
+    Other,
+}
+
+/// 边读配对码的正文边解 base64url，跟踪解出来的 JSON 对象闭合了没有。
+#[derive(Default)]
+struct PairingBody {
+    shape: BodyShape,
+    /// 还没凑满一个字节的位。
+    bits: u32,
+    bit_count: u32,
+    /// 没闭合的 `{` / `[` 层数。
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl PairingBody {
+    /// 喂进一串 base64url 字符（调用方保证都是 `is_word` 的字符）。
+    fn feed(&mut self, chars: &[u8]) {
+        for &c in chars {
+            let sextet = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'-' => 62,
+                _ => 63,
+            };
+            self.bits = (self.bits << 6) | u32::from(sextet);
+            self.bit_count += 6;
+            if self.bit_count >= 8 {
+                self.bit_count -= 8;
+                let byte = (self.bits >> self.bit_count) as u8;
+                self.bits &= (1 << self.bit_count) - 1;
+                self.push(byte);
+            }
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        match self.shape {
+            BodyShape::Unknown => {
+                self.shape = if byte == b'{' {
+                    self.depth = 1;
+                    BodyShape::Open
+                } else {
+                    BodyShape::Other
+                };
+            }
+            BodyShape::Open if self.in_string => {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+            }
+            BodyShape::Open => match byte {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        self.shape = BodyShape::Closed;
+                    }
+                }
+                _ => {}
+            },
+            BodyShape::Closed | BodyShape::Other => {}
+        }
+    }
 }
 
 /// 值是否为变量/表达式引用形态（非字面密钥）。

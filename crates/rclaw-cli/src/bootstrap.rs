@@ -97,6 +97,9 @@ pub struct CoreComponents {
     #[allow(dead_code)]
     pub web_search_control: Option<Arc<WebSearchControl>>,
     pub _mcp_manager: Option<Arc<rclaw_tools::mcp::McpManager>>,
+    /// 多端同步：宿主建出 `AgentLoop` 之后用 [`crate::sync::SyncSeed::attach`] 接上
+    /// （在 `run()` 之前）。同步没开时接上的只是一个空句柄。
+    pub sync: crate::sync::SyncSeed,
 }
 
 /// 装配全部核心组件。
@@ -169,6 +172,12 @@ pub async fn assemble_core_with(
             std::env::remove_var(&flag);
         }
     }
+
+    // 多端同步的私有目录 `<rclaw.toml 所在目录>/sync/`（空间密钥、存储凭据、同步状态）是
+    // 文件工具的禁区（docs/multi-device-sync.md §11.4）。不管同步开没开都登记：不能让模型
+    // 抢在开启之前往里面放东西。
+    let data_root = crate::sync::data_root_of(&slash_config_path);
+    rclaw_tools::access::protect_dir(&data_root.join("sync"));
 
     // [skills] 技能执行参数：stdout/stderr 单流字节限额（进程级槽位，技能入口
     // 工具执行时读取；缺省 64 KiB 与历史一致——桌面/Termux 不写该键零行为变化）。
@@ -551,6 +560,18 @@ pub async fn assemble_core_with(
         ..AgentOptions::default()
     };
 
+    // 多端同步：这里只备料（不起线程、不碰磁盘），引擎要等宿主建出 AgentLoop 才能接上
+    // ——它靠运行时的会话生命周期句柄与 turn 互斥。
+    let sync = crate::sync::SyncSeed::new(
+        cfg.sync.clone(),
+        data_root,
+        session.clone(),
+        memory.clone(),
+        cron.clone(),
+        bots.clone(),
+        web_search_control.clone(),
+    );
+
     Ok(CoreComponents {
         hot,
         provider,
@@ -567,6 +588,7 @@ pub async fn assemble_core_with(
         review_provider,
         web_search_control,
         _mcp_manager,
+        sync,
     })
 }
 

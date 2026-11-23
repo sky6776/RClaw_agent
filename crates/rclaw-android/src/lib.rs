@@ -415,6 +415,20 @@ pub fn app_foreground() -> bool {
     }
 }
 
+/// 当前网络是否按流量计费（蜂窝数据、标了「按流量计费」的 Wi-Fi）。多端同步只在两处
+/// 看它：界面在后台时的轮询只在非计费网络下进行、计费网络下的首次同步要用户确认。问不到
+/// （JavaVM 没就绪、没有网络）时按不计费算。桌面恒 false。
+pub fn network_metered() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        jni_bridge::network_metered().unwrap_or(false)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        false
+    }
+}
+
 /// 拍照/录视频（kind: photo|video）：起系统相机，结果走 Activity onActivityResult
 /// → CaptureBridge 落盘 uploads/ + 写 capture_result.json。
 pub fn capture(kind: &str) -> Result<String> {
@@ -2501,6 +2515,12 @@ pub mod jni_bridge {
 
     pub(super) fn keep_alive_open_oem_settings() -> Result<bool> {
         call_static_bool("keepAliveOpenOemSettings")
+    }
+
+    /// 当前网络是否按流量计费（`ConnectivityManager.isActiveNetworkMetered`），见
+    /// [`crate::network_metered`]。
+    pub(super) fn network_metered() -> Result<bool> {
+        call_static_bool("isNetworkMetered")
     }
 }
 

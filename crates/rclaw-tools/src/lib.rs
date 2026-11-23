@@ -25,6 +25,7 @@ pub mod skill_entrypoint;
 pub mod skill_ledger;
 pub mod skill_manage;
 pub mod skill_signals;
+pub mod skill_sync;
 pub mod skill_usage;
 pub mod truncate;
 pub mod turn_state;

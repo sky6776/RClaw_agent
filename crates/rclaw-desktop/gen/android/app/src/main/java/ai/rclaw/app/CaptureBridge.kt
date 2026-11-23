@@ -28,11 +28,14 @@ object CaptureBridge {
     private const val REQ_MIC = 2003
     private const val REQ_WRITE = 2004
     private const val REQ_CAMERA = 2005
+    private const val REQ_SCAN = 2006
 
     /** MainActivity 生命周期持有；系统相机/麦克风授权都需要 Activity。 */
     @JvmStatic var activity: Activity? = null
 
     private var pendingPhotoFile: File? = null
+    /** 上一次为扫码拉起相机的时刻（elapsedRealtime 毫秒），只用来挡连点。 */
+    private var scanLaunchedAt = -10_000L
     private var recorder: MediaRecorder? = null
     private var recordFile: File? = null
     private var startRecordWhenGranted = false
@@ -71,6 +74,50 @@ object CaptureBridge {
             "ok"
         } catch (e: Exception) {
             AppConfig.trace(activity, "capture-photo-error ${e.message}")
+            "error:${e.message}"
+        }
+    }
+
+    /** 扫配对码时拍下的照片。它等同于配对码本身，所以不进工作区：固定落在
+     *  files/sync/scan/qr.jpg（同步目录是助手文件工具的禁区，文件面板也看不到）。
+     *  位置固定，Rust 侧随时可以无条件删掉它，不依赖本进程记住的任何状态——拍照期间
+     *  进程被系统回收、结果文件没写成，都不会留下一张没人管的照片。 */
+    private fun scanFile(activity: Activity): File {
+        val dir = File(activity.filesDir, "sync/scan").apply { mkdirs() }
+        return File(dir, "qr.jpg")
+    }
+
+    /** 起系统相机拍配对码的二维码（多端同步的「拍照扫码」）。返回约定同 capturePhoto。
+     *  结果写 capture_result.json：{"kind":"scan"} 或 {"kind":"scan","cancelled":true}。 */
+    @JvmStatic
+    @Synchronized
+    fun captureScan(): String {
+        val activity = activity ?: return "error:Activity 未就绪"
+        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            pendingCaptureKind = "scan"
+            ActivityCompat.requestPermissions(
+                activity, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
+            return "permission_requested"
+        }
+        // 连点两下只起一次相机。按时间判断而不是记一个「进行中」的标志：相机没有把结果
+        // 送回来的时候（个别机型上会发生），标志会一直挂着，之后就再也扫不了了。
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - scanLaunchedAt < 1500) return "ok"
+        return try {
+            val file = scanFile(activity)
+            file.delete()
+            val uri = FileProvider.getUriForFile(
+                activity, activity.packageName + ".fileprovider", file)
+            val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                .putExtra(MediaStore.EXTRA_OUTPUT, uri)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                          Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            activity.startActivityForResult(intent, REQ_SCAN)
+            scanLaunchedAt = now
+            "ok"
+        } catch (e: Exception) {
+            AppConfig.trace(activity, "capture-scan-error ${e.message}")
             "error:${e.message}"
         }
     }
@@ -117,6 +164,18 @@ object CaptureBridge {
                     finishCapture("photo", null)
                 }
             }
+            REQ_SCAN -> {
+                // 相机回来了：下一次扫码不用再等连点的间隔。
+                scanLaunchedAt = -10_000L
+                // 不依赖内存里的状态：拍照期间进程可能被回收过，照片的位置是固定的。
+                val file = scanFile(activity)
+                // 扫码已经被取消或收拾掉（标记没了）：没有人会来取这张照片，当场删掉。
+                val wanted = File(activity.filesDir, "capture_scan.pending").isFile
+                val taken = wanted && resultCode == Activity.RESULT_OK
+                    && file.isFile && file.length() > 0
+                if (!taken) file.delete()
+                if (wanted) finishScan(activity, taken)
+            }
             REQ_VIDEO -> {
                 if (resultCode == Activity.RESULT_OK) {
                     val uri: Uri? = data?.data
@@ -159,9 +218,25 @@ object CaptureBridge {
         } else {
             "{\"kind\":\"$kind\",\"cancelled\":true}"
         }
-        // 临时文件 + rename 原子提交：Rust 轮询消费端读到半截 JSON 会把文件
-        // 删掉（读后即删），非原子写会整份丢失采集结果。
-        try {
+        if (!writeCaptureResult(activity, json)) return
+        AppConfig.trace(activity, "capture-done kind=$kind file=${file?.name ?: "cancelled"}")
+    }
+
+    /** 扫码的结果。照片在固定位置，结果里不带路径。结果写不成的话把照片删掉：没有结果，
+     *  就不会有人来取它。 */
+    private fun finishScan(activity: Activity, taken: Boolean) {
+        val json = if (taken) "{\"kind\":\"scan\"}" else "{\"kind\":\"scan\",\"cancelled\":true}"
+        if (!writeCaptureResult(activity, json)) {
+            scanFile(activity).delete()
+            return
+        }
+        AppConfig.trace(activity, "capture-done kind=scan taken=$taken")
+    }
+
+    /** 临时文件 + rename 原子提交：Rust 轮询消费端读到半截 JSON 会把文件
+     *  删掉（读后即删），非原子写会整份丢失采集结果。 */
+    private fun writeCaptureResult(activity: Activity, json: String): Boolean {
+        return try {
             val target = File(activity.filesDir, "capture_result.json")
             val tmp = File(activity.filesDir, "capture_result.json.tmp")
             tmp.writeText(json)
@@ -169,11 +244,11 @@ object CaptureBridge {
                 target.writeText(json)
                 tmp.delete()
             }
+            true
         } catch (e: Exception) {
             AppConfig.trace(activity, "capture-result-write-error ${e.message}")
-            return
+            false
         }
-        AppConfig.trace(activity, "capture-done kind=$kind file=${file?.name ?: "cancelled"}")
     }
 
     // ------------------------------------------------------------------
@@ -275,6 +350,7 @@ object CaptureBridge {
                 when (kind) {
                     "photo" -> capturePhoto()
                     "video" -> captureVideo()
+                    "scan" -> captureScan()
                 }
             } else {
                 pendingCaptureKind = null

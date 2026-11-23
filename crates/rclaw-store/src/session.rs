@@ -506,15 +506,9 @@ impl SessionStore {
         anchor_message_id: i64,
         files_note: &str,
     ) -> Result<i64> {
-        let meta = serde_json::json!({
-            "fork_notice": { "parent": parent_chat_id, "anchor": anchor_message_id }
-        })
-        .to_string();
-        let text = format!(
-            "【会话分叉】本会话自父会话 `{parent_chat_id}` 的消息 #{anchor_message_id} 分叉而来，\
-             上面的历史继承自父会话。{files_note}\n\
-             请从本分叉继续：不要假设分叉点之后的消息在本会话发生过。"
-        );
+        let parent = Some((parent_chat_id, anchor_message_id));
+        let meta = raw::fork_notice_meta(parent);
+        let text = raw::fork_notice_text(parent, files_note);
         self.db.transaction(|tx| {
             let Some(sid) = session_id(tx, channel, chat_id)? else {
                 return Err(StoreError::Other(format!(
@@ -814,33 +808,11 @@ impl SessionStore {
         })
     }
 
-    /// 删除会话（消息 / checkpoint 级联；usage 锚点、会话目标与 fork 血缘 kv 一并删除，
-    /// artifact 目录级联清理）。返回会话是否存在。
+    /// 删除会话（消息 / checkpoint 级联；usage 锚点、会话目标、fork 血缘与标题 kv 一并
+    /// 删除，artifact 目录级联清理）。返回会话是否存在。该会话参与多端同步时，删除会
+    /// 传播到其他设备（见 [`Self::delete_session_with`]）。
     pub fn delete_session(&self, channel: &str, chat_id: &str) -> Result<bool> {
-        let existed = self.db.transaction(|tx| {
-            tx.execute(
-                "DELETE FROM usage_anchor WHERE channel = ?1 AND chat_id = ?2",
-                params![channel, chat_id],
-            )?;
-            // 会话级 kv（/goal 目标、fork 血缘）随会话删除：目标活不过它的会话；血缘
-            // 行留着会让 chat_id 复用时「新会话被当成旧分叉」。
-            tx.execute(
-                "DELETE FROM kv WHERE key IN (?1, ?2)",
-                params![
-                    session_goal_key(channel, chat_id),
-                    fork_lineage_key(channel, chat_id)
-                ],
-            )?;
-            let n = tx.execute(
-                "DELETE FROM session WHERE channel = ?1 AND chat_id = ?2",
-                params![channel, chat_id],
-            )?;
-            Ok(n > 0)
-        })?;
-        if existed {
-            remove_artifact_dir(&self.layout, channel, chat_id);
-        }
-        Ok(existed)
+        self.delete_session_with(channel, chat_id, SessionDeleteSync::Propagate)
     }
 
     /// 从任意消息锚点 fork 出【新会话】（ZCode `forkStableConversationAtMessage` 同源语义，
@@ -962,6 +934,15 @@ impl SessionStore {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 params![fork_lineage_key(channel, new_chat_id), lineage, now],
             )?;
+            // 「仅本机」的会话分出来的也是仅本机的（多端同步 §7.9）：分叉带着父会话的整段
+            // 历史，不带上标记，这段历史就会被发布到其他设备。和复制在同一个事务里——新
+            // 会话一出现就带着标记，发布扫描看不到没有标记的它。想同步这个分叉，可以之后
+            // 再把标记取消。
+            let local_only = crate::sync_db::local_only_key(channel, chat_id);
+            if let Some(mark) = crate::sync_db::kv_get(tx, &local_only)? {
+                let inherited = crate::sync_db::local_only_key(channel, new_chat_id);
+                crate::sync_db::kv_put(tx, &inherited, &mark)?;
+            }
             Ok(SessionFork {
                 new_chat_id: new_chat_id.to_string(),
                 copied: prefix.len(),
@@ -977,7 +958,7 @@ impl SessionStore {
     /// fork 时把源会话的 artifact 目录整份复制到新会话键下（配合消息体里的路径重写，
     /// 新分支的落盘句柄自持，父会话删除不再牵连）。best-effort：源目录不存在静默跳过，
     /// 复制失败只告警。
-    fn copy_artifact_dir(&self, channel: &str, source_chat: &str, target_chat: &str) {
+    pub fn copy_artifact_dir(&self, channel: &str, source_chat: &str, target_chat: &str) {
         let source = self
             .layout
             .base
@@ -1024,7 +1005,7 @@ impl SessionStore {
     /// 消息体里 artifact 句柄的目录前缀（带尾斜杠、正斜杠形态）：与 runtime spill 的
     /// display 路径同构造——Path::join 归一 base 尾部分隔符（手拼字符串会出现
     /// `agent//artifacts`，与落盘路径对不上、重写永不命中），相对 base 按进程 CWD 展开。
-    fn artifacts_dir_prefix(&self, channel: &str, chat_id: &str) -> String {
+    pub fn artifacts_dir_prefix(&self, channel: &str, chat_id: &str) -> String {
         let base = &self.layout.base;
         let base = if base.is_absolute() {
             base.clone()
@@ -1139,15 +1120,16 @@ impl SessionStore {
                 "DELETE FROM tool_call_meta; DELETE FROM file_checkpoint; DELETE FROM message; \
                  DELETE FROM session; DELETE FROM usage_anchor;",
             )?;
-            // 会话全清，会话级 kv（/goal 目标、fork 血缘）一并删除——否则 /clear 后旧
-            // 目标还挂在 kv 里，goal reminder 会把它注进「全新」的会话；血缘行会让复用
-            // chat_id 的新会话被当成旧分叉。plan / workflow 等运行时 journal 与其 kv
-            // 不属会话，保留。
+            // 会话全清，会话级 kv（/goal 目标、fork 血缘、标题）一并删除——否则 /clear 后旧
+            // 目标还挂在 kv 里，goal reminder 会把它注进「全新」的会话；血缘行与标题会让
+            // 复用 chat_id 的新会话被当成旧分叉 / 顶着旧标题。plan / workflow 等运行时
+            // journal 与其 kv 不属会话，保留。
             tx.execute(
-                "DELETE FROM kv WHERE key LIKE 'session-goal/%' OR key LIKE 'session-fork/%'",
+                "DELETE FROM kv WHERE key LIKE 'session-goal/%' OR key LIKE 'session-fork/%' \
+                 OR key LIKE 'session-title/%'",
                 [],
             )?;
-            Ok(())
+            raw::on_clear_all_sessions(tx)
         })?;
         if let Err(e) = self.db.vacuum() {
             tracing::warn!("state.sqlite VACUUM 失败（数据已删除，仅文件体积未回收）: {e}");
@@ -2396,6 +2378,9 @@ pub fn load_history(
 pub fn clear_session(store: &SessionStore, channel: &str, chat_id: &str) -> Result<()> {
     store.delete_session(channel, chat_id).map(|_| ())
 }
+
+pub mod raw;
+pub use raw::{session_title_key, MessageOrigin, RawMessageRow, SessionDeleteSync};
 
 #[cfg(test)]
 mod tests;

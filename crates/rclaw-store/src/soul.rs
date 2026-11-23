@@ -759,6 +759,141 @@ fn validate_soul_content(bytes: &[u8]) -> std::result::Result<&str, String> {
     Ok(text)
 }
 
+// ---- 多端同步的入口 ----
+
+/// 生效人格在同步里的路径（相对 agent 根，正斜杠）。
+pub const SYNC_ACTIVE_PATH: &str = "config/SOUL.md";
+const SYNC_LIBRARY_PREFIX: &str = "config/souls/";
+
+/// 同步路径对应的人格库文件名：必须是库内的一级文件名，各个系统上都建得出来，且不是
+/// 四个内置人格之一（内置人格随各端二进制下发，同步会让不同版本互相覆盖）。和内置人格
+/// 只差大小写的名字也不算：在不分大小写的文件系统上它们就是同一个文件。
+///
+/// 同步来的名字是别的设备给的，不可信：在 Windows 上 `C:notes.md` 是「C 盘当前目录下的
+/// notes.md」（`join` 之后就不在人格库里了），`a.md:x.txt` 是 `a.md` 的备用数据流，`NUL.md`
+/// 是设备（[`crate::fs::is_portable_file_name`]）。这些名字在哪个系统上都不同步——否则
+/// 一台设备上建得出来的名字，到另一台上不是写错地方就是每一轮都失败。
+fn sync_library_name(rel: &str) -> Option<String> {
+    let name = validate_existing_file_name(rel.strip_prefix(SYNC_LIBRARY_PREFIX)?)?;
+    if name.starts_with(' ') || !crate::fs::is_portable_file_name(&name) {
+        return None;
+    }
+    let lower = name.to_lowercase();
+    (!BUILTIN_SOULS
+        .iter()
+        .any(|p| p.file_name.to_lowercase() == lower))
+    .then_some(name)
+}
+
+/// 一个路径是不是参与同步的人格文件：生效人格，或人格库里用户自建的文件。
+pub fn is_sync_path(rel: &str) -> bool {
+    rel == SYNC_ACTIVE_PATH || sync_library_name(rel).is_some()
+}
+
+fn sync_target(layout: &Layout, rel: &str) -> Result<PathBuf> {
+    if rel == SYNC_ACTIVE_PATH {
+        return Ok(layout.soul_file.clone());
+    }
+    sync_library_name(rel)
+        .map(|name| souls_dir(layout).join(name))
+        .ok_or_else(|| StoreError::InvalidPath(format!("不是可同步的人格文件: {rel}")))
+}
+
+/// 读一个参与同步的人格文件。符号链接、通不过内容校验的文件都当作没有。
+fn sync_read_path(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_IMPORT_BYTES as u64 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    validate_soul_content(&bytes).ok().map(str::to_string)
+}
+
+/// 参与同步的人格文件的当前内容：`(相对路径, 内容)`，按路径排序。空的或仍是占位的
+/// 生效人格不算（没有东西可同步）。
+pub fn sync_files(layout: &Layout) -> Result<Vec<(String, String)>> {
+    let _guard = soul_lock();
+    let mut out = Vec::new();
+    if let Some(content) = sync_read_path(&layout.soul_file).filter(|c| !is_placeholder(c)) {
+        out.push((SYNC_ACTIVE_PATH.to_string(), content));
+    }
+    let dir = souls_dir(layout);
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let rel = format!("{SYNC_LIBRARY_PREFIX}{name}");
+                if sync_library_name(&rel).is_none() {
+                    continue;
+                }
+                if let Some(content) = sync_read_path(&entry.path()) {
+                    out.push((rel, content));
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(StoreError::Other(format!(
+                "读取人格库目录失败（{}）: {e}",
+                dir.display()
+            )))
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// 多端同步写入一份人格（调用方保证用户已在本机确认）。与导入同一套内容校验；覆盖有
+/// 实际内容的生效人格之前先备份（`SOUL.md.bak.<时间>`），返回备份路径。
+pub fn sync_write(layout: &Layout, rel: &str, content: &str) -> Result<Option<PathBuf>> {
+    validate_soul_content(content.as_bytes())
+        .map_err(|e| StoreError::Other(format!("人格内容不可用：{e}")))?;
+    let target = sync_target(layout, rel)?;
+    let _guard = soul_lock();
+    if std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(StoreError::Other(format!(
+            "人格文件是符号链接，拒绝写入：{rel}"
+        )));
+    }
+    let mut backup = None;
+    if rel == SYNC_ACTIVE_PATH {
+        let has_content = match active_soul_bytes(layout)?.as_deref() {
+            None => false,
+            Some(bytes) if bytes == content.as_bytes() => return Ok(None),
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(current) => !current.trim().is_empty() && !is_placeholder(current),
+                // 读不出的旧文件：按「有内容」处理，备份原始字节。
+                Err(_) => true,
+            },
+        };
+        if has_content {
+            backup = backup_active_soul(layout)?;
+        }
+    } else if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            StoreError::Other(format!("创建人格库目录失败（{}）: {e}", parent.display()))
+        })?;
+    }
+    atomic_write(&target, content.as_bytes())?;
+    Ok(backup)
+}
+
+/// 多端同步删除人格库里的一个文件（生效人格不能删）。返回它原来在不在。
+pub fn sync_remove(layout: &Layout, rel: &str) -> Result<bool> {
+    if rel == SYNC_ACTIVE_PATH {
+        return Err(StoreError::InvalidPath("生效人格不能删除".into()));
+    }
+    let target = sync_target(layout, rel)?;
+    let _guard = soul_lock();
+    match std::fs::remove_file(&target) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(StoreError::Io(e)),
+    }
+}
+
 /// 文件名清洗：只取 basename、拒绝前导点/路径分隔、字符集白名单、补扩展名。
 ///
 /// 允许中英文、数字、`.`、`_`、`-`；其他字符（空格、括号等）替换为 `-`。
@@ -1397,6 +1532,110 @@ mod tests {
             list_personas(&layout).unwrap().iter().all(|e| !e.active),
             "list_personas 不能把占位内容标成当前"
         );
+    }
+
+    #[test]
+    fn sync_covers_the_active_soul_and_user_files_only() {
+        let (_dir, layout) = layout_with_tempdir();
+        // 占位的生效人格不算内容。
+        assert!(sync_files(&layout).unwrap().is_empty());
+        prepare_souls(&layout).unwrap();
+        let dir = souls_dir(&layout);
+        std::fs::write(dir.join("我的.md"), "自建人格\n").unwrap();
+        std::fs::write(dir.join("二进制.md"), [0u8, 1, 2]).unwrap();
+        let files = sync_files(&layout).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, ["config/SOUL.md", "config/souls/我的.md"]);
+
+        assert!(is_sync_path("config/SOUL.md"));
+        assert!(is_sync_path("config/souls/我的.md"));
+        for bad in [
+            "config/souls/.active",
+            "config/souls/../SOUL.md",
+            "config/souls/a/b.md",
+            "config/SOUL.md.bak.20260101-000000",
+            "config/USER.md",
+            "config/souls/x.exe",
+        ] {
+            assert!(!is_sync_path(bad), "{bad}");
+        }
+        let builtin = format!("config/souls/{}", BUILTIN_SOULS[1].file_name);
+        assert!(!is_sync_path(&builtin), "内置人格不参与同步");
+        assert!(sync_write(&layout, &builtin, "x\n").is_err());
+        // 只差大小写：在不分大小写的文件系统上就是内置人格那个文件。
+        let builtin_other_case = format!(
+            "config/souls/{}",
+            BUILTIN_SOULS[1].file_name.replace("SOUL", "soul")
+        );
+        assert!(!is_sync_path(&builtin_other_case));
+    }
+
+    /// 别的设备给的名字不可信：带盘符的（Windows 上 `join` 之后跑到人格库外面去）、备用
+    /// 数据流、设备名、系统会悄悄改掉的结尾，一律不是同步路径，写和删都拒绝。
+    #[test]
+    fn sync_refuses_names_that_escape_or_cannot_exist_everywhere() {
+        let (_dir, layout) = layout_with_tempdir();
+        prepare_souls(&layout).unwrap();
+        for bad in [
+            "config/souls/C:notes.md",
+            "config/souls/a:b.md",
+            "config/souls/我的.md:x.txt",
+            "config/souls/NUL.md",
+            "config/souls/con.txt",
+            "config/souls/COM1.md",
+            "config/souls/lpt9.notes.md",
+            "config/souls/a?.md",
+            "config/souls/a*.md",
+            "config/souls/a|b.md",
+            "config/souls/a<b>.md",
+            "config/souls/a\"b.md",
+            "config/souls/a\tb.md",
+            "config/souls/ a.md",
+        ] {
+            assert!(!is_sync_path(bad), "{bad}");
+            assert!(sync_write(&layout, bad, "x\n").is_err(), "{bad}");
+            assert!(sync_remove(&layout, bad).is_err(), "{bad}");
+        }
+        // 正常的名字不受影响（`COM10`、`console` 不是设备名）。
+        for ok in [
+            "config/souls/我的 人格.md",
+            "config/souls/notes-2.markdown",
+            "config/souls/COM10.md",
+            "config/souls/console.txt",
+        ] {
+            assert!(is_sync_path(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn sync_write_backs_up_the_active_soul_and_sync_remove_spares_it() {
+        let (_dir, layout) = layout_with_tempdir();
+        prepare_souls(&layout).unwrap();
+        std::fs::write(&layout.soul_file, "我手写的旧人格\n").unwrap();
+        let backup = sync_write(&layout, SYNC_ACTIVE_PATH, "别的设备上的人格\n")
+            .unwrap()
+            .expect("覆盖有内容的生效人格必须备份");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "我手写的旧人格\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&layout.soul_file).unwrap(),
+            "别的设备上的人格\n"
+        );
+        // 内容相同：不写也不备份。
+        assert!(sync_write(&layout, SYNC_ACTIVE_PATH, "别的设备上的人格\n")
+            .unwrap()
+            .is_none());
+        assert!(sync_write(&layout, SYNC_ACTIVE_PATH, "  \n").is_err());
+
+        assert!(sync_write(&layout, "config/souls/新.md", "新人格\n")
+            .unwrap()
+            .is_none());
+        assert!(sync_remove(&layout, "config/souls/新.md").unwrap());
+        assert!(!sync_remove(&layout, "config/souls/新.md").unwrap());
+        assert!(sync_remove(&layout, SYNC_ACTIVE_PATH).is_err());
+        assert!(sync_remove(&layout, "config/souls/../SOUL.md").is_err());
     }
 
     #[test]

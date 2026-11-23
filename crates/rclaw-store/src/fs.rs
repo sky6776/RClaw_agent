@@ -234,7 +234,19 @@ pub fn init_layout(layout: &Layout) -> Result<()> {
 /// 与本函数的持久化保证相矛盾。因此这里用 `f.sync_all()?` 传播错误（而不是 `let _ =`）。
 /// 会话 / journal 数据不走本函数：它们在 `agent/state.sqlite` 里由 SQLite 事务保证落盘。
 pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
-    let path = path.as_ref();
+    atomic_write_mode(path.as_ref(), data, false)
+}
+
+/// 同 [`atomic_write`]，用于只该本用户读的文件（密钥、凭据）：Unix 上临时文件从创建起就
+/// 是 0600，改名之后目标自然也是。
+///
+/// 先写后收紧权限是不够的：内容落盘到收紧之间别的本机用户读得到；这中间进程退出，留下
+/// 的临时文件还一直可读。Windows 上文件权限随用户目录的 ACL，与 [`atomic_write`] 相同。
+pub fn atomic_write_private(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
+    atomic_write_mode(path.as_ref(), data, true)
+}
+
+fn atomic_write_mode(path: &Path, data: &[u8], private: bool) -> Result<()> {
     ensure_parent_dir(path)?;
 
     let backup = backup_path_for(path);
@@ -270,7 +282,16 @@ pub fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
         armed: false,
     };
     {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut f = options.open(&tmp)?;
         tmp_guard.armed = true;
         f.write_all(data)?;
         // 传播 fsync 错误：ENOSPC/EIO 时让整轮失败，而非谎报成功。
@@ -410,6 +431,61 @@ fn rename_strict(from: &Path, to: &Path, ctx: &str) -> Result<()> {
     })
 }
 
+/// 文件名里在 Windows 上有特殊含义、或者根本不能出现的字符。
+fn is_reserved_name_char(c: char) -> bool {
+    c.is_control() || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+}
+
+/// Windows 的保留设备名：`CON`、`PRN`、`AUX`、`NUL`、`COM0`–`COM9`、`LPT0`–`LPT9`（第 4 个
+/// 字符还包括上标数字 `¹²³`），以及 `CONIN$`、`CONOUT$`。不分大小写，只看第一个点之前
+/// 的主干（`NUL.md`、`con.txt` 同样是设备），主干后面的空格不算。
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let mut chars = upper.chars();
+    let prefix: String = chars.by_ref().take(3).collect();
+    (prefix == "COM" || prefix == "LPT")
+        && matches!(chars.next(), Some('0'..='9' | '¹' | '²' | '³'))
+        && chars.next().is_none()
+}
+
+/// 一个文件名（路径里的一段）在各个系统上都能原样存在，而且只是一个普通的名字。
+///
+/// 来自别的设备的名字要先过这一关，才能原样拼进本机路径。Windows 上名字里的 `:` 不只是
+/// 「建不出来」：`C:x` 是另一个盘上的相对路径，`PathBuf::push` / `join` 遇到它会把前面
+/// 的目录整个换掉；`a:b` 是文件 `a` 的备用数据流；`NUL`、`COM1` 是设备；结尾的点和空格
+/// 会被悄悄去掉，于是两个名字指向同一个文件。这些在 Linux、macOS、Android 上都是合法
+/// 的普通文件名，所以规则不分平台：过了这一关的名字，到哪台设备上都只是它自己。
+pub fn is_portable_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.ends_with(['.', ' '])
+        && !name.chars().any(is_reserved_name_char)
+        && !is_reserved_device_name(name)
+}
+
+/// 把一个名字改成 [`is_portable_file_name`] 认可的样子：特殊字符换成 `_`，去掉结尾的点和
+/// 空格，设备名前面加 `_`，什么都不剩就叫 `file`。已经合规的名字原样返回。
+pub fn portable_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if is_reserved_name_char(c) { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_end_matches(['.', ' ']);
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else if is_reserved_device_name(cleaned) {
+        format!("_{cleaned}")
+    } else {
+        cleaned.to_string()
+    }
+}
+
 /// 同步【父目录】，确保 `rename` / 备份删除产生的【目录项】变更也落盘（修复 P3）。
 ///
 /// **背景**：[`atomic_write`] 已对临时文件【内容】做 `sync_all`，但 `rename`（tmp→目标）
@@ -474,6 +550,90 @@ mod tests {
         // 结束后无残留临时/备份文件。
         assert!(!target.with_extension("tmp").exists());
         assert!(!target.with_extension("bak").exists());
+    }
+
+    /// 在 Windows 上会逃出目录、指向设备或者指向另一个文件的名字都不算可移植；改写之后
+    /// 的名字一定可移植，已经合规的不动。
+    #[test]
+    fn portable_file_names_are_plain_everywhere() {
+        let bad = [
+            "",
+            ".",
+            "..",
+            "C:x",
+            "C:",
+            "a:b.md",
+            "12:30.png",
+            "a/b",
+            "a\\b",
+            "a?.md",
+            "a*.md",
+            "a|b",
+            "a<b>",
+            "a\"b",
+            "a\tb",
+            "a\u{0}b",
+            "a.",
+            "a ",
+            "a. .",
+            "NUL",
+            "nul.md",
+            "CON.txt",
+            "con .txt",
+            "COM1",
+            "com0.log",
+            "LPT9.notes.md",
+            "COM¹",
+            "lpt².txt",
+            "CONIN$",
+            "conout$.txt",
+        ];
+        for name in bad {
+            assert!(!is_portable_file_name(name), "{name:?}");
+            let fixed = portable_file_name(name);
+            assert!(is_portable_file_name(&fixed), "{name:?} → {fixed:?}");
+        }
+        let good = [
+            "a.png",
+            "我的 人格.md",
+            " leading space",
+            ".hidden",
+            "a..b",
+            "COM10.md",
+            "console.txt",
+            "null",
+            "aux2",
+            "x：y.txt",
+        ];
+        for name in good {
+            assert!(is_portable_file_name(name), "{name:?}");
+            assert_eq!(portable_file_name(name), name);
+        }
+        assert_eq!(portable_file_name("x:y?.jpg"), "x_y_.jpg");
+        assert_eq!(portable_file_name("NUL.txt"), "_NUL.txt");
+        assert_eq!(portable_file_name(" . "), "file");
+    }
+
+    /// 只该本用户读的文件：新建和覆盖之后都是 0600，旁边不留临时文件。
+    #[test]
+    fn atomic_write_private_keeps_the_file_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secrets.json");
+        for content in [&b"{\"key\":\"one\"}"[..], &b"{\"key\":\"two\"}"[..]] {
+            atomic_write_private(&target, content).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), content);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = fs::metadata(&target).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+        }
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["secrets.json"]);
     }
 
     /// 写入全新文件（目标不存在）走直接 rename 分支。

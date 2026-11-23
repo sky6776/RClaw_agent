@@ -24,6 +24,17 @@ export default function SkillsPanel({ agentReady }: { agentReady: boolean }) {
     if (agentReady) void refresh();
   }, [agentReady, refresh]);
 
+  // 多端同步装上、换掉或删掉了技能：重新取清单（来源标注也随之更新）。
+  useEffect(() => {
+    if (!agentReady) return;
+    const un = api.onSync((event) => {
+      if (event.kind === "reload" && event.what === "skills") void refresh();
+    });
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, [agentReady, refresh]);
+
   const toggle = async (skill: SkillEntry) => {
     setPending(skill.name);
     try {
@@ -101,6 +112,14 @@ export default function SkillsPanel({ agentReady }: { agentReady: boolean }) {
                   {s.pinned && (
                     <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-400">
                       pinned
+                    </span>
+                  )}
+                  {s.sync_origin && (
+                    <span
+                      className="max-w-[14rem] truncate rounded-full bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300"
+                      title={`这个技能是从「${s.sync_origin}」同步来的。它依赖的命令、工具在这台设备上不一定都有。`}
+                    >
+                      来自「{s.sync_origin}」
                     </span>
                   )}
                 </div>

@@ -113,8 +113,11 @@ use external_action::*;
 
 mod gate;
 mod history;
+/// 多端同步与 turn 的接缝：合入登记、`/sync`、带范围的 `/clear`。
+mod sync;
 use gate::QuiescenceGate;
 use history::HistoryLoader;
+pub use sync::{MergeGuard, SyncControl};
 
 pub(crate) use effect::{
     shell_command_attempts_media_publisher, shell_command_runs_media_publisher,
@@ -870,8 +873,23 @@ struct ActiveTurn {
     /// 在跑」与「终局已交付、外壳尚未清理」——后者若仍按忙碌算，紧随终局之后的命令
     /// 回复会被标成 intermediate，桌面端忙碌态翻不回来、排队消息全部卡住。
     final_delivered: bool,
+    /// 登记的时刻。多端同步把运行了一阵的 turn 写进「运行提示」
+    /// （见 [`TurnManager::long_running_sessions`]）。
+    started: std::time::Instant,
     // 注意：不存放 turn 任务的 `JoinHandle`。tokio 的 spawned 任务在句柄 drop 时自动
     // detach（继续在后台跑），而取消走 `CancellationToken`（不用 join.abort()），故无需持有句柄。
+}
+
+/// [`TurnManager::spawn_turn`] / [`TurnManager::offer`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spawned {
+    /// 消息有了去处：启动了新 turn，或交给了同 key 的活动 turn（含队列满被丢弃的情况）。
+    Yes,
+    /// 静默门被生命周期操作持有，现在无法启动：稍后重投（见 [`TurnManager::park`]）。
+    GateHeld,
+    /// 多端同步正在往这个会话合入消息，会改历史的 turn 现在不能开始：稍后重投
+    /// （见 [`TurnManager::park`]）。
+    Merging,
 }
 
 /// `/compact` 登记进 active map 时使用的 `cron_job_id`（见 [`TurnManager::compact_active_key`]）。
@@ -1143,6 +1161,11 @@ pub struct TurnManager {
     /// （真机误拒实测：纯报告型回复被判「write_or_update 无回执」后整条回复被丢）。
     /// 本 turn 匹配失败时回退此账本。
     effect_ledger: Mutex<HashMap<(String, String), VecDeque<ArchivedEffect>>>,
+
+    /// 多端同步的合入登记与等它结束的消息（见 [`sync::MergeState`]）。没有同步引擎时恒为空。
+    merges: Mutex<sync::MergeState>,
+    /// 多端同步的控制入口（每实例最多安装一次；None = 宿主没有接入多端同步）。
+    sync: OnceLock<Arc<dyn SyncControl>>,
 }
 
 /// 会话账本只回溯最近的成功副作用，防长会话无界增长。
@@ -1213,6 +1236,8 @@ impl TurnManager {
             reviews,
             gate,
             effect_ledger: Mutex::new(HashMap::new()),
+            merges: Mutex::new(sync::MergeState::default()),
+            sync: OnceLock::new(),
         }
     }
 
@@ -1538,6 +1563,10 @@ impl TurnManager {
     /// 任务再次进入（见 `run_turn` 收尾）；「检查 active → 插入 active」的竞态由
     /// `spawn_turn` 的 double-check 兜底，因此仍需与 turn 任务的自移除互斥。
     pub async fn route(self: &Arc<Self>, msg: BusMessage) {
+        // 多端同步的配对码打进了对话里：不记日志、不落会话、不交给模型。
+        let Some(msg) = self.intercept_pairing_code(msg).await else {
+            return;
+        };
         if msg.source() == MessageSource::User {
             tracing::info!(
                 channel = ?msg.channel,
@@ -1576,6 +1605,22 @@ impl TurnManager {
 
         let key = TurnKey::from_msg(&msg);
 
+        // 这个会话有消息启动不了 turn、还在等重投：后到的排在它们后面，不能抢先。
+        if self.queue_behind_parked(&msg) {
+            return;
+        }
+        match self.offer(&key, &msg) {
+            Spawned::Yes => {}
+            // 合入是毫秒级的，拿着静默门的操作（多端同步装技能、分叉、技能整理）多半也
+            // 很短：不当场回「请稍后重试」、也不把定时任务的消息丢掉，交给重投任务稍后
+            // 再试，不占路由循环。等过上限还启动不了才回复忙（见 `park`）。
+            Spawned::Merging | Spawned::GateHeld => self.park(msg),
+        }
+    }
+
+    /// 把一条消息交给它的会话：有活动 turn 就作为插队事件投递，没有就启动新 turn。同步、
+    /// 不阻塞；`route` 与同步合入之后的重投（[`Self::park`]）共用。
+    fn offer(self: &Arc<Self>, key: &TurnKey, msg: &BusMessage) -> Spawned {
         // 1) 已有活动 turn → 投递插队事件（同步取发送端，再用 try_send 不阻塞路由）。
         //
         // 这里命中的一定是【同一个 TurnKey】。不同 `(channel, chat_id)`，或同一回复目标下
@@ -1587,10 +1632,10 @@ impl TurnManager {
         // 若撞上「event_rx 已关闭但 active 条目尚未清理」的窄窗口，清掉同一条旧通道后重试，
         // 避免把消息投给已结束的 turn 或在 spawn_turn 的双重检查里丢失。
         loop {
-            if let Some(tx) = self.active_event_tx(&key) {
+            if let Some(tx) = self.active_event_tx(key) {
                 // 用 clone 投递：通道关闭时 msg 仍完整，可在清理 stale 条目后继续使用。
                 match tx.try_send(Interjection::AppendMessage(msg.clone())) {
-                    Ok(()) => return,
+                    Ok(()) => return Spawned::Yes,
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // MVP 不阻塞路由：插队队列满时丢弃并告警（极端情况，队列容量 32 已很大）。
                         tracing::warn!(
@@ -1598,11 +1643,11 @@ impl TurnManager {
                             key.channel,
                             key.chat_id
                         );
-                        return;
+                        return Spawned::Yes;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         // 窄窗口：turn 任务已退出但还没来得及从 active 移除。
-                        if self.active_remove_if_same_event_tx(&key, &tx) {
+                        if self.active_remove_if_same_event_tx(key, &tx) {
                             tracing::debug!(
                                 "turn 事件通道已关闭，已移除僵尸 active 条目后重试 ({}:{})",
                                 key.channel,
@@ -1616,38 +1661,41 @@ impl TurnManager {
                 }
             } else {
                 // 2) 无活动 turn → 启动新 turn 任务。
-                if !self.spawn_turn(msg.clone()) {
-                    // 静默门被生命周期操作持有时拒绝启动：回送短暂提示（罕见窗口）。
-                    if msg.source() == MessageSource::User {
-                        let _ = self
-                            .outbound_tx
-                            .send(BusMessage::new(
-                                msg.channel,
-                                msg.chat_id,
-                                "⏳ 系统正在执行清理 / 维护操作，请稍后重试。",
-                            ))
-                            .await;
-                    } else {
-                        tracing::warn!(
-                            "静默门被生命周期操作持有，非用户来源的残留消息被丢弃 ({}:{})",
-                            msg.channel,
-                            msg.chat_id
-                        );
-                        // 被丢弃的交接消息：按失败通知等待方，而不是挂到超时。
-                        if let Some(router) = &self.bot_router {
-                            router.notify(
-                                &msg.channel,
-                                &msg.chat_id,
-                                msg.handoff_id(),
-                                crate::bots::HandoffOutcome::Failed(
-                                    "系统正在执行清理 / 维护操作，交接未投递".into(),
-                                ),
-                            );
-                        }
-                    }
-                }
-                return;
+                return self.spawn_turn(msg.clone());
             };
+        }
+    }
+
+    /// 消息等过了上限还是启动不了 turn——静默门一直被生命周期操作持有，或者多端同步的
+    /// 合入一直没结束：回送短暂提示（非用户来源的丢弃）。
+    async fn reject_busy(&self, msg: BusMessage) {
+        if msg.source() == MessageSource::User {
+            let _ = self
+                .outbound_tx
+                .send(BusMessage::new(
+                    msg.channel,
+                    msg.chat_id,
+                    "⏳ 系统正在执行清理 / 维护操作，请稍后重试。",
+                ))
+                .await;
+        } else {
+            tracing::warn!(
+                "等过上限仍启动不了 turn（静默门被生命周期操作持有，或同步合入没结束），\
+                 非用户来源的消息被丢弃 ({}:{})",
+                msg.channel,
+                msg.chat_id
+            );
+            // 被丢弃的交接消息：按失败通知等待方，而不是挂到超时。
+            if let Some(router) = &self.bot_router {
+                router.notify(
+                    &msg.channel,
+                    &msg.chat_id,
+                    msg.handoff_id(),
+                    crate::bots::HandoffOutcome::Failed(
+                        "系统正在执行清理 / 维护操作，交接未投递".into(),
+                    ),
+                );
+            }
         }
     }
 
@@ -1726,6 +1774,10 @@ impl TurnManager {
         let (event_tx, event_rx) = mpsc::channel(1);
         {
             let mut active = self.active.lock().expect("active map 锁未被毒化");
+            if self.merge_registered(channel, chat_id) {
+                self.gate.end_turn();
+                return "⏳ 该会话正在合入同步消息，/compact 已中止，请稍后重试。".to_string();
+            }
             // 僵尸条目（turn 主体已退出、外壳尚未自移除）不算活动 turn（同 is_session_busy）；
             // 同 chat 的 cron 轮次不碰会话历史，也不算（见 ActiveTurn::touches_history）。
             if active.iter().any(|(key, turn)| {
@@ -1746,6 +1798,7 @@ impl TurnManager {
                     event_tx: event_tx.clone(),
                     touches_history: true,
                     final_delivered: false,
+                    started: std::time::Instant::now(),
                 },
             );
         }
@@ -2698,34 +2751,78 @@ impl TurnManager {
     /// （WAL 文件里被覆盖前的旧页）由 store 的 `VACUUM` + TRUNCATE checkpoint 尽力清掉，
     /// 它们失败只影响磁盘痕迹，不改变「已清空」的结论（见 `SessionStore::clear_all_sessions`）。
     async fn handle_clear(&self, content: &str) -> String {
+        // 这台设备在同步空间里时，清空必须说明范围（docs/multi-device-sync.md §7.5）：只清
+        // 本机并退出同步空间，还是连同其他设备一起清。没接入同步、没加入过空间时行为不变。
+        // 「在不在」可能要读一次磁盘上的配对状态：放到阻塞线程上问。问不出来就不清——
+        // 不知道范围就清空，记忆的清空可能在同步恢复时传到所有设备。
+        let control = match self.sync_control() {
+            None => None,
+            Some(control) => {
+                let probe = control.clone();
+                match tokio::task::spawn_blocking(move || probe.in_space()).await {
+                    Ok(Ok(true)) => Some(control),
+                    Ok(Ok(false)) => None,
+                    Ok(Err(error)) => {
+                        return format!("⚠️ 读取多端同步的状态失败，/clear 已中止：{error}");
+                    }
+                    Err(error) => {
+                        return format!("⚠️ 读取多端同步的状态失败，/clear 已中止：{error}")
+                    }
+                }
+            }
+        };
         if !clear_confirmed(content) {
-            return "⚠️ /clear 会【永久删除】以下内容，不可恢复：\n\
-                    \n\
-                    - 全部会话历史（agent/state.sqlite：所有会话的消息、文件 checkpoint 与用量锚点，含当前会话）\n\
-                    - 全部长期记忆（agent/memory/：MEMORY.md、daily/、session_summaries/）\n\
-                    \n确认请输入：/clear confirm"
-                .to_string();
+            let confirm = match &control {
+                Some(_) => sync::CLEAR_SCOPE_HINT,
+                None => "确认请输入：/clear confirm",
+            };
+            return format!(
+                "⚠️ /clear 会【永久删除】以下内容，不可恢复：\n\
+                 \n\
+                 - 全部会话历史（agent/state.sqlite：所有会话的消息、文件 checkpoint 与用量锚点，含当前会话）\n\
+                 - 全部长期记忆（agent/memory/：MEMORY.md、daily/、session_summaries/）\n\
+                 \n{confirm}"
+            );
         }
+        let scope = sync::clear_scope(content);
+        if control.is_some() && scope.is_none() {
+            return format!("⚠️ {}", sync::CLEAR_SCOPE_HINT);
+        }
+        let retry = match scope {
+            Some(sync::ClearScope::Local) => "/clear confirm local",
+            Some(sync::ClearScope::All) => "/clear confirm all",
+            None => "/clear confirm",
+        };
         // 静默门关门：拿到 = 无 turn / review 在跑，且持门期间新 turn 无法启动，
         // 与删除动作之间不存在竞态窗口（C7 替代原 check-then-act）。
         let Some(_quiescent) = self.gate.try_acquire() else {
             let (turns, reviews) = self.gate.running();
             if turns > 0 {
-                return "⏳ 有任务正在运行，/clear 已中止：清空后该 turn 会把旧历史 / 记忆写回，\
-                        导致「已清空但状态复活」。\n\n请先 /cancel 或等其结束后重试：/clear confirm"
-                    .to_string();
+                return format!(
+                    "⏳ 有任务或会话合入正在运行，/clear 已中止。\n\n结束后请重试：{retry}"
+                );
             }
             if reviews > 0 {
-                return "⏳ 后台记忆 / 自进化 review 仍在运行，/clear 已中止：它会基于清空前的对话把记忆写回。\n\n\
-                        请稍后重试：/clear confirm"
-                    .to_string();
+                return format!("⏳ 后台记忆 / 自进化 review 仍在运行，/clear 已中止。\n\n结束后请重试：{retry}");
             }
-            return "⏳ 系统正在执行清理 / 维护操作，请稍后重试：/clear confirm".to_string();
+            return format!("⏳ 系统正在执行清理 / 维护操作，请稍后重试：{retry}");
         };
+        // 同步侧先做（退出同步空间，或把会话删除传给其他设备）：它失败就什么都不清。
+        let mut sync_note = String::new();
+        if let (Some(control), Some(scope)) = (&control, scope) {
+            match self.prepare_clear(control.clone(), scope).await {
+                Ok(note) => sync_note = note,
+                Err(reply) => return reply,
+            }
+        }
         let session = self.session.clone();
         let layout = self.layout.clone();
         let cleared =
             tokio::task::spawn_blocking(move || clear_agent_state(&session, &layout)).await;
+        if control.is_some() {
+            // 记忆清空等改动由同步引擎的下一轮发布出去（已退出空间时这一下没有作用）。
+            self.notify_sync(false);
+        }
         // 会话级运行期状态（usage 锚点、压缩防抖 / 冷却）随库一起归零：只要删除事务已提交，
         // 即便 memory/ 清理失败也不能让旧防抖判断留给新历史。安全闸 / 统计阶段失败时库没动，
         // 状态保留；任务 panic 时无从得知进度，按「可能已删」归零（多归零一次只丢防抖状态）。
@@ -2738,10 +2835,10 @@ impl TurnManager {
             self.ledger_clear_all();
         }
         match cleared {
-            Ok(Ok(summary)) => format!("✅ 已清空 agent 本地状态：\n\n{summary}"),
+            Ok(Ok(summary)) => format!("✅ 已清空 agent 本地状态：\n\n{summary}{sync_note}"),
             Ok(Err(failure)) => {
                 format!(
-                    "⚠️ 清空失败（可能部分文件被占用，可重试 /clear confirm）：{}",
+                    "⚠️ 清空失败（可能部分文件被占用，可重试 {retry}）：{}{sync_note}",
                     failure.message
                 )
             }
@@ -2991,10 +3088,11 @@ impl TurnManager {
     ///
     /// 同步持锁完成 `check + spawn + insert`（spawn 本身不 await），保证 turn 任务的自移除
     /// 不会抢在我们插入前把条目删掉，避免「插入已完成 turn 的僵尸条目」的窄窗口竞争。
-    /// 返回 false 表示静默门被生命周期操作持有、无法启动（调用方回送提示）。
-    fn spawn_turn(self: &Arc<Self>, msg: BusMessage) -> bool {
+    /// 返回 [`Spawned::GateHeld`] 表示静默门被生命周期操作持有、现在无法启动；
+    /// [`Spawned::Merging`] 表示多端同步正在往这个会话合入消息。两种情况调用方都稍后重投。
+    fn spawn_turn(self: &Arc<Self>, msg: BusMessage) -> Spawned {
         if !self.gate.try_begin_turn() {
-            return false;
+            return Spawned::GateHeld;
         }
         let key = TurnKey::from_msg(&msg);
 
@@ -3008,7 +3106,7 @@ impl TurnManager {
                     Ok(()) => {
                         // 未真正启动新 turn：释放本次占用的槽位。
                         self.gate.end_turn();
-                        return true;
+                        return Spawned::Yes;
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         tracing::warn!(
@@ -3017,7 +3115,7 @@ impl TurnManager {
                             key.chat_id
                         );
                         self.gate.end_turn();
-                        return true;
+                        return Spawned::Yes;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         if self.active_remove_if_same_event_tx(&key, &tx) {
@@ -3034,13 +3132,22 @@ impl TurnManager {
                 }
             }
 
+            // 与 run_turn_inner 的 `is_cron` 分支同源：cron 轮次不加载也不持久化会话历史。
+            let touches_history = !msg.is_cron_task();
+            // 多端同步正在往这个会话合入消息（docs/multi-device-sync.md §7.3）：会改历史的
+            // turn 现在不能开始，否则远端消息会夹进本机的一问一答中间。这项检查与下面的登记
+            // 在同一次持锁里；合入一侧登记前也在这把锁里确认没有活动 turn（`begin_merge`）。
+            if touches_history && self.merge_registered(&key.channel, &key.chat_id) {
+                drop(active);
+                self.gate.end_turn();
+                return Spawned::Merging;
+            }
+
             let cancel = CancellationToken::new();
             let (event_tx, event_rx) = mpsc::channel::<Interjection>(32);
             let mgr = self.clone();
             let cancel_for_task = cancel.clone();
             let event_tx_for_task = event_tx.clone();
-            // 与 run_turn_inner 的 `is_cron` 分支同源：cron 轮次不加载也不持久化会话历史。
-            let touches_history = !msg.is_cron_task();
             // 生命周期观察者：在任务 spawn 之前（仍持 active 锁）上报「已启动」，保证
             // 它先于本 turn 的任何 outbound / terminal / ended 回调发生。
             self.observe_begun(&msg);
@@ -3058,9 +3165,10 @@ impl TurnManager {
                     event_tx,
                     touches_history,
                     final_delivered: false,
+                    started: std::time::Instant::now(),
                 },
             );
-            return true;
+            return Spawned::Yes;
         }
     }
 
@@ -3203,6 +3311,11 @@ impl TurnManager {
         // 生命周期观察者：与 spawn_turn 的 begun 一一配对（正常 / 取消 / panic 均到此）；
         // 放在残留插队重路由之前——它们各自会作为新 turn 再上报 begun。
         self.observe_ended(&panic_report_target);
+        // 多端同步：turn 运行期间不发布这个会话，它写下的消息现在可以发了（cron 轮次不写
+        // 会话历史，不用通知）。
+        if !panic_report_target.is_cron_task() {
+            self.notify_sync(true);
+        }
 
         // 残留插队输入：按到达顺序重新路由为新 turn，确保用户输入不丢失
         // （例如补充正好在本 turn 收尾时到达、未被安全点处理到）。
@@ -3451,6 +3564,32 @@ impl TurnManager {
         }
         messages.push(user_msg);
 
+        // 跨设备续聊说明（docs/multi-device-sync.md §7.8）：会话里有产生于其他设备的消息时，
+        // 每次推理的尾部消息里带一段说明，不落库。每个 turn 查一次就够——turn 运行期间
+        // 多端同步不会往这个会话里合入消息。
+        //
+        // 这个进程从没见过同步表（没开过多端同步）时什么都不做，连库锁都不碰。见过的话
+        // 要查几次库，放到阻塞线程上，不占着跑 turn 的线程。
+        let cross_device_note = if is_cron || !rclaw_store::sync_db::sync_tables_seen() {
+            None
+        } else {
+            let store = self.session.clone();
+            let (channel, chat_id) = (msg.channel.clone(), msg.chat_id.clone());
+            let origins =
+                tokio::task::spawn_blocking(move || store.remote_origins(&channel, &chat_id)).await;
+            match origins {
+                Ok(Ok(origins)) => context::cross_device_note(&origins),
+                Ok(Err(e)) => {
+                    tracing::warn!("读取会话的来源设备失败，本轮不带跨设备说明: {e}");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("读取会话来源设备的任务没跑完，本轮不带跨设备说明: {e}");
+                    None
+                }
+            }
+        };
+
         // ---- 轮内上下文管理（ZCode 移植 · Layer 1）----
         // turn_start = 本轮 user 消息的下标（刚 push 的那条）：[..turn_start] 是加载期历史
         // （与 store 视图一致），[turn_start..] 是本轮区——本轮 user 消息 + 本轮追加（含
@@ -3686,6 +3825,9 @@ impl TurnManager {
                         &msg.chat_id,
                     ) {
                         tail_message.content.push(ContentBlock::text(block));
+                    }
+                    if let Some(note) = &cross_device_note {
+                        tail_message.content.push(ContentBlock::text(note.clone()));
                     }
                     let team_inbox_unread =
                         crate::agent_tools::read_team_inbox_unread(&self.session.journal());
