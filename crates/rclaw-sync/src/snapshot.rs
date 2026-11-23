@@ -2393,6 +2393,16 @@ async fn sweep_due(
     let mut retry_keys: HashSet<String> = HashSet::new();
     let mut parked: Vec<String> = Vec::new();
     for (path, basis, pack, orphan, candidate) in due {
+        // 同一快照还有别的行（未到期/退避/本轮没轮到）：清单先不尝试——删掉清单就
+        // 意味着这份快照处理完了、来历也清了。整行跳过，不占这一类的名额，让后面的
+        // 可删对象先推进；等分片都结算完，清单自然只剩自己一行。
+        if path.ends_with(".snap") {
+            if let Some(key) = snap_key_of_path(&path) {
+                if snap_rows.get(&key).copied().unwrap_or(0) > 1 {
+                    continue;
+                }
+            }
+        }
         if orphan && !candidate {
             // 旧版本排下的 orphan 行：来源证明不了是「从未公布过的候选」，按受保护快照
             // 处理（不删）。新写快照排的行带 `candidate` 证明，不会覆盖带依据的旧行。

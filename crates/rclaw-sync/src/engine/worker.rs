@@ -118,7 +118,7 @@ impl StorageLock {
             .open(Self::lock_path(paths))?;
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(StorageLock { file })),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) if crate::lock_is_contended(&error) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -409,6 +409,8 @@ struct Worker {
     switch_tries: u32,
     /// 切换已放弃（等不到在途提交）：状态要粘住，不能被之后普通轮次的 idle 覆盖。
     switch_failed: bool,
+    /// 从磁盘确认同步已经关闭（或宿主停止）：worker 退出，剩下的交给宿主。
+    stop: bool,
 }
 
 impl Worker {
@@ -442,6 +444,7 @@ impl Worker {
             pending_switch: false,
             switch_tries: 0,
             switch_failed: false,
+            stop: false,
         }
     }
 
@@ -449,6 +452,9 @@ impl Worker {
         // 打开连接时会在协议锁里确认磁盘上的同步设置（见 [`Worker::open`]）。
         self.open(true).await;
         loop {
+            if self.stop {
+                break;
+            }
             self.revive_transfers();
             let wake = self.deadline();
             tokio::select! {
@@ -714,15 +720,23 @@ impl Worker {
         let Some(fresh) = refresh()? else {
             return Ok(());
         };
-        let before = self.config.clone();
-        self.config.apply_storage_from(&fresh);
-        self.config.enabled = fresh.enabled;
-        if self.config != before {
+        // 共享配置可能刚被宿主（导入、面板保存）更新过：在它的锁里只改「磁盘确认的
+        // 字段」（存储段与开关），其余字段保留宿主最新的一份——用 worker 自己的旧副本
+        // 整份写回会把刚发表的范围/通道/设备名回退。
+        let mut shared = lock(&self.shared.config);
+        let mut merged = shared.clone();
+        merged.apply_storage_from(&fresh);
+        merged.enabled = fresh.enabled;
+        if merged != *shared {
             tracing::info!("按磁盘上的 rclaw.toml 更新同步设置（另一进程保存过）");
+            *shared = merged.clone();
+        }
+        drop(shared);
+        if merged != self.config {
+            self.config = merged;
             self.shared
                 .attachment_max
                 .store(self.config.attachment_max_bytes(), Ordering::Relaxed);
-            *lock(&self.shared.config) = self.config.clone();
         }
         Ok(())
     }
@@ -748,7 +762,18 @@ impl Worker {
                     return;
                 }
                 Err(error) => {
-                    // 锁文件都建不出来：保存协议本来也用不了，别让同步永远不启动。
+                    // 有宿主回调时「确认」是打开的前提：锁文件坏了说明配置和凭据都
+                    // 没法确认，不能拿可能过期的缓存去连存储——进入可见的重试状态。
+                    // 没有回调（测试/无配置文件的宿主）时按当前配置继续。
+                    if self.shared.refresh_config.is_some() {
+                        tracing::warn!("确认同步设置时拿不到协议锁（稍后重试）: {error}");
+                        self.shared.set_state(
+                            "syncing",
+                            Some("等待确认同步存储设置（锁不可用），稍后重试".into()),
+                        );
+                        self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
+                        return;
+                    }
                     tracing::warn!("确认同步设置时拿不到协议锁（按当前配置继续）: {error}");
                 }
             }
@@ -758,11 +783,13 @@ impl Worker {
                     return;
                 }
                 if !self.config.enabled {
-                    // 另一个进程把同步关了：不接手引擎所有权，状态以磁盘为准，等宿主
-                    // 重新打开（保存命令会再走这条打开路径）。
+                    // 另一个进程把同步关了：不接手引擎所有权，状态以磁盘为准。worker
+                    // 自己也退出——留着它会让「关闭同步后只清本机」走在线命令路径，
+                    // 却因为没有引擎锁而被拒绝。
                     self.lock = None;
                     self.shared.set_state("off", None);
                     self.reopen_at = None;
+                    self.stop = true;
                     return;
                 }
             }

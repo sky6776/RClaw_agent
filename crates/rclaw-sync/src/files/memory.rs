@@ -165,7 +165,7 @@ impl ClearLock {
             .open(path)?;
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(ClearLock { file })),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) if crate::lock_is_contended(&error) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }

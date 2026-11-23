@@ -68,6 +68,13 @@ where
     blocking(move || f(&ctx)).await
 }
 
+/// 文件锁的「已被占用」判定：Windows 上 `fs2` 的竞争错误是 `ERROR_LOCK_VIOLATION`
+/// （33），std 把它归到 `Uncategorized`，只按 `WouldBlock` 判断会被当成真实 I/O 错误。
+pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 pub use bundle::{export_session, import_session, ImportOptions, Imported};
 pub use config::{Scopes, SyncConfig, SyncPaths};
 pub use engine::{
