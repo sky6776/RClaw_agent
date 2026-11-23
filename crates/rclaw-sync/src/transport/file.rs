@@ -191,10 +191,9 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
     // 目录 API 已经走扩展路径）。
     fn wide_long(path: &Path) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
-        // 规范化父目录得到 verbatim（`\?\`）绝对路径，消掉正斜杠、`.`/`..` 与
-        // 相对路径；目标文件名可能还不存在，只拼叶子。路径全程按 UTF-16 编码，
-        // 不做 to_string_lossy——否则含未配对代理单元的目录名会被替换成 U+FFFD，
-        // 找不到已写好的临时文件。
+        // 规范化父目录得到 verbatim（扩展长度）绝对路径，消掉正斜杠、`.`/`..` 与
+        // 相对路径；目标文件名可能还不存在，只拼叶子。成功分支直接按 UTF-16
+        // 编码（无损，含未配对代理单元也不会被替换）。
         if let Some(parent) = path.parent() {
             if let Ok(parent) = std::fs::canonicalize(parent) {
                 let full = match path.file_name() {
@@ -208,25 +207,62 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
                     .collect();
             }
         }
-        // 规范化失败（SMB 权限、卷暂不可访问等）：回退到基线行为——把正斜杠规范
-        // 成原生分隔符，再按绝对路径/UNC 形式补扩展前缀，避免长路径下 MoveFileExW
-        // 找不到源/目标。这条分支只在拿不到规范父目录时走到，罕见。
-        let text = path.to_string_lossy();
-        let text = if text.contains('/') {
-            std::borrow::Cow::Owned(text.replace('/', "\\"))
-        } else {
-            text
-        };
-        let text = if text.starts_with(r"\\?\") {
-            text.into_owned()
-        } else if let Some(rest) = text.strip_prefix(r"\\") {
-            format!(r"\\?\UNC\{rest}")
-        } else if path.is_absolute() {
-            format!(r"\\?\{text}")
-        } else {
-            text.into_owned()
-        };
-        text.encode_utf16().chain(std::iter::once(0)).collect()
+        // 规范化失败（SMB 权限、卷暂不可访问等）：先做词法归一化（扩展路径不解释
+        // `.`/`..`），再按绝对盘符/UNC 形式补扩展前缀；全程 OsStr/UTF-16，
+        // 不走 to_string_lossy。
+        let normalized = lexical_normalize(path);
+        let mut wide: Vec<u16> = Vec::new();
+        let mut components = normalized.components();
+        let prefix = components.next();
+        // 宽字符前缀：\\?\UNC\ 与 \\?\（用码点常量，避免转义歧义）。
+        const UNC_PREFIX: [u16; 8] = [0x5c, 0x5c, 0x3f, 0x5c, 0x55, 0x4e, 0x43, 0x5c];
+        const DISK_PREFIX: [u16; 4] = [0x5c, 0x5c, 0x3f, 0x5c];
+        let already_extended = matches!(
+            prefix,
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(
+                    prefix.kind(),
+                    std::path::Prefix::VerbatimDisk(_)
+                        | std::path::Prefix::VerbatimUNC(_, _)
+                        | std::path::Prefix::Verbatim(_)
+                )
+        );
+        if !already_extended && path.is_absolute() {
+            if let Some(std::path::Component::Prefix(prefix)) = prefix {
+                if let std::path::Prefix::UNC(server, share) = prefix.kind() {
+                    wide.extend(UNC_PREFIX);
+                    wide.extend(server.encode_wide());
+                    wide.push(0x5c);
+                    wide.extend(share.encode_wide());
+                    for component in components {
+                        wide.push(0x5c);
+                        wide.extend(component.as_os_str().encode_wide());
+                    }
+                    wide.push(0);
+                    return wide;
+                }
+            }
+            wide.extend(DISK_PREFIX);
+        }
+        wide.extend(normalized.as_os_str().encode_wide());
+        wide.push(0);
+        wide
+    }
+
+    /// 词法归一化：去掉 `.`、消解 `..`（扩展长度路径不解释点分量）。
+    fn lexical_normalize(path: &Path) -> PathBuf {
+        use std::path::Component;
+        let mut out = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop();
+                }
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
     }
     let from: Vec<u16> = wide_long(tmp);
     let to: Vec<u16> = wide_long(path);
