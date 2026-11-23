@@ -38,6 +38,8 @@ const FOLLOW_UP_DELAY: Duration = Duration::from_millis(300);
 /// 出错之后的重试间隔：从 `RETRY_MIN` 起逐次翻倍，到 `RETRY_MAX` 为止。
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(300);
+/// 换存储设置时等待在途提交的轮数上限：超过就升级成可见错误，不再静默重试。
+const SWITCH_GIVE_UP_TRIES: u32 = 5;
 /// 要用户动手才能好的错误（密码不对、空间被重置、要升级）：慢慢重试。
 const RETRY_SLOW: Duration = Duration::from_secs(300);
 /// 存储限流时最多等这么久。
@@ -403,6 +405,8 @@ struct Worker {
     standby_tries: u32,
     /// 换了存储设置但上一刻还有在途提交：连接还没重建，下一轮开头再试。
     pending_switch: bool,
+    /// 上面那条重试了几次（用于给出可见状态与放弃提示）。
+    switch_tries: u32,
 }
 
 impl Worker {
@@ -434,6 +438,7 @@ impl Worker {
             reopen_at: None,
             standby_tries: 0,
             pending_switch: false,
+            switch_tries: 0,
         }
     }
 
@@ -557,8 +562,27 @@ impl Worker {
         if self.pending_switch && self.session.is_some() {
             if self.teardown().await {
                 self.pending_switch = false;
+                self.switch_tries = 0;
                 self.open().await;
             } else {
+                self.switch_tries = self.switch_tries.saturating_add(1);
+                if self.switch_tries >= SWITCH_GIVE_UP_TRIES {
+                    // 一直等不到在途提交结束：升级成可见错误（配置仍是新的，等阻塞结束
+                    // 或用户重试）；不再每分钟静默重试。
+                    self.shared.set_state(
+                        "error",
+                        Some("存储设置还没生效：有附件提交一直没有结束".into()),
+                    );
+                    self.pending_switch = false;
+                    return Ok(());
+                }
+                self.shared.set_state(
+                    "syncing",
+                    Some(format!(
+                        "等待在途的附件提交结束（第 {} 次重试）",
+                        self.switch_tries + 1
+                    )),
+                );
                 self.request(Kind::Full, RETRY_MIN);
                 return Ok(());
             }
@@ -1090,6 +1114,11 @@ impl Worker {
                 // 还有在途的提交阶段：配置已经是新的，连接留到下一轮开头再重建
                 // （不能退回旧配置——宿主与 TOML 都已经换成新的了）。
                 self.pending_switch = true;
+                self.switch_tries = 0;
+                self.shared.set_state(
+                    "syncing",
+                    Some("等待在途的附件提交结束，稍后重建同步连接".into()),
+                );
                 self.request(Kind::Full, RETRY_MIN);
                 return;
             }

@@ -703,22 +703,32 @@ pub fn blob_register_or_upload(
             |row| row.get(0),
         )
         .optional()?;
-    match current {
-        None => {
-            conn.execute(
-                "INSERT INTO sync_blob(blob_id, rel_path, size, state) VALUES (?1, ?2, ?3, ?4)",
-                params![blob_id, rel_path, size as i64, state],
-            )?;
-            Ok(state)
+    // 「目标状态」是要收敛到的状态，不只是新插入行的初值：
+    // - 本机缓存（FETCHED）遇到范围关着 → HELD（重新开启后「上传已有附件」才找得到）；
+    // - 本机缓存或 HELD 在新消息引用且范围允许时 → PENDING（引用要能取到字节）；
+    // - UPLOADED / REMOTE 是远端已有的结论，不回退。
+    let next = match (current, state) {
+        (None, _) => Some(state),
+        (Some(BLOB_FETCHED), BLOB_HELD) | (Some(BLOB_FETCHED), BLOB_PENDING) => Some(state),
+        (Some(BLOB_HELD), BLOB_PENDING) => Some(state),
+        (Some(_), _) => None,
+    };
+    match next {
+        Some(next) => {
+            if current.is_none() {
+                conn.execute(
+                    "INSERT INTO sync_blob(blob_id, rel_path, size, state) VALUES (?1, ?2, ?3, ?4)",
+                    params![blob_id, rel_path, size as i64, next],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE sync_blob SET state = ?2, rel_path = ?3 WHERE blob_id = ?1",
+                    params![blob_id, next, rel_path],
+                )?;
+            }
+            Ok(next)
         }
-        Some(existing) if state == BLOB_PENDING && existing == BLOB_FETCHED => {
-            conn.execute(
-                "UPDATE sync_blob SET state = ?2, rel_path = ?3 WHERE blob_id = ?1",
-                params![blob_id, BLOB_PENDING, rel_path],
-            )?;
-            Ok(BLOB_PENDING)
-        }
-        Some(existing) => Ok(existing),
+        None => Ok(current.unwrap_or(state)),
     }
 }
 

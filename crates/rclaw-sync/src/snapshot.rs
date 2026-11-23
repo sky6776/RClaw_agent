@@ -112,6 +112,8 @@ const GC_PARK_MS: i64 = 30 * 24 * 3600 * 1000;
 /// 晋升（候选快照 / 候选回收位置）前的完整复核一次走完的时限：这一步每小时最多一次，
 /// 给得比每轮的回收扫描宽，让大一点的快照也有机会一次核完（跨轮前缀不能当证据）。
 const PROMOTE_BUDGET: Duration = Duration::from_secs(30);
+/// 一份依据连续这么多次没能在一次判定里核完，就不再重试（保留旧边界与对象）。
+const PROMOTE_TRIES: u32 = 3;
 /// 回收检查（回收位置、附件）隔这么久做一次。
 const GC_SCAN_MS: i64 = 3600 * 1000;
 /// 一轮里最多新下载这么多个快照清单、最多吃这么多个快照。
@@ -307,6 +309,10 @@ struct Maint {
     /// 里取代上一份快照（[`promote_snap`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snap_pending: Option<SnapRef>,
+    /// 候选快照完整复核失败的次数。超过上限后不再每小时重试（候选留着，等下一份候选
+    /// 取代它）；旧指针与旧快照都保留——这是弱版本存储上无法一次核完时的保守落点。
+    #[serde(default)]
+    snap_attempts: u32,
 }
 
 /// 候选回收位置（[`Maint::floor_pending`]）：对象删除已经按宽限期排队，但本机日志的
@@ -317,6 +323,10 @@ struct PendingFloor {
     floor: u64,
     /// 回收依据：`<设备>/<快照名>`、清单摘要。
     basis: (String, String),
+    /// 已经尝试完整复核的次数。一次判定必须连续走完（不能跨轮复用前缀），大快照在弱
+    /// 版本存储上可能永远走不完：超过上限就撤掉候选、保留对象与旧边界，别每小时重读。
+    #[serde(default)]
+    tries: u32,
 }
 
 /// 一份快照的分片核验进度（[`Maint::covers_checked`] 的值）。
@@ -1471,6 +1481,7 @@ impl Writer {
                     let new_digest = snap.digest.clone();
                     if published.is_some() && published != Some(name.as_str()) {
                         // 候选保留独立指针：head 与上一份快照都先不动。
+                        record.snap_attempts = 0;
                         record.snap_pending = Some(snap);
                         let when = GcWhen {
                             after_ms: now + SNAP_GRACE_MS,
@@ -1490,6 +1501,7 @@ impl Writer {
                     // 没有上一份快照（首次发布，或同名重写）：直接接管，无人引用的旧
                     // 对象照旧排队，新指针下一次写 head 带出去。
                     record.snap_pending = None;
+                    record.snap_attempts = 0;
                     let when = GcWhen {
                         after_ms: now + SNAP_GRACE_MS,
                         floor: None,
@@ -2213,6 +2225,9 @@ async fn sweep_due(
             BasisCheck::Intact => deletable.push(path),
             BasisCheck::Deferred => {
                 tracing::debug!("回收依据 {} 这轮没核验完，押着它的对象先不删", basis.0);
+                // 和核验不过一样退避：否则排在批头的慢依据每 60 秒重读一遍，后面的
+                // 行永远轮不到（一次判定必须连续走完，不能跨轮续用前缀）。
+                retry.push(path.clone());
                 due_left.push((path, Some(basis), pack));
             }
             BasisCheck::Broken => {
@@ -2641,7 +2656,11 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
         for pack in packs.iter().filter(|pack| pack.to <= floor) {
             queue_delete(tx, &codec::rollup_path(&s.device, &pack.name), &when)?;
         }
-        record.floor_pending = Some(PendingFloor { floor, basis });
+        record.floor_pending = Some(PendingFloor {
+            floor,
+            basis,
+            tries: 0,
+        });
         put_maint(tx, &record)
     })
 }
@@ -2715,8 +2734,45 @@ async fn promote_floor(
     )
     .await;
     if verdict != BasisCheck::Intact {
-        // 暂缓或失效都不公布：等下一轮。失效的依据要是一直修不好，它的设备换快照、
-        // head 指针挪走之后，上面的「没人提着」分支会来收尾。
+        // 暂缓或失效都不公布：等下一轮。连续失败达到上限说明这份依据在本机（弱版本
+        // 存储 + 大快照）上无法在一次判定里核完：撤掉候选、释放押着的删除记录，保留
+        // 对象与旧边界（不回收比删错好），也给后面的候选让路。
+        let basis = pending.basis.0.clone();
+        let gave_up = offload(ctx, move |ctx| {
+            db::write(ctx.db(), |tx| {
+                let mut record = maint(tx)?;
+                let Some(mut pending) = record.floor_pending.clone() else {
+                    return Ok(false);
+                };
+                if pending.basis.0 != basis {
+                    return Ok(false);
+                }
+                pending.tries = pending.tries.saturating_add(1);
+                if pending.tries < PROMOTE_TRIES {
+                    record.floor_pending = Some(pending);
+                    put_maint(tx, &record)?;
+                    return Ok(false);
+                }
+                record.floor_pending = None;
+                put_maint(tx, &record)?;
+                for (path, row) in db::state_scan(tx, scope::GC, "")? {
+                    if row
+                        .json::<GcWhen>()
+                        .is_some_and(|when| when.basis.is_some_and(|b| b.0 == basis))
+                    {
+                        db::state_del(tx, scope::GC, &path)?;
+                    }
+                }
+                Ok(true)
+            })
+        })
+        .await?;
+        if gave_up {
+            tracing::warn!(
+                "回收依据 {} 连续 {PROMOTE_TRIES} 次没能在一次判定里核完，保留旧边界与对象",
+                pending.basis.0
+            );
+        }
         return Ok(None);
     }
     let floor = pending.floor;
@@ -2800,6 +2856,15 @@ async fn promote_snap(
     // 里重新确认一遍（强版本没变的只花一次 stat，其余重新下载核对）。登记时的结论
     // 不能直接当晋升依据——两份结论之间分片可能被换掉。
     let basis = (key.clone(), pending.digest.clone());
+    let attempts = offload(ctx, |ctx| {
+        db::read(ctx.db(), |conn| Ok(maint(conn)?.snap_attempts))
+    })
+    .await?;
+    if attempts >= PROMOTE_TRIES {
+        // 连续几次都没能在一次判定里核完（弱版本存储 + 大快照）：不再每小时重试。
+        // 候选留着、旧指针不动；下一份候选会把它换掉。
+        return Ok(());
+    }
     let seed = basis_seed(ctx, &basis.0, &basis.1).await?;
     let verdict = basis_intact(
         transport,
@@ -2810,7 +2875,18 @@ async fn promote_snap(
     )
     .await;
     if verdict != BasisCheck::Intact {
-        // 没核完或对不上：候选先留着，下一轮再试。
+        // 没核完或对不上：记一次，候选先留着，下一轮再试（超过上限就不再试）。
+        offload(ctx, move |ctx| {
+            db::write(ctx.db(), |tx| {
+                let mut record = maint(tx)?;
+                if record.snap_pending.as_ref() == Some(&pending) {
+                    record.snap_attempts = record.snap_attempts.saturating_add(1);
+                    put_maint(tx, &record)?;
+                }
+                Ok(())
+            })
+        })
+        .await?;
         return Ok(());
     }
     // 向量覆盖到当前的回收边界（`coverage` 会对照日志核对清单里记的位置）。
