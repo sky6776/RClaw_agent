@@ -225,7 +225,8 @@ pub(crate) enum Cmd {
     SyncNow(Reply<()>),
     /// 发送前的拉取：拉完（或者不需要拉）就回话。
     Presend(oneshot::Sender<()>),
-    Reconfigure(SyncConfig),
+    /// 重配：配置 + 宿主发布时分配的序号（比共享序号旧的命令直接丢掉）。
+    Reconfigure(SyncConfig, u64),
     Pause(bool, Reply<()>),
     Resolve {
         id: String,
@@ -775,9 +776,11 @@ impl Worker {
                 Ok(Some(lock)) => protocol_lock = Some(lock),
                 Ok(None) => {
                     if !self.config.enabled {
+                        // 已知关闭只是上一次读盘的结果：锁暂时被占时保留一次确认
+                        // 重试，等另一进程放开后再看看磁盘是否已经重新开启。
                         self.open_note = Some(CLOSED_NOTE.into());
                         self.shared.set_state("off", None);
-                        self.reopen_at = None;
+                        self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
                         return;
                     }
                     let note = "另一个进程正在保存同步设置，确认后再连接（稍后自动重试）";
@@ -793,7 +796,7 @@ impl Worker {
                     if !self.config.enabled {
                         self.open_note = Some(CLOSED_NOTE.into());
                         self.shared.set_state("off", None);
-                        self.reopen_at = None;
+                        self.reopen_at = Some(Instant::now() + STANDBY_RETRY);
                         return;
                     }
                     if self.shared.refresh_config.is_some() {
@@ -945,6 +948,9 @@ impl Worker {
         self.start_downloads(session.live.clone());
         self.session = Some(session);
         self.open_note = None;
+        // 新一代连接建立 = 一次新的配置安装：推进安装序号，让更早的保存/加入回执
+        // 失效（它们不能把重建之后的状态再发布回去）。
+        self.publish_local_config();
         // 连接已经按当前配置（含新的存储设置）重建：切换标记与计数到这里就算完成。
         self.pending_switch = false;
         self.switch_failed = false;
@@ -1054,7 +1060,7 @@ impl Worker {
                 self.presend().await;
                 let _ = reply.send(());
             }
-            Cmd::Reconfigure(config) => self.reconfigure(config).await,
+            Cmd::Reconfigure(config, host_seq) => self.reconfigure(config, host_seq).await,
             Cmd::Pause(paused, reply) => {
                 let _ = reply.send(self.set_paused(paused).await);
             }
@@ -1251,12 +1257,21 @@ impl Worker {
 
     /// 把 worker 刚安装的配置发布到共享的那一份，并推进安装序号：保存/加入的回执
     /// 带着这个序号，宿主按它决定谁该发布（发布顺序跟随安装顺序）。
-    fn publish_local_config(&mut self) {
-        *lock(&self.shared.config) = self.config.clone();
-        self.shared.config_seq.fetch_add(1, Ordering::Relaxed);
+    fn publish_local_config(&mut self) -> u64 {
+        // 值与序号在同一把锁里提交：回执方在锁内比较序号，不会看到「新值 + 旧序号」。
+        let mut guard = lock(&self.shared.config);
+        *guard = self.config.clone();
+        self.shared.config_seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    async fn reconfigure(&mut self, config: SyncConfig) {
+    async fn reconfigure(&mut self, config: SyncConfig, host_seq: u64) {
+        // 比共享序号旧的重配是宿主已经作废的发布（之后又关了同步/换了配置）：
+        // 装上去会把最新状态回退。
+        let latest = self.shared.config_seq.load(Ordering::Relaxed);
+        if host_seq < latest {
+            tracing::info!("收到过期的配置重配（#{host_seq} < #{latest}），忽略");
+            return;
+        }
         let old = std::mem::replace(&mut self.config, config);
         self.publish_local_config();
         let new = &self.config;
@@ -1478,8 +1493,10 @@ impl Worker {
             code,
         )
         .await?;
-        // 配对码里带了存储设置的话，配置也跟着换。
+        // 配对码里带了存储设置的话，配置也跟着换：和同空间重加一样走同一次
+        // 「安装 + 发布 + 推进序号」，回执带的就是这次安装的序号。
         self.config = joined.clone();
+        self.publish_local_config();
         self.open(false).await;
         Ok(joined)
     }

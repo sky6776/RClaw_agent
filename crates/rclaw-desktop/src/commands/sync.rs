@@ -110,19 +110,35 @@ async fn save_with_secret(
     engine: &SyncEngine,
     config: SyncConfig,
     secret: Option<String>,
+    // 创建/加入向导会收集设备名：`Some(向导打开时的设备名)` 表示「和它不同就采用表单
+    // 里的新名字，相同就保留锁内读到的（别处可能刚改过）」；普通存储表单传 `None`，
+    // 设备名以磁盘为准。
+    device_name_baseline: Option<String>,
 ) -> Result<(), String> {
     let home = state.home.clone();
+    let merge_home = home.clone();
+    let write_home = home.clone();
     engine
-        .save_storage_with(config, secret.filter(|secret| !secret.is_empty()), move |proposed| {
-            // 锁内以磁盘最新一份为底，只采用这次表单的存储段与开关：表单里可能带
-            // 着过期的范围/通道（填表之后别处刚改过），不能整份写回。
-            let before = disk_config(&home)?;
-            let mut merged = before.clone();
-            merged.apply_storage_from(proposed);
-            merged.enabled = proposed.enabled;
-            persist_from(&home, &before, &merged)?;
-            Ok(merged)
-        })
+        .save_storage_with(
+            config,
+            secret.filter(|secret| !secret.is_empty()),
+            move |proposed| {
+                // 锁内以磁盘最新一份为底，只采用这次表单的存储段与开关：表单里可能带
+                // 着过期的范围/通道（填表之后别处刚改过），不能整份写回。
+                let before = disk_config(&merge_home)?;
+                let mut merged = before.clone();
+                merged.apply_storage_from(proposed);
+                merged.enabled = proposed.enabled;
+                if device_name_baseline
+                    .as_deref()
+                    .is_some_and(|baseline| proposed.device_name != baseline)
+                {
+                    merged.device_name = proposed.device_name.clone();
+                }
+                Ok(merged)
+            },
+            move |merged| persist(&write_home, merged),
+        )
         .await
         .map_err(fail)?;
     crate::sync_host::emit_status();
@@ -205,7 +221,7 @@ pub async fn sync_save_storage(
     next.file = config.file;
     next.s3 = config.s3;
     next.validate().map_err(fail)?;
-    save_with_secret(&state, &engine, next, secret).await
+    save_with_secret(&state, &engine, next, secret, None).await
 }
 
 /// 「测试连接」：用表单上正在填的设置（不必先保存）把存储要用到的操作逐个走一遍。
@@ -244,7 +260,8 @@ pub async fn sync_create_space(
 ) -> Result<(), String> {
     let engine = handle(&state)?;
     config.enabled = true;
-    save_with_secret(&state, &engine, config.clone(), secret).await?;
+    let baseline = engine.config().device_name;
+    save_with_secret(&state, &engine, config.clone(), secret, Some(baseline)).await?;
     engine.create_space().await.map_err(fail)
 }
 
@@ -307,13 +324,14 @@ pub async fn sync_join_space(
     secret: Option<String>,
 ) -> Result<(), String> {
     let engine = handle(&state)?;
+    let baseline = engine.config().device_name;
     let mut base = config.unwrap_or_else(|| engine.config());
     base.enabled = true;
     // 配对码可能带着自己的存储设置：加入之前先把最终目标写回文件。只在加入之后才写的话，
     // 「密钥已经存好、设置还没写回」的窗口里重启会按旧设置连到另一处存储；写入失败也
     // 不会动远端的空间和本机密钥。重复加入同一空间是幂等的（见 `SyncEngine::join_space`）。
     let preview = rclaw_sync::pairing_config(&base, &code).map_err(fail)?;
-    save_with_secret(&state, &engine, base, secret).await?;
+    save_with_secret(&state, &engine, base, secret, Some(baseline)).await?;
     if preview != engine.config() {
         let home = state.home.clone();
         let target = preview.clone();
@@ -335,22 +353,26 @@ pub async fn sync_join_space(
     let (joined, join_seq) = engine.join_space_with_seq(&code).await.map_err(|error| {
         format!("{error}（配对码带来的存储设置已经写回 rclaw.toml；修好后可以重试同一配对码）")
     })?;
-    // 加入之后以引擎实际采用的设置为准再写一次（配对码没带存储设置时与上一份相同）。
-    // 只有这次加入仍是引擎最近一次安装时才写：期间另一次存储保存/导入已经装上更新的
-    // 配置时，让那份提交去写盘，迟到的回写不能把它覆盖。
-    if joined != preview {
+    // 加入之后以引擎实际采用的设置为准再写一次。即使结果与预写相同也要核对磁盘：
+    // 预写与加入之间可能完成过另一次存储保存（TOML 已是 C），而这次加入才是最后一次
+    // 安装（引擎在 B）——不写就会 TOML 与引擎分叉。只有这次加入仍是引擎最近一次
+    // 安装时才写：更新的提交负责写盘，迟到的回写不能覆盖它。
+    {
         let home = state.home.clone();
         let target = joined.clone();
         let seq_check = engine.clone();
         let lock_home = home.clone();
         let written = run_blocking("保存同步设置", move || {
+            let paths = rclaw_sync::SyncPaths::new(&lock_home);
+            let _lock = rclaw_sync::StorageLock::acquire(&paths)
+                .map_err(|error| format!("取同步存储锁失败: {error}"))?;
+            // 序号复核必须在协议锁内：保存存储在这把锁内一直持有到 worker 安装与
+            // 宿主发布结束，锁内看到的序号就是最终顺序；锁外检查后再取锁，期间
+            // 完成的保存会被这次旧回写盖掉。
             if seq_check.config_seq() != join_seq {
                 tracing::info!("加入空间的回写迟到：引擎已安装更新的配置，跳过写盘");
                 return Ok(());
             }
-            let paths = rclaw_sync::SyncPaths::new(&lock_home);
-            let _lock = rclaw_sync::StorageLock::acquire(&paths)
-                .map_err(|error| format!("取同步存储锁失败: {error}"))?;
             let before = disk_config(&home)?;
             let mut merged = before.clone();
             merged.apply_storage_from(&target);
@@ -358,15 +380,13 @@ pub async fn sync_join_space(
         })
         .await;
         crate::sync_host::emit_status();
-        return written.map_err(|error| {
+        written.map_err(|error| {
             format!(
                 "已经加入同步空间，但设置没能写回 rclaw.toml（{error}）。\
                  请在同步设置里再保存一次，否则下次启动后连不上"
             )
-        });
+        })
     }
-    crate::sync_host::emit_status();
-    Ok(())
 }
 
 /// 退出同步空间：本机的密钥与存储密码清掉，会话、记忆等数据原样留着。

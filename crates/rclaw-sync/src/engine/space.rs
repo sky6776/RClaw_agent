@@ -241,9 +241,16 @@ pub(crate) fn pairing_code(
 }
 
 /// 记下「这个空间是本机建的」并保存 secrets。
-async fn save_created(ctx: &Ctx, next: &Secrets) -> Result<()> {
+async fn save_created(
+    ctx: &Ctx,
+    next: &Secrets,
+    keepalive: Option<std::sync::Arc<std::fs::File>>,
+) -> Result<()> {
     let (ctx, next) = (ctx.clone(), next.clone());
     blocking(move || {
+        // 引擎锁跟着这次本机写入活到底：调用方的等待被超时丢弃时，已经开始的
+        // 写入仍然攥着锁，别的进程不能在它写 secrets/创建者标记时接手。
+        let _keep = keepalive;
         db::write(ctx.db(), |tx| {
             db::kv_put_json(tx, db::KV_CREATOR, &next.space_id)
         })?;
@@ -363,7 +370,7 @@ pub(crate) async fn resume_pending(
     };
     match pending.action {
         SpaceAction::Reset => {
-            finish_reset(ctx, config, secrets, pending).await?;
+            finish_reset(ctx, config, secrets, pending, keepalive.clone()).await?;
             Ok(Some(SpaceAction::Reset))
         }
         SpaceAction::Leave => {
@@ -397,6 +404,7 @@ async fn finish_reset(
     config: &SyncConfig,
     secrets: &mut Secrets,
     pending: PendingSpace,
+    keepalive: Option<std::sync::Arc<std::fs::File>>,
 ) -> Result<()> {
     let Some(next) = pending.replacement.clone() else {
         // 记录不完整（老版本或写坏了）：没法接着做，丢弃记录，本机保持现状。
@@ -482,7 +490,7 @@ async fn finish_reset(
         }
     }
     // 3. 本机切到新空间（记「这个空间是本机建的」+ secrets 落盘），做完才删记录。
-    save_created(ctx, &next).await?;
+    save_created(ctx, &next, keepalive).await?;
     pending_clear(&ctx.paths)?;
     *secrets = next;
     Ok(())
@@ -525,7 +533,7 @@ pub(crate) async fn create(ctx: &Ctx, config: &SyncConfig, secrets: &mut Secrets
     let live = load_live(config, &next).await?;
     create_file_namespace(config, &next.space_id).await?;
     remote::open_space(live.transport(), &live.keys, &next.space_id, true).await?;
-    save_created(ctx, &next).await?;
+    save_created(ctx, &next, None).await?;
     *secrets = next;
     Ok(())
 }
@@ -647,7 +655,7 @@ pub(crate) async fn reset(ctx: &Ctx, config: &SyncConfig, secrets: &mut Secrets)
         replacement: Some(next.clone()),
     };
     pending_save(&ctx.paths, &pending)?;
-    finish_reset(ctx, config, secrets, pending).await
+    finish_reset(ctx, config, secrets, pending, None).await
 }
 
 /// 「测试连接」（§10）：在存储根下把用到的操作逐个走一遍。

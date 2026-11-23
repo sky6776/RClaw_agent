@@ -358,12 +358,15 @@ impl SyncEngine {
     /// 引擎线程收到之后会再试一次。线程自己退出了的话重新起一条。
     pub fn apply_config(&self, config: SyncConfig) {
         let mut running = lock(&self.inner.running);
-        {
-            // 值与版本在同一把锁里提交：引擎线程只会在锁内看到成对的「新值 + 新版本」。
+        let host_seq = {
+            // 值与版本、安装序号在同一把锁里提交：引擎线程只会在锁内看到成对的
+            // 「新值 + 新版本 + 新序号」。更早派发的保存/加入回执（序号更小）不能
+            // 把这份发布覆盖回去；旧的重配命令带着小序号也不会再发布。
             let mut guard = lock(&self.inner.config);
             *guard = config.clone();
             self.inner.config_version.fetch_add(1, Ordering::Relaxed);
-        }
+            self.inner.config_seq.fetch_add(1, Ordering::Relaxed) + 1
+        };
         if !config.enabled {
             if let Some(running) = running.take() {
                 let _ = running.commands.send(Cmd::Stop);
@@ -372,7 +375,7 @@ impl SyncEngine {
         }
         let delivered = running
             .as_ref()
-            .is_some_and(|live| live.commands.send(Cmd::Reconfigure(config.clone())).is_ok());
+            .is_some_and(|live| live.commands.send(Cmd::Reconfigure(config.clone(), host_seq)).is_ok());
         if !delivered {
             *running = self.spawn(config);
         }
@@ -669,7 +672,7 @@ impl SyncEngine {
     /// 一半补上。命令成功才把新配置公布给宿主、清掉意图——失败时宿主内存里仍是旧配置，
     /// 界面上看到的与实际生效的一致。
     pub async fn save_storage(&self, config: SyncConfig, secret: Option<String>) -> Result<()> {
-        self.save_storage_with(config, secret, |config| Ok(config.clone()))
+        self.save_storage_with(config, secret, |config| Ok(config.clone()), |_| Ok(()))
             .await
     }
 
@@ -677,27 +680,37 @@ impl SyncEngine {
     /// （`rclaw.toml`）。整段在一把跨进程锁里串行：先落「更新意图」→ 写配置文件 →
     /// 引擎按同一条请求绑定 secrets 并生效 → 按意图标识结算。中途失败留下意图，下次
     /// 启动由宿主与引擎收敛到同一套；两次保存不会交错出 TOML 与运行配置各一套的状态。
-    pub async fn save_storage_with<F>(
+    pub async fn save_storage_with<M, W>(
         &self,
         config: SyncConfig,
         secret: Option<String>,
-        persist: F,
+        merge: M,
+        write: W,
     ) -> Result<()>
     where
-        F: FnOnce(&SyncConfig) -> std::result::Result<SyncConfig, String> + Send + 'static,
+        M: FnOnce(&SyncConfig) -> std::result::Result<SyncConfig, String> + Send + 'static,
+        W: FnOnce(&SyncConfig) -> std::result::Result<(), String> + Send + 'static,
     {
         let paths = self.inner.ctx.paths.clone();
         let lock_paths = paths.clone();
         let _lock = blocking(move || worker::StorageLock::acquire(&lock_paths)).await?;
         let secret = secret.filter(|secret| !secret.is_empty());
-        // 宿主在协议锁内把要提交的配置收敛到磁盘上的最新一份（只采用这次表单的存储段
-        // 与开关），写回配置并返回真正生效的那一份：意图、worker、宿主发布用同一份。
-        let saved = blocking(move || persist(&config).map_err(SyncError::other)).await;
-        let config = match saved {
-            Ok(config) => config,
-            Err(error) => return Err(error),
+        // 协议顺序：锁内先算出要提交的配置（宿主把它和磁盘上的最新一份合并），**先**
+        // 耐久登记「更新意图」（含这次要绑的密码），再写 TOML、派发命令。意图没写上
+        // 就停下：不能出现「TOML 已经是新存储、凭据却还绑在旧账户」而重启后无从恢复
+        // 的状态。
+        let merged = blocking(move || merge(&config).map_err(SyncError::other)).await?;
+        let id = worker::storage_intent_save(&paths, &merged, secret.as_deref())?;
+        let written = {
+            let target = merged.clone();
+            blocking(move || write(&target).map_err(SyncError::other)).await
         };
-        let id = worker::storage_intent_save(&paths, &config, secret.as_deref())?;
+        if let Err(error) = written {
+            // 确定 TOML 没换成：撤掉这次意图，什么都不生效。
+            let _ = worker::storage_intent_clear_if(&paths, &id);
+            return Err(error);
+        }
+        let config = merged;
         let seq = self
             .call(|reply| Cmd::SaveStorage {
                 config: config.clone(),
