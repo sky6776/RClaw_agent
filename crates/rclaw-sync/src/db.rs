@@ -686,9 +686,9 @@ pub fn blob_objects_at(conn: &Connection, rel_path: &str) -> Result<Vec<(String,
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// 登记一个要随消息/快照发出的本地对象：已经登记过、但只是本机缓存（`BLOB_FETCHED`）
-/// 的，升成待上传——「本机有这份内容」不等于「远端有这份副本」。远端已经确认过的
-/// （`UPLOADED`）与按范围留着的（`HELD`）不动。
+/// 登记一个要随消息/快照发出的本地对象：`state` 是要收敛到的目标状态——本机缓存
+/// （`BLOB_FETCHED`）在范围关着时转 `HELD`、范围开时升 `PENDING`；已 `HELD` 的对象
+/// 在新引用且范围允许时升 `PENDING`。远端已经确认过的（`UPLOADED`/`REMOTE`）不回退。
 pub fn blob_register_or_upload(
     conn: &Connection,
     blob_id: &str,

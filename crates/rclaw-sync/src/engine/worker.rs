@@ -407,6 +407,8 @@ struct Worker {
     pending_switch: bool,
     /// 上面那条重试了几次（用于给出可见状态与放弃提示）。
     switch_tries: u32,
+    /// 切换已放弃（等不到在途提交）：状态要粘住，不能被之后普通轮次的 idle 覆盖。
+    switch_failed: bool,
 }
 
 impl Worker {
@@ -439,6 +441,7 @@ impl Worker {
             standby_tries: 0,
             pending_switch: false,
             switch_tries: 0,
+            switch_failed: false,
         }
     }
 
@@ -558,22 +561,29 @@ impl Worker {
 
     /// 跑一轮。失败时返回原因（给等着结果的调用方看）。
     async fn run_round(&mut self, kind: Kind) -> std::result::Result<(), String> {
-        // 上一刻没能重建的连接（换存储设置时有在途提交）：每轮开头再试。
-        if self.pending_switch && self.session.is_some() {
+        // 上一刻没能重建的连接（换存储设置时有在途提交）：每轮开头再试。放弃之后
+        // （switch_failed）也留在这条路上——「立即同步」/定时轮次都会再试一次切换，
+        // 否则配置与连接会长期不一致而界面看起来正常。
+        if (self.pending_switch || self.switch_failed) && self.session.is_some() {
             if self.teardown().await {
                 self.pending_switch = false;
+                self.switch_failed = false;
                 self.switch_tries = 0;
                 self.open().await;
             } else {
                 self.switch_tries = self.switch_tries.saturating_add(1);
                 if self.switch_tries >= SWITCH_GIVE_UP_TRIES {
-                    // 一直等不到在途提交结束：升级成可见错误（配置仍是新的，等阻塞结束
-                    // 或用户重试）；不再每分钟静默重试。
+                    // 一直等不到在途提交结束：把错误粘住（配置仍是新的、连接仍是旧的），
+                    // 不再每分钟静默重试；下一次「立即同步」或定时轮次会再试。
+                    self.switch_failed = true;
+                    self.pending_switch = false;
                     self.shared.set_state(
                         "error",
-                        Some("存储设置还没生效：有附件提交一直没有结束".into()),
+                        Some(
+                            "存储设置还没生效：有附件提交一直没有结束。当前仍在使用旧存储；                             点「立即同步」可重试切换"
+                                .into(),
+                        ),
                     );
-                    self.pending_switch = false;
                     return Ok(());
                 }
                 self.shared.set_state(
@@ -635,8 +645,11 @@ impl Worker {
             || outcome
                 .retry_after
                 .is_some_and(|after| after < Duration::from_secs(1));
-        self.shared
-            .set_state(if busy { "syncing" } else { "idle" }, None);
+        if !self.switch_failed {
+            // 切换没完成的错误要粘住：普通轮次成功不代表配置已经生效。
+            self.shared
+                .set_state(if busy { "syncing" } else { "idle" }, None);
+        }
         if outcome.again {
             if self.reruns < RERUN_MAX {
                 self.reruns += 1;
@@ -1107,6 +1120,21 @@ impl Worker {
             return;
         }
         if old == self.config {
+            // 上一次切换因为等在途提交而放弃（已升级成可见错误）：用户点「重试」会带着
+            // 同一份配置再来一次，这里重新排队换。
+            if !self.pending_switch
+                && self.switch_tries >= SWITCH_GIVE_UP_TRIES
+                && self.session.is_some()
+            {
+                self.pending_switch = true;
+                self.switch_failed = false;
+                self.switch_tries = 0;
+                self.shared.set_state(
+                    "syncing",
+                    Some("重新尝试重建同步连接".into()),
+                );
+                self.request(Kind::Full, Duration::ZERO);
+            }
             return;
         }
         if storage {
@@ -1114,6 +1142,7 @@ impl Worker {
                 // 还有在途的提交阶段：配置已经是新的，连接留到下一轮开头再重建
                 // （不能退回旧配置——宿主与 TOML 都已经换成新的了）。
                 self.pending_switch = true;
+                self.switch_failed = false;
                 self.switch_tries = 0;
                 self.shared.set_state(
                     "syncing",

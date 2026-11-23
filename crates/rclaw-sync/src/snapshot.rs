@@ -109,9 +109,10 @@ const GC_RETRY_MS: i64 = 5 * 60 * 1000;
 /// 升级前留下的、推不出恢复依据的日志对象：退到很久以后再看（对象不删）。不退避的话
 /// 它们每轮都占满批次，后面的正常删除记录永远轮不到。
 const GC_PARK_MS: i64 = 30 * 24 * 3600 * 1000;
-/// 晋升（候选快照 / 候选回收位置）前的完整复核一次走完的时限：这一步每小时最多一次，
-/// 给得比每轮的回收扫描宽，让大一点的快照也有机会一次核完（跨轮前缀不能当证据）。
-const PROMOTE_BUDGET: Duration = Duration::from_secs(30);
+/// 晋升（候选快照 / 候选回收位置）前的完整复核一次走完的时限。必须与删除时的复核
+/// 份额一致：晋升时 30 秒核完、删除时 6 秒核不完，会留下“floor 已前进、对象永远删不掉”
+/// 的中间状态。单份依据的 sweep 份额是 `SWEEP_BUDGET * 0.75`（6 秒），这里就用同一个数。
+const PROMOTE_BUDGET: Duration = Duration::from_secs(6);
 /// 一份依据连续这么多次没能在一次判定里核完，就不再重试（保留旧边界与对象）。
 const PROMOTE_TRIES: u32 = 3;
 /// 回收检查（回收位置、附件）隔这么久做一次。
@@ -313,6 +314,11 @@ struct Maint {
     /// 取代它）；旧指针与旧快照都保留——这是弱版本存储上无法一次核完时的保守落点。
     #[serde(default)]
     snap_attempts: u32,
+    /// 已经放弃的回收依据（`<设备>/<快照名>`，清单摘要）：在一次判定的时限内核不完，
+    /// 不再重复登记同一个依据（否则 advance_floor 每周都会把它重新排上、每小时空转
+    /// 一次全量复核）。依据换成另一份时才重新考虑。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floor_abandoned: Option<(String, String)>,
 }
 
 /// 候选回收位置（[`Maint::floor_pending`]）：对象删除已经按宽限期排队，但本机日志的
@@ -2163,6 +2169,11 @@ async fn sweep_due(
     let mut due_left: Vec<Due> = Vec::new();
     // 这轮核验不过（不是预算不够）的行：退避一会儿，别让排在前面的坏依据每轮占满批次。
     let mut retry: Vec<String> = Vec::new();
+    // 按**依据/包**退避：同一份依据下可能有一百条以上的行；只给这一批的行写 retry_ms，
+    // 下一轮批次轮转会把同一依据的下一批取出来、又完整复核一遍。这里记住这轮失败的
+    // 依据与包，事务里把所有押在它们上的行一起推后。
+    let mut retry_bases: HashSet<(String, String)> = HashSet::new();
+    let mut retry_packs: HashSet<(String, String)> = HashSet::new();
     let mut parked: Vec<String> = Vec::new();
     for (path, basis, pack) in due {
         if basis.is_none() && pack.is_none() && !path.starts_with("blobs/") {
@@ -2195,6 +2206,7 @@ async fn sweep_due(
                 deletable.push(path);
             } else {
                 tracing::debug!("汇总包 {} 这轮读不回来，押着它的零散段先不删", pack.name);
+                retry_packs.insert((pack.name.clone(), pack.digest.clone()));
                 retry.push(path.clone());
                 due_left.push((path, None, Some(pack)));
             }
@@ -2227,11 +2239,13 @@ async fn sweep_due(
                 tracing::debug!("回收依据 {} 这轮没核验完，押着它的对象先不删", basis.0);
                 // 和核验不过一样退避：否则排在批头的慢依据每 60 秒重读一遍，后面的
                 // 行永远轮不到（一次判定必须连续走完，不能跨轮续用前缀）。
+                retry_bases.insert(basis.clone());
                 retry.push(path.clone());
                 due_left.push((path, Some(basis), pack));
             }
             BasisCheck::Broken => {
                 tracing::debug!("回收依据 {} 这轮核验不过，押着它的对象先不删", basis.0);
+                retry_bases.insert(basis.clone());
                 retry.push(path.clone());
                 due_left.push((path, Some(basis), pack));
             }
@@ -2257,16 +2271,43 @@ async fn sweep_due(
             for path in &done {
                 db::state_del(tx, scope::GC, path)?;
             }
-            for (paths, retry_ms) in [(&retry, now + GC_RETRY_MS), (&parked, now + GC_PARK_MS)] {
-                for path in paths {
-                    let Some(mut when) =
-                        db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
-                    else {
+            // 这轮失败/放弃的行与它们所在依据（或包）下的**全部**行一起推后。
+            let mut delayed: HashSet<String> = retry.iter().cloned().collect();
+            if !retry_bases.is_empty() || !retry_packs.is_empty() {
+                for (path, row) in db::state_scan(tx, scope::GC, "")? {
+                    let Some(when) = row.json::<GcWhen>() else {
                         continue;
                     };
-                    when.retry_ms = retry_ms;
-                    db::state_put_json(tx, scope::GC, path, db::HLC_ZERO, &when)?;
+                    let hit = when
+                        .basis
+                        .as_ref()
+                        .is_some_and(|basis| retry_bases.contains(basis))
+                        || when
+                            .pack
+                            .as_ref()
+                            .is_some_and(|pack| retry_packs.contains(&(pack.name.clone(), pack.digest.clone())));
+                    if hit {
+                        delayed.insert(path);
+                    }
                 }
+            }
+            for path in &delayed {
+                let Some(mut when) =
+                    db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
+                else {
+                    continue;
+                };
+                when.retry_ms = now + GC_RETRY_MS;
+                db::state_put_json(tx, scope::GC, path, db::HLC_ZERO, &when)?;
+            }
+            for path in &parked {
+                let Some(mut when) =
+                    db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
+                else {
+                    continue;
+                };
+                when.retry_ms = now + GC_PARK_MS;
+                db::state_put_json(tx, scope::GC, path, db::HLC_ZERO, &when)?;
             }
             Ok(())
         })
@@ -2638,6 +2679,10 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
         let Some(basis) = basis else {
             return Ok(());
         };
+        // 这份依据已经放弃（一次判定核不完）：不再登记，别每周重新排上、每小时空转。
+        if record.floor_abandoned.as_ref() == Some(&basis) {
+            return Ok(());
+        }
         // 删除要等带着新回收位置的 head 写出去之后才动手（`floor` 守卫）；删之前与公布
         // 之前都还会按 basis 复核一次。
         let when = GcWhen {
@@ -2754,12 +2799,16 @@ async fn promote_floor(
                     return Ok(false);
                 }
                 record.floor_pending = None;
+                // 记住这份依据放弃了：advance_floor 不再登记同一个依据。
+                record.floor_abandoned = Some((basis.clone(), pending.basis.1.clone()));
                 put_maint(tx, &record)?;
+                // 只撤掉**这次候选**排的删除（同一个 floor）：已公布 floor 的删除安排
+                // 与快照替换的删除记录不能跟着一起丢。
                 for (path, row) in db::state_scan(tx, scope::GC, "")? {
-                    if row
-                        .json::<GcWhen>()
-                        .is_some_and(|when| when.basis.is_some_and(|b| b.0 == basis))
-                    {
+                    if row.json::<GcWhen>().is_some_and(|when| {
+                        when.floor == Some(pending.floor)
+                            && when.basis.as_ref().is_some_and(|b| b.0 == basis)
+                    }) {
                         db::state_del(tx, scope::GC, &path)?;
                     }
                 }
