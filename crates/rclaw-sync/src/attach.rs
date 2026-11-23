@@ -689,8 +689,10 @@ fn place(ctx: &Ctx, commit: &Commit, blob_id: &str, plain: &Path) -> Result<Path
         ctx.env.checked_path(&rel_path)?
     };
     // 落点上原本就有一份内容相同的（或登记的地方就是同步缓存里那一份）时直接复用——
-    // 那是用户或以前的同步留下的，不属于这次任务，中途作废也不动它。
-    if !(target.is_file() && same_content(&target, plain)) {
+    // 那是用户或以前的同步留下的，不属于这次任务，中途作废也不动它；但登记仍要更新
+    // （这次取回的结论就是「本机有它了」）。
+    let needs_write = !(target.is_file() && same_content(&target, plain));
+    let staging = if needs_write {
         if !commit.valid() {
             return Err(abandoned());
         }
@@ -705,35 +707,43 @@ fn place(ctx: &Ctx, commit: &Commit, blob_id: &str, plain: &Path) -> Result<Path
             let _ = std::fs::remove_file(&staging);
             return Err(e.into());
         }
-        // 最终改名与记账都在最终写入段里：许可活着时换代不会发生（见
-        // [`SpaceEpoch::enter`]）。teardown 关入口之后拿到的许可无效——旧世代只把
-        // 暂存文件收掉，不再改名进落点、不再记账。
-        let permit = ctx.space.enter();
-        if !permit.ok() || !commit.valid() {
-            let _ = std::fs::remove_file(&staging);
-            return Err(abandoned());
+        Some(staging)
+    } else {
+        None
+    };
+    // 最终改名与记账都在最终写入段里：许可活着时换代不会发生（见
+    // [`SpaceEpoch::enter`]）。teardown 关入口之后拿到的许可无效——旧世代只把暂存
+    // 文件收掉，不再改名进落点、不再记账。
+    let permit = ctx.space.enter();
+    if !permit.ok() || !commit.valid() {
+        if let Some(staging) = &staging {
+            let _ = std::fs::remove_file(staging);
         }
-        if let Err(e) = std::fs::rename(&staging, &target) {
-            let _ = std::fs::remove_file(&staging);
+        return Err(abandoned());
+    }
+    if let Some(staging) = &staging {
+        if let Err(e) = std::fs::rename(staging, &target) {
+            let _ = std::fs::remove_file(staging);
+            drop(permit);
             return Err(e.into());
         }
-        // 记账：事务里再核对一次代，失配就让事务回滚——旧空间的登记不会留下来。
-        let stored = db::write(ctx.db(), |tx| {
-            if !permit.ok() || !commit.valid() {
-                return Err(abandoned());
-            }
-            db::blob_set(tx, blob_id, &rel_path, BLOB_FETCHED)?;
-            forget(tx, blob_id)
-        });
-        drop(permit);
-        if let Err(error) = stored {
-            // 只收回这次任务自己写下的落点：内容还是这次复制进去的那一份才删。路径
-            // 可能已被新空间的对象复用，不能按路径硬删。
-            if same_content(&target, plain) {
-                let _ = std::fs::remove_file(&target);
-            }
-            return Err(error);
+    }
+    // 记账：事务里再核对一次代，失配就让事务回滚——旧空间的登记不会留下来。
+    let stored = db::write(ctx.db(), |tx| {
+        if !permit.ok() || !commit.valid() {
+            return Err(abandoned());
         }
+        db::blob_set(tx, blob_id, &rel_path, BLOB_FETCHED)?;
+        forget(tx, blob_id)
+    });
+    drop(permit);
+    if let Err(error) = stored {
+        // 只收回这次任务自己写下的落点：内容还是这次复制进去的那一份才删。路径
+        // 可能已被新空间的对象复用，不能按路径硬删。
+        if needs_write && same_content(&target, plain) {
+            let _ = std::fs::remove_file(&target);
+        }
+        return Err(error);
     }
     // 同一个对象登记过的其他落点（别的会话的 artifact 目录等）一并补上。登记提交之后
     // 才换的代：落点与登记都在切换之前落定，是一致的；补别名会再写文件，与改名、记账
