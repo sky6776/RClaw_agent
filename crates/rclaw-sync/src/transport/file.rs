@@ -190,25 +190,28 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
     extern "system" {
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     }
-    fn wide_long(path: &Path) -> Option<Vec<u16>> {
-        let parent = std::fs::canonicalize(path.parent()?).ok()?;
-        let full = match path.file_name() {
-            Some(name) => parent.join(name),
-            None => parent,
-        };
-        Some(
-            full.as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect(),
-        )
-    }
-    let from = wide_long(tmp).ok_or_else(|| {
-        std::io::Error::other(format!("无法规范化临时文件路径 {}", tmp.display()))
-    })?;
-    let to = wide_long(path).ok_or_else(|| {
-        std::io::Error::other(format!("无法规范化目标路径 {}", path.display()))
-    })?;
+    // 源与目标是同一个目录里的两个叶子（临时文件用 `with_file_name` 生成）：父目录
+    // 只规范化**一次**，两个叶子都从这一份规范路径拼出来。分两次解析的话，上级目录
+    // 联接在两次之间改指，会把标记发布到同卷的另一个目录去。
+    let parent = path
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .ok_or_else(|| {
+            std::io::Error::other(format!("无法规范化目标父目录 {}", path.display()))
+        })?;
+    let leaf = |leaf: &Path| -> std::io::Result<Vec<u16>> {
+        let name = leaf.file_name().ok_or_else(|| {
+            std::io::Error::other(format!("路径没有文件名 {}", leaf.display()))
+        })?;
+        Ok(parent
+            .join(name)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect())
+    };
+    let from = leaf(tmp)?;
+    let to = leaf(path)?;
     let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
     if ok == 0 {
         Err(std::io::Error::last_os_error())
