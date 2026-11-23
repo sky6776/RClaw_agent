@@ -235,8 +235,14 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
                     wide.push(0x5c);
                     wide.extend(share.encode_wide());
                     for component in components {
-                        wide.push(0x5c);
-                        wide.extend(component.as_os_str().encode_wide());
+                        match component {
+                            std::path::Component::RootDir
+                            | std::path::Component::CurDir => {}
+                            other => {
+                                wide.push(0x5c);
+                                wide.extend(other.as_os_str().encode_wide());
+                            }
+                        }
                     }
                     wide.push(0);
                     return wide;
@@ -251,18 +257,58 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
 
     /// 词法归一化：去掉 `.`、消解 `..`（扩展长度路径不解释点分量）。
     fn lexical_normalize(path: &Path) -> PathBuf {
+        use std::os::windows::ffi::OsStrExt;
         use std::path::Component;
         let mut out = PathBuf::new();
+        // 还没落到路径里的前导 `..`（`out` 里已经没有可弹出的组件时累积）。
+        let mut leading_parents = 0usize;
         for component in path.components() {
             match component {
                 Component::CurDir => {}
                 Component::ParentDir => {
-                    out.pop();
+                    if leading_parents > 0 {
+                        leading_parents += 1;
+                    } else if !out.pop() {
+                        // 根上再 `..`：Win32 的普通路径也会保留（不能丢，否则指向别处）。
+                        leading_parents = 1;
+                    }
                 }
-                other => out.push(other.as_os_str()),
+                other => {
+                    for _ in 0..leading_parents {
+                        out.push("..");
+                    }
+                    leading_parents = 0;
+                    let name = other.as_os_str();
+                    // 普通 Win32 会去掉每个分量结尾的点与空格；扩展路径不会——两边
+                    // 混用时（Rust 创建临时文件、这里发布）必须自己按普通语义归一。
+                    let trimmed = if matches!(other, Component::Normal(_)) {
+                        trim_trailing_dots_and_spaces(name)
+                    } else {
+                        name.to_os_string()
+                    };
+                    out.push(trimmed);
+                }
             }
         }
+        for _ in 0..leading_parents {
+            out.push("..");
+        }
         out
+    }
+
+    /// 去掉文件名分量结尾的点与空格（Win32 普通路径语义），按 UTF-16 处理，保留
+    /// 未配对代理单元。
+    fn trim_trailing_dots_and_spaces(name: &std::ffi::OsStr) -> std::ffi::OsString {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        while matches!(wide.last(), Some(0x2e) | Some(0x20)) {
+            wide.pop();
+        }
+        if wide.is_empty() {
+            name.to_os_string()
+        } else {
+            std::ffi::OsString::from_wide(&wide)
+        }
     }
     let from: Vec<u16> = wide_long(tmp);
     let to: Vec<u16> = wide_long(path);
