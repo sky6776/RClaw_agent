@@ -96,8 +96,9 @@ function apply(chatId: string, list: SyncAttachment[]) {
   const pendingKeys = new Set<string>();
   const landed = [...bar.landed];
   list.forEach((item) => {
-    // 工具结果全文（artifact）不在消息流里显示，这里只管被消息引用的工作区文件。
-    if (item.kind !== "file") return;
+    // 工具结果全文（artifact）也列出来：它落到同步缓存时，消息里原有的路径句柄指向的
+    // 可能是工作区里的另一个同名文件，用户得能从这儿打开同步来的那份准确内容。
+    if (item.kind !== "file" && item.kind !== "artifact") return;
     const id = `${item.message_id}:${item.blob}`;
     const before = known[id];
     nextKnown[id] = item.state;
@@ -302,7 +303,8 @@ function AttachmentCard({
             {formatBytes(item.size)} · 已下载到 {item.path}
           </span>
         </span>
-        <button onClick={() => open(item.path)} className={CARD_BTN}>
+        {/* 工具结果（artifact）在消息里只有一个文件名：打开按对象走登记的本机路径。 */}
+        <button onClick={() => open(item.local_path ?? item.path)} className={CARD_BTN}>
           打开
         </button>
       </div>
@@ -341,7 +343,16 @@ function AttachmentCard({
             </button>
           )}
         </div>
-        {error && <div className={`mt-1 ${CARD_ERROR}`}>{error}</div>}
+        {error && (
+          <div className="mt-1 flex items-start justify-between gap-2">
+            <div className={`min-w-0 flex-1 ${CARD_ERROR}`}>{error}</div>
+            {/* 快照核对不过（内容被本机改写过）或其他取用失败：重新下载走缺附件的
+                路径，由持有正确内容的设备核对摘要后重传。 */}
+            <button onClick={() => download(item.blob)} className={CARD_BTN}>
+              重新下载
+            </button>
+          </div>
+        )}
       </div>
     );
   }

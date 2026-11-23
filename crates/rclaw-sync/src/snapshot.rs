@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rclaw_store::sync_db::{self, INBOX_PENDING, SEAL_LOCAL};
+use rclaw_store::sync_db::{self, INBOX_PENDING, INBOX_SNAP_STAGE, SEAL_LOCAL};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
@@ -104,11 +104,20 @@ const KEEP_SEGMENTS: usize = 8;
 const SWEEP_SPACING_MS: i64 = 60 * 1000;
 const SWEEP_BATCH: usize = 100;
 const SWEEP_BUDGET: Duration = Duration::from_secs(8);
+/// 一次复核（候选回收位置的依据）最多处理这么多个分片：每个分片要么查一次版本、要么
+/// 下载核对一次摘要，配合 [`SWEEP_BUDGET`] 把单轮占用封住。
+const BASIS_PARTS_PER_ROUND: usize = 256;
 /// 回收检查（回收位置、附件）隔这么久做一次。
 const GC_SCAN_MS: i64 = 3600 * 1000;
 /// 一轮里最多新下载这么多个快照清单、最多吃这么多个快照。
 const MANIFESTS_PER_ROUND: usize = 4;
 const APPLIES_PER_ROUND: usize = 2;
+/// 一轮里最多核验这么多个快照分片：推进回收位置的依据要完整核验过（分批做，见
+/// [`refresh_covers`]）。
+const VERIFY_PARTS_PER_ROUND: usize = 8;
+/// 清单刚读不过的快照，这么久以内不再试它（[`Memo`] 里退避）：把预算让给排在后面的
+/// 候选，别让最前面的几个堵住所有轮次。
+const MANIFEST_BACKOFF_MS: i64 = 10 * 60 * 1000;
 /// 内存里留着的快照清单个数。
 const MEMO_MANIFESTS: usize = 16;
 /// 吃快照、登记附件时一个事务最多写这么多行。
@@ -281,6 +290,47 @@ struct Maint {
     /// 改吃另一个快照的话，先把它留在收件箱里的 op 清掉。
     #[serde(default)]
     applying: Option<String>,
+    /// 各快照分片的核验进度：键 `<设备>/<快照名>`。清单摘要钉住内容；`next` 之前的前缀
+    /// 都已下载并核对过摘要。只有 `next` 追平 `parts` 的（完整核验过）才能推进回收位置。
+    #[serde(default)]
+    covers_checked: BTreeMap<String, VerifiedCover>,
+    /// 待公布的回收位置（[`PendingFloor`]）：删除已排队，head 与日志索引还没动。公布前
+    /// 要把依据的快照在当前存储上重新完整复核一遍。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floor_pending: Option<PendingFloor>,
+    /// 写好、还没核验完的候选快照：分片完整核验、并确认覆盖到回收边界之后，才在 head
+    /// 里取代上一份快照（[`promote_snap`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snap_pending: Option<SnapRef>,
+}
+
+/// 候选回收位置（[`Maint::floor_pending`]）：对象删除已经按宽限期排队，但本机日志的
+/// 索引、`log.floor` 与 head 都还没动——新设备仍然按旧边界读得到这些对象。只有在当前
+/// 存储上把依据的快照完整复核通过之后，才推进并公布这个位置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingFloor {
+    floor: u64,
+    /// 回收依据：`<设备>/<快照名>`、清单摘要。
+    basis: (String, String),
+}
+
+/// 一份快照的分片核验进度（[`Maint::covers_checked`] 的值）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct VerifiedCover {
+    /// 清单的摘要：换清单（换了内容）就从头核验。
+    digest: String,
+    /// 它覆盖本机日志到哪里。
+    seq: u64,
+    /// 清单里声明的分片数。
+    parts: usize,
+    /// 已经核验过摘要的前缀长度。
+    next: usize,
+}
+
+impl VerifiedCover {
+    fn complete(&self) -> bool {
+        self.next >= self.parts
+    }
 }
 
 fn maint(conn: &Connection) -> Result<Maint> {
@@ -297,7 +347,10 @@ pub(crate) fn forget_own(conn: &Connection) -> Result<()> {
     let mut record = maint(conn)?;
     record.writing = None;
     record.covers.clear();
+    record.covers_checked.clear();
     record.blob_snap = None;
+    record.floor_pending = None;
+    record.snap_pending = None;
     put_maint(conn, &record)
 }
 
@@ -312,6 +365,11 @@ struct GcWhen {
     /// 而且本机写出的 head 里的快照指针已经是它。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snap: Option<String>,
+    /// 而且这份回收依据（`<设备>/<快照名>`，清单摘要）那时还能完整读到。删日志对象前
+    /// 再确认一次：作为依据的快照要是没了（第三方目录只同步了一半、被改过），删除就得
+    /// 等着——新设备可能正靠它补齐这段已被回收的日志。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basis: Option<(String, String)>,
 }
 
 fn queue_delete(conn: &Connection, path: &str, when: &GcWhen) -> Result<()> {
@@ -323,6 +381,8 @@ fn queue_delete(conn: &Connection, path: &str, when: &GcWhen) -> Result<()> {
 pub struct Memo {
     manifests: HashMap<String, Arc<Manifest>>,
     order: VecDeque<String>,
+    /// 清单读不过的快照（键 `<设备>/<快照名>`）：不早于这个时刻（本机时钟）再试它。
+    backoff: HashMap<String, i64>,
     /// 这次运行里已经试过「新设备直接从快照起步」。
     pub tried_new: bool,
     /// 上次删到期对象的时刻。
@@ -344,9 +404,30 @@ impl Memo {
             }
         }
     }
+
+    /// 清单上次读不过、还没到重试时刻。
+    fn backed_off(&mut self, key: &str, now: i64) -> bool {
+        match self.backoff.get(key) {
+            Some(&until) if now < until => true,
+            Some(_) => {
+                self.backoff.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 清单这次读不过：退避一段时间，不每轮都堵在同几个候选上。
+    fn note_backoff(&mut self, key: &str, now: i64) {
+        if self.backoff.len() > MEMO_MANIFESTS * 4 {
+            self.backoff.clear();
+        }
+        self.backoff.insert(key.to_string(), now + MANIFEST_BACKOFF_MS);
+    }
 }
 
-/// 取一个快照的清单：下载、解密、核对摘要、解析。读过的留在内存里。
+/// 取一个快照的清单：下载、解密、核对摘要、解析。读过的留在内存里；读不过的（对象不在、
+/// 校验不过、要升级）退避一会儿，避免每轮都把预算耗在最前面的几个候选上。
 async fn fetch_manifest(
     transport: &dyn SyncTransport,
     keys: &Arc<Keys>,
@@ -359,9 +440,19 @@ async fn fetch_manifest(
         return Ok(found);
     }
     let path = codec::snapshot_path(dev, &snap.name);
-    let object = transport
+    // 清单不在（404：被回收的旧快照、第三方目录只同步了一半）与解密/解析失败一样，
+    // 都是这个候选的问题——同样退避，别让最前面的几个缺清单的候选每轮耗光预算。
+    let object = match transport
         .get(&path, codec::sealed_max(MANIFEST_PLAIN_MAX))
-        .await?;
+        .await
+    {
+        Ok(object) => object,
+        Err(error) if skippable(&SyncError::from(error.clone())) => {
+            memo.note_backoff(&key, now_ms());
+            return Err(SyncError::from(error));
+        }
+        Err(error) => return Err(SyncError::from(error)),
+    };
     let (keys, dev, name, digest, ops) = (
         keys.clone(),
         dev.to_string(),
@@ -369,7 +460,7 @@ async fn fetch_manifest(
         snap.digest.clone(),
         snap.ops,
     );
-    let manifest = blocking(move || {
+    let manifest = match blocking(move || {
         let plain = codec::open_log_object(&keys, &path, &object, MANIFEST_PLAIN_MAX)?;
         if sha256_hex(&plain) != digest {
             return Err(SyncError::corrupt(format!(
@@ -385,17 +476,48 @@ async fn fetch_manifest(
         }
         Ok(manifest)
     })
-    .await?;
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) if skippable(&error) => {
+            memo.note_backoff(&key, now_ms());
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     let manifest = Arc::new(manifest);
     memo.put(key, manifest.clone());
     Ok(manifest)
+}
+
+/// 下载一个快照分片，解密后核对它与清单里记的摘要（推进回收位置前核验依据用）。
+async fn verify_snapshot_part(
+    transport: &dyn SyncTransport,
+    keys: &Arc<Keys>,
+    dev: &str,
+    snap_name: &str,
+    part: &PartRef,
+) -> Result<()> {
+    let path = codec::snapshot_part_path(dev, snap_name, &part.name);
+    let object = transport.get(&path, codec::SEGMENT_OBJECT_MAX).await?;
+    let (keys, digest) = (keys.clone(), part.digest.clone());
+    blocking(move || {
+        let plain = codec::open_log_object(&keys, &path, &object, codec::SEGMENT_PLAIN_MAX)?;
+        drop(object);
+        if sha256_hex(&plain) != digest {
+            return Err(SyncError::corrupt(format!("{path} 的摘要与清单里记的不符")));
+        }
+        Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
 // 写快照：条件与内容
 // ---------------------------------------------------------------------------
 
-/// 写快照的前提里便宜的那几项：会话范围开着；没有排队、悬空、被隔离、还没处理的 op；
+/// 写快照的前提里便宜的那几项：会话范围开着；没有排队、悬空、被隔离、还没处理的 op
+/// （因范围收窄暂缓的除外——它们留着自己等范围重开，不该挡住别的范围写快照）；
 /// 本机的变更都封了段、传上去了；没有跳过的线程、没丢过 op；各设备的日志都处理到了取回
 /// 的位置，而且读得下去。
 fn settled(conn: &Connection, s: &Settings, now: i64) -> Result<bool> {
@@ -403,11 +525,16 @@ fn settled(conn: &Connection, s: &Settings, now: i64) -> Result<bool> {
         return Ok(false);
     }
     let busy: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sync_inbox) OR EXISTS(SELECT 1 FROM sync_outbox)",
+        "SELECT EXISTS(SELECT 1 FROM sync_inbox)",
         [],
         |row| row.get(0),
     )?;
-    if busy {
+    if busy || seal::has_sendable(conn, s)? {
+        return Ok(false);
+    }
+    // 队列里还有因范围收窄暂缓的行：文件寄存器里是它们从未发布的最新内容，快照会把
+    // 这些内容绕过范围带给其他设备。等它们封出去（范围重开）或被清掉再写。
+    if seal::has_deferred(conn, s)? {
         return Ok(false);
     }
     let log = db::log_state(conn)?;
@@ -628,6 +755,16 @@ struct Producer {
 impl Producer {
     /// 下一个分片的明文与行数；内容都出完了返回 `None`。
     fn next_part(&mut self) -> Result<Option<(Vec<u8>, u64)>> {
+        // 每出一片都把资格重新核对一遍：快照写着写着，队列里可能多了没发布的行（其中
+        // 暂缓行的内容就在寄存器里）、范围也可能变了。不再合格就中止——调用方按写失败
+        // 清掉已经传上去的对象，下一轮重新来过。
+        let now = now_ms();
+        let ok = db::read(self.ctx.db(), |conn| settled(conn, &self.s, now))?;
+        if !ok {
+            return Err(SyncError::other(
+                "写快照期间队列或范围变了，这份快照作废",
+            ));
+        }
         fn push(plain: &mut String, origin: &str, line: &str) {
             plain.push_str(origin);
             plain.push('\t');
@@ -1140,18 +1277,24 @@ impl Writer {
         self.objects.push(path.clone());
         transport::put_checked(transport, &path, object).await?;
 
-        // 本机名下更早的快照对象（上一个快照，以及写到一半没清干净的）：等新指针写出去、
-        // 再过宽限期就删。
+        // 本机名下更早的快照对象。已公布的那一份（head 里的指针）不在这里退位：新快照
+        // 只是**候选**，要等它的分片完整核验、确认覆盖（[`promote_snap`]）之后才接管
+        // head——一份长度对得上但解不开的新快照，挤不掉唯一可用的旧快照。其余的（写到
+        // 一半没清干净的、被更新的候选换掉的）没人引用，过宽限期直接删。
         let dir = snapshot_dir(&self.dev);
-        let stale: Vec<String> = transport
+        let stale: Vec<(String, String)> = transport
             .list(&dir)
             .await?
             .into_iter()
-            .filter(|meta| snapshot_of(&meta.name).is_some_and(|owner| owner != self.name))
-            .map(|meta| format!("{dir}{}", meta.name))
+            .filter_map(|meta| {
+                snapshot_of(&meta.name)
+                    .filter(|owner| *owner != self.name)
+                    .map(|owner| (owner.to_string(), format!("{dir}{}", meta.name)))
+            })
             .collect();
         let now = now_ms();
         let covered = self.vector.get(&self.dev).map_or(0, |entry| entry.seq);
+        let parts = self.parts.len();
         {
             let (dev, name, snap) = (self.dev.clone(), self.name.clone(), snap.clone());
             offload(ctx, move |ctx| {
@@ -1167,19 +1310,52 @@ impl Writer {
                     }
                     record.writing = None;
                     record.covers.insert(snap_key(&dev, &name), covered);
-                    put_maint(tx, &record)?;
+                    // 本机刚写出的快照也不直接算「完整核验」：put_checked 只确认了对象
+                    // 长度，还没核对过摘要。核验进度记 0，由 [`refresh_covers`] 像别的
+                    // 快照一样分批下载核对；对上了才能接管指针、推进回收位置。
+                    record.covers_checked.insert(
+                        snap_key(&dev, &name),
+                        VerifiedCover {
+                            digest: snap.digest.clone(),
+                            seq: covered,
+                            parts,
+                            next: 0,
+                        },
+                    );
+                    let mut log = db::log_state(tx)?;
+                    let published = log.snap.as_ref().map(|snap| snap.name.as_str());
+                    if published.is_some() && published != Some(name.as_str()) {
+                        // 候选保留独立指针：head 与上一份快照都先不动。
+                        record.snap_pending = Some(snap);
+                        let when = GcWhen {
+                            after_ms: now + SNAP_GRACE_MS,
+                            floor: None,
+                            snap: None,
+                            basis: None,
+                        };
+                        for (owner, path) in &stale {
+                            if Some(owner.as_str()) != published {
+                                queue_delete(tx, path, &when)?;
+                            }
+                        }
+                        return put_maint(tx, &record);
+                    }
+                    // 没有上一份快照（首次发布，或同名重写）：直接接管，无人引用的旧
+                    // 对象照旧排队，新指针下一次写 head 带出去。
+                    record.snap_pending = None;
                     let when = GcWhen {
                         after_ms: now + SNAP_GRACE_MS,
                         floor: None,
                         snap: Some(name.clone()),
+                        basis: None,
                     };
-                    for path in &stale {
+                    for (_, path) in &stale {
                         queue_delete(tx, path, &when)?;
                     }
-                    let mut log = db::log_state(tx)?;
                     log.snap = Some(snap);
                     log.head_dirty = true;
-                    db::put_log_state(tx, &log)
+                    db::put_log_state(tx, &log)?;
+                    put_maint(tx, &record)
                 })
             })
             .await?;
@@ -1284,7 +1460,10 @@ fn parse_part(text: &str, expect: u64) -> Result<Vec<PartLine<'_>>> {
     Ok(out)
 }
 
-/// 把一个分片的 op 写进收件箱：序号记为 0，段名是 `snap-<快照名>-<分片名>`。
+/// 把一个分片的 op 写进收件箱：序号记为 0，段名是 `snap-<快照名>-<分片名>`，先停在
+/// 暂存状态（[`INBOX_SNAP_STAGE`]）——这份快照的分片还没全部通过校验，合入不看它们。
+/// 悬空的到期清理按「段取回的时刻」算，这里一并记下；快照携带的 HLC 等转正时才观察，
+/// 不让没提交的批次推动逻辑时钟。
 fn insert_part(ctx: &Ctx, seg: &str, lines: &[PartLine<'_>], sessions_on: bool) -> Result<usize> {
     let now = now_ms();
     let mut inserted = 0usize;
@@ -1295,12 +1474,8 @@ fn insert_part(ctx: &Ctx, seg: &str, lines: &[PartLine<'_>], sessions_on: bool) 
                  VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
             )?;
             let mut count = 0usize;
-            let mut newest: Option<&str> = None;
             let mut origins: BTreeSet<&str> = BTreeSet::new();
             for line in batch {
-                if newest.is_none_or(|best| line.hlc.as_str() > best) {
-                    newest = Some(&line.hlc);
-                }
                 // 会话范围没开的设备不收会话类的 op（与合入时的处理一致）。
                 if !sessions_on && merge::SESSION_OPS.contains(&line.kind.as_str()) {
                     continue;
@@ -1311,13 +1486,10 @@ fn insert_part(ctx: &Ctx, seg: &str, lines: &[PartLine<'_>], sessions_on: bool) 
                     line.hlc,
                     line.sid,
                     line.raw,
-                    INBOX_PENDING
+                    INBOX_SNAP_STAGE
                 ])?;
                 origins.insert(line.origin);
                 count += 1;
-            }
-            if let Some(hlc) = newest {
-                sync_db::hlc_observe(tx, hlc)?;
             }
             // 悬空的 op 到期清理时按「段取回的时刻」算。
             for origin in origins {
@@ -1339,8 +1511,74 @@ fn insert_part(ctx: &Ctx, seg: &str, lines: &[PartLine<'_>], sessions_on: bool) 
     Ok(inserted)
 }
 
-/// 吃一个快照：各分片的 op 进收件箱，然后把各设备日志的读取位置挪到快照的版本向量。
-/// 位置最后才挪：中途失败的话位置没动，下次从头再来（重复的 op 靠幂等消化）。
+/// 没有提交完的快照批：应用快照中断后它们留在收件箱里等下一次 [`apply`] 开头清理；
+/// 引擎启动后的第一轮合入先把它们清掉，免得一直压着「本机够格写快照」（收件箱非空就
+/// 不写）。只在登记了「正在吃快照」的时候查一下，平时零开销。
+///
+/// 两个来源都清：
+/// - 新版本的暂存行（[`INBOX_SNAP_STAGE`]，登记的前缀之内与之外都算——暂存行本来就
+///   只在应用期间有效）；
+/// - 升级前中断的半批：旧版本把行直接写成可合入（[`INBOX_PENDING`]）而且中途停住的话，
+///   标记还指着它。按标记指向的合法前缀清掉这批历史行，标记一并撤销；别的快照已经
+///   提交的行不在前缀里，照常合入。
+pub(crate) fn clear_uncommitted(ctx: &Ctx) -> Result<()> {
+    let applying = db::read(ctx.db(), |conn| Ok(maint(conn)?.applying.clone()))?;
+    let Some(name) = applying else {
+        // 没有标记也把残留的暂存行清掉（理论上传不下来，防旧库搬家之类的意外）。
+        db::write(ctx.db(), |tx| {
+            tx.execute(
+                "DELETE FROM sync_inbox WHERE seq = 0 AND state = ?1",
+                params![INBOX_SNAP_STAGE],
+            )?;
+            Ok(())
+        })?;
+        return Ok(());
+    };
+    let legal = ids::parse_snapshot_name(&name).is_some();
+    db::write(ctx.db(), |tx| {
+        // 新版本的暂存批：登记之内与之外都清。
+        tx.execute(
+            "DELETE FROM sync_inbox WHERE seq = 0 AND state = ?1",
+            params![INBOX_SNAP_STAGE],
+        )?;
+        // 升级前中断的半批：按标记指向的合法前缀清历史行；标记不合法（库被动过）就不
+        // 碰可合入的行，只把标记清掉——乱删会丢内容，留着最多白合入一遍（幂等）。
+        if legal {
+            tx.execute(
+                "DELETE FROM sync_inbox WHERE seq = 0 AND state = ?1 AND seg LIKE ?2",
+                params![INBOX_PENDING, format!("snap-{name}-%")],
+            )?;
+        }
+        let mut record = maint(tx)?;
+        record.applying = None;
+        put_maint(tx, &record)
+    })?;
+    Ok(())
+}
+
+/// 吃快照的最后一步（与采用向量同一个事务）：这份快照的分片已全部通过校验，把它带进
+/// 收件箱的暂存行转成可合入（[`INBOX_PENDING`]），并观察快照携带的 HLC。位置也在这一个
+/// 事务里挪：要么整个快照生效，要么什么都不生效。
+fn promote_snapshot_rows(tx: &Connection, prefix: &str) -> Result<()> {
+    let upper = format!("{prefix}\u{10ffff}");
+    tx.execute(
+        "UPDATE sync_inbox SET state = ?1 WHERE seq = 0 AND state = ?2 AND seg >= ?3 AND seg < ?4",
+        params![INBOX_PENDING, INBOX_SNAP_STAGE, prefix, upper],
+    )?;
+    let newest: Option<String> = tx.query_row(
+        "SELECT max(hlc) FROM sync_inbox WHERE seq = 0 AND seg >= ?1 AND seg < ?2",
+        params![prefix, upper],
+        |row| row.get(0),
+    )?;
+    if let Some(hlc) = newest {
+        sync_db::hlc_observe(tx, &hlc)?;
+    }
+    Ok(())
+}
+
+/// 吃一个快照：各分片的 op 先以暂存状态进收件箱，全部分片都通过校验后，在采用各设备
+/// 日志读取位置的同一个事务里转成可合入。中途失败的话位置没动、暂存行也不可合入，下次
+/// 从头再来（重复的 op 靠幂等消化）；启动、放弃、改吃别的快照都先清掉暂存批。
 ///
 /// 位置挪过之后，快照的向量之前的日志本机不再去读，那里面的续写与删除只能从快照里的
 /// 结果得知：本机手里要是留着某条已被删除的分支更早的样子，光凭墓碑记的末条认不出来。
@@ -1376,6 +1614,12 @@ async fn apply(
                         params![format!("snap-{name}-%")],
                     )?;
                 }
+                // 别的暂存批也一律不留：它们要么属于上面的 leftovers，要么是更早中断的
+                // 半批（它的快照已经不在这台设备的 head 里了）。
+                tx.execute(
+                    "DELETE FROM sync_inbox WHERE seq = 0 AND state = ?1",
+                    params![INBOX_SNAP_STAGE],
+                )?;
                 record.applying = Some(name);
                 put_maint(tx, &record)
             })
@@ -1406,15 +1650,19 @@ async fn apply(
         })
         .await?;
     }
-    let (vector, me) = (manifest.vector.clone(), s.device.clone());
+    let (vector, me, prefix) = (manifest.vector.clone(), s.device.clone(), prefix);
     offload(ctx, move |ctx| {
-        db::write(ctx.db(), |tx| adopt_vector(tx, &vector, &me))
+        db::write(ctx.db(), |tx| {
+            promote_snapshot_rows(tx, &prefix)?;
+            adopt_vector(tx, &vector, &me)
+        })
     })
     .await?;
     Ok(inserted)
 }
 
-/// 吃快照的最后一步：把各设备日志的读取位置挪到快照的版本向量。在调用方的写事务里。
+/// 吃快照的最后一步（与转正暂存行同一个事务，见 [`promote_snapshot_rows`]）：把各设备
+/// 日志的读取位置挪到快照的版本向量。在调用方的写事务里。
 fn adopt_vector(tx: &Connection, vector: &BTreeMap<String, VectorEntry>, me: &str) -> Result<()> {
     for (device, entry) in vector {
         if device == me || entry.seq == 0 {
@@ -1510,6 +1758,10 @@ pub async fn bootstrap(
         let mut applied = false;
         for (dev, snap) in candidates {
             let key = snap_key(&dev, &snap.name);
+            // 刚读不过的候选先退避：别让最前面的几个把每一轮的预算都堵光。
+            if memo.backed_off(&key, now_ms()) {
+                continue;
+            }
             if !tried.insert(key.clone()) {
                 continue;
             }
@@ -1597,6 +1849,10 @@ pub async fn bootstrap_new(
     let Some((dev, snap)) = best else {
         return Ok(none);
     };
+    // 刚读不过的清单等退避结束；这一轮照常从头读日志。
+    if memo.backed_off(&snap_key(&dev, &snap.name), now_ms()) {
+        return Ok(none);
+    }
     let manifest = match fetch_manifest(transport, keys, memo, &dev, &snap).await {
         Ok(manifest) => manifest,
         Err(error) if skippable(&error) => {
@@ -1644,7 +1900,7 @@ pub async fn collect_garbage(
     let mut report = GcReport::default();
     if !(0..SWEEP_SPACING_MS).contains(&(now - memo.swept_ms)) {
         memo.swept_ms = now;
-        report.deleted = sweep_due(ctx, transport, now).await?;
+        report.deleted = sweep_due(ctx, transport, keys, now).await?;
     }
     let scan = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
@@ -1656,9 +1912,16 @@ pub async fn collect_garbage(
         return Ok(report);
     }
     refresh_covers(ctx, transport, keys, s, memo).await?;
+    // 候选快照核验完成就接管 head 的快照指针（旧指针退位）；候选回收位置在依据于当前
+    // 存储上重新完整复核通过之后公布。这两个都以「先不动，证据齐了再动」为顺序。
+    promote_snap(ctx, transport, keys, s, memo, now).await?;
     report.floor = {
-        let s = s.clone();
-        offload(ctx, move |ctx| advance_floor(ctx, &s, now)).await?
+        let promoted = promote_floor(ctx, transport, keys, &s.device).await?;
+        if promoted.is_none() {
+            let s = s.clone();
+            offload(ctx, move |ctx| advance_floor(ctx, &s, now)).await?;
+        }
+        promoted
     };
     if !low_memory {
         collect_blobs(ctx, transport, keys, s, memo, now).await?;
@@ -1674,9 +1937,15 @@ pub async fn collect_garbage(
     Ok(report)
 }
 
-/// 删掉登记过、条件已经满足的对象。
-async fn sweep_due(ctx: &Ctx, transport: &dyn SyncTransport, now: i64) -> Result<usize> {
-    let due: Vec<String> = offload(ctx, move |ctx| {
+/// 删掉登记过、条件已经满足的对象。带回收依据的先确认依据还能完整读到——作为依据的
+/// 快照要是在删除前消失了（第三方目录只同步了一半、被人动过），这一批留着等下一轮。
+async fn sweep_due(
+    ctx: &Ctx,
+    transport: &dyn SyncTransport,
+    keys: &Arc<Keys>,
+    now: i64,
+) -> Result<usize> {
+    let due: Vec<(String, Option<(String, String)>)> = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
             let rows = db::state_scan(conn, scope::GC, "")?;
             if rows.is_empty() {
@@ -1685,16 +1954,15 @@ async fn sweep_due(ctx: &Ctx, transport: &dyn SyncTransport, now: i64) -> Result
             let log = db::log_state(conn)?;
             Ok(rows
                 .into_iter()
-                .filter(|(_, row)| {
-                    row.json::<GcWhen>().is_some_and(|when| {
-                        now >= when.after_ms
-                            && when.floor.is_none_or(|floor| log.head_floor >= floor)
-                            && when
-                                .snap
-                                .is_none_or(|snap| log.head_snap.as_ref() == Some(&snap))
-                    })
+                .filter_map(|(path, row)| {
+                    let when = row.json::<GcWhen>()?;
+                    (now >= when.after_ms
+                        && when.floor.is_none_or(|floor| log.head_floor >= floor)
+                        && when
+                            .snap
+                            .is_none_or(|snap| log.head_snap.as_ref() == Some(&snap)))
+                    .then(|| (path, when.basis))
                 })
-                .map(|(path, _)| path)
                 .take(SWEEP_BATCH)
                 .collect())
         })
@@ -1704,8 +1972,60 @@ async fn sweep_due(ctx: &Ctx, transport: &dyn SyncTransport, now: i64) -> Result
         return Ok(0);
     }
     let started = Instant::now();
+    // 复核（下载、核对摘要）与删除共享这一轮的时间预算：总预算再按依据份数均分，排在
+    // 后面的依据也分得到一份；每份在自己的份额里核对，进度跨轮保留。每份依据确认一次
+    // 就够：同一批删除押的是同一份快照。
+    let mut checked: HashMap<(String, String), BasisCheck> = HashMap::new();
+    let distinct: Vec<(String, String)> = {
+        let mut seen = HashSet::new();
+        due.iter()
+            .filter_map(|(_, basis)| basis.clone())
+            .filter(|basis| seen.insert(basis.clone()))
+            .collect()
+    };
+    let mut share = SWEEP_BUDGET / distinct.len().max(1) as u32;
+    share = share.max(Duration::from_millis(500));
+    let mut deletable: Vec<String> = Vec::new();
+    let mut due_left: Vec<(String, Option<(String, String)>)> = Vec::new();
+    for (path, basis) in due {
+        let Some(basis) = basis else {
+            deletable.push(path);
+            continue;
+        };
+        let verdict = match checked.get(&basis) {
+            Some(&verdict) => verdict,
+            None => {
+                let slice = share.min(SWEEP_BUDGET.saturating_sub(started.elapsed()));
+                if slice.is_zero() {
+                    // 总预算用完：剩下的（连同这条）下一轮再来，进度各自保留。
+                    due_left.push((path, Some(basis)));
+                    continue;
+                }
+                let mut progress = load_basis_progress(ctx, &basis).await?;
+                let verdict = basis_intact(
+                    transport,
+                    keys,
+                    &basis,
+                    &mut progress,
+                    started + slice,
+                    BASIS_PARTS_PER_ROUND,
+                )
+                .await;
+                save_basis_progress(ctx, &basis, &progress).await?;
+                checked.insert(basis.clone(), verdict);
+                verdict
+            }
+        };
+        match verdict {
+            BasisCheck::Intact => deletable.push(path),
+            BasisCheck::Deferred | BasisCheck::Broken => {
+                tracing::debug!("回收依据 {} 这轮没核验完或已失效，押着它的对象先不删", basis.0);
+                due_left.push((path, Some(basis)));
+            }
+        }
+    }
     let mut done: Vec<String> = Vec::new();
-    for path in due {
+    for path in deletable {
         if started.elapsed() > SWEEP_BUDGET {
             break;
         }
@@ -1723,11 +2043,166 @@ async fn sweep_due(ctx: &Ctx, transport: &dyn SyncTransport, now: i64) -> Result
             for path in &done {
                 db::state_del(tx, scope::GC, path)?;
             }
+            // 还押着对象的依据，进度记录留着——包括这轮没轮到的、以及已经核验完但删除
+            // 还没排上的（只看这一批剩下的会把后者的进度清掉，下一轮又从头核）。全都不
+            // 再有对象押着的依据，进度一并清掉。
+            let done_set: HashSet<&str> = done.iter().map(|path| path.as_str()).collect();
+            let mut still_needed: HashSet<String> = db::state_scan(tx, scope::GC, "")?
+                .into_iter()
+                .filter(|(path, _)| !done_set.contains(path.as_str()))
+                .filter_map(|(_, row)| row.json::<GcWhen>()?.basis.map(|basis| basis.0))
+                .collect();
+            if let Some(pending) = maint(tx)?.floor_pending {
+                still_needed.insert(pending.basis.0);
+            }
+            for (key, _) in db::state_scan(tx, SCOPE_BASIS_CHECK, "")? {
+                if !still_needed.contains(&key) {
+                    db::state_del(tx, SCOPE_BASIS_CHECK, &key)?;
+                }
+            }
             Ok(())
         })
     })
     .await?;
     Ok(deleted)
+}
+
+/// 回收依据的分片复核进度（`sync_state` 的 `gc-basis-check`）：键 `<设备>/<快照名>`，
+/// 值 [`BasisProgress`]。与 [`Maint::covers_checked`] 分开记：回收前的复核要独立于登记
+/// 时的核验，二者之间分片可能被动过。
+const SCOPE_BASIS_CHECK: &str = "gc-basis-check";
+
+/// 一次依据复核的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BasisCheck {
+    /// 清单与全部数据片都对上了。
+    Intact,
+    /// 这一轮的预算 / 配额用完，还没核完（`progress` 里是推进后的进度）。
+    Deferred,
+    /// 核验对不上：清单读不到或摘要不符、某个数据片对不上。这轮不删，下一轮再试。
+    Broken,
+}
+
+/// 跨轮复核的进度：清单摘要钉住内容；`next` 之前的前缀都已下载核对过摘要，`versions`
+/// 与清单分片一一对应，记着核对时存储端给出的对象版本（[`ObjectMeta::tag`]；存储端给
+/// 不出可靠版本的记空串）。下一轮先比版本：没变就沿用上次的结论，变了（对象被覆盖过）
+/// 或给不出可靠版本就重新下载核对——两次轮询之间悄悄坏掉的数据片逃不过重读。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct BasisProgress {
+    digest: String,
+    /// 已经核对过摘要的前缀长度。
+    next: usize,
+    #[serde(default)]
+    versions: Vec<String>,
+}
+
+async fn load_basis_progress(ctx: &Ctx, basis: &(String, String)) -> Result<BasisProgress> {
+    let (key, digest) = (basis.0.clone(), basis.1.clone());
+    offload(ctx, move |ctx| {
+        db::read(ctx.db(), |conn| {
+            Ok(db::state_get(conn, SCOPE_BASIS_CHECK, &key)?
+                .and_then(|row| row.json::<BasisProgress>())
+                .filter(|saved| saved.digest == digest)
+                .unwrap_or_default())
+        })
+    })
+    .await
+}
+
+async fn save_basis_progress(
+    ctx: &Ctx,
+    basis: &(String, String),
+    progress: &BasisProgress,
+) -> Result<()> {
+    let (key, saved) = (basis.0.clone(), progress.clone());
+    offload(ctx, move |ctx| {
+        db::write(ctx.db(), |tx| {
+            db::state_put_json(tx, SCOPE_BASIS_CHECK, &key, db::HLC_ZERO, &saved)
+        })
+    })
+    .await
+}
+
+/// 不可逆删除或公布候选回收位置前，回收依据（`<设备>/<快照名>`、清单摘要）是否仍可
+/// 恢复：下载清单、解密、核对摘要；数据片逐个核对——上轮核过的前缀先比对象版本，版本
+/// 没变的沿用结论，其余下载核对摘要。`deadline` 与 `max_parts` 把这一轮的占用封住，
+/// 核不完返回 [`BasisCheck::Deferred`]（`progress` 带回推进后的进度）。任何一环对不上
+/// 都返回 [`BasisCheck::Broken`]——这一批删除等下一轮，物理删除只在全部对上之后执行。
+async fn basis_intact(
+    transport: &dyn SyncTransport,
+    keys: &Arc<Keys>,
+    basis: &(String, String),
+    progress: &mut BasisProgress,
+    deadline: Instant,
+    max_parts: usize,
+) -> BasisCheck {
+    let Some((dev, name)) = basis.0.split_once('/') else {
+        return BasisCheck::Broken;
+    };
+    let path = codec::snapshot_path(dev, name);
+    let digest = basis.1.clone();
+    let object = match transport
+        .get(&path, codec::sealed_max(MANIFEST_PLAIN_MAX))
+        .await
+    {
+        Ok(object) => object,
+        Err(_) => return BasisCheck::Broken,
+    };
+    let keys_for_parse = keys.clone();
+    let (dev_for_parse, name_for_parse) = (dev.to_string(), name.to_string());
+    let manifest = match blocking(move || {
+        let plain = codec::open_log_object(&keys_for_parse, &path, &object, MANIFEST_PLAIN_MAX)?;
+        if sha256_hex(&plain) != digest {
+            return Err(SyncError::corrupt("回收依据的摘要不符"));
+        }
+        Manifest::parse(&plain, &dev_for_parse, &name_for_parse)
+    })
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(_) => return BasisCheck::Broken,
+    };
+    // 清单换过（摘要不符已经拦了）或进度越界：从头核。
+    if progress.digest != basis.1 || progress.next > manifest.parts.len() {
+        progress.digest = basis.1.clone();
+        progress.next = 0;
+        progress.versions.clear();
+    }
+    let mut worked = 0usize;
+    while progress.next < manifest.parts.len()
+        && worked < max_parts
+        && Instant::now() < deadline
+    {
+        let index = progress.next;
+        let part = &manifest.parts[index];
+        let part_path = codec::snapshot_part_path(dev, name, &part.name);
+        // 上轮核过的先比版本；要重核就趁下载前把版本取好，核过之后记下来——记的必须是
+        // 核对当时存储端的版本，别的设备拿着它才能信「这份内容核对过」。
+        let meta = transport::stat(transport, &part_path).await.ok().flatten();
+        let saved = progress.versions.get(index);
+        let trusted = match (&meta, saved) {
+            (Some(meta), Some(saved)) if meta.stable_version && !saved.is_empty() => {
+                meta.tag() == *saved
+            }
+            _ => false,
+        };
+        if !trusted && verify_snapshot_part(transport, keys, dev, name, part).await.is_err() {
+            return BasisCheck::Broken;
+        }
+        if progress.versions.len() <= index {
+            progress.versions.resize(index + 1, String::new());
+        }
+        progress.versions[index] = meta
+            .filter(|meta| meta.stable_version)
+            .map_or(String::new(), |meta| meta.tag());
+        progress.next += 1;
+        worked += 1;
+    }
+    if progress.next >= manifest.parts.len() {
+        BasisCheck::Intact
+    } else {
+        BasisCheck::Deferred
+    }
 }
 
 /// 一个快照覆盖了本机日志到哪里。它的向量里记的必须确实是本机这条日志上的位置。
@@ -1749,7 +2224,9 @@ fn coverage(manifest: &Manifest, me: &str, log: &LogState, entries: &[SegEntry])
 }
 
 /// 各设备 head 里带着的快照覆盖了本机日志到哪里：没算过的读它的清单算出来记下，已经
-/// 没人提的快照从记录里去掉。
+/// 没人提的快照从记录里去掉。算出来的只是「清单说覆盖到哪里」；推进回收位置之前，还要
+/// 把分片分批下载下来核对摘要（[`Maint::covers_checked`]），全对上了才算数——清单先到、
+/// 分片迟到或漏掉（第三方同步文件夹会这样）的快照不能当成日志的备份。
 async fn refresh_covers(
     ctx: &Ctx,
     transport: &dyn SyncTransport,
@@ -1758,28 +2235,61 @@ async fn refresh_covers(
     memo: &mut Memo,
 ) -> Result<()> {
     let me = s.device.clone();
-    let (refs, known, log, entries) = offload(ctx, move |ctx| {
+    let (refs, known, known_checked, log, entries) = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
+            let record = maint(conn)?;
             let log = db::log_state(conn)?;
             let mut refs: Vec<(String, SnapRef)> = db::peers(conn)?
                 .into_iter()
                 .filter_map(|(device, peer)| peer.snap.map(|snap| (device, snap)))
                 .collect();
-            refs.extend(log.snap.clone().map(|snap| (me, snap)));
-            Ok((refs, maint(conn)?.covers, log, seal::seg_entries(conn)?))
+            refs.extend(log.snap.clone().map(|snap| (me.clone(), snap)));
+            // 候选快照还没接管 head：把它也放进名单，分批核验才有预算轮到它。
+            if let Some(pending) = &record.snap_pending {
+                if log.snap.as_ref().map(|snap| snap.name.as_str()) != Some(pending.name.as_str())
+                {
+                    refs.push((me.clone(), pending.clone()));
+                }
+            }
+            Ok((refs, record.covers, record.covers_checked, log, seal::seg_entries(conn)?))
         })
     })
     .await?;
     let mut covers: BTreeMap<String, u64> = BTreeMap::new();
+    // 没人提的快照的核验进度也去掉；有人提的留着——预算轮不到它时依据不丢。
+    let mut checked: BTreeMap<String, VerifiedCover> = known_checked
+        .iter()
+        .filter(|(key, _)| {
+            refs.iter()
+                .any(|(dev, snap)| &snap_key(dev, &snap.name) == *key)
+        })
+        .map(|(key, entry)| (key.clone(), entry.clone()))
+        .collect();
     let mut fetches = 0usize;
+    let mut verify_budget = VERIFY_PARTS_PER_ROUND;
     for (dev, snap) in &refs {
         let key = snap_key(dev, &snap.name);
-        if let Some(seq) = known.get(&key) {
-            covers.insert(key, *seq);
+        // 覆盖算过没有：算过就用记下的；没算过要读清单。
+        let need_cover = known.get(&key).is_none();
+        // 核验还没做完的也要清单（分片名单在清单里）：只读内存里有的，不额外占预算。
+        let label = checked.get(&key);
+        let need_verify = label.is_none_or(|entry| !entry.complete() || entry.digest != snap.digest);
+        if !need_cover && !need_verify {
+            covers.insert(key.clone(), known[&key]);
+            continue;
+        }
+        // 清单刚读不过的先退避，下一轮再试；已有的核验进度照旧留着。
+        if memo.backed_off(&key, now_ms()) {
+            if let Some(seq) = known.get(&key) {
+                covers.insert(key, *seq);
+            }
             continue;
         }
         if memo.get(&key).is_none() {
             if fetches >= MANIFESTS_PER_ROUND {
+                if let Some(seq) = known.get(&key) {
+                    covers.insert(key, *seq);
+                }
                 continue;
             }
             fetches += 1;
@@ -1788,17 +2298,52 @@ async fn refresh_covers(
             Ok(manifest) => manifest,
             Err(error) if skippable(&error) => {
                 tracing::debug!("读设备 {dev} 的快照清单失败: {error}");
+                if let Some(seq) = known.get(&key) {
+                    covers.insert(key, *seq);
+                }
                 continue;
             }
             Err(error) => return Err(error),
         };
-        covers.insert(key, coverage(&manifest, &s.device, &log, &entries));
+        if need_cover {
+            covers.insert(key.clone(), coverage(&manifest, &s.device, &log, &entries));
+        } else {
+            covers.insert(key.clone(), known[&key]);
+        }
+        // 分批核验这份快照的分片：换清单（换了内容）就从头核。
+        let mut entry = checked.remove(&key).unwrap_or_default();
+        if entry.digest != snap.digest {
+            entry.next = 0;
+        }
+        entry.digest = snap.digest.clone();
+        entry.seq = covers[&key];
+        entry.parts = manifest.parts.len();
+        while entry.next < entry.parts && verify_budget > 0 {
+            let part = &manifest.parts[entry.next];
+            match verify_snapshot_part(transport, keys, dev, &snap.name, part).await {
+                Ok(()) => {
+                    entry.next += 1;
+                    verify_budget -= 1;
+                }
+                Err(error) if skippable(&error) => {
+                    tracing::debug!(
+                        "设备 {dev} 的快照 {} 分片 {} 核验不过（下一轮再试）: {error}",
+                        snap.name,
+                        part.name
+                    );
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        checked.insert(key, entry);
     }
-    if covers != known {
+    if covers != known || checked != known_checked {
         offload(ctx, move |ctx| {
             db::write(ctx.db(), |tx| {
                 let mut record = maint(tx)?;
                 record.covers = covers;
+                record.covers_checked = checked;
                 put_maint(tx, &record)
             })
         })
@@ -1807,18 +2352,23 @@ async fn refresh_covers(
     Ok(())
 }
 
-/// 回收本机的日志：已经打进汇总包、head 也改用汇总包的零散段对象；以及被所有活跃设备
-/// 回执、又被某个快照覆盖的那一段日志（回收位置前移）。只在本机登记，对象稍后才删。
-/// 返回新的回收位置（没动为 `None`）。
-fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<Option<u64>> {
-    let moved = db::write(ctx.db(), |tx| {
-        let mut log = db::log_state(tx)?;
+/// 回收本机的日志，分两步（都只在本机登记）：
+/// 这一步登记**候选**回收位置：把要删的段与汇总包按宽限期排队、把位置记进
+/// [`Maint::floor_pending`]，但日志索引、`log.floor` 与 head 都不动——新设备仍然按旧
+/// 边界读得到这些对象。公布（推进位置、改写 head）由 [`promote_floor`] 在依据的快照于
+/// 当前存储上完整复核通过之后进行。
+/// 另一件独立的事照旧直接做：已经打进汇总包、head 也改用汇总包的零散段对象，排队删除。
+fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
+    db::write(ctx.db(), |tx| {
+        let log = db::log_state(tx)?;
         let mut entries = seal::seg_entries(tx)?;
         let packs = upload::pack_entries(tx)?;
+        let mut record = maint(tx)?;
         let grace = GcWhen {
             after_ms: now + LOG_GRACE_MS,
             floor: None,
             snap: None,
+            basis: None,
         };
         for entry in &mut entries {
             if entry.packed && entry.up && !entry.gone && entry.to <= log.head_packed {
@@ -1827,15 +2377,29 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<Option<u64>> {
                 seal::put_seg_entry(tx, entry)?;
             }
         }
+        // 上一个候选还没公布：不叠加新的，先把旧的等出结果。
+        if record.floor_pending.is_some() {
+            return Ok(());
+        }
         // 最近的几个段始终留着。
         let Some(keep) = entries
             .len()
             .checked_sub(KEEP_SEGMENTS + 1)
             .map(|index| entries[index].to)
         else {
-            return Ok(None);
+            return Ok(());
         };
-        let covered = maint(tx)?.covers.values().copied().max().unwrap_or(0);
+        // 回收依据只能是完整核验过的快照：清单和它声明的每个分片都对上了（分批核验，
+        // 没核验完的不算数）。挑覆盖得最远的那一份，把它钉在候选记录里，公布与删除之前
+        // 都会在当前存储上再复核。
+        let basis = record
+            .covers_checked
+            .iter()
+            .filter(|(_, entry)| entry.complete())
+            .max_by_key(|(_, entry)| entry.seq)
+            .map(|(key, entry)| (key.clone(), entry.digest.clone(), entry.seq));
+        let covered = basis.as_ref().map_or(0, |(_, _, seq)| *seq);
+        let basis = basis.map(|(key, digest, _)| (key, digest));
         // 没有活跃的其他设备时不用等回执：以后加入的设备从快照起步。
         let mut acked = u64::MAX;
         for (_, peer) in db::peers(tx)? {
@@ -1860,37 +2424,271 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<Option<u64>> {
             None => None,
         };
         let Some(floor) = target.filter(|floor| *floor > log.floor) else {
-            return Ok(None);
+            return Ok(());
         };
-        // 对象要等带着新回收位置的 head 写出去之后才删。
+        let Some(basis) = basis else {
+            return Ok(());
+        };
+        // 删除要等带着新回收位置的 head 写出去之后才动手（`floor` 守卫）；删之前与公布
+        // 之前都还会按 basis 复核一次。
         let when = GcWhen {
             after_ms: now + LOG_GRACE_MS,
             floor: Some(floor),
             snap: None,
+            basis: Some(basis.clone()),
         };
         for entry in entries.iter().filter(|entry| entry.to <= floor) {
             if !entry.gone {
                 queue_delete(tx, &codec::segment_path(&s.device, &entry.name), &when)?;
             }
-            seal::del_seg_entry(tx, entry.to)?;
         }
         for pack in packs.iter().filter(|pack| pack.to <= floor) {
             queue_delete(tx, &codec::rollup_path(&s.device, &pack.name), &when)?;
-            upload::del_pack_entry(tx, pack.to)?;
         }
-        if log.rollup.as_ref().is_some_and(|rollup| rollup.to <= floor) {
-            log.rollup = None;
-        }
-        log.floor = floor;
-        log.head_dirty = true;
-        db::put_log_state(tx, &log)?;
-        Ok(Some(floor))
-    })?;
-    if moved.is_some() {
+        record.floor_pending = Some(PendingFloor { floor, basis });
+        put_maint(tx, &record)
+    })
+}
+
+/// 公布候选回收位置（[`Maint::floor_pending`]）：把依据的快照在当前存储上重新完整复核
+/// （跨轮分批，进度按数据片的对象版本绑定，见 [`BasisProgress`]），全部对上才推进日志
+/// 索引、把新回收位置记进 head（下一次写 head 带出去）。在那之前新设备仍按旧边界读得
+/// 到这些对象，引导不会被没有依据的位置卡住。依据的快照不再被任何设备提着（它的设备
+/// 已经换掉并删了它）时，撤销候选并释放押在它上面的删除——这份依据已经不能恢复什么，
+/// 死等只会堵死往后的回收。返回公布的回收位置（没动为 `None`）。
+async fn promote_floor(
+    ctx: &Ctx,
+    transport: &dyn SyncTransport,
+    keys: &Arc<Keys>,
+    device: &str,
+) -> Result<Option<u64>> {
+    let pending = offload(ctx, |ctx| {
+        db::read(ctx.db(), |conn| Ok(maint(conn)?.floor_pending))
+    })
+    .await?;
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+    // 依据的快照还有没有设备提着（谁的 head 里还有它）？
+    let key = pending.basis.0.clone();
+    let device = device.to_string();
+    let referenced = offload(ctx, move |ctx| {
+        db::read(ctx.db(), |conn| {
+            let own = db::log_state(conn)?
+                .snap
+                .map(|snap| snap_key(&device, &snap.name));
+            let peers = db::peers(conn)?
+                .into_iter()
+                .filter_map(|(dev, peer)| peer.snap.map(|snap| snap_key(&dev, &snap.name)));
+            Ok(peers.chain(own).any(|other| other == key))
+        })
+    })
+    .await?;
+    if !referenced {
+        let basis = pending.basis.0.clone();
+        offload(ctx, move |ctx| {
+            db::write(ctx.db(), |tx| {
+                let mut record = maint(tx)?;
+                if record.floor_pending.as_ref().map(|p| p.basis.0.as_str()) != Some(basis.as_str())
+                {
+                    return Ok(());
+                }
+                record.floor_pending = None;
+                put_maint(tx, &record)?;
+                for (path, row) in db::state_scan(tx, scope::GC, "")? {
+                    if row
+                        .json::<GcWhen>()
+                        .is_some_and(|when| when.basis.is_some_and(|b| b.0 == basis))
+                    {
+                        db::state_del(tx, scope::GC, &path)?;
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await?;
+        return Ok(None);
+    }
+    let mut progress = load_basis_progress(ctx, &pending.basis).await?;
+    let verdict = basis_intact(
+        transport,
+        keys,
+        &pending.basis,
+        &mut progress,
+        Instant::now() + SWEEP_BUDGET,
+        BASIS_PARTS_PER_ROUND,
+    )
+    .await;
+    save_basis_progress(ctx, &pending.basis, &progress).await?;
+    if verdict != BasisCheck::Intact {
+        // 暂缓或失效都不公布：等下一轮。失效的依据要是一直修不好，它的设备换快照、
+        // head 指针挪走之后，上面的「没人提着」分支会来收尾。
+        return Ok(None);
+    }
+    let floor = pending.floor;
+    let promoted = offload(ctx, move |ctx| {
+        db::write(ctx.db(), |tx| {
+            let mut record = maint(tx)?;
+            // 候选还是这一个才动手；被并发改掉就等下一轮。
+            if record.floor_pending.as_ref() != Some(&pending) {
+                return Ok(None);
+            }
+            let mut log = db::log_state(tx)?;
+            for entry in seal::seg_entries(tx)?.iter().filter(|entry| entry.to <= floor) {
+                seal::del_seg_entry(tx, entry.to)?;
+            }
+            for pack in upload::pack_entries(tx)?.iter().filter(|pack| pack.to <= floor) {
+                upload::del_pack_entry(tx, pack.to)?;
+            }
+            if log.rollup.as_ref().is_some_and(|rollup| rollup.to <= floor) {
+                log.rollup = None;
+            }
+            log.floor = floor;
+            log.head_dirty = true;
+            db::put_log_state(tx, &log)?;
+            record.floor_pending = None;
+            put_maint(tx, &record)?;
+            Ok(Some(floor))
+        })
+    })
+    .await?;
+    if promoted.is_some() {
         // 这些段在本机留着的密文也用不上了。
         seal::sweep_outgoing(ctx)?;
     }
-    Ok(moved)
+    Ok(promoted)
+}
+
+/// 候选快照（[`Maint::snap_pending`]）接管 head 的快照指针：分片完整核验（清单摘要与
+/// 写它时一致、每个分片都对上了）、向量也覆盖到本机当前的回收边界，才取代上一份快照。
+/// 上一份快照的删除押在「新指针已公布」上（宽限期 + head 守卫），它还是候选回收位置
+/// 的依据时再多留一阵——公布之后就没人在乎它了，下一轮写快照时按旧对象清走。
+async fn promote_snap(
+    ctx: &Ctx,
+    transport: &dyn SyncTransport,
+    keys: &Arc<Keys>,
+    s: &Settings,
+    memo: &mut Memo,
+    now: i64,
+) -> Result<()> {
+    let pending = offload(ctx, |ctx| {
+        db::read(ctx.db(), |conn| Ok(maint(conn)?.snap_pending))
+    })
+    .await?;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let key = snap_key(&s.device, &pending.name);
+    let verified = offload(ctx, {
+        let key = key.clone();
+        let digest = pending.digest.clone();
+        move |ctx| {
+            db::read(ctx.db(), |conn| {
+                Ok(maint(conn)?
+                    .covers_checked
+                    .get(&key)
+                    .is_some_and(|entry| entry.complete() && entry.digest == digest))
+            })
+        }
+    })
+    .await?;
+    if !verified {
+        return Ok(());
+    }
+    // 向量覆盖到当前的回收边界（`coverage` 会对照日志核对清单里记的位置）。
+    let manifest = match fetch_manifest(transport, keys, memo, &s.device, &pending).await {
+        Ok(manifest) => manifest,
+        Err(error) if skippable(&error) => {
+            tracing::debug!("读候选快照 {} 的清单失败（下一轮再试）: {error}", pending.name);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let (covers_floor, previous, dir) = offload(ctx, {
+        let manifest = manifest.clone();
+        let device = s.device.clone();
+        move |ctx| {
+            db::read(ctx.db(), |conn| {
+                let log = db::log_state(conn)?;
+                let entries = seal::seg_entries(conn)?;
+                let covered = coverage(&manifest, &device, &log, &entries);
+                Ok((covered >= log.floor, log.snap.clone(), snapshot_dir(&device)))
+            })
+        }
+    })
+    .await?;
+    if !covers_floor {
+        // 覆盖不到当前的回收边界：它替代不了上一份快照，等下一份候选。
+        return Ok(());
+    }
+    // 上一份快照的全部对象（清单加数据片）——接管之后它们退位，按宽限期排队。
+    let old_paths: Vec<String> = match previous.as_ref().map(|previous| previous.name.clone()) {
+        Some(name) if name != pending.name => transport
+            .list(&dir)
+            .await?
+            .into_iter()
+            .filter(|meta| snapshot_of(&meta.name) == Some(name.as_str()))
+            .map(|meta| format!("{dir}{}", meta.name))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let device = s.device.clone();
+    offload(ctx, move |ctx| {
+        db::write(ctx.db(), |tx| {
+            let mut record = maint(tx)?;
+            // 候选还是这一个才动手；被并发改掉就等下一轮。
+            if record.snap_pending.as_ref() != Some(&pending) {
+                return Ok(());
+            }
+            let mut log = db::log_state(tx)?;
+            record.snap_pending = None;
+            log.snap = Some(pending.clone());
+            log.head_dirty = true;
+            db::put_log_state(tx, &log)?;
+            put_maint(tx, &record)?;
+            let Some(previous) = previous else {
+                return Ok(());
+            };
+            if previous.name == pending.name {
+                return Ok(());
+            }
+            let old_key = snap_key(&device, &previous.name);
+            // 上一份快照还是候选回收位置的依据：先留着它（公布回收位置之前它还是唯一
+            // 的恢复路径），不排删除。
+            let still_basis = record
+                .floor_pending
+                .as_ref()
+                .is_some_and(|pending| pending.basis.0 == old_key);
+            // 其余押在上一份快照上的日志对象改押刚核验过的这一份，不然它们永远删不掉。
+            let new_key = snap_key(&device, &pending.name);
+            for (path, row) in db::state_scan(tx, scope::GC, "")? {
+                let Some(mut when) = row.json::<GcWhen>() else {
+                    continue;
+                };
+                if let Some((who, digest)) = &mut when.basis {
+                    if *who == old_key {
+                        *who = new_key.clone();
+                        *digest = pending.digest.clone();
+                        db::state_put_json(tx, scope::GC, &path, db::HLC_ZERO, &when)?;
+                    }
+                }
+            }
+            if !still_basis {
+                let when = GcWhen {
+                    after_ms: now + SNAP_GRACE_MS,
+                    floor: None,
+                    snap: Some(pending.name.clone()),
+                    basis: None,
+                };
+                for path in old_paths {
+                    queue_delete(tx, &path, &when)?;
+                }
+            }
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(())
 }
 
 /// 本机的消息与技能还引用着的附件对象。分页读，不长时间占着库锁。
@@ -2065,6 +2863,7 @@ fn note_unreferenced(
                     after_ms: now,
                     floor: None,
                     snap: None,
+                    basis: None,
                 },
             )?;
             // 文件还在本机：以后又有人要的话（`blob.want`）重新上传。

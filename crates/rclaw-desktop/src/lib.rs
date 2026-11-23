@@ -241,6 +241,7 @@ pub fn run() {
             commands::whisper_transcribe,
             commands::sync::sync_status,
             commands::sync::sync_save_config,
+            commands::sync::sync_save_storage,
             commands::sync::sync_set_secret,
             commands::sync::sync_test_connection,
             commands::sync::sync_probe_certificate,

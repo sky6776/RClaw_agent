@@ -345,10 +345,22 @@ impl SyncTransport for WebdavTransport {
                     "服务端的目录列表没有给出文件长度（getcontentlength），无法用于同步".into(),
                 ));
             };
+            // 强 ETag 算稳定标识。弱 ETag（`W/"…"`：服务端不保证两次取回逐字节一致）与
+            // 只有修改时间的不算：等长的两次更新可以带着同一个弱标签、同一个秒级时间
+            // ——同长度的新内容会被当成旧值，读者据此不能判重
+            // （[`ObjectMeta::stable_version`]），只能按有界的窗口定期实读。
+            let (version, stable_version) = match (entry.etag, entry.modified) {
+                (Some(etag), _) => {
+                    let strong = !etag.trim_start().starts_with("W/");
+                    (etag, strong)
+                }
+                (None, modified) => (modified.unwrap_or_default(), false),
+            };
             out.push(ObjectMeta {
                 name: name.to_string(),
                 size,
-                version: entry.etag.or(entry.modified).unwrap_or_default(),
+                version,
+                stable_version,
             });
         }
         Ok(out)

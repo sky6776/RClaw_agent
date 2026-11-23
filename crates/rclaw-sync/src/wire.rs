@@ -12,7 +12,7 @@ use rclaw_store::{Db, SessionStore};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{sha256_reader, Keys};
+use crate::crypto::{sha256_hex, sha256_reader, Keys};
 use crate::db::{self, BLOB_REMOTE};
 use crate::error::{Result, SyncError};
 use crate::map::{self, MsgMap, SessionMap};
@@ -448,7 +448,7 @@ pub fn cache_path(path: &str, blob: &str) -> String {
     format!("sync/files/{}/{blob}/{name}", &blob[..2.min(blob.len())])
 }
 
-fn placeholder_text(size: u64) -> String {
+pub(crate) fn placeholder_text(size: u64) -> String {
     format!(
         "（这段工具结果全文共 {size} 字节，保存在另一台设备上，还没有下载到本机。\
          可以在「多端同步」里下载附件后再读取。）\n"
@@ -518,7 +518,9 @@ pub struct Landing<'a> {
 }
 
 /// 把消息内联的 artifact 全文写进会话的 artifact 目录；没有内联的全文先放一个占位文件
-/// （本机已有或以后取回时由 [`settle_aliases`] 换成全文）。
+/// （本机已有或以后取回时由 [`settle_aliases`] 换成全文）。内联全文撞上同名不同内容的
+/// 文件时不覆盖，改放进按摘要命名的同步缓存——[`land_msg`] 会把它登记成附件，附件区
+/// 按对象列出来。
 ///
 /// 只做文件 IO，不碰数据库。调用方在开事务**之前**做完：事务里不做磁盘写入（库锁是
 /// 会话读写共用的），而且提交之后消息里的句柄一定指向存在的文件。重复执行结果相同。
@@ -532,10 +534,30 @@ pub fn write_artifacts(env: &Env, channel: &str, chat_id: &str, msg: &WireMsg) -
         let path = dir.join(&artifact.name);
         env.check_path(&format!("{rel_dir}{}", artifact.name), &path)?;
         match &artifact.text {
-            Some(text) => rclaw_store::atomic_write(&path, text.as_bytes())?,
+            Some(text) => {
+                // 落点冲突策略与取回下载一致（§8.7）：原位置已有内容不同的真实文件就
+                // 不覆盖，全文放进按摘要命名的同步缓存，会话顶部的附件区列着它。
+                let same = path.is_file()
+                    && std::fs::read(&path)
+                        .map(|bytes| bytes == text.as_bytes())
+                        .unwrap_or(false);
+                if path.exists() && !same {
+                    let digest = sha256_hex(text.as_bytes());
+                    let rel = cache_path(&format!("{rel_dir}{}", artifact.name), &digest);
+                    let full = env.checked_path(&rel)?;
+                    if let Some(parent) = full.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    rclaw_store::atomic_write(&full, text.as_bytes())?;
+                } else {
+                    rclaw_store::atomic_write(&path, text.as_bytes())?;
+                }
+            }
             None if !path.exists() => {
                 rclaw_store::atomic_write(&path, placeholder_text(artifact.size).as_bytes())?
             }
+            // 原位置已有文件就不动：是我们写下的占位（等着取回的全文来替换），或是
+            // 同一对象之前已经落过地；真实文件更不能覆盖。
             None => {}
         }
     }
@@ -575,7 +597,21 @@ pub fn land_msg(conn: &Connection, env: &Env, landing: Landing<'_>, msg: &WireMs
     };
     let rel_dir = artifact_rel_dir(landing.channel, landing.chat_id);
     for artifact in &msg.artifacts {
-        if artifact.text.is_some() {
+        if let Some(text) = &artifact.text {
+            // 内联全文撞了名、被 [`write_artifacts`] 放进按摘要命名的同步缓存的：登记成
+            // 本机的缓存附件（对象名就是内容摘要，本机就有），附件区按对象列出来。没撞
+            // 名的全文在 artifact 目录里，消息自己就能打开，不进附件清单。缓存文件在不
+            // 在与 `write_artifacts` 的落点决定是同一个判据，重复执行结果相同。
+            let digest = sha256_hex(text.as_bytes());
+            let rel = cache_path(&format!("{rel_dir}{}", artifact.name), &digest);
+            if env.resolve(&rel).is_file() {
+                db::blob_register(conn, &digest, &rel, artifact.size, BLOB_FETCHED)?;
+                stored.artifacts.push(ArtifactRef {
+                    name: artifact.name.clone(),
+                    size: artifact.size,
+                    blob: Some(digest),
+                });
+            }
             continue;
         }
         stored.artifacts.push(ArtifactRef {
@@ -609,35 +645,58 @@ pub fn land_msg(conn: &Connection, env: &Env, landing: Landing<'_>, msg: &WireMs
     Ok(message_id)
 }
 
-/// artifact 的占位文件可以被取回的全文覆盖；工作区里的文件不覆盖（§8.7）。
-fn may_overwrite(rel_path: &str) -> bool {
-    rel_path.starts_with("artifacts/")
+/// artifact 的占位文件可以被取回的全文覆盖；工作区里的文件不覆盖（§8.7）。可覆盖的
+/// 只有同步自己写下的占位（内容一字不差）：用户改写的、别的版本落过地的都是真实文件。
+/// 读不出来（权限、被占用）返回 `Err`：不能当成「不是占位」销账，留着重试。
+fn may_overwrite(rel_path: &str, target: &std::path::Path, size: u64) -> Result<bool> {
+    if !rel_path.starts_with("artifacts/") {
+        return Ok(false);
+    }
+    std::fs::read(target)
+        .map(|bytes| bytes == placeholder_text(size).as_bytes())
+        .map_err(Into::into)
 }
 
-fn copy_into_place(env: &Env, source_rel: &str, target_rel: &str) -> bool {
+/// 别名落点补全的结果。
+enum Copied {
+    /// 复制成功。
+    Done,
+    /// 目标已经是真实文件（不是占位）：不覆盖。对象在同步缓存里有完整的一份，附件入口
+    /// 按对象找得到——这条落点销掉。
+    Conflict,
+    /// 暂时写不进去或读不了（权限、文件被占）：留着下轮再试。
+    Retry,
+}
+
+fn copy_into_place(env: &Env, source_rel: &str, target_rel: &str, size: u64) -> Copied {
     let (Ok(source), Ok(target)) = (env.checked_path(source_rel), env.checked_path(target_rel))
     else {
-        return false;
+        return Copied::Retry;
     };
-    if target.exists() && !may_overwrite(target_rel) {
-        return false;
+    if target.exists() {
+        match may_overwrite(target_rel, &target, size) {
+            Ok(true) => {}
+            Ok(false) => return Copied::Conflict,
+            // 读不了不是「有冲突」：销了账这份落点就永远缺着，留下轮再试。
+            Err(_) => return Copied::Retry,
+        }
     }
     if let Some(parent) = target.parent() {
         if std::fs::create_dir_all(parent).is_err() {
-            return false;
+            return Copied::Retry;
         }
     }
     // 先写同目录的临时文件再改名：读者看不到复制了一半的文件。
     let staging = target.with_extension(format!("part-{}", crate::ids::random_hex::<4>()));
     if std::fs::copy(source, &staging).is_err() {
         let _ = std::fs::remove_file(&staging);
-        return false;
+        return Copied::Retry;
     }
     if std::fs::rename(&staging, &target).is_err() {
         let _ = std::fs::remove_file(&staging);
-        return false;
+        return Copied::Retry;
     }
-    true
+    Copied::Done
 }
 
 /// 登记一个本机应当有的附件对象，落点是 `rel_path`。本机还没有这个对象（内容寻址）就
@@ -685,9 +744,21 @@ pub const SCOPE_BLOB_ALIAS: &str = "blob-alias";
 /// 把登记过的「其他落点」补上：对象已经在本机的，复制到位并销掉登记；还在别的设备上的
 /// 留着，等取回之后再补。文件复制在库锁之外做。`blob` 给定时只看这一个对象。返回补上的
 /// 个数。
-pub fn settle_aliases(env: &Env, blob: Option<&str>) -> Result<usize> {
+///
+/// `still_valid` 是这次工作的提交许可（换空间期间的作废判据）：复制与销账都要在许可
+/// 之内——许可没了（旧世代已被收尾）就不能再改名进旧落点、销掉旧账目；给 `None` 的
+/// 调用方不受约束（引擎轮次内的补落点，不在换空间的提交边界里）。
+///
+/// 成功、源目标相同、登记没了才销账。目标已是真实文件（重名冲突）也销：对象在同步缓存
+/// 里有完整的一份，附件入口按对象打开的是缓存。暂时写不进去的留着，下一轮再补。
+pub fn settle_aliases(
+    env: &Env,
+    blob: Option<&str>,
+    still_valid: Option<&dyn Fn() -> bool>,
+) -> Result<usize> {
+    let allowed = || still_valid.is_none_or(|valid| valid());
     let prefix = blob.map(|blob| format!("{blob}|")).unwrap_or_default();
-    let todo: Vec<(String, String, String)> = db::read(env.db(), |conn| {
+    let todo: Vec<(String, String, String, u64)> = db::read(env.db(), |conn| {
         let mut todo = Vec::new();
         for (key, _) in db::state_scan(conn, SCOPE_BLOB_ALIAS, &prefix)? {
             let Some((blob_id, target)) = key.split_once('|') else {
@@ -695,11 +766,11 @@ pub fn settle_aliases(env: &Env, blob: Option<&str>) -> Result<usize> {
             };
             let Some(row) = db::blob_get(conn, blob_id)? else {
                 // 对象的登记没了（附件被回收）：这条落点也不用留。
-                todo.push((key.clone(), String::new(), String::new()));
+                todo.push((key.clone(), String::new(), String::new(), 0));
                 continue;
             };
             if row.state != BLOB_REMOTE {
-                todo.push((key.clone(), row.rel_path, target.to_string()));
+                todo.push((key.clone(), row.rel_path, target.to_string(), row.size));
             }
         }
         Ok(todo)
@@ -708,22 +779,34 @@ pub fn settle_aliases(env: &Env, blob: Option<&str>) -> Result<usize> {
         return Ok(0);
     }
     let mut done = 0usize;
-    for (_, source, target) in &todo {
+    let mut settled: Vec<&String> = Vec::new();
+    for (key, source, target, size) in &todo {
         if source.is_empty() || source == target {
+            settled.push(key);
             continue;
         }
-        if copy_into_place(env, source, target) {
-            done += 1;
-        } else {
-            tracing::debug!("附件没有补到 {target}（目标已有文件或写入失败）");
+        // 复制挂在慢盘上时可能正赶上换空间收尾：收尾之后这份许可就没了，不能再把文件
+        // 改名进旧落点。这一条留着，等下一轮（新世代里登记还在的话）再补。
+        if !allowed() {
+            break;
+        }
+        match copy_into_place(env, source, target, *size) {
+            Copied::Done => {
+                done += 1;
+                settled.push(key);
+            }
+            Copied::Conflict => settled.push(key),
+            Copied::Retry => tracing::debug!("附件没有补到 {target}（写入失败，下轮再试）"),
         }
     }
-    db::write(env.db(), |tx| {
-        for (key, _, _) in &todo {
-            db::state_del(tx, SCOPE_BLOB_ALIAS, key)?;
-        }
-        Ok(())
-    })?;
+    if !settled.is_empty() && allowed() {
+        db::write(env.db(), |tx| {
+            for key in &settled {
+                db::state_del(tx, SCOPE_BLOB_ALIAS, key)?;
+            }
+            Ok(())
+        })?;
+    }
     Ok(done)
 }
 

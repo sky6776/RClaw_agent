@@ -2807,16 +2807,33 @@ impl TurnManager {
             }
             return format!("⏳ 系统正在执行清理 / 维护操作，请稍后重试：{retry}");
         };
-        // 同步侧先做（退出同步空间，或把会话删除传给其他设备）：它失败就什么都不清。
-        let mut sync_note = String::new();
-        if let (Some(control), Some(scope)) = (&control, scope) {
-            match self.prepare_clear(control.clone(), scope).await {
-                Ok(note) => sync_note = note,
-                Err(reply) => return reply,
+        // 安全闸先过（任何有副作用的步骤之前）：记忆目录不是真实目录时，不删除任何东西、
+        // 也不给同步侧登记任何删除。
+        if control.is_some() {
+            let layout = self.layout.clone();
+            let checked = tokio::task::spawn_blocking(move || {
+                ensure_dir_is_real(&layout.memory_dir, &layout.base)
+            })
+            .await;
+            if let Err(message) = checked.unwrap_or_else(|e| Err(format!("任务执行异常: {e}"))) {
+                return format!(
+                    "⚠️ 记忆目录安全检查未通过，没有清空任何内容、也没有同步任何删除：\
+                     {message}\n\n请检查目录之后重试：{retry}"
+                );
             }
         }
+        // 同步侧先做（退出同步空间，或把会话删除传给其他设备）：它失败就什么都不清。
+        // 记忆的删除在这里只留副本（不可发布），等本地清空成功后才提交。
+        let (mut sync_note, memory_ids) = match (&control, scope) {
+            (Some(control), Some(scope)) => match self.prepare_clear(control.clone(), scope).await {
+                Ok(result) => result,
+                Err(reply) => return reply,
+            },
+            _ => (String::new(), Vec::new()),
+        };
         let session = self.session.clone();
         let layout = self.layout.clone();
+        let all_scope = matches!(scope, Some(sync::ClearScope::All));
         let cleared =
             tokio::task::spawn_blocking(move || clear_agent_state(&session, &layout)).await;
         if control.is_some() {
@@ -2834,11 +2851,45 @@ impl TurnManager {
             self.history.reset_runtime_state();
             self.ledger_clear_all();
         }
+        // 本地清空成功之后才把记忆的删除登记为可发送；失败时不登记（重试时再走一遍）。
+        if all_scope && control.is_some() && matches!(&cleared, Ok(Ok(_))) {
+            let sync = control.as_ref().unwrap().clone();
+            let committed = tokio::task::spawn_blocking(move || {
+                sync.commit_memory_clear(&memory_ids)
+            })
+            .await;
+            match committed {
+                Ok(Ok(0)) => {}
+                Ok(Ok(count)) => {
+                    sync_note.push_str(&format!(
+                        "\n\n多端同步已把 {count} 条记忆的删除登记给所有设备。"
+                    ));
+                }
+                Ok(Err(error)) => {
+                    sync_note.push_str(&format!(
+                        "\n\n⚠️ 记忆的删除没能同步给其他设备（{error}）；本机已清空，\
+                         重试 /clear confirm all 可以把这一步补上。"
+                    ));
+                }
+                Err(e) => {
+                    sync_note.push_str(&format!(
+                        "\n\n⚠️ 记忆的删除没能同步给其他设备（任务异常: {e}）；本机已清空，\
+                         重试 /clear confirm all 可以把这一步补上。"
+                    ));
+                }
+            }
+        }
         match cleared {
             Ok(Ok(summary)) => format!("✅ 已清空 agent 本地状态：\n\n{summary}{sync_note}"),
             Ok(Err(failure)) => {
+                // 回显从实际提交结果生成：all 范围下会话删除已经传给其他设备了，得说清。
+                let propagated = if all_scope && control.is_some() {
+                    "\n\n（注意：已发布的会话删除在此之前已同步给其他设备，没有回退。）"
+                } else {
+                    ""
+                };
                 format!(
-                    "⚠️ 清空失败（可能部分文件被占用，可重试 {retry}）：{}{sync_note}",
+                    "⚠️ 清空失败（可能部分文件被占用，可重试 {retry}）：{}{propagated}{sync_note}",
                     failure.message
                 )
             }

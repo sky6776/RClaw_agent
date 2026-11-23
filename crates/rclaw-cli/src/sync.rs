@@ -215,6 +215,14 @@ impl CronHost for CronAdapter {
         self.0.add(job).map_err(|error| error.to_string())
     }
 
+    fn add_disabled(&self, job: CronJob) -> std::result::Result<String, String> {
+        self.0.add_disabled(job).map_err(|error| error.to_string())
+    }
+
+    fn set_enabled(&self, id: &str, enabled: bool) -> std::result::Result<(), String> {
+        self.0.set_enabled(id, enabled).map_err(|error| error.to_string())
+    }
+
     fn remove(&self, id: &str) -> std::result::Result<bool, String> {
         self.0.remove(id).map_err(|error| error.to_string())
     }
@@ -391,9 +399,21 @@ impl SyncControl for Control {
             .map_err(|error| error.to_string())
     }
 
-    fn delete_published_sessions(&self) -> std::result::Result<(usize, usize), String> {
+    fn delete_published_sessions(&self) -> std::result::Result<usize, String> {
         self.0
             .delete_published_sessions()
+            .map_err(|error| error.to_string())
+    }
+
+    fn stash_memory_for_clear(&self) -> std::result::Result<Vec<String>, String> {
+        self.0
+            .stash_memory_for_clear()
+            .map_err(|error| error.to_string())
+    }
+
+    fn commit_memory_clear(&self, ids: &[String]) -> std::result::Result<usize, String> {
+        self.0
+            .commit_memory_clear(ids)
             .map_err(|error| error.to_string())
     }
 

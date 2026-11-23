@@ -64,6 +64,7 @@ pub(crate) fn ctx_with(gate: Arc<dyn SessionGate>) -> (tempfile::TempDir, Ctx) {
         host: Arc::new(NoHost),
         cron: None,
         skills: None,
+        space: Arc::new(crate::SpaceEpoch::default()),
     };
     (dir, ctx)
 }

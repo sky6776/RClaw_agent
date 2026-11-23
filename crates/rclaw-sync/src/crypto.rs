@@ -332,6 +332,41 @@ pub fn sha256_reader(reader: &mut dyn Read) -> Result<([u8; 32], u64)> {
     Ok((digest, total))
 }
 
+/// 边读边算 SHA-256 的包装读端：封装密文与核对摘要用同一次读取，密文对应的就是核对过
+/// 的那一段明文（读完 [`Keys::seal_blob`] 之后调 [`HashingReader::finish`]）。
+pub struct HashingReader<R: Read> {
+    inner: R,
+    ctx: digest::Context,
+    total: u64,
+}
+
+impl<R: Read> HashingReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            ctx: digest::Context::new(&digest::SHA256),
+            total: 0,
+        }
+    }
+
+    /// 读到头之后的 `(摘要字节, 长度)`。
+    pub fn finish(self) -> ([u8; 32], u64) {
+        (
+            self.ctx.finish().as_ref().try_into().expect("SHA-256 是 32 字节"),
+            self.total,
+        )
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.ctx.update(&buf[..n]);
+        self.total += n as u64;
+        Ok(n)
+    }
+}
+
 /// 段明文的压缩（deflate）。
 pub fn deflate(data: &[u8]) -> Vec<u8> {
     let mut encoder =

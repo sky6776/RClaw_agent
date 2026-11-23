@@ -69,16 +69,17 @@ fn io_error(what: &str, path: &Path, e: std::io::Error) -> TransportError {
 }
 
 fn meta_of(name: String, meta: &std::fs::Metadata) -> ObjectMeta {
-    let version = meta
+    let modified = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos().to_string())
-        .unwrap_or_default();
+        .map(|d| d.as_nanos().to_string());
+    let stable_version = modified.is_some();
     ObjectMeta {
         name,
         size: meta.len(),
-        version,
+        version: modified.unwrap_or_default(),
+        stable_version,
     }
 }
 

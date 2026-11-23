@@ -1254,25 +1254,26 @@ ${event.payload.command}
     setPage("chat");
   }, []);
 
-  // localOnly（多端同步的「仅本机」）：在第一条消息落库之前就打上标记，发布扫描从一开始
-  // 就跳过这个会话（docs/multi-device-sync.md §7.9）。
+  // localOnly（多端同步的「仅本机」）：先把标记落库，成功才打开会话——发送入口不等待
+  // 标记，先打开后标记的话，标记没落库的窗口里发出去的首条消息会被发布扫描接走（标记
+  // 失败时也拿不到任何补救机会）。打开失败就留在原页，草稿不动，用户可以直接重试。
   const newChat = useCallback(
-    (returnTo: Page | null = null, localOnly = false) => {
+    async (returnTo: Page | null = null, localOnly = false) => {
       const id = freshChatId();
+      if (localOnly) {
+        try {
+          await api.syncSetLocalOnly(id, true);
+        } catch (e) {
+          setErrorToast(`没能把新对话标成「仅本机」，没有打开它: ${String(e)}`);
+          return;
+        }
+        void loadSyncMarks();
+      }
       prepareChat(id, returnTo);
       setChats((prev) => [
         { chat_id: id, title: "新对话", updated_at: Date.now(), archived: false },
         ...prev.filter((c) => c.chat_id !== id),
       ]);
-      if (localOnly) {
-        api
-          .syncSetLocalOnly(id, true)
-          .then(() => loadSyncMarks())
-          // 标记没打上时必须让用户知道：否则他以为这个对话不会同步出去。
-          .catch((e) =>
-            setErrorToast(`没能把新对话标成「仅本机」，它会照常同步: ${String(e)}`),
-          );
-      }
     },
     [prepareChat, loadSyncMarks],
   );
@@ -1301,7 +1302,7 @@ ${event.payload.command}
           if (next) {
             void openChat(next.chat_id, from);
           } else {
-            newChat(from);
+            void newChat(from);
           }
           return list;
         });
@@ -1857,7 +1858,7 @@ ${event.payload.command}
       // 先切会话（入口会清空草稿），再并入分享文本：同一事件批处理中
       // 函数式更新按序应用，并入最终生效。
       if (target === "new") {
-        newChat();
+        void newChat();
       } else {
         void openChat(target);
       }
@@ -1880,7 +1881,7 @@ ${event.payload.command}
       const text = forwardDraftRef.current;
       forwardDraftRef.current = null;
       if (target === "new") {
-        newChat();
+        void newChat();
       } else {
         void openChat(target);
       }
@@ -2186,7 +2187,7 @@ ${event.payload.command}
           {/* 新建对话快捷按钮（RClaw 右侧；新建即回到对话页）。 */}
           <button
             onClick={() => {
-              newChat();
+              void newChat();
               setPage("chat");
               setDrawerOpen(false);
             }}
@@ -2447,8 +2448,9 @@ ${event.payload.command}
             {syncOn && (
               <button
                 onClick={() => {
-                  newChat("chats", true);
-                  setPage("chat");
+                  // 标记落库成功才会切到对话页（newChat 内部做）；失败留在本页提示。
+                  void newChat("chats", true);
+                  setDrawerOpen(false);
                 }}
                 title="新建一个只留在这台设备上、不同步到其他设备的对话"
                 className="shrink-0 whitespace-nowrap rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 max-md:px-2"
@@ -2458,10 +2460,10 @@ ${event.payload.command}
               </button>
             )}
             <button
-              onClick={() => {
-                newChat("chats");
-                setPage("chat");
-              }}
+            onClick={() => {
+              void newChat("chats");
+              setDrawerOpen(false);
+            }}
               className="shrink-0 whitespace-nowrap rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 max-md:px-2"
             >
               ＋ 新建对话

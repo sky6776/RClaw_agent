@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use crate::attach::now_ms;
 use crate::bundle::{self, ImportOptions, Imported};
 use crate::config::{SyncConfig, SyncPaths};
-use crate::db;
+use crate::db::{self, BLOB_FETCHED};
 use crate::error::{Result, SyncError};
 use crate::files;
 use crate::pairing::PairingCode;
@@ -284,6 +284,7 @@ impl SyncEngine {
             host: deps.host,
             cron: deps.cron,
             skills: deps.skills,
+            space: Arc::new(crate::SpaceEpoch::default()),
         };
         SyncEngine {
             inner: Arc::new(Inner {
@@ -564,7 +565,8 @@ impl SyncEngine {
             Ok((Some(lock), secrets))
         })
         .await?;
-        let result = space::leave(&ctx, &mut secrets).await;
+        let config = self.config();
+        let result = space::leave(&ctx, &config, &mut secrets).await;
         drop(lock);
         result
     }
@@ -590,6 +592,30 @@ impl SyncEngine {
     pub async fn set_storage_secret(&self, secret: &str) -> Result<()> {
         let secret = secret.to_string();
         self.call(|reply| Cmd::SetSecret { secret, reply }).await
+    }
+
+    /// 存储的设置与密码一起保存并生效（面板「保存」用这个）：密码按这条命令里的配置
+    /// 绑定存储账户，中间不会有别的配置变更插进来。`secret` 为空 = 不动已经存着的。
+    ///
+    /// 派发之前先把「更新意图」落盘：命令失败（worker 待机、secrets 写失败）时，
+    /// `rclaw.toml` 已经是新的一套而 secrets 还是旧的，重启后的引擎会按记录把剩下的
+    /// 一半补上。命令成功才把新配置公布给宿主、清掉意图——失败时宿主内存里仍是旧配置，
+    /// 界面上看到的与实际生效的一致。
+    pub async fn save_storage(&self, config: SyncConfig, secret: Option<String>) -> Result<()> {
+        worker::storage_intent_save(
+            &self.inner.ctx.paths,
+            &config,
+            secret.as_deref().filter(|secret| !secret.is_empty()),
+        )?;
+        self.call(|reply| Cmd::SaveStorage {
+            config: config.clone(),
+            secret,
+            reply,
+        })
+        .await?;
+        worker::storage_intent_clear(&self.inner.ctx.paths)?;
+        *lock(&self.inner.config) = config;
+        Ok(())
     }
 
     /// 用户同意在按流量计费的网络下做首次同步（§8.8）。
@@ -693,25 +719,38 @@ impl SyncEngine {
         Ok(existed)
     }
 
-    /// `/clear confirm all`（§7.5）：把参与同步、已经发布的会话逐个删除并传播出去，本机
-    /// 各留一份在回收站。返回登记删除的会话数和记忆条目数。其余会话由调用方接着清。
+    /// `/clear confirm all`（§7.5）第一半：把参与同步、已经发布的会话逐个删除并传播出去，
+    /// 本机各留一份在回收站。返回登记删除的会话数。其余会话由调用方接着清。
     ///
-    /// 调用方随后清空的 `MEMORY.md` 同样要传到所有设备：这里把它现有的条目留一份在回收站
-    /// （别的设备合入这些删除时各自留一份），并把清空登记成发给所有设备的删除。同步此刻
-    /// 关着也照办——登记在库里，同步一恢复就传出去。
+    /// 记忆的清空拆在 [`Self::stash_memory_for_clear`]（清空之前留副本）与
+    /// [`Self::commit_memory_clear`]（本地清空成功后才登记为可发送的删除）两步：本地清空
+    /// 中途失败的话，记忆的删除不能已经发出去。
     ///
     /// 调用方必须保证这期间没有 turn 在跑、合入也进不来（运行时持着静默门调用）：这里不
     /// 逐个去占会话。
-    pub fn delete_published_sessions(&self) -> Result<(usize, usize)> {
+    pub fn delete_published_sessions(&self) -> Result<usize> {
         let config = self.config();
         let keep_trash = config.trash_days > 0;
-        let supported = self.inner.sessions_supported;
-        let deleted = local::delete_published(&self.inner.ctx, &config, supported, keep_trash)?;
-        // 记忆放在会话之后：会话那一步半路失败的话调用方不会清空本机，记忆的删除也就
-        // 不该已经发出去。
-        let memory = local::clear_memory(&self.inner.ctx, &config, supported, keep_trash)?;
+        let deleted = local::delete_published(&self.inner.ctx, &config, self.inner.sessions_supported, keep_trash)?;
         self.notify(Trigger::LocalChange);
-        Ok((deleted, memory))
+        Ok(deleted)
+    }
+
+    /// `/clear confirm all`（§7.5）第二半的前一步：把本机 `MEMORY.md` 现有的条目在回收站
+    /// 里留一份，返回它们的标识。没有可发布的副作用。
+    pub fn stash_memory_for_clear(&self) -> Result<Vec<String>> {
+        let keep_trash = self.config().trash_days > 0;
+        local::stash_memory_clear(&self.inner.ctx, keep_trash)
+    }
+
+    /// `/clear confirm all`（§7.5）第二半的后一步：本地清空已成功，把清空登记成发给所有
+    /// 设备的删除。`ids` 是 [`Self::stash_memory_for_clear`] 返回的那些。返回登记数。
+    pub fn commit_memory_clear(&self, ids: &[String]) -> Result<usize> {
+        let config = self.config();
+        let committed =
+            local::commit_memory_clear(&self.inner.ctx, &config, self.inner.sessions_supported, ids)?;
+        self.notify(Trigger::LocalChange);
+        Ok(committed)
     }
 
     /// 标记 / 取消「仅本机」（§7.9）。
@@ -737,6 +776,29 @@ impl SyncEngine {
     /// 一个会话里各条消息引用的附件在本机的情况（§8.7）。
     pub fn attachments(&self, channel: &str, chat_id: &str) -> Result<Vec<AttachmentInfo>> {
         local::attachments(&self.inner.ctx, channel, chat_id)
+    }
+
+    /// 本机缓存的一份附件现在还是不是它登记的那个对象（明文摘要对得上对象名）。打开
+    /// 缓存副本的入口用它拦下被原地改写的文件：内容不符就不当「有」，用户重新下载会
+    /// 走缺附件的路径。验不了（没配对、读不出密钥、文件不在）时不算坏——那有别的说法。
+    pub fn cached_attachment_intact(&self, blob: &str) -> bool {
+        let secrets = match Secrets::load(&self.inner.ctx.paths) {
+            Ok(secrets) => secrets,
+            Err(_) => return true,
+        };
+        let Ok(keys) = secrets.keys() else {
+            return true;
+        };
+        let rel = db::read(self.inner.ctx.db(), |conn| {
+            Ok(db::blob_get(conn, blob)?.filter(|row| row.state == BLOB_FETCHED).map(|row| row.rel_path))
+        });
+        let Ok(Some(rel)) = rel else {
+            return true;
+        };
+        match self.inner.ctx.env.checked_path(&rel) {
+            Ok(path) => crate::attach::hash_file(&keys, &path).is_some_and(|id| id == blob),
+            Err(_) => true,
+        }
     }
 
     /// 用户点了一个还没下载的附件：排到下载队列的最前面。结果经

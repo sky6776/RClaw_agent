@@ -7,11 +7,13 @@
 //! 一个数据目录同一时刻只有一个进程做同步：靠 `sync/engine.lock` 上的文件锁。拿不到锁
 //! 的进程处于 `standby`，隔一阵再试。
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rclaw_store::sync_db;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -49,6 +51,9 @@ const STANDBY_FIRST: Duration = Duration::from_secs(2);
 const STANDBY_RETRY: Duration = Duration::from_secs(30);
 /// 本机这边没准备好（目录、数据库出错）：隔这么久再试。
 const OPEN_RETRY: Duration = Duration::from_secs(30);
+/// 拆任务时等已经开始的附件提交阶段结束最多这么久（换空间 / 清理之前）。等不到也往下
+/// 走：代已经换了，它们的结果不会生效，落地文件的那一步也会自己收干净。
+const TEARDOWN_SETTLE: Duration = Duration::from_secs(15);
 /// 连着马上再来一轮最多这么多次，然后歇一会儿（大批量的首次同步照样走得完，出了
 /// 「总觉得还有活」的毛病时也不至于空转）。
 const RERUN_MAX: u32 = 50;
@@ -58,6 +63,62 @@ const TAIL_MESSAGES: usize = 30;
 
 pub(crate) const STANDBY_HINT: &str = "另一个 RClaw 进程正在用这个数据目录做同步，本进程先不同步。\
      要在这里操作同步空间，请到那个进程里去，或者先退出它";
+
+/// 没存完的存储设置（`sync/pending-storage.json`）：`rclaw.toml` 与 secrets 两个文件不
+/// 能原子一起提交——保存先把 TOML 写出去，命令再把 secrets 写上。命令失败（worker
+/// 待机、secrets 写失败、进程中断）时这条记录留下：下一次引擎打开先把它做完，两边才
+/// 收敛到同一套配置，不会拿旧存储的凭据记录去试新目标。做完就删。与密钥同样的私有权限。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StorageIntent {
+    config: SyncConfig,
+    /// 要绑定的密码；`None` 或空 = 不改密码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+}
+
+fn storage_intent_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join("pending-storage.json")
+}
+
+pub(crate) fn storage_intent_save(
+    paths: &SyncPaths,
+    config: &SyncConfig,
+    secret: Option<&str>,
+) -> Result<()> {
+    let intent = StorageIntent {
+        config: config.clone(),
+        secret: secret.map(|secret| secret.to_string()),
+    };
+    paths.ensure_root()?;
+    rclaw_store::atomic_write_private(
+        &storage_intent_path(paths),
+        &serde_json::to_vec_pretty(&intent)?,
+    )?;
+    Ok(())
+}
+
+fn storage_intent_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
+    match std::fs::read(storage_intent_path(paths)) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(intent) => Ok(Some(intent)),
+            Err(error) => {
+                tracing::warn!("sync/pending-storage.json 损坏，丢弃: {error}");
+                let _ = std::fs::remove_file(storage_intent_path(paths));
+                Ok(None)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn storage_intent_clear(paths: &SyncPaths) -> Result<()> {
+    match std::fs::remove_file(storage_intent_path(paths)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
 
 pub(crate) type Reply<T> = oneshot::Sender<Result<T>>;
 
@@ -111,6 +172,13 @@ pub(crate) enum Cmd {
     },
     SetSecret {
         secret: String,
+        reply: Reply<()>,
+    },
+    /// 存储的设置（可带刚填的密码）一起生效：密码绑定的是这份配置的存储账户，同一条
+    /// 命令内核对并写入，中间不会插进别的配置变更（引擎线程一次只办一条命令）。
+    SaveStorage {
+        config: SyncConfig,
+        secret: Option<String>,
         reply: Reply<()>,
     },
     ConfirmMetered(Reply<()>),
@@ -548,6 +616,20 @@ impl Worker {
                 return self.fail_open(error.to_string(), Some(OPEN_RETRY));
             }
         }
+        // 上一次重置 / 退出没做完：按落盘的记录与远端的实际状态接着做（重置可能已经把
+        // 本机换到了新空间），再按正常打开往下走。
+        if let Err(error) =
+            space::resume_pending(&shared.ctx, &self.config, &mut self.secrets).await
+        {
+            return self.fail_open(
+                format!("上一次的空间切换没有做完: {error}（修好后会自动接着做）"),
+                Some(OPEN_RETRY),
+            );
+        }
+        // 上次没存完的存储设置先收尾（secrets 按 TOML 里的目标补写），两个文件才是一套。
+        if let Err(error) = self.resume_storage_intent().await {
+            tracing::warn!("没存完的存储设置收尾失败（下次打开再试）: {error}");
+        }
         let paired = self.secrets.is_paired();
         shared.paired.store(paired, Ordering::Relaxed);
         shared.set_space(
@@ -594,6 +676,8 @@ impl Worker {
         shared.storage_ok.store(true, Ordering::Relaxed);
         shared.last_pull_ms.store(0, Ordering::Relaxed);
 
+        // 连上了：重新打开附件提交入口（换空间 / 清理期间是关着的）。
+        shared.ctx.space.reopen();
         let session = Session::new(live, identity);
         self.start_uploads(session.live.clone());
         self.start_downloads(session.live.clone());
@@ -645,6 +729,19 @@ impl Worker {
     /// 断开同步空间：停掉附件任务。写到一半的快照留给下次清理（它的名字记在库里）。
     async fn teardown(&mut self) {
         self.shared.set_fetch(None);
+        // 拆任务只拆得掉异步的那一层：已经开始的文件与记账阶段（`spawn_blocking`）拦不
+        // 住。顺序是：先关提交入口（旧任务此后拿到的阶段一律作废，只能用开始时捕获的
+        // 代）→ 等在途的阶段走完（它们在切换之前正常提交，不越过边界）→ 等不到才换代，
+        // 把没走完的与新的状态隔离开（它们随后的核对失配、丢弃结果，只收拾自己写下的
+        // 东西）。之后才换空间、清理本机的登记。
+        self.shared.ctx.space.seal();
+        let _ = self
+            .shared
+            .ctx
+            .space
+            .wait_idle(TEARDOWN_SETTLE)
+            .await;
+        self.shared.ctx.space.bump();
         for task in [self.uploads.take(), self.downloads.take()]
             .into_iter()
             .flatten()
@@ -718,6 +815,13 @@ impl Worker {
             }
             Cmd::SetSecret { secret, reply } => {
                 let _ = reply.send(self.set_secret(secret).await);
+            }
+            Cmd::SaveStorage {
+                config,
+                secret,
+                reply,
+            } => {
+                let _ = reply.send(self.save_storage(config, secret).await);
             }
             Cmd::ConfirmMetered(reply) => {
                 let _ = reply.send(self.confirm_metered().await);
@@ -998,7 +1102,7 @@ impl Worker {
     async fn leave_space(&mut self) -> Result<()> {
         self.require_owner()?;
         self.teardown().await;
-        let result = space::leave(&self.shared.ctx, &mut self.secrets).await;
+        let result = space::leave(&self.shared.ctx, &self.config, &mut self.secrets).await;
         // 退出成功就停在「还没配对」；没成功就照旧连回去。
         self.open().await;
         result
@@ -1041,6 +1145,67 @@ impl Worker {
             self.teardown().await;
             self.open().await;
         }
+        Ok(())
+    }
+
+    /// 存储设置和密码一起生效：「先存配置、再单独存密码」分两条命令的话，中间可能插进
+    /// 别的入口改过的配置，密码就会绑到后一份配置的存储账户上（`storage_secret` 按账户
+    /// 匹配），甚至发送到那个地址去。这里在同一条命令里按新配置绑密码、落盘、重建客户端。
+    ///
+    /// 调用方在派发之前已把「更新意图」落盘（[`storage_intent_save`]）：本方法失败
+    /// （worker 待机、secrets 写失败）时两个文件不会都换好，重启后的 [`Self::open`]
+    /// 按记录把剩下的一半补上，两边收敛到同一套。
+    async fn save_storage(&mut self, config: SyncConfig, secret: Option<String>) -> Result<()> {
+        self.require_owner()?;
+        let mut next = self.secrets.clone();
+        if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+            if config.transport != "file" {
+                next.set_storage_secret(&config, secret)?;
+            }
+        }
+        let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
+        blocking(move || saved.save(&paths)).await?;
+        self.secrets = next;
+        self.config = config;
+        self.shared.set_space(
+            self.secrets
+                .is_paired()
+                .then(|| self.secrets.space_id.clone()),
+            self.secret_saved(),
+        );
+        if self.secrets.is_paired() {
+            self.teardown().await;
+            self.open().await;
+        }
+        Ok(())
+    }
+
+    /// 上次没存完的存储设置：`rclaw.toml` 在保存时已经先写成新的一套，secrets 是命令
+    /// 失败没写上的那一半。按记录的配置把密码绑上、落盘（配置以记录为准——密码是按它
+    /// 绑的），两边收敛到同一套，然后删记录。
+    async fn resume_storage_intent(&mut self) -> Result<()> {
+        let paths = self.shared.ctx.paths.clone();
+        let Some(intent) = blocking(move || storage_intent_load(&paths)).await? else {
+            return Ok(());
+        };
+        let mut next = self.secrets.clone();
+        if let Some(secret) = intent.secret.as_deref().filter(|secret| !secret.is_empty()) {
+            if intent.config.transport != "file" {
+                next.set_storage_secret(&intent.config, secret.to_string())?;
+            }
+        }
+        let (paths, saved) = (self.shared.ctx.paths.clone(), next.clone());
+        blocking(move || saved.save(&paths)).await?;
+        self.secrets = next;
+        self.config = intent.config;
+        let paths = self.shared.ctx.paths.clone();
+        blocking(move || storage_intent_clear(&paths)).await?;
+        self.shared.set_space(
+            self.secrets
+                .is_paired()
+                .then(|| self.secrets.space_id.clone()),
+            self.secret_saved(),
+        );
         Ok(())
     }
 

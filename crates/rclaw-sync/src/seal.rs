@@ -118,56 +118,205 @@ struct Ready {
     row: Option<(i64, Option<String>, Vec<LocalBlob>)>,
 }
 
-const BATCH_ROWS: usize = 2000;
+const BATCH_ROWS: usize = 500;
+
+/// 这个通道还在生效的会话同步范围内吗。读不到范围记录（还没开过同步）时按「在」算：
+/// 排队不因为缺记录而被拦。
+fn in_range(range: &Option<db::Range>, channel: &str) -> bool {
+    match range {
+        None => true,
+        Some(range) => {
+            range.sessions && range.channels.iter().any(|known| known == channel)
+        }
+    }
+}
+
+/// 队列里还有没有当前范围内**可以封出去**的 op。因范围收窄而暂缓的不算——首次同步的
+/// 收尾、快照的资格都只等这一类：暂缓行留在队列里，不该让别的范围永远做不完。
+/// 坏行（读不出 JSON）按「还有活」算：它也要走一遍封段的清理路径。
+pub(crate) fn has_sendable(conn: &Connection, s: &crate::publish::Settings) -> Result<bool> {
+    let range = db::Range::of(s);
+    let mut after = i64::MIN;
+    loop {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, op FROM sync_outbox WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![after, BATCH_ROWS as i64])?;
+        let mut fetched = 0usize;
+        while let Some(row) = rows.next()? {
+            fetched += 1;
+            let id: i64 = row.get(0)?;
+            after = id;
+            let op: String = row.get(1)?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&op) else {
+                return Ok(true);
+            };
+            let kind = value.get("t").and_then(|v| v.as_str()).unwrap_or_default();
+            if in_scope(
+                conn,
+                &Some(range.clone()),
+                kind,
+                value.get("sid").and_then(|v| v.as_str()),
+            )? {
+                return Ok(true);
+            }
+        }
+        if fetched < BATCH_ROWS {
+            return Ok(false);
+        }
+    }
+}
+
+/// 队列里有没有因为范围收窄而**暂缓**的 op（当前范围内能封出去的不算）。有的话这个
+/// 设备先不写全量快照：文件寄存器里存着这些 op 的最新内容，快照会把从没发布过的东西
+/// 绕过范围带给其他设备。等它们封出去（范围重新变宽）或被清掉，再写快照。
+/// 坏行（读不出 JSON）不算暂缓：它有专门的清理路径，也不牵涉寄存器内容。
+pub(crate) fn has_deferred(conn: &Connection, s: &crate::publish::Settings) -> Result<bool> {
+    let range = db::Range::of(s);
+    let mut after = i64::MIN;
+    loop {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, op FROM sync_outbox WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![after, BATCH_ROWS as i64])?;
+        let mut fetched = 0usize;
+        while let Some(row) = rows.next()? {
+            fetched += 1;
+            let id: i64 = row.get(0)?;
+            after = id;
+            let op: String = row.get(1)?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&op) else {
+                continue;
+            };
+            let kind = value.get("t").and_then(|v| v.as_str()).unwrap_or_default();
+            if !in_scope(
+                conn,
+                &Some(range.clone()),
+                kind,
+                value.get("sid").and_then(|v| v.as_str()),
+            )? {
+                return Ok(true);
+            }
+        }
+        if fetched < BATCH_ROWS {
+            return Ok(false);
+        }
+    }
+}
+
+/// 队列里的一条 op 该不该这轮封出去。范围收窄之后排着的 op 留在队列里：不封也不丢，
+/// 范围重新变宽时照常封出去。会话类按线程的通道算（消息与线程的开头信息、属性、删除、
+/// 重发）；文件类按各自的范围算（人格在线路上就是 `file.put` / `file.del`）。附件点名、
+/// 定时任务的交接与撤回不在范围之内——它们是维护操作（撤回更是范围关了也要发出去的），
+/// 照常发。
+fn in_scope(
+    conn: &Connection,
+    range: &Option<db::Range>,
+    kind: &str,
+    sid: Option<&str>,
+) -> Result<bool> {
+    let file = |flag: bool| match range {
+        // 读不到范围记录（还没开过同步）时按「在」算：排队不因为缺记录而被拦。
+        None => Ok(true),
+        Some(_) => Ok(flag),
+    };
+    match kind {
+        "msg" | "session.open" | "session.set" | "session.delete" | "session.want"
+        | "session.bundle" => {
+            let Some(sid) = sid else {
+                return Ok(true);
+            };
+            match map::thread_sessions(conn, sid)?.first() {
+                Some(session) => Ok(in_range(range, &session.channel)),
+                // 这个线程还没有落到本机（比如 `session.open` 还排在前面）：会话同步整个
+                // 关着时不放行——关掉会话同步就是不再发会话内容；开着时让它过（查不到
+                // 通道多半是历史重放，合入那边本来也只会把它排回队列）。
+                None => Ok(range.as_ref().is_none_or(|range| range.sessions)),
+            }
+        }
+        "mem.add" | "mem.del" | "daily.append" => {
+            file(range.as_ref().is_none_or(|range| range.memory))
+        }
+        "file.put" | "file.del" => file(range.as_ref().is_none_or(|range| range.persona)),
+        "skill.put" | "skill.del" => file(range.as_ref().is_none_or(|range| range.skills)),
+        "bot.put" | "bot.del" => file(range.as_ref().is_none_or(|range| range.bots)),
+        // 定时任务的定义同步按任务范围算；交接（接管请求、回执、落定）是维护操作，
+        // 落进默认放行。
+        "cron.put" | "cron.del" => file(range.as_ref().is_none_or(|range| range.cron)),
+        _ => Ok(true),
+    }
+}
 
 fn read_pending(conn: &Connection, ctx: &Ctx, budget: usize) -> Result<Vec<Pending>> {
-    let mut stmt = conn
-        .prepare_cached("SELECT id, session_id, hlc, op FROM sync_outbox ORDER BY id LIMIT ?1")?;
-    let mut rows = stmt.query(params![BATCH_ROWS as i64])?;
+    let range: Option<db::Range> = db::kv_json(conn, db::KV_RANGE)?;
     let mut out = Vec::new();
     let mut size = 0usize;
-    while out.is_empty() || size <= budget {
-        let Some(row) = rows.next()? else {
-            break;
-        };
-        let (outbox_id, session_id, hlc): (i64, Option<i64>, String) =
-            (row.get(0)?, row.get(1)?, row.get(2)?);
-        let op: String = row.get(3)?;
-        size += op.len();
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&op) else {
+    // 换身份之后重新入队的 op 用的是负 id（排在队首，见 `identity::rotate`）：游标必须从
+    // 最小整数起，不能用 0。
+    let mut after = i64::MIN;
+    'read: loop {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, session_id, hlc, op FROM sync_outbox WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![after, BATCH_ROWS as i64])?;
+        let mut fetched = 0usize;
+        while let Some(row) = rows.next()? {
+            fetched += 1;
+            let (outbox_id, session_id, hlc): (i64, Option<i64>, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            after = outbox_id;
+            let op: String = row.get(3)?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&op) else {
+                out.push(Pending {
+                    outbox_id,
+                    hlc,
+                    body: Body::Gone,
+                });
+                continue;
+            };
+            let kind = value.get("t").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            // 完整的线上行（设备轮换重排的 msg 没有引用）与带引用的消息行都带着线程 id，
+            // 统一按范围过滤；带引用的消息在载入之后还有一道按会话通道的核对。
+            if !in_scope(conn, &range, &kind, value.get("sid").and_then(|v| v.as_str()))? {
+                continue;
+            }
+            let body = match (kind.as_str(), value.get("ref").and_then(|v| v.as_i64())) {
+                ("msg", Some(message_id)) => match load_row(conn, ctx, message_id)? {
+                    Some((sid, row)) => {
+                        if !in_range(&range, &row.channel) {
+                            continue;
+                        }
+                        size += row.msg.data.len();
+                        Body::Row {
+                            sid,
+                            row: Box::new(row),
+                        }
+                    }
+                    None => Body::Gone,
+                },
+                ("session.open", _) => Body::Full {
+                    value,
+                    open_session: session_id,
+                },
+                _ => Body::Full {
+                    value,
+                    open_session: None,
+                },
+            };
+            size += op.len();
             out.push(Pending {
                 outbox_id,
                 hlc,
-                body: Body::Gone,
+                body,
             });
-            continue;
-        };
-        let kind = value.get("t").and_then(|v| v.as_str()).unwrap_or_default();
-        let body = match (kind, value.get("ref").and_then(|v| v.as_i64())) {
-            ("msg", Some(message_id)) => match load_row(conn, ctx, message_id)? {
-                Some((sid, row)) => {
-                    size += row.msg.data.len();
-                    Body::Row {
-                        sid,
-                        row: Box::new(row),
-                    }
-                }
-                None => Body::Gone,
-            },
-            ("session.open", _) => Body::Full {
-                value,
-                open_session: session_id,
-            },
-            _ => Body::Full {
-                value,
-                open_session: None,
-            },
-        };
-        out.push(Pending {
-            outbox_id,
-            hlc,
-            body,
-        });
+            // 至少带走一条；够了一段（或预算用完）就停。
+            if !out.is_empty() && size > budget {
+                break 'read;
+            }
+        }
+        if fetched < BATCH_ROWS {
+            break;
+        }
     }
     Ok(out)
 }
@@ -225,6 +374,8 @@ fn prepare(ctx: &Ctx, opts: &SealOptions<'_>, pending: Vec<Pending>) -> Result<V
             Body::Row { sid, mut row } => {
                 let mut blobs = wire::fill_artifacts(&ctx.env, &mut row, policy);
                 let mut new_refs = None;
+                let mut stored = row.stored.clone().unwrap_or_default();
+                let mut changed = row.stored.is_none();
                 if row.stored.is_none() {
                     let found = attach::extract_refs(
                         &ctx.env,
@@ -232,12 +383,34 @@ fn prepare(ctx: &Ctx, opts: &SealOptions<'_>, pending: Vec<Pending>) -> Result<V
                         &row.msg.data,
                         opts.attachment_max,
                     );
-                    let mut stored = StoredRefs::default();
                     for (file, blob) in found {
                         stored.files.push(file);
                         blobs.push(blob);
                     }
                     row.msg.refs = stored.files.clone();
+                }
+                // 本机的附件清单与线上的同一份：非内联的 artifact（带对象名的）也记进
+                // refs。接收端落地时写的就是它；来源端缺了它，会话顶部的附件清单只在
+                // 接收端有，转「仅本机」时也清不到它排在自动上传队列里的那份。旧消息的
+                // 索引可能只有一半（先有文件引用、后加的 artifact 记录）：文件引用还在
+                // 就不重抽，缺的 artifact 记录从消息里补上。
+                for artifact in &row.msg.artifacts {
+                    let Some(blob) = &artifact.blob else {
+                        continue;
+                    };
+                    let known = stored.artifacts.iter().any(|known| {
+                        known.name == artifact.name && known.blob.as_deref() == Some(blob.as_str())
+                    });
+                    if !known {
+                        stored.artifacts.push(wire::ArtifactRef {
+                            name: artifact.name.clone(),
+                            size: artifact.size,
+                            blob: Some(blob.clone()),
+                        });
+                        changed = true;
+                    }
+                }
+                if changed {
                     new_refs = Some(stored.to_column());
                 }
                 let message_id = row.message_id;

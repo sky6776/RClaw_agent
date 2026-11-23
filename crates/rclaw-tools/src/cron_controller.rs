@@ -170,6 +170,23 @@ impl CronController {
         sanitize_destination(&mut job);
         job.enabled = true;
         job.last_run = 0;
+        self.push(job)
+    }
+
+    /// 把一个任务**停用**着加进任务表：多端同步的接手方在所有权落定之前用它（见
+    /// [`crate::CronHost::add_disabled`]）。落定之后经 [`Self::set_enabled`] 启用；
+    /// 原归属设备等不到落定而收回时，本机这一份从未启用过，不会两边同时执行。
+    /// 其余行为（id 生成、落盘顺序、锁纪律）与 [`Self::add`] 完全一致。
+    pub fn add_disabled(&self, mut job: CronJob) -> Result<String, StoreError> {
+        sanitize_destination(&mut job);
+        job.enabled = false;
+        job.last_run = 0;
+        self.push(job)
+    }
+
+    /// `add` / `add_disabled` 的公共部分：入表前的语义检查 + 「生成唯一 id → 构造新表 →
+    /// 写盘 → 替换内存」的加锁关键区。
+    fn push(&self, mut job: CronJob) -> Result<String, StoreError> {
         // Controller 是公共边界，不能只依赖 cron_add 工具层校验。外部调用方若直接传入
         // interval_s=None/0 的 Every 任务，旧逻辑会算出 next_run=now，运行时每个 tick
         // 都会认为它到期。这里在入表前统一拒绝不可调度任务。
@@ -200,6 +217,28 @@ impl CronController {
         // dirty 不再需要重试，清除以防它把磁盘倒退回旧状态。
         self.clear_dirty();
         Ok(id)
+    }
+
+    /// 启用 / 停用一个已在任务表里的任务（多端同步的接管落定后启用）。
+    ///
+    /// 与 `add` / `remove` 同一套锁纪律：持锁「改新表 → 写盘 → 替换内存」，写盘失败时
+    /// 内存不动（错误抛给调用者），内存与 `cron.json` 不分叉。
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), StoreError> {
+        let mut guard = self.jobs.lock().unwrap();
+        let mut new_jobs = guard.clone();
+        let Some(job) = new_jobs.iter_mut().find(|j| j.id == id) else {
+            return Err(StoreError::Other(format!("任务 {id} 不在任务表里")));
+        };
+        if job.enabled == enabled {
+            return Ok(());
+        }
+        job.enabled = enabled;
+        // 先写盘成功，再替换内存（同一把锁内）。
+        save_jobs_layout(&self.layout, &new_jobs)?;
+        *guard = new_jobs;
+        // 本次成功落盘已覆盖遗留 dirty 快照，与 add / remove 同理清除之。
+        self.clear_dirty();
+        Ok(())
     }
 
     /// 按 id 删除任务。

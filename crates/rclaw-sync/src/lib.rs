@@ -134,6 +134,15 @@ pub trait CronHost: Send + Sync {
     /// 触发时间；返回新的 id。
     fn add(&self, job: rclaw_store::CronJob) -> std::result::Result<String, String>;
 
+    /// 把一个任务加进本机任务表，但**保持停用**（§8.6）：所有权还没有明确落到本机
+    /// （原归属设备的落定回执还没发出来）时用它。原归属设备等不到本机落定会把任务收回
+    /// 去，本机这一份要是已经启用了就会两边同时执行。落定之后用 [`CronHost::set_enabled`]
+    /// 启用。返回新的 id。
+    fn add_disabled(&self, job: rclaw_store::CronJob) -> std::result::Result<String, String>;
+
+    /// 启用 / 停用一个已经在任务表里的任务（接管落定后启用）。
+    fn set_enabled(&self, id: &str, enabled: bool) -> std::result::Result<(), String>;
+
     /// 从本机任务表移除一个任务。返回它原来在不在。
     fn remove(&self, id: &str) -> std::result::Result<bool, String>;
 }
@@ -265,6 +274,120 @@ pub struct Ctx {
     pub cron: Option<Arc<dyn CronHost>>,
     /// 技能目录；没注入时技能不参与同步。
     pub skills: Option<Arc<dyn SkillHost>>,
+    /// 空间的代与已经开始的提交阶段（[`SpaceEpoch`]）：换空间、清理时拆引擎的任务，
+    /// 但已经跑起来的阻塞阶段（落文件、记账）要等它结束、并且发现代变了就丢弃结果。
+    pub space: Arc<SpaceEpoch>,
+}
+
+/// 空间的代（换空间 / 清理时 +1）、提交入口的开关，以及已经开始的提交阶段。
+///
+/// 引擎拆任务只拆得掉异步的那一层：`spawn_blocking` 已经开始的部分拦不住。它们动本机
+/// 文件（落点、别名）和库里的附件登记；换空间之后旧空间的登记与落点都不该再写。
+///
+/// 换空间的顺序是：[`SpaceEpoch::seal`] 关掉提交入口（之后开始的阶段一律作废，旧任务
+/// 只能用开始时捕获的代）→ [`SpaceEpoch::wait_idle`] 等在途的阶段走完（它们在切换**之前**
+/// 正常提交，写的是旧空间的落点与账目，不算越过边界）→ 等不到才 [`SpaceEpoch::bump`]
+/// 换代，把没走完的阶段与新的状态隔离开：它们随后的核对都会失配，结果丢弃，只收拾
+/// 自己写下的东西。连上新空间之后 [`SpaceEpoch::reopen`]。
+#[derive(Default)]
+pub struct SpaceEpoch {
+    epoch: std::sync::atomic::AtomicU64,
+    inflight: std::sync::atomic::AtomicUsize,
+    /// 提交入口关着：换空间 / 清理期间不受理新的提交阶段。
+    sealed: std::sync::atomic::AtomicBool,
+}
+
+/// 入口关着时开始阶段的代：任何真实的代都到不了它。
+const SEALED_EPOCH: u64 = u64::MAX;
+
+impl SpaceEpoch {
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 换空间 / 清理：代 +1。已经挂号的阶段随后的核对都会失配。
+    pub fn bump(&self) -> u64 {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// 关掉提交入口：之后开始的阶段一律作废。已经在途的照常走完。
+    pub fn seal(&self) {
+        self.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 连上了新的空间：重新打开提交入口。
+    pub fn reopen(&self) {
+        self.sealed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 开始一个提交阶段（落文件、记账）：结算之前 `teardown` 会等它。入口关着时拿到的
+    /// 阶段从一开始就作废。
+    pub fn begin(self: &Arc<Self>) -> Commit {
+        self.inflight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let open = !self.sealed.load(std::sync::atomic::Ordering::SeqCst);
+        Commit {
+            epoch: if open { self.epoch() } else { SEALED_EPOCH },
+            space: self.clone(),
+        }
+    }
+
+    /// 等已经开始的提交阶段都结束。超时返回假（调用方接着换代：没走完的会被隔离，
+    /// 结果不会生效）。
+    pub async fn wait_idle(&self, timeout: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        while self.inflight.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+}
+
+/// 一个已经开始的提交阶段。`valid()` 为假 = 期间换了空间（或者开始时入口已经关了），
+/// 结果要丢弃。
+pub struct Commit {
+    epoch: u64,
+    space: Arc<SpaceEpoch>,
+}
+
+impl Commit {
+    pub fn valid(&self) -> bool {
+        self.space.epoch() == self.epoch
+    }
+
+    /// 这一刻的代的只读快照：交给阻塞闭包核对用。它不占 `inflight` 的名额（`Commit`
+    /// 自身留在异步一侧守着），可以克隆。
+    pub fn token(&self) -> EpochToken {
+        EpochToken {
+            epoch: self.epoch,
+            space: self.space.clone(),
+        }
+    }
+}
+
+impl Drop for Commit {
+    fn drop(&mut self) {
+        self.space
+            .inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 一个提交阶段的代的只读快照（见 [`Commit::token`]）。
+#[derive(Clone)]
+pub struct EpochToken {
+    epoch: u64,
+    space: Arc<SpaceEpoch>,
+}
+
+impl EpochToken {
+    /// 阶段还有效吗（期间没有换空间）。
+    pub fn valid(&self) -> bool {
+        self.space.epoch() == self.epoch
+    }
 }
 
 impl Ctx {

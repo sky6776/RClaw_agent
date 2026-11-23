@@ -74,6 +74,26 @@ async fn save_and_apply(
     Ok(())
 }
 
+/// 同 [`save_and_apply`]，但配置与刚填的密码在同一条命令里交给引擎（[`SyncEngine::
+/// save_storage`]）：密码按这条命令里的配置绑定存储账户，两步之间插进来的别的配置变更
+/// 不会把它绑到另一处存储上。创建 / 加入 / 修改存储设置都走这一条。
+async fn save_with_secret(
+    state: &AppState,
+    engine: &SyncEngine,
+    config: SyncConfig,
+    secret: Option<String>,
+) -> Result<(), String> {
+    let home = state.home.clone();
+    let saved = config.clone();
+    run_blocking("保存同步设置", move || persist(&home, &saved)).await?;
+    engine
+        .save_storage(config, secret.filter(|secret| !secret.is_empty()))
+        .await
+        .map_err(fail)?;
+    crate::sync_host::emit_status();
+    Ok(())
+}
+
 /// `rclaw.toml` 被别的入口改写之后（配置面板保存了 `sync.*`、导入了整份配置）：把文件里
 /// 的 `[sync]` 重新交给引擎。读不出来只记日志——文件本身的毛病由那个入口自己报。
 pub(super) async fn reload_config(state: &AppState) {
@@ -88,22 +108,6 @@ pub(super) async fn reload_config(state: &AppState) {
         }
         Err(error) => tracing::warn!("重新读取 [sync] 设置失败: {error}"),
     }
-}
-
-/// 界面上刚填的存储密码存到本机（`sync/secrets.json`）。没填就不动已经存着的；共享文件夹
-/// 不需要密码。
-async fn store_secret(
-    engine: &SyncEngine,
-    config: &SyncConfig,
-    secret: Option<String>,
-) -> Result<(), String> {
-    let Some(secret) = secret.filter(|secret| !secret.is_empty()) else {
-        return Ok(());
-    };
-    if config.transport == "file" {
-        return Ok(());
-    }
-    engine.set_storage_secret(&secret).await.map_err(fail)
 }
 
 /// 面板的全部状态：引擎的状态 + 当前生效的设置（表单的初值）。
@@ -145,6 +149,36 @@ pub async fn sync_set_secret(state: State<'_, AppState>, secret: String) -> Resu
     engine.set_storage_secret(&secret).await.map_err(fail)
 }
 
+/// 保存存储的设置（地址、账号、目录……）与刚填的密码，一起生效。
+///
+/// 面板上「先保存配置、再单独保存密码」两条命令之间，别的入口（配置面板保存 `sync.*`、
+/// 导入整份配置）可能把配置换成另一份；worker 用收到命令时的配置决定密码绑定的账户，
+/// 密码就会绑到后一份配置上，并可能在重连时发到那个地址去。这里把两者放进同一条命令，
+/// 由引擎线程一次办完。
+#[tauri::command]
+pub async fn sync_save_storage(
+    state: State<'_, AppState>,
+    config: SyncConfig,
+    secret: Option<String>,
+) -> Result<(), String> {
+    let engine = handle(&state)?;
+    // 只带走存储这几段：别处（范围、设备名）在这期间改过的不被这份草稿盖回去。
+    let current = engine.config();
+    let mut next = current.clone();
+    next.transport = config.transport;
+    next.webdav = config.webdav;
+    next.file = config.file;
+    next.s3 = config.s3;
+    next.validate().map_err(fail)?;
+    let home = state.home.clone();
+    let saved = next.clone();
+    run_blocking("保存同步设置", move || persist(&home, &saved)).await?;
+    let secret = secret.filter(|secret| !secret.is_empty());
+    engine.save_storage(next, secret).await.map_err(fail)?;
+    crate::sync_host::emit_status();
+    Ok(())
+}
+
 /// 「测试连接」：用表单上正在填的设置（不必先保存）把存储要用到的操作逐个走一遍。
 /// `secret` 不给就用本机存着的。
 #[tauri::command]
@@ -171,7 +205,8 @@ pub async fn sync_probe_certificate(url: String) -> Result<String, String> {
 // 同步空间：创建、加入、退出、重置；配对码
 // ---------------------------------------------------------------------------
 
-/// 创建同步空间：保存表单上的设置（顺带开启同步）与密码，然后在存储上建出空间。
+/// 创建同步空间：保存表单上的设置（顺带开启同步）与密码，然后在存储上建出空间。设置与
+/// 密码在同一条命令里交给引擎（见 [`save_with_secret`]）。
 #[tauri::command]
 pub async fn sync_create_space(
     state: State<'_, AppState>,
@@ -180,8 +215,7 @@ pub async fn sync_create_space(
 ) -> Result<(), String> {
     let engine = handle(&state)?;
     config.enabled = true;
-    save_and_apply(&state, &engine, config.clone()).await?;
-    store_secret(&engine, &config, secret).await?;
+    save_with_secret(&state, &engine, config.clone(), secret).await?;
     engine.create_space().await.map_err(fail)
 }
 
@@ -246,8 +280,7 @@ pub async fn sync_join_space(
     let engine = handle(&state)?;
     let mut base = config.unwrap_or_else(|| engine.config());
     base.enabled = true;
-    save_and_apply(&state, &engine, base.clone()).await?;
-    store_secret(&engine, &base, secret).await?;
+    save_with_secret(&state, &engine, base.clone(), secret).await?;
     let joined = engine.join_space(&code).await.map_err(fail)?;
     // 密钥已经存到本机、引擎也已经用上了新设置；剩下把设置写回文件，下次启动才连得上。
     let home = state.home.clone();
@@ -671,10 +704,27 @@ fn cached_snapshot(
         .attachments(CHANNEL_DESKTOP, chat_id)
         .map_err(fail)?
         .into_iter()
-        .find(|item| item.blob == blob && item.kind == "file" && item.state == "cached")
+        // 文件与工具结果全文（artifact）都可能有缓存副本：后者落到缓存时，工作区里的
+        // 原路径句柄指向的可能是另一个同名文件，用户从会话顶部的附件区打开的就是这份。
+        // 会话、对象、允许的类型一起选：拿第一条缓存记录去核对另一个 blob 的摘要，
+        // 预览和保存就会取错附件。
+        .find(|item| {
+            item.blob == blob
+                && (item.kind == "file" || item.kind == "artifact")
+                && item.state == "cached"
+        })
         .ok_or_else(|| {
             "这个附件不在本机的同步缓存里（可能还没有下载，或者已经被清理）".to_string()
         })?;
+    // 缓存的副本要还是登记的那个对象（摘要对得上）才给用：被原地改写的文件不当作
+    // 它——用户重新下载会走缺附件的路径，由持有正确内容的设备重新传。
+    if !engine.cached_attachment_intact(&info.blob) {
+        return Err(
+            "这份缓存副本的内容已经和登记的不一致（可能被本机的程序改写过）。\
+             请重新下载这个附件。"
+                .to_string(),
+        );
+    }
     let local = info
         .local_path
         .as_deref()
@@ -731,7 +781,15 @@ pub async fn sync_attachment_save(
     let home = state.home.clone();
     run_blocking("存进工作区", move || {
         let (info, full) = cached_snapshot(&engine, &home, &chat_id, &blob)?;
-        save_snapshot(&home, &info.path, &full)
+        // 工具结果（artifact）在消息里只有一个文件名，没有 uploads/ 这类前缀：导出到
+        // 专用的 output/ 路径（工作区只认 uploads/、media/、output/ 之下的落点）。
+        let target = if info.kind == "artifact" {
+            let name = info.path.rsplit('/').next().unwrap_or(&info.path);
+            format!("output/{name}")
+        } else {
+            info.path.clone()
+        };
+        save_snapshot(&home, &target, &full)
     })
     .await
 }

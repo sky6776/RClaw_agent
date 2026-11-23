@@ -43,6 +43,9 @@ pub const INBOX_QUEUED: i64 = 1;
 pub const INBOX_ORPHAN: i64 = 2;
 /// `sync_inbox.state`：校验失败，所属线程从这条起隔离。
 pub const INBOX_QUARANTINED: i64 = 3;
+/// `sync_inbox.state`：还没核验完的快照分片带来的 op（序号记为 0）。所属快照的分片全部
+/// 对上清单之后，才与采用版本向量同一个事务转成 [`INBOX_PENDING`]；合入不看这个状态。
+pub const INBOX_SNAP_STAGE: i64 = 4;
 
 const SYNC_DDL: &str = "
 CREATE TABLE IF NOT EXISTS sync_session (

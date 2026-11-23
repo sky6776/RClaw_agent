@@ -842,10 +842,12 @@ pub(crate) fn origins(conn: &Connection) -> Result<Vec<(String, String)>> {
 }
 
 /// 登记一个本机有、要传上去的附件对象（技能里的大文件；不看「同步附件」开没开）。登记
-/// 一律指向技能目录里的这一份：它的内容刚核对过，就是这个对象。
+/// 一律指向技能目录里的这一份：它的内容刚核对过，就是这个对象。排进队列时给对象记上
+/// 「技能依赖」这个上传原因：会话附件的范围收窄不能拦住它，不然接收端装不上同一个技能。
 fn register_upload(conn: &Connection, blob: &LocalBlob) -> Result<()> {
     let Some(found) = db::blob_get(conn, &blob.blob_id)? else {
         db::blob_register(conn, &blob.blob_id, &blob.rel_path, blob.size, BLOB_PENDING)?;
+        crate::attach::mark_skill_blob(conn, &blob.blob_id)?;
         return Ok(());
     };
     if found.state == BLOB_REMOTE
@@ -866,11 +868,14 @@ fn register_upload(conn: &Connection, blob: &LocalBlob) -> Result<()> {
         // 本机自己有这份内容了：不用再等别的设备传。
         crate::attach::forget(conn, &blob.blob_id)?;
     }
-    // 远端已经有的不用再传；其余排进上传队列。
+    // 远端已经有的不用再传；其余排进上传队列，记上「技能依赖」。
     let state = match found.state {
         BLOB_UPLOADED | BLOB_FETCHED => found.state,
         _ => BLOB_PENDING,
     };
+    if state == BLOB_PENDING {
+        crate::attach::mark_skill_blob(conn, &blob.blob_id)?;
+    }
     db::blob_set(conn, &blob.blob_id, &blob.rel_path, state)
 }
 

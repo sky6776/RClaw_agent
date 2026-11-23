@@ -37,6 +37,7 @@ use crate::op::{ForkOf, Op, OpLine, WireMsg, ARTIFACT_INLINE_MAX};
 use crate::portable;
 use crate::publish::{self, Settings};
 use crate::pull::{self, InSeg};
+use crate::snapshot;
 use crate::status;
 use crate::trash;
 use crate::wire::{self, ArtifactPolicy, Landing, StoredRefs, OP_ARTIFACTS_MAX};
@@ -737,6 +738,24 @@ fn tombstone(conn: &Connection, sid: &str, tip: Option<&str>) -> Result<Option<b
     )
 }
 
+/// 占住会话之后复核一次：占到之前这条分支可能又往下写了，或者已经不在这个线程里了。
+/// 会话还在 `sid` 这个线程里、真实的末条上有生效的墓碑，才给出（重新读出的会话行，墓碑
+/// 是不是彻底删除，这时真实的末条）。
+fn recheck_tombstone(
+    conn: &Connection,
+    sid: &str,
+    session_id: i64,
+) -> Result<Option<(SessionMap, bool, Option<String>)>> {
+    let session = map::session_map(conn, session_id)?;
+    let Some(session) = session.filter(|session| session.sid == sid) else {
+        return Ok(None);
+    };
+    let Some(tip) = true_tip(conn, session_id)? else {
+        return Ok(None);
+    };
+    Ok(tombstone(conn, sid, tip.as_deref())?.map(|purge| (session, purge, tip)))
+}
+
 /// 线程 `sid` 的墓碑所带的链：`(墓碑的键, 链)`，至多 [`CHAINS_PER_THREAD`] 条。
 fn thread_chains(conn: &Connection, sid: &str) -> Result<Vec<(String, String)>> {
     let lower = format!("{sid}/");
@@ -940,6 +959,9 @@ pub fn sweep_stale(ctx: &Ctx, s: &Settings, all: bool) -> Result<StaleSweep> {
 
 impl Round<'_> {
     fn run(&mut self, full: bool) -> Result<()> {
+        // 上次应用快照中断留下的暂存批先清掉：它们不可合入，只会一直压着「本机够格写
+        // 快照」。平时没有登记中的快照，这一下是零开销。
+        snapshot::clear_uncommitted(self.ctx)?;
         self.retry_tombstones()?;
         self.drain_queued()?;
         self.main_pass()?;
@@ -1613,7 +1635,15 @@ impl Round<'_> {
             return self.park(row, INBOX_QUEUED);
         }
         for session in &matching {
-            self.remove_session(session, purge)?;
+            // 占住之后再确认一次：占到之前这条分支可能又往下写了，远端的删除没覆盖到续写
+            // 的部分。会话还在这个线程里、末条没变才删，用的是这时墓碑里的彻底删除标记。
+            let current = db::read(ctx.db(), |conn| recheck_tombstone(conn, sid, session.session_id))?;
+            match current {
+                Some((session, purge, now_tip)) if now_tip == tip.map(str::to_string) => {
+                    self.remove_session(&session, purge)?;
+                }
+                _ => {}
+            }
         }
         db::write(ctx.db(), |tx| settle(tx, row, None))?;
         Ok(Outcome::Done)
@@ -2027,19 +2057,19 @@ impl Round<'_> {
     /// 的末条时，它不会复活。
     fn sweep_tombstones(&mut self, sid: &str) -> Result<()> {
         let ctx = self.ctx;
-        let hits: Vec<(SessionMap, bool)> = db::read(ctx.db(), |conn| {
+        let hits: Vec<SessionMap> = db::read(ctx.db(), |conn| {
             let mut hits = Vec::new();
             for session in map::thread_sessions(conn, sid)? {
                 let Some(tip) = true_tip(conn, session.session_id)? else {
                     continue;
                 };
-                if let Some(purge) = tombstone(conn, sid, tip.as_deref())? {
-                    hits.push((session, purge));
+                if tombstone(conn, sid, tip.as_deref())?.is_some() {
+                    hits.push(session);
                 }
             }
             Ok(hits)
         })?;
-        for (session, purge) in hits {
+        for session in hits {
             let key = (session.channel.clone(), session.chat_id.clone());
             if !self.hold(sid, vec![key]) {
                 // 正忙：记下来，下一轮再删。
@@ -2048,14 +2078,10 @@ impl Round<'_> {
                 })?;
                 continue;
             }
-            // 占住之后再确认一次：占到之前它可能又往下写了。
-            let still = db::read(ctx.db(), |conn| {
-                Ok(match true_tip(conn, session.session_id)? {
-                    Some(tip) => tombstone(conn, sid, tip.as_deref())?.is_some(),
-                    None => false,
-                })
-            })?;
-            if still {
+            // 占住之后再确认一次：占到之前它可能又往下写了。是不是彻底删除也按这时生效的
+            // 墓碑算。
+            let current = db::read(ctx.db(), |conn| recheck_tombstone(conn, sid, session.session_id))?;
+            if let Some((session, purge, _)) = current {
                 self.remove_session(&session, purge)?;
             }
         }

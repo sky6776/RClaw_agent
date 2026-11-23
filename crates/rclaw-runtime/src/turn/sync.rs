@@ -96,10 +96,19 @@ pub trait SyncControl: Send + Sync {
     /// 退出同步空间（`/clear confirm local`）。其他设备上的数据不动。
     async fn leave_space(&self) -> Result<(), String>;
 
-    /// 把参与同步的会话逐个按「删除」处理（`/clear confirm all`）：本机回收站留一份，删除
-    /// 传到其他设备。返回登记删除的会话数与记忆条目数。**阻塞**。调用方持静默门：期间没有 turn 在跑，也
-    /// 不会有合入，实现不要再去占会话。
-    fn delete_published_sessions(&self) -> Result<(usize, usize), String>;
+    /// `/clear confirm all` 的会话部分：把参与同步的会话逐个按「删除」处理——本机回收站
+    /// 留一份，删除传到其他设备。返回登记删除的会话数。**阻塞**。调用方持静默门：期间
+    /// 没有 turn 在跑，也不会有合入，实现不要再去占会话。
+    fn delete_published_sessions(&self) -> Result<usize, String>;
+
+    /// `/clear confirm all` 的记忆部分前一步：把本机 `MEMORY.md` 现有的条目留一份副本，
+    /// 返回它们的标识。**没有任何可发布的副作用**；删除的登记由调用方在本地清空成功后
+    /// 经 [`SyncControl::commit_memory_clear`] 提交。**阻塞**。
+    fn stash_memory_for_clear(&self) -> Result<Vec<String>, String>;
+
+    /// `/clear confirm all` 的记忆部分后一步：本地清空已成功，把清空登记成发给所有设备
+    /// 的删除。`ids` 是 [`SyncControl::stash_memory_for_clear`] 返回的那些。**阻塞**。
+    fn commit_memory_clear(&self, ids: &[String]) -> Result<usize, String>;
 
     /// 本机数据变了，尽快发布：`turn_ended` 为真是一个 turn 刚结束（它写下的消息可以发了），
     /// 为假是别的改动（清空等）。不能阻塞。
@@ -459,13 +468,15 @@ impl TurnManager {
         }
     }
 
-    /// `/clear confirm local|all` 在清空本机之前要做的同步侧动作（§7.5）。调用方持静默门。
-    /// 成功返回附在清空摘要后面的一段说明；失败返回给用户的整条回复，调用方不再清空。
+    /// `/clear confirm local|all` 在清空本机之前要做的同步侧动作（§7.5）。调用方持静默门，
+    /// 并且已经先过了本地安全预检（记忆目录安全闸）。成功返回附在清空摘要后面的一段说明
+    /// 和「记忆清空待提交」的条目标识（`all` 才有）；失败返回给用户的整条回复，调用方
+    /// 不再清空。
     pub(super) async fn prepare_clear(
         &self,
         sync: Arc<dyn SyncControl>,
         scope: ClearScope,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<String>), String> {
         match scope {
             ClearScope::Local => {
                 // 同步引擎在两轮同步之间才办这件事。一轮跑得久（首次同步、网络卡住）时，
@@ -487,29 +498,47 @@ impl TurnManager {
                         ));
                     }
                 }
-                Ok(
+                Ok((
                     "\n\n多端同步：这台设备已退出同步空间；其他设备上的会话与记忆没有动。"
                         .to_string(),
-                )
+                    Vec::new(),
+                ))
             }
             ClearScope::All => {
-                let (deleted, memory) =
-                    tokio::task::spawn_blocking(move || sync.delete_published_sessions())
+                let sessions = sync.clone();
+                let deleted = tokio::task::spawn_blocking(move || sessions.delete_published_sessions())
+                    .await
+                    .map_err(|error| format!("⚠️ 清空任务执行异常: {error}"))?
+                    .map_err(|error| {
+                        format!(
+                            "⚠️ 把会话删除同步给其他设备时出错，/clear 已中止：{error}\n\n\
+                             已登记的会话删除可能会同步出去。可以重试：\
+                             /clear confirm all"
+                        )
+                    })?;
+                // 记忆的条目先留副本（还没有任何可发布的副作用）；本地清空成功后才提交。
+                let ids = {
+                    tokio::task::spawn_blocking(move || sync.stash_memory_for_clear())
                         .await
                         .map_err(|error| format!("⚠️ 清空任务执行异常: {error}"))?
                         .map_err(|error| {
                             format!(
-                                "⚠️ 把会话删除同步给其他设备时出错，/clear 已中止：{error}\n\n\
-                             已登记的会话删除可能会同步出去。可以重试：\
-                             /clear confirm all"
+                                "⚠️ 清空之前给记忆留副本时出错，/clear 已中止：{error}\n\n\
+                                 已登记的会话删除可能会同步出去。可以重试：\
+                                 /clear confirm all"
                             )
-                        })?;
-                Ok(format!(
-                    "\n\n多端同步已登记 {deleted} 个会话和 {memory} 条记忆的删除。各设备按自己的回收站保留设置保存副本。\n\
-                     每日笔记只同步追加、不同步删除：这次只清了这台设备上的，其他设备上的还在\
-                     （以后新加入的设备也会收到）。要清掉它们，请到每台设备上各执行一次 \
-                     /clear confirm all；要让它们从同步空间里也消失，各端清空之后在多端同步的\
-                     设置里重置同步空间。"
+                        })?
+                };
+                Ok((
+                    format!(
+                        "\n\n多端同步已把 {deleted} 个已发布会话的删除传给其他设备。\
+                         记忆的删除等本机清空成功后再登记。\n\
+                         每日笔记只同步追加、不同步删除：这次只清了这台设备上的，其他设备上的还在\
+                         （以后新加入的设备也会收到）。要清掉它们，请到每台设备上各执行一次 \
+                         /clear confirm all；要让它们从同步空间里也消失，各端清空之后在多端同步的\
+                         设置里重置同步空间。"
+                    ),
+                    ids,
                 ))
             }
         }

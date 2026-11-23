@@ -613,6 +613,17 @@ fn gone(conn: &Connection, device: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// 强制接管后可以启用任务了吗：用户标了「已丢失」，或者归属设备已经陈旧（§9.5，很久
+/// 没再出现）。界面对这两种设备都提供「强制接管」；这条准入与调度器的启用用同一个判定
+/// ——接管之后就该启用，不然用户看到的操作与结果不一致，任务没人执行。
+fn takeover_ready(conn: &Connection, owner: &str, now: i64) -> Result<bool> {
+    if gone(conn, owner)? {
+        return Ok(true);
+    }
+    let peer = db::peer_state(conn, owner)?;
+    Ok(peer.seen_ms > 0 && !peer.is_active(now) && peer.replaced_by.is_none())
+}
+
 /// 本机发的一条 op 是不是已经传到存储上了：不在待发队列里，也没有封好还没传的段。
 fn is_shipped(conn: &Connection, hlc: &str) -> Result<bool> {
     let queued: bool = conn.query_row(
@@ -624,7 +635,7 @@ fn is_shipped(conn: &Connection, hlc: &str) -> Result<bool> {
 }
 
 fn claim_of(conn: &Connection, key: &str) -> Result<Option<Claim>> {
-    Ok(db::state_get(conn, SCOPE_CLAIM, key)?.and_then(|row| row.json()))
+    Ok(db::state_get(conn, SCOPE_CLAIM, key)?.and_then(|row| row.json::<Claim>()))
 }
 
 fn save_claim(ctx: &Ctx, key: &str, claim: &Claim) -> Result<()> {
@@ -645,6 +656,15 @@ fn save_parked(ctx: &Ctx, key: &str, parked: &Parked) -> Result<()> {
 
 fn drop_parked(ctx: &Ctx, key: &str) -> Result<()> {
     db::write(ctx.db(), |tx| db::state_del(tx, SCOPE_PARKED, key))
+}
+
+/// 外部副作用（改任务表 `cron.json`）之前，把刚提交的交接记录推到盘上。SQLite 用
+/// `synchronous=NORMAL`，掉电可能回滚最近的提交：任务已经从任务表里移除（或加进去）而
+/// 记录丢了的话，任务的定义就两头都没有（或者同一交接加出两份）。先耐久、再动手，
+/// 中途断了才总有一份记录认得回已经动过的任务表。
+fn durable(ctx: &Ctx) -> Result<()> {
+    ctx.db().flush()?;
+    Ok(())
 }
 
 /// 别的设备上的定时任务：归属本机的、归属已经变了的、归属设备已换了新身份的都不算。
@@ -841,8 +861,10 @@ fn hand_over(ctx: &Ctx, s: &Settings, host: &dyn CronHost, report: &mut FilesRep
                     before: None,
                     restored: None,
                 };
-                // 先留底，再从任务表里移除：中途中断的话，任务的定义不会两头都没有。
+                // 先留底（并推到盘上），再从任务表里移除：中途中断的话，任务的定义不会
+                // 两头都没有。
                 save_parked(ctx, &key, &parked)?;
+                durable(ctx)?;
                 match host.remove(&xfer.id) {
                     Ok(true) => parked,
                     // 没移除成：任务还在任务表里（或者刚被用户删了），留底用不着。
@@ -921,7 +943,18 @@ fn fate(conn: &Connection, s: &Settings, key: &str, parked: &Parked, now: i64) -
             }
         }
         ACK if !parked.urgent && now - parked.sent_ms < RECLAIM_AFTER_MS => Fate::Keep,
-        ACK if caught_up(conn, &xfer.to)? => Fate::Reclaim,
+        // 本机换过身份：那条回执对方可能永远读不到，等不到它接手，只能按日志读到头推断
+        // （对方的接手在没有落定回执前是停用的，收回了也不会两边同时执行）。
+        ACK if parked.urgent => {
+            if caught_up(conn, &xfer.to)? {
+                Fate::Reclaim
+            } else {
+                Fate::Stuck
+            }
+        }
+        // 回执传出去一天还等不到落定：不再自动收回——「读到头」只能证明读完了它已发布
+        // 的日志，它的落定可能写好了还没传上来；收回了就可能两边各跑一遍。提醒用户去
+        // 处理：把那台设备标为「已丢失」，或者到对方上把接手办完（办不成了它会归还）。
         ACK => Fate::Stuck,
         _ => Fate::Unpark,
     })
@@ -941,14 +974,16 @@ fn restored(jobs: &[CronJob], parked: &Parked) -> Option<String> {
     }
 }
 
-/// 把交出去的任务放回本机任务表，返回它在任务表里的 id。外层的错误是库出了问题，内层的
-/// 是任务表不收（原因给用户看）。
+/// 把交出去的任务放回本机任务表，返回它在任务表里的 id。`disabled` = 交接还没有得到
+/// 对方确认（退出 / 重置时看不到它落没落定），放回来也要停用——对方其实已经接手的话，
+/// 启用的两份会同时跑。外层的错误是库出了问题，内层的是任务表不收（原因给用户看）。
 fn put_back(
     ctx: &Ctx,
     host: &dyn CronHost,
     jobs: &[CronJob],
     key: &str,
     parked: &mut Parked,
+    disabled: bool,
 ) -> Result<std::result::Result<String, String>> {
     // 它压根没离开过任务表（留了底、还没移除就中断了）。
     let original = parked
@@ -965,11 +1000,24 @@ fn put_back(
     if parked.before.is_none() {
         parked.before = Some(twins(jobs, &job));
         save_parked(ctx, key, parked)?;
+        // 加进任务表之前把「已有同样的任务」的底推到盘上：掉电丢了它，认不出上次加过的
+        // 那一份，就会加出第二份。
+        durable(ctx)?;
     }
     let before = parked.before.as_deref().unwrap_or_default();
     Ok(match orphan(jobs, &job, before) {
         Some(local) => Ok(local),
-        None => host.add(job),
+        None => {
+            // 动任务表之前再推一次落盘点：上次可能提交成功、flush 却失败了（库还能读出
+            // 这条记录，但掉电会丢）。已有意图也不能豁免——只有确认这份记录真的耐久了，
+            // 才允许加进任务表；认回已存在的任务（上面的 orphan 分支）不新增，不用重推。
+            durable(ctx)?;
+            if disabled {
+                host.add_disabled(job)
+            } else {
+                host.add(job)
+            }
+        }
     })
 }
 
@@ -1053,16 +1101,15 @@ fn settle_parked(
                         "cron-handover-unconfirmed",
                         &key,
                         &format!(
-                            "{}交给了「{taker}」，但没法确认它有没有接手",
+                            "{}交给了「{taker}」，但一直没能确认它有没有接手",
                             title_of(&parked.job)
                         ),
                         &format!(
-                            "本机已经按「{taker}」的请求把这个任务交了出去，之后一直没有等到它确认\
-                             接手；而它的同步数据本机现在读不到头（可能要先升级本机的程序，或者存储\
-                             上的数据有问题），所以不知道它是不是已经在执行。读得到之后会自动处理：\
-                             它接手了就到此为止，没接手本机就把任务收回来。不想等的话，先到那台设备\
-                             上看一眼：任务不在那里，就在本机把那台设备标为「已丢失」，本机会马上把\
-                             任务收回来。"
+                            "本机已经按「{taker}」的请求把这个任务交了出去，一直没有等到它确认\
+                             接手。为了不冒「两边各跑一遍」的险，本机不再按时限自动收回：它的\
+                             接手在没有落定回执之前是停用的，这个任务现在没有任何设备在执行。\
+                             请二选一：到那台设备上看一眼，任务不在那里的话让它重新发起接手，\
+                             或者就在本机把那台设备标为「已丢失」，本机会马上把任务收回来。"
                         ),
                     );
                     parked.warned = true;
@@ -1112,7 +1159,8 @@ fn settle_parked(
             }
             Fate::Unpark => {
                 if back.is_none() {
-                    match put_back(ctx, host, &jobs, &key, &mut parked)? {
+                    // 没人要接手了（请求作废、记录没了）：对方不可能落定，放回即启用。
+                    match put_back(ctx, host, &jobs, &key, &mut parked, false)? {
                         Ok(_) => {
                             report.reload.insert(Reload::Cron);
                         }
@@ -1124,7 +1172,7 @@ fn settle_parked(
                 }
                 drop_parked(ctx, &key)?;
             }
-            Fate::Reclaim => match put_back(ctx, host, &jobs, &key, &mut parked)? {
+            Fate::Reclaim => match put_back(ctx, host, &jobs, &key, &mut parked, false)? {
                 Ok(local) => {
                     parked.restored = Some(local);
                     // 换过身份的话，落定以本机现在的身份发。
@@ -1169,9 +1217,12 @@ enum Step {
     /// 接着等。
     Wait,
     /// 把任务加进本机任务表。`settle` = 原归属设备已经回执，加进去之后发落定。
+    /// 任务先停用着进表（所有权还没有明确落到本机），落定发出后才启用。
     Land { settle: bool },
     /// 早就加进任务表了（强制接管），现在等到了回执：补发落定。
     Settle,
+    /// 落定已经发过了，任务在表里还是停用的（中途断过）：补上启用。
+    Enable,
     /// 另一台设备的强制接管压过了本机的：本机那份撤掉，请求留着——原归属设备的回执还
     /// 可能指向本机。
     Withdraw,
@@ -1249,7 +1300,7 @@ fn next_step(
     owner: &str,
     key: &str,
     claim: &Claim,
-    held: bool,
+    held: Option<bool>,
 ) -> Result<Step> {
     // 任务已撤回或出现新版本，旧的请求和临时接管都应结束。
     let Some(xfer) = effective(conn, key)? else {
@@ -1267,16 +1318,14 @@ fn next_step(
     if xfer.rank >= ACK {
         return Ok(match (mine, xfer.rank) {
             // 定了。请求留到任务不在任务表里为止：原归属设备更早的一条收回记录可能晚到，
-            // 那时要靠它把本机这份撤掉。
-            (true, DONE) => {
-                if held {
-                    Step::Wait
-                } else {
-                    Step::Forget
-                }
-            }
+            // 那时要靠它把本机这份撤掉。在表里还是停用的（落定前后中断过）就补上启用。
+            (true, DONE) => match held {
+                Some(false) => Step::Enable,
+                Some(true) => Step::Wait,
+                None => Step::Forget,
+            },
             (true, _) => {
-                if claim.local.is_some() {
+                if held.is_some() {
                     Step::Settle
                 } else {
                     Step::Land { settle: true }
@@ -1300,13 +1349,20 @@ fn next_step(
         None => return Ok(Step::GiveUp(Lost::Deleted)),
     }
     Ok(if !mine {
-        if held {
+        if held.is_some() {
             Step::Withdraw
         } else {
             Step::Wait
         }
-    } else if xfer.rank == FORCE && claim.local.is_none() {
-        Step::Land { settle: false }
+    } else if xfer.rank == FORCE {
+        match held {
+            None => Step::Land { settle: false },
+            // 用户后来才把那台设备标成「已丢失」，或者它已经陈旧（很久没出现）：它的
+            // 回执不会来了，停用的这一份该启用了——不然任务谁都不执行。这条准入与
+            // 界面给「强制接管」的条件一致。
+            Some(false) if takeover_ready(conn, owner, now_ms())? => Step::Enable,
+            Some(_) => Step::Wait,
+        }
     } else {
         Step::Wait
     })
@@ -1344,8 +1400,8 @@ fn landing_job(conn: &Connection, claim: &Claim) -> Result<std::result::Result<C
     Ok(Ok(job))
 }
 
-/// 把一条请求里的任务加进本机任务表，返回它在任务表里的 id。外层的错误是库出了问题，
-/// 内层的是落不了地的原因（给用户看）。
+/// 把一条请求里的任务加进本机任务表（先停用；落定之后才启用），返回它在任务表里的 id。
+/// 外层的错误是库出了问题，内层的是落不了地的原因（给用户看）。
 fn land(
     ctx: &Ctx,
     host: &dyn CronHost,
@@ -1360,19 +1416,27 @@ fn land(
                 Ok(job) => job,
                 Err(reason) => return Ok(Err(reason)),
             };
-            // 先记下要加的是哪一份、任务表里已有哪些同样的任务，再动手。
+            // 先记下要加的是哪一份、任务表里已有哪些同样的任务（推到盘上），再动手：
+            // 掉电丢了这份记录的话，加进去的那一份会被当成新的再加一遍。
             let attempt = Attempt {
                 before: twins(jobs, &job),
                 job,
             };
             claim.attempt = Some(attempt.clone());
             save_claim(ctx, key, claim)?;
+            durable(ctx)?;
             attempt
         }
     };
     Ok(match orphan(jobs, &attempt.job, &attempt.before) {
         Some(local) => Ok(local),
-        None => host.add(attempt.job),
+        None => {
+            // 动任务表之前再推一次落盘点：上次可能提交成功、flush 却失败了（库还能读出
+            // 这条记录，但掉电会丢）。已有意图也不能豁免——只有确认这份记录真的耐久了，
+            // 才允许加进任务表；认回已存在的任务（上面的 orphan 分支）不新增，不用重推。
+            durable(ctx)?;
+            host.add_disabled(attempt.job)
+        }
     })
 }
 
@@ -1404,8 +1468,8 @@ fn withdraw(
     true
 }
 
-/// 本机用户发起的接手请求：归属定给本机了（或者是强制接管）就把任务加进本机任务表，
-/// 接不成了就了结，本机那份不该再执行了就撤掉。
+/// 本机用户发起的接手请求：归属定给本机了（或者是强制接管）就把任务加进本机任务表
+/// （先停用，落定之后才启用），接不成了就了结并归还，本机那份不该再执行了就撤掉。
 fn settle_claims(
     ctx: &Ctx,
     s: &Settings,
@@ -1421,16 +1485,42 @@ fn settle_claims(
         };
         let jobs = host.jobs();
         let local = landed(&jobs, &claim);
+        // 它在表里的话，现在是启用还是停用。
+        let held = local.as_deref().and_then(|local| {
+            jobs.iter()
+                .find(|job| job.id == local)
+                .map(|job| job.enabled)
+        });
         let step = db::read(ctx.db(), |conn| {
-            next_step(conn, s, owner, &key, &claim, local.is_some())
+            next_step(conn, s, owner, &key, &claim, held)
         })?;
         let done = transfer(owner, id, &s.device, &claim.rev, DONE);
         match step {
             Step::Wait => {}
             Step::Forget => drop_claim(ctx, &key)?,
             Step::Settle => {
+                // 落定发出之后才启用：启用顺序反了的话，原归属设备等不到落定而收回时，
+                // 本机这一份已经跑起来了。
                 db::write(ctx.db(), |tx| publish_xfer(tx, s, &key, &done).map(drop))?;
                 report.published += 1;
+                if let Some(local) = &local {
+                    if let Err(reason) = host.set_enabled(local, true) {
+                        tracing::warn!("启用接手来的定时任务 {local} 失败: {reason}");
+                        report.retry = true;
+                    } else {
+                        report.reload.insert(Reload::Cron);
+                    }
+                }
+            }
+            Step::Enable => {
+                if let Some(local) = &local {
+                    if let Err(reason) = host.set_enabled(local, true) {
+                        tracing::warn!("启用接手来的定时任务 {local} 失败: {reason}");
+                        report.retry = true;
+                    } else {
+                        report.reload.insert(Reload::Cron);
+                    }
+                }
             }
             Step::Land { settle } => match land(ctx, host, &jobs, &key, &mut claim)? {
                 Ok(added) => {
@@ -1444,16 +1534,33 @@ fn settle_claims(
                         Ok(())
                     })?;
                     report.published += usize::from(settle);
+                    // 什么时候可以启用：落定已经发出去，或者原归属设备已被用户标为丢失
+                    // （强制接管，它的回执永远不会来——任务没人执行才是真问题）。其余情况
+                    // 保持停用：原归属设备还没确认把任务交出来，收回了也不会两边同时跑。
+                    let owner_gone = db::read(ctx.db(), |conn| gone(conn, owner))?;
+                    if (settle || owner_gone) && claim.local.is_some() {
+                        if let Some(local) = &claim.local {
+                            if let Err(reason) = host.set_enabled(local, true) {
+                                tracing::warn!("启用接手来的定时任务 {local} 失败: {reason}");
+                                report.retry = true;
+                            } else {
+                                report.reload.insert(Reload::Cron);
+                            }
+                        }
+                    }
                     // 上一次没接住的提示用不着了。
                     report.status_changed |=
                         status::clear_notice(&ctx.paths, "cron-takeover", &key);
                     report.reload.insert(Reload::Cron);
                 }
                 Err(reason) => {
-                    // 不发落定：原归属设备到点会把任务收回去；用户也可以再试。
+                    // 接不成：不发明文以外的「放弃」记录（现成的几种记录都比回执低，
+                    // 盖不过它），原归属设备会一直等本机的落定。把话说清楚，让用户决定：
+                    // 在这台设备上再试一次，或者到原归属设备上把它标为「已丢失」。
                     let hint = if settle {
-                        "原来的设备已经把它交了出来：可以在「其他设备上的定时任务」里再试一次；\
-                         一天之内没有设备接手的话，原来的设备会把它收回去继续执行。"
+                        "原来的设备已经把它交了出来，现在没有设备在执行它。可以在\
+                         「其他设备上的定时任务」里再试一次；不想再移的话，去原来那台设备上\
+                         把本机标为「已丢失」，它会把任务收回去继续执行。"
                     } else {
                         "可以在「其他设备上的定时任务」里再试一次。"
                     };
@@ -1651,8 +1758,9 @@ pub(crate) fn reconcile(ctx: &Ctx, s: &Settings, report: &mut FilesReport) -> Re
 }
 
 /// 这台设备不再同步定时任务（范围关着）时每一轮做的收尾：发布过的任务向别的设备撤回，
-/// 镜像清空，不再受理新的移交。已经开始的交接照常走完——交出去的任务等不到对方落定照样
-/// 收回，本机请求过、对方已经回执的照样加进任务表——不然任务会卡在半路，哪边都不执行。
+/// 镜像清空，不再受理新的移交。已经开始的交接照常走完——本机请求过、对方已经回执的照样
+/// 加进任务表；交出去、还没等到落定的留着等（不按时限自动收回，见 [`fate`]），用户把那台
+/// 设备标为「已丢失」时收回。不然任务会卡在半路，哪边都不执行。
 pub(crate) fn wind_down(ctx: &Ctx, s: &Settings, report: &mut FilesReport) -> Result<()> {
     retire_local(ctx, s, report)?;
     if let Some(host) = &ctx.cron {
@@ -1689,8 +1797,17 @@ pub(crate) fn release_parked(ctx: &Ctx) -> Result<()> {
             Some(mut parked) => {
                 let definition = parked.job.to_string();
                 // 对方已经落定：任务在它那里，本机收回过的那份（有的话）撤掉。
-                let taken = xfer.is_some_and(|xfer| {
+                let taken = xfer.as_ref().is_some_and(|xfer| {
                     xfer.rev == parked.rev && xfer.rank == DONE && !mine.contains(&xfer.to)
+                });
+                // 交接悬着（回执已发、对方没落定）：清掉之后就再也看不到它落没落定，
+                // 放回来必须停用——对方其实已经接手的话，启用的两份会同时跑。定义作为
+                // 停用备份保留，用户核对另一台设备后再启用。
+                let unconfirmed = xfer.as_ref().is_some_and(|xfer| {
+                    xfer.rev == parked.rev
+                        && xfer.rank >= REQUEST
+                        && xfer.rank <= ACK
+                        && !mine.contains(&xfer.to)
                 });
                 match &ctx.cron {
                     Some(host) => {
@@ -1702,10 +1819,29 @@ pub(crate) fn release_parked(ctx: &Ctx) -> Result<()> {
                                 }
                             }
                             (false, None) => {
-                                if let Err(reason) =
-                                    put_back(ctx, host.as_ref(), &jobs, &key, &mut parked)?
-                                {
+                                if let Err(reason) = put_back(
+                                    ctx,
+                                    host.as_ref(),
+                                    &jobs,
+                                    &key,
+                                    &mut parked,
+                                    unconfirmed,
+                                )? {
                                     keep(&definition, &reason);
+                                } else if unconfirmed {
+                                    status::notice(
+                                        &ctx.paths,
+                                        "cron-handover-unknown",
+                                        &key,
+                                        &format!(
+                                            "{}放回了本机，但保持停用",
+                                            title_of(&parked.job)
+                                        ),
+                                        "本机曾把这个任务交给另一台设备，退出 / 重置时没能确认\
+                                         它有没有接手。为了不出现两台设备同时执行，放回的这份\
+                                         是停用的；到那台设备上核对过之后，在本机的任务表里\
+                                         手动启用或删掉其一。",
+                                    );
                                 }
                             }
                             _ => {}
@@ -1759,6 +1895,29 @@ mod tests {
             job.enabled = true;
             self.jobs.lock().unwrap().push(job.clone());
             Ok(job.id)
+        }
+
+        fn add_disabled(&self, mut job: CronJob) -> std::result::Result<String, String> {
+            if *self.refuse.lock().unwrap() {
+                return Err("任务表写不进去".into());
+            }
+            let mut next = self.next.lock().unwrap();
+            *next += 1;
+            job.id = format!("{:08x}", *next);
+            job.enabled = false;
+            self.jobs.lock().unwrap().push(job.clone());
+            Ok(job.id)
+        }
+
+        fn set_enabled(&self, id: &str, enabled: bool) -> std::result::Result<(), String> {
+            let mut jobs = self.jobs.lock().unwrap();
+            match jobs.iter_mut().find(|job| job.id == id) {
+                Some(job) => {
+                    job.enabled = enabled;
+                    Ok(())
+                }
+                None => Err(format!("任务 {id} 不在任务表里")),
+            }
         }
 
         fn remove(&self, id: &str) -> std::result::Result<bool, String> {
@@ -2162,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_takes_the_job_back_when_the_taker_never_confirms() {
+    fn the_owner_keeps_waiting_and_reports_when_the_taker_never_confirms() {
         let (a, table_a) = device();
         let (b, table_b) = device();
         table_a.add(job("巡检")).unwrap();
@@ -2178,25 +2337,16 @@ mod tests {
         sync_files(&a);
         assert!(table_a.jobs().is_empty());
         age_parked(&a);
-        db::write(a.ctx.db(), |tx| {
-            let mut peer = db::peer_state(tx, &b.settings.device)?;
-            peer.pull_incomplete = true;
-            db::put_peer_state(tx, &b.settings.device, &peer)
-        })
-        .unwrap();
         sync_files(&a);
-        assert!(
-            table_a.jobs().is_empty(),
-            "接手方的日志只拉到一半：不能收回"
-        );
-        db::write(a.ctx.db(), |tx| {
-            let mut peer = db::peer_state(tx, &b.settings.device)?;
-            peer.pull_incomplete = false;
-            db::put_peer_state(tx, &b.settings.device, &peer)
-        })
-        .unwrap();
+        // 等了一天也没等到落定：不再按时限自动收回——「读到头」证明不了它没有落定，
+        // 收回了就可能两边各跑一遍。提醒用户来处理；对方的接手在落定之前是停用的，
+        // 这个任务此刻没有任何设备在执行。
+        assert!(table_a.jobs().is_empty(), "超时不自动收回");
+        assert_eq!(notices(&a, "cron-handover-unconfirmed"), 1);
+        // 用户确认那台设备已经不在了：这才收回。
+        mark_lost_on(&a, &b);
         sync_files(&a);
-        assert_eq!(names(&table_a), ["巡检"], "等不到对方落定：收回");
+        assert_eq!(names(&table_a), ["巡检"], "用户确认失联：收回");
         assert_eq!(notices(&a, "cron-reclaimed"), 1);
         sync_files(&a);
         assert_eq!(table_a.jobs().len(), 1, "不会收回两遍");
@@ -2226,37 +2376,35 @@ mod tests {
     }
 
     #[test]
-    fn the_first_to_settle_keeps_the_job_taker_first() {
+    fn the_owner_waits_when_it_has_not_seen_the_settle() {
         let (a, table_a) = device();
         let (b, table_b) = device();
         table_a.add(job("巡检")).unwrap();
         exchange(&a, &b);
         take(&b, false).unwrap();
         exchange(&b, &a);
-        // 接手的设备看到回执，把任务加进任务表、发了落定——但落定还没传到原设备。
+        // 接手的设备看到回执，把任务加进任务表（先停用）、发了落定、然后启用——
+        // 但落定还没传到原设备。
         exchange(&a, &b);
         assert_eq!(names(&table_b), ["巡检"]);
+        assert!(table_b.jobs()[0].enabled, "落定已发出：已启用");
         later();
         sync_files(&a);
         age_parked(&a);
         sync_files(&a);
-        assert_eq!(
-            names(&table_a),
-            ["巡检"],
-            "原设备没看到落定，把任务收了回来"
-        );
-        // 两边的落定互相到达：先发的（接手的设备）算数，原设备把收回的那份撤掉。
+        // 原设备没看到落定也不收回：收回了就可能两边各跑一遍；提醒用户来处理。
+        assert!(table_a.jobs().is_empty(), "超时不自动收回");
+        assert_eq!(notices(&a, "cron-handover-unconfirmed"), 1);
+        // 落定到达：任务归接手的设备，本机的留底了结。
         exchange(&b, &a);
         assert!(table_a.jobs().is_empty());
-        assert_eq!(notices(&a, "cron-reclaim-undone"), 1);
+        assert_eq!(notices(&a, "cron-reclaim-undone"), 0);
         assert!(parked(&a).is_empty());
-        exchange(&a, &b);
         assert_eq!(names(&table_b), ["巡检"]);
-        assert_eq!(notices(&b, "cron-takeover-lost"), 0);
     }
 
     #[test]
-    fn the_first_to_settle_keeps_the_job_owner_first() {
+    fn a_reclaim_that_races_a_late_settle_loses_to_the_taker() {
         let (a, table_a) = device();
         let (b, table_b) = device();
         table_a.add(job("巡检")).unwrap();
@@ -2266,18 +2414,16 @@ mod tests {
         // 回执到了接手的设备的收件箱，它还没来得及处理……
         testing::ship(&a, &b);
         sync_files(&a);
-        age_parked(&a);
+        // ……原设备把它标为「已丢失」，把任务收了回来（收回记录还没传出去）。
+        mark_lost_on(&a, &b);
         sync_files(&a);
-        assert_eq!(
-            names(&table_a),
-            ["巡检"],
-            "……原设备等不到落定，把任务收了回来"
-        );
+        assert_eq!(names(&table_a), ["巡检"]);
         later();
-        // 接手的设备这才看到回执（还没看到对方的收回）：加进任务表，发落定。
+        // 接手的设备这才看到回执（还没看到对方的收回）：加进任务表（先停用），发落定。
         b.merge();
         sync_files(&b);
         assert_eq!(names(&table_b), ["巡检"]);
+        assert!(table_b.jobs()[0].enabled, "落定已发出：已启用");
         // 两边的落定互相到达：先发的（原设备）算数，接手的设备把自己那份撤掉。
         exchange(&a, &b);
         assert!(table_b.jobs().is_empty());
@@ -2301,6 +2447,8 @@ mod tests {
         take(&b, true).unwrap();
         sync_files(&b);
         assert_eq!(names(&table_b), ["巡检"]);
+        // 原设备已被用户标为「已丢失」：强制接管直接算数，任务立刻启用（它的回执不会来）。
+        assert!(table_b.jobs()[0].enabled, "原设备已标失联：直接启用");
         later();
         take(&c, true).unwrap();
         sync_files(&c);
@@ -2475,8 +2623,13 @@ mod tests {
         sync_files(&a);
         assert!(table_a.jobs().is_empty(), "不盲目收回");
         assert_eq!(notices(&a, "cron-handover-unconfirmed"), 1);
-        // 读得到了，对方确实没有落定：收回，提示撤掉。
+        // 读得到了也不够：它可能是落定写好了还没传上来。继续等，提示保留。
         halt(None);
+        sync_files(&a);
+        assert!(table_a.jobs().is_empty(), "读到头也不自动收回");
+        assert_eq!(notices(&a, "cron-handover-unconfirmed"), 1);
+        // 用户确认那台设备不在了：收回，提示撤掉。
+        mark_lost_on(&a, &b);
         sync_files(&a);
         assert_eq!(names(&table_a), ["巡检"]);
         assert_eq!(notices(&a, "cron-handover-unconfirmed"), 0);

@@ -163,9 +163,20 @@ pub(crate) async fn download_task(
 async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<()>) {
     let error = match result {
         Ok(()) => None,
-        Err(error) if error.is_not_found() => {
+        // 对象不在存储上，与对象在但内容对不上（长度相同却解不开/摘要不符）一样：这本机
+        // 都拿不到它。按「缺」走同一套簿记——向持有它的设备发一条有界的 `blob.want`，
+        // 持有方重新排队上传时会核对明文摘要、用正确的内容盖掉坏的。
+        Err(error) if error.is_not_found() || matches!(error, SyncError::Corrupt(_)) => {
+            // 记账是一个提交阶段：换空间期间作废，不往新空间的库里写旧空间的等待记录。
+            let commit = shared.ctx.space.begin();
+            if !commit.valid() {
+                return;
+            }
             let (ctx, wanted) = (shared.ctx.clone(), blob.clone());
             let missing = blocking(move || {
+                if !commit.valid() {
+                    return Ok(None);
+                }
                 db::write(ctx.db(), |tx| {
                     let Some(device) = sync_db::device_id(tx)? else {
                         return Ok(None);

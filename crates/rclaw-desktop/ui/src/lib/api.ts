@@ -1481,6 +1481,11 @@ export const api = {
   /** 只换存储的密码（WebDAV 的密码 / 对象存储的 Secret Key）；它只存在本机。 */
   syncSetSecret: (secret: string) => invoke<void>("sync_set_secret", { secret }),
 
+  /** 存储的设置（可带刚填的密码）一起保存并生效：密码按这份配置的存储账户绑定，
+   *  中间不会被别的配置变更插进来。 */
+  syncSaveStorage: (config: SyncConfig, secret: string | null) =>
+    invoke<void>("sync_save_storage", { config, secret }),
+
   /** 「测试连接」：用表单上正在填的设置（不必先保存）把存储要用到的操作逐个走一遍。
    *  secret 不给就用本机存着的。 */
   syncTestConnection: (config: SyncConfig, secret: string | null) =>

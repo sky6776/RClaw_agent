@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use rclaw_store::sync_db::{self, SEAL_SEALED};
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
 
 use super::local;
 use super::space::Live;
@@ -23,9 +22,8 @@ use super::Shared;
 use crate::attach::{self, now_ms, Backlog};
 use crate::codec;
 use crate::config::SyncConfig;
-use crate::db::{self, scope, BLOB_REMOTE};
-use crate::error::{Result, SyncError};
-use crate::files;
+use crate::db::{self, scope, Range, BLOB_REMOTE};
+use crate::error::{Result, SyncError};use crate::files;
 use crate::identity::{self, Identity};
 use crate::map;
 use crate::merge::{self, MergeReport};
@@ -64,6 +62,8 @@ const PRIME_PEER_WAIT_MS: i64 = 10 * 60 * 1000;
 const STALE_BUSY_WAIT: Duration = Duration::from_secs(10 * 60);
 /// 文件类数据每隔这么久做一次不看指纹缓存的完整对比。
 const FILES_FORCE_EVERY: Duration = Duration::from_secs(10 * 60);
+/// 暂缓的附件别名落点：空闲轮隔这么久重试一次补全（目标占用解除后自己接上）。
+const ALIAS_RETRY_EVERY: Duration = Duration::from_secs(15 * 60);
 /// 文件对比有事情没做成（文件正在被改、有 turn 在跑）时，隔这么久重试，最多连着试几次。
 const FILES_RETRY_AFTER: Duration = Duration::from_secs(5);
 const FILES_RETRY_MAX: u32 = 3;
@@ -120,34 +120,9 @@ impl Outcome {
     }
 }
 
-/// 会话同步的范围（kv `sync/range`）。范围变宽时，之前因为不在范围内而跳过的会话 op 要
-/// 重新过一遍。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct Range {
-    #[serde(default)]
-    sessions: bool,
-    #[serde(default)]
-    channels: Vec<String>,
-    #[serde(default)]
-    attachments: bool,
-}
-
+/// 会话同步的范围（kv `sync/range`，结构见 [`db::Range`]）。范围变宽时，之前因为不在
+/// 范围内而跳过的会话 op 要重新过一遍。
 impl Range {
-    fn of(s: &Settings) -> Range {
-        let mut channels = if s.scopes.sessions {
-            s.channels.clone()
-        } else {
-            Vec::new()
-        };
-        channels.sort();
-        channels.dedup();
-        Range {
-            sessions: s.scopes.sessions,
-            channels,
-            attachments: s.scopes.attachments,
-        }
-    }
-
     /// 比 `old` 多出了要同步的会话（会话同步从关到开，或多了通道）。
     fn widens(&self, old: &Range) -> bool {
         self.channels
@@ -298,6 +273,8 @@ pub(crate) struct Session {
     regressed: u32,
     /// 第一次检查「能不能发布本机存量」的时刻。
     prime_wait: Option<Instant>,
+    /// 上一次补附件别名落点的时刻：空闲轮按有界的间隔重试，成功或有新合入时清零。
+    aliases_due: Option<Instant>,
     /// 吃过快照、换过身份之后的那次清点第一次碰上会话正忙的时刻。
     stale_wait: Option<Instant>,
     /// 「存量附件要不要问用户」这次运行里已经看过。
@@ -333,6 +310,7 @@ impl Session {
             writer: None,
             regressed: 0,
             prime_wait: None,
+            aliases_due: None,
             stale_wait: None,
             backlog_checked: false,
             auto_fetched: HashSet::new(),
@@ -522,7 +500,13 @@ impl Session {
             if answered > 0 {
                 out.again = true;
             }
-            on_pool(ctx, |ctx| wire::settle_aliases(&ctx.env, None)).await?;
+            self.aliases_due = None;
+            on_pool(ctx, |ctx| wire::settle_aliases(&ctx.env, None, None)).await?;
+        } else if self.aliases_due.is_none_or(|at| at.elapsed() >= ALIAS_RETRY_EVERY) {
+            // 别的轮次不再自动补别名：但暂缓的落点（目标一时占用、读不了）得有机会在
+            // 空闲轮里补上——有界的间隔重试，占用的目标解除后自己接上。
+            self.aliases_due = Some(Instant::now());
+            on_pool(ctx, |ctx| wire::settle_aliases(&ctx.env, None, None)).await?;
         }
 
         // 各设备的日志都读到头了：清点别处已经删掉的分支留在本机的旧样子（§7.5）。
@@ -542,13 +526,15 @@ impl Session {
                 .await?;
         }
 
-        // 首次同步收尾（§8.8）。发布扫描这一轮跑过、没有会话被搁下、本机的东西都传完了。
+        // 首次同步收尾（§8.8）。发布扫描这一轮跑过、没有会话被搁下、本机的东西都传完了
+        // ——因范围收窄暂缓的 op 不算「没传完」（它们留着，范围重开时续发）。
         let mut initial = flags.initial;
         if !initial && flags.primed && !scan.skipped_busy && !pulled.more {
             let space = live.space_id.clone();
+            let s2 = s.clone();
             initial = on_pool(ctx, move |ctx| {
                 db::write(ctx.db(), |tx| {
-                    if map::outbox_len(tx)? > 0 || db::log_state(tx)?.pending.is_some() {
+                    if seal::has_sendable(tx, &s2)? || db::log_state(tx)?.pending.is_some() {
                         return Ok(false);
                     }
                     db::kv_put_json(tx, db::KV_INITIAL, &space)?;
@@ -992,8 +978,12 @@ impl Session {
                     attach::download(ctx, live.transport(), &live.keys, blob, s.attachment_max);
                 match download.await {
                     Ok(_) => fetched += 1,
-                    Err(error) if error.is_not_found() => {
-                        // 存储上还没有：向别的设备要。
+                    // 存储上还没有这个对象，与对象在但内容对不上（等长的坏文件）一样：
+                    // 本机都拿不到它，按「缺」走同一套簿记——向持有它的设备发有界的
+                    // `blob.want`，持有方重新排队上传时会核对明文摘要、用正确的内容盖掉。
+                    Err(error)
+                        if error.is_not_found() || matches!(error, SyncError::Corrupt(_)) =>
+                    {
                         let (device, blob) = (s.device.clone(), blob.clone());
                         let missing = on_pool(ctx, move |ctx| {
                             db::write(ctx.db(), |tx| {

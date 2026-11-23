@@ -358,19 +358,13 @@ pub(crate) fn delete_published(
     Ok(deleted)
 }
 
-/// `/clear confirm all`（§7.5）：调用方马上要清空本机的 `MEMORY.md`，这个清空要传到所有
-/// 设备。这里先在回收站里留一份现有的条目（`keep_trash`），再把清空登记成发给所有设备的
-/// 删除（[`memory::publish_clear`]）——用户已经明说了范围，不等下一轮对比自己发现「文件
-/// 空了」再来问一遍。返回登记的删除数。
-///
-/// 没在同步记忆（范围关着、还没有同步数据）时只留副本：以后打开这个范围，对比发现原有
-/// 的条目都不在了，会问用户。文件读不出来时照样往下走：那不是不让清空的理由。
-pub(crate) fn clear_memory(
-    ctx: &Ctx,
-    config: &SyncConfig,
-    sessions_supported: bool,
-    keep_trash: bool,
-) -> Result<usize> {
+/// `/clear confirm all`（§7.5）的第一半：调用方马上要清空本机的 `MEMORY.md`，先把现有的
+/// 条目在回收站里留一份（`keep_trash`），并登记「正在清理」的意图（[`memory::mark_clearing`]）
+/// ——之后的文件删除要是只成功了一半，后台对比不能把缺掉的条目当成正常删除发给别的
+/// 设备（`/clear` 会报失败、让用户重试，这次清理并没有完成）。返回条目标识。这一步本身
+/// 没有任何可发布的副作用——把清空登记成发给所有设备的删除（[`commit_memory_clear`]）
+/// 留给调用方在本地清空成功之后做。
+pub(crate) fn stash_memory_clear(ctx: &Ctx, keep_trash: bool) -> Result<Vec<String>> {
     let entries = match ctx.memory.list_entries(MemoryTarget::Memory) {
         Ok(entries) => entries,
         Err(error) => {
@@ -386,10 +380,33 @@ pub(crate) fn clear_memory(
             &entries,
         )?;
     }
+    let ids: Vec<String> = entries.iter().map(|text| memory::mem_id(text)).collect();
+    // 清理意图：只在文件删除之前登记，让后台对比跳到这次清理有了着落为止。没开过同步
+    // 的库里没有同步表，也不需要这个标记。
+    db::write(ctx.db(), |tx| {
+        if sync_db::sync_tables_exist(tx)? {
+            memory::mark_clearing(tx, "memory", &ids)?;
+        }
+        Ok(())
+    })?;
+    Ok(ids)
+}
+
+/// `/clear confirm all`（§7.5）的第二半：本地清空已经成功，把清空登记成发给所有设备的
+/// 删除（[`memory::publish_clear`]）——用户已经明说了范围，不等下一轮对比自己发现「文件
+/// 空了」再来问一遍。返回登记的删除数。
+///
+/// 没在同步记忆（范围关着、还没有同步数据）时不登记：以后打开这个范围，对比发现原有的
+/// 条目都不在了，会问用户。
+pub(crate) fn commit_memory_clear(
+    ctx: &Ctx,
+    config: &SyncConfig,
+    sessions_supported: bool,
+    ids: &[String],
+) -> Result<usize> {
     if !scopes_of(config, sessions_supported).memory {
         return Ok(0);
     }
-    let present: Vec<String> = entries.iter().map(|text| memory::mem_id(text)).collect();
     db::write(ctx.db(), |tx| {
         if !sync_db::sync_tables_exist(tx)? {
             return Ok(0);
@@ -398,7 +415,7 @@ pub(crate) fn clear_memory(
         if s.device.is_empty() {
             return Ok(0);
         }
-        memory::publish_clear(tx, &s, "memory", &present)
+        memory::publish_clear(tx, &s, "memory", ids)
     })
 }
 

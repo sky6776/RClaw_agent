@@ -317,7 +317,8 @@ fn pack_cache(ctx: &Ctx, device: &str, name: &str) -> PathBuf {
 }
 
 /// 取一个汇总包。沿链往回找的时候会先后读到好几个，密文先落到本机的临时目录：往前
-/// 处理时不必再下载一遍，内存里也始终只有一个包。
+/// 处理时不必再下载一遍，内存里也始终只有一个包。返回包、它是不是这次从存储上取的
+/// （缓存命中不占网络预算）、以及这次实际下载的字节数（预算按字节算）。
 async fn load_pack(
     ctx: &Ctx,
     transport: &dyn SyncTransport,
@@ -325,17 +326,23 @@ async fn load_pack(
     device: &str,
     name: &str,
     digest: &str,
-) -> Result<Rollup> {
+) -> Result<(Rollup, bool, usize)> {
     let cache = pack_cache(ctx, device, name);
     let path = codec::rollup_path(device, name);
-    let object = match tokio::fs::read(&cache).await {
-        Ok(bytes) => bytes,
+    let (object, downloaded) = match tokio::fs::read(&cache).await {
+        Ok(bytes) => (bytes, false),
         Err(_) => {
             let bytes = transport.get(&path, codec::ROLLUP_OBJECT_MAX).await?;
-            let _ = tokio::fs::write(&cache, &bytes).await;
-            bytes
+            // 缓存只是加速：写不上（数据目录临时区没空间、被并发清了）下一轮要重下，
+            // 但读取游标的推进不依赖它，说一声就行。
+            if let Err(error) = tokio::fs::write(&cache, &bytes).await {
+                tracing::debug!("汇总包缓存写不上（下一轮可能要重下）: {error}");
+            }
+            trim_pack_cache(ctx, &cache);
+            (bytes, true)
         }
     };
+    let network = downloaded.then(|| object.len()).unwrap_or(0);
     let (keys, device, digest) = (keys.clone(), device.to_string(), digest.to_string());
     let parsed = tokio::task::spawn_blocking(move || -> Result<Rollup> {
         let plain = codec::open_log_object(&keys, &path, &object, codec::ROLLUP_PLAIN_MAX)?;
@@ -349,8 +356,64 @@ async fn load_pack(
     if parsed.is_err() {
         let _ = tokio::fs::remove_file(&cache).await;
     }
-    parsed
+    Ok((parsed?, downloaded, network))
 }
+
+/// 汇总包的缓存（`<数据根>/sync/tmp/pack-…`）最多留这么多字节：超了按修改时间从最旧
+/// 的开始删，刚写的那个不动。它只是「往前处理时不必再下载」的加速，删掉的下一轮重取。
+const PACK_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 缓存总量超了上限就删最旧的缓存文件（`keep` 是刚写的那个）。
+fn trim_pack_cache(ctx: &Ctx, keep: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(&ctx.paths.tmp) else {
+        return;
+    };
+    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = entries
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && entry.file_name().to_string_lossy().starts_with("pack-")
+        })
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            Some((entry.path(), meta.len(), meta.modified().ok()?))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, size, _)| *size).sum();
+    if total <= PACK_CACHE_MAX_BYTES {
+        return;
+    }
+    files.sort_by_key(|(_, _, modified)| *modified);
+    for (path, size, _) in files {
+        if total <= PACK_CACHE_MAX_BYTES || path == keep {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
+/// 一条汇总包链往回找的进度。跨轮记在 [`Memo`] 里：预算用完停在中途时，下一轮从这里
+/// 接着往回找，不把已经确认过的路径再走一遍。
+#[derive(Debug, Clone, Default)]
+struct PackChain {
+    /// 这条链属于哪台设备：缓存文件名按它算（淘汰别的设备的链时不能拿当前设备拼）。
+    device: String,
+    /// 已知的链：新的在前。
+    links: Vec<RollupLink>,
+    /// 已经找到「包住本机位置」的那一环（或链的开头）。
+    complete: bool,
+}
+
+/// 跨轮的汇总包链最多记这么多台设备。
+const PACK_CHAINS_MAX: usize = 8;
+
+/// 一轮里回溯最多为新下载这么多汇总包（缓存命中不算）。回溯阶段一分段也交不出去——
+/// 本机位置还在更早的包里没找到——字节预算卡不死它（包比预算大、缓存又留不住时，
+/// 每轮都会重下同一个包停在原地），改用条数封顶：链的进度跨轮保留，再长的链也终会
+/// 走到头。
+const PACK_LINKS_PER_ROUND: usize = 16;
 
 struct DevicePull<'a> {
     ctx: &'a Ctx,
@@ -360,6 +423,8 @@ struct DevicePull<'a> {
     budget: usize,
     spent: usize,
     ops: usize,
+    /// 汇总包链往回找的进度：跨轮留着（见 [`PackChain`]）。
+    pack_chains: &'a mut HashMap<String, PackChain>,
     /// 这一趟读不下去，是因为日志接不上本机记着的位置（位置落在某个段的中间，或者链对
     /// 不上），不是对象坏了、没到齐。
     misfit: bool,
@@ -368,6 +433,25 @@ struct DevicePull<'a> {
 impl DevicePull<'_> {
     fn exhausted(&self) -> bool {
         self.spent >= self.budget
+    }
+
+    /// 记下一条汇总包链的进度；超过上限时淘汰最旧的一条，它缓存的密文一并清掉。
+    fn remember_chain(&mut self, key: String, chain: PackChain) {
+        if self.pack_chains.len() >= PACK_CHAINS_MAX && !self.pack_chains.contains_key(&key) {
+            if let Some(victim) = self.pack_chains.keys().next().cloned() {
+                if let Some(old) = self.pack_chains.remove(&victim) {
+                    self.clean_caches(&old);
+                }
+            }
+        }
+        self.pack_chains.insert(key, chain);
+    }
+
+    /// 清掉一条链各个包在本机临时目录里的密文。缓存文件名按链所属的设备算。
+    fn clean_caches(&self, chain: &PackChain) {
+        for link in &chain.links {
+            let _ = std::fs::remove_file(pack_cache(self.ctx, &chain.device, &link.name));
+        }
     }
 
     async fn ingest_segment(
@@ -442,19 +526,31 @@ impl DevicePull<'_> {
 
     /// 位置比最近的汇总包还早：沿汇总包链往回找到含有本机位置的那一个，再往前逐段处理。
     /// 返回是否把汇总包覆盖的部分全部读完。
+    ///
+    /// 往回找与往前处理共用这一轮的预算（下载、解包、临时文件）：预算用完就停在中途，
+    /// 进度记在 [`Memo`] 里，下一轮接着往回找，不重走已经确认过的链。
     async fn pull_packs(&mut self, peer: &mut PeerState, head: &Head) -> Result<bool> {
         let Some(newest) = &head.rollup else {
             return Ok(true);
         };
-        // 往回找：只记下各包的名字与摘要（密文已经落在临时目录里）。
-        let mut chain: Vec<RollupLink> = vec![RollupLink {
-            name: newest.name.clone(),
-            digest: newest.digest.clone(),
-            to: newest.to,
-        }];
-        loop {
-            let link = chain.last().expect("至少一个").clone();
-            let pack = load_pack(
+        let key = format!("{}|{}|{}", self.device, newest.name, newest.digest);
+        let mut chain = self.pack_chains.remove(&key).unwrap_or_default();
+        if chain.links.is_empty() {
+            chain.device = self.device.to_string();
+            chain.links.push(RollupLink {
+                name: newest.name.clone(),
+                digest: newest.digest.clone(),
+                to: newest.to,
+            });
+        }
+        // 往回找：只记下各包的名字与摘要（密文落在临时目录里，往前处理时不必再下载）。
+        // 这一阶段不拿字节预算当停止条件——卡住的位置在任何可交的段之外，字节预算只会
+        // 让「包比预算大、缓存又留不住」的设备每轮重下同一个包停在原地。每轮新下载的
+        // 环数按 [`PACK_LINKS_PER_ROUND`] 封顶，链的进度跨轮保留。
+        let mut walked = 0usize;
+        while !chain.complete {
+            let link = chain.links.last().expect("至少一个").clone();
+            let (pack, downloaded, network) = load_pack(
                 self.ctx,
                 self.transport,
                 self.keys,
@@ -463,20 +559,42 @@ impl DevicePull<'_> {
                 &link.digest,
             )
             .await?;
+            if downloaded {
+                self.spent += network;
+                walked += 1;
+                if walked >= PACK_LINKS_PER_ROUND {
+                    // 这一轮往回找的深度到顶：链的进度留着，下一轮接着往回找。
+                    self.remember_chain(key, chain);
+                    return Ok(false);
+                }
+            }
             if pack.header.from <= peer.fetched + 1 {
+                chain.complete = true;
                 break;
             }
             match pack.header.prev {
-                Some(prev) => chain.push(prev),
+                Some(prev) => chain.links.push(prev),
                 // 更早的日志已经被回收：只能从这里读起（`locate` 已确认位置不早于回收点）。
-                None => break,
+                None => {
+                    chain.complete = true;
+                }
             }
         }
-        for link in chain.iter().rev() {
-            if self.exhausted() {
+        for link in chain.links.iter().rev() {
+            // 整包都在本机位置之前的不再下载也不解包：把它的缓存顺手清掉。
+            if link.to <= peer.fetched {
+                let _ =
+                    tokio::fs::remove_file(pack_cache(self.ctx, &chain.device, &link.name)).await;
+                continue;
+            }
+            if self.exhausted() && !self.pack_in_cache(&chain.device, &link.name) {
+                // 停在中途：链已经完整找到了，下一轮直接从链上接着往前处理（已处理过的
+                // 段按位置跳过），不必重走回溯。缓存里还有这个包就接着读：读取游标的
+                // 推进不依赖网络预算，读缓存不再花网络。
+                self.remember_chain(key, chain);
                 return Ok(false);
             }
-            let pack = load_pack(
+            let (pack, downloaded, network) = load_pack(
                 self.ctx,
                 self.transport,
                 self.keys,
@@ -485,6 +603,10 @@ impl DevicePull<'_> {
                 &link.digest,
             )
             .await?;
+            if downloaded {
+                self.spent += network;
+            }
+            let mut ingested_here = 0usize;
             for (seg, segment) in pack.segments {
                 if seg.to <= peer.fetched {
                     // 正好停在这个段末尾时核对链：对不上说明这个身份有过两个写者。
@@ -494,6 +616,8 @@ impl DevicePull<'_> {
                         })
                     {
                         self.misfit = true;
+                        // 这条链读不下去：缓存的密文不用留着了。
+                        self.clean_caches(&chain);
                         return Err(SyncError::corrupt(format!(
                             "设备 {} 的日志在序号 {} 处与本机取到的不是同一条链",
                             self.device, seg.to
@@ -501,12 +625,25 @@ impl DevicePull<'_> {
                     }
                     continue;
                 }
+                // 已经下载且校验成功的包至少提交一段：它自己花的网络预算不拦读取游标，
+                // 缓存留不留得住也一样。之后到预算用尽就停在这里，链的进度留着，下一轮
+                // 从这条链接着往前（已经处理过的段按位置跳过）。
+                if ingested_here > 0 && self.exhausted() {
+                    self.remember_chain(key.clone(), chain.clone());
+                    return Ok(false);
+                }
                 self.ingest_segment(peer, &seg.name, &seg.digest, segment)
                     .await?;
+                ingested_here += 1;
             }
             let _ = tokio::fs::remove_file(pack_cache(self.ctx, self.device, &link.name)).await;
         }
         Ok(true)
+    }
+
+    /// 这个包的密文缓存还在不在本机（读取它不花网络预算）。
+    fn pack_in_cache(&self, device: &str, name: &str) -> bool {
+        std::fs::metadata(pack_cache(self.ctx, device, name)).is_ok()
     }
 }
 
@@ -550,6 +687,7 @@ async fn pull_device(
     budget: usize,
     known: bool,
     grace_ms: i64,
+    chains: &mut HashMap<String, PackChain>,
 ) -> Result<(usize, bool)> {
     let mut peer = {
         let device = device.to_string();
@@ -619,6 +757,7 @@ async fn pull_device(
         budget,
         spent: 0,
         ops: 0,
+        pack_chains: chains,
         misfit: false,
     };
     // 位置正好是日志的末尾：快照给的位置到这里算核对过（见最后记账的那个事务）。
@@ -778,17 +917,43 @@ struct Stranger {
 #[derive(Debug, Default)]
 pub struct Memo {
     strangers: HashMap<String, Stranger>,
+    /// 版本标识不可靠的设备（存储端既没给 ETag 也没给修改时间）上次重读 head 的时刻。
+    /// 这些设备的 head 不能靠「版本 + 长度」判重：同长度的新回执会被当成旧值跳过，长期
+    /// 漏读会一直挡着日志回收。改为有界地定期 GET，读到之后按解开并校验过的内容判重
+    /// （[`pull_device`] 只取还没取过的段，内容没变就是一次空跑）。
+    unstable_ms: HashMap<String, i64>,
+    /// 汇总包链往回找的进度（见 [`PackChain`]）：预算用完时下一轮接着走，不重走验证过
+    /// 的路径。
+    pack_chains: HashMap<String, PackChain>,
 }
+
+/// 版本标识不可靠的 head 每隔这么久重读一次。
+const UNSTABLE_HEAD_RECHECK_MS: i64 = 60 * 1000;
 
 impl Memo {
     /// 不在这次列表里的名字不必再记着。
     fn keep_listed(&mut self, heads: &[ObjectMeta]) {
-        if self.strangers.is_empty() {
-            return;
+        if !self.strangers.is_empty() {
+            let listed: HashSet<&str> = heads.iter().map(|meta| meta.name.as_str()).collect();
+            self.strangers
+                .retain(|device, _| listed.contains(device.as_str()));
         }
-        let listed: HashSet<&str> = heads.iter().map(|meta| meta.name.as_str()).collect();
-        self.strangers
-            .retain(|device, _| listed.contains(device.as_str()));
+        if !self.unstable_ms.is_empty() {
+            let listed: HashSet<&str> = heads.iter().map(|meta| meta.name.as_str()).collect();
+            self.unstable_ms
+                .retain(|device, _| listed.contains(device.as_str()));
+        }
+    }
+
+    /// 版本不可靠的设备现在还不必再读（上次重读还不到间隔）。
+    fn unstable_waits(&self, device: &str, now: i64) -> bool {
+        self.unstable_ms.get(device).is_some_and(|checked| {
+            (0..UNSTABLE_HEAD_RECHECK_MS).contains(&(now - checked))
+        })
+    }
+
+    fn unstable_read(&mut self, device: &str, now: i64) {
+        self.unstable_ms.insert(device.to_string(), now);
     }
 
     /// 这个没认出来的 head 现在还不必再读：还是那一份，也还没到再试的时刻。
@@ -852,14 +1017,35 @@ pub async fn pull(
         }
         let tag = meta.tag();
         let known = seen.get(device);
-        match known {
-            Some(last) if *last == tag => continue,
-            None if memo.waits(device, &tag, now_ms()) => continue,
-            _ => {}
+        let now = now_ms();
+        if meta.stable_version {
+            match known {
+                Some(last) if *last == tag => continue,
+                None if memo.waits(device, &tag, now) => continue,
+                _ => {}
+            }
+        } else {
+            // 存储端没给版本标识：同长度的新 head（定长加密开销下的常规更新）用「版本 +
+            // 长度」分不出来。有界地定期重读，读到之后按内容判重。
+            if memo.unstable_waits(device, now) {
+                continue;
+            }
+            memo.unstable_read(device, now);
         }
         report.changed += 1;
         let known = known.is_some();
-        let pulled = pull_device(ctx, transport, keys, device, &tag, budget, known, grace_ms).await;
+        let pulled = pull_device(
+            ctx,
+            transport,
+            keys,
+            device,
+            &tag,
+            budget,
+            known,
+            grace_ms,
+            &mut memo.pack_chains,
+        )
+        .await;
         let failed = match pulled {
             Ok((ops, more)) => {
                 report.ops += ops;

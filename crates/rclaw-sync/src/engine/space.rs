@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use rclaw_store::sync_db::{self, KV_SYNC_DEVICE, KV_SYNC_HLC, KV_SYNC_SCHEMA, SEAL_LOCAL};
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 
 use crate::attach;
-use crate::codec;
+use crate::codec::SpaceFile;
 use crate::config::{S3Section, SyncConfig, SyncPaths, WebdavSection};
 use crate::crypto::{Keys, SpaceKey};
 use crate::db::{
@@ -25,6 +26,7 @@ use crate::pairing::{PairedStorage, PairingCode};
 use crate::remote;
 use crate::seal;
 use crate::secrets::{new_space_id, Secrets};
+use crate::status;
 use crate::transport::file::FileTransport;
 use crate::transport::s3::{S3Options, S3Transport};
 use crate::transport::webdav::{WebdavOptions, WebdavTransport};
@@ -242,6 +244,245 @@ async fn save_created(ctx: &Ctx, next: &Secrets) -> Result<()> {
     .await
 }
 
+// ---------------------------------------------------------------------------
+// 没做完的空间切换
+// ---------------------------------------------------------------------------
+
+/// 一次没做完的空间切换（重置 / 退出）。动远端、换本机密钥之前先把它落盘（`sync/
+/// pending-space.json`，与密钥同样的私有权限）：中途退出（掉电、写不了盘）后，重启或
+/// 重试按记录与远端的实际状态接着做，同一个切换不会做岔、也不会留下只有远端知道的新
+/// 空间。做完才删记录。记录里带着这次切换用的存储配置：恢复必须回**同一个位置**做，
+/// 配置改了（换了前缀、换了桶）也不能在新位置把 404 当成「旧空间已不在」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingSpace {
+    action: SpaceAction,
+    /// 这一次切换所用的存储配置。老版本写的记录没有这个字段，恢复时沿用当时的配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage: Option<SyncConfig>,
+    /// 动手之前本机的 secrets：关旧空间要用它的存储凭据与旧密钥。
+    previous: Secrets,
+    /// 重置要切到的新 secrets（退出没有）。
+    replacement: Option<Secrets>,
+}
+
+/// 规范化的存储位置标识：同一次空间切换必须在同一个位置上恢复。
+fn storage_binding(config: &SyncConfig) -> String {
+    match config.transport.as_str() {
+        "webdav" => format!(
+            "webdav|{}|{}",
+            config.webdav.url.trim().trim_end_matches('/'),
+            config.webdav.username.trim()
+        ),
+        "s3" => format!(
+            "s3|{}|{}|{}",
+            config.s3.endpoint.trim().trim_end_matches('/'),
+            config.s3.bucket.trim(),
+            config.s3.prefix.trim().trim_end_matches('/')
+        ),
+        "file" => format!(
+            "file|{}",
+            config.file.dir.trim().trim_end_matches(['/', '\\'])
+        ),
+        other => format!("storage|{other}"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SpaceAction {
+    /// 重置：立起新空间、废弃旧空间、本机切到新空间。
+    Reset,
+    /// 退出：本机改回未配对、清掉同步状态（远端不动）。
+    Leave,
+}
+
+fn pending_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join("pending-space.json")
+}
+
+fn pending_load(paths: &SyncPaths) -> Result<Option<PendingSpace>> {
+    match std::fs::read(pending_path(paths)) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(pending) => Ok(Some(pending)),
+            Err(error) => {
+                // 记录坏了就没法接着做；把它丢掉，本机保持现在这份密钥不动。
+                tracing::warn!("sync/pending-space.json 损坏，丢弃: {error}");
+                let _ = std::fs::remove_file(pending_path(paths));
+                Ok(None)
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn pending_save(paths: &SyncPaths, pending: &PendingSpace) -> Result<()> {
+    paths.ensure_root()?;
+    rclaw_store::atomic_write_private(
+        &pending_path(paths),
+        &serde_json::to_vec_pretty(pending)?,
+    )?;
+    Ok(())
+}
+
+fn pending_clear(paths: &SyncPaths) -> Result<()> {
+    match std::fs::remove_file(pending_path(paths)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 上一次的空间切换没做完：按记录与远端的实际状态接着做，做完删记录。没有记录就是
+/// 无事可做；做完了返回这次完成的动作（调用方据此判断「重试的那次重置已经做完了」）。
+/// 每一步都幂等，重复走不产生第二个空间。
+///
+/// 恢复用的存储是**记录里的那一份**：配置在这期间被改到别的位置（换了前缀、换了桶）
+/// 时，回原位置继续做，并在状态里留一句话说明；不然新位置上的 404 会被当成「旧空间已
+/// 不存在」，隔离就没有真正发生。
+pub(crate) async fn resume_pending(
+    ctx: &Ctx,
+    config: &SyncConfig,
+    secrets: &mut Secrets,
+) -> Result<Option<SpaceAction>> {
+    let Some(pending) = pending_load(&ctx.paths)? else {
+        return Ok(None);
+    };
+    match pending.action {
+        SpaceAction::Reset => {
+            finish_reset(ctx, config, secrets, pending).await?;
+            Ok(Some(SpaceAction::Reset))
+        }
+        SpaceAction::Leave => {
+            let mut next = pending.previous.clone();
+            next.leave_space();
+            let ctx_for_task = ctx.clone();
+            let saved = next.clone();
+            blocking(move || {
+                saved.save(&ctx_for_task.paths)?;
+                reset_local_state(&ctx_for_task, None, None)
+            })
+            .await?;
+            pending_clear(&ctx.paths)?;
+            *secrets = next;
+            Ok(Some(SpaceAction::Leave))
+        }
+    }
+}
+
+/// 重置的后半程（入口见 [`reset`]）：新空间立起来（已立就核对）、旧空间废弃（已废弃或
+/// 不在了就跳过）、本机切到新空间，全部走完才删记录。哪一步失败都原样上抛：记录还在，
+/// 下次打开引擎或重试从这一步接着做。
+///
+/// 恢复用的是**记录里的存储配置**：改了配置（换了前缀/桶）时回原位置做，不然新位置上的
+/// 404 会被误当成「旧空间已不在」，隔离就没发生。
+async fn finish_reset(
+    ctx: &Ctx,
+    config: &SyncConfig,
+    secrets: &mut Secrets,
+    pending: PendingSpace,
+) -> Result<()> {
+    let Some(next) = pending.replacement.clone() else {
+        // 记录不完整（老版本或写坏了）：没法接着做，丢弃记录，本机保持现状。
+        tracing::warn!("待完成的重置记录里没有新空间的密钥，丢弃");
+        pending_clear(&ctx.paths)?;
+        return Err(SyncError::other(
+            "上次的重置没有留下能接着做的新空间记录；请再重试一次「重置同步空间」",
+        ));
+    };
+    // 老记录（没有存储字段）沿用当时的配置；位置换了就在原位置继续做，并告诉用户。
+    let at: SyncConfig = pending.storage.clone().unwrap_or_else(|| config.clone());
+    if storage_binding(&at) != storage_binding(config) {
+        tracing::warn!(
+            "重置的恢复在原来的存储位置（{}）上继续，当前配置指向的是另一处",
+            storage_binding(&at)
+        );
+        status::notice(
+            &ctx.paths,
+            "reset-resumed-elsewhere",
+            &next.space_id,
+            "重置在原来的存储位置上继续完成",
+            &format!(
+                "上次没做完的「重置同步空间」是在另一个存储位置上开始的。这次配置指向了\
+                 别处，恢复回到原来的位置（{}）继续，以免把那里的 404 误当成「旧空间已经\
+                 关闭」。当前配置没有被改动；确认重置完成之后，可以再把存储改回你想要的\
+                 地址。",
+                storage_binding(&at)
+            ),
+        );
+    }
+    // 恢复用记录的存储位置，但凭据跟着当前这份 secrets 走（同一个存储账户时）：这期间
+    // 用户可能已经在设置里换过密码——旧密码被撤销时，新密码同样开得了这个空间。
+    let mut next = next;
+    let mut old_secrets = pending.previous.clone();
+    if storage_binding(&at) == storage_binding(config) {
+        refresh_credentials(&mut next, secrets);
+        refresh_credentials(&mut old_secrets, secrets);
+    }
+    let fresh = load_live(&at, &next).await?;
+    // 1. 新空间立起来。已存在就核对密钥（幂等）；已废弃说明情况不对，停下来让人看。
+    create_file_namespace(&at, &next.space_id).await?;
+    remote::open_space(fresh.transport(), &fresh.keys, &next.space_id, true).await?;
+    // 2. 废弃旧空间。先核对远端确实是旧空间再关；已经关了（或不在了）就跳过。位置上
+    //    不是当初那个空间（被改过、别的空间）时给出具体错误，不当作「已关闭」跳过。
+    //    这里不再删新空间回滚：如果关闭其实已在远端生效、只是响应丢了，新空间是唯一能
+    //    接着用的。
+    if pending.previous.is_paired() {
+        let open = match read_old_space(&at, &old_secrets).await {
+            Ok(Some(file)) => {
+                file.verify(&old_secrets.keys()?, &old_secrets.space_id)
+                    .map_err(|error| {
+                        SyncError::other(format!(
+                            "旧空间的位置（{}）上不是当初那个空间，不能当作「已关闭」跳过；\
+                             请核对存储地址后重试: {error}",
+                            storage_binding(&at)
+                        ))
+                    })?;
+                !file.closed
+            }
+            Ok(None) => false,
+            Err(error) => {
+                return Err(SyncError::other(format!(
+                    "恢复重置：读不到旧空间（{error}）。存储恢复可访问后重试；\
+                     不想继续这次切换可以用「退出同步空间」收场"
+                )));
+            }
+        };
+        if open {
+            let old = load_live(&at, &old_secrets).await?;
+            remote::close_space(old.transport(), &old.keys, &old.space_id).await?;
+        }
+    }
+    // 3. 本机切到新空间（记「这个空间是本机建的」+ secrets 落盘），做完才删记录。
+    save_created(ctx, &next).await?;
+    pending_clear(&ctx.paths)?;
+    *secrets = next;
+    Ok(())
+}
+
+/// 恢复时把记录里的存储凭据换成当前 secrets 里的（只在同一个存储账户上调用）。
+fn refresh_credentials(target: &mut Secrets, current: &Secrets) {
+    target.webdav_account = current.webdav_account.clone();
+    target.webdav_password = current.webdav_password.clone();
+    target.s3_account = current.s3_account.clone();
+    target.s3_secret_key = current.s3_secret_key.clone();
+}
+
+/// 读旧空间的 `space.json`。`file` 后端平常把空间子目录本身当传输根（[`open_live`]）：
+/// 子目录没了会把「命名空间不在了」变成整个存储不可访问。这里改从外层根 + 空间前缀
+/// 进——共享目录还在而旧空间子目录没了（被清掉、没同步过来）时，读不到 `space.json`
+/// 就是「已关闭」，恢复照常收敛。
+async fn read_old_space(config: &SyncConfig, secrets: &Secrets) -> Result<Option<SpaceFile>> {
+    let (config, secrets, space_id) = (
+        config.clone(),
+        secrets.clone(),
+        secrets.space_id.clone(),
+    );
+    let root = blocking(move || root_transport(&config, &secrets)).await?;
+    let transport = Scoped::new(root, &space_id);
+    remote::read_space(&transport).await
+}
+
 /// 创建一个新的同步空间，本机是它的第一台设备。存储上先写出 `space.json`，写不通就
 /// 什么都不改。
 pub(crate) async fn create(ctx: &Ctx, config: &SyncConfig, secrets: &mut Secrets) -> Result<()> {
@@ -289,18 +530,38 @@ pub(crate) async fn join(
 
 /// 退出同步空间：密钥与存储凭据从本机清掉，本机的同步状态回到「没同步过」。会话、记忆
 /// 等数据原样留在本机；存储上的密文不动（别的设备还在用）。
-pub(crate) async fn leave(ctx: &Ctx, secrets: &mut Secrets) -> Result<()> {
+///
+/// 动手之前先落盘一条「退出」记录：改成未配对之后清同步状态这一步要是断了（掉电、
+/// 写不了盘），重试时本机已经是未配对，靠记录把剩下的清完（见 [`resume_pending`]）。
+pub(crate) async fn leave(
+    ctx: &Ctx,
+    config: &SyncConfig,
+    secrets: &mut Secrets,
+) -> Result<()> {
+    // 上次没做完的切换先做完（可能是一次重置：先收敛到新空间），再决定退不退。
+    let _ = resume_pending(ctx, config, secrets).await?;
     if !secrets.is_paired() {
         return Ok(());
     }
     let mut next = secrets.clone();
     next.leave_space();
-    let (ctx, saved) = (ctx.clone(), next.clone());
+    pending_save(
+        &ctx.paths,
+        &PendingSpace {
+            action: SpaceAction::Leave,
+            storage: Some(config.clone()),
+            previous: secrets.clone(),
+            replacement: None,
+        },
+    )?;
+    let ctx_for_task = ctx.clone();
+    let saved = next.clone();
     blocking(move || {
-        saved.save(&ctx.paths)?;
-        reset_local_state(&ctx, None, None)
+        saved.save(&ctx_for_task.paths)?;
+        reset_local_state(&ctx_for_task, None, None)
     })
     .await?;
+    pending_clear(&ctx.paths)?;
     *secrets = next;
     Ok(())
 }
@@ -308,30 +569,32 @@ pub(crate) async fn leave(ctx: &Ctx, secrets: &mut Secrets) -> Result<()> {
 /// 重置同步空间（§11.2，设备丢失之后用）：新建空间和新密钥，旧空间标记为已废弃——其余
 /// 设备读到这个标记就停止同步，等用户拿新的配对码重新加入。本机随后从本地数据全量重新
 /// 发布（换了空间，下次打开时清掉本机的同步状态）。
+///
+/// 动远端之前先落盘一条「重置」记录（新旧空间、新旧密钥都在里面）：中途断掉的话，重启
+/// 或重试按 [`finish_reset`] 从记录接着做，收敛到同一个新空间；不会另开一个新空间，也
+/// 不会出现「旧空间已关、新密钥却没落到本机」的死角。
 pub(crate) async fn reset(ctx: &Ctx, config: &SyncConfig, secrets: &mut Secrets) -> Result<()> {
+    // 上次没做完的重置 / 退出：先接着做完，收敛到同一次切换的结果。刚接完的是一次
+    // 重置的话，本机已经在那次重置的替代空间里——这次调用到此为止，用户再点一次才是
+    // 在新空间里再重置（不会接着又开出第二个新空间）。
+    if resume_pending(ctx, config, secrets).await? == Some(SpaceAction::Reset) {
+        return Ok(());
+    }
     if !secrets.is_paired() {
         return Err(SyncError::other("还没有创建或加入同步空间"));
     }
-    let old = load_live(config, secrets).await?;
     let mut next = secrets.clone();
     next.space_id = new_space_id();
     next.key = SpaceKey::generate().to_base64();
-    let fresh = load_live(config, &next).await?;
-    // 先把新空间建好，再废弃旧空间：哪一步不通，本机都还没有任何改动。
-    create_file_namespace(config, &next.space_id).await?;
-    remote::open_space(fresh.transport(), &fresh.keys, &next.space_id, true).await?;
-    let closed = async {
-        create_file_namespace(config, &old.space_id).await?;
-        remote::close_space(old.transport(), &old.keys, &old.space_id).await
-    }
-    .await;
-    if let Err(error) = closed {
-        let _ = fresh.transport().delete(codec::SPACE_FILE).await;
-        return Err(error);
-    }
-    save_created(ctx, &next).await?;
-    *secrets = next;
-    Ok(())
+    // 动远端之前先把这次切换记下来（连同它用的存储配置）。
+    let pending = PendingSpace {
+        action: SpaceAction::Reset,
+        storage: Some(config.clone()),
+        previous: secrets.clone(),
+        replacement: Some(next.clone()),
+    };
+    pending_save(&ctx.paths, &pending)?;
+    finish_reset(ctx, config, secrets, pending).await
 }
 
 /// 「测试连接」（§10）：在存储根下把用到的操作逐个走一遍。
@@ -479,6 +742,9 @@ pub(crate) fn reset_local_state(
     rekey: Option<&Keys>,
     space: Option<&str>,
 ) -> Result<()> {
+    // 本机的同步状态要整片换掉了：已经开始、还没结算的附件提交阶段随后的核对都会失配
+    // （它们的落点与账目属于旧状态，不能再写）。
+    ctx.space.bump();
     let exists = db::read(ctx.db(), |conn| Ok(sync_db::sync_tables_exist(conn)?))?;
     if exists {
         // 交给别的设备、还没等到对方落定的定时任务先放回本机的任务表：下面一清，本机就

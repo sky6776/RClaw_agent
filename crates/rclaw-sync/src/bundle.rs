@@ -57,10 +57,17 @@ pub struct BundleHeader {
 pub struct BranchExport {
     pub header: BundleHeader,
     pub rows: Vec<RowWire>,
+    /// 本机有、却表达不成线上形态的行数（不认识的 meta 暂停发布之后的那一段）。大于 0
+    /// 说明这份导出**不是完整备份**：只到暂停处为止，后面的本地对话不在里面。
+    pub skipped: usize,
 }
 
 /// 读出一条分支：先补全映射（只分配身份，不排队），再逐行取线上形态。
 /// 在调用方的写事务里执行。
+///
+/// 没有映射的行（版本表达不了的那一段）不出现在 `rows` 里，只记进 `skipped`：线上形态
+/// 有格式约束，那些行不能悄悄被当成完整内容——备份、回收站都要据此决定怎么办（[`Self`]
+/// 的调用方，见 `export_session`）。
 pub fn collect_branch(
     conn: &Connection,
     env: &Env,
@@ -74,6 +81,7 @@ pub fn collect_branch(
     let maps = map::session_msg_maps(conn, session_id)?;
     let rows = raw::raw_messages(conn, session_id)?;
     let mut out = Vec::with_capacity(maps.len());
+    let mut skipped = 0usize;
     // 两边都按消息行 id 升序；没有映射的行（因不认识的 meta 而暂停处之后的）不导出。
     let mut maps = maps.into_iter().peekable();
     for row in rows {
@@ -82,10 +90,14 @@ pub fn collect_branch(
                 let mapped = maps.next().expect("刚看过");
                 out.push(wire::row_to_wire(conn, env, &session, &row, &mapped)?);
             }
-            _ => continue,
+            _ => skipped += 1,
         }
     }
-    Ok(BranchExport { header, rows: out })
+    Ok(BranchExport {
+        header,
+        rows: out,
+        skipped,
+    })
 }
 
 /// 一条分支的包头（数据库阶段）。`tip` 取会话当前的末条。
@@ -173,7 +185,11 @@ pub fn collect_published(
     let mut header = branch_header(conn, device, &session)?;
     header.tip = Some(tip);
     let rows = branch_page(conn, env, &session, 0, upto, usize::MAX, usize::MAX)?;
-    Ok(Some(BranchExport { header, rows }))
+    Ok(Some(BranchExport {
+        header,
+        rows,
+        skipped: 0,
+    }))
 }
 
 /// 把导出内容写成若干个会话包文本，每个不超过约 `chunk_bytes`（至少一条消息）。
@@ -210,6 +226,10 @@ pub fn render_chunks(
 }
 
 /// 导出一个会话为会话包文本（手动导出、回收站）。全文都带上，不受同步的内联上限限制。
+///
+/// 会话里有本机版本表达不出来的行（不认识的 meta，发布停在那一段）时**明确失败**：线上
+/// 形态装不下它们，导出的只能是个前缀。悄悄给出一个前缀的话，用户以为拿到了完整备份，
+/// 拿它恢复、或者拿它当删除之前唯一的副本，后一段对话就无声无息地没了。
 pub fn export_session(env: &Env, channel: &str, chat_id: &str) -> Result<String> {
     let export = db::write(env.db(), |tx| {
         let device = db::ensure_device(tx)?;
@@ -217,6 +237,14 @@ pub fn export_session(env: &Env, channel: &str, chat_id: &str) -> Result<String>
             .ok_or_else(|| SyncError::invalid(format!("会话 {channel}/{chat_id} 不存在")))?;
         collect_branch(tx, env, &device, session_id)
     })?;
+    if export.skipped > 0 {
+        return Err(SyncError::invalid(format!(
+            "这个会话里有 {} 条消息用了本版本还不认识的内容格式，导出的会话包只会是前半段。\
+             为了不让你把它当成完整备份，导出已经拒绝。要备份全部内容，请升级这台设备的 RClaw \
+             之后重试；只想要前半段的话，可以先把这几条消息删掉再导出。",
+            export.skipped
+        )));
+    }
     let (mut chunks, _) = render_chunks(env, export, ArtifactPolicy::BUNDLE, usize::MAX)?;
     Ok(chunks.pop().unwrap_or_default())
 }
@@ -418,7 +446,7 @@ pub fn import_session(env: &Env, text: &str, options: &ImportOptions) -> Result<
     match imported {
         Ok(imported) => {
             // 包里引用的附件本机已经有的，复制到这个会话自己的位置。
-            if let Err(e) = wire::settle_aliases(env, None) {
+            if let Err(e) = wire::settle_aliases(env, None, None) {
                 tracing::warn!("导入会话包后补附件失败: {e}");
             }
             Ok(imported)

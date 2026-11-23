@@ -31,6 +31,10 @@ pub struct ObjectMeta {
     /// 版本标识：有 ETag 用 ETag，没有就用修改时间。只用来判断「变没变」，不假定它可靠：
     /// 读者只在读取并校验成功之后才记下它。
     pub version: String,
+    /// 这个版本标识是不是存储端真正给出的（ETag 或修改时间）。两者都没有时它就是空串，
+    /// [`ObjectMeta::tag`] 只剩长度——同长度的新内容会被当成旧值，读者不能拿它判重，
+    /// 要按内容（读取并校验之后的 head）来认。
+    pub stable_version: bool,
 }
 
 impl ObjectMeta {

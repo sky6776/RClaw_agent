@@ -48,11 +48,35 @@ const REMOVED_NOTICE_MIN: usize = 5;
 /// 基线里至少有这么多条、文件里却一条都不剩时，不把删除发出去，先问用户。只有一两条的
 /// 时候，全删掉也是平常的整理。
 const WIPE_MIN: usize = 3;
-/// `/clear confirm all` 发出清空之后，最多等调用方这么久把文件删掉（它先要清库，大库上
-/// 慢）。过了还没删，就当那次清空没做成：文件里的条目照常同步。
+/// 清空已经提交（删除已发布）之后，最多等调用方这么久把文件删掉（它先要清库，大库上
+/// 慢）。过了还没删，就当文件删除这半步没做成：文件里还在的条目照常同步（删除本身已经
+/// 发出去了，落地时会赢）。
 const CLEARING_MAX_MS: i64 = 30 * 60 * 1000;
 /// 「原有的条目都不见了」这条待处理事项的类别。
 const KIND_WIPE: &str = "mem-wipe";
+
+/// 登记一个目标「正在清理（待提交）」：在删除它的文件**之前**调用（`/clear confirm all`
+/// 的留副本那一步）。这个状态在文件缺失、命令失败、进程重启之后都不会解除，也没有超时
+/// ——普通对比不得发布任何删除，直到清理被明确提交（[`publish_clear`] 把标记转成等待态）
+/// 或文件里所有条目都回来了（用户从备份恢复了，这次清空被撤销）。重试清理时与上一次的
+/// 条目集合合并：文件可能已经删掉了一部分，这次读出来的条目会变少。
+pub(crate) fn mark_clearing(conn: &Connection, target: &str, ids: &[String]) -> Result<()> {
+    let mut known = db::state_get(conn, SCOPE_CLEARING, target)?
+        .and_then(|row| row.json::<Clearing>())
+        .map(|clearing| clearing.ids)
+        .unwrap_or_default();
+    for id in ids {
+        if !known.contains(id) {
+            known.push(id.clone());
+        }
+    }
+    let clearing = Clearing {
+        at: now_ms(),
+        ids: known,
+        staged: true,
+    };
+    db::state_put_json(conn, SCOPE_CLEARING, target, db::HLC_ZERO, &clearing)
+}
 
 /// 等用户回答：文件里原有的条目都不见了，是不是有意删的。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,13 +92,22 @@ struct Wipe {
     approved: bool,
 }
 
-/// `/clear confirm all` 已经把一个目标的清空发了出去，调用方正要删文件。
+/// `/clear confirm all` 的清理进度，分两个阶段：
+/// 待提交（`staged`）：删除还没发布，调用方正要删文件。文件没了、命令失败、重启都不
+/// 解除它——只有清理被明确提交（转成等待态）或条目全部回到文件里（撤销）才放行。
+/// 等待态（`staged` = false）：删除已经发布（[`publish_clear`]），在等调用方把文件删完。
+/// 条目还剩着就按窗口暂停对比，超时后照常（那时文件里的条目会被当成本机新写的重新发出，
+/// 与已发布的删除在落地时按 HLC 见分晓）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Clearing {
-    /// 那一刻（Unix 毫秒）。
+    /// 进入当前阶段的时刻（Unix 毫秒）。
     at: i64,
-    /// 那一刻文件里的条目（本机 id）。它们都不在了，就是删完了。
+    /// 这次清理涉及的条目（本机 id）。等待态下它们都不在了，就是删完了；待提交态下它们
+    /// 全部回来，就是清理被撤销了。
     ids: Vec<String>,
+    /// 还是「待提交」状态（删除尚未发布）。
+    #[serde(default)]
+    staged: bool,
 }
 
 /// 条目身份：空白规整之后文本摘要的前 32 位。
@@ -308,9 +341,11 @@ pub(crate) fn publish_clear(
     if present.is_empty() {
         db::state_del(conn, SCOPE_CLEARING, target)?;
     } else {
+        // 待提交的清理现在有了着落（删除已经发出去了）：转成等待态，等文件删完。
         let clearing = Clearing {
             at: now_ms(),
             ids: present.to_vec(),
+            staged: false,
         };
         db::state_put_json(conn, SCOPE_CLEARING, target, db::HLC_ZERO, &clearing)?;
     }
@@ -441,6 +476,15 @@ fn plan(
     plan
 }
 
+/// 真正动文件或登记操作之前复核清理标记：`/clear confirm all` 可能刚好在另一个线程上
+/// 登记了待提交的清理（在这轮对比读过状态之后才发生），这个目标必须整体让路，下一轮
+/// 再对比。
+fn clearing_pending(ctx: &Ctx, target: &str) -> Result<bool> {
+    db::read(ctx.db(), |conn| {
+        Ok(db::state_get(conn, SCOPE_CLEARING, target)?.is_some())
+    })
+}
+
 pub(crate) fn reconcile(
     ctx: &Ctx,
     s: &Settings,
@@ -514,12 +558,23 @@ fn reconcile_target(
         .and_then(|row| row.json())
         .unwrap_or_default();
 
-    // `/clear confirm all` 已经把清空发出去了，调用方还没把文件删完：等它。这时候对比，
-    // 文件里还在的条目会被当成本机新写的，再发给所有设备。
+    // `/clear confirm all` 的两个阶段（见 [`Clearing`]）：
+    // 待提交：删除还没发布，无论文件删没删成、重启没重启、过了多久，普通对比都不得
+    // 发布删除——只有条目全部回到文件里（用户从备份恢复了，撤销这次清理）或清理被
+    // 明确提交（标记已转等待态）才继续。
+    // 等待态：删除已经发布，在等文件删完。条目还剩着就等（这时对比会把它们当成本机
+    // 新写的再发给所有设备）；超时后放行，让落地去分胜负。
     if let Some(clearing) = &clearing {
-        let remaining = clearing.ids.iter().any(|id| current.contains_key(id));
-        if remaining && (0..CLEARING_MAX_MS).contains(&(now_ms() - clearing.at)) {
-            return Ok(());
+        if clearing.staged {
+            let restored = clearing.ids.iter().all(|id| current.contains_key(id));
+            if !restored {
+                return Ok(());
+            }
+        } else {
+            let remaining = clearing.ids.iter().any(|id| current.contains_key(id));
+            if remaining && (0..CLEARING_MAX_MS).contains(&(now_ms() - clearing.at)) {
+                return Ok(());
+            }
         }
         db::write(ctx.db(), |tx| {
             db::state_del(tx, SCOPE_CLEARING, &target.name)
@@ -578,6 +633,10 @@ fn reconcile_target(
     let mut touched = false;
 
     if !plan.adds.is_empty() || !plan.dels.is_empty() {
+        // 动文件之前再复核一次清理标记：刚登记的待提交清理优先于这轮的落地。
+        if clearing_pending(ctx, &target.name)? {
+            return Ok(());
+        }
         let adds: Vec<String> = plan.adds.iter().map(|change| change.text.clone()).collect();
         let dels: Vec<String> = plan.dels.iter().map(|(_, text)| text.clone()).collect();
         // 别的设备删掉的条目，动文件之前先在本机回收站里留一份（§7.5）：删除会传到所有
@@ -628,6 +687,10 @@ fn reconcile_target(
 
     let published = plan.publish_add.len() + plan.publish_del.len();
     if published > 0 || !handled.is_empty() || base != old_base || base_row.is_none() || answered {
+        // 登记操作之前再复核一次：文件落地之后刚好登记的待提交清理，不能被这轮的发布越过。
+        if clearing_pending(ctx, &target.name)? {
+            return Ok(());
+        }
         db::write(ctx.db(), |tx| {
             if answered {
                 db::state_del(tx, SCOPE_WIPE, &target.name)?;
@@ -740,6 +803,28 @@ pub(crate) fn derived(conn: &Connection) -> Result<Vec<PendingItem>> {
             at_ms: wipe.at,
             actions: vec!["accept".into(), "reject".into()],
             payload: serde_json::json!({ "target": target, "count": wipe.count, "hlc": wipe.version }),
+        });
+    }
+    for (target, row) in db::state_scan(conn, SCOPE_CLEARING, "")? {
+        let clearing: Clearing = row.json().unwrap_or_default();
+        if !clearing.staged {
+            // 等待态只是等文件删完，有明确的时限，不用惊动用户。
+            continue;
+        }
+        items.push(PendingItem {
+            id: status::item_id("mem-clearing", &target),
+            kind: "mem-clearing".into(),
+            title: format!("{}的清空没有完成", describe(&target)),
+            detail: "上一次「清空所有设备」只成功了一半：本机文件还没有清理干净，\
+                     这次清理也没有登记为删除。同步先停在这里：这些条目既不删除、\
+                     也不发给其他设备，避免误删。\n\
+                     想继续清空，重新执行一次清空命令；改变了主意，把条目放回文件\
+                     （回收站里有副本），同步会自动恢复。"
+                .into(),
+            origin: None,
+            at_ms: clearing.at,
+            actions: Vec::new(),
+            payload: serde_json::json!({ "target": target }),
         });
     }
     Ok(items)

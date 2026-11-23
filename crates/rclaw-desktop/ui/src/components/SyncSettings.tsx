@@ -95,15 +95,18 @@ function StorageCard({ config, status, onChanged }: CardProps) {
     setBusy(true);
     setError(null);
     try {
-      // 只带走存储这几段：别处（范围、设备名）在这期间改过的不被这份草稿盖回去。
-      await api.syncSaveConfig({
-        ...config,
-        transport: draft.transport,
-        webdav: draft.webdav,
-        file: draft.file,
-        s3: draft.s3,
-      });
-      if (secret && draft.transport !== "file") await api.syncSetSecret(secret);
+      // 存储设置与密码放在同一条命令里：分两次的话，中间别的入口改了配置，密码就会
+      // 绑到另一份配置的存储账户上。
+      await api.syncSaveStorage(
+        {
+          ...config,
+          transport: draft.transport,
+          webdav: draft.webdav,
+          file: draft.file,
+          s3: draft.s3,
+        },
+        secret && draft.transport !== "file" ? secret : null,
+      );
       setSecret("");
       setEditing(false);
     } catch (e) {

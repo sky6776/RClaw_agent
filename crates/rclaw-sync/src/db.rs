@@ -89,6 +89,54 @@ pub const KV_PRIMED: &str = "sync/primed";
 pub const KV_STALE_CHECK: &str = "sync/stale-check";
 /// 上一轮用的会话同步范围：范围扩大时要把各设备的日志从头再读一遍。
 pub const KV_RANGE: &str = "sync/range";
+
+/// 生效的同步范围（kv [`KV_RANGE`]，引擎每轮写；封段与附件上传在动手前读它——范围
+/// 收窄之后，排着队的会话 op、文件类 op 与自动排队的附件不再发出去，范围重新变宽时
+/// 照常恢复）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Range {
+    #[serde(default)]
+    pub sessions: bool,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default)]
+    pub attachments: bool,
+    #[serde(default)]
+    pub memory: bool,
+    #[serde(default)]
+    pub persona: bool,
+    #[serde(default)]
+    pub skills: bool,
+    #[serde(default)]
+    pub bots: bool,
+    /// 定时任务的定义同步（`cron.put` / `cron.del`）。老库里的记录没有这个字段，读出来
+    /// 按关算——引擎下一轮写 [`KV_RANGE`] 时就会带上当前值。
+    #[serde(default)]
+    pub cron: bool,
+}
+
+impl Range {
+    /// 本机当前生效的范围（引擎每轮把它写进 kv [`KV_RANGE`]）。
+    pub(crate) fn of(s: &crate::publish::Settings) -> Range {
+        let mut channels = if s.scopes.sessions {
+            s.channels.clone()
+        } else {
+            Vec::new()
+        };
+        channels.sort();
+        channels.dedup();
+        Range {
+            sessions: s.scopes.sessions,
+            channels,
+            attachments: s.scopes.attachments,
+            memory: s.scopes.memory,
+            persona: s.scopes.persona,
+            skills: s.scopes.skills,
+            bots: s.scopes.bots,
+            cron: s.scopes.cron,
+        }
+    }
+}
 /// 存量附件的上传范围（§8.8）：`"all"`、天数、`"none"`。
 pub const KV_BACKLOG: &str = "sync/backlog";
 /// 快照与回收的记录。

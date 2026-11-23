@@ -5,6 +5,7 @@
 //! 「同步附件」这个范围只决定传不传；消息里的引用清单只要会话在同步就照常记录，以后
 //! 打开附件同步时存量附件才有清单可依。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::params;
 
 use crate::codec;
-use crate::crypto::{sealed_blob_len, sha256_reader, Keys, BLOB_CHUNK};
+use crate::crypto::{sealed_blob_len, sha256_reader, HashingReader, Keys, BLOB_CHUNK};
 use crate::db::{
     self, scope, BlobRow, BLOB_FETCHED, BLOB_HELD, BLOB_PENDING, BLOB_REMOTE, BLOB_UPLOADED,
 };
@@ -22,7 +23,7 @@ use crate::op::{FileRef, Op};
 use crate::portable::{self, MARK_ROOT};
 use crate::transport::{self, SyncTransport};
 use crate::wire::{self, Env, LocalBlob};
-use crate::{offload, Ctx};
+use crate::{offload, Commit, Ctx};
 
 /// 一条消息最多登记这么多个被引用的文件。
 const MAX_REFS_PER_MESSAGE: usize = 64;
@@ -200,6 +201,25 @@ fn tmp_file(ctx: &Ctx, tag: &str) -> PathBuf {
         .join(format!("{tag}-{}", ids::random_hex::<8>()))
 }
 
+/// 本次任务写下的临时文件：任务被取消（换空间、清理）时 `Drop` 就把它删掉，不等调用
+/// 方走到那一步的去删。明文与密文都用它兜底。
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::debug!("清理临时文件 {} 失败: {e}", self.0.display()),
+        }
+    }
+}
+
+/// 换空间 / 清理时这次附件任务的提交作废。
+fn abandoned() -> SyncError {
+    SyncError::other("同步空间已经切换或清理，这次附件的提交作废")
+}
+
 /// 登记着的那份内容本机还拿不拿得出来：文件在、摘要对得上才算。文件没了、换成了别的
 /// 内容返回 `Ok(false)`；文件在却读不了（被别的程序占着、没有权限）是错误，不算「拿不
 /// 出来」——那句话是要告诉别的设备的（`blob.gone`），不能因为一时读不了就说。
@@ -221,6 +241,37 @@ fn still_there(keys: &Keys, source: &Path, blob_id: &str) -> Result<bool> {
     Ok(keys.blob_id(&digest) == blob_id)
 }
 
+/// 存储上有一份「长度对、内容不对」的对象时的修复登记（`sync_state` 的 `blob-repair`）：
+/// 取回时发现内容与对象名不符记下的。下一次轮到上传这个对象时不再被「同长度即已有」
+/// 挡住，重传一遍把坏的那份盖掉。
+const SCOPE_REPAIR: &str = "blob-repair";
+
+fn repair_get(conn: &rusqlite::Connection, blob_id: &str) -> Result<bool> {
+    if !rclaw_store::sync_db::sync_tables_exist(conn)? {
+        return Ok(false);
+    }
+    Ok(db::state_get(conn, SCOPE_REPAIR, blob_id)?.is_some())
+}
+
+/// 标记一个对象「存储上的那份要重传覆盖」。
+fn mark_repair(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
+    // 没开过同步的库（测试里的裸库）没有同步表：没有要修的。
+    if !rclaw_store::sync_db::sync_tables_exist(conn)? {
+        return Ok(());
+    }
+    if db::state_get(conn, SCOPE_REPAIR, blob_id)?.is_none() {
+        db::state_put(conn, SCOPE_REPAIR, blob_id, db::HLC_ZERO, None, None)?;
+    }
+    Ok(())
+}
+
+fn repair_del(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
+    if !rclaw_store::sync_db::sync_tables_exist(conn)? {
+        return Ok(());
+    }
+    db::state_del(conn, SCOPE_REPAIR, blob_id)
+}
+
 /// 这个 IO 错误说的是「没有这个文件」，不是「看不了」。
 fn is_absent(error: &std::io::Error) -> bool {
     use std::io::ErrorKind::{NotADirectory, NotFound};
@@ -236,28 +287,63 @@ pub async fn upload(
     blob: &BlobRow,
 ) -> Result<bool> {
     let key = codec::blob_path(&blob.blob_id);
+    // 两种情况不能拿「远端长度对」当「远端内容对」：取回时发现长度对、内容不对的
+    // （登记过要修的），以及别的设备点名重要过、对象被重新排队的（收到重复请求时
+    // 校验存储副本）——都重新封装并核对摘要之后真的传一遍。
+    let repair = db::read(ctx.db(), |conn| {
+        Ok(repair_get(conn, &blob.blob_id)?
+            || db::state_get(conn, SCOPE_NAMED, &blob.blob_id)?.is_some()
+            || db::state_get(conn, SCOPE_SKILL_BLOB, &blob.blob_id)?.is_some())
+    })?;
     // 同名即同内容：远端已经有了完整的一份就不再传。「完整」要看长度——连接中断时有的
     // 服务端会留下截断的对象，只看「在不在」的话它就永远留在那里，谁也取不回来。长度
-    // 对不上的照常重传一遍，把它盖掉。
-    if let Some(meta) = transport::stat(transport, &key).await? {
-        if meta.size == sealed_blob_len(blob.size) {
-            return Ok(true);
+    // 对不上的照常重传一遍，把它盖掉。取回时发现「长度对、内容不对」的（登记过要修的）
+    // 也重传一遍。
+    if !repair {
+        if let Some(meta) = transport::stat(transport, &key).await? {
+            if meta.size == sealed_blob_len(blob.size) {
+                return Ok(true);
+            }
         }
     }
-    let sealed = tmp_file(ctx, "up");
+    let sealed = Scratch(tmp_file(ctx, "up"));
     let keys_for_task = keys.clone();
     let (env, rel_path) = (ctx.env.clone(), blob.rel_path.clone());
-    let (blob_id, sealed_for_task, key_for_task) =
-        (blob.blob_id.clone(), sealed.clone(), key.clone());
+    let (blob_id, sealed_for_task, key_for_task, registered_size) = (
+        blob.blob_id.clone(),
+        sealed.0.clone(),
+        key.clone(),
+        blob.size,
+    );
+    // 提交阶段挂号：换空间时 `teardown` 先关入口、等在途的阶段走完，等不到才换代。
+    let commit = ctx.space.begin();
+    let token = commit.token();
     let prepared = tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
         let source = env.checked_path(&rel_path)?;
-        // 内容必须还是登记时的那一份：对象名是它的摘要。
-        if !still_there(&keys_for_task, &source, &blob_id)? {
-            return Ok(None);
+        // 登记说本机有这个文件，其实不在了（被删、被换成了目录）：拿不出来，和以前一样
+        // 报「没有」，由调用方说 blob.gone。
+        match std::fs::metadata(&source) {
+            Ok(meta) if !meta.is_file() => return Ok(None),
+            Ok(_) => {}
+            Err(e) if is_absent(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
         }
-        let mut reader = std::fs::File::open(&source)?;
+        let mut reader = match std::fs::File::open(&source) {
+            Ok(file) => HashingReader::new(file),
+            Err(e) if is_absent(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // 摘要与封装读同一次：核对的就是真正被封装的那些字节，封装期间文件变了也不会
+        // 以旧对象名传出错的内容。
+        if !token.valid() {
+            return Err(abandoned());
+        }
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&sealed_for_task)?);
         let len = keys_for_task.seal_blob(&key_for_task, &mut reader, &mut writer)?;
+        let (digest, plain_len) = reader.finish();
+        if keys_for_task.blob_id(&digest) != blob_id || plain_len != registered_size {
+            return Ok(None);
+        }
         Ok(Some(len))
     })
     .await
@@ -266,25 +352,34 @@ pub async fn upload(
         let Some(len) = prepared? else {
             return Ok(false);
         };
-        transport.put_file(&key, &sealed).await?;
+        if !commit.valid() {
+            return Err(abandoned());
+        }
+        transport.put_file(&key, &sealed.0).await?;
         transport::check_len(transport, &key, len).await?;
         Ok(true)
     }
     .await;
-    let _ = tokio::fs::remove_file(&sealed).await;
+    drop(sealed);
+    // 修完了：把标记摘掉，以后同名同长度照常跳过。换了空间就不动了。
+    if repair && matches!(&result, Ok(true)) && commit.valid() {
+        db::write(ctx.db(), |tx| repair_del(tx, &blob.blob_id))?;
+    }
+    drop(commit);
     result
 }
 
 /// 取回之前先看本机的结果。
 enum Lookup {
-    /// 文件就在本机登记的地方：不用取。
+    /// 文件就在本机登记的地方（内容核对过）：不用取。
     Here(PathBuf),
     /// 要去存储上取。
     Fetch(BlobRow),
 }
 
-/// 取回一个附件之前先看本机：有没有它的登记，文件是不是已经在本机了。
-fn lookup(ctx: &Ctx, blob_id: &str) -> Result<Lookup> {
+/// 取回一个附件之前先看本机：有没有它的登记，文件是不是已经在本机了。本机的那一份只认
+/// 摘要——被人原地改过的内容不能拿去充当这个对象，改去存储上取原来的那份。
+fn lookup(ctx: &Ctx, keys: &Keys, blob_id: &str) -> Result<Lookup> {
     let (row, was_mine) = db::read(ctx.db(), |conn| {
         let row = db::blob_get(conn, blob_id)?;
         let was_mine = row.is_none() && db::state_get(conn, scope::BLOB_GONE, blob_id)?.is_some();
@@ -302,7 +397,12 @@ fn lookup(ctx: &Ctx, blob_id: &str) -> Result<Lookup> {
     if row.state != BLOB_REMOTE {
         let path = ctx.env.checked_path(&row.rel_path)?;
         match std::fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => return Ok(Lookup::Here(path)),
+            Ok(meta) if meta.is_file() => {
+                if still_there(keys, &path, blob_id)? {
+                    return Ok(Lookup::Here(path));
+                }
+                // 内容变了：不当它还在，去存储上取（取回后按占位规则落回）。
+            }
             // 登记说本机有，文件却不在了：去存储上取。
             Ok(_) => {}
             Err(e) if is_absent(&e) => {}
@@ -333,10 +433,28 @@ pub async fn download(
 ) -> Result<PathBuf> {
     let found = {
         let blob_id = blob_id.to_string();
-        offload(ctx, move |ctx| lookup(ctx, &blob_id)).await?
+        let keys = keys.clone();
+        offload(ctx, move |ctx| lookup(&ctx, &keys, &blob_id)).await?
     };
     let row = match found {
-        Lookup::Here(path) => return Ok(path),
+        // 本机就有也不用白拿一趟：同一个对象登记过的其他落点（占位）顺手补上。补别名会写
+        // 文件，和落盘一样在提交边界之内（换空间期间作废）；文件复制放到阻塞线程池。
+        Lookup::Here(path) => {
+            let commit = ctx.space.begin();
+            if !commit.valid() {
+                return Err(abandoned());
+            }
+            let blob = blob_id.to_string();
+            offload(ctx, move |ctx| {
+                if !commit.valid() {
+                    return Err(abandoned());
+                }
+                let valid = || commit.valid();
+                wire::settle_aliases(&ctx.env, Some(&blob), Some(&valid))
+            })
+            .await?;
+            return Ok(path);
+        }
         Lookup::Fetch(row) => row,
     };
     if row.size > max_size {
@@ -349,47 +467,68 @@ pub async fn download(
         )));
     }
     let key = codec::blob_path(blob_id);
-    let sealed = tmp_file(ctx, "down");
-    let plain = tmp_file(ctx, "plain");
-    let fetched = async {
+    let sealed = Scratch(tmp_file(ctx, "down"));
+    let plain = Scratch(tmp_file(ctx, "plain"));
+    // 提交阶段挂号：换空间 / 清理时 teardown 先换代、再等它结束；落到文件和记账之前
+    // 都要核对代，失配就丢掉这次结果（明文临时文件由 Scratch 收掉）。
+    let commit = ctx.space.begin();
+    // 暂存文件的守卫交给阻塞闭包自己拿：异步一侧取消（换空间超时收尾）不会提前删掉
+    // 闭包正在读写的文件、也不会留下它重新写出来的明文；闭包跑完把守卫还回来，谁最后
+    // 拿到谁收尾。
+    let fetched: Result<(Scratch, Scratch, Commit)> = async move {
         transport
-            .get_file(&key, &sealed, download_max(row.size))
+            .get_file(&key, &sealed.0, download_max(row.size))
             .await?;
         let keys = keys.clone();
-        let (sealed, plain, key, blob_id) = (
-            sealed.clone(),
-            plain.clone(),
-            key.clone(),
-            blob_id.to_string(),
-        );
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut reader = std::io::BufReader::new(std::fs::File::open(&sealed)?);
-            let mut writer = std::io::BufWriter::new(std::fs::File::create(&plain)?);
-            keys.open_blob(&key, &mut reader, &mut writer)?;
-            drop(writer);
-            // 解密通过只说明它是这个空间里的对象；内容还得就是这个名字对应的那一份。
-            if hash_file(&keys, &plain).as_deref() != Some(blob_id.as_str()) {
-                return Err(SyncError::corrupt("附件内容与对象名不符"));
-            }
-            Ok(())
-        })
+        let key = key.clone();
+        let blob_id = blob_id.to_string();
+        let repair_ctx = ctx.clone();
+        let token = commit.token();
+        let (result, sealed, plain) = tokio::task::spawn_blocking(
+            move || -> (Result<()>, Scratch, Scratch) {
+                let outcome = (|| -> Result<()> {
+                    let mut reader = std::io::BufReader::new(std::fs::File::open(&sealed.0)?);
+                    let mut writer = std::io::BufWriter::new(std::fs::File::create(&plain.0)?);
+                    keys.open_blob(&key, &mut reader, &mut writer)?;
+                    drop(writer);
+                    // 解密通过只说明它是这个空间里的对象；内容还得就是这个名字对应的那一份。
+                    if hash_file(&keys, &plain.0).as_deref() != Some(blob_id.as_str()) {
+                        // 存储上有一份长度对、内容不对的对象：登记要修，下一次上传把它盖掉。
+                        // 这是记账：期间换了空间就不写了（那是旧空间的登记）。
+                        if token.valid() {
+                            let _ = db::write(repair_ctx.db(), |tx| mark_repair(tx, &blob_id));
+                        }
+                        return Err(SyncError::corrupt("附件内容与对象名不符"));
+                    }
+                    Ok(())
+                })();
+                (outcome, sealed, plain)
+            },
+        )
         .await
-        .map_err(|e| SyncError::other(format!("附件解密任务失败: {e}")))?
+        .map_err(|e| SyncError::other(format!("附件解密任务失败: {e}")))?;
+        result?;
+        Ok((sealed, plain, commit))
     }
     .await;
-    let _ = tokio::fs::remove_file(&sealed).await;
-    if let Err(e) = fetched {
-        let _ = tokio::fs::remove_file(&plain).await;
-        return Err(e);
+    let (sealed, plain, commit) = match fetched {
+        Ok(guards) => guards,
+        Err(error) => return Err(error),
+    };
+    if !commit.valid() {
+        return Err(abandoned());
     }
     let ctx_for_task = ctx.clone();
-    let (blob_id, plain_for_task) = (blob_id.to_string(), plain.clone());
-    let placed =
-        tokio::task::spawn_blocking(move || place(&ctx_for_task, &blob_id, &plain_for_task))
-            .await
-            .map_err(|e| SyncError::other(format!("附件落盘任务失败: {e}")))?;
-    let _ = tokio::fs::remove_file(&plain).await;
-    placed
+    let blob_id = blob_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        // 明文的守卫随闭包走（见上）；落盘把慢复制与最终提交分开，见 `place`。
+        let placed = place(&ctx_for_task, &commit, &blob_id, &plain.0);
+        drop(plain);
+        drop(sealed);
+        placed
+    })
+    .await
+    .map_err(|e| SyncError::other(format!("附件落盘任务失败: {e}")))?
 }
 
 fn same_content(a: &Path, b: &Path) -> bool {
@@ -408,15 +547,26 @@ fn same_content(a: &Path, b: &Path) -> bool {
     digest(a).is_some() && digest(a) == digest(b)
 }
 
-/// 把取回的明文放到登记的落点，并更新登记。
-fn place(ctx: &Ctx, blob_id: &str, plain: &Path) -> Result<PathBuf> {
+/// 把取回的明文放到登记的落点，并更新登记。落点上已有的文件只有「同步写下的占位」才
+/// 原位替换；内容不同的真实文件不覆盖，取回的全文改放进按摘要命名的同步缓存（§8.7），
+/// 附件入口按对象找到它。
+///
+/// `commit` 是这次任务的提交阶段：换空间之后登记与落点都不是本机的了，写文件、写库之前
+/// 各核对一次，失配就丢掉结果。
+fn place(ctx: &Ctx, commit: &Commit, blob_id: &str, plain: &Path) -> Result<PathBuf> {
     let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob_id))?
         .ok_or_else(|| SyncError::invalid("没有这个附件的登记"))?;
+    if !commit.valid() {
+        return Err(abandoned());
+    }
     let mut rel_path = row.rel_path.clone();
     let original = ctx.env.checked_path(&rel_path);
     let is_artifact = rel_path.starts_with("artifacts/");
     let target = if original.as_ref().is_ok_and(|target| {
-        !target.exists() || target.is_file() && (is_artifact || same_content(target, plain))
+        !target.exists()
+            || target.is_file()
+                && (is_artifact && is_placeholder(target, row.size)
+                    || same_content(target, plain))
     }) {
         original?
     } else {
@@ -424,26 +574,66 @@ fn place(ctx: &Ctx, blob_id: &str, plain: &Path) -> Result<PathBuf> {
         rel_path = wire::cache_path(&rel_path, blob_id);
         ctx.env.checked_path(&rel_path)?
     };
+    // 这次任务有没有往落点写过文件。落点上原本就有一份内容相同的（或登记的地方就是
+    // 同步缓存里那一份）时直接复用——那是用户或以前的同步留下的，不属于这次任务，
+    // 中途作废也不动它。
+    let mut wrote = false;
     if !(target.is_file() && same_content(&target, plain)) {
+        if !commit.valid() {
+            return Err(abandoned());
+        }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // 先在目标目录里写临时文件再改名：读者看不到写了一半的文件。哪一步失败都不把
-        // 临时文件留在用户的目录里。
+        // 慢复制与最终提交分开：先把明文复制进目标目录里的暂存文件（可能在慢盘上挂
+        // 很久，不占提交许可），改名之前再取许可。哪一步失败都不把暂存文件留在用户的
+        // 目录里。
         let staging = target.with_extension(format!("part-{}", ids::random_hex::<4>()));
-        let moved = std::fs::copy(plain, &staging).and_then(|_| std::fs::rename(&staging, &target));
-        if let Err(e) = moved {
+        if let Err(e) = std::fs::copy(plain, &staging) {
             let _ = std::fs::remove_file(&staging);
             return Err(e.into());
         }
+        // 最终改名与记账都要在提交许可之内：teardown 等在途任务（这次挂着的 `commit`）
+        // 换代；超时收尾之后这一核对会失配——旧世代只把暂存文件收掉，不再改名进落点、
+        // 不再记账。记账的事务里再核对一次。
+        if !commit.valid() {
+            let _ = std::fs::remove_file(&staging);
+            return Err(abandoned());
+        }
+        if let Err(e) = std::fs::rename(&staging, &target) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(e.into());
+        }
+        wrote = true;
     }
-    db::write(ctx.db(), |tx| {
+    // 记账：事务里再核对一次代，失配就让事务回滚——旧空间的登记不会留下来。
+    let stored = db::write(ctx.db(), |tx| {
+        if !commit.valid() {
+            return Err(abandoned());
+        }
         db::blob_set(tx, blob_id, &rel_path, BLOB_FETCHED)?;
         forget(tx, blob_id)
-    })?;
-    // 同一个对象登记过的其他落点（别的会话的 artifact 目录等）一并补上。
-    wire::settle_aliases(&ctx.env, Some(blob_id))?;
+    });
+    if let Err(error) = stored {
+        // 只收回这次任务自己写下的落点；复用的既有文件不在删除清单里。
+        if wrote {
+            let _ = std::fs::remove_file(&target);
+        }
+        return Err(error);
+    }
+    // 同一个对象登记过的其他落点（别的会话的 artifact 目录等）一并补上。登记提交之后
+    // 才换的代：落点与登记都在切换之前落定，是一致的；补别名会再写文件，与改名、记账
+    // 一样要提交许可。
+    if commit.valid() {
+        let valid = || commit.valid();
+        wire::settle_aliases(&ctx.env, Some(blob_id), Some(&valid))?;
+    }
     Ok(target)
+}
+
+/// 这个文件是不是同步写下的占位（内容一字不差）：只有它才能被取回的全文原位替换。
+fn is_placeholder(path: &Path, size: u64) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| bytes == wire::placeholder_text(size).as_bytes())
 }
 
 /// 「同步已有附件」的选择（§8.8）：全部 / 最近若干天 / 都不传。记在 kv 里的写法是
@@ -599,23 +789,95 @@ async fn after_failure(
     }
 }
 
+/// 不受「同步附件」开关约束的上传原因（`sync_state` 的 `blob-named`）。别的设备点名要过
+/// （`blob.want`）——明确的请求，本机答应过要传（§8.8 的界面说明也是这么写的）；范围
+/// 收窄只过滤掉「会话自动」那一种原因，点名的照传。
+const SCOPE_NAMED: &str = "blob-named";
+
+/// 技能发布登记的大文件（`sync_state` 的 `blob-skill`）：技能同步有自己的范围开关，
+/// 与会话附件无关。技能范围开着时，发布技能登记的这些对象必须能传上去，不然接收端
+/// 装不了同一个技能；范围关着时不消化过去排的队（它们跟着 `skill.put` 一起暂缓）。
+const SCOPE_SKILL_BLOB: &str = "blob-skill";
+
+fn mark_named(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
+    if db::state_get(conn, SCOPE_NAMED, blob_id)?.is_none() {
+        db::state_put(conn, SCOPE_NAMED, blob_id, db::HLC_ZERO, None, None)?;
+    }
+    Ok(())
+}
+
+/// 技能发布登记的大文件：给队列里的对象补上「技能依赖」这个上传原因（旧队列里可能
+/// 已经有它——先前自动排队过，或者上一版技能同步留下的）。
+pub(crate) fn mark_skill_blob(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
+    if db::state_get(conn, SCOPE_SKILL_BLOB, blob_id)?.is_none() {
+        db::state_put(conn, SCOPE_SKILL_BLOB, blob_id, db::HLC_ZERO, None, None)?;
+    }
+    Ok(())
+}
+
 /// 上传排着队的附件，最多 `limit` 个。存储够不着时返回错误——没传的留在队列里，调用方
 /// 过一阵再来；只跟某一个附件有关的失败（存储不收这么大的、本机读不了、存储是通的但它
 /// 就是传不上去）不拦着后面的。
+///
+/// 「同步附件」范围收窄之后：自动排队的（本机发布时登记的）不传，有别的上传原因的照传
+/// ——别的设备点名要的、技能发布登记的大文件。范围重新打开时自动的那部分接着传。
 pub async fn upload_pending(
     ctx: &Ctx,
     transport: &dyn SyncTransport,
     keys: &Arc<Keys>,
     limit: usize,
 ) -> Result<UploadBatch> {
+    let (attachments_on, named, skill_deps) = offload(ctx, move |ctx| {
+        db::read(ctx.db(), |conn| {
+            let range = db::kv_json::<db::Range>(conn, db::KV_RANGE)?;
+            let attachments = range.as_ref().is_none_or(|range| range.attachments);
+            let skills = range.as_ref().is_none_or(|range| range.skills);
+            let named: HashSet<String> = db::state_scan(conn, SCOPE_NAMED, "")?
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            let skill_deps: HashSet<String> = if skills {
+                db::state_scan(conn, SCOPE_SKILL_BLOB, "")?
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            Ok((attachments, named, skill_deps))
+        })
+    })
+    .await?;
     let pending = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
-            db::blobs_in_state(conn, BLOB_PENDING, limit)
+            if attachments_on {
+                return db::blobs_in_state(conn, BLOB_PENDING, limit);
+            }
+            // 「同步附件」关着：只传有别的上传原因的——别的设备点名要的（维护，照传），
+            // 以及技能范围开着时技能发布登记的大文件。
+            let mut rows = Vec::new();
+            for blob_id in named.iter().chain(skill_deps.iter()) {
+                if rows.len() >= limit {
+                    break;
+                }
+                if let Some(row) = db::blob_get(conn, blob_id)? {
+                    if row.state == BLOB_PENDING {
+                        rows.push(row);
+                    }
+                }
+            }
+            Ok(rows)
         })
     })
     .await?;
     let mut batch = UploadBatch::default();
     for blob in pending {
+        // 一个附件从上传到记账是一个提交阶段：换空间期间作废——入口关着时拿到的阶段
+        // 一开始就无效，传完发现代变了也不动登记（那是旧空间的账目）。
+        let commit = ctx.space.begin();
+        if !commit.valid() {
+            break;
+        }
         let mut too_large = false;
         let settled = match upload(ctx, transport, keys, &blob).await {
             Ok(true) => Settled::Uploaded,
@@ -637,9 +899,15 @@ pub async fn upload_pending(
                 Settled::Held
             }
         };
+        if !commit.valid() {
+            break;
+        }
         let done = matches!(settled, Settled::Uploaded);
         // 记账、给用户留话都在阻塞线程池上：这个任务和引擎共用一条线程。
         let (taken, said) = offload(ctx, move |ctx| {
+            if !commit.valid() {
+                return Err(abandoned());
+            }
             if too_large {
                 crate::status::notice(
                     &ctx.paths,
@@ -743,6 +1011,10 @@ fn settle(
         }
     };
     db::state_del(tx, scope::BLOB_FAIL, &blob.blob_id)?;
+    // 「点名要」与「技能依赖」的登记跟着它出队列一起了结；之后再有设备来问（或技能
+    // 重新登记）会重新记上。
+    db::state_del(tx, SCOPE_NAMED, &blob.blob_id)?;
+    db::state_del(tx, SCOPE_SKILL_BLOB, &blob.blob_id)?;
     Ok(outcome)
 }
 
@@ -765,13 +1037,22 @@ pub fn on_blob_want(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
             BLOB_FETCHED
         ],
     )?;
-    if requeued > 0 || db::blob_get(conn, blob_id)?.is_some() {
+    if requeued > 0 {
+        // 点名要的：不受「同步附件」范围影响，记下来。已经在队列里的（本来是自动排队
+        // 的）也补上这个标记：点名之后它就是明确请求，范围收窄也照传。
+        mark_named(conn, blob_id)?;
+        return Ok(());
+    }
+    if db::blob_get(conn, blob_id)?.is_some() {
+        // 已经在队列里（比如自动排队的）：点名同样是明确请求，补标记让它不受范围影响。
+        mark_named(conn, blob_id)?;
         return Ok(());
     }
     let note =
         db::state_get(conn, scope::BLOB_GONE, blob_id)?.and_then(|row| row.json::<GoneNote>());
     if let Some(note) = note {
         db::blob_register(conn, blob_id, &note.path, note.size, BLOB_PENDING)?;
+        mark_named(conn, blob_id)?;
     }
     Ok(())
 }

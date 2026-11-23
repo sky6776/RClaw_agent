@@ -383,9 +383,15 @@ impl SyncControl for FakeSync {
         self.in_space.store(false, Ordering::SeqCst);
         Ok(())
     }
-    fn delete_published_sessions(&self) -> Result<(usize, usize), String> {
+    fn delete_published_sessions(&self) -> Result<usize, String> {
         self.purged.fetch_add(1, Ordering::SeqCst);
-        Ok((3, 0))
+        Ok(3)
+    }
+    fn stash_memory_for_clear(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+    fn commit_memory_clear(&self, _ids: &[String]) -> Result<usize, String> {
+        Ok(0)
     }
     fn local_changed(&self, turn_ended: bool) {
         self.changed.lock().unwrap().push(turn_ended);
@@ -444,7 +450,7 @@ async fn clear_in_a_sync_space_needs_a_scope() {
     // all：先把会话删除传给其他设备，再清本机；清完通知引擎发布。
     let done = rig.mgr.handle_clear("/clear confirm ALL").await;
     assert!(done.starts_with("✅"), "{done}");
-    assert!(done.contains("已登记 3 个会话和 0 条记忆的删除"), "{done}");
+    assert!(done.contains("已把 3 个已发布会话的删除传给其他设备"), "{done}");
     assert!(wiped(&rig));
     assert_eq!(sync.purged.load(Ordering::SeqCst), 1);
     assert_eq!(sync.left.load(Ordering::SeqCst), 0);
