@@ -553,15 +553,23 @@ pub async fn download(
             if !commit.valid() {
                 return Err(abandoned());
             }
+            // 最终写入段（本地命中的别名复制也算）：许可活着时换代不会发生；teardown
+            // 等不到在途阶段退场就不换代，所以这里的 valid() 检查可信。
+            let permit = ctx.space.enter();
+            if !permit.ok() {
+                return Err(abandoned());
+            }
+            let token = commit.token();
             let blob = blob_id.to_string();
             offload(ctx, move |ctx| {
-                if !commit.valid() {
+                if !token.valid() {
                     return Err(abandoned());
                 }
-                let valid = || commit.valid();
+                let valid = || token.valid();
                 wire::settle_aliases(&ctx.env, Some(&blob), Some(&valid))
             })
             .await?;
+            drop(permit);
             return Ok(path);
         }
         Lookup::Fetch(row) => row,
@@ -982,20 +990,15 @@ pub async fn upload_pending(
             let mut rows = Vec::new();
             if attachments_on {
                 // 技能依赖的对象在技能范围关着时不传（点名的除外）：它的 `skill.put`
-                // 还暂缓着，先传字节等于绕过技能范围。
-                for row in db::blobs_in_state(conn, BLOB_PENDING, limit.saturating_mul(4))? {
-                    if rows.len() >= limit {
-                        break;
-                    }
-                    if !skills_on
-                        && skill_marked.contains(&row.blob_id)
-                        && !named.contains(&row.blob_id)
-                    {
-                        continue;
-                    }
-                    rows.push(row);
-                }
-                return Ok(rows);
+                // 还暂缓着，先传字节等于绕过技能范围。过滤放在 SQL 里做——先取前 N 个
+                // 再在内存里跳过，队首一堆暂停项会把后面的普通附件永远挡住。
+                return db::blobs_for_upload(
+                    conn,
+                    !skills_on,
+                    SCOPE_SKILL_BLOB,
+                    SCOPE_NAMED,
+                    limit,
+                );
             }
             // 「同步附件」关着：只传有别的上传原因的——别的设备点名要的（维护，照传），
             // 以及技能范围开着时技能发布登记的大文件。
@@ -1066,7 +1069,14 @@ pub async fn upload_pending(
                     ),
                 );
             }
-            let (taken, gave_up, said) = db::write(ctx.db(), |tx| settle(tx, &blob, &settled))?;
+            let (taken, gave_up, said) = db::write(ctx.db(), |tx| {
+                // 写事务可能排在换空间之后：拿到锁之后在事务里再核对一次，旧空间的
+                // 上传结果不写进新空间的账目。
+                if !commit.valid() {
+                    return Err(abandoned());
+                }
+                settle(tx, &blob, &settled)
+            })?;
             if let (true, Settled::Later(reason)) = (gave_up, &settled) {
                 crate::status::notice(
                     &ctx.paths,

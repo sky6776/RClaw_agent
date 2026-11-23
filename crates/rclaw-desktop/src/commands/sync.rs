@@ -78,12 +78,11 @@ async fn save_and_apply(
 }
 
 /// 同 [`save_and_apply`]，但配置与刚填的密码在同一条命令里交给引擎（[`SyncEngine::
-/// save_storage`]）：密码按这条命令里的配置绑定存储账户，两步之间插进来的别的配置变更
-/// 不会把它绑到另一处存储上。创建 / 加入 / 修改存储设置都走这一条。
+/// save_storage_with`]）：密码按这条命令里的配置绑定存储账户，两步之间插进来的别的配置
+/// 变更不会把它绑到另一处存储上。创建 / 加入 / 修改存储设置都走这一条。
 ///
-/// 写 `rclaw.toml` **之前**先把「更新意图」落盘：文件写成之后、secrets 还没换的窗口里
-/// 中断（掉电、进程被回收），重启时宿主按意图把 `[sync]` 补齐、引擎按它补 secrets，
-/// 两半收敛到同一套；`persist` 失败则撤掉意图（那份设置没生效）。
+/// 意图、`rclaw.toml`、secrets 三者的提交由引擎在一把跨进程锁里串行完成：这里只把
+/// 「写回文件」这一步作为回调交进去。中途失败留下意图，重启时宿主与引擎收敛到同一套。
 async fn save_with_secret(
     state: &AppState,
     engine: &SyncEngine,
@@ -91,20 +90,12 @@ async fn save_with_secret(
     secret: Option<String>,
 ) -> Result<(), String> {
     let home = state.home.clone();
-    let secret = secret.filter(|secret| !secret.is_empty());
-    let paths = rclaw_sync::SyncPaths::new(&home);
-    let intent_id = rclaw_sync::storage_intent_save(&paths, &config, secret.as_deref())
-        .map_err(|error| format!("记录同步设置更新意图失败: {error}"))?;
-    let saved = config.clone();
-    if let Err(error) = run_blocking("保存同步设置", move || persist(&home, &saved)).await {
-        // 文件没写成就撤掉意图：下次启动不该按一份没生效的设置去补 secrets。
-        let _ = rclaw_sync::storage_intent_clear_if(&paths, &intent_id);
-        return Err(error);
-    }
-    if let Err(error) = engine.save_storage(config, secret).await.map_err(fail) {
-        // 意图留着（TOML 已经是新的一套）：重启时引擎按它把 secrets 补上。
-        return Err(error);
-    }
+    engine
+        .save_storage_with(config, secret.filter(|secret| !secret.is_empty()), move |saved| {
+            persist(&home, saved)
+        })
+        .await
+        .map_err(fail)?;
     crate::sync_host::emit_status();
     Ok(())
 }

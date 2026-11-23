@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use rclaw_store::{is_valid_bot_name, BotStore, Layout, MemoryStore, MemoryTarget};
+use rclaw_store::{is_valid_bot_name, BotStore, Layout, MemoryStore, MemoryTarget, SyncApplied};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,26 @@ pub(crate) fn abort_clearing(conn: &Connection, target: &str, op: &str) -> Resul
         .and_then(|row| row.json::<Clearing>());
     match current {
         Some(clearing) if clearing.op == op => {
+            db::state_del(conn, SCOPE_CLEARING, target)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// 对比放行之后收尾一个等待态的清理：文件里的条目已经删完（或者等超时了），标记可以
+/// 撤掉。**必须先读后比、比较和删除在同一个写事务里**：对比读到的是等待态 A，这期间
+/// 用户可能又登记了一次清理（B，待提交）。不看标记直接删，删掉的就是 B——它随后的提交
+/// 对不上，本机文件删了一半时也没有标记拦着普通对比了。
+///
+/// 只删「还是等待态、操作标识仍是 `op`」的那一份；对不上就什么都不动，返回假，调用方
+/// 这一轮整个让路（下一轮重新读）。旧的没有操作标识的记录读出来是空串，只有等待态才
+/// 会走到这里，按空串比较与以前一致。
+pub(crate) fn settle_clearing(conn: &Connection, target: &str, op: &str) -> Result<bool> {
+    let current = db::state_get(conn, SCOPE_CLEARING, target)?
+        .and_then(|row| row.json::<Clearing>());
+    match current {
+        Some(clearing) if !clearing.staged && clearing.op == op => {
             db::state_del(conn, SCOPE_CLEARING, target)?;
             Ok(true)
         }
@@ -528,6 +548,30 @@ fn clearing_pending(ctx: &Ctx, target: &str) -> Result<bool> {
     })
 }
 
+/// 把这一轮的远端变更落到本机记忆文件：先按保留天数在回收站里留副本，再写文件。只做
+/// 本机文件操作；调用方持着静默门（见 [`reconcile_target`]），与 `/clear` 删本机文
+/// 件互斥。返回值是落地的结果与留了哪份副本（`(文件名, 来源设备)`）。
+fn apply_plan(
+    ctx: &Ctx,
+    s: &Settings,
+    target: &Target,
+    first_origin: Option<&str>,
+    adds: &[String],
+    dels: &[String],
+) -> Result<(SyncApplied, Option<(String, String)>)> {
+    // 别的设备删掉的条目，动文件之前先在本机回收站里留一份（§7.5）：删除会传到所有
+    // 设备，得留得回来。留不下就不删，下一轮再试。
+    let backup = if let (Some(origin), true) = (first_origin, s.trash_days > 0) {
+        let label = db::read(ctx.db(), |conn| db::device_label(conn, origin))?;
+        let what = format!("{}里被「{label}」的同步删掉的条目", describe(&target.name));
+        trash::stash_memory(&ctx.paths, &target.name, &what, dels)?.map(|name| (name, label))
+    } else {
+        None
+    };
+    let applied = target.store.sync_apply(target.which, adds, dels)?;
+    Ok((applied, backup))
+}
+
 pub(crate) fn reconcile(
     ctx: &Ctx,
     s: &Settings,
@@ -617,9 +661,13 @@ fn reconcile_target(
         if remaining && (0..CLEARING_MAX_MS).contains(&(now_ms() - clearing.at)) {
             return Ok(());
         }
-        db::write(ctx.db(), |tx| {
-            db::state_del(tx, SCOPE_CLEARING, &target.name)
-        })?;
+        // 收尾放进写事务里重新读、重新比（见 [`settle_clearing`]）：读到等待态之后又
+        // 登记了一次清理的话，这次收尾不做，整轮让路。
+        if !db::write(ctx.db(), |tx| {
+            settle_clearing(tx, &target.name, &clearing.op)
+        })? {
+            return Ok(());
+        }
         // 标记是这里撤掉的：发布事务里复核时按「没有标记」比。
         expected_clearing = None;
     }
@@ -682,16 +730,19 @@ fn reconcile_target(
         }
         let adds: Vec<String> = plan.adds.iter().map(|change| change.text.clone()).collect();
         let dels: Vec<String> = plan.dels.iter().map(|(_, text)| text.clone()).collect();
-        // 别的设备删掉的条目，动文件之前先在本机回收站里留一份（§7.5）：删除会传到所有
-        // 设备，得留得回来。留不下就不删，下一轮再试。
-        let backup = if let (Some((first, _)), true) = (plan.dels.first(), s.trash_days > 0) {
-            let label = db::read(ctx.db(), |conn| db::device_label(conn, &first.origin))?;
-            let what = format!("{}里被「{label}」的同步删掉的条目", describe(&target.name));
-            trash::stash_memory(&ctx.paths, &target.name, &what, &dels)?.map(|name| (name, label))
-        } else {
-            None
-        };
-        let applied = target.store.sync_apply(target.which, &adds, &dels)?;
+        // 改记忆文件与 `/clear` 的删除共用同一道静默门（§7.5）：清空从登记清理意图、
+        // 删本机文件到提交，全程持门。对比在这期间把文件写回去的话，清空刚删掉的条目
+        // 下一轮会被当成「本机新写的」再发出去，盖过它发布的删除；反过来，对比持门时
+        // `/clear` 拿不到门，会中止让用户重试。拿不到门就整轮不做，下一轮再对比。
+        let mut outcome = None;
+        let quiet = ctx.gate.when_quiet(&mut || {
+            let first_origin = plan.dels.first().map(|(change, _)| change.origin.as_str());
+            outcome = Some(apply_plan(ctx, s, target, first_origin, &adds, &dels));
+        });
+        if !quiet {
+            return Ok(());
+        }
+        let (applied, backup) = outcome.expect("持门时闭包执行了一次")?;
         if let Some((name, label)) = backup.filter(|_| applied.removed.len() >= REMOVED_NOTICE_MIN)
         {
             status::notice(
@@ -966,6 +1017,9 @@ mod tests {
     use super::*;
     use crate::files::{self, Cache};
     use crate::testing::{self, Device};
+    use crate::SessionGate;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn entries(pairs: &[&str]) -> BTreeMap<String, String> {
         pairs
@@ -1404,5 +1458,99 @@ mod tests {
         })
         .unwrap();
         assert_eq!(published, 2);
+    }
+
+    #[test]
+    fn finalizing_a_wait_never_removes_a_newer_registration() {
+        let a = Device::new();
+        for text in ["entry one", "entry two"] {
+            a.ctx.memory.add_entry(MemoryTarget::Memory, text).unwrap();
+        }
+        let present: Vec<String> = list(&a, MemoryTarget::Memory)
+            .iter()
+            .map(|text| mem_id(text))
+            .collect();
+        let first = db::write(a.ctx.db(), |tx| mark_clearing(tx, "memory", &present)).unwrap();
+        db::write(a.ctx.db(), |tx| {
+            publish_clear(tx, &a.settings, "memory", &present, &first)
+        })
+        .unwrap();
+        // 对比读到等待态 first 之后、收尾之前，用户又重试了一次清空：新的登记是待提交的。
+        // 收尾按读到的标识比较，不能把这次登记删掉——删掉的话，它随后的提交对不上，本机
+        // 文件删了一半时也没有标记拦着普通对比了。
+        let second = db::write(a.ctx.db(), |tx| mark_clearing(tx, "memory", &present)).unwrap();
+        assert!(!db::write(a.ctx.db(), |tx| settle_clearing(tx, "memory", &first)).unwrap());
+        let kept = db::read(a.ctx.db(), |conn| {
+            Ok(db::state_get(conn, SCOPE_CLEARING, "memory")?
+                .and_then(|row| row.json::<Clearing>()))
+        })
+        .unwrap()
+        .unwrap();
+        assert!(kept.staged);
+        assert_eq!(kept.op, second);
+        // 新的登记照常提交；之后旧的等待态收尾也收不掉它，只有它自己的标识对得上。
+        db::write(a.ctx.db(), |tx| {
+            publish_clear(tx, &a.settings, "memory", &present, &second)
+        })
+        .unwrap();
+        assert!(!db::write(a.ctx.db(), |tx| settle_clearing(tx, "memory", &first)).unwrap());
+        assert!(db::write(a.ctx.db(), |tx| settle_clearing(tx, "memory", &second)).unwrap());
+        assert!(db::read(a.ctx.db(), |conn| {
+            Ok(db::state_get(conn, SCOPE_CLEARING, "memory")?)
+        })
+        .unwrap()
+        .is_none());
+    }
+
+    /// 静默门关着（有 turn 在跑，或者 `/clear` 正拿着门删本机文件）。
+    struct Busy(AtomicBool);
+
+    impl SessionGate for Busy {
+        fn begin_merge(&self, _channel: &str, _chat_id: &str) -> Option<Box<dyn Send>> {
+            Some(Box::new(()))
+        }
+
+        fn is_busy(&self, _channel: &str, _chat_id: &str) -> bool {
+            false
+        }
+
+        fn running_sessions(&self) -> Vec<(String, String)> {
+            Vec::new()
+        }
+
+        fn session_changed(&self, _channel: &str, _chat_id: &str, _deleted: bool) {}
+
+        fn when_quiet(&self, f: &mut dyn FnMut()) -> bool {
+            if self.0.load(Ordering::SeqCst) {
+                return false;
+            }
+            f();
+            true
+        }
+    }
+
+    #[test]
+    fn a_remote_entry_lands_only_when_no_clear_is_deleting_the_files() {
+        let a = Device::new();
+        let gate = Arc::new(Busy(AtomicBool::new(true)));
+        let b = Device::with_gate(gate.clone());
+        a.ctx
+            .memory
+            .add_entry(MemoryTarget::Memory, "甲端的约定")
+            .unwrap();
+        sync_files(&a);
+        testing::seal_all(&a);
+        testing::ship(&a, &b);
+        b.merge();
+        // `/clear` 正拿着静默门：对比不在这时候往记忆文件里写远端条目。写回去的条目
+        // 下一轮会被当成「本机新写的」再发出去，盖过清空发布的删除。
+        let report = sync_files(&b);
+        assert_eq!(report.applied, 0);
+        assert!(list(&b, MemoryTarget::Memory).is_empty());
+        // 门开了，照常落地。
+        gate.0.store(false, Ordering::SeqCst);
+        let report = sync_files(&b);
+        assert_eq!(report.applied, 1);
+        assert_eq!(list(&b, MemoryTarget::Memory), ["甲端的约定"]);
     }
 }

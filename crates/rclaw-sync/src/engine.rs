@@ -603,18 +603,43 @@ impl SyncEngine {
     /// 一半补上。命令成功才把新配置公布给宿主、清掉意图——失败时宿主内存里仍是旧配置，
     /// 界面上看到的与实际生效的一致。
     pub async fn save_storage(&self, config: SyncConfig, secret: Option<String>) -> Result<()> {
-        let id = worker::storage_intent_save(
-            &self.inner.ctx.paths,
-            &config,
-            secret.as_deref().filter(|secret| !secret.is_empty()),
-        )?;
+        self.save_storage_with(config, secret, |_| Ok(())).await
+    }
+
+    /// 保存存储设置与密码的完整协议：`persist` 在这一段里把设置写回宿主的配置文件
+    /// （`rclaw.toml`）。整段在一把跨进程锁里串行：先落「更新意图」→ 写配置文件 →
+    /// 引擎按同一条请求绑定 secrets 并生效 → 按意图标识结算。中途失败留下意图，下次
+    /// 启动由宿主与引擎收敛到同一套；两次保存不会交错出 TOML 与运行配置各一套的状态。
+    pub async fn save_storage_with<F>(
+        &self,
+        config: SyncConfig,
+        secret: Option<String>,
+        persist: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&SyncConfig) -> std::result::Result<(), String> + Send + 'static,
+    {
+        let paths = self.inner.ctx.paths.clone();
+        let _lock = worker::StorageLock::acquire(&paths)?;
+        let secret = secret.filter(|secret| !secret.is_empty());
+        let id = worker::storage_intent_save(&paths, &config, secret.as_deref())?;
+        let target = config.clone();
+        let saved = blocking(move || -> Result<()> {
+            persist(&target).map_err(SyncError::other)
+        })
+        .await;
+        if let Err(error) = saved {
+            // 配置文件没写成就撤掉意图：这份设置没有生效。
+            let _ = worker::storage_intent_clear_if(&paths, &id);
+            return Err(error);
+        }
         self.call(|reply| Cmd::SaveStorage {
             config: config.clone(),
             secret,
             reply,
         })
         .await?;
-        worker::storage_intent_clear_if(&self.inner.ctx.paths, &id)?;
+        worker::storage_intent_clear_if(&paths, &id)?;
         *lock(&self.inner.config) = config;
         Ok(())
     }

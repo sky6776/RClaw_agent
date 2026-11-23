@@ -464,8 +464,14 @@ async fn finish_reset(
             // 旧空间目录不在了（被清掉、第三方工具还没同步过来）：补写一个可验证的
             // 「已关闭」标记。迟到的旧副本要是又出现、带着开放状态，至少这里的结论
             // 有据可查，重试也不会一直把「目录缺失」当成不确定。
-            let old = load_live(&at, &old_secrets).await?;
-            remote::close_space(old.transport(), &old.keys, &old.space_id).await?;
+            // 注意从**外层根**加空间前缀写：旧空间子目录本身不存在，直接把它当传输根
+            // 会连根都打不开（文件后端要求根目录先存在）。
+            let space_id = old_secrets.space_id.clone();
+            let keys = Arc::new(old_secrets.keys()?);
+            let (config, secrets) = (at.clone(), old_secrets.clone());
+            let root = blocking(move || root_transport(&config, &secrets)).await?;
+            let transport = Scoped::new(root, &space_id);
+            remote::close_space(&transport, &keys, &space_id).await?;
         } else if open {
             let old = load_live(&at, &old_secrets).await?;
             remote::close_space(old.transport(), &old.keys, &old.space_id).await?;

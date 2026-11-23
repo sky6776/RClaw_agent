@@ -546,14 +546,17 @@ impl DevicePull<'_> {
         chain.device = self.device.to_string();
         // 上一次记下的链（新的在前）。新包头指向的环要是就在里面，接着用那一段。
         let mut previous = Some(chain.links.clone());
+        let mut same_head = false;
         match chain
             .links
             .iter()
             .position(|link| link.name == newest_link.name && link.digest == newest_link.digest)
         {
-            // 这一环已经走过：去掉它前面那些过时的头，从它接着往回找。
+            // 这一环已经走过：去掉它前面那些过时的头，保留它和它之后的历史。head 没变
+            // 时（index == 0）整条链和完成状态都还有效，不必重新回溯。
             Some(index) => {
-                chain.links.truncate(index + 1);
+                same_head = index == 0;
+                chain.links.drain(0..index);
                 previous = None;
             }
             None => {
@@ -561,12 +564,17 @@ impl DevicePull<'_> {
                 chain.links.push(newest_link);
             }
         }
-        chain.complete = false;
+        if !same_head {
+            chain.complete = false;
+        }
         // 往回找：只记下各包的名字与摘要（密文落在临时目录里，往前处理时不必再下载）。
         // 这一阶段的网络预算与别的部分共享，但每轮至少允许下载一个新包：卡住的位置在
         // 任何可交的段之外，一点字节都不让走的话，「包比预算大、缓存又留不住」的设备
         // 永远动不了。新下载的环数另有条数封顶，链的进度跨轮保留。
         let mut walked = 0usize;
+        // 已经在手的定位包：链走到「包住本机位置」那一环时它就在内存里。这一轮即使网络
+        // 预算已经用完，也可以直接拿它提交至少一段（缓存写不上时不用下一轮重下）。
+        let mut cover: Option<(String, crate::codec::Rollup)> = None;
         while !chain.complete {
             let link = chain.links.last().expect("至少一个").clone();
             let loaded = load_pack(
@@ -592,18 +600,21 @@ impl DevicePull<'_> {
             }
             if pack.header.from <= peer.fetched + 1 {
                 chain.complete = true;
+                cover = Some((link.name.clone(), pack));
                 break;
             }
-            // 新包头指向的环在上一轮的链里：把那一整段接在后面，不必重新下载。
+            // 新包头指向的环在上一轮的链里：把那一整段接在后面，不必重新下载。第一次
+            // 没接上时保留旧链——往回再走一两个包就可能接上。
             let mut seeded = false;
             if let Some(prev) = pack.header.prev.as_ref() {
-                if let Some(old) = previous.take() {
+                if let Some(old) = previous.as_ref() {
                     if let Some(at) = old
                         .iter()
                         .position(|link| link.name == prev.name && link.digest == prev.digest)
                     {
                         chain.links.extend(old[at..].iter().cloned());
                         seeded = true;
+                        previous = None;
                     }
                 }
             } else {
@@ -634,22 +645,32 @@ impl DevicePull<'_> {
                     tokio::fs::remove_file(pack_cache(self.ctx, &chain.device, &link.name)).await;
                 continue;
             }
-            if self.exhausted() && !self.pack_in_cache(&chain.device, &link.name) {
+            let preloaded = cover
+                .as_ref()
+                .filter(|(name, _)| *name == link.name)
+                .map(|(_, pack)| pack.clone());
+            if preloaded.is_none()
+                && self.exhausted()
+                && !self.pack_in_cache(&chain.device, &link.name)
+            {
                 // 停在中途：链已经完整找到了，下一轮直接从链上接着往前处理（已处理过的
                 // 段按位置跳过），不必重走回溯。缓存里还有这个包就接着读：读取游标的
                 // 推进不依赖网络预算，读缓存不再花网络。
                 self.remember_chain(key.clone(), chain.clone());
                 return Ok(false);
             }
-            let loaded = load_pack(
+            let loaded = match preloaded {
+                Some(pack) => Ok((pack, false, 0)),
+                None => load_pack(
                 self.ctx,
                 self.transport,
                 self.keys,
                 self.device,
-                &link.name,
-                &link.digest,
-            )
-            .await;
+                    &link.name,
+                    &link.digest,
+                )
+                .await,
+            };
             let (pack, downloaded, network) = match loaded {
                 Ok(loaded) => loaded,
                 Err(error) => {

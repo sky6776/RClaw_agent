@@ -328,6 +328,16 @@ object CaptureBridge {
         AppConfig.trace(activity, "capture-done kind=scan denied")
     }
 
+    /** 相机权限授权后拉起相机失败（没有能处理拍照 Intent 的应用、FileProvider 出错）：
+     *  这条续跑路径没有调用方能拿到返回值，只能就地交付终态——删掉本轮的照片、清掉仍是
+     *  这一轮的标记，Rust 轮询看到标记没了就返回「取消」。不写共享的结果文件：新一轮
+     *  可能已经开始，两边不能互相覆盖。 */
+    private fun finishScanLaunchFailed(activity: Activity, requestId: String) {
+        scanFile(activity, requestId).delete()
+        removeScanMarkerIf(activity, requestId)
+        AppConfig.trace(activity, "capture-done kind=scan launch-failed")
+    }
+
     /** 临时文件 + rename 原子提交：Rust 轮询消费端读到半截 JSON 会把文件
      *  删掉（读后即删），非原子写会整份丢失采集结果。 */
     private fun writeCaptureResult(activity: Activity, json: String): Boolean {
@@ -455,7 +465,12 @@ object CaptureBridge {
                         } else if (scanRequested(activity, scanId)) {
                             // 标记还是这一轮才拉相机；取消之后标记已经没了、或者开始了
                             // 新一轮的话，这声迟到的授权作废。
-                            launchScanLocked(activity, scanId)
+                            val status = launchScanLocked(activity, scanId)
+                            // 授权之后才失败的话没有调用方接住这个 error：就地清掉本轮
+                            // 的照片与标记，别让轮询一直等到超时。
+                            if (status != "ok" && status != "permission_requested") {
+                                finishScanLaunchFailed(activity, scanId)
+                            }
                         }
                     }
                 }

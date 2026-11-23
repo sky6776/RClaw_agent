@@ -686,6 +686,65 @@ pub fn blob_objects_at(conn: &Connection, rel_path: &str) -> Result<Vec<(String,
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// 登记一个要随消息/快照发出的本地对象：已经登记过、但只是本机缓存（`BLOB_FETCHED`）
+/// 的，升成待上传——「本机有这份内容」不等于「远端有这份副本」。远端已经确认过的
+/// （`UPLOADED`）与按范围留着的（`HELD`）不动。
+pub fn blob_register_or_upload(
+    conn: &Connection,
+    blob_id: &str,
+    rel_path: &str,
+    size: u64,
+    state: i64,
+) -> Result<i64> {
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT state FROM sync_blob WHERE blob_id = ?1",
+            params![blob_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match current {
+        None => {
+            conn.execute(
+                "INSERT INTO sync_blob(blob_id, rel_path, size, state) VALUES (?1, ?2, ?3, ?4)",
+                params![blob_id, rel_path, size as i64, state],
+            )?;
+            Ok(state)
+        }
+        Some(existing) if state == BLOB_PENDING && existing == BLOB_FETCHED => {
+            conn.execute(
+                "UPDATE sync_blob SET state = ?2, rel_path = ?3 WHERE blob_id = ?1",
+                params![blob_id, BLOB_PENDING, rel_path],
+            )?;
+            Ok(BLOB_PENDING)
+        }
+        Some(existing) => Ok(existing),
+    }
+}
+
+/// 待上传的附件（按入队顺序取 `limit` 个）。`skip_skill` 为真时在 SQL 里排除「技能依赖
+/// 但没被点名」的对象：先取前 N 个再在内存里过滤，会让队首的一堆暂停项把后面的普通
+/// 附件永远挡住。
+pub fn blobs_for_upload(
+    conn: &Connection,
+    skip_skill: bool,
+    skill_scope: &str,
+    named_scope: &str,
+    limit: usize,
+) -> Result<Vec<BlobRow>> {
+    if !skip_skill {
+        return blobs_in_state(conn, BLOB_PENDING, limit);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT b.blob_id, b.rel_path, b.size, b.state FROM sync_blob b          WHERE b.state = ?1 AND (              NOT EXISTS (SELECT 1 FROM sync_state s WHERE s.scope = ?2 AND s.key = b.blob_id)              OR EXISTS (SELECT 1 FROM sync_state s WHERE s.scope = ?3 AND s.key = b.blob_id)          ) ORDER BY b.rowid LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![BLOB_PENDING, skill_scope, named_scope, limit as i64],
+        row_to_blob,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// 把一个等着上传的附件挪到队尾。队列按 rowid 排（见 [`blobs_in_state`]）：删掉再插入，
 /// 它就排到了最后。登记已经不是「等待上传」时不动它，返回 `false`。
 pub fn blob_requeue(conn: &Connection, blob_id: &str) -> Result<bool> {

@@ -596,7 +596,15 @@ fn try_seal(ctx: &Ctx, opts: &SealOptions<'_>) -> Result<Attempt> {
                 )?;
             }
             for blob in blobs {
-                db::blob_register(tx, &blob.blob_id, &blob.rel_path, blob.size, fresh_blob)?;
+                // 本机有这份内容（缓存里的 FETCHED）不等于远端有：按范围升成待上传，
+                // 否则接收端拿到对象引用却取不到字节。
+                db::blob_register_or_upload(
+                    tx,
+                    &blob.blob_id,
+                    &blob.rel_path,
+                    blob.size,
+                    fresh_blob,
+                )?;
             }
         }
         Ok(true)

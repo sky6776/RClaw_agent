@@ -390,6 +390,13 @@ pub(crate) fn stash_memory_clear(ctx: &Ctx, keep_trash: bool) -> Result<(Vec<Str
         }
         memory::mark_clearing(tx, "memory", &ids)
     })?;
+    // 意图事务提交后、调用方删本机文件之前，必须越过落盘点：库平时是 synchronous=NORMAL，
+    // 提交只写进 WAL、不 fsync，掉电 / 崩溃时这条意图会回滚，而已经删掉的 MEMORY.md 却
+    // 留了下来——重启后的普通对比会把缺掉的一两条当成正常删除发给别的设备。落盘失败就
+    // 返回错误，调用方不会继续删文件；重试走的也是这条路，同样要先落盘。
+    db::flush(ctx.db()).map_err(|error| {
+        SyncError::other(format!("「正在清理记忆」的意图没能落盘（{error}），没有删本机文件"))
+    })?;
     Ok((ids, op))
 }
 

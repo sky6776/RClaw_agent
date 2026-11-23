@@ -583,12 +583,14 @@ pub fn fill_artifacts(env: &Env, row: &mut RowWire, policy: ArtifactPolicy<'_>) 
             });
             if legacy {
                 update_stored_artifact(row, &object.name, &blob, len);
-                blobs.push(LocalBlob {
-                    blob_id: blob,
-                    rel_path: object.rel_path.clone(),
-                    size: len,
-                });
             }
+            // 非内联引用必须有一个远端能取的副本：本机有对象不等于远端有，交给调用方
+            // 按范围登记成待上传（或 HELD）。
+            blobs.push(LocalBlob {
+                blob_id: blob,
+                rel_path: object.rel_path.clone(),
+                size: len,
+            });
             continue;
         }
         if let Some(absent) = row.absent.iter().find(|artifact| artifact.name == name) {
@@ -1103,7 +1105,30 @@ enum Copied {
     Retry,
 }
 
-fn copy_into_place(env: &Env, source_rel: &str, target_rel: &str, size: u64) -> Copied {
+/// 两个文件内容是否一致（别名改名后的所有权核对用）。
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    if meta_a.len() != meta_b.len() {
+        return false;
+    }
+    let digest = |path: &Path| {
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|mut file| sha256_reader(&mut file).ok())
+            .map(|(digest, _)| digest)
+    };
+    digest(a).is_some() && digest(a) == digest(b)
+}
+
+fn copy_into_place(
+    env: &Env,
+    source_rel: &str,
+    target_rel: &str,
+    size: u64,
+    allowed: &dyn Fn() -> bool,
+) -> Copied {
     let (Ok(source), Ok(target)) = (env.checked_path(source_rel), env.checked_path(target_rel))
     else {
         return Copied::Retry;
@@ -1123,12 +1148,25 @@ fn copy_into_place(env: &Env, source_rel: &str, target_rel: &str, size: u64) -> 
     }
     // 先写同目录的临时文件再改名：读者看不到复制了一半的文件。
     let staging = target.with_extension(format!("part-{}", crate::ids::random_hex::<4>()));
-    if std::fs::copy(source, &staging).is_err() {
+    if std::fs::copy(&source, &staging).is_err() {
+        let _ = std::fs::remove_file(&staging);
+        return Copied::Retry;
+    }
+    // 改名之前再核对一次许可：慢复制期间可能已经开始换空间。
+    if !allowed() {
         let _ = std::fs::remove_file(&staging);
         return Copied::Retry;
     }
     if std::fs::rename(&staging, &target).is_err() {
         let _ = std::fs::remove_file(&staging);
+        return Copied::Retry;
+    }
+    if !allowed() {
+        // 换空间已经完成：这次改名可能落进了会被复用的路径。内容还是刚复制的那一份
+        // 才删；新空间已经写进去的（内容不同）留着。
+        if same_file(&source, &target) {
+            let _ = std::fs::remove_file(&target);
+        }
         return Copied::Retry;
     }
     Copied::Done
@@ -1225,7 +1263,7 @@ pub fn settle_aliases(
         if !allowed() {
             break;
         }
-        match copy_into_place(env, source, target, *size) {
+        match copy_into_place(env, source, target, *size, &allowed) {
             Copied::Done => {
                 done += 1;
                 settled.push(key);

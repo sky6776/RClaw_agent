@@ -83,6 +83,51 @@ fn storage_intent_path(paths: &SyncPaths) -> PathBuf {
     paths.root.join("pending-storage.json")
 }
 
+/// 存储保存协议的跨进程锁：意图、`rclaw.toml`、secrets 的整套提交必须串行——两次保存
+/// 交错时会留下 TOML 与运行配置各一套、且没有恢复记录的状态。
+pub struct StorageLock {
+    file: std::fs::File,
+}
+
+impl StorageLock {
+    fn lock_path(paths: &SyncPaths) -> PathBuf {
+        paths.root.join("storage.lock")
+    }
+
+    /// 拿锁（阻塞到别的保存/恢复结束）。
+    pub fn acquire(paths: &SyncPaths) -> Result<StorageLock> {
+        paths.ensure_root()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(Self::lock_path(paths))?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(StorageLock { file })
+    }
+
+    /// 试拿锁：别的地方正拿着就返回 `None`（不等待）。
+    pub fn try_acquire(paths: &SyncPaths) -> Result<Option<StorageLock>> {
+        paths.ensure_root()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(Self::lock_path(paths))?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(StorageLock { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for StorageLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 /// 落盘「存储设置更新意图」，返回它的标识。同一套配置与密码重复调用（桌面在写
 /// `rclaw.toml` 之前先落一次、引擎派发命令时再落一次）沿用手上这条记录的标识，不会
 /// 出现两条意图互相覆盖。
@@ -141,6 +186,11 @@ pub fn storage_intent_clear_if(paths: &SyncPaths, id: &str) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// 两份配置的存储段是否一致（TOML 是否已经补写成意图里的目标）。
+fn same_storage(a: &SyncConfig, b: &SyncConfig) -> bool {
+    a.transport == b.transport && a.webdav == b.webdav && a.file == b.file && a.s3 == b.s3
 }
 
 /// 上一次没存完的存储设置里的目标配置（宿主启动时按它补齐 `rclaw.toml`）。不删记录：
@@ -400,7 +450,7 @@ impl Worker {
                 _ = sleep_until(wake) => self.on_timer().await,
             }
         }
-        self.teardown().await;
+        let _ = self.teardown().await;
     }
 
     // -- 定时 ---------------------------------------------------------------
@@ -758,29 +808,33 @@ impl Worker {
     }
 
     /// 断开同步空间：停掉附件任务。写到一半的快照留给下次清理（它的名字记在库里）。
-    async fn teardown(&mut self) {
+    /// 返回是否换成了新世代：在途的提交阶段没能在期限内退场时**不换代**——已经有最终
+    /// 写入在进行时宣告换代完成，旧任务随后的改名会把旧字节落到可能被复用的路径上。
+    /// 调用方据此中止这次切换（保持旧连接），稍后重试。
+    async fn teardown(&mut self) -> bool {
         self.shared.set_fetch(None);
         // 拆任务只拆得掉异步的那一层：已经开始的文件与记账阶段（`spawn_blocking`）拦不
-        // 住。顺序是：先关提交入口（旧任务此后拿到的阶段一律作废，只能用开始时捕获的
-        // 代）→ 等在途的阶段走完（它们在切换之前正常提交，不越过边界）→ 等不到才换代，
-        // 把没走完的与新的状态隔离开（它们随后的核对失配、丢弃结果，只收拾自己写下的
-        // 东西）。之后才换空间、清理本机的登记。
+        // 住。顺序是：先关提交入口（旧任务此后拿到的阶段一律作废）→ 等在途的阶段走完 →
+        // 再等最终写入段退场 → 换代。任何一步超时都不换代，恢复提交入口让调用方重试。
         self.shared.ctx.space.seal();
-        let _ = self
+        let idle = self
             .shared
             .ctx
             .space
             .wait_idle(TEARDOWN_SETTLE)
             .await;
-        // 还有任务在最终写入段里（正改名、记账、销账）：它们的许可活着时换代会把写入
-        // 越过边界，等它们退场再换代。等不到也换代——它们的许可随之失效，后面的核对
-        // 与清理只收自己写下的东西。
-        let _ = self
-            .shared
-            .ctx
-            .space
-            .wait_writers(TEARDOWN_SETTLE)
-            .await;
+        let writers = idle
+            && self
+                .shared
+                .ctx
+                .space
+                .wait_writers(TEARDOWN_SETTLE)
+                .await;
+        if !writers {
+            tracing::warn!("还有在途的提交阶段，暂不换空间（稍后重试）");
+            self.shared.ctx.space.reopen();
+            return false;
+        }
         self.shared.ctx.space.bump();
         for task in [self.uploads.take(), self.downloads.take()]
             .into_iter()
@@ -791,6 +845,7 @@ impl Worker {
         }
         self.session = None;
         self.next = None;
+        true
     }
 
     // -- 命令 ---------------------------------------------------------------
@@ -1014,7 +1069,12 @@ impl Worker {
             return;
         }
         if storage {
-            self.teardown().await;
+            if !self.teardown().await {
+                // 没换成就退回旧配置：运行中的连接与配置保持一致，稍后再试。
+                self.config = old;
+                self.request(Kind::Full, RETRY_MIN);
+                return;
+            }
             self.open().await;
             return;
         }
@@ -1137,6 +1197,27 @@ impl Worker {
             }
             let mut next = self.secrets.clone();
             let joined = space::apply_pairing(&self.config, &mut next, &parsed);
+            if joined == self.config && next == self.secrets {
+                // 完全没变化：什么都不用做。
+                return Ok(joined);
+            }
+            // 配对码可能带了更新的存储地址/凭据：换凭据必须重建连接，先确认能换（在途
+            // 的提交阶段会拒绝），再按正常加入的规矩核对远端确实是这个空间、密钥对得上。
+            if !self.teardown().await {
+                return Err(SyncError::other("还有在途的附件提交，稍后再重新加入"));
+            }
+            let live = space::load_live(&joined, &next).await?;
+            crate::remote::open_space(
+                live.transport(),
+                &live.keys,
+                &next.space_id,
+                false,
+            )
+            .await?;
+            let paths = self.shared.ctx.paths.clone();
+            let saved = next.clone();
+            blocking(move || saved.save(&paths)).await?;
+            self.secrets = next;
             self.config = joined.clone();
             self.open().await;
             return Ok(joined);
@@ -1156,7 +1237,9 @@ impl Worker {
 
     async fn leave_space(&mut self) -> Result<()> {
         self.require_owner()?;
-        self.teardown().await;
+        if !self.teardown().await {
+            return Err(SyncError::other("还有在途的附件提交，稍后再退出"));
+        }
         let result = space::leave(&self.shared.ctx, &self.config, &mut self.secrets).await;
         // 退出成功就停在「还没配对」；没成功就照旧连回去。
         self.open().await;
@@ -1166,7 +1249,9 @@ impl Worker {
     async fn reset_space(&mut self) -> Result<()> {
         self.require_owner()?;
         self.config.validate()?;
-        self.teardown().await;
+        if !self.teardown().await {
+            return Err(SyncError::other("还有在途的附件提交，稍后再重置"));
+        }
         let result = space::reset(&self.shared.ctx, &self.config, &mut self.secrets).await;
         self.open().await;
         result
@@ -1197,7 +1282,9 @@ impl Worker {
         );
         if self.secrets.is_paired() {
             // 换了密码：存储的客户端要重新组装。
-            self.teardown().await;
+            if !self.teardown().await {
+                return Err(SyncError::other("还有在途的附件提交，稍后重试保存"));
+            }
             self.open().await;
         }
         Ok(())
@@ -1229,7 +1316,9 @@ impl Worker {
             self.secret_saved(),
         );
         if self.secrets.is_paired() {
-            self.teardown().await;
+            if !self.teardown().await {
+                return Err(SyncError::other("还有在途的附件提交，稍后重试保存"));
+            }
             self.open().await;
         }
         Ok(())
@@ -1240,9 +1329,20 @@ impl Worker {
     /// 绑的），两边收敛到同一套，然后删记录。
     async fn resume_storage_intent(&mut self) -> Result<()> {
         let paths = self.shared.ctx.paths.clone();
+        // 宿主正拿着协议锁在保存：这次跳过（它会把意图结算掉，或者下次启动再来）。
+        let Some(_lock) = blocking(move || StorageLock::try_acquire(&paths)).await? else {
+            return Ok(());
+        };
+        let paths = self.shared.ctx.paths.clone();
         let Some(intent) = blocking(move || storage_intent_load(&paths)).await? else {
             return Ok(());
         };
+        // 宿主没能把 `rclaw.toml` 补写成意图里的目标：先别绑定 secrets、也别删意图，
+        // 否则下次启动只剩一份和 TOML 不一致的凭据，恢复依据就没了。
+        if !same_storage(&self.config, &intent.config) {
+            tracing::warn!("存储更新意图与当前配置的存储段不一致（TOML 还没补写），先保留");
+            return Ok(());
+        }
         let mut next = self.secrets.clone();
         if let Some(secret) = intent.secret.as_deref().filter(|secret| !secret.is_empty()) {
             if intent.config.transport != "file" {
