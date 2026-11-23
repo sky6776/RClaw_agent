@@ -303,8 +303,9 @@ function AttachmentCard({
             {formatBytes(item.size)} · 已下载到 {item.path}
           </span>
         </span>
-        {/* 工具结果（artifact）在消息里只有一个文件名：打开按对象走登记的本机路径。 */}
-        <button onClick={() => open(item.local_path ?? item.path)} className={CARD_BTN}>
+        {/* 打开只按工作区相对路径：`open_media` 不收绝对路径（安卓与 Windows 都会拒）。
+            工具结果（artifact）的登记落点就在这个会话的 artifact 目录下。 */}
+        <button onClick={() => open(item.rel_path ?? item.path)} className={CARD_BTN}>
           打开
         </button>
       </div>

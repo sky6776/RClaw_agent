@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use crate::attach::now_ms;
 use crate::bundle::{self, ImportOptions, Imported};
 use crate::config::{SyncConfig, SyncPaths};
-use crate::db::{self, BLOB_FETCHED};
+use crate::db;
 use crate::error::{Result, SyncError};
 use crate::files;
 use crate::pairing::PairingCode;
@@ -50,7 +50,8 @@ pub use crate::files::memory::MemoryRestored;
 pub use crate::transport::SelfTestStep;
 pub use crate::trash::{MemoryTrashItem, TrashItem};
 pub use local::{AttachmentInfo, SessionMark};
-pub use space::apply_pairing;
+pub use space::{apply_pairing, pairing_config};
+pub use worker::{storage_intent_clear_if, storage_intent_config, storage_intent_save};
 
 /// 距上次拉取不到这么久就不再拉（发送前、窗口获得焦点、打开会话时）。
 pub(crate) const PULL_FRESH_MS: i64 = 5_000;
@@ -602,7 +603,7 @@ impl SyncEngine {
     /// 一半补上。命令成功才把新配置公布给宿主、清掉意图——失败时宿主内存里仍是旧配置，
     /// 界面上看到的与实际生效的一致。
     pub async fn save_storage(&self, config: SyncConfig, secret: Option<String>) -> Result<()> {
-        worker::storage_intent_save(
+        let id = worker::storage_intent_save(
             &self.inner.ctx.paths,
             &config,
             secret.as_deref().filter(|secret| !secret.is_empty()),
@@ -613,7 +614,7 @@ impl SyncEngine {
             reply,
         })
         .await?;
-        worker::storage_intent_clear(&self.inner.ctx.paths)?;
+        worker::storage_intent_clear_if(&self.inner.ctx.paths, &id)?;
         *lock(&self.inner.config) = config;
         Ok(())
     }
@@ -737,18 +738,25 @@ impl SyncEngine {
     }
 
     /// `/clear confirm all`（§7.5）第二半的前一步：把本机 `MEMORY.md` 现有的条目在回收站
-    /// 里留一份，返回它们的标识。没有可发布的副作用。
-    pub fn stash_memory_for_clear(&self) -> Result<Vec<String>> {
+    /// 里留一份，并登记「正在清理」的意图，返回条目标识与这次登记的操作标识。没有可发布
+    /// 的副作用：意图先耐久落库，调用方才删本机文件。
+    pub fn stash_memory_for_clear(&self) -> Result<(Vec<String>, String)> {
         let keep_trash = self.config().trash_days > 0;
         local::stash_memory_clear(&self.inner.ctx, keep_trash)
     }
 
     /// `/clear confirm all`（§7.5）第二半的后一步：本地清空已成功，把清空登记成发给所有
-    /// 设备的删除。`ids` 是 [`Self::stash_memory_for_clear`] 返回的那些。返回登记数。
-    pub fn commit_memory_clear(&self, ids: &[String]) -> Result<usize> {
+    /// 设备的删除。`ids` / `op` 是 [`Self::stash_memory_for_clear`] 返回的那些。记忆范围
+    /// 关着时没有可发布的删除，只明确结束这次清理的意图（不留下挡住对比的标记）。
+    pub fn commit_memory_clear(&self, ids: &[String], op: &str) -> Result<usize> {
         let config = self.config();
-        let committed =
-            local::commit_memory_clear(&self.inner.ctx, &config, self.inner.sessions_supported, ids)?;
+        let committed = local::commit_memory_clear(
+            &self.inner.ctx,
+            &config,
+            self.inner.sessions_supported,
+            ids,
+            op,
+        )?;
         self.notify(Trigger::LocalChange);
         Ok(committed)
     }
@@ -778,9 +786,10 @@ impl SyncEngine {
         local::attachments(&self.inner.ctx, channel, chat_id)
     }
 
-    /// 本机缓存的一份附件现在还是不是它登记的那个对象（明文摘要对得上对象名）。打开
-    /// 缓存副本的入口用它拦下被原地改写的文件：内容不符就不当「有」，用户重新下载会
-    /// 走缺附件的路径。验不了（没配对、读不出密钥、文件不在）时不算坏——那有别的说法。
+    /// 本机缓存的一份附件现在还是不是它登记的那个对象。打开缓存副本的入口用它拦下被
+    /// 原地改写的文件：内容不符就不当「有」，用户重新下载会走缺附件的路径。旧版本按
+    /// 明文摘要登记的内联缓存按本机文件内容归一（换成线上对象名），不判坏。验不了
+    /// （没配对、读不出密钥、没有登记）时不算坏——那有别的说法。
     pub fn cached_attachment_intact(&self, blob: &str) -> bool {
         let secrets = match Secrets::load(&self.inner.ctx.paths) {
             Ok(secrets) => secrets,
@@ -789,16 +798,10 @@ impl SyncEngine {
         let Ok(keys) = secrets.keys() else {
             return true;
         };
-        let rel = db::read(self.inner.ctx.db(), |conn| {
-            Ok(db::blob_get(conn, blob)?.filter(|row| row.state == BLOB_FETCHED).map(|row| row.rel_path))
-        });
-        let Ok(Some(rel)) = rel else {
-            return true;
-        };
-        match self.inner.ctx.env.checked_path(&rel) {
-            Ok(path) => crate::attach::hash_file(&keys, &path).is_some_and(|id| id == blob),
-            Err(_) => true,
-        }
+        matches!(
+            crate::attach::check_local_object(&self.inner.ctx, &keys, blob),
+            Ok(crate::attach::LocalObject::Intact(_)) | Ok(crate::attach::LocalObject::Unknown)
+        )
     }
 
     /// 用户点了一个还没下载的附件：排到下载队列的最前面。结果经

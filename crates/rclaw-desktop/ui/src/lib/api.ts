@@ -877,7 +877,12 @@ export interface SyncAttachment {
    *  设备要了，在等）、gone（保存着它的设备说拿不出来了）、lost（等了很久没有设备传
    *  上来）——后两种不再自动去取，点「重试」才再去看一次。 */
   state: string;
+  /** 本机上这个文件的绝对路径。只给需要经引擎核对登记的后端入口用；界面打开文件
+   *  要走 rel_path。 */
   local_path: string | null;
+  /** local 状态下的工作区相对路径（正斜杠）。open_media 只收这种路径；cached 的
+   *  副本在同步缓存里，只能经「存进工作区」取用。 */
+  rel_path: string | null;
   /** 产生这条消息的设备名；本机产生的为空。 */
   origin: string | null;
 }
@@ -958,6 +963,13 @@ export interface SyncScan {
   error: string | null;
   /** 照片没能删掉时的提醒。 */
   warning: string | null;
+}
+
+/** 开始一次拍照扫码：requestId 贯穿本轮的开始、轮询与取消。 */
+export interface SyncScanStart {
+  request_id: string;
+  /** ok / permission_requested。 */
+  status: string;
 }
 
 /** `sync` 事件：只是「该重新取数了」的提示，内容以重新查询为准。
@@ -1603,14 +1615,16 @@ export const api = {
   syncScanQrImage: (dataBase64: string) =>
     invoke<string>("sync_scan_qr_image", { dataBase64 }),
 
-  /** 拍照扫码（仅手机）：拉起系统相机。返回 ok / permission_requested；之后轮询
-   *  syncScanQrPoll。 */
-  syncScanQrStart: () => invoke<string>("sync_scan_qr_start"),
+  /** 拍照扫码（仅手机）：拉起系统相机。返回本轮的 requestId 与 ok / permission_requested；
+   *  之后带着 requestId 轮询 syncScanQrPoll。 */
+  syncScanQrStart: () => invoke<SyncScanStart>("sync_scan_qr_start"),
 
-  syncScanQrPoll: () => invoke<SyncScan>("sync_scan_qr_poll"),
+  syncScanQrPoll: (requestId: string) =>
+    invoke<SyncScan>("sync_scan_qr_poll", { requestId }),
 
-  /** 取消扫码：已经拍下的照片删掉。 */
-  syncScanQrCancel: () => invoke<void>("sync_scan_qr_cancel"),
+  /** 取消扫码：只删本轮 requestId 的标记、照片与结果。 */
+  syncScanQrCancel: (requestId: string) =>
+    invoke<void>("sync_scan_qr_cancel", { requestId }),
 
   /** 同步事件（状态变了 / 会话被同步改了 / 附件取回了 / 某类数据要重新加载）。 */
   onSync: (cb: (payload: SyncEvent) => void): Promise<UnlistenFn> =>

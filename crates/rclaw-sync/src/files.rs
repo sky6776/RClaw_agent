@@ -556,6 +556,10 @@ pub fn decide(
     if memory::decide_wipe(ctx, id, action, reviewed)? {
         return Ok(None);
     }
+    // 「上一次清空没有完成」也是现算的：只有明确的撤销能结束那次清理。
+    if memory::decide_clearing(ctx, id, action, reviewed)? {
+        return Ok(None);
+    }
     let item = status::get(&ctx.paths, id)
         .ok_or_else(|| SyncError::invalid("这条待处理事项已经不在了"))?;
     if !item.actions.iter().any(|allowed| allowed == action) {

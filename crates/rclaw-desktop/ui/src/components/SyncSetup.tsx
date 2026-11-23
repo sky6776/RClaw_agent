@@ -42,18 +42,21 @@ const TAB_OFF =
 let scanEpoch = 0;
 let scanInFlight: Promise<SyncScan> | null = null;
 let scanParked: SyncScan | null = null;
+/** 本轮扫码的 requestId：开始、轮询、取消都带它，旧一轮的结果不会被新一轮认领。 */
+let scanRequestId: string | null = null;
 
 /** 开始或取消一次扫码：此前在途的轮询、记着的结果都作废。 */
 function resetScan() {
   scanEpoch += 1;
   scanInFlight = null;
   scanParked = null;
+  scanRequestId = null;
 }
 
-function pollScan(): Promise<SyncScan> {
+function pollScan(requestId: string): Promise<SyncScan> {
   if (scanInFlight) return scanInFlight;
   const epoch = scanEpoch;
-  const flight: Promise<SyncScan> = api.syncScanQrPoll().then(
+  const flight: Promise<SyncScan> = api.syncScanQrPoll(requestId).then(
     (result) => {
       if (scanInFlight === flight) scanInFlight = null;
       if (epoch === scanEpoch && (result.state === "done" || result.state === "failed")) {
@@ -174,6 +177,9 @@ export default function SyncSetup({
     } else if (result.state === "failed") {
       setScanNote(result.warning);
       setError(result.error || "没有识别出配对码");
+    } else if (result.state === "cancelled") {
+      // 用户自己点「取消」时提示已经被清掉、轮次也作废了；能走到这里的多半是相机权限被拒。
+      setScanNote("这次扫码已取消。如果是相机权限被拒绝，请允许后重新扫码。");
     }
   }, []);
 
@@ -185,9 +191,11 @@ export default function SyncSetup({
       return;
     }
     if (!android) return;
+    const requestId = scanRequestId;
+    if (!requestId) return;
     let stopped = false;
     const epoch = scanEpoch;
-    pollScan().then(
+    pollScan(requestId).then(
       (result) => {
         if (stopped || epoch !== scanEpoch) return;
         applyScan(takeParkedScan() || result);
@@ -201,6 +209,8 @@ export default function SyncSetup({
 
   useEffect(() => {
     if (!scanning) return;
+    const requestId = scanRequestId;
+    if (!requestId) return;
     let stopped = false;
     let timer = 0;
     const epoch = scanEpoch;
@@ -210,10 +220,10 @@ export default function SyncSetup({
         resetScan();
         setScanning(false);
         setScanNote("等了很久相机也没有返回，这次扫码已经取消。");
-        api.syncScanQrCancel().catch(() => {});
+        api.syncScanQrCancel(requestId).catch(() => {});
         return;
       }
-      pollScan().then(
+      pollScan(requestId).then(
         (polled) => {
           if (stopped || epoch !== scanEpoch) return;
           const result = takeParkedScan() || polled;
@@ -247,8 +257,9 @@ export default function SyncSetup({
     resetScan();
     try {
       const started = await api.syncScanQrStart();
+      scanRequestId = started.request_id;
       setScanNote(
-        started === "permission_requested"
+        started.status === "permission_requested"
           ? "请先允许 RClaw 使用相机，同意之后相机会自动打开。没有同意的话，点「取消」。"
           : "用相机对准另一台设备上的二维码，拍一张照片。",
       );
@@ -261,11 +272,13 @@ export default function SyncSetup({
   };
 
   const cancelScan = async () => {
+    const requestId = scanRequestId;
     resetScan();
     setScanning(false);
     setScanNote(null);
+    if (!requestId) return;
     try {
-      await api.syncScanQrCancel();
+      await api.syncScanQrCancel(requestId);
     } catch (e) {
       setError(String(e));
     }

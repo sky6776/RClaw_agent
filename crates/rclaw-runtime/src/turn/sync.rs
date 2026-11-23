@@ -102,13 +102,15 @@ pub trait SyncControl: Send + Sync {
     fn delete_published_sessions(&self) -> Result<usize, String>;
 
     /// `/clear confirm all` 的记忆部分前一步：把本机 `MEMORY.md` 现有的条目留一份副本，
-    /// 返回它们的标识。**没有任何可发布的副作用**；删除的登记由调用方在本地清空成功后
+    /// 并登记「正在清理」的意图，返回条目标识与这次登记的操作标识（提交时要带上它）。
+    /// **没有任何可发布的副作用**，意图先耐久落库；删除的登记由调用方在本地清空成功后
     /// 经 [`SyncControl::commit_memory_clear`] 提交。**阻塞**。
-    fn stash_memory_for_clear(&self) -> Result<Vec<String>, String>;
+    fn stash_memory_for_clear(&self) -> Result<(Vec<String>, String), String>;
 
     /// `/clear confirm all` 的记忆部分后一步：本地清空已成功，把清空登记成发给所有设备
-    /// 的删除。`ids` 是 [`SyncControl::stash_memory_for_clear`] 返回的那些。**阻塞**。
-    fn commit_memory_clear(&self, ids: &[String]) -> Result<usize, String>;
+    /// 的删除。`ids` / `op` 是 [`SyncControl::stash_memory_for_clear`] 返回的那些。
+    /// 记忆范围关着时没有可发布的删除，只结束这次清理的意图。**阻塞**。
+    fn commit_memory_clear(&self, ids: &[String], op: &str) -> Result<usize, String>;
 
     /// 本机数据变了，尽快发布：`turn_ended` 为真是一个 turn 刚结束（它写下的消息可以发了），
     /// 为假是别的改动（清空等）。不能阻塞。
@@ -470,13 +472,13 @@ impl TurnManager {
 
     /// `/clear confirm local|all` 在清空本机之前要做的同步侧动作（§7.5）。调用方持静默门，
     /// 并且已经先过了本地安全预检（记忆目录安全闸）。成功返回附在清空摘要后面的一段说明
-    /// 和「记忆清空待提交」的条目标识（`all` 才有）；失败返回给用户的整条回复，调用方
-    /// 不再清空。
+    /// 和记忆清空意图（`all` 才有：条目标识与这次登记的操作标识）；失败返回给用户的整条
+    /// 回复，调用方不再清空。
     pub(super) async fn prepare_clear(
         &self,
         sync: Arc<dyn SyncControl>,
         scope: ClearScope,
-    ) -> Result<(String, Vec<String>), String> {
+    ) -> Result<(String, Option<(Vec<String>, String)>), String> {
         match scope {
             ClearScope::Local => {
                 // 同步引擎在两轮同步之间才办这件事。一轮跑得久（首次同步、网络卡住）时，
@@ -501,7 +503,7 @@ impl TurnManager {
                 Ok((
                     "\n\n多端同步：这台设备已退出同步空间；其他设备上的会话与记忆没有动。"
                         .to_string(),
-                    Vec::new(),
+                    None,
                 ))
             }
             ClearScope::All => {
@@ -516,8 +518,10 @@ impl TurnManager {
                              /clear confirm all"
                         )
                     })?;
-                // 记忆的条目先留副本（还没有任何可发布的副作用）；本地清空成功后才提交。
-                let ids = {
+                // 记忆的条目先留副本并登记清理意图（意图耐久落库之后调用方才删本机文件；
+                // 还没有任何可发布的副作用）。本地清空成功后才提交，提交时复核这次登记的
+                // 操作标识。
+                let intent = {
                     tokio::task::spawn_blocking(move || sync.stash_memory_for_clear())
                         .await
                         .map_err(|error| format!("⚠️ 清空任务执行异常: {error}"))?
@@ -538,7 +542,7 @@ impl TurnManager {
                          /clear confirm all；要让它们从同步空间里也消失，各端清空之后在多端同步的\
                          设置里重置同步空间。"
                     ),
-                    ids,
+                    Some(intent),
                 ))
             }
         }

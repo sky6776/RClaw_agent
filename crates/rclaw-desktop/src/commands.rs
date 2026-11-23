@@ -7049,7 +7049,8 @@ pub async fn capture_start(state: State<'_, AppState>, kind: String) -> Result<S
     #[cfg(target_os = "android")]
     {
         // "ok" / "permission_requested"（授权后自动续跑）/ "error:<原因>"。
-        let status = rclaw_android::capture(&kind).map_err(|e| format!("无法启动相机: {e}"))?;
+        // 会话拍照/录视频没有扫码那样的请求标识，传空串。
+        let status = rclaw_android::capture(&kind, "").map_err(|e| format!("无法启动相机: {e}"))?;
         if let Some(reason) = status.strip_prefix("error:") {
             return Err(format!("相机不可用: {reason}"));
         }

@@ -799,6 +799,47 @@ fn sync_target(layout: &Layout, rel: &str) -> Result<PathBuf> {
         .ok_or_else(|| StoreError::InvalidPath(format!("不是可同步的人格文件: {rel}")))
 }
 
+/// 一个同步路径在本机实际落到哪个文件（相对路径，名字用盘上的写法）。
+///
+/// 远端给的名字是别的设备上的写法：只差大小写（或 Unicode 规范化形式）的本机文件，在
+/// Windows、macOS 的默认卷上就是同一个文件——`notes.md` 写下去命中的是已有的 `Notes.md`。
+/// 调用方若按原字符串判断「本机有没有」，会把有原件的文件看成没有，接受远端版本时就
+/// 静默覆盖了本机的内容。冲突判断、备份、写入、删除都要按这里返回的文件来。
+///
+/// 盘上没有这个文件时原样返回：区分大小写的文件系统上 `notes.md` 和 `Notes.md` 是两个
+/// 文件，不能凭空建立对应关系。符号链接解析到人格库之外的也不算。
+pub fn sync_local_rel(layout: &Layout, rel: &str) -> String {
+    if rel == SYNC_ACTIVE_PATH {
+        return rel.to_string();
+    }
+    let Some(name) = sync_library_name(rel) else {
+        return rel.to_string();
+    };
+    let dir = souls_dir(layout);
+    // 打开一次，让文件系统自己定案：不分大小写的卷上它会把 `notes.md` 解析到已有的
+    // `Notes.md`，`canonicalize` 返回的路径用的就是盘上的写法。
+    let Ok(target) = std::fs::canonicalize(dir.join(&name)) else {
+        return rel.to_string();
+    };
+    let Some(actual) = target.file_name().and_then(|name| name.to_str()) else {
+        return rel.to_string();
+    };
+    if actual == name {
+        return rel.to_string();
+    }
+    // 只认人格库里真实存在的一级文件：解析到库外（符号链接）的不算。
+    let in_dir = std::fs::read_dir(&dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_str() == Some(actual))
+    });
+    if in_dir {
+        format!("{SYNC_LIBRARY_PREFIX}{actual}")
+    } else {
+        rel.to_string()
+    }
+}
+
 /// 读一个参与同步的人格文件。符号链接、通不过内容校验的文件都当作没有。
 fn sync_read_path(path: &Path) -> Option<String> {
     let meta = std::fs::symlink_metadata(path).ok()?;

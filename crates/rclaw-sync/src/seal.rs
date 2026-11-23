@@ -228,10 +228,14 @@ fn in_scope(
             };
             match map::thread_sessions(conn, sid)?.first() {
                 Some(session) => Ok(in_range(range, &session.channel)),
-                // 这个线程还没有落到本机（比如 `session.open` 还排在前面）：会话同步整个
-                // 关着时不放行——关掉会话同步就是不再发会话内容；开着时让它过（查不到
-                // 通道多半是历史重放，合入那边本来也只会把它排回队列）。
-                None => Ok(range.as_ref().is_none_or(|range| range.sessions)),
+                // 这个线程还没有落到本机（比如 `session.open` 还排在前面）：先查它已经
+                // 登记的开头信息（别的设备发布过、本机导入过），按那里的通道裁剪。查不到
+                // 时，会话同步整个关着就不放行——关掉会话同步就是不再发会话内容；开着
+                // 时让它过（查不到通道多半是历史重放，合入那边本来也只会把它排回队列）。
+                None => match map::open_info(conn, sid)? {
+                    Some(info) => Ok(in_range(range, &info.channel)),
+                    None => Ok(range.as_ref().is_none_or(|range| range.sessions)),
+                },
             }
         }
         "mem.add" | "mem.del" | "daily.append" => {
@@ -240,9 +244,11 @@ fn in_scope(
         "file.put" | "file.del" => file(range.as_ref().is_none_or(|range| range.persona)),
         "skill.put" | "skill.del" => file(range.as_ref().is_none_or(|range| range.skills)),
         "bot.put" | "bot.del" => file(range.as_ref().is_none_or(|range| range.bots)),
-        // 定时任务的定义同步按任务范围算；交接（接管请求、回执、落定）是维护操作，
-        // 落进默认放行。
-        "cron.put" | "cron.del" => file(range.as_ref().is_none_or(|range| range.cron)),
+        // 定时任务的定义同步按任务范围算；撤回（`cron.del`）不在范围之内——范围关了
+        // 也要能把远端镜像撤回，否则别的设备还会显示、甚至尝试接管这个任务。交接
+        // （接管请求、回执、落定）同样是维护操作，落进默认放行。
+        "cron.put" => file(range.as_ref().is_none_or(|range| range.cron)),
+        "cron.del" => Ok(true),
         _ => Ok(true),
     }
 }
@@ -372,10 +378,14 @@ fn prepare(ctx: &Ctx, opts: &SealOptions<'_>, pending: Vec<Pending>) -> Result<V
                 }
             }
             Body::Row { sid, mut row } => {
+                // 已有的索引可能在 fill_artifacts 里被补上或归一（旧版明文摘要登记换成
+                // 线上对象名）：记下改没改，改了要和这一条消息一起写回。
+                let before_refs = row.stored.clone();
                 let mut blobs = wire::fill_artifacts(&ctx.env, &mut row, policy);
                 let mut new_refs = None;
                 let mut stored = row.stored.clone().unwrap_or_default();
-                let mut changed = row.stored.is_none();
+                let mut changed =
+                    row.stored.is_none() || row.stored.as_ref() != before_refs.as_ref();
                 if row.stored.is_none() {
                     let found = attach::extract_refs(
                         &ctx.env,

@@ -28,19 +28,28 @@ object CaptureBridge {
     private const val REQ_MIC = 2003
     private const val REQ_WRITE = 2004
     private const val REQ_CAMERA = 2005
-    private const val REQ_SCAN = 2006
+    /** 扫码相机每次拉起用不同的 requestCode（间隔一段区间，避开上面几个）：旧请求迟到的
+     *  回调据此认出自己的 requestId，不会冒充新一轮。 */
+    private const val REQ_SCAN_BASE = 2100
+    private const val REQ_SCAN_SPAN = 900
 
     /** MainActivity 生命周期持有；系统相机/麦克风授权都需要 Activity。 */
     @JvmStatic var activity: Activity? = null
 
     private var pendingPhotoFile: File? = null
-    /** 上一次为扫码拉起相机的时刻（elapsedRealtime 毫秒），只用来挡连点。 */
+    /** 为哪一轮、什么时候拉起过扫码相机（elapsedRealtime 毫秒），只用来挡同一轮的连点。 */
+    private var scanLaunchedFor: String? = null
     private var scanLaunchedAt = -10_000L
     private var recorder: MediaRecorder? = null
     private var recordFile: File? = null
     private var startRecordWhenGranted = false
-    /** 相机权限授权后自动续跑的采集类型（photo|video），null = 无待续跑。 */
+    /** 相机权限授权后自动续跑的采集类型（photo|video|scan），null = 无待续跑。 */
     private var pendingCaptureKind: String? = null
+    /** 正在等相机权限的扫码请求；取消后标记会被删掉或换成下一轮，授权回调据此作废。 */
+    private var pendingScanRequestId: String? = null
+    /** 已拉起相机的 requestCode → requestId：相机回来时认出是哪一轮，旧回调不冒充新请求。 */
+    private val scanLaunches = HashMap<Int, String>()
+    private var nextScanCode = REQ_SCAN_BASE
 
     // ------------------------------------------------------------------
     // 拍照 / 拍视频
@@ -57,6 +66,7 @@ object CaptureBridge {
         if (ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
             pendingCaptureKind = "photo"
+            pendingScanRequestId = null
             ActivityCompat.requestPermissions(
                 activity, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
             return "permission_requested"
@@ -78,34 +88,67 @@ object CaptureBridge {
         }
     }
 
-    /** 扫配对码时拍下的照片。它等同于配对码本身，所以不进工作区：固定落在
-     *  files/sync/scan/qr.jpg（同步目录是助手文件工具的禁区，文件面板也看不到）。
-     *  位置固定，Rust 侧随时可以无条件删掉它，不依赖本进程记住的任何状态——拍照期间
-     *  进程被系统回收、结果文件没写成，都不会留下一张没人管的照片。 */
-    private fun scanFile(activity: Activity): File {
+    /** 扫配对码时拍下的照片。它等同于配对码本身，所以不进工作区：落在
+     *  files/sync/scan/qr-<requestId>.jpg（同步目录是助手文件工具的禁区，文件面板也看不
+     *  到）。文件名带本轮的请求标识：旧请求迟到的回调只会删自己那张，不会碰新一轮。 */
+    private fun scanFile(activity: Activity, requestId: String): File {
         val dir = File(activity.filesDir, "sync/scan").apply { mkdirs() }
-        return File(dir, "qr.jpg")
+        return File(dir, "qr-$requestId.jpg")
     }
 
-    /** 起系统相机拍配对码的二维码（多端同步的「拍照扫码」）。返回约定同 capturePhoto。
-     *  结果写 capture_result.json：{"kind":"scan"} 或 {"kind":"scan","cancelled":true}。 */
-    @JvmStatic
-    @Synchronized
-    fun captureScan(): String {
-        val activity = activity ?: return "error:Activity 未就绪"
-        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA)
-                != PackageManager.PERMISSION_GRANTED) {
-            pendingCaptureKind = "scan"
-            ActivityCompat.requestPermissions(
-                activity, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
-            return "permission_requested"
+    /** 删掉扫码目录里的全部照片：认不出是哪一轮的迟到回调、旧版本固定名都走这里。 */
+    private fun removeAllScanPhotos(activity: Activity) {
+        val dir = File(activity.filesDir, "sync/scan")
+        dir.listFiles()?.forEach { if (it.isFile) it.delete() }
+    }
+
+    /** requestId 由 Rust 侧生成、会拼进文件名，只接受十六进制与 `-`。 */
+    private fun validScanRequestId(requestId: String): Boolean =
+        requestId.isNotEmpty() && requestId.length <= 64 &&
+            requestId.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' || it == '-' }
+
+    /** 标记文件里记的是不是这一轮：取消、新一轮扫码都会让它变得对不上。 */
+    private fun scanRequested(activity: Activity, requestId: String): Boolean {
+        val marker = File(activity.filesDir, "capture_scan.pending")
+        val raw = try {
+            marker.readText()
+        } catch (e: Exception) {
+            return false
         }
-        // 连点两下只起一次相机。按时间判断而不是记一个「进行中」的标志：相机没有把结果
-        // 送回来的时候（个别机型上会发生），标志会一直挂着，之后就再也扫不了了。
+        return raw.trim() == requestId
+    }
+
+    /** 标记还是这一轮时删掉它（结果写不成时用来交付终态）。 */
+    private fun removeScanMarkerIf(activity: Activity, requestId: String) {
+        if (!scanRequested(activity, requestId)) return
+        File(activity.filesDir, "capture_scan.pending").delete()
+    }
+
+    /** 每次拉起相机换一个 requestCode：相机回来时才能分清是哪一轮的。 */
+    private fun nextScanRequestCode(): Int {
+        repeat(REQ_SCAN_SPAN) {
+            val code = nextScanCode
+            nextScanCode =
+                if (code + 1 >= REQ_SCAN_BASE + REQ_SCAN_SPAN) REQ_SCAN_BASE else code + 1
+            if (!scanLaunches.containsKey(code)) return code
+        }
+        // 极不可能：相机一直没把结果送回来，区间里的 code 都占着。丢掉最老的一条。
+        scanLaunches.keys.firstOrNull()?.let { scanLaunches.remove(it) }
+        return nextScanRequestCode()
+    }
+
+    /** 真正拉起扫码相机。返回 "ok" / "error:<原因>"；标记已经不是这一轮时拒绝启动。 */
+    private fun launchScanLocked(activity: Activity, requestId: String): String {
+        // 连点两下只起一次相机。按「同一轮 + 时间」判断而不是记一个「进行中」的标志：相机
+        // 没有把结果送回来的时候（个别机型上会发生），标志会一直挂着，之后就再也扫不了了；
+        // 取消后马上重扫是新一轮，不能受上一轮的时间差影响。
         val now = android.os.SystemClock.elapsedRealtime()
-        if (now - scanLaunchedAt < 1500) return "ok"
+        if (requestId == scanLaunchedFor && now - scanLaunchedAt < 1500) return "ok"
+        // 取消之后（标记没了）或已经开始新一轮：迟到的授权 / 续跑不能再拉相机。
+        if (!scanRequested(activity, requestId)) return "error:扫码请求已失效"
+        val code = nextScanRequestCode()
         return try {
-            val file = scanFile(activity)
+            val file = scanFile(activity, requestId)
             file.delete()
             val uri = FileProvider.getUriForFile(
                 activity, activity.packageName + ".fileprovider", file)
@@ -113,13 +156,35 @@ object CaptureBridge {
                 .putExtra(MediaStore.EXTRA_OUTPUT, uri)
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
                           Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            activity.startActivityForResult(intent, REQ_SCAN)
+            scanLaunches[code] = requestId
+            activity.startActivityForResult(intent, code)
+            scanLaunchedFor = requestId
             scanLaunchedAt = now
             "ok"
         } catch (e: Exception) {
+            scanLaunches.remove(code)
             AppConfig.trace(activity, "capture-scan-error ${e.message}")
             "error:${e.message}"
         }
+    }
+
+    /** 起系统相机拍配对码的二维码（多端同步的「拍照扫码」）。requestId 是这一轮的标识，
+     *  Rust 侧生成并贯穿轮询/取消。返回约定同 capturePhoto。结果写 capture_result.json：
+     *  {"kind":"scan","request_id":...}，用户放弃时再带 "cancelled":true。 */
+    @JvmStatic
+    @Synchronized
+    fun captureScan(requestId: String): String {
+        val activity = activity ?: return "error:Activity 未就绪"
+        if (!validScanRequestId(requestId)) return "error:请求标识不合法"
+        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            pendingCaptureKind = "scan"
+            pendingScanRequestId = requestId
+            ActivityCompat.requestPermissions(
+                activity, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
+            return "permission_requested"
+        }
+        return launchScanLocked(activity, requestId)
     }
 
     /** 起系统相机录视频；结果经 data URI 流拷贝（EXTRA_OUTPUT 在部分 OEM 相机上不可靠）。
@@ -131,6 +196,7 @@ object CaptureBridge {
         if (ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
             pendingCaptureKind = "video"
+            pendingScanRequestId = null
             ActivityCompat.requestPermissions(
                 activity, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
             return "permission_requested"
@@ -164,18 +230,6 @@ object CaptureBridge {
                     finishCapture("photo", null)
                 }
             }
-            REQ_SCAN -> {
-                // 相机回来了：下一次扫码不用再等连点的间隔。
-                scanLaunchedAt = -10_000L
-                // 不依赖内存里的状态：拍照期间进程可能被回收过，照片的位置是固定的。
-                val file = scanFile(activity)
-                // 扫码已经被取消或收拾掉（标记没了）：没有人会来取这张照片，当场删掉。
-                val wanted = File(activity.filesDir, "capture_scan.pending").isFile
-                val taken = wanted && resultCode == Activity.RESULT_OK
-                    && file.isFile && file.length() > 0
-                if (!taken) file.delete()
-                if (wanted) finishScan(activity, taken)
-            }
             REQ_VIDEO -> {
                 if (resultCode == Activity.RESULT_OK) {
                     val uri: Uri? = data?.data
@@ -203,7 +257,34 @@ object CaptureBridge {
                     finishCapture("video", null)
                 }
             }
+            else -> {
+                // 扫码相机：按 requestCode 找回拉起时的 requestId，旧请求的回调不冒充新请求。
+                val requestId = scanLaunches.remove(requestCode)
+                if (requestId == null) {
+                    // 旧版本的固定 requestCode、或进程重建后才回来的回调：认不出是谁的，
+                    // 没有别的扫码在等结果时就把照片全删掉（等同于配对码，不能留）。
+                    if (scanLaunches.isEmpty()) removeAllScanPhotos(activity)
+                    return
+                }
+                onScanResult(activity, requestId, resultCode)
+            }
         }
+    }
+
+    /** 扫码相机回来了。标记已经被取消、或者换成了下一轮时，这声回调作废：照片当场删掉，
+     *  不写结果。 */
+    private fun onScanResult(activity: Activity, requestId: String, resultCode: Int) {
+        // 相机回来了：下一次扫码不用再等连点的间隔。
+        scanLaunchedFor = null
+        scanLaunchedAt = -10_000L
+        val file = scanFile(activity, requestId)
+        if (!scanRequested(activity, requestId)) {
+            file.delete()
+            return
+        }
+        val taken = resultCode == Activity.RESULT_OK && file.isFile && file.length() > 0
+        if (!taken) file.delete()
+        finishScan(activity, requestId, taken)
     }
 
     private fun captureFile(activity: Activity, prefix: String, ext: String): File {
@@ -222,15 +303,29 @@ object CaptureBridge {
         AppConfig.trace(activity, "capture-done kind=$kind file=${file?.name ?: "cancelled"}")
     }
 
-    /** 扫码的结果。照片在固定位置，结果里不带路径。结果写不成的话把照片删掉：没有结果，
-     *  就不会有人来取它。 */
-    private fun finishScan(activity: Activity, taken: Boolean) {
-        val json = if (taken) "{\"kind\":\"scan\"}" else "{\"kind\":\"scan\",\"cancelled\":true}"
+    /** 扫码的结果。照片按 requestId 分开存放，结果里不带路径、只带这一轮的标识。结果写不
+     *  成的话把照片删掉、标记清掉：没有结果，也不能让 Rust 一直等。 */
+    private fun finishScan(activity: Activity, requestId: String, taken: Boolean) {
+        // 写结果之前再认一次标记：取消可能刚好在这声回调进来之后发生。
+        if (!scanRequested(activity, requestId)) {
+            scanFile(activity, requestId).delete()
+            return
+        }
+        val cancelled = if (taken) "" else ",\"cancelled\":true"
+        val json = "{\"kind\":\"scan\",\"request_id\":\"$requestId\"$cancelled}"
         if (!writeCaptureResult(activity, json)) {
-            scanFile(activity).delete()
+            scanFile(activity, requestId).delete()
+            removeScanMarkerIf(activity, requestId)
             return
         }
         AppConfig.trace(activity, "capture-done kind=scan taken=$taken")
+    }
+
+    /** 用户拒绝相机权限：立刻清掉本轮的标记，Rust 轮询看到标记没了就交付「取消」终态，
+     *  不再一直等相机。不写共享的结果文件：新一轮可能已经开始，两边不能互相覆盖。 */
+    private fun finishScanDenied(activity: Activity, requestId: String) {
+        removeScanMarkerIf(activity, requestId)
+        AppConfig.trace(activity, "capture-done kind=scan denied")
     }
 
     /** 临时文件 + rename 原子提交：Rust 轮询消费端读到半截 JSON 会把文件
@@ -344,16 +439,26 @@ object CaptureBridge {
             } else {
                 startRecordWhenGranted = false
             }
-            REQ_CAMERA -> if (granted) {
+            REQ_CAMERA -> {
                 val kind = pendingCaptureKind
+                val scanId = pendingScanRequestId
                 pendingCaptureKind = null
+                pendingScanRequestId = null
+                val activity = activity ?: return
                 when (kind) {
-                    "photo" -> capturePhoto()
-                    "video" -> captureVideo()
-                    "scan" -> captureScan()
+                    "photo" -> if (granted) capturePhoto()
+                    "video" -> if (granted) captureVideo()
+                    "scan" -> if (scanId != null) {
+                        if (!granted) {
+                            // 用户拒绝：立刻交付终态，别让 Rust 一直等相机。
+                            finishScanDenied(activity, scanId)
+                        } else if (scanRequested(activity, scanId)) {
+                            // 标记还是这一轮才拉相机；取消之后标记已经没了、或者开始了
+                            // 新一轮的话，这声迟到的授权作废。
+                            launchScanLocked(activity, scanId)
+                        }
+                    }
                 }
-            } else {
-                pendingCaptureKind = null
             }
         }
     }

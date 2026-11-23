@@ -70,7 +70,10 @@ where
 
 pub use bundle::{export_session, import_session, ImportOptions, Imported};
 pub use config::{Scopes, SyncConfig, SyncPaths};
-pub use engine::{SyncDeps, SyncEngine};
+pub use engine::{
+    pairing_config, storage_intent_clear_if, storage_intent_config, storage_intent_save, SyncDeps,
+    SyncEngine,
+};
 pub use error::{Result, SyncError, TransportError};
 pub use pairing::PairingCode;
 pub use secrets::Secrets;
@@ -293,6 +296,8 @@ pub struct Ctx {
 pub struct SpaceEpoch {
     epoch: std::sync::atomic::AtomicU64,
     inflight: std::sync::atomic::AtomicUsize,
+    /// 正在最终写入段（改名、记账、销账）里的任务数，见 [`SpaceEpoch::enter`]。
+    writers: std::sync::atomic::AtomicUsize,
     /// 提交入口关着：换空间 / 清理期间不受理新的提交阶段。
     sealed: std::sync::atomic::AtomicBool,
 }
@@ -343,6 +348,49 @@ impl SpaceEpoch {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         true
+    }
+
+    /// 等已经进入最终写入段（改名、记账、销账）的任务退场。换代之前必须等它们：许可之内
+    /// 的写入不会被换代越过。
+    pub async fn wait_writers(&self, timeout: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
+        while self.writers.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        true
+    }
+
+    /// 进入最终写入段：与换代互斥。入口关着（或这期间关掉）时拿到的许可无效，调用方
+    /// 不能写。许可活着的整段时间里 `bump` 不会发生。
+    pub fn enter(&self) -> WritePermit<'_> {
+        self.writers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let open = !self.sealed.load(std::sync::atomic::Ordering::SeqCst);
+        WritePermit { space: self, open }
+    }
+}
+
+/// 一个最终写入段（见 [`SpaceEpoch::enter`]）。
+pub struct WritePermit<'a> {
+    space: &'a SpaceEpoch,
+    open: bool,
+}
+
+impl WritePermit<'_> {
+    /// 还能不能写：开始之后入口又被关上（换空间开始）时也不行。
+    pub fn ok(&self) -> bool {
+        self.open && !self.space.sealed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for WritePermit<'_> {
+    fn drop(&mut self) {
+        self.space
+            .writers
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

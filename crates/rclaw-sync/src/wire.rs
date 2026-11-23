@@ -8,13 +8,14 @@ use std::path::{Path, PathBuf};
 use rclaw_core::{ContentBlock, Message};
 use rclaw_store::session::artifact_chat_key;
 use rclaw_store::session::raw::{self, RawMessageRow};
-use rclaw_store::{Db, SessionStore};
-use rusqlite::Connection;
+use rclaw_store::{sync_db, Db, SessionStore};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{sha256_hex, sha256_reader, Keys};
-use crate::db::{self, BLOB_REMOTE};
+use crate::db::{self, BLOB_FETCHED, BLOB_REMOTE};
 use crate::error::{Result, SyncError};
+use crate::ids;
 use crate::map::{self, MsgMap, SessionMap};
 use crate::op::{Artifact, FileRef, WireMsg};
 use crate::portable::{self, LocalRoot};
@@ -245,6 +246,19 @@ fn local_meta_to_wire(
     Ok(None)
 }
 
+/// 本机已有内容的 artifact 对象（`sync_blob` 的登记）。
+#[derive(Debug, Clone)]
+pub struct StoredObject {
+    /// 消息里引用它的文件名。
+    pub name: String,
+    /// 登记的对象名（可能是旧版本按明文摘要登记的内联缓存）。
+    pub blob: String,
+    /// 登记的本机落点（相对 agent 根）。
+    pub rel_path: String,
+    /// 登记的长度。
+    pub size: u64,
+}
+
 /// 一行消息的线上形态（数据库阶段的产物）。artifact 全文还没读，见 [`fill_artifacts`]。
 #[derive(Debug, Clone)]
 pub struct RowWire {
@@ -256,6 +270,12 @@ pub struct RowWire {
     pub stored: Option<StoredRefs>,
     /// 全文不在本机的 artifact（来自别的设备，还没取回）：照原样转述，不读占位文件。
     pub absent: Vec<ArtifactRef>,
+    /// `refs` 里记着、本机已有内容的对象：按对象取，不按同名的落点猜。
+    pub stored_objects: Vec<StoredObject>,
+    /// 正文里引用、`refs` 里却没有记录的 artifact 在本机登记过的候选（`(文件名,
+    /// [(对象名, 长度)]`）。旧消息缺的索引：占位文件里写着原长度，长度对得上才算同一个
+    /// 对象；同名但内容不同的文件不能被当成它。
+    pub unindexed: Vec<(String, Vec<(String, u64)>)>,
 }
 
 /// 读出一行消息的线上形态。在调用方的事务（或读快照）里执行，不做文件 IO。
@@ -291,14 +311,40 @@ pub fn row_to_wire(
     let data = portable::to_portable(&data, &env.root, &prefix);
     let stored = StoredRefs::parse(mapped.refs.as_deref());
     let mut absent = Vec::new();
+    let mut stored_objects = Vec::new();
     if let Some(stored) = &stored {
         for artifact in &stored.artifacts {
-            let have = match &artifact.blob {
-                Some(blob) => db::blob_get(conn, blob)?.is_some_and(|row| row.state != BLOB_REMOTE),
-                None => false,
-            };
-            if !have {
-                absent.push(artifact.clone());
+            match &artifact.blob {
+                Some(blob) => match db::blob_get(conn, blob)? {
+                    Some(blob_row) if blob_row.state != BLOB_REMOTE => {
+                        stored_objects.push(StoredObject {
+                            name: artifact.name.clone(),
+                            blob: blob.clone(),
+                            rel_path: blob_row.rel_path,
+                            size: blob_row.size,
+                        });
+                    }
+                    _ => absent.push(artifact.clone()),
+                },
+                None => absent.push(artifact.clone()),
+            }
+        }
+    }
+    // 旧消息的 `refs` 可能是在 artifact 记录加进来之前写的：正文引用的文件名与按同一
+    // 落点登记的对象能对上的，留给 [`fill_artifacts`] 核对占位文件的长度后补上。
+    let mut unindexed = Vec::new();
+    if stored.is_some() {
+        let rel_dir = artifact_rel_dir(&session.channel, &session.chat_id);
+        for name in portable::artifact_names(&data) {
+            if stored
+                .as_ref()
+                .is_some_and(|stored| stored.artifacts.iter().any(|known| known.name == name))
+            {
+                continue;
+            }
+            let objects = db::blob_objects_at(conn, &format!("{rel_dir}{name}"))?;
+            if !objects.is_empty() {
+                unindexed.push((name, objects));
             }
         }
     }
@@ -322,6 +368,8 @@ pub fn row_to_wire(
         },
         stored,
         absent,
+        stored_objects,
+        unindexed,
     })
 }
 
@@ -358,6 +406,84 @@ pub struct LocalBlob {
     pub size: u64,
 }
 
+/// 内存里一段字节的 SHA-256 摘要。
+fn digest_of(bytes: &[u8]) -> [u8; 32] {
+    let mut reader = std::io::Cursor::new(bytes);
+    sha256_reader(&mut reader).expect("内存读端不会出错").0
+}
+
+/// 内联全文写进同步缓存、登记成本机对象时用的对象名。
+///
+/// 有空间密钥时就是线上对象名（内容摘要的带密钥摘要），打开、保存、重传、重新封装都按
+/// 普通附件对象处理。没有密钥（导入会话包时还没配对）只能按明文摘要登记：它只在本机
+/// 有意义，不参与线上引用；以后封段重新封装时按文件内容换成线上对象名。
+fn cached_text_id(keys: Option<&Keys>, text: &str) -> String {
+    match keys {
+        Some(keys) => keys.blob_id(&digest_of(text.as_bytes())),
+        None => sha256_hex(text.as_bytes()),
+    }
+}
+
+/// 登记的对象名是不是内容摘要的明文十六进制（旧版本内联缓存的登记方式）。
+fn is_plain_digest(digest: [u8; 32], blob: &str) -> bool {
+    ids::hex(&digest) == blob
+}
+
+/// 本机文件内容与登记的对象名做核对：`(线上对象名, 长度, 是否需要改登记)`。
+///
+/// 有密钥时按空间密钥算对象名；算出来与登记不符、但明文摘要与登记一致的是旧版本的内联
+/// 缓存——对象名要换成带密钥的那个。没有密钥（导出会话包）只能核对明文摘要；带密钥的
+/// 对象名验不了，照登记转述。
+fn object_identity(
+    keys: Option<&Keys>,
+    digest: [u8; 32],
+    len: u64,
+    registered: &str,
+) -> Option<(String, u64, bool)> {
+    match keys {
+        Some(keys) => {
+            let current = keys.blob_id(&digest);
+            if current == registered {
+                Some((current, len, false))
+            } else if is_plain_digest(digest, registered) {
+                Some((current, len, true))
+            } else {
+                None
+            }
+        }
+        // 没有密钥：明文摘要登记的内容核对得出来；带密钥的对象名验不了，按登记转述。
+        None => Some((registered.to_string(), len, false)),
+    }
+}
+
+/// 占位全文里写着的原长度。别的正文碰巧带这句话的，按完整格式再比一次。
+fn placeholder_size(text: &str) -> Option<u64> {
+    let rest = text.strip_prefix("（这段工具结果全文共 ")?;
+    let size: u64 = rest.split_once(" 字节，")?.0.parse().ok()?;
+    (text == placeholder_text(size)).then_some(size)
+}
+
+/// 登记过的对象用不了（不在本机、内容对不上）：照「还在别的设备上」转述，接收端以后
+/// 还能按对象名去取；这一次不拿同名的文件充数。
+fn as_absent(name: String, object: &StoredObject) -> Artifact {
+    Artifact {
+        name,
+        text: None,
+        size: object.size,
+        blob: Some(object.blob.clone()),
+    }
+}
+
+/// 旧登记归一成线上对象名之后，消息的附件清单跟着改：重新封装读到的就是同一个对象。
+fn update_stored_artifact(row: &mut RowWire, name: &str, blob: &str, size: u64) {
+    if let Some(stored) = &mut row.stored {
+        if let Some(known) = stored.artifacts.iter_mut().find(|known| known.name == name) {
+            known.blob = Some(blob.to_string());
+            known.size = size;
+        }
+    }
+}
+
 /// 把消息引用到的 artifact 全文读进来（文件 IO，不碰数据库）。返回需要登记的附件对象。
 pub fn fill_artifacts(env: &Env, row: &mut RowWire, policy: ArtifactPolicy<'_>) -> Vec<LocalBlob> {
     let mut blobs = Vec::new();
@@ -368,6 +494,103 @@ pub fn fill_artifacts(env: &Env, row: &mut RowWire, policy: ArtifactPolicy<'_>) 
         .into_iter()
         .take(256)
     {
+        // 这条消息登记过、本机已有内容的对象：按对象取。内联全文撞名时它就在同步缓存
+        // 里，artifact 目录里同名的那份是另一个对象，不能拿来充数。
+        if let Some(object) = row
+            .stored_objects
+            .iter()
+            .find(|object| object.name == name)
+            .cloned()
+        {
+            let path = env.checked_path(&object.rel_path);
+            let Ok(path) = path else {
+                row.msg.artifacts.push(as_absent(name, &object));
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(&path) else {
+                row.msg.artifacts.push(as_absent(name, &object));
+                continue;
+            };
+            if !meta.is_file() {
+                row.msg.artifacts.push(as_absent(name, &object));
+                continue;
+            }
+            if meta.len() <= policy.inline_max as u64 {
+                let Ok(bytes) = std::fs::read(&path) else {
+                    row.msg.artifacts.push(as_absent(name, &object));
+                    continue;
+                };
+                let Some((blob, len, legacy)) = object_identity(
+                    policy.keys,
+                    digest_of(&bytes),
+                    bytes.len() as u64,
+                    &object.blob,
+                ) else {
+                    row.msg.artifacts.push(as_absent(name, &object));
+                    continue;
+                };
+                let Ok(text) = String::from_utf8(bytes) else {
+                    row.msg.artifacts.push(as_absent(name, &object));
+                    continue;
+                };
+                if (len as usize) <= policy.message_max.saturating_sub(inlined) {
+                    inlined += text.len();
+                    row.msg.artifacts.push(Artifact {
+                        name,
+                        size: len,
+                        text: Some(text),
+                        blob: None,
+                    });
+                } else {
+                    // 内联额度用完了：仍按对象转述，接收端以后取。这些对象来自内联正文的
+                    // 本机缓存、从来没有上传过，必须一并排进上传队列（附件范围关着时由
+                    // 调用方登记成 HELD）；旧登记还要把消息清单改成新的对象名。
+                    row.msg.artifacts.push(Artifact {
+                        name,
+                        size: len,
+                        text: None,
+                        blob: Some(blob.clone()),
+                    });
+                    if legacy {
+                        update_stored_artifact(row, &object.name, &blob, len);
+                    }
+                    blobs.push(LocalBlob {
+                        blob_id: blob,
+                        rel_path: object.rel_path.clone(),
+                        size: len,
+                    });
+                }
+                continue;
+            }
+            let Ok(mut file) = std::fs::File::open(&path) else {
+                row.msg.artifacts.push(as_absent(name, &object));
+                continue;
+            };
+            let Ok((digest, len)) = sha256_reader(&mut file) else {
+                row.msg.artifacts.push(as_absent(name, &object));
+                continue;
+            };
+            let Some((blob, len, legacy)) = object_identity(policy.keys, digest, len, &object.blob)
+            else {
+                row.msg.artifacts.push(as_absent(name, &object));
+                continue;
+            };
+            row.msg.artifacts.push(Artifact {
+                name,
+                size: len,
+                text: None,
+                blob: Some(blob.clone()),
+            });
+            if legacy {
+                update_stored_artifact(row, &object.name, &blob, len);
+                blobs.push(LocalBlob {
+                    blob_id: blob,
+                    rel_path: object.rel_path.clone(),
+                    size: len,
+                });
+            }
+            continue;
+        }
         if let Some(absent) = row.absent.iter().find(|artifact| artifact.name == name) {
             row.msg.artifacts.push(Artifact {
                 name,
@@ -388,6 +611,47 @@ pub fn fill_artifacts(env: &Env, row: &mut RowWire, policy: ArtifactPolicy<'_>) 
             continue;
         }
         let size = meta.len();
+        // 旧消息的索引缺了这一条：占位文件里写着原长度，与本机按同一落点登记的对象
+        // 长度对得上才算同一个对象；对不上的也不把占位正文当成工具结果发出去。
+        if size <= 1024 {
+            if let Some(placeholder) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| placeholder_size(&text))
+            {
+                if let Some((_, objects)) = row
+                    .unindexed
+                    .iter()
+                    .find(|(candidate, _)| candidate == &name)
+                {
+                    if let Some(blob) = recovered_blob(objects, placeholder) {
+                        let artifact = ArtifactRef {
+                            name: name.clone(),
+                            size: placeholder,
+                            blob: Some(blob.clone()),
+                        };
+                        if let Some(stored) = &mut row.stored {
+                            if !stored.artifacts.iter().any(|known| known.name == name) {
+                                stored.artifacts.push(artifact);
+                            }
+                        }
+                        row.msg.artifacts.push(Artifact {
+                            name,
+                            text: None,
+                            size: placeholder,
+                            blob: Some(blob),
+                        });
+                        continue;
+                    }
+                }
+                row.msg.artifacts.push(Artifact {
+                    name,
+                    text: None,
+                    size: placeholder,
+                    blob: None,
+                });
+                continue;
+            }
+        }
         let fits = size <= policy.inline_max as u64
             && (size as usize) <= policy.message_max.saturating_sub(inlined);
         if fits {
@@ -519,12 +783,22 @@ pub struct Landing<'a> {
 
 /// 把消息内联的 artifact 全文写进会话的 artifact 目录；没有内联的全文先放一个占位文件
 /// （本机已有或以后取回时由 [`settle_aliases`] 换成全文）。内联全文撞上同名不同内容的
-/// 文件时不覆盖，改放进按摘要命名的同步缓存——[`land_msg`] 会把它登记成附件，附件区
+/// 文件时不覆盖，改放进按对象名命名的同步缓存——[`land_msg`] 会把它登记成附件，附件区
 /// 按对象列出来。
+///
+/// `keys` 是空间密钥：有它时缓存按线上对象名（内容摘要的带密钥摘要）登记，之后打开、
+/// 保存、重传、重新封装都走普通附件那条路；没有它（导入会话包时还没配对）只能按明文
+/// 摘要登记成仅本机的缓存，重新发布时再归一。
 ///
 /// 只做文件 IO，不碰数据库。调用方在开事务**之前**做完：事务里不做磁盘写入（库锁是
 /// 会话读写共用的），而且提交之后消息里的句柄一定指向存在的文件。重复执行结果相同。
-pub fn write_artifacts(env: &Env, channel: &str, chat_id: &str, msg: &WireMsg) -> Result<()> {
+pub fn write_artifacts(
+    env: &Env,
+    channel: &str,
+    chat_id: &str,
+    msg: &WireMsg,
+    keys: Option<&Keys>,
+) -> Result<()> {
     if msg.artifacts.is_empty() {
         return Ok(());
     }
@@ -536,14 +810,14 @@ pub fn write_artifacts(env: &Env, channel: &str, chat_id: &str, msg: &WireMsg) -
         match &artifact.text {
             Some(text) => {
                 // 落点冲突策略与取回下载一致（§8.7）：原位置已有内容不同的真实文件就
-                // 不覆盖，全文放进按摘要命名的同步缓存，会话顶部的附件区列着它。
+                // 不覆盖，全文放进按对象名命名的同步缓存，会话顶部的附件区列着它。
                 let same = path.is_file()
                     && std::fs::read(&path)
                         .map(|bytes| bytes == text.as_bytes())
                         .unwrap_or(false);
                 if path.exists() && !same {
-                    let digest = sha256_hex(text.as_bytes());
-                    let rel = cache_path(&format!("{rel_dir}{}", artifact.name), &digest);
+                    let blob = cached_text_id(keys, text);
+                    let rel = cache_path(&format!("{rel_dir}{}", artifact.name), &blob);
                     let full = env.checked_path(&rel)?;
                     if let Some(parent) = full.parent() {
                         std::fs::create_dir_all(parent)?;
@@ -567,7 +841,16 @@ pub fn write_artifacts(env: &Env, channel: &str, chat_id: &str, msg: &WireMsg) -
 /// 把一条（已通过检查的）线上消息追加到本地会话末尾：消息行、工具元数据、映射、附件
 /// 登记，并把分支末条推进到这条消息。在调用方的事务里执行，不做文件写入——artifact
 /// 全文由调用方事先用 [`write_artifacts`] 写好，要复制的附件提交后由 [`settle_aliases`] 补。
-pub fn land_msg(conn: &Connection, env: &Env, landing: Landing<'_>, msg: &WireMsg) -> Result<i64> {
+///
+/// `keys` 与 [`write_artifacts`] 传的是同一把：内联全文撞名落进同步缓存时，两边算出的
+/// 必须是同一个对象名。
+pub fn land_msg(
+    conn: &Connection,
+    env: &Env,
+    landing: Landing<'_>,
+    msg: &WireMsg,
+    keys: Option<&Keys>,
+) -> Result<i64> {
     let prefix = env
         .sessions
         .artifacts_dir_prefix(landing.channel, landing.chat_id);
@@ -598,18 +881,20 @@ pub fn land_msg(conn: &Connection, env: &Env, landing: Landing<'_>, msg: &WireMs
     let rel_dir = artifact_rel_dir(landing.channel, landing.chat_id);
     for artifact in &msg.artifacts {
         if let Some(text) = &artifact.text {
-            // 内联全文撞了名、被 [`write_artifacts`] 放进按摘要命名的同步缓存的：登记成
-            // 本机的缓存附件（对象名就是内容摘要，本机就有），附件区按对象列出来。没撞
-            // 名的全文在 artifact 目录里，消息自己就能打开，不进附件清单。缓存文件在不
-            // 在与 `write_artifacts` 的落点决定是同一个判据，重复执行结果相同。
-            let digest = sha256_hex(text.as_bytes());
-            let rel = cache_path(&format!("{rel_dir}{}", artifact.name), &digest);
+            // 内联全文撞了名、被 [`write_artifacts`] 放进按对象名命名的同步缓存的：登记成
+            // 本机的缓存附件（本机就有这份内容），附件区按对象列出来。没撞名的全文在
+            // artifact 目录里，消息自己就能打开，不进附件清单。缓存文件在不在与
+            // `write_artifacts` 的落点决定是同一个判据，重复执行结果相同。
+            let blob = cached_text_id(keys, text);
+            let rel = cache_path(&format!("{rel_dir}{}", artifact.name), &blob);
             if env.resolve(&rel).is_file() {
-                db::blob_register(conn, &digest, &rel, artifact.size, BLOB_FETCHED)?;
+                // 登记的长度取真正写下的字节数：对象名和长度出自同一份内容。
+                let size = text.len() as u64;
+                db::blob_register(conn, &blob, &rel, size, BLOB_FETCHED)?;
                 stored.artifacts.push(ArtifactRef {
                     name: artifact.name.clone(),
-                    size: artifact.size,
-                    blob: Some(digest),
+                    size,
+                    blob: Some(blob),
                 });
             }
             continue;
@@ -644,6 +929,156 @@ pub fn land_msg(conn: &Connection, env: &Env, landing: Landing<'_>, msg: &WireMs
     map::set_tip(conn, landing.session_id, Some(&msg.gid))?;
     Ok(message_id)
 }
+
+/// 占位文件能和哪个登记对上：只认长度唯一的那个；同一长度对上几个不同的对象就不猜。
+fn recovered_blob(objects: &[(String, u64)], size: u64) -> Option<String> {
+    let mut found: Option<&str> = None;
+    for (blob, object_size) in objects {
+        if *object_size != size {
+            continue;
+        }
+        match found {
+            Some(known) if known != blob => return None,
+            Some(_) => {}
+            None => found = Some(blob),
+        }
+    }
+    found.map(str::to_string)
+}
+
+/// 已封段的历史行：`refs` 里缺的 artifact 记录补上（旧版本先有文件引用、后来才加
+/// artifact 记录；那些行不会再进封段队列，只能在这里补）。每个会话清点一次。
+///
+/// 只补能准确重建的：落点上的占位文件写着原长度，本机 `sync_blob` 里按同一个落点登记的
+/// 对象长度与它唯一对上，才认成同一个对象。对不上的不猜——同名但内容不同的文件不能当成
+/// 它。返回补上的条数。
+pub fn backfill_artifact_refs(env: &Env, channel: &str, chat_id: &str) -> Result<usize> {
+    let rel_dir = artifact_rel_dir(channel, chat_id);
+    let prefix = env.sessions.artifacts_dir_prefix(channel, chat_id);
+    let (session_id, candidates) = db::read(env.db(), |conn| {
+        if !sync_db::sync_tables_exist(conn)? {
+            return Ok((None, Vec::new()));
+        }
+        let Some(session_id) = raw::find_session(conn, channel, chat_id)? else {
+            return Ok((None, Vec::new()));
+        };
+        // 清点过的会话不再扫第二遍：这次补的是已封段的历史行，以后封段的行自带索引。
+        if db::state_get(conn, SCOPE_REFS_INDEX, &session_id.to_string())?.is_some() {
+            return Ok((None, Vec::new()));
+        }
+        let mut stmt = conn.prepare_cached(
+            "SELECT message_id, data, refs FROM sync_msg WHERE session_id = ?1 AND sealed = ?2 \
+             AND refs IS NOT NULL ORDER BY message_id",
+        )?;
+        let rows = stmt.query_map(params![session_id, sync_db::SEAL_SEALED], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (message_id, data, column) = row?;
+            let Some(refs) = StoredRefs::parse(Some(&column)) else {
+                continue;
+            };
+            let portable = portable::to_portable(&data, &env.root, &prefix);
+            for name in portable::artifact_names(&portable) {
+                if refs.artifacts.iter().any(|known| known.name == name) {
+                    continue;
+                }
+                let objects = db::blob_objects_at(conn, &format!("{rel_dir}{name}"))?;
+                if !objects.is_empty() {
+                    out.push((message_id, name, objects));
+                }
+            }
+        }
+        Ok((Some(session_id), out))
+    })?;
+    let Some(session_id) = session_id else {
+        return Ok(0);
+    };
+    // 文件 IO 在库锁之外。占位文件很短；读不出来（不是「文件不在」）就留着下次再扫。
+    let mut updates: Vec<(i64, ArtifactRef)> = Vec::new();
+    let mut retry = false;
+    for (message_id, name, objects) in candidates {
+        let path = env.checked_path(&format!("{rel_dir}{name}"));
+        let Ok(path) = path else {
+            continue;
+        };
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !meta.is_file() || meta.len() > 1024 {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                retry |= e.kind() != std::io::ErrorKind::NotFound;
+                continue;
+            }
+        };
+        let Some(size) = placeholder_size(&text) else {
+            continue;
+        };
+        if let Some(blob) = recovered_blob(&objects, size) {
+            updates.push((
+                message_id,
+                ArtifactRef {
+                    name,
+                    size,
+                    blob: Some(blob),
+                },
+            ));
+        }
+    }
+    db::write(env.db(), |tx| {
+        let mut written = 0usize;
+        for (message_id, artifact) in &updates {
+            // 清单可能在这期间被清掉（会话被删、换空间）：留着下一个事务重新看一眼。
+            let Ok(column) = tx.query_row(
+                "SELECT refs FROM sync_msg WHERE message_id = ?1",
+                params![message_id],
+                |row| row.get::<_, Option<String>>(0),
+            ) else {
+                continue;
+            };
+            let Some(mut stored) = StoredRefs::parse(column.as_deref()) else {
+                continue;
+            };
+            if stored
+                .artifacts
+                .iter()
+                .any(|known| known.name == artifact.name)
+            {
+                continue;
+            }
+            stored.artifacts.push(artifact.clone());
+            tx.execute(
+                "UPDATE sync_msg SET refs = ?2 WHERE message_id = ?1",
+                params![message_id, stored.to_column()],
+            )?;
+            written += 1;
+        }
+        if !retry {
+            db::state_put(
+                tx,
+                SCOPE_REFS_INDEX,
+                &session_id.to_string(),
+                db::HLC_ZERO,
+                None,
+                None,
+            )?;
+        }
+        Ok(written)
+    })
+}
+
+/// 附件索引已清点过的会话（`sync_state` 的 `refs-index`）。
+const SCOPE_REFS_INDEX: &str = "refs-index";
 
 /// artifact 的占位文件可以被取回的全文覆盖；工作区里的文件不覆盖（§8.7）。可覆盖的
 /// 只有同步自己写下的占位（内容一字不差）：用户改写的、别的版本落过地的都是真实文件。

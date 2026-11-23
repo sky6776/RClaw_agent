@@ -387,10 +387,10 @@ impl SyncControl for FakeSync {
         self.purged.fetch_add(1, Ordering::SeqCst);
         Ok(3)
     }
-    fn stash_memory_for_clear(&self) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
+    fn stash_memory_for_clear(&self) -> Result<(Vec<String>, String), String> {
+        Ok((Vec::new(), String::new()))
     }
-    fn commit_memory_clear(&self, _ids: &[String]) -> Result<usize, String> {
+    fn commit_memory_clear(&self, _ids: &[String], _op: &str) -> Result<usize, String> {
         Ok(0)
     }
     fn local_changed(&self, turn_ended: bool) {

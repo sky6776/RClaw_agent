@@ -104,6 +104,8 @@ const KEEP_SEGMENTS: usize = 8;
 const SWEEP_SPACING_MS: i64 = 60 * 1000;
 const SWEEP_BATCH: usize = 100;
 const SWEEP_BUDGET: Duration = Duration::from_secs(8);
+/// 依据这轮核验不过（不是预算不够）后的退避：排在后面的对象才轮得到。
+const GC_RETRY_MS: i64 = 5 * 60 * 1000;
 /// 一次复核（候选回收位置的依据）最多处理这么多个分片：每个分片要么查一次版本、要么
 /// 下载核对一次摘要，配合 [`SWEEP_BUDGET`] 把单轮占用封住。
 const BASIS_PARTS_PER_ROUND: usize = 256;
@@ -325,6 +327,10 @@ struct VerifiedCover {
     parts: usize,
     /// 已经核验过摘要的前缀长度。
     next: usize,
+    /// 核验时存储端给出的对象版本（与清单分片一一对应；给不出可信版本的记空串）。
+    /// 晋升候选快照前按它做一遍版本复核，省掉重复下载，也让「核对过」有据可查。
+    #[serde(default)]
+    versions: Vec<String>,
 }
 
 impl VerifiedCover {
@@ -370,6 +376,28 @@ struct GcWhen {
     /// 等着——新设备可能正靠它补齐这段已被回收的日志。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     basis: Option<(String, String)>,
+    /// 而且这份汇总包（[`PackGuard`]）那时还能完整读到：零散段删掉之后，包里是这段
+    /// 日志唯一的副本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack: Option<PackGuard>,
+    /// 依据这轮核验不过后的重试时刻（本机时钟）。不早于它之前不再重复核验，免得排在
+    /// 前面的坏依据每轮都占满批次，后面的对象永远轮不到。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    retry_ms: i64,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+/// 删除零散段前要能读回的汇总包。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PackGuard {
+    /// 包所属设备。
+    device: String,
+    name: String,
+    /// 包明文的摘要。
+    digest: String,
 }
 
 fn queue_delete(conn: &Connection, path: &str, when: &GcWhen) -> Result<()> {
@@ -510,6 +538,24 @@ async fn verify_snapshot_part(
         Ok(())
     })
     .await
+}
+
+/// 汇总包还能不能完整读回：下载、解密、核对明文摘要、解析包头并逐段核对。零散段删掉
+/// 之后包里是这段日志唯一的副本，读不回来就不能删。
+async fn pack_intact(transport: &dyn SyncTransport, keys: &Arc<Keys>, pack: &PackGuard) -> bool {
+    let path = codec::rollup_path(&pack.device, &pack.name);
+    let object = match transport.get(&path, codec::ROLLUP_OBJECT_MAX).await {
+        Ok(object) => object,
+        Err(_) => return false,
+    };
+    let (keys, digest, device, parse_path) =
+        (keys.clone(), pack.digest.clone(), pack.device.clone(), path);
+    blocking(move || -> Result<bool> {
+        let plain = codec::open_log_object(&keys, &parse_path, &object, codec::ROLLUP_PLAIN_MAX)?;
+        Ok(sha256_hex(&plain) == digest && codec::parse_rollup(&plain, &device).is_ok())
+    })
+    .await
+    .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,8 +1220,16 @@ impl Writer {
         &mut self,
         ctx: &Ctx,
         transport: &dyn SyncTransport,
+        s: &Settings,
         budget: Duration,
     ) -> Result<Option<SnapRef>> {
+        // 快照的内容按开始时的范围与计划生成。范围（会话/记忆/技能/附件/通道）在这期间
+        // 变了，已经写出去的分片就是旧范围的内容——整份作废，不能收尾发布。
+        if !self.settings_match(s) {
+            return Err(SyncError::other(
+                "写快照期间同步范围变了，这份快照作废",
+            ));
+        }
         let started = Instant::now();
         loop {
             let mut producer = self
@@ -1189,7 +1243,7 @@ impl Writer {
             .await?;
             self.producer = Some(producer);
             let Some((plain, lines)) = part else {
-                return self.finish(ctx, transport).await.map(Some);
+                return self.finish(ctx, transport, s).await.map(Some);
             };
             if self.parts.len() >= PARTS_MAX {
                 return Err(SyncError::other("快照太大，写不下"));
@@ -1203,8 +1257,26 @@ impl Writer {
         }
     }
 
+    /// 范围相关的设置是否还和开始写时一样（设备身份也一样：换了身份这份快照就不属于
+    /// 本机了）。
+    fn settings_match(&self, s: &Settings) -> bool {
+        let Some(producer) = &self.producer else {
+            return true;
+        };
+        producer.s.device == s.device
+            && producer.s.scopes == s.scopes
+            && producer.s.channels == s.channels
+            && producer.s.device_name == s.device_name
+            && producer.s.attachment_max == s.attachment_max
+    }
+
     /// 收尾：在用附件清单、快照清单，然后一个事务里把本机记录换成新快照。
-    async fn finish(&mut self, ctx: &Ctx, transport: &dyn SyncTransport) -> Result<SnapRef> {
+    async fn finish(
+        &mut self,
+        ctx: &Ctx,
+        transport: &dyn SyncTransport,
+        s: &Settings,
+    ) -> Result<SnapRef> {
         let mut producer = self
             .producer
             .take()
@@ -1297,6 +1369,7 @@ impl Writer {
         let parts = self.parts.len();
         {
             let (dev, name, snap) = (self.dev.clone(), self.name.clone(), snap.clone());
+            let s = s.clone();
             offload(ctx, move |ctx| {
                 db::write(ctx.db(), |tx| {
                     let current = db::device_record(tx)?.map(|record| record.id);
@@ -1306,6 +1379,14 @@ impl Writer {
                     {
                         return Err(SyncError::other(
                             "写快照期间本机的同步身份变了，这个快照作废",
+                        ));
+                    }
+                    // 收尾前在同一个写事务里再确认一遍：这期间队列或范围不再合格（新排
+                    // 队的行、因范围暂缓的行、范围被收窄）时整份作废。寄存器在写分片时
+                    // 就读过了，只有事务里的复核能把「检查与读取之间新登记的行」挡住。
+                    if !settled(tx, &s, now_ms())? {
+                        return Err(SyncError::other(
+                            "写快照期间队列或范围变了，这份快照作废",
                         ));
                     }
                     record.writing = None;
@@ -1320,6 +1401,7 @@ impl Writer {
                             seq: covered,
                             parts,
                             next: 0,
+                            versions: Vec::new(),
                         },
                     );
                     let mut log = db::log_state(tx)?;
@@ -1332,6 +1414,8 @@ impl Writer {
                             floor: None,
                             snap: None,
                             basis: None,
+                            pack: None,
+                            retry_ms: 0,
                         };
                         for (owner, path) in &stale {
                             if Some(owner.as_str()) != published {
@@ -1348,6 +1432,8 @@ impl Writer {
                         floor: None,
                         snap: Some(name.clone()),
                         basis: None,
+                        pack: None,
+                        retry_ms: 0,
                     };
                     for (_, path) in &stale {
                         queue_delete(tx, path, &when)?;
@@ -1939,13 +2025,15 @@ pub async fn collect_garbage(
 
 /// 删掉登记过、条件已经满足的对象。带回收依据的先确认依据还能完整读到——作为依据的
 /// 快照要是在删除前消失了（第三方目录只同步了一半、被人动过），这一批留着等下一轮。
+/// 押在汇总包上的同理：零散段删掉之后，包里是这段日志唯一的副本。
 async fn sweep_due(
     ctx: &Ctx,
     transport: &dyn SyncTransport,
     keys: &Arc<Keys>,
     now: i64,
 ) -> Result<usize> {
-    let due: Vec<(String, Option<(String, String)>)> = offload(ctx, move |ctx| {
+    type Due = (String, Option<(String, String)>, Option<PackGuard>);
+    let due: Vec<Due> = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
             let rows = db::state_scan(conn, scope::GC, "")?;
             if rows.is_empty() {
@@ -1957,11 +2045,12 @@ async fn sweep_due(
                 .filter_map(|(path, row)| {
                     let when = row.json::<GcWhen>()?;
                     (now >= when.after_ms
+                        && now >= when.retry_ms
                         && when.floor.is_none_or(|floor| log.head_floor >= floor)
                         && when
                             .snap
                             .is_none_or(|snap| log.head_snap.as_ref() == Some(&snap)))
-                    .then(|| (path, when.basis))
+                    .then(|| (path, when.basis, when.pack))
                 })
                 .take(SWEEP_BATCH)
                 .collect())
@@ -1974,31 +2063,55 @@ async fn sweep_due(
     let started = Instant::now();
     // 复核（下载、核对摘要）与删除共享这一轮的时间预算：总预算再按依据份数均分，排在
     // 后面的依据也分得到一份；每份在自己的份额里核对，进度跨轮保留。每份依据确认一次
-    // 就够：同一批删除押的是同一份快照。
+    // 就够：同一批删除押的是同一份快照。删除阶段固定留四分之一，复核把预算吃光时至少
+    // 还能删掉已经确认过的那些。
+    let verify_end = started + SWEEP_BUDGET.mul_f64(0.75);
     let mut checked: HashMap<(String, String), BasisCheck> = HashMap::new();
+    let mut packs_ok: HashMap<(String, String), bool> = HashMap::new();
     let distinct: Vec<(String, String)> = {
         let mut seen = HashSet::new();
         due.iter()
-            .filter_map(|(_, basis)| basis.clone())
+            .filter_map(|(_, basis, _)| basis.clone())
             .filter(|basis| seen.insert(basis.clone()))
             .collect()
     };
-    let mut share = SWEEP_BUDGET / distinct.len().max(1) as u32;
+    let mut share = SWEEP_BUDGET.mul_f64(0.75) / distinct.len().max(1) as u32;
     share = share.max(Duration::from_millis(500));
     let mut deletable: Vec<String> = Vec::new();
-    let mut due_left: Vec<(String, Option<(String, String)>)> = Vec::new();
-    for (path, basis) in due {
+    let mut due_left: Vec<Due> = Vec::new();
+    // 这轮核验不过（不是预算不够）的行：退避一会儿，别让排在前面的坏依据每轮占满批次。
+    let mut retry: Vec<String> = Vec::new();
+    for (path, basis, pack) in due {
         let Some(basis) = basis else {
-            deletable.push(path);
+            let Some(pack) = pack else {
+                deletable.push(path);
+                continue;
+            };
+            let key = (pack.name.clone(), pack.digest.clone());
+            let ok = match packs_ok.get(&key) {
+                Some(&ok) => ok,
+                None => {
+                    let ok = pack_intact(transport, keys, &pack).await;
+                    packs_ok.insert(key, ok);
+                    ok
+                }
+            };
+            if ok {
+                deletable.push(path);
+            } else {
+                tracing::debug!("汇总包 {} 这轮读不回来，押着它的零散段先不删", pack.name);
+                retry.push(path.clone());
+                due_left.push((path, None, Some(pack)));
+            }
             continue;
         };
         let verdict = match checked.get(&basis) {
             Some(&verdict) => verdict,
             None => {
-                let slice = share.min(SWEEP_BUDGET.saturating_sub(started.elapsed()));
+                let slice = share.min(verify_end.saturating_duration_since(Instant::now()));
                 if slice.is_zero() {
                     // 总预算用完：剩下的（连同这条）下一轮再来，进度各自保留。
-                    due_left.push((path, Some(basis)));
+                    due_left.push((path, Some(basis), pack));
                     continue;
                 }
                 let mut progress = load_basis_progress(ctx, &basis).await?;
@@ -2007,7 +2120,7 @@ async fn sweep_due(
                     keys,
                     &basis,
                     &mut progress,
-                    started + slice,
+                    Instant::now() + slice,
                     BASIS_PARTS_PER_ROUND,
                 )
                 .await;
@@ -2018,9 +2131,14 @@ async fn sweep_due(
         };
         match verdict {
             BasisCheck::Intact => deletable.push(path),
-            BasisCheck::Deferred | BasisCheck::Broken => {
-                tracing::debug!("回收依据 {} 这轮没核验完或已失效，押着它的对象先不删", basis.0);
-                due_left.push((path, Some(basis)));
+            BasisCheck::Deferred => {
+                tracing::debug!("回收依据 {} 这轮没核验完，押着它的对象先不删", basis.0);
+                due_left.push((path, Some(basis), pack));
+            }
+            BasisCheck::Broken => {
+                tracing::debug!("回收依据 {} 这轮核验不过，押着它的对象先不删", basis.0);
+                retry.push(path.clone());
+                due_left.push((path, Some(basis), pack));
             }
         }
     }
@@ -2042,6 +2160,14 @@ async fn sweep_due(
         db::write(ctx.db(), |tx| {
             for path in &done {
                 db::state_del(tx, scope::GC, path)?;
+            }
+            for path in &retry {
+                let Some(mut when) = db::state_get(tx, scope::GC, path)?.and_then(|row| row.json::<GcWhen>())
+                else {
+                    continue;
+                };
+                when.retry_ms = now + GC_RETRY_MS;
+                db::state_put_json(tx, scope::GC, path, db::HLC_ZERO, &when)?;
             }
             // 还押着对象的依据，进度记录留着——包括这轮没轮到的、以及已经核验完但删除
             // 还没排上的（只看这一批剩下的会把后者的进度清掉，下一轮又从头核）。全都不
@@ -2094,6 +2220,11 @@ struct BasisProgress {
     next: usize,
     #[serde(default)]
     versions: Vec<String>,
+    /// 复核游标：正向核完之后，从头按对象版本再确认一遍（没有可信版本的重新下载核对）。
+    /// 只有这一遍也走完才算完整通过；通过后游标归零，下一次判断必须重新走一遍——公布
+    /// 与物理删除各自拿自己那一遍的证据，不沿用上一阶段的结论。
+    #[serde(default)]
+    recheck: usize,
 }
 
 async fn load_basis_progress(ctx: &Ctx, basis: &(String, String)) -> Result<BasisProgress> {
@@ -2123,11 +2254,28 @@ async fn save_basis_progress(
     .await
 }
 
+/// 核对完一个分片后记下它当时在存储端的版本：核前核后两次元数据一致（且都是可信版本）
+/// 才算这个版本对应刚核对过的内容；拿不到就记空串，下一次复核重新下载。
+async fn verified_part_version(
+    transport: &dyn SyncTransport,
+    path: &str,
+    before: Option<&transport::ObjectMeta>,
+) -> String {
+    let Some(before) = before.filter(|meta| meta.stable_version) else {
+        return String::new();
+    };
+    match transport::stat(transport, path).await.ok().flatten() {
+        Some(after) if after.stable_version && after.tag() == before.tag() => after.tag(),
+        _ => String::new(),
+    }
+}
+
 /// 不可逆删除或公布候选回收位置前，回收依据（`<设备>/<快照名>`、清单摘要）是否仍可
-/// 恢复：下载清单、解密、核对摘要；数据片逐个核对——上轮核过的前缀先比对象版本，版本
-/// 没变的沿用结论，其余下载核对摘要。`deadline` 与 `max_parts` 把这一轮的占用封住，
-/// 核不完返回 [`BasisCheck::Deferred`]（`progress` 带回推进后的进度）。任何一环对不上
-/// 都返回 [`BasisCheck::Broken`]——这一批删除等下一轮，物理删除只在全部对上之后执行。
+/// 恢复：下载清单、解密、核对摘要；数据片逐个核对，正向核完之后再按对象版本复核一遍
+/// ——两次轮询之间悄悄坏掉的数据片逃不过重读。`deadline` 与 `max_parts` 把这一轮的占用
+/// 封住，核不完返回 [`BasisCheck::Deferred`]（`progress` 带回推进后的进度）。任何一环
+/// 对不上都返回 [`BasisCheck::Broken`]——这一批删除等下一轮，物理删除只在完整走完一遍
+/// 之后执行。
 async fn basis_intact(
     transport: &dyn SyncTransport,
     keys: &Arc<Keys>,
@@ -2163,46 +2311,76 @@ async fn basis_intact(
         Err(_) => return BasisCheck::Broken,
     };
     // 清单换过（摘要不符已经拦了）或进度越界：从头核。
-    if progress.digest != basis.1 || progress.next > manifest.parts.len() {
+    if progress.digest != basis.1
+        || progress.next > manifest.parts.len()
+        || progress.recheck > manifest.parts.len()
+    {
         progress.digest = basis.1.clone();
         progress.next = 0;
+        progress.recheck = 0;
         progress.versions.clear();
     }
     let mut worked = 0usize;
-    while progress.next < manifest.parts.len()
-        && worked < max_parts
-        && Instant::now() < deadline
-    {
+    // 正向：还没核对过的分片下载核对摘要，记下核对当时存储端的版本。
+    while progress.next < manifest.parts.len() && worked < max_parts && Instant::now() < deadline {
         let index = progress.next;
         let part = &manifest.parts[index];
         let part_path = codec::snapshot_part_path(dev, name, &part.name);
-        // 上轮核过的先比版本；要重核就趁下载前把版本取好，核过之后记下来——记的必须是
-        // 核对当时存储端的版本，别的设备拿着它才能信「这份内容核对过」。
         let meta = transport::stat(transport, &part_path).await.ok().flatten();
-        let saved = progress.versions.get(index);
-        let trusted = match (&meta, saved) {
-            (Some(meta), Some(saved)) if meta.stable_version && !saved.is_empty() => {
-                meta.tag() == *saved
-            }
-            _ => false,
-        };
-        if !trusted && verify_snapshot_part(transport, keys, dev, name, part).await.is_err() {
+        if verify_snapshot_part(transport, keys, dev, name, part).await.is_err() {
             return BasisCheck::Broken;
         }
+        let version = verified_part_version(transport, &part_path, meta.as_ref()).await;
         if progress.versions.len() <= index {
             progress.versions.resize(index + 1, String::new());
         }
-        progress.versions[index] = meta
-            .filter(|meta| meta.stable_version)
-            .map_or(String::new(), |meta| meta.tag());
+        progress.versions[index] = version;
         progress.next += 1;
         worked += 1;
     }
-    if progress.next >= manifest.parts.len() {
-        BasisCheck::Intact
-    } else {
-        BasisCheck::Deferred
+    // 复核：上一遍核对过、这一遍还没复核的分片按对象版本确认没被换过；拿不到可信版本
+    // （或版本变了）就重新下载核对。走完这一遍才是 `Intact`。
+    while progress.next >= manifest.parts.len()
+        && progress.recheck < manifest.parts.len()
+        && worked < max_parts
+        && Instant::now() < deadline
+    {
+        let index = progress.recheck;
+        let part = &manifest.parts[index];
+        let part_path = codec::snapshot_part_path(dev, name, &part.name);
+        let meta = transport::stat(transport, &part_path).await.ok().flatten();
+        let saved = progress.versions.get(index).cloned().unwrap_or_default();
+        let trusted = meta.as_ref().is_some_and(|meta| {
+            meta.stable_version && !saved.is_empty() && meta.tag() == saved
+        });
+        if !trusted {
+            if verify_snapshot_part(transport, keys, dev, name, part).await.is_err() {
+                return BasisCheck::Broken;
+            }
+            let version = verified_part_version(transport, &part_path, meta.as_ref()).await;
+            if progress.versions.len() <= index {
+                progress.versions.resize(index + 1, String::new());
+            }
+            progress.versions[index] = version;
+        }
+        progress.recheck += 1;
+        worked += 1;
     }
+    if progress.next >= manifest.parts.len() && progress.recheck >= manifest.parts.len() {
+        // 这一遍完整通过：进度回到复核起点，下一次判断（公布之后、物理删除之前）必须
+        // 重新走一遍，不能沿用这次的结论。
+        progress.recheck = 0;
+        return BasisCheck::Intact;
+    }
+    BasisCheck::Deferred
+}
+
+/// 新快照的向量是否覆盖了旧快照的每一段：每个设备记的位置都不比旧的少。只有这样才能
+/// 说「旧快照能恢复的，新快照也恢复得了」，删旧对象不会减少可达的历史。
+fn covers_dominates(new: &Manifest, old: &Manifest) -> bool {
+    old.vector
+        .iter()
+        .all(|(device, entry)| new.vector.get(device).is_some_and(|mine| mine.seq >= entry.seq))
 }
 
 /// 一个快照覆盖了本机日志到哪里。它的向量里记的必须确实是本机这条日志上的位置。
@@ -2310,18 +2488,29 @@ async fn refresh_covers(
         } else {
             covers.insert(key.clone(), known[&key]);
         }
-        // 分批核验这份快照的分片：换清单（换了内容）就从头核。
+        // 分批核验这份快照的分片：换清单（换了内容）就从头核，并记下核对当时存储端的
+        // 对象版本（晋升候选前按它复核，省掉重复下载）。
         let mut entry = checked.remove(&key).unwrap_or_default();
         if entry.digest != snap.digest {
             entry.next = 0;
+            entry.versions.clear();
         }
         entry.digest = snap.digest.clone();
         entry.seq = covers[&key];
         entry.parts = manifest.parts.len();
+        entry.versions.truncate(entry.next.min(entry.parts));
         while entry.next < entry.parts && verify_budget > 0 {
-            let part = &manifest.parts[entry.next];
+            let index = entry.next;
+            let part = &manifest.parts[index];
+            let part_path = codec::snapshot_part_path(dev, &snap.name, &part.name);
+            let meta = transport::stat(transport, &part_path).await.ok().flatten();
             match verify_snapshot_part(transport, keys, dev, &snap.name, part).await {
                 Ok(()) => {
+                    let version = verified_part_version(transport, &part_path, meta.as_ref()).await;
+                    if entry.versions.len() <= index {
+                        entry.versions.resize(index + 1, String::new());
+                    }
+                    entry.versions[index] = version;
                     entry.next += 1;
                     verify_budget -= 1;
                 }
@@ -2364,15 +2553,30 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
         let mut entries = seal::seg_entries(tx)?;
         let packs = upload::pack_entries(tx)?;
         let mut record = maint(tx)?;
-        let grace = GcWhen {
-            after_ms: now + LOG_GRACE_MS,
-            floor: None,
-            snap: None,
-            basis: None,
-        };
+        // 零散段删掉之后，汇总包是这段日志唯一的副本：删除必须押在「包还能完整读回」上，
+        // 找不到能证明的包（旧记录、包被回收）就不删。
         for entry in &mut entries {
             if entry.packed && entry.up && !entry.gone && entry.to <= log.head_packed {
-                queue_delete(tx, &codec::segment_path(&s.device, &entry.name), &grace)?;
+                let Some(guard) = packs
+                    .iter()
+                    .find(|pack| pack.from <= entry.to && entry.to <= pack.to)
+                    .map(|pack| PackGuard {
+                        device: s.device.clone(),
+                        name: pack.name.clone(),
+                        digest: pack.digest.clone(),
+                    })
+                else {
+                    continue;
+                };
+                let when = GcWhen {
+                    after_ms: now + LOG_GRACE_MS,
+                    floor: None,
+                    snap: None,
+                    basis: None,
+                    pack: Some(guard),
+                    retry_ms: 0,
+                };
+                queue_delete(tx, &codec::segment_path(&s.device, &entry.name), &when)?;
                 entry.gone = true;
                 seal::put_seg_entry(tx, entry)?;
             }
@@ -2436,6 +2640,8 @@ fn advance_floor(ctx: &Ctx, s: &Settings, now: i64) -> Result<()> {
             floor: Some(floor),
             snap: None,
             basis: Some(basis.clone()),
+            pack: None,
+            retry_ms: 0,
         };
         for entry in entries.iter().filter(|entry| entry.to <= floor) {
             if !entry.gone {
@@ -2537,8 +2743,31 @@ async fn promote_floor(
             for entry in seal::seg_entries(tx)?.iter().filter(|entry| entry.to <= floor) {
                 seal::del_seg_entry(tx, entry.to)?;
             }
-            for pack in upload::pack_entries(tx)?.iter().filter(|pack| pack.to <= floor) {
+            let packs = upload::pack_entries(tx)?;
+            for pack in packs.iter().filter(|pack| pack.to <= floor) {
                 upload::del_pack_entry(tx, pack.to)?;
+            }
+            // 押在即将删掉的汇总包上的零散段：快照已经覆盖这段日志，改押这份快照依据。
+            // 不改的话包一删，它们的核验永远对不上，删除记录会一直留在队列里。
+            let gone: HashSet<(String, String)> = packs
+                .iter()
+                .filter(|pack| pack.to <= floor)
+                .map(|pack| (pack.name.clone(), pack.digest.clone()))
+                .collect();
+            if !gone.is_empty() {
+                for (path, row) in db::state_scan(tx, scope::GC, "")? {
+                    let Some(mut when) = row.json::<GcWhen>() else {
+                        continue;
+                    };
+                    let Some(guard) = when.pack.as_ref() else {
+                        continue;
+                    };
+                    if gone.contains(&(guard.name.clone(), guard.digest.clone())) {
+                        when.pack = None;
+                        when.basis = Some(pending.basis.clone());
+                        db::state_put_json(tx, scope::GC, &path, db::HLC_ZERO, &when)?;
+                    }
+                }
             }
             if log.rollup.as_ref().is_some_and(|rollup| rollup.to <= floor) {
                 log.rollup = None;
@@ -2579,20 +2808,41 @@ async fn promote_snap(
         return Ok(());
     };
     let key = snap_key(&s.device, &pending.name);
-    let verified = offload(ctx, {
+    // 候选必须**现在**完整可读：先沿用登记时的核验进度（免去已核过部分的重复下载），
+    // 再在当前存储上把每个分片按对象版本复核一遍。登记时的结论不能直接当晋升依据——
+    // 两份结论之间分片可能被换掉。
+    let basis = (key.clone(), pending.digest.clone());
+    let mut progress = {
         let key = key.clone();
         let digest = pending.digest.clone();
-        move |ctx| {
+        offload(ctx, move |ctx| {
             db::read(ctx.db(), |conn| {
-                Ok(maint(conn)?
-                    .covers_checked
-                    .get(&key)
-                    .is_some_and(|entry| entry.complete() && entry.digest == digest))
+                let saved = maint(conn)?.covers_checked.get(&key).cloned();
+                Ok(saved
+                    .filter(|entry| entry.complete() && entry.digest == digest)
+                    .map(|entry| BasisProgress {
+                        digest,
+                        next: entry.parts,
+                        versions: entry.versions,
+                        recheck: 0,
+                    })
+                    .unwrap_or_default())
             })
-        }
-    })
-    .await?;
-    if !verified {
+        })
+        .await?
+    };
+    let verdict = basis_intact(
+        transport,
+        keys,
+        &basis,
+        &mut progress,
+        Instant::now() + SWEEP_BUDGET,
+        BASIS_PARTS_PER_ROUND,
+    )
+    .await;
+    save_basis_progress(ctx, &basis, &progress).await?;
+    if verdict != BasisCheck::Intact {
+        // 没核完或对不上：候选先留着，下一轮再试。
         return Ok(());
     }
     // 向量覆盖到当前的回收边界（`coverage` 会对照日志核对清单里记的位置）。
@@ -2631,6 +2881,22 @@ async fn promote_snap(
             .map(|meta| format!("{dir}{}", meta.name))
             .collect(),
         _ => Vec::new(),
+    };
+    // 上一份快照的覆盖不能比候选多：逐个设备比清单里的向量，候选都覆盖到了才允许
+    // 退位。读不出上一份的清单（第三方工具弄丢）就只剩候选可保，照常退位。
+    let dominates = match previous.as_ref().filter(|previous| previous.name != pending.name) {
+        Some(previous) => match fetch_manifest(transport, keys, memo, &s.device, previous).await {
+            Ok(old) => covers_dominates(&manifest, &old),
+            Err(error) if skippable(&error) => {
+                tracing::debug!(
+                    "读上一份快照 {} 的清单失败，旧对象先留着（下一轮再试）: {error}",
+                    previous.name
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        },
+        None => true,
     };
     let device = s.device.clone();
     offload(ctx, move |ctx| {
@@ -2673,12 +2939,16 @@ async fn promote_snap(
                     }
                 }
             }
-            if !still_basis {
+            if !still_basis && dominates {
+                // 旧快照的删除押在「新快照现在仍可完整读回」上：到期回收时还要再复核
+                // 一遍，候选在这期间坏掉就保不住旧对象。
                 let when = GcWhen {
                     after_ms: now + SNAP_GRACE_MS,
                     floor: None,
                     snap: Some(pending.name.clone()),
-                    basis: None,
+                    basis: Some((new_key.clone(), pending.digest.clone())),
+                    pack: None,
+                    retry_ms: 0,
                 };
                 for path in old_paths {
                     queue_delete(tx, &path, &when)?;
@@ -2864,6 +3134,8 @@ fn note_unreferenced(
                     floor: None,
                     snap: None,
                     basis: None,
+                    pack: None,
+                    retry_ms: 0,
                 },
             )?;
             // 文件还在本机：以后又有人要的话（`blob.want`）重新上传。
@@ -3057,7 +3329,7 @@ mod tests {
             .unwrap()?;
             let snap = loop {
                 if let Some(snap) = writer
-                    .step(self.ctx(), transport, Duration::from_secs(60))
+                    .step(self.ctx(), transport, &self.device.settings, Duration::from_secs(60))
                     .await
                     .unwrap()
                 {

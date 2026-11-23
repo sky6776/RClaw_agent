@@ -146,8 +146,9 @@ fn canonical_query(params: &[(&str, &str)]) -> String {
 /// ListObjectsV2 的一页结果。
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ListPage {
-    /// （完整键，长度，版本标识）。
-    objects: Vec<(String, u64, String)>,
+    /// （完整键，长度，版本标识，版本是否可信）。缺 ETag 时版本标识是修改时间，只是
+    /// 提示：等长的两次更新可以带着同一个秒级时间，不能据此判重。
+    objects: Vec<(String, u64, String, bool)>,
     next_token: Option<String>,
 }
 
@@ -224,8 +225,10 @@ fn parse_list(xml: &str, what: &str) -> TransportResult<ListPage> {
                     if page.objects.len() >= LIST_MAX {
                         return Err(too_many(what));
                     }
+                    let strong = etag.is_some();
                     let version = etag.take().or(modified.take()).unwrap_or_default();
-                    page.objects.push((std::mem::take(&mut key), size, version));
+                    page.objects
+                        .push((std::mem::take(&mut key), size, version, strong));
                 }
             }
         }
@@ -480,7 +483,7 @@ impl SyncTransport for S3Transport {
             let page = parse_list(&String::from_utf8_lossy(&body), prefix)?;
             drop(body);
             walk.page(page.objects.len(), page.next_token.as_deref(), prefix)?;
-            for (key, size, version) in page.objects {
+            for (key, size, version, stable_version) in page.objects {
                 let Some(name) = key.get(dir_len..) else {
                     continue;
                 };
@@ -491,7 +494,7 @@ impl SyncTransport for S3Transport {
                 {
                     continue;
                 }
-                let stable_version = !version.is_empty();
+                let stable_version = stable_version && !version.is_empty();
                 out.push(ObjectMeta {
                     name: name.to_string(),
                     size,
@@ -703,9 +706,15 @@ mod tests {
                 (
                     "rclaw/sync/heads/0123456789abcdef".into(),
                     321,
-                    "\"e1\"".into()
+                    "\"e1\"".into(),
+                    true
                 ),
-                ("rclaw/sync/heads/fedcba9876543210".into(), 5, "t".into()),
+                (
+                    "rclaw/sync/heads/fedcba9876543210".into(),
+                    5,
+                    "t".into(),
+                    false
+                ),
             ]
         );
         assert!(parse_list("<a><b></a>", "heads/").is_err());

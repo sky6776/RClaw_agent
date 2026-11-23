@@ -70,6 +70,9 @@ pub(crate) const STANDBY_HINT: &str = "另一个 RClaw 进程正在用这个数�
 /// 收敛到同一套配置，不会拿旧存储的凭据记录去试新目标。做完就删。与密钥同样的私有权限。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StorageIntent {
+    /// 这次保存请求的标识：两次保存交错时，先完成的一方不能把后一个请求的意图删掉。
+    #[serde(default)]
+    id: String,
     config: SyncConfig,
     /// 要绑定的密码；`None` 或空 = 不改密码。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,21 +83,34 @@ fn storage_intent_path(paths: &SyncPaths) -> PathBuf {
     paths.root.join("pending-storage.json")
 }
 
-pub(crate) fn storage_intent_save(
+/// 落盘「存储设置更新意图」，返回它的标识。同一套配置与密码重复调用（桌面在写
+/// `rclaw.toml` 之前先落一次、引擎派发命令时再落一次）沿用手上这条记录的标识，不会
+/// 出现两条意图互相覆盖。
+pub fn storage_intent_save(
     paths: &SyncPaths,
     config: &SyncConfig,
     secret: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
+    let secret = secret.map(|secret| secret.to_string());
+    if let Some(existing) = storage_intent_load(paths)? {
+        if !existing.id.is_empty()
+            && existing.config == *config
+            && existing.secret == secret
+        {
+            return Ok(existing.id);
+        }
+    }
     let intent = StorageIntent {
+        id: crate::ids::random_hex::<8>(),
         config: config.clone(),
-        secret: secret.map(|secret| secret.to_string()),
+        secret,
     };
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
         &storage_intent_path(paths),
         &serde_json::to_vec_pretty(&intent)?,
     )?;
-    Ok(())
+    Ok(intent.id)
 }
 
 fn storage_intent_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
@@ -112,12 +128,25 @@ fn storage_intent_load(paths: &SyncPaths) -> Result<Option<StorageIntent>> {
     }
 }
 
-fn storage_intent_clear(paths: &SyncPaths) -> Result<()> {
+/// 只删自己那条意图：标识对不上说明它已经被后一个保存请求替换了，不能删。
+pub fn storage_intent_clear_if(paths: &SyncPaths, id: &str) -> Result<()> {
+    let Some(intent) = storage_intent_load(paths)? else {
+        return Ok(());
+    };
+    if intent.id != id {
+        return Ok(());
+    }
     match std::fs::remove_file(storage_intent_path(paths)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// 上一次没存完的存储设置里的目标配置（宿主启动时按它补齐 `rclaw.toml`）。不删记录：
+/// secrets 由引擎收尾之后按标识删。
+pub fn storage_intent_config(paths: &SyncPaths) -> Result<Option<SyncConfig>> {
+    Ok(storage_intent_load(paths)?.map(|intent| intent.config))
 }
 
 pub(crate) type Reply<T> = oneshot::Sender<Result<T>>;
@@ -616,6 +645,12 @@ impl Worker {
                 return self.fail_open(error.to_string(), Some(OPEN_RETRY));
             }
         }
+        // 上次没存完的存储设置先收尾（secrets 按 TOML 里的目标补写），两个文件才是一套。
+        // 放在空间切换恢复之前：恢复要按「这个账户」的当前凭据去开存储，先让配置与
+        // secrets 收敛到同一套。
+        if let Err(error) = self.resume_storage_intent().await {
+            tracing::warn!("没存完的存储设置收尾失败（下次打开再试）: {error}");
+        }
         // 上一次重置 / 退出没做完：按落盘的记录与远端的实际状态接着做（重置可能已经把
         // 本机换到了新空间），再按正常打开往下走。
         if let Err(error) =
@@ -625,10 +660,6 @@ impl Worker {
                 format!("上一次的空间切换没有做完: {error}（修好后会自动接着做）"),
                 Some(OPEN_RETRY),
             );
-        }
-        // 上次没存完的存储设置先收尾（secrets 按 TOML 里的目标补写），两个文件才是一套。
-        if let Err(error) = self.resume_storage_intent().await {
-            tracing::warn!("没存完的存储设置收尾失败（下次打开再试）: {error}");
         }
         let paired = self.secrets.is_paired();
         shared.paired.store(paired, Ordering::Relaxed);
@@ -740,6 +771,15 @@ impl Worker {
             .ctx
             .space
             .wait_idle(TEARDOWN_SETTLE)
+            .await;
+        // 还有任务在最终写入段里（正改名、记账、销账）：它们的许可活着时换代会把写入
+        // 越过边界，等它们退场再换代。等不到也换代——它们的许可随之失效，后面的核对
+        // 与清理只收自己写下的东西。
+        let _ = self
+            .shared
+            .ctx
+            .space
+            .wait_writers(TEARDOWN_SETTLE)
             .await;
         self.shared.ctx.space.bump();
         for task in [self.uploads.take(), self.downloads.take()]
@@ -1086,6 +1126,21 @@ impl Worker {
 
     async fn join_space(&mut self, code: &str) -> Result<SyncConfig> {
         self.require_owner()?;
+        // 已经在这个空间里（上次加入在把设置写回文件之前中断了）：重复加入是幂等的，
+        // 只把配对码带来的存储设置对齐。别的空间的配对码仍然报错。
+        if self.secrets.is_paired() {
+            let parsed = crate::pairing::PairingCode::parse(code)?;
+            if parsed.space_id != self.secrets.space_id || parsed.key != self.secrets.key {
+                return Err(SyncError::other(
+                    "本机已经在一个同步空间里了；要加入另一个，请先退出当前的",
+                ));
+            }
+            let mut next = self.secrets.clone();
+            let joined = space::apply_pairing(&self.config, &mut next, &parsed);
+            self.config = joined.clone();
+            self.open().await;
+            return Ok(joined);
+        }
         let joined = space::join(
             &self.shared.ctx.paths,
             &self.config,
@@ -1198,8 +1253,8 @@ impl Worker {
         blocking(move || saved.save(&paths)).await?;
         self.secrets = next;
         self.config = intent.config;
-        let paths = self.shared.ctx.paths.clone();
-        blocking(move || storage_intent_clear(&paths)).await?;
+        let (paths, id) = (self.shared.ctx.paths.clone(), intent.id);
+        blocking(move || storage_intent_clear_if(&paths, &id)).await?;
         self.shared.set_space(
             self.secrets
                 .is_paired()

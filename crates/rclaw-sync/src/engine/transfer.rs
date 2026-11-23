@@ -178,6 +178,11 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
                     return Ok(None);
                 }
                 db::write(ctx.db(), |tx| {
+                    // 取的写事务可能排在换空间后面：拿到锁之后在事务里再核对一次，
+                    // 旧空间的等待记录不写进新空间的库。
+                    if !commit.valid() {
+                        return Ok(None);
+                    }
                     let Some(device) = sync_db::device_id(tx)? else {
                         return Ok(None);
                     };

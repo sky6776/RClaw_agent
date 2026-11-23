@@ -231,6 +231,11 @@ pub fn render_chunks(
 /// 形态装不下它们，导出的只能是个前缀。悄悄给出一个前缀的话，用户以为拿到了完整备份，
 /// 拿它恢复、或者拿它当删除之前唯一的副本，后一段对话就无声无息地没了。
 pub fn export_session(env: &Env, channel: &str, chat_id: &str) -> Result<String> {
+    // 旧消息的附件索引可能只有一半（那时还没有 artifact 记录）：导出前把能准确重建的
+    // 补上，否则导出的包里会把占位正文当成工具结果全文。
+    if let Err(error) = wire::backfill_artifact_refs(env, channel, chat_id) {
+        tracing::debug!("导出前补附件索引失败（照常导出）: {error}");
+    }
     let export = db::write(env.db(), |tx| {
         let device = db::ensure_device(tx)?;
         let session_id = raw::find_session(tx, channel, chat_id)?
@@ -391,7 +396,10 @@ pub fn import_session(env: &Env, text: &str, options: &ImportOptions) -> Result<
     let base = options.chat_id.as_deref().unwrap_or(&header.chat_id);
     let chat_id = db::read(env.db(), |conn| free_chat_id(conn, &channel, base, ""))?;
     for msg in &messages {
-        wire::write_artifacts(env, &channel, &chat_id, msg)?;
+        // 导入可能发生在配对之前，拿不到空间密钥：撞名落进缓存的内联全文只能按明文摘要
+        // 登记成本机缓存（`write_artifacts` 的 `None` 分支），不发到线上；以后封段重新
+        // 封装时再按文件内容换成线上对象名。
+        wire::write_artifacts(env, &channel, &chat_id, msg, None)?;
     }
     let imported = db::write(env.db(), |tx| {
         let device = db::ensure_device(tx)?;
@@ -425,7 +433,7 @@ pub fn import_session(env: &Env, text: &str, options: &ImportOptions) -> Result<
             sealed: SEAL_LOCAL,
         };
         for msg in &messages {
-            wire::land_msg(tx, env, landing, msg)?;
+            wire::land_msg(tx, env, landing, msg, None)?;
         }
         if let Some(title) = header.title.as_deref().and_then(portable::clean_title) {
             sync_db::kv_put(

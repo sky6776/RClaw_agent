@@ -2823,13 +2823,13 @@ impl TurnManager {
             }
         }
         // 同步侧先做（退出同步空间，或把会话删除传给其他设备）：它失败就什么都不清。
-        // 记忆的删除在这里只留副本（不可发布），等本地清空成功后才提交。
-        let (mut sync_note, memory_ids) = match (&control, scope) {
+        // 记忆的删除在这里只留副本、登记清理意图（不可发布），等本地清空成功后才提交。
+        let (mut sync_note, memory_clear) = match (&control, scope) {
             (Some(control), Some(scope)) => match self.prepare_clear(control.clone(), scope).await {
                 Ok(result) => result,
                 Err(reply) => return reply,
             },
-            _ => (String::new(), Vec::new()),
+            _ => (String::new(), None),
         };
         let session = self.session.clone();
         let layout = self.layout.clone();
@@ -2852,30 +2852,33 @@ impl TurnManager {
             self.ledger_clear_all();
         }
         // 本地清空成功之后才把记忆的删除登记为可发送；失败时不登记（重试时再走一遍）。
+        // 登记时带上这次清理的操作标识：对不上（期间重新登记或撤销过）就不发布。
         if all_scope && control.is_some() && matches!(&cleared, Ok(Ok(_))) {
-            let sync = control.as_ref().unwrap().clone();
-            let committed = tokio::task::spawn_blocking(move || {
-                sync.commit_memory_clear(&memory_ids)
-            })
-            .await;
-            match committed {
-                Ok(Ok(0)) => {}
-                Ok(Ok(count)) => {
-                    sync_note.push_str(&format!(
-                        "\n\n多端同步已把 {count} 条记忆的删除登记给所有设备。"
-                    ));
-                }
-                Ok(Err(error)) => {
-                    sync_note.push_str(&format!(
-                        "\n\n⚠️ 记忆的删除没能同步给其他设备（{error}）；本机已清空，\
-                         重试 /clear confirm all 可以把这一步补上。"
-                    ));
-                }
-                Err(e) => {
-                    sync_note.push_str(&format!(
-                        "\n\n⚠️ 记忆的删除没能同步给其他设备（任务异常: {e}）；本机已清空，\
-                         重试 /clear confirm all 可以把这一步补上。"
-                    ));
+            if let Some((ids, op)) = memory_clear {
+                let sync = control.as_ref().unwrap().clone();
+                let committed = tokio::task::spawn_blocking(move || {
+                    sync.commit_memory_clear(&ids, &op)
+                })
+                .await;
+                match committed {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(count)) => {
+                        sync_note.push_str(&format!(
+                            "\n\n多端同步已把 {count} 条记忆的删除登记给所有设备。"
+                        ));
+                    }
+                    Ok(Err(error)) => {
+                        sync_note.push_str(&format!(
+                            "\n\n⚠️ 记忆的删除没能同步给其他设备（{error}）；本机已清空，\
+                             重试 /clear confirm all 可以把这一步补上。"
+                        ));
+                    }
+                    Err(e) => {
+                        sync_note.push_str(&format!(
+                            "\n\n⚠️ 记忆的删除没能同步给其他设备（任务异常: {e}）；本机已清空，\
+                             重试 /clear confirm all 可以把这一步补上。"
+                        ));
+                    }
                 }
             }
         }

@@ -361,10 +361,11 @@ pub(crate) fn delete_published(
 /// `/clear confirm all`（§7.5）的第一半：调用方马上要清空本机的 `MEMORY.md`，先把现有的
 /// 条目在回收站里留一份（`keep_trash`），并登记「正在清理」的意图（[`memory::mark_clearing`]）
 /// ——之后的文件删除要是只成功了一半，后台对比不能把缺掉的条目当成正常删除发给别的
-/// 设备（`/clear` 会报失败、让用户重试，这次清理并没有完成）。返回条目标识。这一步本身
-/// 没有任何可发布的副作用——把清空登记成发给所有设备的删除（[`commit_memory_clear`]）
-/// 留给调用方在本地清空成功之后做。
-pub(crate) fn stash_memory_clear(ctx: &Ctx, keep_trash: bool) -> Result<Vec<String>> {
+/// 设备（`/clear` 会报失败、让用户重试，这次清理并没有完成）。返回条目标识与这次登记的
+/// 操作标识。这一步本身没有任何可发布的副作用——意图先耐久落库，调用方才删本机文件；
+/// 把清空登记成发给所有设备的删除（[`commit_memory_clear`]）留给调用方在本地清空成功
+/// 之后做。
+pub(crate) fn stash_memory_clear(ctx: &Ctx, keep_trash: bool) -> Result<(Vec<String>, String)> {
     let entries = match ctx.memory.list_entries(MemoryTarget::Memory) {
         Ok(entries) => entries,
         Err(error) => {
@@ -383,39 +384,40 @@ pub(crate) fn stash_memory_clear(ctx: &Ctx, keep_trash: bool) -> Result<Vec<Stri
     let ids: Vec<String> = entries.iter().map(|text| memory::mem_id(text)).collect();
     // 清理意图：只在文件删除之前登记，让后台对比跳到这次清理有了着落为止。没开过同步
     // 的库里没有同步表，也不需要这个标记。
-    db::write(ctx.db(), |tx| {
-        if sync_db::sync_tables_exist(tx)? {
-            memory::mark_clearing(tx, "memory", &ids)?;
+    let op = db::write(ctx.db(), |tx| {
+        if !sync_db::sync_tables_exist(tx)? {
+            return Ok(String::new());
         }
-        Ok(())
+        memory::mark_clearing(tx, "memory", &ids)
     })?;
-    Ok(ids)
+    Ok((ids, op))
 }
 
 /// `/clear confirm all`（§7.5）的第二半：本地清空已经成功，把清空登记成发给所有设备的
 /// 删除（[`memory::publish_clear`]）——用户已经明说了范围，不等下一轮对比自己发现「文件
-/// 空了」再来问一遍。返回登记的删除数。
+/// 空了」再来问一遍。返回登记的删除数。`op` 是 [`stash_memory_clear`] 返回的操作标识：
+/// 复核与发布在同一个事务里，这次意图已经被另一次登记取代时不发布。
 ///
-/// 没在同步记忆（范围关着、还没有同步数据）时不登记：以后打开这个范围，对比发现原有的
-/// 条目都不在了，会问用户。
+/// 没在同步记忆（范围关着、还没有同步身份）时不登记，但要明确结束这次意图：否则标记
+/// 会一直挡着这个目标的对比。基线留着不动——以后打开这个范围，对比发现原有的条目都
+/// 不在了，会照常问用户。
 pub(crate) fn commit_memory_clear(
     ctx: &Ctx,
     config: &SyncConfig,
     sessions_supported: bool,
     ids: &[String],
+    op: &str,
 ) -> Result<usize> {
-    if !scopes_of(config, sessions_supported).memory {
-        return Ok(0);
-    }
     db::write(ctx.db(), |tx| {
         if !sync_db::sync_tables_exist(tx)? {
             return Ok(0);
         }
         let s = local_settings(tx, config, sessions_supported)?;
-        if s.device.is_empty() {
+        if !s.scopes.memory || s.device.is_empty() {
+            memory::abort_clearing(tx, "memory", op)?;
             return Ok(0);
         }
-        memory::publish_clear(tx, &s, "memory", ids)
+        memory::publish_clear(tx, &s, "memory", ids, op)
     })
 }
 
@@ -625,8 +627,13 @@ pub struct AttachmentInfo {
     /// 传上来；`gone`：保存着它的设备说已经拿不出来了；`lost`：等了很久也没有设备传
     /// 上来。后两种本机不再自动去取，用户点「重试」时才再去看一次。
     pub state: &'static str,
-    /// 本机上这个文件的绝对路径（有的话）。
+    /// 本机上这个文件的绝对路径（有的话）。只给需要经引擎核对登记的后端入口用
+    /// （预览、保存快照）；界面打开文件要走 [`Self::rel_path`]。
     pub local_path: Option<String>,
+    /// `local` 状态下这个文件在 agent 根下的相对路径（正斜杠）：界面按它打开文件
+    /// （`open_media` 只收工作区相对路径）。`cached` 的副本在同步缓存里，只能经
+    /// 「存进工作区」取用。
+    pub rel_path: Option<String>,
     /// 产生这条消息的设备的名字；本机产生的为空。
     pub origin: Option<String>,
 }
@@ -644,6 +651,11 @@ struct FoundRef {
 }
 
 pub(crate) fn attachments(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<Vec<AttachmentInfo>> {
+    // 旧消息的附件索引可能只有一半（那时还没有 artifact 记录）：打开会话时把能准确
+    // 重建的补上，否则清单里会缺掉那些工具结果。补不成不算错，清单照常给。
+    if let Err(error) = crate::wire::backfill_artifact_refs(&ctx.env, channel, chat_id) {
+        tracing::debug!("补附件索引失败（清单照常）: {error}");
+    }
     let found: Vec<FoundRef> = db::read(ctx.db(), |conn| {
         if !sync_db::sync_tables_exist(conn)? {
             return Ok(Vec::new());
@@ -729,21 +741,21 @@ pub(crate) fn attachments(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<Vec
                 let path = ctx.env.resolve_exact(rel_path)?;
                 path.is_file().then(|| path.to_string_lossy().into_owned())
             };
-            let (state, local_path) = match &found.row {
-                Some(row) if row.state == BLOB_REMOTE => (found.remote, None),
+            let (state, local_path, rel_path) = match &found.row {
+                Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
                 Some(row) => match present(&row.rel_path) {
                     Some(path) if row.rel_path.starts_with(SYNC_DIR_PREFIX) => {
-                        ("cached", Some(path))
+                        ("cached", Some(path), None)
                     }
-                    Some(path) => ("local", Some(path)),
-                    None => ("missing", None),
+                    Some(path) => ("local", Some(path), Some(row.rel_path.clone())),
+                    None => ("missing", None, None),
                 },
                 // 没有登记（登记被回收了）：工作区里原来的位置上还有就算本机有。
                 None if found.kind == "file" => match present(&found.path) {
-                    Some(path) => ("local", Some(path)),
-                    None => ("missing", None),
+                    Some(path) => ("local", Some(path), Some(found.path.clone())),
+                    None => ("missing", None, None),
                 },
-                None => ("missing", None),
+                None => ("missing", None, None),
             };
             AttachmentInfo {
                 message_id: found.message_id,
@@ -753,6 +765,7 @@ pub(crate) fn attachments(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<Vec
                 size: found.size,
                 state,
                 local_path,
+                rel_path,
                 origin: found.origin,
             }
         })

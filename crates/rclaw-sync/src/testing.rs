@@ -114,6 +114,7 @@ impl Device {
         merge::merge_round(
             &self.ctx,
             &self.settings,
+            &self.keys,
             &mut self.memo.borrow_mut(),
             false,
         )
@@ -122,8 +123,14 @@ impl Device {
 
     /// 合入一轮，并把悬空区、墓碑全部复查一遍。
     pub fn merge_full(&self) -> MergeReport {
-        merge::merge_round(&self.ctx, &self.settings, &mut self.memo.borrow_mut(), true)
-            .expect("合入")
+        merge::merge_round(
+            &self.ctx,
+            &self.settings,
+            &self.keys,
+            &mut self.memo.borrow_mut(),
+            true,
+        )
+        .expect("合入")
     }
 }
 

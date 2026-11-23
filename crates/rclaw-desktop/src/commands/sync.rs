@@ -12,6 +12,9 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "android", test))]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use rclaw_sync::engine::{
     AttachmentInfo, Backlog, MemoryRestored, MemoryTrashItem, RemoteJob, SelfTestStep, SessionMark,
@@ -77,6 +80,10 @@ async fn save_and_apply(
 /// 同 [`save_and_apply`]，但配置与刚填的密码在同一条命令里交给引擎（[`SyncEngine::
 /// save_storage`]）：密码按这条命令里的配置绑定存储账户，两步之间插进来的别的配置变更
 /// 不会把它绑到另一处存储上。创建 / 加入 / 修改存储设置都走这一条。
+///
+/// 写 `rclaw.toml` **之前**先把「更新意图」落盘：文件写成之后、secrets 还没换的窗口里
+/// 中断（掉电、进程被回收），重启时宿主按意图把 `[sync]` 补齐、引擎按它补 secrets，
+/// 两半收敛到同一套；`persist` 失败则撤掉意图（那份设置没生效）。
 async fn save_with_secret(
     state: &AppState,
     engine: &SyncEngine,
@@ -84,12 +91,20 @@ async fn save_with_secret(
     secret: Option<String>,
 ) -> Result<(), String> {
     let home = state.home.clone();
+    let secret = secret.filter(|secret| !secret.is_empty());
+    let paths = rclaw_sync::SyncPaths::new(&home);
+    let intent_id = rclaw_sync::storage_intent_save(&paths, &config, secret.as_deref())
+        .map_err(|error| format!("记录同步设置更新意图失败: {error}"))?;
     let saved = config.clone();
-    run_blocking("保存同步设置", move || persist(&home, &saved)).await?;
-    engine
-        .save_storage(config, secret.filter(|secret| !secret.is_empty()))
-        .await
-        .map_err(fail)?;
+    if let Err(error) = run_blocking("保存同步设置", move || persist(&home, &saved)).await {
+        // 文件没写成就撤掉意图：下次启动不该按一份没生效的设置去补 secrets。
+        let _ = rclaw_sync::storage_intent_clear_if(&paths, &intent_id);
+        return Err(error);
+    }
+    if let Err(error) = engine.save_storage(config, secret).await.map_err(fail) {
+        // 意图留着（TOML 已经是新的一套）：重启时引擎按它把 secrets 补上。
+        return Err(error);
+    }
     crate::sync_host::emit_status();
     Ok(())
 }
@@ -170,13 +185,7 @@ pub async fn sync_save_storage(
     next.file = config.file;
     next.s3 = config.s3;
     next.validate().map_err(fail)?;
-    let home = state.home.clone();
-    let saved = next.clone();
-    run_blocking("保存同步设置", move || persist(&home, &saved)).await?;
-    let secret = secret.filter(|secret| !secret.is_empty());
-    engine.save_storage(next, secret).await.map_err(fail)?;
-    crate::sync_host::emit_status();
-    Ok(())
+    save_with_secret(&state, &engine, next, secret).await
 }
 
 /// 「测试连接」：用表单上正在填的设置（不必先保存）把存储要用到的操作逐个走一遍。
@@ -280,18 +289,35 @@ pub async fn sync_join_space(
     let engine = handle(&state)?;
     let mut base = config.unwrap_or_else(|| engine.config());
     base.enabled = true;
-    save_with_secret(&state, &engine, base.clone(), secret).await?;
-    let joined = engine.join_space(&code).await.map_err(fail)?;
-    // 密钥已经存到本机、引擎也已经用上了新设置；剩下把设置写回文件，下次启动才连得上。
-    let home = state.home.clone();
-    let written = run_blocking("保存同步设置", move || persist(&home, &joined)).await;
+    // 配对码可能带着自己的存储设置：加入之前先把最终目标写回文件。只在加入之后才写的话，
+    // 「密钥已经存好、设置还没写回」的窗口里重启会按旧设置连到另一处存储；写入失败也
+    // 不会动远端的空间和本机密钥。重复加入同一空间是幂等的（见 `SyncEngine::join_space`）。
+    let preview = rclaw_sync::pairing_config(&base, &code).map_err(fail)?;
+    save_with_secret(&state, &engine, base, secret).await?;
+    if preview != engine.config() {
+        let home = state.home.clone();
+        let target = preview.clone();
+        run_blocking("保存同步设置", move || persist(&home, &target))
+            .await
+            .map_err(|error| format!("保存同步设置失败（还没加入同步空间）：{error}"))?;
+    }
+    let joined = engine.join_space(&code).await.map_err(|error| {
+        format!("{error}（配对码带来的存储设置已经写回 rclaw.toml；修好后可以重试同一配对码）")
+    })?;
+    // 加入之后以引擎实际采用的设置为准再写一次（配对码没带存储设置时与上一份相同）。
+    if joined != preview {
+        let home = state.home.clone();
+        let written = run_blocking("保存同步设置", move || persist(&home, &joined)).await;
+        crate::sync_host::emit_status();
+        return written.map_err(|error| {
+            format!(
+                "已经加入同步空间，但设置没能写回 rclaw.toml（{error}）。\
+                 请在同步设置里再保存一次，否则下次启动后连不上"
+            )
+        });
+    }
     crate::sync_host::emit_status();
-    written.map_err(|error| {
-        format!(
-            "已经加入同步空间，但设置没能写回 rclaw.toml（{error}）。\
-             请在同步设置里再保存一次，否则下次启动后连不上"
-        )
-    })
+    Ok(())
 }
 
 /// 退出同步空间：本机的密钥与存储密码清掉，会话、记忆等数据原样留着。
@@ -1175,24 +1201,71 @@ pub async fn sync_scan_qr_image(data_base64: String) -> Result<String, String> {
 //
 // 走的是会话里「拍照」的同一条采集通道（系统相机拍完，结果写进 capture_result.json），但
 // 这张照片拍的是配对码，等同于钥匙，所以它有自己的采集类型 `scan`，和会话的照片分开：
-// - 照片不进工作区，固定落在 `sync/scan/qr.jpg`。同步目录是文件工具的禁区，文件面板也
-//   看不到；位置固定，这里随时可以无条件删掉它，不用依赖谁还记着它叫什么——拍照期间
-//   进程被系统回收也一样。
-// - 结果里只有 `{"kind":"scan"}`，不带路径；会话那边的消费入口见到它不交给会话。
-// - 扫码期间数据目录里有一个标记。相机回来时标记已经不在了（用户取消了、被收拾掉了），
-//   Kotlin 侧（`CaptureBridge`）当场把照片删掉，不写结果。
+// - 照片不进工作区，按 `sync/scan/qr-<requestId>.jpg` 落在固定目录里。同步目录是文件工具
+//   的禁区，文件面板也看不到；文件名带本轮的请求标识，旧请求迟到的回调只会删自己那张。
+// - 结果是 `{"kind":"scan","request_id":...}`，不带路径；会话那边的消费入口见到它不交给
+//   会话，扫码这边也只认自己 requestId 的结果。
+// - 扫码期间数据目录里有一个标记，内容是这一轮的 requestId。相机回来时标记已经没了或换成
+//   了下一轮（用户取消了、被收拾掉了），Kotlin 侧（`CaptureBridge`）当场把照片删掉，不写
+//   结果；用户拒绝相机权限时，Kotlin 侧立刻写下一份「取消」的终态。
 // 这里读到结果之后把照片读进内存、删掉文件，再识别。没走完的那一次，在应用启动时、下一次
-// 扫码或拍照之前被收拾掉。
+// 扫码或拍照之前被收拾掉；旧版本固定名的 `qr.jpg` 与内容为 `1` 的标记也在这时清掉。
 
-/// 「正在扫配对码」的标记文件（数据目录下，与 capture_result.json 并列）。
+/// 「正在扫配对码」的标记文件（数据目录下，与 capture_result.json 并列），内容是本轮
+/// requestId；旧版本写的是 `1`，对不上任何请求，按「不是本轮」处理。
 const SCAN_MARKER: &str = "capture_scan.pending";
 const CAPTURE_RESULT: &str = "capture_result.json";
-/// 扫码拍下的照片的固定位置（相对数据目录）；与 `CaptureBridge.scanFile` 一致。
-const SCAN_PHOTO: &str = "sync/scan/qr.jpg";
+/// 扫码拍下的照片目录（相对数据目录）；照片按 `qr-<requestId>.jpg` 命名，与
+/// `CaptureBridge.scanFile` 一致。
+const SCAN_PHOTO_DIR: &str = "sync/scan";
 /// 扫码在采集通道里的类型名；与 `NativeBridge.capture` 一致。
 const SCAN_KIND: &str = "scan";
 
-/// 有一次扫码还没走完。
+/// 扫码的文件操作串行化：开始 / 轮询 / 取消可能同时进来（用户在界面切换），而「检查标记
+/// 再删文件」不是一步原子操作。
+static SCAN_LOCK: Mutex<()> = Mutex::new(());
+
+fn scan_lock() -> MutexGuard<'static, ()> {
+    SCAN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 本轮扫码的请求标识：时间戳 + 进程内序号。只含十六进制与 `-`，可以直接拼进文件名。
+/// 桌面端不扫码，只有 Android 与测试用到。
+#[cfg(any(target_os = "android", test))]
+fn new_scan_request_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos:x}-{:x}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// requestId 会拼进文件名（也会从界面传回来），只接受自己生成的形态。
+fn valid_scan_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= 64
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+/// 标记文件的内容（不管是不是某一轮）；没有标记时是 None。
+fn read_scan_marker(home: &Path) -> Option<String> {
+    std::fs::read_to_string(home.join(SCAN_MARKER))
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+/// 标记文件里记的是不是这一轮。标记没了、或者已经换成了别的请求，都算不是。
+fn scan_requested(home: &Path, request_id: &str) -> bool {
+    read_scan_marker(home).as_deref() == Some(request_id)
+}
+
+/// 有一次扫码还没走完（标记存在，不看内容：旧版本留下的固定名标记也算）。
 pub(super) fn scan_pending(home: &Path) -> bool {
     home.join(SCAN_MARKER).exists()
 }
@@ -1210,9 +1283,15 @@ pub(super) fn is_scan_result(raw: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 删掉扫码拍下的照片。返回它是不是确实不在了。
-fn remove_scan_photo(home: &Path) -> bool {
-    match std::fs::remove_file(home.join(SCAN_PHOTO)) {
+/// 一轮扫码拍下的照片。位置按 requestId 分开：旧请求迟到的回调只会动自己那张。
+fn scan_photo_path(home: &Path, request_id: &str) -> PathBuf {
+    home.join(SCAN_PHOTO_DIR)
+        .join(format!("qr-{request_id}.jpg"))
+}
+
+/// 删掉这一轮扫码拍下的照片。返回它是不是确实不在了。
+fn remove_scan_photo(home: &Path, request_id: &str) -> bool {
+    match std::fs::remove_file(scan_photo_path(home, request_id)) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
@@ -1220,6 +1299,35 @@ fn remove_scan_photo(home: &Path) -> bool {
             false
         }
     }
+}
+
+/// 删掉扫码目录里的全部照片（旧版本的固定名 `qr.jpg` 与按 requestId 命名的都在这里）。
+/// 只在整轮收拾时用：拍照期间应用被杀，留下来的照片等同于配对码。
+fn remove_all_scan_photos(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(home.join(SCAN_PHOTO_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("扫码拍下的照片没能删除: {e}");
+        }
+    }
+}
+
+/// 一份采集结果里记的 requestId；不是扫码结果的返回 None。
+fn scan_result_request(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if value.get("kind").and_then(|kind| kind.as_str()) != Some(SCAN_KIND) {
+        return None;
+    }
+    value
+        .get("request_id")
+        .and_then(|request_id| request_id.as_str())
+        .map(|request_id| request_id.to_string())
 }
 
 /// 扫码拍下的照片：已经读进内存，文件已经删掉。
@@ -1237,20 +1345,21 @@ enum ScanCapture {
     Photo(ScanPhoto),
 }
 
-/// 把照片读进内存，然后不管读没读成都删掉文件。
-fn read_and_remove(home: &Path) -> ScanPhoto {
-    let abs = home.join(SCAN_PHOTO);
+/// 把这一轮的照片读进内存，然后不管读没读成都删掉文件。
+fn read_and_remove(home: &Path, request_id: &str) -> ScanPhoto {
+    let abs = scan_photo_path(home, request_id);
     let bytes = match std::fs::metadata(&abs) {
         Ok(meta) if meta.len() > super::MEDIA_MAX_BYTES => Err("照片太大，识别不了".to_string()),
         _ => std::fs::read(&abs).map_err(|e| format!("读取照片失败: {e}")),
     };
-    let leftover = !remove_scan_photo(home);
+    let leftover = !remove_scan_photo(home, request_id);
     ScanPhoto { bytes, leftover }
 }
 
-/// 取走扫码的采集结果。拿到结果（照片或「放弃」）之后，结果文件与标记一并清掉；照片先
-/// 删、标记后清，中途被打断的话照片也已经不在了。
-fn take_scan_capture(home: &Path) -> ScanCapture {
+/// 取走这一轮扫码的采集结果。拿到结果（照片或「放弃」）之后，本轮的结果文件与标记一并
+/// 清掉；照片先删、标记后清，中途被打断的话照片也已经不在了。结果里没有本轮的 requestId
+/// （旧请求迟到的、旧版本写的）就不算数；标记已经换成了下一轮就作废，不碰任何文件。
+fn take_scan_capture(home: &Path, request_id: &str) -> ScanCapture {
     let result_path = home.join(CAPTURE_RESULT);
     let Ok(raw) = std::fs::read_to_string(&result_path) else {
         return ScanCapture::Waiting;
@@ -1262,26 +1371,55 @@ fn take_scan_capture(home: &Path) -> ScanCapture {
     if value.get("kind").and_then(|kind| kind.as_str()) != Some(SCAN_KIND) {
         return ScanCapture::Waiting;
     }
+    if value.get("request_id").and_then(|id| id.as_str()) != Some(request_id) {
+        return ScanCapture::Waiting;
+    }
+    // 标记已经被取消或者换成了下一轮：这份结果不作数，也不动新一轮的任何文件。
+    if !scan_requested(home, request_id) {
+        return ScanCapture::Cancelled;
+    }
     let cancelled = value
         .get("cancelled")
         .and_then(|cancelled| cancelled.as_bool())
         .unwrap_or(false);
     let capture = if cancelled {
-        remove_scan_photo(home);
+        remove_scan_photo(home, request_id);
         ScanCapture::Cancelled
     } else {
-        ScanCapture::Photo(read_and_remove(home))
+        ScanCapture::Photo(read_and_remove(home, request_id))
     };
     let _ = std::fs::remove_file(&result_path);
-    let _ = std::fs::remove_file(home.join(SCAN_MARKER));
+    if scan_requested(home, request_id) {
+        let _ = std::fs::remove_file(home.join(SCAN_MARKER));
+    }
     capture
+}
+
+/// 只收拾这一轮扫码留下的东西：本轮的照片、本轮写下的结果，以及本轮还挂着的标记。
+/// 取消旧请求时新一轮可能已经开始，别人的文件一概不碰。
+fn discard_scan_request(home: &Path, request_id: &str) {
+    remove_scan_photo(home, request_id);
+    let result_path = home.join(CAPTURE_RESULT);
+    if let Ok(raw) = std::fs::read_to_string(&result_path) {
+        if scan_result_request(&raw).as_deref() == Some(request_id) {
+            let _ = std::fs::remove_file(&result_path);
+        }
+    }
+    if scan_requested(home, request_id) {
+        let _ = std::fs::remove_file(home.join(SCAN_MARKER));
+    }
 }
 
 /// 收拾扫码留下的东西（界面被回收、应用被杀、用户点了取消、相机在取消之后才回来）：照片
 /// 无条件删掉，扫码的结果与标记清掉。会话拍照的结果不归这里管。没有东西可收拾时只是
 /// 几次落空的删除，所以应用启动时、每次扫码和拍照之前都调一遍。
 pub(crate) fn discard_scan(home: &Path) {
-    remove_scan_photo(home);
+    let _guard = scan_lock();
+    discard_scan_files(home);
+}
+
+fn discard_scan_files(home: &Path) {
+    remove_all_scan_photos(home);
     let result_path = home.join(CAPTURE_RESULT);
     if let Ok(raw) = std::fs::read_to_string(&result_path) {
         if is_scan_result(&raw) {
@@ -1314,21 +1452,33 @@ impl ScanDto {
     }
 }
 
-/// 开始扫码：拉起系统相机。返回 `ok`，或 `permission_requested`（系统正在问相机权限，
-/// 用户同意后相机自动打开）。之后界面轮询 [`sync_scan_qr_poll`]。
+/// 开始扫码的结果：本轮请求标识 + 相机状态（`ok` / `permission_requested`）。之后的轮询
+/// 与取消都带着这个 requestId。
+#[derive(Serialize)]
+pub struct ScanStartDto {
+    pub request_id: String,
+    pub status: String,
+}
+
+/// 开始扫码：拉起系统相机。返回本轮 requestId 与 `ok` / `permission_requested`（系统正在
+/// 问相机权限，用户同意后相机自动打开）。之后界面带着 requestId 轮询
+/// [`sync_scan_qr_poll`]。
 #[tauri::command]
-pub async fn sync_scan_qr_start(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn sync_scan_qr_start(state: State<'_, AppState>) -> Result<ScanStartDto, String> {
     #[cfg(target_os = "android")]
     {
         let home = state.home.clone();
+        let request_id = new_scan_request_id();
+        let id = request_id.clone();
         // 文件操作和拉起相机（JNI）都放到阻塞线程上。
-        run_blocking("准备扫码", move || {
-            discard_scan(&home);
-            // 上一次会话拍照留下的结果不能被当成这一次的。
-            let _ = std::fs::remove_file(home.join(CAPTURE_RESULT));
-            std::fs::write(home.join(SCAN_MARKER), b"1")
+        let status = run_blocking("准备扫码", move || {
+            let _guard = scan_lock();
+            // 上一轮（包括旧版本固定名的标记 / 照片）留下的东西先收拾干净。
+            discard_scan_files(&home);
+            // 会话拍照的结果不归扫码管：这一轮相机的扫描结果会把它覆盖。
+            std::fs::write(home.join(SCAN_MARKER), &id)
                 .map_err(|e| format!("准备扫码失败: {e}"))?;
-            let started = match rclaw_android::capture(SCAN_KIND) {
+            let started = match rclaw_android::capture(SCAN_KIND, &id) {
                 Ok(status) => match status.strip_prefix("error:") {
                     Some(reason) => Err(format!("相机不可用: {reason}")),
                     None => Ok(status),
@@ -1336,11 +1486,12 @@ pub async fn sync_scan_qr_start(state: State<'_, AppState>) -> Result<String, St
                 Err(e) => Err(format!("无法启动相机: {e}")),
             };
             if started.is_err() {
-                discard_scan(&home);
+                discard_scan_request(&home, &id);
             }
             started
         })
-        .await
+        .await?;
+        Ok(ScanStartDto { request_id, status })
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -1349,17 +1500,30 @@ pub async fn sync_scan_qr_start(state: State<'_, AppState>) -> Result<String, St
     }
 }
 
-/// 看扫码走到哪了。相机回来之后的第一次调用会取走照片、删掉它、识别出配对码。
+/// 看扫码走到哪了。相机回来之后的第一次调用会取走照片、删掉它、识别出配对码。带
+/// requestId：取消后重新扫码时，旧请求的轮询不能取走新一轮的结果。
 #[tauri::command]
-pub async fn sync_scan_qr_poll(state: State<'_, AppState>) -> Result<ScanDto, String> {
+pub async fn sync_scan_qr_poll(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<ScanDto, String> {
     let home = state.home.clone();
     run_blocking("识别二维码", move || {
-        if !scan_pending(&home) {
-            // 没有在扫码：顺手把可能留下的照片收拾掉。
-            discard_scan(&home);
+        if !valid_scan_request_id(&request_id) {
+            return Err("无效的扫码请求".to_string());
+        }
+        let _guard = scan_lock();
+        if !scan_requested(&home, &request_id) {
+            // 没有在扫这一轮（取消了，或者已经开始下一轮）：只收拾本轮自己的东西。
+            if read_scan_marker(&home).is_some() {
+                discard_scan_request(&home, &request_id);
+            } else {
+                // 标记也没了：整轮收拾（含旧版本留下的固定名文件），不碰别的请求。
+                discard_scan_files(&home);
+            }
             return Ok(ScanDto::only("cancelled"));
         }
-        Ok(match take_scan_capture(&home) {
+        Ok(match take_scan_capture(&home, &request_id) {
             ScanCapture::Waiting => ScanDto::only("waiting"),
             ScanCapture::Cancelled => ScanDto::only("cancelled"),
             ScanCapture::Photo(photo) => {
@@ -1388,13 +1552,20 @@ pub async fn sync_scan_qr_poll(state: State<'_, AppState>) -> Result<ScanDto, St
     .await
 }
 
-/// 取消扫码：已经拍下的照片删掉，标记清掉。相机还开着的话，它回来时标记已经不在，
-/// 照片由 Kotlin 侧当场删掉。
+/// 取消扫码：这一轮已经拍下的照片与结果删掉，标记清掉。相机还开着的话，它回来时标记已经
+/// 不是这一轮了，Kotlin 侧当场把照片删掉、不写结果；权限弹窗迟到的授权回调同样作废。
+/// 取消旧请求不会碰新一轮的标记、照片和结果。
 #[tauri::command]
-pub async fn sync_scan_qr_cancel(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn sync_scan_qr_cancel(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
     let home = state.home.clone();
     run_blocking("取消扫码", move || {
-        discard_scan(&home);
+        if valid_scan_request_id(&request_id) {
+            let _guard = scan_lock();
+            discard_scan_request(&home, &request_id);
+        }
         Ok(())
     })
     .await
@@ -1552,33 +1723,53 @@ mod tests {
         let home = dir.path();
         let uploads = home.join("agent/uploads");
         std::fs::create_dir_all(&uploads).unwrap();
-        let photo_path = home.join(SCAN_PHOTO);
+        // 每一轮扫码有自己的 requestId：照片、结果、标记都按它认领。
+        let request_id = "1a2b-3c4d";
+        let other_id = "9f8e-7d6c";
+        let photo_path = scan_photo_path(home, request_id);
+        let other_photo = scan_photo_path(home, other_id);
         std::fs::create_dir_all(photo_path.parent().unwrap()).unwrap();
         let result = home.join(CAPTURE_RESULT);
         let marker = home.join(SCAN_MARKER);
-        const TAKEN: &str = r#"{"kind":"scan"}"#;
+        let taken = format!(r#"{{"kind":"scan","request_id":"{request_id}"}}"#);
+        let cancelled =
+            format!(r#"{{"kind":"scan","request_id":"{request_id}","cancelled":true}}"#);
         const CHAT: &str = r#"{"kind":"photo","file":"uploads/chat.jpg"}"#;
+
+        // requestId 只接受自己生成的形态，且每次都不一样。
+        let first = new_scan_request_id();
+        let second = new_scan_request_id();
+        assert_ne!(first, second);
+        assert!(valid_scan_request_id(&first) && valid_scan_request_id(&second));
+        assert!(!valid_scan_request_id("../a") && !valid_scan_request_id(""));
 
         // 会话拍照的结果和照片不归扫码管：收拾的时候不碰。
         std::fs::write(&result, CHAT).unwrap();
         std::fs::write(uploads.join("chat.jpg"), b"chat photo").unwrap();
-        assert!(!is_scan_result(CHAT) && !is_scan_result("not json") && is_scan_result(TAKEN));
+        assert!(!is_scan_result(CHAT) && !is_scan_result("not json") && is_scan_result(&taken));
         discard_scan(home);
         assert!(result.exists() && uploads.join("chat.jpg").exists());
 
         // 扫码中、相机还没回来（结果文件里还是会话那一份）：等着，不动它。
-        std::fs::write(&marker, b"1").unwrap();
+        std::fs::write(&marker, request_id).unwrap();
         assert!(scan_pending(home));
-        assert!(matches!(take_scan_capture(home), ScanCapture::Waiting));
+        assert!(scan_requested(home, request_id));
+        assert!(matches!(
+            take_scan_capture(home, request_id),
+            ScanCapture::Waiting
+        ));
         assert!(scan_pending(home) && result.exists());
         std::fs::remove_file(&result).unwrap();
-        assert!(matches!(take_scan_capture(home), ScanCapture::Waiting));
+        assert!(matches!(
+            take_scan_capture(home, request_id),
+            ScanCapture::Waiting
+        ));
 
         // 拍到了二维码：照片读进内存后就删，标记与结果文件清掉。
         let code = pairing_code();
         std::fs::write(&photo_path, qr_png(&code).unwrap()).unwrap();
-        std::fs::write(&result, TAKEN).unwrap();
-        let ScanCapture::Photo(photo) = take_scan_capture(home) else {
+        std::fs::write(&result, &taken).unwrap();
+        let ScanCapture::Photo(photo) = take_scan_capture(home, request_id) else {
             panic!("应该拿到照片");
         };
         assert!(!photo.leftover);
@@ -1586,41 +1777,63 @@ mod tests {
         assert!(!photo_path.exists() && !result.exists() && !scan_pending(home));
 
         // 拍的不是二维码：识别不出来，照片照样删。
-        std::fs::write(&marker, b"1").unwrap();
+        std::fs::write(&marker, request_id).unwrap();
         std::fs::write(&photo_path, b"not an image").unwrap();
-        std::fs::write(&result, TAKEN).unwrap();
-        let ScanCapture::Photo(photo) = take_scan_capture(home) else {
+        std::fs::write(&result, &taken).unwrap();
+        let ScanCapture::Photo(photo) = take_scan_capture(home, request_id) else {
             panic!("应该拿到照片");
         };
         assert!(decode_pairing_qr(&photo.bytes.unwrap()).is_err());
-        assert!(!photo_path.exists() && !scan_pending(home));
+        assert!(!photo_path.exists() && !result.exists() && !scan_pending(home));
 
         // 用户放弃了拍照：就算相机留下了半张照片也删掉。
-        std::fs::write(&marker, b"1").unwrap();
+        std::fs::write(&marker, request_id).unwrap();
         std::fs::write(&photo_path, b"half").unwrap();
-        std::fs::write(&result, r#"{"kind":"scan","cancelled":true}"#).unwrap();
-        assert!(matches!(take_scan_capture(home), ScanCapture::Cancelled));
+        std::fs::write(&result, &cancelled).unwrap();
+        assert!(matches!(
+            take_scan_capture(home, request_id),
+            ScanCapture::Cancelled
+        ));
         assert!(!photo_path.exists() && !result.exists() && !scan_pending(home));
 
         // 结果说拍了、照片却不在：报错，不崩溃。
-        std::fs::write(&marker, b"1").unwrap();
-        std::fs::write(&result, TAKEN).unwrap();
-        let ScanCapture::Photo(photo) = take_scan_capture(home) else {
+        std::fs::write(&marker, request_id).unwrap();
+        std::fs::write(&result, &taken).unwrap();
+        let ScanCapture::Photo(photo) = take_scan_capture(home, request_id) else {
             panic!("应该走到照片分支");
         };
         assert!(photo.bytes.is_err() && !photo.leftover);
 
-        // 没走完的扫码（界面被回收、应用被杀）：收拾时把照片、结果、标记都删掉。
-        std::fs::write(&marker, b"1").unwrap();
-        std::fs::write(&photo_path, b"qr photo").unwrap();
-        std::fs::write(&result, TAKEN).unwrap();
-        discard_scan(home);
-        assert!(!photo_path.exists() && !result.exists() && !scan_pending(home));
+        // 取消后重新扫码、旧相机回调迟到：标记已经是新一轮的，旧结果作废，谁也不碰。
+        std::fs::write(&marker, other_id).unwrap();
+        std::fs::write(&photo_path, b"old qr photo").unwrap();
+        std::fs::write(&result, &taken).unwrap();
+        assert!(matches!(
+            take_scan_capture(home, request_id),
+            ScanCapture::Cancelled
+        ));
+        assert!(photo_path.exists() && result.exists() && scan_requested(home, other_id));
 
-        // 相机在取消之后才回来、结果也没写成：没有标记、没有结果，照片照样删。
+        // 旧请求的取消只收拾自己的照片与结果，不碰新一轮的标记和照片。
+        std::fs::write(&other_photo, b"new qr photo").unwrap();
+        discard_scan_request(home, request_id);
+        assert!(!photo_path.exists() && !result.exists());
+        assert!(other_photo.exists() && scan_requested(home, other_id));
+
+        // 整轮收拾（启动 / 开始扫码 / 会话拍照之前）：旧版本固定名与本轮的文件一起删掉，
+        // 会话的照片不受影响。
+        std::fs::write(&marker, b"1").unwrap();
+        std::fs::write(home.join(SCAN_PHOTO_DIR).join("qr.jpg"), b"legacy").unwrap();
         std::fs::write(&photo_path, b"qr photo").unwrap();
+        std::fs::write(&other_photo, b"qr photo").unwrap();
+        std::fs::write(
+            &result,
+            format!(r#"{{"kind":"scan","request_id":"{other_id}"}}"#),
+        )
+        .unwrap();
         discard_scan(home);
-        assert!(!photo_path.exists());
+        assert!(!photo_path.exists() && !other_photo.exists() && !result.exists());
+        assert!(!home.join(SCAN_PHOTO_DIR).join("qr.jpg").exists() && !scan_pending(home));
 
         // 会话的照片自始至终不受影响。
         assert!(uploads.join("chat.jpg").exists());

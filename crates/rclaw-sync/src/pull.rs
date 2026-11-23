@@ -533,24 +533,43 @@ impl DevicePull<'_> {
         let Some(newest) = &head.rollup else {
             return Ok(true);
         };
-        let key = format!("{}|{}|{}", self.device, newest.name, newest.digest);
+        // 链的进度按设备记：来源端打了新包时，新包头指向的环往往已经在走过的链里，接着
+        // 用那一段，不必从新包头把整条链再走一遍（每轮都从新包头重走的设备永远到不了
+        // 本机位置）。
+        let key = self.device.to_string();
         let mut chain = self.pack_chains.remove(&key).unwrap_or_default();
-        if chain.links.is_empty() {
-            chain.device = self.device.to_string();
-            chain.links.push(RollupLink {
-                name: newest.name.clone(),
-                digest: newest.digest.clone(),
-                to: newest.to,
-            });
+        let newest_link = RollupLink {
+            name: newest.name.clone(),
+            digest: newest.digest.clone(),
+            to: newest.to,
+        };
+        chain.device = self.device.to_string();
+        // 上一次记下的链（新的在前）。新包头指向的环要是就在里面，接着用那一段。
+        let mut previous = Some(chain.links.clone());
+        match chain
+            .links
+            .iter()
+            .position(|link| link.name == newest_link.name && link.digest == newest_link.digest)
+        {
+            // 这一环已经走过：去掉它前面那些过时的头，从它接着往回找。
+            Some(index) => {
+                chain.links.truncate(index + 1);
+                previous = None;
+            }
+            None => {
+                chain.links.clear();
+                chain.links.push(newest_link);
+            }
         }
+        chain.complete = false;
         // 往回找：只记下各包的名字与摘要（密文落在临时目录里，往前处理时不必再下载）。
-        // 这一阶段不拿字节预算当停止条件——卡住的位置在任何可交的段之外，字节预算只会
-        // 让「包比预算大、缓存又留不住」的设备每轮重下同一个包停在原地。每轮新下载的
-        // 环数按 [`PACK_LINKS_PER_ROUND`] 封顶，链的进度跨轮保留。
+        // 这一阶段的网络预算与别的部分共享，但每轮至少允许下载一个新包：卡住的位置在
+        // 任何可交的段之外，一点字节都不让走的话，「包比预算大、缓存又留不住」的设备
+        // 永远动不了。新下载的环数另有条数封顶，链的进度跨轮保留。
         let mut walked = 0usize;
         while !chain.complete {
             let link = chain.links.last().expect("至少一个").clone();
-            let (pack, downloaded, network) = load_pack(
+            let loaded = load_pack(
                 self.ctx,
                 self.transport,
                 self.keys,
@@ -558,26 +577,54 @@ impl DevicePull<'_> {
                 &link.name,
                 &link.digest,
             )
-            .await?;
+            .await;
+            let (pack, downloaded, network) = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    // 已经找到的链留着：下一轮从这里接着走，不重走已经下载过的包。
+                    self.remember_chain(key, chain);
+                    return Err(error);
+                }
+            };
             if downloaded {
                 self.spent += network;
                 walked += 1;
-                if walked >= PACK_LINKS_PER_ROUND {
-                    // 这一轮往回找的深度到顶：链的进度留着，下一轮接着往回找。
-                    self.remember_chain(key, chain);
-                    return Ok(false);
-                }
             }
             if pack.header.from <= peer.fetched + 1 {
                 chain.complete = true;
                 break;
             }
-            match pack.header.prev {
-                Some(prev) => chain.links.push(prev),
-                // 更早的日志已经被回收：只能从这里读起（`locate` 已确认位置不早于回收点）。
-                None => {
-                    chain.complete = true;
+            // 新包头指向的环在上一轮的链里：把那一整段接在后面，不必重新下载。
+            let mut seeded = false;
+            if let Some(prev) = pack.header.prev.as_ref() {
+                if let Some(old) = previous.take() {
+                    if let Some(at) = old
+                        .iter()
+                        .position(|link| link.name == prev.name && link.digest == prev.digest)
+                    {
+                        chain.links.extend(old[at..].iter().cloned());
+                        seeded = true;
+                    }
                 }
+            } else {
+                previous = None;
+            }
+            if seeded {
+                // 已经接上了旧链，下一次循环直接处理那一段。
+            } else {
+                match pack.header.prev {
+                    Some(prev) => chain.links.push(prev),
+                    // 更早的日志已经被回收：只能从这里读起（`locate` 已确认位置不早于回收点）。
+                    None => {
+                        chain.complete = true;
+                    }
+                }
+            }
+            if walked >= PACK_LINKS_PER_ROUND || (walked > 0 && self.exhausted()) {
+                // 这一轮往回找的深度或网络预算到顶：链的进度留着，下一轮接着往回找
+                // （当前这一环的回指已经处理过，不会重复下载它）。
+                self.remember_chain(key, chain);
+                return Ok(false);
             }
         }
         for link in chain.links.iter().rev() {
@@ -591,10 +638,10 @@ impl DevicePull<'_> {
                 // 停在中途：链已经完整找到了，下一轮直接从链上接着往前处理（已处理过的
                 // 段按位置跳过），不必重走回溯。缓存里还有这个包就接着读：读取游标的
                 // 推进不依赖网络预算，读缓存不再花网络。
-                self.remember_chain(key, chain);
+                self.remember_chain(key.clone(), chain.clone());
                 return Ok(false);
             }
-            let (pack, downloaded, network) = load_pack(
+            let loaded = load_pack(
                 self.ctx,
                 self.transport,
                 self.keys,
@@ -602,7 +649,15 @@ impl DevicePull<'_> {
                 &link.name,
                 &link.digest,
             )
-            .await?;
+            .await;
+            let (pack, downloaded, network) = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    // 链已经完整找到了：留着它，下一轮接着往前处理。
+                    self.remember_chain(key.clone(), chain.clone());
+                    return Err(error);
+                }
+            };
             if downloaded {
                 self.spent += network;
             }

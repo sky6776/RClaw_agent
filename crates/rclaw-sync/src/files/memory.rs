@@ -54,13 +54,19 @@ const WIPE_MIN: usize = 3;
 const CLEARING_MAX_MS: i64 = 30 * 60 * 1000;
 /// 「原有的条目都不见了」这条待处理事项的类别。
 const KIND_WIPE: &str = "mem-wipe";
+/// 「上一次清空只成功了一半」这条待处理事项的类别。
+const KIND_CLEARING: &str = "mem-clearing";
 
 /// 登记一个目标「正在清理（待提交）」：在删除它的文件**之前**调用（`/clear confirm all`
 /// 的留副本那一步）。这个状态在文件缺失、命令失败、进程重启之后都不会解除，也没有超时
 /// ——普通对比不得发布任何删除，直到清理被明确提交（[`publish_clear`] 把标记转成等待态）
-/// 或文件里所有条目都回来了（用户从备份恢复了，这次清空被撤销）。重试清理时与上一次的
-/// 条目集合合并：文件可能已经删掉了一部分，这次读出来的条目会变少。
-pub(crate) fn mark_clearing(conn: &Connection, target: &str, ids: &[String]) -> Result<()> {
+/// 或明确撤销（[`abort_clearing`]）。文件里的条目全都在**不**算撤销：登记与删文件之间
+/// 它们本来就在。重试清理时与上一次的条目集合合并：文件可能已经删掉了一部分，这次读出来
+/// 的条目会变少。
+///
+/// 返回这次登记的操作标识：提交与撤销都要带上它，对不上说明这次意图已经被另一次登记
+/// 取代。先调它把意图耐久落库，调用方再删本机文件。
+pub(crate) fn mark_clearing(conn: &Connection, target: &str, ids: &[String]) -> Result<String> {
     let mut known = db::state_get(conn, SCOPE_CLEARING, target)?
         .and_then(|row| row.json::<Clearing>())
         .map(|clearing| clearing.ids)
@@ -74,8 +80,27 @@ pub(crate) fn mark_clearing(conn: &Connection, target: &str, ids: &[String]) -> 
         at: now_ms(),
         ids: known,
         staged: true,
+        op: crate::ids::random_hex::<8>(),
     };
-    db::state_put_json(conn, SCOPE_CLEARING, target, db::HLC_ZERO, &clearing)
+    let op = clearing.op.clone();
+    db::state_put_json(conn, SCOPE_CLEARING, target, db::HLC_ZERO, &clearing)?;
+    Ok(op)
+}
+
+/// 明确撤销一次清空：用户作废了「清空没有完成」的这次清理，或者记忆范围关着时本机已经
+/// 清空成功（没有可发布的删除）。`op` 对不上说明意图已经被另一次登记取代，什么都不动，
+/// 返回假。撤销之后这个目标回到普通对比：文件里少了什么就照常发布或者问用户
+/// （`mem-wipe`）。
+pub(crate) fn abort_clearing(conn: &Connection, target: &str, op: &str) -> Result<bool> {
+    let current = db::state_get(conn, SCOPE_CLEARING, target)?
+        .and_then(|row| row.json::<Clearing>());
+    match current {
+        Some(clearing) if clearing.op == op => {
+            db::state_del(conn, SCOPE_CLEARING, target)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// 等用户回答：文件里原有的条目都不见了，是不是有意删的。
@@ -94,7 +119,9 @@ struct Wipe {
 
 /// `/clear confirm all` 的清理进度，分两个阶段：
 /// 待提交（`staged`）：删除还没发布，调用方正要删文件。文件没了、命令失败、重启都不
-/// 解除它——只有清理被明确提交（转成等待态）或条目全部回到文件里（撤销）才放行。
+/// 解除它——只有清理被明确提交（[`publish_clear`]，转成等待态）或明确撤销
+/// （[`abort_clearing`]）才放行。对比的时候文件里条目还在是常态（登记与删文件之间），
+/// 不能当成用户从备份恢复。
 /// 等待态（`staged` = false）：删除已经发布（[`publish_clear`]），在等调用方把文件删完。
 /// 条目还剩着就按窗口暂停对比，超时后照常（那时文件里的条目会被当成本机新写的重新发出，
 /// 与已发布的删除在落地时按 HLC 见分晓）。
@@ -102,12 +129,15 @@ struct Wipe {
 struct Clearing {
     /// 进入当前阶段的时刻（Unix 毫秒）。
     at: i64,
-    /// 这次清理涉及的条目（本机 id）。等待态下它们都不在了，就是删完了；待提交态下它们
-    /// 全部回来，就是清理被撤销了。
+    /// 这次清理涉及的条目（本机 id）。等待态下它们都不在了，就是删完了。
     ids: Vec<String>,
     /// 还是「待提交」状态（删除尚未发布）。
     #[serde(default)]
     staged: bool,
+    /// 这次登记的操作标识。提交与撤销都带着它复核，对不上说明这次意图已经被另一次登记
+    /// 取代。旧记录没有这个字段，读出来是空的（只能重新执行一次清空来推进）。
+    #[serde(default)]
+    op: String,
 }
 
 /// 条目身份：空白规整之后文本摘要的前 32 位。
@@ -308,13 +338,24 @@ fn replay(conn: &Connection, target: &str) -> Result<()> {
 ///
 /// `present` 是文件里现有条目的本机 id：调用方随后删掉文件，在那之前这个目标不对比
 /// （见 [`Clearing`]）——否则文件还在、基线已经空了的那一刻，这些条目会被当成本机新写的
-/// 再发出去。
+/// 再发出去。`op` 是 [`mark_clearing`] 返回的操作标识：复核必须和发布在同一个事务里
+/// （调用方用 [`db::write`] 包着），对不上说明这次意图已经被另一次登记或撤销取代，不
+/// 登记任何删除。
 pub(crate) fn publish_clear(
     conn: &Connection,
     s: &Settings,
     target: &str,
     present: &[String],
+    op: &str,
 ) -> Result<usize> {
+    let staged = db::state_get(conn, SCOPE_CLEARING, target)?
+        .and_then(|row| row.json::<Clearing>())
+        .is_some_and(|clearing| clearing.staged && clearing.op == op);
+    if !staged {
+        return Err(SyncError::other(
+            "这次清空的登记已经变化（可能已经重新执行过或撤销），没有登记任何删除",
+        ));
+    }
     let prefix = format!("{target}/");
     let mut known: BTreeSet<String> = db::state_get(conn, SCOPE_BASE, target)?
         .and_then(|row| row.json::<BTreeMap<String, String>>())
@@ -342,10 +383,12 @@ pub(crate) fn publish_clear(
         db::state_del(conn, SCOPE_CLEARING, target)?;
     } else {
         // 待提交的清理现在有了着落（删除已经发出去了）：转成等待态，等文件删完。
+        // 操作标识留着：这一次清理的提交已经做完，但标识仍是它的身份。
         let clearing = Clearing {
             at: now_ms(),
             ids: present.to_vec(),
             staged: false,
+            op: op.to_string(),
         };
         db::state_put_json(conn, SCOPE_CLEARING, target, db::HLC_ZERO, &clearing)?;
     }
@@ -529,6 +572,14 @@ fn reconcile_target(
         return Ok(());
     }
 
+    // 「待提交」的清理（见 [`Clearing`]）：调用方正要删（或者已经删掉了一部分）这台设备上
+    // 的记忆文件。这个目标整体让路——不读基线、不动文件、不发布，也不动标记。文件里的
+    // 条目全都在也不能当成「用户从备份恢复了」：登记与删文件之间它们本来就在。只有明确的
+    // 提交（[`publish_clear`]）或撤销（[`abort_clearing`]）能结束这个阶段。
+    if clearing.as_ref().is_some_and(|clearing| clearing.staged) {
+        return Ok(());
+    }
+
     // 漂移的文件（条目之后有手工写的别的内容）不同步：程序不会去覆盖它。
     let drifted = target.store.is_drifted(target.which)?;
     if drifted != held {
@@ -558,27 +609,19 @@ fn reconcile_target(
         .and_then(|row| row.json())
         .unwrap_or_default();
 
-    // `/clear confirm all` 的两个阶段（见 [`Clearing`]）：
-    // 待提交：删除还没发布，无论文件删没删成、重启没重启、过了多久，普通对比都不得
-    // 发布删除——只有条目全部回到文件里（用户从备份恢复了，撤销这次清理）或清理被
-    // 明确提交（标记已转等待态）才继续。
-    // 等待态：删除已经发布，在等文件删完。条目还剩着就等（这时对比会把它们当成本机
-    // 新写的再发给所有设备）；超时后放行，让落地去分胜负。
+    // 等待态（见 [`Clearing`]）：删除已经发布，在等文件删完。条目还剩着就等（这时对比
+    // 会把它们当成本机新写的再发给所有设备）；超时后放行，让落地去分胜负。
+    let mut expected_clearing = clearing.as_ref().map(|clearing| clearing.op.clone());
     if let Some(clearing) = &clearing {
-        if clearing.staged {
-            let restored = clearing.ids.iter().all(|id| current.contains_key(id));
-            if !restored {
-                return Ok(());
-            }
-        } else {
-            let remaining = clearing.ids.iter().any(|id| current.contains_key(id));
-            if remaining && (0..CLEARING_MAX_MS).contains(&(now_ms() - clearing.at)) {
-                return Ok(());
-            }
+        let remaining = clearing.ids.iter().any(|id| current.contains_key(id));
+        if remaining && (0..CLEARING_MAX_MS).contains(&(now_ms() - clearing.at)) {
+            return Ok(());
         }
         db::write(ctx.db(), |tx| {
             db::state_del(tx, SCOPE_CLEARING, &target.name)
         })?;
+        // 标记是这里撤掉的：发布事务里复核时按「没有标记」比。
+        expected_clearing = None;
     }
 
     // 基线里的条目在文件里一条都不剩：文件多半是被清空、删掉或换掉了。把这些删除发出去，
@@ -687,11 +730,17 @@ fn reconcile_target(
 
     let published = plan.publish_add.len() + plan.publish_del.len();
     if published > 0 || !handled.is_empty() || base != old_base || base_row.is_none() || answered {
-        // 登记操作之前再复核一次：文件落地之后刚好登记的待提交清理，不能被这轮的发布越过。
-        if clearing_pending(ctx, &target.name)? {
-            return Ok(());
-        }
         db::write(ctx.db(), |tx| {
+            // 与清理共用同一排他条件：复核放进写事务里，登记清空与这里的发布不可能交错。
+            // 这一轮开始时没有进行中的清理（待提交的已经整体让路，等待态刚由上面撤掉），
+            // 事务里却出现了清理标记——说明 `/clear` 恰好在复核之后登记了新的清理：这一
+            // 轮的发布整体作废，下一轮再对比（文件已落地的远端变更幂等）。
+            let current = db::state_get(tx, SCOPE_CLEARING, &target.name)?
+                .and_then(|row| row.json::<Clearing>())
+                .map(|clearing| clearing.op);
+            if current != expected_clearing {
+                return Ok(());
+            }
             if answered {
                 db::state_del(tx, SCOPE_WIPE, &target.name)?;
             }
@@ -812,19 +861,20 @@ pub(crate) fn derived(conn: &Connection) -> Result<Vec<PendingItem>> {
             continue;
         }
         items.push(PendingItem {
-            id: status::item_id("mem-clearing", &target),
-            kind: "mem-clearing".into(),
+            id: status::item_id(KIND_CLEARING, &target),
+            kind: KIND_CLEARING.into(),
             title: format!("{}的清空没有完成", describe(&target)),
             detail: "上一次「清空所有设备」只成功了一半：本机文件还没有清理干净，\
                      这次清理也没有登记为删除。同步先停在这里：这些条目既不删除、\
                      也不发给其他设备，避免误删。\n\
-                     想继续清空，重新执行一次清空命令；改变了主意，把条目放回文件\
-                     （回收站里有副本），同步会自动恢复。"
+                     想继续清空，重新执行一次清空命令；不打算清空了，选「拒绝」：\
+                     这次清理作废，这个目标按文件现状继续同步（少掉的条目会照常问用户\
+                     或者作为删除发出去）。"
                 .into(),
             origin: None,
             at_ms: clearing.at,
-            actions: Vec::new(),
-            payload: serde_json::json!({ "target": target }),
+            actions: vec!["reject".into()],
+            payload: serde_json::json!({ "target": target, "hlc": clearing.op }),
         });
     }
     Ok(items)
@@ -870,6 +920,43 @@ pub(crate) fn decide_wipe(
             }
             _ => return Err(SyncError::invalid("这条待处理事项不支持这个操作")),
         }
+        Ok(true)
+    })
+}
+
+/// 用户回答了「上一次清空没有完成」（`id` 是那条事项的标识）。不是这类事项返回
+/// `Ok(false)`，调用方按别的类别接着找。
+///
+/// 唯一的操作 `reject`：这次清空作废——撤销待提交的标记（[`abort_clearing`]），这个目标
+/// 回到普通对比。`reviewed` 是用户看到的那一版的登记标识：这期间重新执行过一次清空的话
+/// 不办，别撤错。
+pub(crate) fn decide_clearing(
+    ctx: &Ctx,
+    id: &str,
+    action: &str,
+    reviewed: Option<&str>,
+) -> Result<bool> {
+    if !id.starts_with(KIND_CLEARING) {
+        return Ok(false);
+    }
+    db::write(ctx.db(), |tx| {
+        if !rclaw_store::sync_db::sync_tables_exist(tx)? {
+            return Ok(false);
+        }
+        let found = db::state_scan(tx, SCOPE_CLEARING, "")?
+            .into_iter()
+            .find(|(target, _)| status::item_id(KIND_CLEARING, target) == id);
+        let Some((target, row)) = found else {
+            return Ok(false);
+        };
+        let clearing: Clearing = row.json().unwrap_or_default();
+        if action != "reject" {
+            return Err(SyncError::invalid("这条待处理事项不支持这个操作"));
+        }
+        if !clearing.staged || reviewed != Some(clearing.op.as_str()) {
+            return Err(SyncError::other("这项清空确认已经变化，请重新查看后再操作"));
+        }
+        abort_clearing(tx, &target, &clearing.op)?;
         Ok(true)
     })
 }
@@ -1228,13 +1315,14 @@ mod tests {
         testing::ship(&b, &a);
         a.merge();
 
-        // `/clear confirm all`：已知的四条都作为删除发出去。
+        // `/clear confirm all`：先登记清理意图（与运行时一样，在删文件之前），再提交。
         let present: Vec<String> = list(&a, MemoryTarget::Memory)
             .iter()
             .map(|text| mem_id(text))
             .collect();
+        let op = db::write(a.ctx.db(), |tx| mark_clearing(tx, "memory", &present)).unwrap();
         let published = db::write(a.ctx.db(), |tx| {
-            publish_clear(tx, &a.settings, "memory", &present)
+            publish_clear(tx, &a.settings, "memory", &present, &op)
         })
         .unwrap();
         assert_eq!(published, 4);
@@ -1261,5 +1349,60 @@ mod tests {
             .unwrap();
         exchange(&a, &b);
         assert_eq!(list(&b, MemoryTarget::Memory), ["written after the clear"]);
+    }
+
+    #[test]
+    fn a_staged_clear_is_not_undone_by_the_entries_still_being_there() {
+        let a = Device::new();
+        for text in ["entry one", "entry two", "entry three"] {
+            a.ctx.memory.add_entry(MemoryTarget::Memory, text).unwrap();
+        }
+        assert_eq!(sync_files(&a).published, 3);
+        // `/clear confirm all` 刚登记、清理线程还没删文件：对比看到条目都还在，不能当成
+        // 用户从备份恢复了而撤掉标记。
+        let present: Vec<String> = list(&a, MemoryTarget::Memory)
+            .iter()
+            .map(|text| mem_id(text))
+            .collect();
+        let _op = db::write(a.ctx.db(), |tx| mark_clearing(tx, "memory", &present)).unwrap();
+        let report = sync_files(&a);
+        assert_eq!((report.published, report.applied), (0, 0));
+        let items = db::read(a.ctx.db(), derived).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "mem-clearing");
+        // 删本机文件只成功了一半（MEMORY.md 删了，另一个文件失败，提交没走到）：下一轮
+        // 对比仍然不得把缺掉的条目当成删除发出去。
+        std::fs::remove_file(&a.ctx.layout.memory_file).unwrap();
+        assert_eq!(sync_files(&a).published, 0);
+        // 只有明确的撤销才结束这次意图。
+        assert!(decide_clearing(&a.ctx, &items[0].id, "reject", items[0].version()).unwrap());
+        assert!(db::read(a.ctx.db(), derived).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_publish_under_a_superseded_clear_registration_is_refused() {
+        let a = Device::new();
+        for text in ["entry one", "entry two"] {
+            a.ctx.memory.add_entry(MemoryTarget::Memory, text).unwrap();
+        }
+        assert_eq!(sync_files(&a).published, 2);
+        let present: Vec<String> = list(&a, MemoryTarget::Memory)
+            .iter()
+            .map(|text| mem_id(text))
+            .collect();
+        let _first = db::write(a.ctx.db(), |tx| mark_clearing(tx, "memory", &present)).unwrap();
+        // 用户重试了一次清空：第一次登记的操作标识不再有权提交。
+        let second = db::write(a.ctx.db(), |tx| mark_clearing(tx, "memory", &present)).unwrap();
+        assert!(db::write(a.ctx.db(), |tx| {
+            publish_clear(tx, &a.settings, "memory", &present, "00000000")
+        })
+        .is_err());
+        assert_eq!(sync_files(&a).published, 0);
+        // 这一次登记的标识对得上才提交得出去。
+        let published = db::write(a.ctx.db(), |tx| {
+            publish_clear(tx, &a.settings, "memory", &present, &second)
+        })
+        .unwrap();
+        assert_eq!(published, 2);
     }
 }

@@ -74,7 +74,9 @@ fn meta_of(name: String, meta: &std::fs::Metadata) -> ObjectMeta {
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos().to_string());
-    let stable_version = modified.is_some();
+    // 修改时间只是提示：同步工具复制、保留时间戳时两版等长内容会带着同一个值。共享
+    // 目录不是「强版本」存储，判重只能靠有界窗口里的实读。
+    let stable_version = false;
     ObjectMeta {
         name,
         size: meta.len(),

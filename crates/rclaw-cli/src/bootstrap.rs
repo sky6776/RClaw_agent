@@ -496,6 +496,8 @@ pub async fn assemble_core_with(
     let _ = agent_tools_registry.set(tools.clone());
 
     // 斜杠命令注册表：/llmodel 持久化到调用方指定的 rclaw.toml 路径。
+    // 后面收尾没存完的同步设置还要写回同一个文件：留一份路径。
+    let sync_config_path = slash_config_path.clone();
     let slash = Arc::new({
         let reg = SlashRegistry::new(hot.clone(), slash_config_path, cfg.llm.provider.clone());
         match web_search_control.clone() {
@@ -562,8 +564,22 @@ pub async fn assemble_core_with(
 
     // 多端同步：这里只备料（不起线程、不碰磁盘），引擎要等宿主建出 AgentLoop 才能接上
     // ——它靠运行时的会话生命周期句柄与 turn 互斥。
+    // 上次保存存储设置只写了一半（TOML 还没换上）：按落盘的更新意图把 `[sync]` 补齐，
+    // 再交给引擎；secrets 由引擎按同一条意图收尾。两个文件最终收敛到同一套。
+    let mut sync_config = cfg.sync.clone();
+    let sync_paths = rclaw_sync::SyncPaths::new(&data_root);
+    match rclaw_sync::storage_intent_config(&sync_paths) {
+        Ok(Some(intent)) if intent != sync_config => {
+            match crate::sync::save_sync_config(&sync_config_path, &sync_config, &intent) {
+                Ok(()) => sync_config = intent,
+                Err(error) => tracing::warn!("补齐没存完的存储设置失败（下次启动再试）: {error}"),
+            }
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!("读取没存完的存储设置失败: {error}"),
+    }
     let sync = crate::sync::SyncSeed::new(
-        cfg.sync.clone(),
+        sync_config,
         data_root,
         session.clone(),
         memory.clone(),

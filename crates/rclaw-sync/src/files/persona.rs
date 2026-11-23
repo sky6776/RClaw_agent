@@ -105,11 +105,17 @@ enum Step<'a> {
     Settle {
         row: &'a Row,
         base: Option<Option<String>>,
+        /// 盘上实际命中的文件：只差大小写时和寄存器里的写法不同。
+        local_path: String,
     },
     /// 本机的版本发布出去。
     Publish { op: Op, base: Option<String> },
     /// 远端版本等用户确认。
-    Ask { row: &'a Row },
+    Ask {
+        row: &'a Row,
+        /// 盘上实际命中的文件：确认页要显示它，接受/拒绝也按它来。
+        local_path: String,
+    },
     /// 没有可发布的东西了（生效人格被清空）：只把基线清掉。
     Forget,
 }
@@ -119,6 +125,21 @@ fn set_base(conn: &Connection, path: &str, base: &Option<String>) -> Result<()> 
         Some(hash) => db::state_put(conn, SCOPE_BASE, path, db::HLC_ZERO, None, Some(hash)),
         None => db::state_del(conn, SCOPE_BASE, path),
     }
+}
+
+/// 记基线。远端那个写法和盘上的写法指向同一个文件时两边都记：下一轮对比是从盘上的
+/// 名字出发的，只记一边会让它看起来像本机的新改动，再发一遍。
+fn set_base_for(
+    conn: &Connection,
+    path: &str,
+    local_path: &str,
+    base: &Option<String>,
+) -> Result<()> {
+    set_base(conn, path, base)?;
+    if local_path != path {
+        set_base(conn, local_path, base)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn reconcile(
@@ -153,24 +174,39 @@ pub(crate) fn reconcile(
         .chain(register.keys().copied())
         .chain(bases.keys().map(String::as_str))
         .collect();
+    // 基线可能记在远端那个写法上（旧版本只按原字符串记）：按本机落点建一份索引，
+    // 盘上的名字也能找回同一份文件的基线，免得把它当成新改动再发一遍。
+    let on_disk_bases: BTreeMap<String, &String> = bases
+        .iter()
+        .map(|(key, base)| (soul::sync_local_rel(&ctx.layout, key), base))
+        .collect();
 
     let mut steps: Vec<(&str, Step)> = Vec::new();
     for path in paths {
-        let content = local.get(path);
+        // 只差大小写的名字在本机不分大小写的卷上就是同一个文件（远端的 `notes.md` 落到
+        // 盘上可能是已有的 `Notes.md`）。本机有没有原件、往哪写、删哪个，都按盘上那个
+        // 文件判断；按原字符串判断会把本机的原件看成不存在，接受时静默覆盖。
+        let local_path = soul::sync_local_rel(&ctx.layout, path);
+        let aliased = local_path != path;
+        let content = local.get(&local_path);
         let local_hash = content.map(|content| sha256_hex(content.as_bytes()));
-        let base = bases.get(path);
-        // 本机的版本能不能发布：有内容就能；删除只对人格库文件有意义。
+        let base = bases
+            .get(path)
+            .or_else(|| bases.get(&local_path))
+            .or_else(|| on_disk_bases.get(&local_path).copied());
+        // 本机的版本能不能发布：有内容就能；删除只对人格库文件有意义。盘上的名字和远端
+        // 给的不一样时不从这里发：本机那个名字自己会发，同一个改动不发两遍。
         let local_op = match content {
-            Some(content) => Some(Op::FilePut {
+            Some(content) if !aliased => Some(Op::FilePut {
                 path: path.to_string(),
                 hash: local_hash.clone().unwrap_or_default(),
                 content: content.clone(),
             }),
-            None if path != SYNC_ACTIVE_PATH => Some(Op::FileDel {
+            None if !aliased && path != SYNC_ACTIVE_PATH => Some(Op::FileDel {
                 path: path.to_string(),
                 hash: base.cloned().unwrap_or_default(),
             }),
-            None => None,
+            _ => None,
         };
         let changed = local_hash.as_ref() != base;
         match register.get(path).copied().filter(|row| row.is_unapplied()) {
@@ -188,6 +224,7 @@ pub(crate) fn reconcile(
                         Step::Settle {
                             row,
                             base: Some(local_hash),
+                            local_path,
                         },
                     ));
                 } else if let (true, Some(op)) = (local_newer, local_op) {
@@ -198,20 +235,38 @@ pub(crate) fn reconcile(
                             base: local_hash,
                         },
                     ));
+                } else if aliased && local_newer {
+                    // 本机这个文件的改动由盘上那个名字自己发布；远端这一版作废，把寄存器
+                    // 收掉，免得每一轮都再问。
+                    steps.push((
+                        path,
+                        Step::Settle {
+                            row,
+                            base: Some(local_hash),
+                            local_path,
+                        },
+                    ));
                 } else if rejected.get(path).map(String::as_str) == Some(remote.unwrap_or(REJ_DEL))
                 {
                     // 没有基线的设备（刚加入）拒绝之后把基线记成本机当前的内容，免得反过来
                     // 把本机的版本推给别的设备。
                     let base = base.is_none().then_some(local_hash);
-                    steps.push((path, Step::Settle { row, base }));
+                    steps.push((
+                        path,
+                        Step::Settle {
+                            row,
+                            base,
+                            local_path,
+                        },
+                    ));
                 } else if row.is_new()
                     || status::get(&ctx.paths, &status::item_id(KIND, path)).is_none()
                 {
                     // 刚到的版本；或者在等确认、而那条待处理事项不见了（补一条）。
-                    steps.push((path, Step::Ask { row }));
+                    steps.push((path, Step::Ask { row, local_path }));
                 }
             }
-            None if changed => match local_op {
+            None if changed && !aliased => match local_op {
                 Some(op) => steps.push((
                     path,
                     Step::Publish {
@@ -230,17 +285,21 @@ pub(crate) fn reconcile(
             let mut labels: Vec<String> = Vec::new();
             for (path, step) in &steps {
                 match step {
-                    Step::Settle { row, base } => {
+                    Step::Settle {
+                        row,
+                        base,
+                        local_path,
+                    } => {
                         mark(tx, scope::FILE, &row.key, &row.hlc, HANDLED)?;
                         if let Some(base) = base {
-                            set_base(tx, path, base)?;
+                            set_base_for(tx, path, local_path, base)?;
                         }
                     }
                     Step::Publish { op, base } => {
                         publish(tx, s, scope::FILE, path, op)?;
                         set_base(tx, path, base)?;
                     }
-                    Step::Ask { row } => {
+                    Step::Ask { row, .. } => {
                         mark(tx, scope::FILE, &row.key, &row.hlc, AWAITING)?;
                         labels.push(db::device_label(tx, &row.origin)?);
                     }
@@ -253,27 +312,43 @@ pub(crate) fn reconcile(
         for (path, step) in &steps {
             let id = status::item_id(KIND, path);
             match step {
-                Step::Ask { row } => {
+                Step::Ask { row, local_path } => {
                     let label = labels.next().unwrap_or_default();
                     let what = describe(path);
                     let (title, op) = match &row.op {
-                        Op::FilePut { .. } if local.contains_key(*path) => {
+                        Op::FilePut { .. } if local.contains_key(local_path.as_str()) => {
                             (format!("「{label}」修改了{what}"), "put")
                         }
                         Op::FilePut { .. } => (format!("「{label}」新增了{what}"), "put"),
                         _ => (format!("「{label}」删除了{what}"), "del"),
                     };
-                    let detail = if *path == SYNC_ACTIVE_PATH {
+                    let mut detail = if *path == SYNC_ACTIVE_PATH {
                         "人格决定 agent 的行为方式，所以别的设备上的改动要你在这台设备上看过、\
                          确认之后才会写入；接受后在下次启动 RClaw 时生效。拒绝则这台设备继续用现在的人格。"
+                            .to_string()
                     } else {
                         "人格库里的文件，确认之后才会写入这台设备。拒绝则这台设备保持现状。"
+                            .to_string()
                     };
+                    // 本机命中的文件和远端给的名字只差大小写：写明接受后真正被动到的是哪个。
+                    if local_path.as_str() != *path {
+                        if let Some((_, name)) = local_path.rsplit_once('/') {
+                            let action = if op == "put" {
+                                "被对方的内容覆盖"
+                            } else {
+                                "被删除"
+                            };
+                            detail.push_str(&format!(
+                                "\n这台设备上命中的是已有的「{name}」：接受后它会{action}，\
+                                 原内容会留一份副本。"
+                            ));
+                        }
+                    }
                     let item = PendingItem {
                         id,
                         kind: KIND.into(),
                         title,
-                        detail: detail.into(),
+                        detail,
                         origin: Some(label),
                         at_ms: crate::attach::now_ms(),
                         actions: vec!["accept".into(), "reject".into()],
@@ -320,31 +395,37 @@ fn pending_row(ctx: &Ctx, item: &PendingItem) -> Result<(String, Row)> {
 /// 差异对比用的两份内容。
 pub(crate) fn detail(ctx: &Ctx, item: &PendingItem) -> Result<serde_json::Value> {
     let (path, row) = pending_row(ctx, item)?;
+    // 本机落点可能和远端给的名字只差大小写：确认页要显示真正命中的那个文件。
+    let local_path = soul::sync_local_rel(&ctx.layout, &path);
     let local = soul::sync_files(&ctx.layout)?
         .into_iter()
-        .find(|(rel, _)| *rel == path)
+        .find(|(rel, _)| *rel == local_path)
         .map(|(_, content)| content);
     let remote = match row.op {
         Op::FilePut { content, .. } => Some(content),
         _ => None,
     };
-    Ok(serde_json::json!({ "path": path, "local": local, "remote": remote }))
+    Ok(serde_json::json!({ "path": path, "local_path": local_path, "local": local, "remote": remote }))
 }
 
 /// 用户在本机接受或拒绝了一个远端版本。
 pub(crate) fn decide(ctx: &Ctx, _s: &Settings, item: &PendingItem, accept: bool) -> Result<()> {
     let (path, row) = pending_row(ctx, item)?;
+    // 只差大小写的名字在不分大小写的卷上就是同一个文件：备份、写入、删除都按盘上那个
+    // 文件来，不能按远端给的写法另起一份（或者当成本机没有）。
+    let local_path = soul::sync_local_rel(&ctx.layout, &path);
     let local = soul::sync_files(&ctx.layout)?
         .into_iter()
-        .find(|(rel, _)| *rel == path)
+        .find(|(rel, _)| *rel == local_path)
         .map(|(_, content)| content);
     let local_hash = local.as_ref().map(|content| sha256_hex(content.as_bytes()));
     let remote = remote_hash(&row.op).map(str::to_string);
+    let aliased = local_path != path;
 
     if accept {
         // 被替换、被删除的人格库文件留一个副本；生效人格由 `sync_write` 自己备份。
-        if let (Some(content), Some((_, name))) = (&local, path.rsplit_once('/')) {
-            if path != SYNC_ACTIVE_PATH {
+        if let (Some(content), Some((_, name))) = (&local, local_path.rsplit_once('/')) {
+            if local_path != SYNC_ACTIVE_PATH {
                 keep_copy(
                     ctx,
                     "souls",
@@ -355,25 +436,36 @@ pub(crate) fn decide(ctx: &Ctx, _s: &Settings, item: &PendingItem, accept: bool)
         }
         match &row.op {
             Op::FilePut { content, .. } => {
-                soul::sync_write(&ctx.layout, &path, content)?;
+                soul::sync_write(&ctx.layout, &local_path, content)?;
             }
             _ => {
-                soul::sync_remove(&ctx.layout, &path)?;
+                soul::sync_remove(&ctx.layout, &local_path)?;
             }
         }
     }
     db::write(ctx.db(), |tx| {
         mark(tx, scope::FILE, &row.key, &row.hlc, HANDLED)?;
         if accept {
-            set_base(tx, &path, &remote)?;
-            db::state_del(tx, SCOPE_REJ, &path)
+            set_base_for(tx, &path, &local_path, &remote)?;
+            db::state_del(tx, SCOPE_REJ, &path)?;
+            if aliased {
+                db::state_del(tx, SCOPE_REJ, &local_path)?;
+            }
+            Ok(())
         } else {
             let rejected = remote.as_deref().unwrap_or(REJ_DEL);
             db::state_put(tx, SCOPE_REJ, &path, db::HLC_ZERO, None, Some(rejected))?;
+            if aliased {
+                db::state_put(tx, SCOPE_REJ, &local_path, db::HLC_ZERO, None, Some(rejected))?;
+            }
             // 还没有基线（刚加入的设备）：记成本机当前的内容，免得反过来把本机的版本推给
             // 别的设备。之后本机再改，照常发布。
             if db::state_get(tx, SCOPE_BASE, &path)?.is_none() {
                 set_base(tx, &path, &local_hash)?;
+            }
+            // 盘上那个写法的基线也要记：下一轮对比是从它出发的。
+            if aliased && db::state_get(tx, SCOPE_BASE, &local_path)?.is_none() {
+                set_base(tx, &local_path, &local_hash)?;
             }
             Ok(())
         }

@@ -405,15 +405,15 @@ impl SyncControl for Control {
             .map_err(|error| error.to_string())
     }
 
-    fn stash_memory_for_clear(&self) -> std::result::Result<Vec<String>, String> {
+    fn stash_memory_for_clear(&self) -> std::result::Result<(Vec<String>, String), String> {
         self.0
             .stash_memory_for_clear()
             .map_err(|error| error.to_string())
     }
 
-    fn commit_memory_clear(&self, ids: &[String]) -> std::result::Result<usize, String> {
+    fn commit_memory_clear(&self, ids: &[String], op: &str) -> std::result::Result<usize, String> {
         self.0
-            .commit_memory_clear(ids)
+            .commit_memory_clear(ids, op)
             .map_err(|error| error.to_string())
     }
 

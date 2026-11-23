@@ -805,9 +805,10 @@ impl Session {
         let ctx = &shared.ctx;
         let memo = std::mem::take(&mut self.merge_memo);
         let (pool_ctx, pool_s) = (ctx.clone(), s.clone());
+        let keys = self.live.keys.clone();
         let (merged, memo) = tokio::task::spawn_blocking(move || {
             let mut memo = memo;
-            let merged = merge::merge_round(&pool_ctx, &pool_s, &mut memo, full);
+            let merged = merge::merge_round(&pool_ctx, &pool_s, &keys, &mut memo, full);
             (merged, memo)
         })
         .await
@@ -1149,7 +1150,7 @@ impl Session {
             return;
         }
         shared.set_state("syncing", None);
-        match writer.step(ctx, transport, SNAP_STEP).await {
+        match writer.step(ctx, transport, s, SNAP_STEP).await {
             // 写完了：快照指针要随 head 写出去。
             Ok(Some(_)) => out.again = true,
             Ok(None) => {

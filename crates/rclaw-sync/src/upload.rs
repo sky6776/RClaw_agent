@@ -606,6 +606,31 @@ async fn make_rollup(
     } = blocking(move || build_pack(&keys, &outgoing, &device, &loose, prev, plain_max)).await?;
     let path = codec::rollup_path(opts.device, &pack.name);
     transport::put_checked(transport, &path, object).await?;
+    // 回读核对：只确认远端长度不够——同长度的坏对象一旦进 head，零散段就会被回收，
+    // 包里是这段日志唯一的副本。解密、核对明文摘要、解析包头与逐段摘要都通过才算传好。
+    let object = transport
+        .get(&path, codec::ROLLUP_OBJECT_MAX)
+        .await
+        .map_err(SyncError::from)?;
+    let (keys, device, digest, read_path) = (
+        opts.keys.clone(),
+        opts.device.to_string(),
+        pack.digest.clone(),
+        path.clone(),
+    );
+    let verified = blocking(move || -> Result<bool> {
+        let plain = codec::open_log_object(&keys, &read_path, &object, codec::ROLLUP_PLAIN_MAX)?;
+        if sha256_hex(&plain) != digest {
+            return Ok(false);
+        }
+        Ok(codec::parse_rollup(&plain, &device).is_ok())
+    })
+    .await?;
+    if !verified {
+        return Err(SyncError::corrupt(format!(
+            "汇总包 {path} 回读核对不通过，不能进 head"
+        )));
+    }
     // 汇总包已经在存储上了：登记它，把这些段标成已打包。head 这一轮稍后就写。
     offload(ctx, move |ctx| {
         db::write(ctx.db(), |tx| {

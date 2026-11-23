@@ -675,6 +675,17 @@ pub fn blob_set(conn: &Connection, blob_id: &str, rel_path: &str, state: i64) ->
     Ok(())
 }
 
+/// 落在同一个落点上的登记：`(对象名, 长度)`。旧消息的附件索引可能缺项，占位文件与这里
+/// 的长度对上时才能准确认出是哪个对象。
+pub fn blob_objects_at(conn: &Connection, rel_path: &str) -> Result<Vec<(String, u64)>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT blob_id, size FROM sync_blob WHERE rel_path = ?1")?;
+    let rows = stmt.query_map(params![rel_path], |row| {
+        Ok((row.get(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// 把一个等着上传的附件挪到队尾。队列按 rowid 排（见 [`blobs_in_state`]）：删掉再插入，
 /// 它就排到了最后。登记已经不是「等待上传」时不动它，返回 `false`。
 pub fn blob_requeue(conn: &Connection, blob_id: &str) -> Result<bool> {

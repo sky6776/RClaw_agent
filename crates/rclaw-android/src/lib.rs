@@ -429,16 +429,17 @@ pub fn network_metered() -> bool {
     }
 }
 
-/// 拍照/录视频（kind: photo|video）：起系统相机，结果走 Activity onActivityResult
-/// → CaptureBridge 落盘 uploads/ + 写 capture_result.json。
-pub fn capture(kind: &str) -> Result<String> {
+/// 拍照/录视频/扫配对码（kind: photo|video|scan）：起系统相机，结果走 Activity onActivityResult
+/// → CaptureBridge 落盘 uploads/ + 写 capture_result.json。扫码时 `request_id` 贯穿到
+/// Java/Kotlin 侧，用来认领本轮的标记、照片与结果；拍照/录视频传空串。
+pub fn capture(kind: &str, request_id: &str) -> Result<String> {
     #[cfg(target_os = "android")]
     {
-        jni_bridge::capture(kind)
+        jni_bridge::capture(kind, request_id)
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = kind;
+        let _ = (kind, request_id);
         Err(anyhow!("capture 仅在 Android 宿主可用"))
     }
 }
@@ -2256,19 +2257,23 @@ pub mod jni_bridge {
         jstring_to_string(&mut env, object)
     }
 
-    pub(super) fn capture(kind: &str) -> Result<String> {
+    pub(super) fn capture(kind: &str, request_id: &str) -> Result<String> {
         let vm = JAVA_VM.get().ok_or_else(|| anyhow!("JavaVM 尚未初始化"))?;
         let mut env = vm
             .attach_current_thread()
             .context("附加采集线程到 JavaVM 失败")?;
         let class = native_bridge_class(&mut env)?;
         let jkind = env.new_string(kind)?;
+        let jrequest = env.new_string(request_id)?;
         let value = env
             .call_static_method(
                 class,
                 "capture",
-                "(Ljava/lang/String;)Ljava/lang/String;",
-                &[JValue::Object(&JObject::from(jkind))],
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    JValue::Object(&JObject::from(jkind)),
+                    JValue::Object(&JObject::from(jrequest)),
+                ],
             )
             .map_err(|error| {
                 let _ = env.exception_clear();

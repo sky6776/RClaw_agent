@@ -618,11 +618,14 @@ public final class NativeBridge {
     // ------------------------------------------------------------------
 
     /** 拍照/录视频/扫配对码（kind: photo|video|scan）：起系统相机，结果走 onActivityResult。
+     *  requestId 只用于扫码：标记、照片与结果都按它认领；拍照/录视频传空串。
      *  返回 "ok" / "permission_requested" / "error:<原因>"。 */
-    static String capture(String kind) {
+    static String capture(String kind, String requestId) {
         if ("photo".equals(kind)) return CaptureBridge.capturePhoto();
         if ("video".equals(kind)) return CaptureBridge.captureVideo();
-        if ("scan".equals(kind)) return CaptureBridge.captureScan();
+        if ("scan".equals(kind)) {
+            return CaptureBridge.captureScan(requestId == null ? "" : requestId);
+        }
         return "error:未知采集类型";
     }
 

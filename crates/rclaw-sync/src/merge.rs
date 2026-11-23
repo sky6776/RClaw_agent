@@ -458,14 +458,14 @@ fn needs_files(plan: &Plan, msg: &WireMsg) -> bool {
 
 /// 落地要用的文件：artifact 全文写进目标会话的目录；分支先把源会话的 artifact 目录复制
 /// 过来。在事务之前做，重复执行结果相同。
-fn prepare_files(ctx: &Ctx, plan: &Plan, msg: &WireMsg) -> Result<()> {
+fn prepare_files(ctx: &Ctx, plan: &Plan, msg: &WireMsg, keys: Option<&Keys>) -> Result<()> {
     match plan {
         Plan::Append {
             channel, chat_id, ..
         }
         | Plan::New {
             channel, chat_id, ..
-        } => wire::write_artifacts(&ctx.env, channel, chat_id, msg),
+        } => wire::write_artifacts(&ctx.env, channel, chat_id, msg, keys),
         Plan::Branch {
             channel,
             source_chat,
@@ -475,7 +475,7 @@ fn prepare_files(ctx: &Ctx, plan: &Plan, msg: &WireMsg) -> Result<()> {
             ctx.env
                 .sessions
                 .copy_artifact_dir(channel, source_chat, chat_id);
-            wire::write_artifacts(&ctx.env, channel, chat_id, msg)
+            wire::write_artifacts(&ctx.env, channel, chat_id, msg, keys)
         }
         _ => Ok(()),
     }
@@ -586,6 +586,7 @@ fn apply_plan(
     sid: &str,
     msg: &WireMsg,
     plan: &Plan,
+    keys: Option<&Keys>,
 ) -> Result<Effect> {
     let env = &ctx.env;
     match plan {
@@ -605,7 +606,7 @@ fn apply_plan(
                 chat_id,
                 sealed: SEAL_SEALED,
             };
-            wire::land_msg(conn, env, landing, msg)?;
+            wire::land_msg(conn, env, landing, msg, keys)?;
             let attrs_changed =
                 attrs_at(conn, sid, &msg.gid)? && publish::refresh_attrs(conn, s, *session_id)?;
             Ok(Effect {
@@ -630,7 +631,7 @@ fn apply_plan(
                 chat_id,
                 sealed: SEAL_SEALED,
             };
-            wire::land_msg(conn, env, landing, msg)?;
+            wire::land_msg(conn, env, landing, msg, keys)?;
             if *landed {
                 // 展示用：「<标题> · <来源设备名>」。
                 db::state_put(
@@ -677,7 +678,7 @@ fn apply_plan(
                 chat_id,
                 sealed: SEAL_SEALED,
             };
-            wire::land_msg(conn, env, landing, msg)?;
+            wire::land_msg(conn, env, landing, msg, keys)?;
             // 展示用：「<标题>（<设备名>的分支）」，直到用户给它改名（§7.6）。
             let author = ids::gid_device(&msg.gid).unwrap_or_default();
             db::state_put(
@@ -846,6 +847,8 @@ struct Held {
 struct Round<'a> {
     ctx: &'a Ctx,
     s: &'a Settings,
+    /// 空间密钥：落地内联工具结果撞名时要按它算对象名。清理类轮次没有消息落地，可以为空。
+    keys: Option<&'a Keys>,
     memo: &'a mut Memo,
     report: MergeReport,
     held: Option<Held>,
@@ -859,11 +862,18 @@ struct Round<'a> {
 
 /// 合入一轮。阻塞（数据库与文件 IO），由引擎放在阻塞线程上跑；同一时刻只能有一轮。
 /// `full` 为真时把所有悬空区、墓碑都复查一遍，并做到期清理（启动时、导入会话包之后、
-/// 以及每隔一段时间）。
-pub fn merge_round(ctx: &Ctx, s: &Settings, memo: &mut Memo, full: bool) -> Result<MergeReport> {
+/// 以及每隔一段时间）。`keys` 是当前空间密钥：内联工具结果撞名时按它登记对象名。
+pub fn merge_round(
+    ctx: &Ctx,
+    s: &Settings,
+    keys: &Keys,
+    memo: &mut Memo,
+    full: bool,
+) -> Result<MergeReport> {
     let mut round = Round {
         ctx,
         s,
+        keys: Some(keys),
         memo,
         report: MergeReport::default(),
         held: None,
@@ -940,6 +950,8 @@ pub fn sweep_stale(ctx: &Ctx, s: &Settings, all: bool) -> Result<StaleSweep> {
     let mut round = Round {
         ctx,
         s,
+        // 这一步只删会话、不发消息：不需要空间密钥。
+        keys: None,
         memo: &mut memo,
         report: MergeReport::default(),
         held: None,
@@ -1387,6 +1399,9 @@ impl Round<'_> {
         row: Option<&InboxRow>,
     ) -> Result<MsgOutcome> {
         let (ctx, s) = (self.ctx, self.s);
+        // 空间密钥：落地时内联工具结果撞名要按它登记对象名（`keys` 下面还有同名局部量，
+        // 是会话占用的键）。
+        let space_keys = self.keys;
         let mut hint: Option<String> = None;
         let mut prepared: Option<Plan> = None;
         for _ in 0..MSG_ATTEMPTS {
@@ -1418,7 +1433,7 @@ impl Round<'_> {
                     if let Some(old) = prepared.take() {
                         discard_files(ctx, &old);
                     }
-                    prepare_files(ctx, &plan, msg)?;
+                    prepare_files(ctx, &plan, msg, space_keys)?;
                     prepared = Some(plan.clone());
                 }
                 if let Plan::Branch { chat_id, .. } = &plan {
@@ -1444,7 +1459,7 @@ impl Round<'_> {
                 if plan_msg(tx, sid, msg, hint.as_deref())? != plan {
                     return Ok(None);
                 }
-                let effect = apply_plan(tx, ctx, s, sid, msg, &plan)?;
+                let effect = apply_plan(tx, ctx, s, sid, msg, &plan, space_keys)?;
                 if let Some(row) = row {
                     match &plan {
                         Plan::Orphan => settle(tx, row, Some(INBOX_ORPHAN))?,

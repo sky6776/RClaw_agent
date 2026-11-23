@@ -140,6 +140,14 @@ async fn create_file_namespace(config: &SyncConfig, space_id: &str) -> Result<()
     Ok(())
 }
 
+/// 配对码带来的存储设置（不碰本机的密钥与凭据）：宿主先把它写进 `rclaw.toml` 再加入，
+/// 避免「密钥已经存好、设置还没写回」时下次启动连到另一处存储。
+pub fn pairing_config(config: &SyncConfig, code: &str) -> Result<SyncConfig> {
+    let parsed = PairingCode::parse(code)?;
+    let mut secrets = Secrets::default();
+    Ok(apply_pairing(config, &mut secrets, &parsed))
+}
+
 /// 把配对码里的内容落到配置与 secrets 上。纯函数：不碰磁盘和网络。CLI 的 `--sync-join`
 /// 没有引擎可用，直接调它。配对码里带了存储设置就以它为准，没带则沿用本机已填的。
 pub fn apply_pairing(config: &SyncConfig, secrets: &mut Secrets, code: &PairingCode) -> SyncConfig {
@@ -274,10 +282,14 @@ fn storage_binding(config: &SyncConfig) -> String {
             config.webdav.username.trim()
         ),
         "s3" => format!(
-            "s3|{}|{}|{}",
+            "s3|{}|{}|{}|{}|{}",
             config.s3.endpoint.trim().trim_end_matches('/'),
             config.s3.bucket.trim(),
-            config.s3.prefix.trim().trim_end_matches('/')
+            config.s3.prefix.trim().trim_end_matches('/'),
+            // 同一个桶和前缀下换一套账户，是不同的「位置」：凭据不能混着用，否则待恢复
+            // 副本里的旧账户密钥会被新账户的覆盖掉，之后再也查不到能开旧空间的密钥。
+            config.s3.access_key_id.trim(),
+            config.s3.path_style
         ),
         "file" => format!(
             "file|{}",
@@ -428,7 +440,7 @@ async fn finish_reset(
     //    这里不再删新空间回滚：如果关闭其实已在远端生效、只是响应丢了，新空间是唯一能
     //    接着用的。
     if pending.previous.is_paired() {
-        let open = match read_old_space(&at, &old_secrets).await {
+        let (open, missing) = match read_old_space(&at, &old_secrets).await {
             Ok(Some(file)) => {
                 file.verify(&old_secrets.keys()?, &old_secrets.space_id)
                     .map_err(|error| {
@@ -438,9 +450,9 @@ async fn finish_reset(
                             storage_binding(&at)
                         ))
                     })?;
-                !file.closed
+                (!file.closed, false)
             }
-            Ok(None) => false,
+            Ok(None) => (false, true),
             Err(error) => {
                 return Err(SyncError::other(format!(
                     "恢复重置：读不到旧空间（{error}）。存储恢复可访问后重试；\
@@ -448,7 +460,13 @@ async fn finish_reset(
                 )));
             }
         };
-        if open {
+        if missing {
+            // 旧空间目录不在了（被清掉、第三方工具还没同步过来）：补写一个可验证的
+            // 「已关闭」标记。迟到的旧副本要是又出现、带着开放状态，至少这里的结论
+            // 有据可查，重试也不会一直把「目录缺失」当成不确定。
+            let old = load_live(&at, &old_secrets).await?;
+            remote::close_space(old.transport(), &old.keys, &old.space_id).await?;
+        } else if open {
             let old = load_live(&at, &old_secrets).await?;
             remote::close_space(old.transport(), &old.keys, &old.space_id).await?;
         }
@@ -539,7 +557,23 @@ pub(crate) async fn leave(
     secrets: &mut Secrets,
 ) -> Result<()> {
     // 上次没做完的切换先做完（可能是一次重置：先收敛到新空间），再决定退不退。
-    let _ = resume_pending(ctx, config, secrets).await?;
+    // 上次没做完的切换先试着收尾；收不了也不能挡住退出——用户就是要离开这个空间。
+    // 丢掉恢复记录：它的目标（新空间）本机不再使用，留着会让下次启动又把本机拉回
+    // 配对状态。远端可能仍保留原空间的状态，在状态页交代清楚。
+    if let Err(error) = resume_pending(ctx, config, secrets).await {
+        tracing::warn!("退出前收尾未完成的切换失败，按本机退出继续: {error}");
+        status::notice(
+            &ctx.paths,
+            "leave-after-failed-resume",
+            "",
+            "退出同步空间：上次未完成的切换没有收尾",
+            &format!(
+                "本机已经退出同步空间，不会再同步。上次没做完的空间切换（重置或退出）\
+                 没能收尾，远端可能仍保留原空间的状态；其它设备不受影响。具体原因：{error}"
+            ),
+        );
+        pending_clear(&ctx.paths)?;
+    }
     if !secrets.is_paired() {
         return Ok(());
     }
