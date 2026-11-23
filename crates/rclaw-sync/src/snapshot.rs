@@ -1445,7 +1445,6 @@ impl Writer {
         // 其他设备的 head 里还指着的快照不能当「无人引用」删：新设备会按那台设备的
         // head 去找它。
         let peer_snaps: HashSet<String> = offload(ctx, {
-            let dev = self.dev.clone();
             move |ctx| {
                 db::read(ctx.db(), |conn| {
                     Ok(db::peers(conn)?
@@ -2189,12 +2188,22 @@ async fn sweep_due(
                 key.and_then(|key| retry_until.get(&key).copied())
                     .is_some_and(|until| until > now)
             };
+            // orphan（旧候选对象）在排队时可能 head 还指着它（升级前/并发写出的队列）：
+            // 只要存储上的 head 还指着这份快照，先留着。
+            let head_points_at = |path: &str| {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                log.head_snap
+                    .as_deref()
+                    .is_some_and(|head| snapshot_of(name) == Some(head))
+            };
             let due: Vec<Due> = rows
                 .into_iter()
                 .filter_map(|(path, row)| {
                     let when = row.json::<GcWhen>()?;
+                    let stale_head = when.orphan && head_points_at(&path);
                     (now >= when.after_ms
                         && now >= when.retry_ms
+                        && !stale_head
                         && !blocked(&when.basis, &when.pack)
                         && when.floor.is_none_or(|floor| log.head_floor >= floor)
                         && when

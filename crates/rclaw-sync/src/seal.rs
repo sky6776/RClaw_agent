@@ -21,7 +21,7 @@ use crate::error::Result;
 use crate::ids;
 use crate::map;
 use crate::op::{MsgOp, Op, ARTIFACT_INLINE_MAX, FORMAT_VERSION};
-use crate::wire::{self, ArtifactPolicy, LocalBlob, RowWire, StoredRefs, OP_ARTIFACTS_MAX};
+use crate::wire::{self, ArtifactPolicy, LocalBlob, RowWire, OP_ARTIFACTS_MAX};
 use crate::Ctx;
 
 /// 本机已封的一个段（`sync_state` 的 `seg`，键是 12 位补零的止序号）。
