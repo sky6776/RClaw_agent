@@ -35,6 +35,10 @@ pub struct ObjectMeta {
     /// [`ObjectMeta::tag`] 只剩长度——同长度的新内容会被当成旧值，读者不能拿它判重，
     /// 要按内容（读取并校验之后的 head）来认。
     pub stable_version: bool,
+    /// 这个版本标识是不是**强**标识（内容变了标识一定跟着变）。只有强标识能当回收
+    /// 依据的「这份对象核对过、之后没被换过」；修改时间、弱 ETag、不合规标签都只是
+    /// 提示，判重时要么立刻读取（标识变了），要么按窗口定期实读（标识没变也读）。
+    pub strong_version: bool,
 }
 
 impl ObjectMeta {

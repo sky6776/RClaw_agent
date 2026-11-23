@@ -494,12 +494,14 @@ impl SyncTransport for S3Transport {
                 {
                     continue;
                 }
-                let stable_version = stable_version && !version.is_empty();
+                let strong_version = stable_version && !version.is_empty();
+                let stable_version = !version.is_empty();
                 out.push(ObjectMeta {
                     name: name.to_string(),
                     size,
                     version,
                     stable_version,
+                    strong_version,
                 });
             }
             token = page.next_token;

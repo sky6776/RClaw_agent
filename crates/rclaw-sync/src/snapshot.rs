@@ -2011,14 +2011,13 @@ pub async fn collect_garbage(
     // 候选快照核验完成就接管 head 的快照指针（旧指针退位）；候选回收位置在依据于当前
     // 存储上重新完整复核通过之后公布。这两个都以「先不动，证据齐了再动」为顺序。
     promote_snap(ctx, transport, keys, s, memo, now).await?;
-    report.floor = {
-        let promoted = promote_floor(ctx, transport, keys, &s.device).await?;
-        if promoted.is_none() {
-            let s = s.clone();
-            offload(ctx, move |ctx| advance_floor(ctx, &s, now)).await?;
-        }
-        promoted
-    };
+    // 先登记候选回收位置（只动本机记录），随即尝试公布：证据齐全时这一轮就能推进，
+    // 大快照这一轮核不完就跨轮继续（已登记的候选下一轮接着核）。
+    {
+        let s = s.clone();
+        offload(ctx, move |ctx| advance_floor(ctx, &s, now)).await?;
+    }
+    report.floor = promote_floor(ctx, transport, keys, &s.device).await?;
     if !low_memory {
         collect_blobs(ctx, transport, keys, s, memo, now).await?;
     }
@@ -2271,11 +2270,11 @@ async fn verified_part_version(
     path: &str,
     before: Option<&transport::ObjectMeta>,
 ) -> String {
-    let Some(before) = before.filter(|meta| meta.stable_version) else {
+    let Some(before) = before.filter(|meta| meta.strong_version) else {
         return String::new();
     };
     match transport::stat(transport, path).await.ok().flatten() {
-        Some(after) if after.stable_version && after.tag() == before.tag() => after.tag(),
+        Some(after) if after.strong_version && after.tag() == before.tag() => after.tag(),
         _ => String::new(),
     }
 }
@@ -2361,7 +2360,7 @@ async fn basis_intact(
         let meta = transport::stat(transport, &part_path).await.ok().flatten();
         let saved = progress.versions.get(index).cloned().unwrap_or_default();
         let trusted = meta.as_ref().is_some_and(|meta| {
-            meta.stable_version && !saved.is_empty() && meta.tag() == saved
+            meta.strong_version && !saved.is_empty() && meta.tag() == saved
         });
         if !trusted {
             if verify_snapshot_part(transport, keys, dev, name, part).await.is_err() {

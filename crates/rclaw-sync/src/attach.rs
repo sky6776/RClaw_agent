@@ -406,6 +406,10 @@ pub async fn upload(
     // （登记过要修的），以及别的设备点名重要过、对象被重新排队的（收到重复请求时
     // 校验存储副本）——都重新封装并核对摘要之后真的传一遍。
     let repair = db::read(ctx.db(), |conn| {
+        // 还没开过同步的库（测试里的裸库）没有同步表：没有要修的，也没有上传原因。
+        if !rclaw_store::sync_db::sync_tables_exist(conn)? {
+            return Ok(false);
+        }
         Ok(repair_get(conn, &blob.blob_id)?
             || db::state_get(conn, SCOPE_NAMED, &blob.blob_id)?.is_some()
             || db::state_get(conn, SCOPE_SKILL_BLOB, &blob.blob_id)?.is_some())

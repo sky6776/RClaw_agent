@@ -1073,16 +1073,23 @@ pub async fn pull(
         let tag = meta.tag();
         let known = seen.get(device);
         let now = now_ms();
-        if meta.stable_version {
+        // 强标识：标识没变就跳过。弱标识（修改时间、弱 ETag、不合规标签）与完全没有
+        // 标识的：标识变了立刻读，没变也要按有界窗口定期实读——等长同标识的更新只能
+        // 靠重读发现。上一轮没读成（登记里的版本是空的）不算「没变」。
+        if meta.stable_version && meta.strong_version {
             match known {
                 Some(last) if *last == tag => continue,
                 None if memo.waits(device, &tag, now) => continue,
                 _ => {}
             }
         } else {
-            // 存储端没给版本标识：同长度的新 head（定长加密开销下的常规更新）用「版本 +
-            // 长度」分不出来。有界地定期重读，读到之后按内容判重。
-            if memo.unstable_waits(device, now) {
+            // 不认识的名字：按陌生设备的退避，别每轮重读。
+            if known.is_none() && memo.waits(device, &tag, now) {
+                continue;
+            }
+            let retry = known.is_some_and(|last| last.is_empty());
+            let same = known.is_some_and(|last| *last == tag);
+            if same && !retry && memo.unstable_waits(device, now) {
                 continue;
             }
             memo.unstable_read(device, now);
