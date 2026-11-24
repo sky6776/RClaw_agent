@@ -432,10 +432,30 @@ fn refresh_connection_settings(target: &mut SyncConfig, current: &SyncConfig) {
 
 /// 同一空间、同一存储位置算同一条收尾：配对码只带空间 ID 与密钥，同一个空间可以
 /// 被复制到别的存储位置上，那两处要各留一条。
+/// 两个配置是不是同一个实际存储位置。按位置字段逐字相等判（不用规范化的位置标识：
+/// 规范化会把「末尾字面反斜杠」「用户名首尾空白」这类不同的实际位置当成同一处，确认
+/// 事实会串到另一个副本上）；连接设置（证书指纹、区域、明文开关）不参与——同一个
+/// 位置换了指纹，两条记录该合成一条。
+fn same_close_location(a: &SyncConfig, b: &SyncConfig) -> bool {
+    if a.transport != b.transport {
+        return false;
+    }
+    match a.transport.as_str() {
+        "webdav" => a.webdav.url == b.webdav.url && a.webdav.username == b.webdav.username,
+        "s3" => {
+            a.s3.endpoint == b.s3.endpoint
+                && a.s3.bucket == b.s3.bucket
+                && a.s3.prefix == b.s3.prefix
+                && a.s3.access_key_id == b.s3.access_key_id
+                && a.s3.path_style == b.s3.path_style
+        }
+        "file" => a.file.dir == b.file.dir,
+        _ => false,
+    }
+}
+
 fn same_close_target(close: &PendingClose, storage: &SyncConfig, space_id: &str) -> bool {
-    // 按配置逐字段相等判同一目标（不用规范化的位置标识）：规范化会把「末尾字面反斜杠」
-    // 「用户名首尾空白」这类不同的实际位置当成同一处，确认事实会串到另一个副本上。
-    close.previous.space_id == space_id && close.storage == *storage
+    close.previous.space_id == space_id && same_close_location(&close.storage, storage)
 }
 
 /// 收尾队列的跨进程互斥：读改写之间可能还有别的进程（或旧的后台任务）在加记录。
@@ -669,8 +689,25 @@ async fn finish_one_close(
             close.closed_seen = true;
         }
     }
-    match remote::ensure_closed_if_started(&transport, &keys, &space_id, close.closed_seen)
-        .await
+    // 补写过程中再读到「已验证关闭」时，先落盘（按 id，缺 id 按同目标）再动远端。
+    let confirm = || -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
+    > {
+        Box::pin(pending_close_mark_seen(
+            paths,
+            &close.id,
+            &close.storage,
+            &space_id,
+        ))
+    };
+    match remote::ensure_closed_if_started(
+        &transport,
+        &keys,
+        &space_id,
+        close.closed_seen,
+        Some(&confirm),
+    )
+    .await
     {
         remote::CloseAttempt::Done | remote::CloseAttempt::NotStarted => {
             pending_close_finish(paths, &close.id).await?;
@@ -848,6 +885,8 @@ async fn finish_reset(
                 &old.keys,
                 &old.space_id,
                 true,
+                // 这条记录的「已确认关闭」在上面已经落盘了，不需要再回调。
+                None,
             )
             .await
             {
@@ -1439,6 +1478,36 @@ mod tests {
             Err(SyncError::SpaceClosed)
         ));
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_records_at_one_location_merge_even_if_connection_settings_differ() {
+        let secrets = paired();
+        let mut first = SyncConfig::default();
+        first.webdav.url = "https://dav.example.com/rclaw/".into();
+        first.webdav.username = "me".into();
+        let mut second = first.clone();
+        second.webdav.pinned_cert_sha256 = "aa".repeat(32);
+        let entry = |storage: &SyncConfig| PendingClose {
+            id: String::new(),
+            storage: storage.clone(),
+            previous: secrets.clone(),
+            closed_seen: false,
+        };
+        // 同一个位置、只换了连接设置：算同一个目标。
+        assert!(same_close_target(
+            &entry(&first),
+            &second,
+            &secrets.space_id
+        ));
+        // 用户名只差一个尾随空格：实际位置不同，不合并。
+        let mut elsewhere = second.clone();
+        elsewhere.webdav.username = "me ".into();
+        assert!(!same_close_target(
+            &entry(&first),
+            &elsewhere,
+            &secrets.space_id
+        ));
     }
 
     /// 老版本写下的条目没有身份：读进来要先补上各自的，结算才不会串到别的空间上。

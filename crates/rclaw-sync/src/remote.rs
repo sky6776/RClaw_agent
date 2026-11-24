@@ -233,7 +233,7 @@ async fn finish_known_closed(
     let marker_closed = match read_space(transport).await {
         Ok(Some(file)) => match file.verify(keys, space_id) {
             Ok(()) => file.closed,
-            Err(error) => return ConfirmedButFailed(error),
+            Err(error) => return Failed(error),
         },
         Ok(None) | Err(SyncError::Corrupt(_)) => false,
         Err(error) => return ConfirmedButFailed(error),
@@ -241,16 +241,21 @@ async fn finish_known_closed(
     if let Err(error) = ensure_closed(transport, keys, space_id).await {
         return ConfirmedButFailed(error);
     }
-    // 本来就是关闭版的标记不再重写（非原子 PUT 重复写可能把好的标记截断）。
-    let still_closed = marker_closed
-        && matches!(
-            marker_closed_state(transport, keys, space_id).await,
-            Ok(Some(true))
-        );
-    if !still_closed {
-        if let Err(error) = write_closed_marker(transport, keys, space_id).await {
-            return ConfirmedButFailed(error);
+    // 本来就是关闭版的标记不再重写（非原子 PUT 重复写可能把好的标记截断）；但复核
+    // 读出来的错误不能当成「需要补写」——身份不符/版本过高说明位置上不是这个空间，
+    // 网络/权限错误下覆写也可能把一份有效的标记截断。两种都留待重试。
+    if marker_closed {
+        match marker_closed_state(transport, keys, space_id).await {
+            Ok(Some(true)) => return Done,
+            Ok(_) => {}
+            Err(error @ SyncError::Upgrade(_)) | Err(error @ SyncError::Other(_)) => {
+                return Failed(error)
+            }
+            Err(error) => return ConfirmedButFailed(error),
         }
+    }
+    if let Err(error) = write_closed_marker(transport, keys, space_id).await {
+        return ConfirmedButFailed(error);
     }
     Done
 }
@@ -268,6 +273,13 @@ pub enum CloseAttempt {
     Failed(SyncError),
 }
 
+/// 观察到兼容标记确实是关闭版时立刻调用（在任何补写 I/O 之前）：调用方据此把
+/// 「已确认关闭」落盘，之后补写失败或这次尝试被取消都不会丢这个事实。
+pub type ConfirmClosed<'a> = &'a (dyn Fn() -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>,
+> + Send
+              + Sync);
+
 /// 只在远端确实显示「关闭已经开始」时把关闭补完：兼容标记已关闭，或墓碑已经写下。
 ///
 /// 重置的记录可能在本机退出时被丢掉，之后靠一条独立的收尾记录调用这里；重置也可能
@@ -275,13 +287,14 @@ pub enum CloseAttempt {
 /// 本机在关闭现场确认过标记是关闭版、但墓碑没补上的情况：这个事实已经落盘，迟到的
 /// 创建把标记改回开放也不影响，直接补完。
 ///
-/// 标记一验证为关闭版就通过 `CloseAttempt::ConfirmedButFailed` 把事实交回调用方
-/// （补写接着失败时调用方仍能落盘），不靠补写完再复读一次。
+/// 补写过程中重新读到「已验证关闭」时，先用 `confirm` 把事实落盘再动远端——不靠
+/// 补写完再交回，被取消也不会丢。
 pub async fn ensure_closed_if_started(
     transport: &dyn SyncTransport,
     keys: &Keys,
     space_id: &str,
     known_closed: bool,
+    confirm: Option<ConfirmClosed<'_>>,
 ) -> CloseAttempt {
     use CloseAttempt::*;
     if known_closed {
@@ -297,6 +310,12 @@ pub async fn ensure_closed_if_started(
         Err(error) => return Failed(error),
     };
     if marker_closed {
+        // 这次读到的关闭也要先落盘，再补墓碑：补写期间被取消也不会丢。
+        if let Some(confirm) = confirm {
+            if let Err(error) = confirm().await {
+                return ConfirmedButFailed(error);
+            }
+        }
         // 与「关闭现场已确认」同样的补法：墓碑补写期间迟到创建可能把标记改回开放，
         // 补完要复核一次。
         return finish_known_closed(transport, keys, space_id).await;
@@ -534,6 +553,75 @@ mod tests {
         ));
     }
 
+    /// 测试存储：兼容标记第一次读是本空间的（关闭版），之后换成另一个空间的可解析标记。
+    struct ForeignAfterFirst {
+        inner: FileTransport,
+        marker_reads: AtomicUsize,
+        foreign: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl SyncTransport for ForeignAfterFirst {
+        async fn list(&self, prefix: &str) -> TransportResult<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn get(&self, key: &str, max: u64) -> TransportResult<Vec<u8>> {
+            if key == SPACE_FILE && self.marker_reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(self.foreign.clone());
+            }
+            self.inner.get(key, max).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+            self.inner.put(key, body).await
+        }
+
+        async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+            self.inner.put_new(key, body).await
+        }
+
+        async fn delete(&self, key: &str) -> TransportResult<()> {
+            self.inner.delete(key).await
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_marker_seen_on_the_recheck_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = FileTransport::new(dir.path());
+        let keys = Keys::derive(&SpaceKey::generate());
+        let space_id = crate::secrets::new_space_id();
+        open_space(&inner, &keys, &space_id, true).await.unwrap();
+        close_space(&inner, &keys, &space_id).await.unwrap();
+        // 复核时读到另一个空间的可解析标记：不能拿我们的关闭版把它盖掉。
+        let other_keys = Keys::derive(&SpaceKey::generate());
+        let other_space = crate::secrets::new_space_id();
+        let foreign = SpaceFile::new(&other_keys, &other_space)
+            .encode()
+            .unwrap();
+        let transport = ForeignAfterFirst {
+            inner,
+            marker_reads: AtomicUsize::new(0),
+            foreign,
+        };
+        assert!(matches!(
+            ensure_closed_if_started(&transport, &keys, &space_id, true, None).await,
+            CloseAttempt::Failed(_)
+        ));
+        // 原标记没有被动过。
+        assert_eq!(
+            marker_closed_state(&transport.inner, &keys, &space_id)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+    }
+
     #[tokio::test]
     async fn the_marker_state_is_read_only_when_it_verifies() {
         let dir = tempfile::tempdir().unwrap();
@@ -597,7 +685,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            ensure_closed_if_started(&transport, &keys, &space_id, false, None).await,
             CloseAttempt::NotStarted
         ));
         // 关闭开了个头（墓碑先写成、兼容标记没写成）→ 补完两件。
@@ -608,7 +696,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            ensure_closed_if_started(&transport, &keys, &space_id, false, None).await,
             CloseAttempt::Done
         ));
         assert!(matches!(
@@ -617,13 +705,13 @@ mod tests {
         ));
         // 幂等。
         assert!(matches!(
-            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            ensure_closed_if_started(&transport, &keys, &space_id, false, None).await,
             CloseAttempt::Done
         ));
         // 旧版关闭只写了兼容标记：补墓碑。
         transport.delete(SPACE_CLOSED_FILE).await.unwrap();
         assert!(matches!(
-            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            ensure_closed_if_started(&transport, &keys, &space_id, false, None).await,
             CloseAttempt::Done
         ));
         assert!(matches!(
@@ -637,7 +725,7 @@ mod tests {
             .unwrap();
         transport.delete(SPACE_CLOSED_FILE).await.unwrap();
         assert!(matches!(
-            ensure_closed_if_started(&transport, &keys, &space_id, true).await,
+            ensure_closed_if_started(&transport, &keys, &space_id, true, None).await,
             CloseAttempt::Done
         ));
         assert!(matches!(
@@ -662,7 +750,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            ensure_closed_if_started(&transport, &keys, &space_id, false, None).await,
             CloseAttempt::NotStarted
         ));
         assert!(!read_space(&transport).await.unwrap().unwrap().closed);
