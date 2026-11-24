@@ -69,6 +69,9 @@ public final class RClawService extends Service {
     /** 本服务实例见过「还没有 rclaw.toml」的待配置态：只有这种「向导刚写完配置」的
      *  转换才需要装配宽限；本来就带着配置启动的服务不享受宽限。 */
     private volatile boolean sawPendingConfig;
+    /** 定时检查与闹钟检查可能跑在不同执行器上：观察文件、JNI 健康与字段更新要在同一把锁里
+     *  串行，否则一次陈旧的「没配置」观察会把刚结束的宽限重新打开。 */
+    private final Object healthCheckLock = new Object();
     private volatile long nativeStartedAtMs;
     private PowerManager.WakeLock startupWakeLock;
     private PowerManager.WakeLock turnWakeLock;
@@ -287,6 +290,12 @@ public final class RClawService extends Service {
     }
 
     private void checkNativeRuntime() {
+        synchronized (healthCheckLock) {
+            checkNativeRuntimeLocked();
+        }
+    }
+
+    private void checkNativeRuntimeLocked() {
         if (stopping.get() || !nativeStarted) {
             return;
         }

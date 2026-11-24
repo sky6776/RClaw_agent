@@ -291,10 +291,11 @@ struct PendingClose {
     /// 这条记录的身份：收尾结果按它结算，不按目标——期间同目标可能已经被新记录替代。
     #[serde(default)]
     id: String,
-    /// 这条记录（或它最近一次被失败恢复）落盘的时刻：成功的按目标清理只删**更早**的
-    /// 记录，不把并发失败刚补回来的重试依据一起删掉。
+    /// 这条记录（或它最近一次被失败恢复）落盘时的队列版本（队列锁内递增分配）：
+    /// 成功的按目标清理只删**版本不高于尝试开始时上界**的记录，不把并发失败刚补回来
+    /// 的重试依据一起删掉；也不受墙钟回拨/同毫秒影响。
     #[serde(default)]
-    at_ms: u64,
+    rev: u64,
     /// 关闭时用的存储配置（来自那条没做完的重置记录）。
     storage: SyncConfig,
     /// 旧空间的密钥与存储凭据。
@@ -456,13 +457,6 @@ fn same_close_location(a: &SyncConfig, b: &SyncConfig) -> bool {
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn same_close_target(close: &PendingClose, storage: &SyncConfig, space_id: &str) -> bool {
     close.previous.space_id == space_id && same_close_location(&close.storage, storage)
 }
@@ -548,7 +542,7 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
             }
         }
         let mut close = close;
-        close.at_ms = now_ms();
+        close.rev = closes.iter().map(|entry| entry.rev).max().unwrap_or(0) + 1;
         // 确认事实是目标的性质：并进新条目的同时，留在旧的里面也不算丢。
         for old in closes
             .iter()
@@ -612,6 +606,15 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
         // 提前传播会让封顶的回退规则淘汰错人（可能丢掉唯一带有效凭据的快照）。
         let mut closes = closes;
         changed |= cap_close_history(&mut closes);
+        // 老记录没有版本：按盘上顺序补上，之后的清理边界才有意义。
+        let mut next = closes.iter().map(|entry| entry.rev).max().unwrap_or(0);
+        for entry in &mut closes {
+            if entry.rev == 0 {
+                next += 1;
+                entry.rev = next;
+                changed = true;
+            }
+        }
         // 「已确认关闭」是**目标**的事实，不是某条记录私有的：同目标（同空间 + 同位置）
         // 里只要有一条确认过，保留下来的其余条目也带着这个事实去补写——否则有效密码
         // 那条可能被当成「远端没开始关闭」删掉，只剩失效密码那条永远补不完。
@@ -646,9 +649,9 @@ async fn pending_close_finish_target(
     space_id: &str,
     keep_confirmed: bool,
     only_batch: Option<&std::collections::HashSet<String>>,
-    // 只删不晚于这个时刻落盘的记录（`0` = 不设限）：这次成功之前刚被并发失败恢复
-    // 回来的记录要留着。
-    not_after_ms: u64,
+    // 只删版本不高于它的记录（`u64::MAX` = 不设限）：这次尝试期间/之后被并发失败
+    // 恢复回来的记录版本更高，要留着。
+    rev_limit: u64,
 ) -> Result<()> {
     let paths = paths.clone();
     let (storage, space_id) = (storage.clone(), space_id.to_string());
@@ -666,7 +669,7 @@ async fn pending_close_finish_target(
             if !same_close_target(close, &storage, &space_id) {
                 return true;
             }
-            if not_after_ms != 0 && close.at_ms > not_after_ms {
+            if close.rev > rev_limit {
                 return true;
             }
             if any_confirmed {
@@ -694,22 +697,39 @@ async fn pending_close_finish_target(
 /// 不会造出重复条目。
 async fn pending_close_restore(paths: &SyncPaths, close: &PendingClose) -> Result<()> {
     let paths = paths.clone();
-    let mut close = close.clone();
-    close.at_ms = now_ms();
+    let close = close.clone();
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
+        let rev = closes.iter().map(|entry| entry.rev).max().unwrap_or(0) + 1;
         match closes.iter_mut().find(|entry| entry.id == close.id) {
             Some(entry) => {
                 entry.closed_seen |= close.closed_seen;
-                entry.at_ms = close.at_ms;
+                entry.rev = rev;
             }
             None => {
+                let mut close = close;
+                close.rev = rev;
                 closes.push(close);
                 cap_close_history(&mut closes);
             }
         }
         pending_close_save(&paths, &closes)
+    })
+    .await
+}
+
+/// 这次尝试开始时的队列版本上界（在队列锁内读）：清理只删版本不高于它的记录，
+/// 期间/之后被并发失败恢复的记录（版本更高）留着。
+async fn pending_close_rev_limit(paths: &SyncPaths) -> Result<u64> {
+    let paths = paths.clone();
+    blocking(move || {
+        let _lock = CloseQueueLock::acquire(&paths)?;
+        Ok(pending_close_load(&paths)?
+            .iter()
+            .map(|entry| entry.rev)
+            .max()
+            .unwrap_or(0))
     })
     .await
 }
@@ -778,7 +798,7 @@ pub(crate) async fn finish_pending_close(
             ));
             continue;
         };
-        let attempt_started_ms = now_ms();
+        let rev_limit = pending_close_rev_limit(paths).await?;
         let closed = {
             // 单条也限时：卡住的一条不能把后面的健康记录一直饿着。
             match tokio::time::timeout(
@@ -787,7 +807,7 @@ pub(crate) async fn finish_pending_close(
                     &mut close,
                     paths,
                     &batch_ids,
-                    attempt_started_ms,
+                    rev_limit,
                     current.as_ref(),
                     secrets.as_ref(),
                     refresh.as_ref(),
@@ -823,9 +843,9 @@ async fn finish_one_close(
     close: &mut PendingClose,
     paths: &SyncPaths,
     batch_ids: &std::collections::HashSet<String>,
-    // 这次尝试开始的时刻：成功清理只删这之前落盘的记录，这次尝试期间/之后被并发
-    // 失败恢复回来的记录留着。
-    attempt_started_ms: u64,
+    // 这次尝试开始时的队列版本上界：成功清理只删版本不高于它的记录，这次尝试期间/
+    // 之后被并发失败恢复回来的记录留着。
+    rev_limit: u64,
     current: Option<&SyncConfig>,
     current_secrets: Option<&Secrets>,
     refresh: Option<&crate::engine::ConfigRefresh>,
@@ -954,7 +974,7 @@ async fn finish_one_close(
                 &space_id,
                 false,
                 None,
-                attempt_started_ms,
+                rev_limit,
             )
             .await?;
             Ok(())
@@ -968,7 +988,7 @@ async fn finish_one_close(
                 &space_id,
                 true,
                 Some(batch_ids),
-                0,
+                u64::MAX,
             )
             .await?;
             Ok(())
@@ -1135,7 +1155,7 @@ async fn finish_reset(
             // 都不会丢；补墓碑成功再把这条记录撤掉。
             let close = PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                at_ms: now_ms(),
+                rev: 0,
                 storage: at.clone(),
                 previous: old_secrets.clone(),
                 closed_seen: true,
@@ -1145,7 +1165,7 @@ async fn finish_reset(
                 tracing::warn!("记下没补完的空间关闭失败: {write_error}");
             }
             let old = load_live(&at, &old_secrets).await?;
-            let attempt_started_ms = now_ms();
+            let rev_limit = pending_close_rev_limit(&ctx.paths).await?;
             // 两份对象都确认了才撤这条记录；撤记录只是收尾，撤不掉留给后台再验一遍
             //（幂等），不能把本机提交挡在后面。
             match remote::ensure_closed_if_started(
@@ -1167,7 +1187,7 @@ async fn finish_reset(
                         &old.space_id,
                         false,
                         None,
-                        attempt_started_ms,
+                        rev_limit,
                     )
                     .await
                     {
@@ -1316,7 +1336,7 @@ pub(crate) async fn leave(
                     &ctx.paths,
                     PendingClose {
                         id: crate::ids::random_hex::<8>(),
-                        at_ms: now_ms(),
+                        rev: 0,
                         storage: at,
                         previous,
                         closed_seen: false,
@@ -1744,7 +1764,7 @@ mod tests {
             &ctx.paths,
             &[PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                at_ms: now_ms(),
+                rev: 0,
                 storage: config.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
@@ -1770,7 +1790,7 @@ mod tests {
         config.webdav.username = "me".into();
         let entry = |fingerprint: &str, closed: bool| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: {
                 let mut storage = config.clone();
                 storage.webdav.pinned_cert_sha256 = fingerprint.into();
@@ -1790,7 +1810,7 @@ mod tests {
         // 另一个不同空间/位置不受影响。
         let other = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: paired(),
             closed_seen: false,
@@ -1812,7 +1832,7 @@ mod tests {
         config.webdav.username = "me".into();
         let entry = |fingerprint: &str, closed: bool| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: {
                 let mut storage = config.clone();
                 storage.webdav.pinned_cert_sha256 = fingerprint.into();
@@ -1847,7 +1867,7 @@ mod tests {
             .all(|close| close.closed_seen));
     }
 
-    /// 成功清理只删「完成时刻之前」落盘的记录：并发失败刚补回来的重试依据要留着。
+    /// 成功清理只删版本不高于尝试开始时上界的记录：并发失败刚补回来的（版本更高）要留着。
     #[tokio::test]
     async fn a_target_cleanup_keeps_records_restored_after_its_done() {
         let (_tmp, ctx) = crate::testing::ctx();
@@ -1855,29 +1875,20 @@ mod tests {
         let mut config = SyncConfig::default();
         config.transport = "file".into();
         config.file.dir = "C:/sync-a".into();
-        let done_at = 1_800_000_000_000u64;
-        let entry = |at_ms: u64| PendingClose {
+        let entry = |rev: u64| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms,
+            rev,
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: true,
         };
-        // 更早的记录（完成之前落盘）：清掉。
-        let older = entry(done_at - 1_000);
-        // 并发失败在完成之后恢复的记录：留着。
-        let newer = entry(done_at + 1_000);
+        // 尝试开始时队列上界是 10：版本 5 的事前记录清掉，版本 20 的并发恢复记录留着。
+        let older = entry(5);
+        let newer = entry(20);
         pending_close_save(&ctx.paths, &[older, newer.clone()]).unwrap();
-        pending_close_finish_target(
-            &ctx.paths,
-            &config,
-            &secrets.space_id,
-            false,
-            None,
-            done_at,
-        )
-        .await
-        .unwrap();
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, 10)
+            .await
+            .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 1);
         assert_eq!(closes[0].id, newer.id);
@@ -1893,14 +1904,14 @@ mod tests {
         config.file.dir = "C:/sync-a".into();
         let confirmed = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: true,
         };
         let unconfirmed = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -1926,14 +1937,21 @@ mod tests {
         config.file.dir = "C:/sync-a".into();
         let entry = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: true,
         };
         pending_close_save(&ctx.paths, &[entry.clone()]).unwrap();
         // 并发的成功清理把同目标全删了。
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, 0)
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            false,
+            None,
+            u64::MAX,
+        )
             .await
             .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
@@ -1962,7 +1980,7 @@ mod tests {
         config.webdav.username = "me".into();
         let entry = |fingerprint: &str, closed: bool| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: {
                 let mut storage = config.clone();
                 storage.webdav.pinned_cert_sha256 = fingerprint.into();
@@ -2059,7 +2077,7 @@ mod tests {
         old.webdav.pinned_cert_sha256 = "aa".repeat(32);
         let entry = |storage: &SyncConfig, closed: bool| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: storage.clone(),
             previous: secrets.clone(),
             closed_seen: closed,
@@ -2081,7 +2099,14 @@ mod tests {
             old.webdav.pinned_cert_sha256
         );
         // 收尾成功：同目标的全部历史一起清掉。
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, 0)
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            false,
+            None,
+            u64::MAX,
+        )
             .await
             .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
@@ -2097,7 +2122,7 @@ mod tests {
         second.webdav.pinned_cert_sha256 = "aa".repeat(32);
         let entry = |storage: &SyncConfig| PendingClose {
             id: String::new(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: storage.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2129,7 +2154,7 @@ mod tests {
         let second = paired();
         let entry = |space: &Secrets| PendingClose {
             id: String::new(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: space.clone(),
             closed_seen: false,
@@ -2175,7 +2200,7 @@ mod tests {
         let config = config_at("C:/sync-a");
         let old = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2183,7 +2208,7 @@ mod tests {
         pending_close_save(&ctx.paths, &[old.clone()]).unwrap();
         let fresh = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2194,7 +2219,7 @@ mod tests {
         // 另一条不同空间的记录。
         let other = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: other_space.clone(),
             closed_seen: false,
@@ -2221,7 +2246,7 @@ mod tests {
         // 直接落盘而不是 add，否则 add 会把 fresh 的确认事实并进来、这里就测不到批次判据。
         let later = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            at_ms: now_ms(),
+            rev: 0,
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2240,7 +2265,14 @@ mod tests {
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert!(closes.iter().any(|close| close.id == fresh.id && close.closed_seen));
         // 收尾成功清掉同目标的全部历史，别的目标不动。
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, 0)
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            false,
+            None,
+            u64::MAX,
+        )
             .await
             .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
@@ -2264,7 +2296,7 @@ mod tests {
             &ctx.paths,
             PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                at_ms: now_ms(),
+                rev: 0,
                 storage: first.clone(),
                 previous: secrets.clone(),
                 closed_seen: true,
@@ -2277,7 +2309,7 @@ mod tests {
             &ctx.paths,
             PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                at_ms: now_ms(),
+                rev: 0,
                 storage: second.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
@@ -2293,7 +2325,7 @@ mod tests {
             &ctx.paths,
             PendingClose {
                 id: id.clone(),
-                at_ms: now_ms(),
+                rev: 0,
                 storage: first.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
@@ -2328,7 +2360,7 @@ mod tests {
             &ctx.paths,
             &[PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                at_ms: now_ms(),
+                rev: 0,
                 storage: config.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
