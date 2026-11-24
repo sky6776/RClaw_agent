@@ -35,6 +35,9 @@ use crate::trash;
 use crate::wire::{self, StoredRefs};
 use crate::{blocking, Ctx};
 
+/// 一条收尾记录最多等这么久：卡住的一条不能把后面的健康记录一直饿着。
+const CLOSE_ENTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// 一个打开的同步空间：套了空间子目录的传输，和这个空间的密钥。
 pub(crate) struct Live {
     transport: Box<dyn SyncTransport>,
@@ -462,6 +465,12 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
+        // 老版本写下的条目先补上各自的身份：后面按身份结算才不会串。
+        for old in &mut closes {
+            if old.id.is_empty() {
+                old.id = crate::ids::random_hex::<8>();
+            }
+        }
         let mut close = close;
         if let Some(old) = closes
             .iter()
@@ -476,19 +485,55 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
     .await
 }
 
-/// 把「本机确认过标记是关闭版」落到这条记录上（按记录身份，不按目标）：就算这一批
-/// 后面的补写超时、被取消、进程退出，下次也知道关闭已经开始。
-async fn pending_close_mark_seen(paths: &SyncPaths, id: &str) -> Result<()> {
+/// 把「本机确认过标记是关闭版」落到这条记录上：就算这一批后面的补写超时、被取消、
+/// 进程退出，下次也知道关闭已经开始。记录如果已经按同一目标换了身份（退出时为这次
+/// 重置又加了一条），事实落到新那条上——它说的是这个空间，不是这条记录。
+async fn pending_close_mark_seen(
+    paths: &SyncPaths,
+    id: &str,
+    storage: &SyncConfig,
+    space_id: &str,
+) -> Result<()> {
     let paths = paths.clone();
-    let id = id.to_string();
+    let (id, storage, space_id) = (id.to_string(), storage.clone(), space_id.to_string());
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
-        let Some(close) = closes.iter_mut().find(|close| close.id == id) else {
+        let slot = closes
+            .iter()
+            .position(|close| close.id == id)
+            .or_else(|| {
+                closes
+                    .iter()
+                    .position(|close| same_close_target(close, &storage, &space_id))
+            });
+        let Some(slot) = slot else {
             return Ok(());
         };
-        close.closed_seen = true;
+        closes[slot].closed_seen = true;
         pending_close_save(&paths, &closes)
+    })
+    .await
+}
+
+/// 给老版本写下的、没有身份的条目补上身份（并落盘）：身份共用空串的话，一条的结算
+/// 会落到另一条上。
+async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>> {
+    let paths = paths.clone();
+    blocking(move || {
+        let _lock = CloseQueueLock::acquire(&paths)?;
+        let mut closes = pending_close_load(&paths)?;
+        let mut changed = false;
+        for close in &mut closes {
+            if close.id.is_empty() {
+                close.id = crate::ids::random_hex::<8>();
+                changed = true;
+            }
+        }
+        if changed {
+            pending_close_save(&paths, &closes)?;
+        }
+        Ok(closes)
     })
     .await
 }
@@ -518,26 +563,51 @@ pub(crate) async fn finish_pending_close(
     paths: &SyncPaths,
     refresh: Option<crate::engine::ConfigRefresh>,
 ) -> Result<()> {
-    let current = refresh.and_then(|refresh| refresh().ok().flatten());
-    let current_secrets = Secrets::load(paths).ok();
+    let closes = pending_close_ensure_ids(paths).await?;
+    if closes.is_empty() {
+        return Ok(());
+    }
     let mut first_error = None;
-    for mut close in pending_close_load(paths)? {
-        match finish_one_close(
-            &mut close,
-            paths,
-            current.as_ref(),
-            current_secrets.as_ref(),
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(error) => {
-                tracing::warn!(
-                    "补完空间 {} 的关闭失败（稍后再试）: {error}",
-                    close.previous.space_id
-                );
-                first_error.get_or_insert(error);
+    for mut close in closes {
+        // 当前配置与凭据逐条读：一批里可能等很久，期间设置可能又改过。读不出来就
+        // 不拿旧设置去连（可能已经不允许明文了），留着下次再试。
+        let current = match &refresh {
+            Some(refresh) => {
+                let refresh = refresh.clone();
+                match blocking(move || Ok::<_, SyncError>((refresh)())).await? {
+                    Ok(config) => config,
+                    Err(()) => {
+                        first_error.get_or_insert(SyncError::other(
+                            "同步设置暂时读不出来，稍后再补完空间关闭",
+                        ));
+                        continue;
+                    }
+                }
             }
+            None => None,
+        };
+        let secrets = {
+            let paths = paths.clone();
+            blocking(move || Secrets::load(&paths)).await.ok()
+        };
+        let closed = {
+            // 单条也限时：卡住的一条不能把后面的健康记录一直饿着。
+            match tokio::time::timeout(
+                CLOSE_ENTRY_TIMEOUT,
+                finish_one_close(&mut close, paths, current.as_ref(), secrets.as_ref()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(SyncError::other("补完这条空间关闭超时")),
+            }
+        };
+        if let Err(error) = closed {
+            tracing::warn!(
+                "补完空间 {} 的关闭失败（稍后再试）: {error}",
+                close.previous.space_id
+            );
+            first_error.get_or_insert(error);
         }
     }
     match first_error {
@@ -587,13 +657,27 @@ async fn finish_one_close(
     let transport = Scoped::new(root, &space_id);
     // 先看一眼标记：验证过是关闭版就立刻记进记录（这一批后面超时/取消也不丢）。
     if !close.closed_seen {
-        let observed = remote::marker_closed_state(&transport, &keys, &space_id).await?;
-        if observed == Some(true) {
-            pending_close_mark_seen(paths, &close.id).await?;
+        if remote::marker_closed_state(&transport, &keys, &space_id).await? == Some(true) {
+            pending_close_mark_seen(paths, &close.id, &close.storage, &space_id).await?;
             close.closed_seen = true;
         }
     }
-    remote::ensure_closed_if_started(&transport, &keys, &space_id, close.closed_seen).await?;
+    if let Err(error) =
+        remote::ensure_closed_if_started(&transport, &keys, &space_id, close.closed_seen).await
+    {
+        // 补写失败时再看一眼标记：关闭可能刚好在两次观察之间写成（ensure 内部第二次
+        // 读到的就是关闭版）。这时的确认同样要落盘。
+        if !close.closed_seen
+            && matches!(
+                remote::marker_closed_state(&transport, &keys, &space_id).await,
+                Ok(Some(true))
+            )
+        {
+            pending_close_mark_seen(paths, &close.id, &close.storage, &space_id).await?;
+            close.closed_seen = true;
+        }
+        return Err(error);
+    }
     pending_close_finish(paths, &close.id).await?;
     Ok(())
 }
@@ -687,7 +771,11 @@ async fn finish_reset(
     let mut old_secrets = pending.previous.clone();
     if storage_binding(&at) == storage_binding(config) {
         refresh_credentials(&mut next, secrets);
-        refresh_credentials(&mut old_secrets, secrets);
+        // 旧空间的凭据只在当前设置确实有「那个账户」的凭据时换：用户名带尾随空格这类
+        // 规范化差异下，换错账户会让记录里本来能用的密码变成空。
+        if !secrets.storage_secret(&at).is_empty() {
+            refresh_credentials(&mut old_secrets, secrets);
+        }
     }
     let fresh = load_live(&at, &next).await?;
     // 1. 新空间立起来。已存在就核对密钥（幂等）；已废弃说明情况不对，停下来让人看。
@@ -735,24 +823,22 @@ async fn finish_reset(
             remote::close_space(old.transport(), &old.keys, &old.space_id).await?;
         } else {
             // 标记已是关闭版，但上一次关闭可能只写成了标记（墓碑那次 PUT 失败）：
-            // 提交重置之前把墓碑补上，否则迟到创建覆盖标记后旧空间又能被接受。
+            // 先把这个「已确认关闭」的事实落盘——后面 load_live、补墓碑失败或进程退出
+            // 都不会丢；补墓碑成功再把这条记录撤掉。
+            let close = PendingClose {
+                id: crate::ids::random_hex::<8>(),
+                storage: at.clone(),
+                previous: old_secrets.clone(),
+                closed_seen: true,
+            };
+            let added = pending_close_add(&ctx.paths, close.clone()).await;
+            if let Err(write_error) = &added {
+                tracing::warn!("记下没补完的空间关闭失败: {write_error}");
+            }
             let old = load_live(&at, &old_secrets).await?;
-            if let Err(error) =
-                remote::ensure_closed(old.transport(), &old.keys, &old.space_id).await
-            {
-                // 这次已经确认旧标记是关闭版、墓碑却没补上：把这个事实落盘。本机随后
-                // 可能退出并清掉旧空间密钥，只有它能保证迟到创建把标记改回开放之后，
-                // 收尾仍按「关闭已经开始」补完。
-                let close = PendingClose {
-                    id: crate::ids::random_hex::<8>(),
-                    storage: at.clone(),
-                    previous: old_secrets.clone(),
-                    closed_seen: true,
-                };
-                if let Err(write_error) = pending_close_add(&ctx.paths, close).await {
-                    tracing::warn!("记下没补完的空间关闭失败: {write_error}");
-                }
-                return Err(error);
+            remote::ensure_closed(old.transport(), &old.keys, &old.space_id).await?;
+            if added.is_ok() {
+                pending_close_finish(&ctx.paths, &close.id).await?;
             }
         }
     }
@@ -882,7 +968,9 @@ pub(crate) async fn leave(
             if pending.action == SpaceAction::Reset && pending.previous.is_paired() {
                 let at = pending.storage.clone().unwrap_or_else(|| config.clone());
                 let mut previous = pending.previous.clone();
-                if storage_binding(&at) == storage_binding(config) {
+                if storage_binding(&at) == storage_binding(config)
+                    && !secrets.storage_secret(&at).is_empty()
+                {
                     refresh_credentials(&mut previous, secrets);
                 }
                 pending_close_add(
@@ -1331,14 +1419,61 @@ mod tests {
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
-    /// 结算按记录身份：旧的「未开始」结果不能删掉/改写同目标的新记录。
+    /// 老版本写下的条目没有身份：读进来要先补上各自的，结算才不会串到别的空间上。
+    #[tokio::test]
+    async fn legacy_entries_without_identity_get_distinct_ones() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let first = paired();
+        let second = paired();
+        let entry = |space: &Secrets| PendingClose {
+            id: String::new(),
+            storage: config.clone(),
+            previous: space.clone(),
+            closed_seen: false,
+        };
+        pending_close_save(&ctx.paths, &[entry(&first), entry(&second)]).unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 2);
+        assert!(!closes[0].id.is_empty());
+        assert_ne!(closes[0].id, closes[1].id);
+        // 补出来的身份要落盘：下一次读到的还是这两个。
+        let again = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(again[0].id, closes[0].id);
+        assert_eq!(again[1].id, closes[1].id);
+        // 结算一条不会删掉另一条。
+        pending_close_finish(&ctx.paths, &closes[0].id).await.unwrap();
+        let left = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, closes[1].id);
+        // 置位也只落到剩下那条上。
+        pending_close_mark_seen(
+            &ctx.paths,
+            &closes[1].id,
+            &closes[1].storage,
+            &closes[1].previous.space_id,
+        )
+        .await
+        .unwrap();
+        assert!(pending_close_load(&ctx.paths).unwrap()[0].closed_seen);
+    }
+
+    /// 结算按记录身份：旧的「未开始」结果不能删掉同目标的新记录；但「这个空间已确认
+    /// 关闭」是目标的性质，旧身份没了也要落到同目标的新记录上。
     #[tokio::test]
     async fn close_results_are_settled_by_record_id() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let other_space = paired();
+        let config_at = |dir: &str| {
+            let mut config = SyncConfig::default();
+            config.transport = "file".into();
+            config.file.dir = dir.into();
+            config
+        };
+        let config = config_at("C:/sync-a");
         let old = PendingClose {
             id: crate::ids::random_hex::<8>(),
             storage: config.clone(),
@@ -1355,19 +1490,40 @@ mod tests {
         };
         pending_close_add(&ctx.paths, fresh.clone()).await.unwrap();
         assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 1);
-        // 旧记录的「完成」结算不能删掉这条新记录。
+        // 另一条不同空间的记录。
+        pending_close_add(
+            &ctx.paths,
+            PendingClose {
+                id: crate::ids::random_hex::<8>(),
+                storage: config.clone(),
+                previous: other_space.clone(),
+                closed_seen: false,
+            },
+        )
+        .await
+        .unwrap();
+        // 旧身份的「完成」结算不能删掉这条新记录。
         pending_close_finish(&ctx.paths, &old.id).await.unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
-        assert_eq!(closes.len(), 1);
-        assert_eq!(closes[0].id, fresh.id);
-        // 「确认关闭」只落在它自己的身份上。
-        pending_close_mark_seen(&ctx.paths, &old.id).await.unwrap();
-        assert!(!pending_close_load(&ctx.paths).unwrap()[0].closed_seen);
-        pending_close_mark_seen(&ctx.paths, &fresh.id).await.unwrap();
-        assert!(pending_close_load(&ctx.paths).unwrap()[0].closed_seen);
+        assert_eq!(closes.len(), 2);
+        assert!(closes.iter().any(|close| close.id == fresh.id));
+        // 「确认关闭」按身份找不到时落到同目标上，不碰别的空间。
+        pending_close_mark_seen(&ctx.paths, &old.id, &config, &secrets.space_id)
+            .await
+            .unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        let fresh_now = closes.iter().find(|close| close.id == fresh.id).unwrap();
+        assert!(fresh_now.closed_seen);
+        let other_now = closes
+            .iter()
+            .find(|close| close.previous.space_id == other_space.space_id)
+            .unwrap();
+        assert!(!other_now.closed_seen);
         // 按身份结算才删得掉。
         pending_close_finish(&ctx.paths, &fresh.id).await.unwrap();
-        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].previous.space_id, other_space.space_id);
     }
 
     #[tokio::test]

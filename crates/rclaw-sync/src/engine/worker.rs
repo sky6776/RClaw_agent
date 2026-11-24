@@ -53,9 +53,6 @@ const FOCUS_RETRY: Duration = Duration::from_secs(15);
 /// 拿不到引擎锁：第一次很快再试（多半是上一个引擎线程还在收尾），之后慢慢试。
 const STANDBY_FIRST: Duration = Duration::from_secs(2);
 const STANDBY_RETRY: Duration = Duration::from_secs(30);
-/// 「补完空间关闭」放到后台做时最多等这么久：卡住的旧存储不能把这个任务永远挂着，
-/// 记录本来就留着重试。
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 本机这边没准备好（目录、数据库出错）：隔这么久再试。
 const OPEN_RETRY: Duration = Duration::from_secs(30);
 /// 拆任务时等已经开始的附件提交阶段结束最多这么久（换空间 / 清理之前）。等不到也往下
@@ -858,16 +855,11 @@ impl Worker {
         self.close_generation += 1;
         let generation = self.close_generation;
         self.close_task = Some(tokio::spawn(async move {
-            // 当前配置从宿主重读入口拿（任务跑起来之后设置可能又改过），拿不到用记录里的。
-            let report = match tokio::time::timeout(
-                CLOSE_TIMEOUT,
-                space::finish_pending_close(&paths, refresh),
-            )
-            .await
-            {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(_) => Err("补完空间关闭超时".to_string()),
+            // 每一条自己限时，整批不设总时限（后台任务，不挡主循环）。当前配置从宿主
+            // 重读入口拿（任务跑起来之后设置可能又改过），读不出来就留着下次再试。
+            let report = match space::finish_pending_close(&paths, refresh).await {
+                Ok(()) => Ok(()),
+                Err(error) => Err(error.to_string()),
             };
             let _ = done.send((generation, report));
         }));
@@ -1261,6 +1253,10 @@ impl Worker {
                     self.shared.set_state("off", None);
                     self.reopen_at = None;
                     self.close_retry_at = None;
+                    // 已经启动的收尾不再往下做：锁已经交给另一个进程了。
+                    if let Some(task) = self.close_task.take() {
+                        task.abort();
+                    }
                     return;
                 }
             }

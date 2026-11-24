@@ -247,7 +247,11 @@ pub async fn ensure_closed_if_started(
             Err(error) => return Err(error),
         };
         ensure_closed(transport, keys, space_id).await?;
-        if !marker_closed {
+        // 墓碑补写期间兼容标记可能被迟到创建改回开放：补完再看一眼，只有它现在还
+        // 不是关闭版才写（已经关闭的不重写）。
+        let still_closed = marker_closed
+            && marker_closed_state(transport, keys, space_id).await? == Some(true);
+        if !still_closed {
             write_closed_marker(transport, keys, space_id).await?;
         }
         return Ok(true);
