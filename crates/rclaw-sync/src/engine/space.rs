@@ -718,6 +718,10 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
             if let Err(error) = retire_close_legacy(&paths) {
                 tracing::warn!("清退旧版收尾队列文件失败（下一轮再试）: {error}");
             }
+        } else if let Err(error) = retire_close_file(&legacy_close_backup_path(&paths)) {
+            // 新文件还没有、旧主文件仍是唯一的队列（不能动它），但它的备份从来不是队列
+            // 来源：留下就是旧空间的密钥和旧密码，每批都重试清退。
+            tracing::warn!("清退旧版收尾队列备份失败（下一轮再试）: {error}");
         }
         Ok(closes)
     })
@@ -2242,6 +2246,42 @@ mod tests {
             !pending_close_legacy_path(&ctx.paths).exists(),
             "没有改动的一批也要清退旧文件"
         );
+    }
+
+    /// 首次迁移之前（新文件还没有）旧主文件是唯一的队列，不能动；但遗留的
+    /// `.pending-close.json.bak` 从来不是队列来源，批首要每轮清退它。
+    #[tokio::test]
+    async fn the_legacy_backup_is_retired_before_the_first_migration() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let close = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            mark: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        // 只有旧文件（还没迁移），外加一份带旧凭据的备份。
+        std::fs::write(
+            pending_close_legacy_path(&ctx.paths),
+            serde_json::to_vec(&[close.clone()]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_close_backup_path(&ctx.paths),
+            serde_json::to_vec(&[close]).unwrap(),
+        )
+        .unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 1, "旧文件仍是队列，不能被当成可清退的残留");
+        assert!(
+            !legacy_close_backup_path(&ctx.paths).exists(),
+            "首次迁移之前也要清退备份"
+        );
+        assert!(pending_close_legacy_path(&ctx.paths).exists());
     }
 
     /// 原地清空不产生任何副本（原子写的兜底替换会留一层 `.bak`，带着旧凭据）。
