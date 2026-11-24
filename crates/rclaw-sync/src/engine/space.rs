@@ -1700,8 +1700,12 @@ mod tests {
         assert!(!closes.iter().any(|close| fingerprint(close) == "bb2"));
         assert!(closes.iter().any(|close| fingerprint(close) == "bb3"));
         assert!(closes.iter().any(|close| fingerprint(close) == "bb4"));
+        // 封顶结果也要落盘（不只是改内存）：回读一遍。
+        let again = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(again.len(), 4);
+        assert!(again.iter().any(|close| close.id == oldest));
 
-        // 场景二（6 条 → 4 条）：两个 victim 都断言——先 bb0、再 bb1。
+        // 场景二（6 条 → 4 条）：两个 victim 都断言——先 dd1、再 dd2。
         let seeded = vec![
             entry("cc0", true),
             entry("dd1", false),
