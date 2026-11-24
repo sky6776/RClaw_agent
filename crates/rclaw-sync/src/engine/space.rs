@@ -778,6 +778,7 @@ pub(crate) async fn finish_pending_close(
             ));
             continue;
         };
+        let attempt_started_ms = now_ms();
         let closed = {
             // 单条也限时：卡住的一条不能把后面的健康记录一直饿着。
             match tokio::time::timeout(
@@ -786,6 +787,7 @@ pub(crate) async fn finish_pending_close(
                     &mut close,
                     paths,
                     &batch_ids,
+                    attempt_started_ms,
                     current.as_ref(),
                     secrets.as_ref(),
                     refresh.as_ref(),
@@ -821,6 +823,9 @@ async fn finish_one_close(
     close: &mut PendingClose,
     paths: &SyncPaths,
     batch_ids: &std::collections::HashSet<String>,
+    // 这次尝试开始的时刻：成功清理只删这之前落盘的记录，这次尝试期间/之后被并发
+    // 失败恢复回来的记录留着。
+    attempt_started_ms: u64,
     current: Option<&SyncConfig>,
     current_secrets: Option<&Secrets>,
     refresh: Option<&crate::engine::ConfigRefresh>,
@@ -941,10 +946,17 @@ async fn finish_one_close(
     .await
     {
         remote::CloseAttempt::Done => {
-            // 关闭做完：同目标的历史快照都已完成使命。删除以这次成功完成的时刻为界，
-            // 并发失败随后恢复回来的记录（`at_ms` 更晚）留着。
-            pending_close_finish_target(paths, &close.storage, &space_id, false, None, now_ms())
-                .await?;
+            // 关闭做完：同目标的历史快照都已完成使命。删除以这次尝试开始的时刻为界，
+            // 期间/之后被并发失败恢复回来的记录（`at_ms` 更晚）留着。
+            pending_close_finish_target(
+                paths,
+                &close.storage,
+                &space_id,
+                false,
+                None,
+                attempt_started_ms,
+            )
+            .await?;
             Ok(())
         }
         remote::CloseAttempt::NotStarted => {
@@ -1133,6 +1145,7 @@ async fn finish_reset(
                 tracing::warn!("记下没补完的空间关闭失败: {write_error}");
             }
             let old = load_live(&at, &old_secrets).await?;
+            let attempt_started_ms = now_ms();
             // 两份对象都确认了才撤这条记录；撤记录只是收尾，撤不掉留给后台再验一遍
             //（幂等），不能把本机提交挡在后面。
             match remote::ensure_closed_if_started(
@@ -1146,12 +1159,19 @@ async fn finish_reset(
             .await
             {
                 remote::CloseAttempt::Done => {
-                    // 只撤这一条：同目标的其它快照可能正在另一条任务里补写，这次成功
-                    // 不代表它们不会失败；留给后台成功时按目标清理（幂等）。
-                    if added.is_ok() {
-                        if let Err(error) = pending_close_finish(&ctx.paths, &close.id).await {
-                            tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
-                        }
+                    // 关闭已完成：清同目标的历史快照。以这次尝试开始的时刻为界，期间/
+                    // 之后被并发失败恢复回来的记录留着（下一轮复核会把它修好）。
+                    if let Err(error) = pending_close_finish_target(
+                        &ctx.paths,
+                        &close.storage,
+                        &old.space_id,
+                        false,
+                        None,
+                        attempt_started_ms,
+                    )
+                    .await
+                    {
+                        tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
                     }
                 }
                 remote::CloseAttempt::NotStarted => {}
