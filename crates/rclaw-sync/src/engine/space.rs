@@ -390,6 +390,12 @@ fn pending_close_legacy_path(paths: &SyncPaths) -> PathBuf {
     paths.root.join("pending-close.json")
 }
 
+/// 原子写兜底替换留下的备份（命名与 `rclaw_store` 的 `backup_path_for` 一致）：
+/// 清空旧文件时走备用路径会把旧内容挪到这里，里面同样是旧空间的密钥和旧密码。
+fn legacy_close_backup_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join(".pending-close.json.bak")
+}
+
 fn load_close_file(path: &Path) -> Result<Vec<PendingClose>> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -427,20 +433,27 @@ fn pending_close_load(paths: &SyncPaths) -> Result<Vec<PendingClose>> {
     load_close_file(&pending_close_legacy_path(paths))
 }
 
-/// 让旧版队列文件彻底退场：删得掉就删；删不掉（被占用/权限）就把它换成空队列——里面
+/// 让一个旧路径彻底退场：删得掉就删；删不掉（被占用/权限）就把它换成空队列——里面
 /// 是旧空间的密钥和旧密码，不能因为一次删除失败就长期留盘。新版加载把空文件当成
 /// 「第一次迁移」读到空队列，没有副作用。写也失败才报错，留给下一轮。
-fn retire_close_legacy(paths: &SyncPaths) -> Result<()> {
-    let legacy = pending_close_legacy_path(paths);
-    match remove_close_file(&legacy) {
+fn retire_close_file(path: &Path) -> Result<()> {
+    match remove_close_file(path) {
         Ok(()) => Ok(()),
-        Err(remove_error) => match rclaw_store::atomic_write_private(&legacy, b"[]") {
+        Err(remove_error) => match rclaw_store::atomic_write_private(path, b"[]") {
             Ok(()) => Ok(()),
             Err(write_error) => Err(SyncError::other(format!(
-                "旧版收尾队列文件删不掉（{remove_error}），清空也失败（{write_error}）"
+                "旧版收尾队列文件 {} 删不掉（{remove_error}），清空也失败（{write_error}）",
+                path.display()
             ))),
         },
     }
+}
+
+fn retire_close_legacy(paths: &SyncPaths) -> Result<()> {
+    retire_close_file(&pending_close_legacy_path(paths))?;
+    // 清空走原子写的兜底路径时，旧内容会被挪成 `.pending-close.json.bak`——那份同样
+    // 是旧空间的密钥和旧密码，备份删除失败或进程退出都可能留下它，一并清退。
+    retire_close_file(&legacy_close_backup_path(paths))
 }
 
 fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> {
@@ -2216,6 +2229,37 @@ mod tests {
         assert!(
             !pending_close_legacy_path(&ctx.paths).exists(),
             "没有改动的一批也要清退旧文件"
+        );
+    }
+
+    /// 原子写兜底替换留下的 `.pending-close.json.bak` 里也是旧空间的密钥和旧密码：
+    /// 批首清退旧文件时一并清掉它（不然后续只看主路径的重试永远碰不到这份备份）。
+    #[tokio::test]
+    async fn the_legacy_backup_file_is_retired_with_the_legacy_queue() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let close = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            mark: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        pending_close_save(&ctx.paths, &[close.clone()]).unwrap();
+        // 清空旧文件走备用替换时留下的备份（含旧凭据）。
+        std::fs::write(
+            legacy_close_backup_path(&ctx.paths),
+            serde_json::to_vec(&[close]).unwrap(),
+        )
+        .unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 1);
+        assert!(
+            !legacy_close_backup_path(&ctx.paths).exists(),
+            "备份里的旧凭据也要清退"
         );
     }
 
