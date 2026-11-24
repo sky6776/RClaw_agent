@@ -433,13 +433,24 @@ fn pending_close_load(paths: &SyncPaths) -> Result<Vec<PendingClose>> {
     load_close_file(&pending_close_legacy_path(paths))
 }
 
+/// 原地把文件换成空队列。**故意不走原子写**：原子写的兜底替换会把旧内容挪成
+/// `.<名字>.bak`，那张备份里同样是旧空间的密钥和旧密码，再去清它就是无限的「备份的
+/// 备份」。原地截断不产生任何副本；中途退出留下的是 0 字节文件，加载时按损坏丢弃。
+fn overwrite_close_file_quiet(path: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(0)?;
+    file.write_all(b"[]")?;
+    file.sync_all()
+}
+
 /// 让一个旧路径彻底退场：删得掉就删；删不掉（被占用/权限）就把它换成空队列——里面
 /// 是旧空间的密钥和旧密码，不能因为一次删除失败就长期留盘。新版加载把空文件当成
 /// 「第一次迁移」读到空队列，没有副作用。写也失败才报错，留给下一轮。
 fn retire_close_file(path: &Path) -> Result<()> {
     match remove_close_file(path) {
         Ok(()) => Ok(()),
-        Err(remove_error) => match rclaw_store::atomic_write_private(path, b"[]") {
+        Err(remove_error) => match overwrite_close_file_quiet(path) {
             Ok(()) => Ok(()),
             Err(write_error) => Err(SyncError::other(format!(
                 "旧版收尾队列文件 {} 删不掉（{remove_error}），清空也失败（{write_error}）",
@@ -451,8 +462,9 @@ fn retire_close_file(path: &Path) -> Result<()> {
 
 fn retire_close_legacy(paths: &SyncPaths) -> Result<()> {
     retire_close_file(&pending_close_legacy_path(paths))?;
-    // 清空走原子写的兜底路径时，旧内容会被挪成 `.pending-close.json.bak`——那份同样
-    // 是旧空间的密钥和旧密码，备份删除失败或进程退出都可能留下它，一并清退。
+    // 更早的清空曾经走原子写，兜底替换会把旧内容挪成 `.pending-close.json.bak`——那份
+    // 同样是旧空间的密钥和旧密码，备份删除失败或进程退出都可能留下它，一并清退
+    //（原地清空，不会再产生下一层备份）。
     retire_close_file(&legacy_close_backup_path(paths))
 }
 
@@ -2230,6 +2242,20 @@ mod tests {
             !pending_close_legacy_path(&ctx.paths).exists(),
             "没有改动的一批也要清退旧文件"
         );
+    }
+
+    /// 原地清空不产生任何副本（原子写的兜底替换会留一层 `.bak`，带着旧凭据）。
+    #[test]
+    fn overwriting_a_close_file_in_place_leaves_no_backup() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let path = pending_close_legacy_path(&ctx.paths);
+        std::fs::write(&path, b"secret").unwrap();
+        overwrite_close_file_quiet(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        assert!(!legacy_close_backup_path(&ctx.paths).exists());
+        // 幂等：重复清空同一个文件不出错。
+        overwrite_close_file_quiet(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
     }
 
     /// 原子写兜底替换留下的 `.pending-close.json.bak` 里也是旧空间的密钥和旧密码：
