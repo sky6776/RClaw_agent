@@ -243,17 +243,29 @@ GetObject / PutObject / DeleteObject，以及创建空间用的条件 `PutObject
      （`400 PublicEndpointForbidden`）。这时要用自定义域名，而且注意 RClaw 会按虚拟主机式
      **在填写的域名前再拼桶名**：桶 `rclaw-sync`、填 `https://oss.example.com`，实际请求的是
      `https://rclaw-sync.oss.example.com`——OSS 绑定、CNAME 和证书都要按这个主机名配置。
-  8. **版本**：OSS 空间的所有设备都要升到带这个开关的版本（2.8.34 起）；旧设备会发
+  8. **版本**：OSS 空间的所有设备都要用**包含该开关的构建**（提交 `0ead653` 及以后；正式版
+     从下一个包含它的发布开始）——`v2.8.34` 的正式包早于这个功能，装它仍会发
      `If-None-Match` 被 400 拒绝。不勾这个选项时，OSS 会让**创建空间直接失败**（不是退化成
      墓碑兜底）。
-  验证：隔离前缀下跑手动验收（会写一个几十字节的对象再删）：
+  验证：在隔离前缀下跑手动验收（会写一个几十字节的对象再删）：
 
   ```bash
-  RCLAW_OSS_ENDPOINT=https://s3.oss-cn-hangzhou.aliyuncs.com   RCLAW_OSS_REGION=cn-hangzhou   RCLAW_OSS_BUCKET=<桶> RCLAW_OSS_ACCESS_KEY_ID=<AK> RCLAW_OSS_SECRET_KEY=<SK>   RCLAW_OSS_FORBID_OVERWRITE=1   cargo test -p rclaw-sync --test oss_conditional -- --ignored --nocapture
+  # 先按实际配置导出（值用引号，不要留 <> 尖括号：shell 会当成重定向）
+  export RCLAW_OSS_ENDPOINT="https://s3.oss-cn-hangzhou.aliyuncs.com"
+  export RCLAW_OSS_REGION="cn-hangzhou"
+  export RCLAW_OSS_BUCKET="你的桶"
+  export RCLAW_OSS_ACCESS_KEY_ID="你的AK"
+  export RCLAW_OSS_SECRET_KEY="你的SK"
+  # 探针目录要落在 RAM 授权的前缀里（按第 6 节授权 rclaw/* 时用下面这个）
+  export RCLAW_OSS_PREFIX="rclaw/acceptance-$(date +%s)-$$"
+
+  RCLAW_OSS_PATH_STYLE=0 RCLAW_OSS_FORBID_OVERWRITE=1 \
+    cargo test -p rclaw-sync --test oss_conditional -- --ignored --nocapture
   ```
 
-  通过的标准是：第一次写入成功；第二次被拒且错误里是 **409** + `FileAlreadyExists`；读回仍是
-  第一次的内容。桶开过版本控制时第二次会成功，验收会明确失败。
+  通过的标准是：第一次写入成功；第二次被拒、状态码是 **409** 且错误码是完整的
+  `FileAlreadyExists`；读回仍是第一次的内容。桶开过版本控制时第二次会成功，验收会明确失败。
+  端点被公网策略限制时，换你实际使用（已绑定/已备案）的端点再跑同一套环境变量。
 - **COS**：2024-01-01 之后创建的桶必须关闭路径式寻址，更早的桶也推荐关闭。
 - 自检通过不等于条件写可用：先用同一套配置**实际创建并加入一个空空间**，再按第 1 节做
   双写读回验收（创建/加入只证明条件请求被接受，不证明已有对象不会被覆盖；OSS 的完整验收
@@ -395,8 +407,9 @@ GetObject / PutObject / DeleteObject，以及创建空间用的条件 `PutObject
       OSS 模式下对应的是 409 `FileAlreadyExists`），或已知服务端不实现并接受墓碑兜底的边界
 - [ ] 用 OSS 时：勾选「阿里云 OSS」开关、桶从未开启过版本控制、未勾路径风格；服务地址是
       S3 兼容端点、区域填 `cn-hangzhou` 这种区域 ID；账号已开通 S3 V4 签名；RAM 授权
-      `oss:ListObjects`（桶 ARN + `oss:Prefix`）与对象读写删；所有设备 ≥ 2.8.34；隔离前缀
-      下的双写验收通过（409 + `FileAlreadyExists`、读回第一次内容）
+      `oss:ListObjects`（桶 ARN + `oss:Prefix`）与对象读写删；所有设备用**包含该开关的构建**
+      （`0ead653` 及以后；`v2.8.34` 正式包没有它）；在授权前缀下跑双写验收（409 +
+      `FileAlreadyExists`、读回第一次内容）
 - [ ] 防火墙只放行需要的端口；公网暴露时限制来源 IP。云服务器要放行**两处**：云控制台的
       安全组（如阿里云 ECS 的 入方向规则）和机内 firewalld/ufw
 - [ ] 在 RClaw 里「测试连接」六项全过，并实际创建 / 加入一个空空间

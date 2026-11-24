@@ -83,20 +83,29 @@ async fn oss_conditional_create_double_write() {
             );
         }
         Err(error) => {
-            // 只认「已存在」这一种失败：别的错误（403、超时、签名错）不能算通过。
-            let text = error.to_string();
+            // 只认「已存在」这一种失败，而且按结构精确判定：错误串形如
+            // `创建 <key>失败（HTTP 409 Conflict）（FileAlreadyExists）`。子串匹配会把
+            // 403 里恰好带了 "412" 之类的内容判成通过。
+            let rclaw_sync::TransportError::Other(message) = &error else {
+                panic!("第二次写入不是预期的冲突类型: {error}");
+            };
+            let prefix = format!("创建 {key}失败（HTTP ");
+            let rest = message
+                .strip_prefix(prefix.as_str())
+                .unwrap_or_else(|| panic!("第二次写入缺少 HTTP 状态: {error}"));
+            let (status, tail) = rest
+                .split_once('）')
+                .unwrap_or_else(|| panic!("第二次写入的状态串不完整: {error}"));
+            let expected = if oss_forbid_overwrite { "409" } else { "412" };
+            assert_eq!(
+                status.split_ascii_whitespace().next(),
+                Some(expected),
+                "第二次写入的状态码不对: {error}"
+            );
             if oss_forbid_overwrite {
-                assert!(
-                    text.contains("409") && text.contains("FileAlreadyExists"),
-                    "OSS 模式期望 409 FileAlreadyExists，实际: {text}"
-                );
-            } else {
-                assert!(
-                    text.contains("412"),
-                    "标准模式期望 412 Precondition Failed，实际: {text}"
-                );
+                assert_eq!(tail, "（FileAlreadyExists）", "OSS 错误码不对: {error}");
             }
-            println!("第二次 put_new 被拒（冲突码正确）: {error}");
+            println!("第二次 put_new 被拒（状态码与错误码都正确）: {error}");
         }
     }
 
