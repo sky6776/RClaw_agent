@@ -457,6 +457,43 @@ fn same_close_location(a: &SyncConfig, b: &SyncConfig) -> bool {
     }
 }
 
+fn rev_seq_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join("pending-close.seq")
+}
+
+/// 已分配版本的最大值（独立于队列文件：删光记录/清空队列也不回退）。
+fn rev_seq_load(paths: &SyncPaths) -> u64 {
+    std::fs::read_to_string(rev_seq_path(paths))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn rev_seq_save(paths: &SyncPaths, rev: u64) -> Result<()> {
+    rclaw_store::atomic_write_private(&rev_seq_path(paths), rev.to_string().as_bytes())?;
+    Ok(())
+}
+
+/// 队列锁内：给缺版本的存量记录按盘上顺序补版本（补完再取上界，避免「取样之后才补」
+/// 让旧记录拿到更高版本、逃过成功清理），返回当前最大已分配版本。
+fn rev_normalize_locked(paths: &SyncPaths, closes: &mut Vec<PendingClose>) -> Result<u64> {
+    let mut next = rev_seq_load(paths)
+        .max(closes.iter().map(|entry| entry.rev).max().unwrap_or(0));
+    let mut changed = false;
+    for entry in closes.iter_mut() {
+        if entry.rev == 0 {
+            next += 1;
+            entry.rev = next;
+            changed = true;
+        }
+    }
+    rev_seq_save(paths, next)?;
+    if changed {
+        pending_close_save(paths, closes)?;
+    }
+    Ok(next)
+}
+
 fn same_close_target(close: &PendingClose, storage: &SyncConfig, space_id: &str) -> bool {
     close.previous.space_id == space_id && same_close_location(&close.storage, storage)
 }
@@ -541,8 +578,10 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
                 old.id = crate::ids::random_hex::<8>();
             }
         }
+        let next = rev_normalize_locked(&paths, &mut closes)?;
         let mut close = close;
-        close.rev = closes.iter().map(|entry| entry.rev).max().unwrap_or(0) + 1;
+        close.rev = next + 1;
+        rev_seq_save(&paths, close.rev)?;
         // 确认事实是目标的性质：并进新条目的同时，留在旧的里面也不算丢。
         for old in closes
             .iter()
@@ -607,14 +646,7 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
         let mut closes = closes;
         changed |= cap_close_history(&mut closes);
         // 老记录没有版本：按盘上顺序补上，之后的清理边界才有意义。
-        let mut next = closes.iter().map(|entry| entry.rev).max().unwrap_or(0);
-        for entry in &mut closes {
-            if entry.rev == 0 {
-                next += 1;
-                entry.rev = next;
-                changed = true;
-            }
-        }
+        rev_normalize_locked(&paths, &mut closes)?;
         // 「已确认关闭」是**目标**的事实，不是某条记录私有的：同目标（同空间 + 同位置）
         // 里只要有一条确认过，保留下来的其余条目也带着这个事实去补写——否则有效密码
         // 那条可能被当成「远端没开始关闭」删掉，只剩失效密码那条永远补不完。
@@ -701,7 +733,8 @@ async fn pending_close_restore(paths: &SyncPaths, close: &PendingClose) -> Resul
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
-        let rev = closes.iter().map(|entry| entry.rev).max().unwrap_or(0) + 1;
+        let rev = rev_normalize_locked(&paths, &mut closes)? + 1;
+        rev_seq_save(&paths, rev)?;
         match closes.iter_mut().find(|entry| entry.id == close.id) {
             Some(entry) => {
                 entry.closed_seen |= close.closed_seen;
@@ -725,11 +758,8 @@ async fn pending_close_rev_limit(paths: &SyncPaths) -> Result<u64> {
     let paths = paths.clone();
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
-        Ok(pending_close_load(&paths)?
-            .iter()
-            .map(|entry| entry.rev)
-            .max()
-            .unwrap_or(0))
+        let mut closes = pending_close_load(&paths)?;
+        rev_normalize_locked(&paths, &mut closes)
     })
     .await
 }
@@ -1165,7 +1195,14 @@ async fn finish_reset(
                 tracing::warn!("记下没补完的空间关闭失败: {write_error}");
             }
             let old = load_live(&at, &old_secrets).await?;
-            let rev_limit = pending_close_rev_limit(&ctx.paths).await?;
+            // 上界读不到只影响「Done 之后清同目标旧记录」，不能挡远端复核与本机提交。
+            let rev_limit = match pending_close_rev_limit(&ctx.paths).await {
+                Ok(limit) => Some(limit),
+                Err(error) => {
+                    tracing::warn!("读收尾队列版本上界失败（这次不清理旧记录）: {error}");
+                    None
+                }
+            };
             // 两份对象都确认了才撤这条记录；撤记录只是收尾，撤不掉留给后台再验一遍
             //（幂等），不能把本机提交挡在后面。
             match remote::ensure_closed_if_started(
@@ -1179,19 +1216,21 @@ async fn finish_reset(
             .await
             {
                 remote::CloseAttempt::Done => {
-                    // 关闭已完成：清同目标的历史快照。以这次尝试开始的时刻为界，期间/
-                    // 之后被并发失败恢复回来的记录留着（下一轮复核会把它修好）。
-                    if let Err(error) = pending_close_finish_target(
-                        &ctx.paths,
-                        &close.storage,
-                        &old.space_id,
-                        false,
-                        None,
-                        rev_limit,
-                    )
-                    .await
-                    {
-                        tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
+                    // 关闭已完成：清同目标的历史快照。以这次尝试开始的版本上界为界，
+                    // 期间/之后被并发失败恢复回来的记录留着（下一轮复核会把它修好）。
+                    if let Some(rev_limit) = rev_limit {
+                        if let Err(error) = pending_close_finish_target(
+                            &ctx.paths,
+                            &close.storage,
+                            &old.space_id,
+                            false,
+                            None,
+                            rev_limit,
+                        )
+                        .await
+                        {
+                            tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
+                        }
                     }
                 }
                 remote::CloseAttempt::NotStarted => {}
@@ -1865,6 +1904,78 @@ mod tests {
             .iter()
             .filter(|close| ["dd", "ee"].contains(&fingerprint(close).as_str()))
             .all(|close| close.closed_seen));
+    }
+
+    /// 版本不复用：清空队列/删掉最大版本后，新记录仍拿到更大的版本，不会被在途尝试的
+    /// 旧上界误删。
+    #[tokio::test]
+    async fn revision_numbers_are_not_reused_after_the_queue_is_cleared() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let entry = |rev: u64| PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            rev,
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        let seeded = [entry(1), entry(2)];
+        pending_close_save(&ctx.paths, &seeded).unwrap();
+        // 在途尝试的上界：2。
+        let in_flight_limit = pending_close_rev_limit(&ctx.paths).await.unwrap();
+        assert_eq!(in_flight_limit, 2);
+        // 队列被清空（成功清理删掉整组 / 清空文件）。
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, 2)
+            .await
+            .unwrap();
+        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+        // 清空之后恢复一条：版本必须大于 2，否则在途尝试的旧上界会把它删掉。
+        pending_close_restore(&ctx.paths, &entry(1)).await.unwrap();
+        let restored = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0].rev > in_flight_limit);
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            false,
+            None,
+            in_flight_limit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 1);
+    }
+
+    /// 取样时先把老记录的版本补齐：不会出现「取样之后老记录才拿到更高版本」而逃过清理。
+    #[tokio::test]
+    async fn legacy_records_get_their_revision_before_the_limit_is_taken() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let legacy = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            rev: 0,
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        pending_close_save(&ctx.paths, &[legacy.clone()]).unwrap();
+        let limit = pending_close_rev_limit(&ctx.paths).await.unwrap();
+        assert!(limit > 0);
+        // 老记录已经被补上版本并落盘，清理按这个上界能删掉它（它在尝试之前就存在）。
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert!(closes[0].rev > 0, "取样时应把老记录的版本补上");
+        assert!(closes[0].rev <= limit);
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, limit)
+            .await
+            .unwrap();
+        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
     /// 成功清理只删版本不高于尝试开始时上界的记录：并发失败刚补回来的（版本更高）要留着。
