@@ -427,6 +427,22 @@ fn pending_close_load(paths: &SyncPaths) -> Result<Vec<PendingClose>> {
     load_close_file(&pending_close_legacy_path(paths))
 }
 
+/// 让旧版队列文件彻底退场：删得掉就删；删不掉（被占用/权限）就把它换成空队列——里面
+/// 是旧空间的密钥和旧密码，不能因为一次删除失败就长期留盘。新版加载把空文件当成
+/// 「第一次迁移」读到空队列，没有副作用。写也失败才报错，留给下一轮。
+fn retire_close_legacy(paths: &SyncPaths) -> Result<()> {
+    let legacy = pending_close_legacy_path(paths);
+    match remove_close_file(&legacy) {
+        Ok(()) => Ok(()),
+        Err(remove_error) => match rclaw_store::atomic_write_private(&legacy, b"[]") {
+            Ok(()) => Ok(()),
+            Err(write_error) => Err(SyncError::other(format!(
+                "旧版收尾队列文件删不掉（{remove_error}），清空也失败（{write_error}）"
+            ))),
+        },
+    }
+}
+
 fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> {
     if closes.is_empty() {
         return pending_close_clear(paths);
@@ -436,18 +452,19 @@ fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> 
         &pending_close_path(paths),
         &serde_json::to_vec_pretty(closes)?,
     )?;
-    // 旧文件从此不参与加载，删得掉就删（删不掉只是留个没人读的文件，不报错）。
-    if let Err(error) = remove_close_file(&pending_close_legacy_path(paths)) {
-        tracing::warn!("删除旧版收尾队列文件失败（已不再使用，忽略）: {error}");
+    // 旧文件从此不参与加载：尽力让它退场（新文件已写成功，这里失败不把整次保存算失败；
+    // 批首每轮还会再试）。
+    if let Err(error) = retire_close_legacy(paths) {
+        tracing::warn!("清退旧版收尾队列文件失败（稍后再试）: {error}");
     }
     Ok(())
 }
 
 fn pending_close_clear(paths: &SyncPaths) -> Result<()> {
-    // 先删旧文件、再删新文件：新文件删了而旧文件还在时，下一次加载会把它当成「第一次
-    // 迁移」读回来（已结算目标的失效凭据又活了）；反过来中途退出，新文件还在，下一轮
-    // 还能按记录身份重清。
-    remove_close_file(&pending_close_legacy_path(paths))?;
+    // 先清掉旧文件、再删新文件：新文件删了而旧文件还有内容时，下一次加载会把它当成
+    // 「第一次迁移」读回来（已结算目标的失效凭据又活了）；反过来中途退出，新文件还在，
+    // 下一轮还能按记录身份重清。
+    retire_close_legacy(paths)?;
     remove_close_file(&pending_close_path(paths))
 }
 
@@ -668,6 +685,14 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
         }
         if changed {
             pending_close_save(&paths, &closes)?;
+        }
+        if pending_close_path(&paths).exists() {
+            // 新文件已经在：顺手让旧文件退场。稳定的只读批次（远端一直认证失败）不会走
+            // 保存路径，上一轮删失败的旧文件要靠这里每轮重试，不能带着旧空间的密钥和
+            // 旧密码长期留盘。
+            if let Err(error) = retire_close_legacy(&paths) {
+                tracing::warn!("清退旧版收尾队列文件失败（下一轮再试）: {error}");
+            }
         }
         Ok(closes)
     })
@@ -2160,6 +2185,59 @@ mod tests {
         .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 1, "取样之后的新版恢复不能当作旧记录删掉");
+    }
+
+    /// 迁移之后才出现的旧文件（旧版闭包又写出来的）会在下一批被清退——即使这一批
+    /// 没有任何改动、也不会走保存路径：里面是旧空间的密钥和旧密码，不能长期留盘。
+    #[tokio::test]
+    async fn a_legacy_file_left_after_the_migration_is_retired_without_changes() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let close = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            mark: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        pending_close_save(&ctx.paths, &[close.clone()]).unwrap();
+        // 旧版闭包在迁移之后又把旧凭据写回旧文件。
+        std::fs::write(
+            pending_close_legacy_path(&ctx.paths),
+            serde_json::to_vec(&[close]).unwrap(),
+        )
+        .unwrap();
+        // 这一批不需要补 ID、封顶或传播确认（没有任何改动），批首仍要清退旧文件。
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 1);
+        assert!(
+            !pending_close_legacy_path(&ctx.paths).exists(),
+            "没有改动的一批也要清退旧文件"
+        );
+    }
+
+    /// 旧路径彻底清退不了（目录占位）也只告警，不能挡住这一批的推进。
+    #[tokio::test]
+    async fn a_legacy_path_that_cannot_be_retired_does_not_block_the_batch() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let close = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            mark: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        pending_close_save(&ctx.paths, &[close]).unwrap();
+        std::fs::create_dir(pending_close_legacy_path(&ctx.paths)).unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 1);
     }
 
     /// 成功清理只删尝试开始时已在盘上的记录：并发失败刚补回来的（换了标记）要留着。
