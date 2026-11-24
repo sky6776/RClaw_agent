@@ -430,8 +430,6 @@ fn refresh_connection_settings(target: &mut SyncConfig, current: &SyncConfig) {
     }
 }
 
-/// 同一空间、同一存储位置算同一条收尾：配对码只带空间 ID 与密钥，同一个空间可以
-/// 被复制到别的存储位置上，那两处要各留一条。
 /// 两个配置是不是同一个实际存储位置。按位置字段逐字相等判（不用规范化的位置标识：
 /// 规范化会把「末尾字面反斜杠」「用户名首尾空白」这类不同的实际位置当成同一处，确认
 /// 事实会串到另一个副本上）；连接设置（证书指纹、区域、明文开关）不参与——同一个
@@ -480,8 +478,13 @@ impl Drop for CloseQueueLock {
     }
 }
 
-/// 记下一条「补完关闭」。同一目标只留一条（后写的凭据更新），但已经确认过的
-/// 「标记是关闭版」这个事实不会因为后来的记录没有它而丢掉。
+/// 同一个实际位置最多留这么多条收尾记录：每次没做完的重置/退出都会留一条，各自带
+/// 当时的凭据与连接设置——旧的未必错（可能是后来那次填错了密码），全删掉会丢掉唯一
+/// 能用的那份；但也不能无限攒。
+const CLOSE_RECORDS_PER_TARGET: usize = 4;
+
+/// 记下一条「补完关闭」。同一目标不删旧条目（各条的凭据/连接设置都要留着试），
+/// 只把已经确认过的「标记是关闭版」事实并进这一条，并给同目标的历史封顶。
 async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()> {
     let paths = paths.clone();
     blocking(move || {
@@ -494,16 +497,33 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
             }
         }
         let mut close = close;
-        // 同一目标可能因为连接设置变过而留下不止一条（升级前的队列）：确认过的事实
-        // 要把每一条都并进来，不能只看第一条。
+        // 确认事实是目标的性质：并进新条目的同时，留在旧的里面也不算丢。
         for old in closes
             .iter()
             .filter(|old| same_close_target(old, &close.storage, &close.previous.space_id))
         {
             close.closed_seen |= old.closed_seen;
         }
-        closes.retain(|old| !same_close_target(old, &close.storage, &close.previous.space_id));
+        let storage = close.storage.clone();
+        let space_id = close.previous.space_id.clone();
         closes.push(close);
+        // 同目标超过上限时从最老的开始丢。
+        let mut excess = closes
+            .iter()
+            .filter(|entry| same_close_target(entry, &storage, &space_id))
+            .count()
+            .saturating_sub(CLOSE_RECORDS_PER_TARGET);
+        if excess > 0 {
+            let mut kept = Vec::with_capacity(closes.len());
+            for entry in closes.drain(..) {
+                if excess > 0 && same_close_target(&entry, &storage, &space_id) {
+                    excess -= 1;
+                    continue;
+                }
+                kept.push(entry);
+            }
+            closes = kept;
+        }
         pending_close_save(&paths, &closes)
     })
     .await
@@ -554,28 +574,29 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
                 changed = true;
             }
         }
-        // 同一个实际位置的旧记录合掉（升级前可能因连接设置不同留下几条）：留下**后写
-        // 那条**的连接快照与凭据（凭据/指纹后来可能换过，旧的那份可能已经连不上），
-        // 确认过的事实并入；其余删掉。
-        let mut unique: Vec<PendingClose> = Vec::with_capacity(closes.len());
-        for close in closes.drain(..) {
-            match unique.iter_mut().position(|kept| {
-                same_close_target(kept, &close.storage, &close.previous.space_id)
-            }) {
-                Some(slot) => {
-                    let mut newer = close;
-                    newer.closed_seen |= unique[slot].closed_seen;
-                    unique[slot] = newer;
-                    changed = true;
-                }
-                None => unique.push(close),
-            }
-        }
-        let closes = unique;
+        let closes = closes;
         if changed {
             pending_close_save(&paths, &closes)?;
         }
         Ok(closes)
+    })
+    .await
+}
+
+/// 一条收尾成功后，把同一目标的记录**全部**删掉：关闭是幂等的，同目标的历史快照
+/// （旧指纹、旧密码）都已完成使命。
+async fn pending_close_finish_target(
+    paths: &SyncPaths,
+    storage: &SyncConfig,
+    space_id: &str,
+) -> Result<()> {
+    let paths = paths.clone();
+    let (storage, space_id) = (storage.clone(), space_id.to_string());
+    blocking(move || {
+        let _lock = CloseQueueLock::acquire(&paths)?;
+        let mut closes = pending_close_load(&paths)?;
+        closes.retain(|close| !same_close_target(close, &storage, &space_id));
+        pending_close_save(&paths, &closes)
     })
     .await
 }
@@ -704,7 +725,10 @@ async fn finish_one_close(
     }
     // 取样到建连之间设置可能又变了（保存方不与我们共用这段时间的锁）：建连前再核对
     // 一次敏感项（明文开关、证书指纹、区域），变了就这一轮先不做，下次重新取样。
-    if let Some(current) = current {
+    // 只在「记录位置就是当前设置的位置」（连接项是从当前设置刷新的）时核对；记录指向
+    // 别的存储是正常情况，不能因为它和当前设置不同就永远跳过。
+    let refreshed = current.is_some_and(|current| same_close_location(&at, current)) && at.transport != "file";
+    if refreshed {
         let at_expected = at.clone();
         let paths_for_check = paths.clone();
         let refresh_for_check = refresh.cloned();
@@ -725,10 +749,18 @@ async fn finish_one_close(
             if !same_close_location(&at_expected, &latest) {
                 return Ok(false);
             }
-            Ok(at_expected.webdav.allow_http == latest.webdav.allow_http
-                && at_expected.webdav.pinned_cert_sha256 == latest.webdav.pinned_cert_sha256
-                && at_expected.s3.allow_http == latest.s3.allow_http
-                && at_expected.s3.region == latest.s3.region)
+            Ok(match at_expected.transport.as_str() {
+                "webdav" => {
+                    at_expected.webdav.allow_http == latest.webdav.allow_http
+                        && at_expected.webdav.pinned_cert_sha256
+                            == latest.webdav.pinned_cert_sha256
+                }
+                "s3" => {
+                    at_expected.s3.allow_http == latest.s3.allow_http
+                        && at_expected.s3.region == latest.s3.region
+                }
+                _ => true,
+            })
         })
         .await?;
         if !unchanged {
@@ -775,7 +807,8 @@ async fn finish_one_close(
     .await
     {
         remote::CloseAttempt::Done | remote::CloseAttempt::NotStarted => {
-            pending_close_finish(paths, &close.id).await?;
+            // 关闭做完（或确认没开始）就把同目标的历史快照一起收掉。
+            pending_close_finish_target(paths, &close.storage, &space_id).await?;
             Ok(())
         }
         // 这一遍补写里又确认了关闭（第一次读时还没写成）：事实同样要落盘。
@@ -1545,9 +1578,9 @@ mod tests {
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
-    /// 升级前同一个位置可能留下几条（连接设置不同）：读进来合掉，确认过的事实不能丢。
+    /// 同一位置的历史条目各留各的快照（旧密码未必错），事实随目标走，成功时一起清。
     #[tokio::test]
-    async fn duplicate_records_at_one_location_are_coalesced_with_their_facts() {
+    async fn duplicate_records_at_one_location_keep_their_snapshots_and_facts() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
         let mut config = SyncConfig::default();
@@ -1564,27 +1597,24 @@ mod tests {
         // 升级前留下的两条：旧指纹那条不知道关闭已确认，新指纹那条知道。
         pending_close_save(&ctx.paths, &[entry(&old, false), entry(&config, true)]).unwrap();
         let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
-        assert_eq!(closes.len(), 1);
-        assert!(closes[0].closed_seen);
-        // 留下的是后写那条的连接快照（旧指纹那份可能已经连不上）。
+        // 读入不合并：两条快照都留着（旧的未必不能连）。
+        assert_eq!(closes.len(), 2);
+        // 新入队继承目标上已确认的事实，同时保留自己的快照。
+        let newest = entry(&old, false);
+        pending_close_add(&ctx.paths, newest.clone()).await.unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 3);
+        let added = closes.iter().find(|close| close.id == newest.id).unwrap();
+        assert!(added.closed_seen);
         assert_eq!(
-            closes[0].storage.webdav.pinned_cert_sha256,
-            config.webdav.pinned_cert_sha256
+            added.storage.webdav.pinned_cert_sha256,
+            old.webdav.pinned_cert_sha256
         );
-        let again = pending_close_load(&ctx.paths).unwrap();
-        assert_eq!(again.len(), 1);
-        assert!(again[0].closed_seen);
-        assert_eq!(
-            again[0].storage.webdav.pinned_cert_sha256,
-            config.webdav.pinned_cert_sha256
-        );
-        // 新入队时也要把同一位置的每一条都并进来。
-        pending_close_add(&ctx.paths, entry(&old, false))
+        // 收尾成功：同目标的全部历史一起清掉。
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id)
             .await
             .unwrap();
-        let closes = pending_close_load(&ctx.paths).unwrap();
-        assert_eq!(closes.len(), 1);
-        assert!(closes[0].closed_seen);
+        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
     #[test]
@@ -1658,8 +1688,7 @@ mod tests {
         assert!(pending_close_load(&ctx.paths).unwrap()[0].closed_seen);
     }
 
-    /// 结算按记录身份：旧的「未开始」结果不能删掉同目标的新记录；但「这个空间已确认
-    /// 关闭」是目标的性质，旧身份没了也要落到同目标的新记录上。
+    /// 结算按记录身份；确认事实在身份消失时落到同目标；收尾成功清掉同目标全部。
     #[tokio::test]
     async fn close_results_are_settled_by_record_id() {
         let (_tmp, ctx) = crate::testing::ctx();
@@ -1679,7 +1708,6 @@ mod tests {
             closed_seen: false,
         };
         pending_close_save(&ctx.paths, &[old.clone()]).unwrap();
-        // 同目标的新记录替代旧记录。
         let fresh = PendingClose {
             id: crate::ids::random_hex::<8>(),
             storage: config.clone(),
@@ -1687,20 +1715,17 @@ mod tests {
             closed_seen: false,
         };
         pending_close_add(&ctx.paths, fresh.clone()).await.unwrap();
-        assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 1);
+        // 同一目标的历史保留（各条快照都要留着试），事实在 add 时并进新条目。
+        assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 2);
         // 另一条不同空间的记录。
-        pending_close_add(
-            &ctx.paths,
-            PendingClose {
-                id: crate::ids::random_hex::<8>(),
-                storage: config.clone(),
-                previous: other_space.clone(),
-                closed_seen: false,
-            },
-        )
-        .await
-        .unwrap();
-        // 旧身份的「完成」结算不能删掉这条新记录。
+        let other = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: other_space.clone(),
+            closed_seen: false,
+        };
+        pending_close_add(&ctx.paths, other.clone()).await.unwrap();
+        // 旧身份的「完成」只删它自己。
         pending_close_finish(&ctx.paths, &old.id).await.unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 2);
@@ -1717,8 +1742,10 @@ mod tests {
             .find(|close| close.previous.space_id == other_space.space_id)
             .unwrap();
         assert!(!other_now.closed_seen);
-        // 按身份结算才删得掉。
-        pending_close_finish(&ctx.paths, &fresh.id).await.unwrap();
+        // 收尾成功清掉同目标的全部历史，别的目标不动。
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id)
+            .await
+            .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 1);
         assert_eq!(closes[0].previous.space_id, other_space.space_id);
@@ -1760,7 +1787,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 2);
-        // 同一目标再来一条（这次不知道关闭已确认）：合并成一条，但确认过的事实不丢。
+        // 同一目标再来一条（这次不知道关闭已确认）：旧条目留着（各带各的快照），
+        // 确认过的事实并进新这条。
         let id = crate::ids::random_hex::<8>();
         pending_close_add(
             &ctx.paths,
@@ -1774,13 +1802,9 @@ mod tests {
         .await
         .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
-        assert_eq!(closes.len(), 2);
-        let kept = closes
-            .iter()
-            .find(|close| same_close_target(close, &first, &secrets.space_id))
-            .unwrap();
-        assert_eq!(kept.id, id);
-        assert!(kept.closed_seen);
+        assert_eq!(closes.len(), 3);
+        let added = closes.iter().find(|close| close.id == id).unwrap();
+        assert!(added.closed_seen);
     }
 
     /// 重置可能压根没走到关闭那一步：退出后不能替用户关掉一个还在用的旧空间。
