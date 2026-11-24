@@ -243,7 +243,9 @@ GetObject / PutObject / DeleteObject，以及创建空间用的条件 `PutObject
      （`400 PublicEndpointForbidden`）。这时要用自定义域名，而且注意 RClaw 会按虚拟主机式
      **在填写的域名前再拼桶名**：桶 `rclaw-sync`、填 `https://oss.example.com`，实际请求的是
      `https://rclaw-sync.oss.example.com`——OSS 绑定、CNAME 和证书都要按这个主机名配置。
-  8. **版本**：OSS 空间的所有设备都要用**包含该开关的构建**（当前分支自 `ddf28d6` 起；
+  8. **ETag 大小写**：OSS 返回的 ETag 是**大写**（S3 是小写）。RClaw 只把它当不透明的
+     版本串、只在同一个后端内比较，不依赖大小写；排障时不要按大小写去比对。
+  9. **版本**：OSS 空间的所有设备都要用**包含该开关的构建**（当前分支自 `ddf28d6` 起；
      正式版从下一个包含它的发布开始）——`v2.8.34` 的正式包早于这个功能，装它仍会发
      `If-None-Match` 被 400 拒绝。不勾这个选项时，OSS 会让**创建空间直接失败**（不是退化成
      墓碑兜底）。

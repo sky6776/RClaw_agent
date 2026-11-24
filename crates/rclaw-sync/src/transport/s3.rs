@@ -3,6 +3,17 @@
 //! 请求签名（SigV4）只用到 HMAC 和 SHA-256，不引入 SDK。只用四个操作：
 //! ListObjectsV2、GetObject、PutObject、DeleteObject。地址遵守与 `webdav` 相同的
 //! HTTPS 规则（见 [`super::net`]）。
+//!
+//! 阿里云 OSS 的兼容性（依据官方文档《OSS 与 Amazon S3 的兼容性》）：
+//! - 这四个操作都在支持列表里（GetBucketV2 / GetObject / PutObject / DeleteObject）；
+//!   分片、ACL、HeadBucket 等我们不用，所以不碰它们的差异；
+//! - OSS **只支持虚拟主机式**寻址（path-style 会被拒），开 `oss_forbid_overwrite`
+//!   时不要用 path-style；
+//! - OSS 的 `PutObject` 会**拒绝** `If-None-Match` 等条件头（400 NotImplemented），
+//!   「仅创建」必须用它的 `x-oss-forbid-overwrite: true`（已存在 409
+//!   `FileAlreadyExists`），见 [`S3Options::oss_forbid_overwrite`]；
+//! - OSS 的 ETag 是大写（S3 小写）。这里只把它当不透明版本串、只在同一后端内比较，
+//!   不依赖大小写；以后若做跨后端比较，要忽略大小写。
 
 use std::collections::HashSet;
 use std::path::Path;
