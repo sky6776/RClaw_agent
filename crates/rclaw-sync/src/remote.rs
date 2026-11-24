@@ -222,6 +222,39 @@ pub async fn close_space(transport: &dyn SyncTransport, keys: &Keys, space_id: &
     write_closed_marker(transport, keys, space_id).await
 }
 
+/// 「标记已验证为关闭版」时的补法：补墓碑 → 复核标记（迟到创建可能把它改回开放）→
+/// 需要才写标记。任一步失败都带上「已确认关闭」的事实。
+async fn finish_known_closed(
+    transport: &dyn SyncTransport,
+    keys: &Keys,
+    space_id: &str,
+) -> CloseAttempt {
+    use CloseAttempt::*;
+    let marker_closed = match read_space(transport).await {
+        Ok(Some(file)) => match file.verify(keys, space_id) {
+            Ok(()) => file.closed,
+            Err(error) => return ConfirmedButFailed(error),
+        },
+        Ok(None) | Err(SyncError::Corrupt(_)) => false,
+        Err(error) => return ConfirmedButFailed(error),
+    };
+    if let Err(error) = ensure_closed(transport, keys, space_id).await {
+        return ConfirmedButFailed(error);
+    }
+    // 本来就是关闭版的标记不再重写（非原子 PUT 重复写可能把好的标记截断）。
+    let still_closed = marker_closed
+        && matches!(
+            marker_closed_state(transport, keys, space_id).await,
+            Ok(Some(true))
+        );
+    if !still_closed {
+        if let Err(error) = write_closed_marker(transport, keys, space_id).await {
+            return ConfirmedButFailed(error);
+        }
+    }
+    Done
+}
+
 /// 补一次关闭尝试的结果。`ConfirmedButFailed` 带着「标记已验证为关闭版、只是没补完」
 /// 这个事实——调用方要把它落盘（迟到创建可能随后把标记改回开放）。
 pub enum CloseAttempt {
@@ -252,32 +285,7 @@ pub async fn ensure_closed_if_started(
 ) -> CloseAttempt {
     use CloseAttempt::*;
     if known_closed {
-        // 标记还在就核对身份；本来就是关闭版的标记不再重写（非原子 PUT 重复写可能把
-        // 好的标记截断）。
-        let marker_closed = match read_space(transport).await {
-            Ok(Some(file)) => match file.verify(keys, space_id) {
-                Ok(()) => file.closed,
-                Err(error) => return Failed(error),
-            },
-            Ok(None) | Err(SyncError::Corrupt(_)) => false,
-            Err(error) => return Failed(error),
-        };
-        if let Err(error) = ensure_closed(transport, keys, space_id).await {
-            return ConfirmedButFailed(error);
-        }
-        // 墓碑补写期间兼容标记可能被迟到创建改回开放：补完再看一眼，只有它现在还
-        // 不是关闭版才写（已经关闭的不重写）。
-        let still_closed = marker_closed
-            && matches!(
-                marker_closed_state(transport, keys, space_id).await,
-                Ok(Some(true))
-            );
-        if !still_closed {
-            if let Err(error) = write_closed_marker(transport, keys, space_id).await {
-                return ConfirmedButFailed(error);
-            }
-        }
-        return Done;
+        return finish_known_closed(transport, keys, space_id).await;
     }
     let marker_closed = match read_space(transport).await {
         Ok(Some(file)) => match file.verify(keys, space_id) {
@@ -289,10 +297,9 @@ pub async fn ensure_closed_if_started(
         Err(error) => return Failed(error),
     };
     if marker_closed {
-        if let Err(error) = ensure_closed(transport, keys, space_id).await {
-            return ConfirmedButFailed(error);
-        }
-        return Done;
+        // 与「关闭现场已确认」同样的补法：墓碑补写期间迟到创建可能把标记改回开放，
+        // 补完要复核一次。
+        return finish_known_closed(transport, keys, space_id).await;
     }
     let started = match read_closed(transport, keys, space_id).await {
         Ok(closed) => closed,
