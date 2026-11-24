@@ -1,0 +1,145 @@
+# RClaw 多端同步：阿里云 OSS 一键资源栈（ROS 模板）
+#
+# 在阿里云「资源编排 ROS → 创建资源栈 → 使用模板」里导入本文件即可，会自动创建：
+#   1) 一个私有 OSS 桶（不开启版本控制——RClaw 的「仅创建」要求桶从未开过版本控制）
+#   2) 一个 RAM 子账号（默认 rclaw-oss）和一份最小权限策略：
+#        oss:ListObjects 授在桶上、用 oss:Prefix 限制到桶内目录；
+#        该目录下的对象给 GetObject / PutObject / DeleteObject。
+#   3) 该子账号的 AccessKey（输出里可复制）
+# 输出里还有 S3 兼容 Endpoint、Region、桶内目录，直接填进 RClaw 的 S3 表单。
+#
+# 注意：
+#   - 资源栈要建在你想用的地域（桶就建在那个地域）。
+#   - 桶名全局唯一，必须自己填；桶内目录默认 rclaw（和 RClaw 表单里的「桶内目录」一致）。
+#   - AccessKey 会出现在资源栈输出里（仅本账号可见）；复制到 RClaw 后建议按需轮换，
+#     或在 RAM 控制台另建一对密钥并禁用这一对。
+#   - 本模板只在本地做过 YAML 解析检查，没有在真实账号里执行过；创建前用 ROS 的
+#     「预览/校验」看一眼，创建后到 OSS/RAM 控制台核对：版本控制=未开启、ACL=私有、
+#     策略里只有上面这几项权限。
+ROSTemplateFormatVersion: '2015-09-01'
+Description: RClaw 多端同步用 OSS 桶 + 最小权限 RAM 子账号（桶不开启版本控制）
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: 全局唯一的桶名（小写字母/数字/连字符，3–63 位，不能以连字符开头或结尾）
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+    MinLength: 3
+    MaxLength: 63
+  Prefix:
+    Type: String
+    Default: rclaw
+    Description: 桶内目录（RClaw 表单里的「桶内目录」填同一个值）
+    AllowedPattern: '^[a-z0-9][a-z0-9/_-]{0,62}$'
+  UserName:
+    Type: String
+    Default: rclaw-oss
+    Description: RAM 子账号名（已存在会失败，换一个）
+  PolicyName:
+    Type: String
+    Default: rclaw-oss-sync
+    Description: 自定义策略名（同账号内唯一）
+
+Resources:
+  Bucket:
+    Type: ALIYUN::OSS::Bucket
+    Properties:
+      BucketName:
+        Ref: BucketName
+      AccessControl: private
+      StorageClass: Standard
+      DataRedundancyType: LRS
+
+  User:
+    Type: ALIYUN::RAM::User
+    Properties:
+      UserName:
+        Ref: UserName
+      DisplayName: RClaw OSS sync
+
+  Policy:
+    Type: ALIYUN::RAM::ManagedPolicy
+    Properties:
+      PolicyName:
+        Ref: PolicyName
+      PolicyDocument:
+        Version: '1'
+        Statement:
+          # 列举：授予桶 ARN，用 oss:Prefix 限制只能列 <目录>/* 下的东西
+          #（RClaw 的「列目录」和写后长度核对都是带 prefix 的 ListObjectsV2）
+          - Effect: Allow
+            Action:
+              - oss:ListObjects
+            Resource:
+              - Fn::Sub: 'acs:oss:*:*:${BucketName}'
+            Condition:
+              StringLike:
+                oss:Prefix:
+                  - Fn::Sub: '${Prefix}/*'
+          # 读写删：只给桶内目录下的对象
+          - Effect: Allow
+            Action:
+              - oss:GetObject
+              - oss:PutObject
+              - oss:DeleteObject
+            Resource:
+              - Fn::Sub: 'acs:oss:*:*:${BucketName}/${Prefix}/*'
+
+  AttachPolicy:
+    Type: ALIYUN::RAM::AttachPolicyToUser
+    DependsOn:
+      - Policy
+      - User
+    Properties:
+      PolicyType: Custom
+      PolicyName:
+        Fn::GetAtt:
+          - Policy
+          - PolicyName
+      UserName:
+        Fn::GetAtt:
+          - User
+          - UserName
+
+  AccessKey:
+    Type: ALIYUN::RAM::AccessKey
+    DependsOn: User
+    Properties:
+      UserName:
+        Fn::GetAtt:
+          - User
+          - UserName
+
+Outputs:
+  Bucket:
+    Description: RClaw 表单里的「桶名」
+    Value:
+      Ref: BucketName
+  Endpoint:
+    Description: RClaw 表单里的「服务地址（S3 兼容端点，不带桶名/路径）」
+    Value:
+      Fn::Sub: 'https://s3.oss-${ALIYUN::Region}.aliyuncs.com'
+  Region:
+    Description: RClaw 表单里的「区域」——填区域 ID，不是端点里的 oss- 前缀
+    Value:
+      Ref: ALIYUN::Region
+  Prefix:
+    Description: RClaw 表单里的「桶内目录」
+    Value:
+      Ref: Prefix
+  AccessKeyId:
+    Description: RAM 子账号的 Access Key ID
+    Value:
+      Fn::GetAtt:
+        - AccessKey
+        - AccessKeyId
+  AccessKeySecret:
+    Description: RAM 子账号的 Access Key Secret（别发到聊天/仓库里）
+    Value:
+      Fn::GetAtt:
+        - AccessKey
+        - AccessKeySecret
+  OssInternalEndpoint:
+    Description: 同地域 ECS 内网访问用的 S3 兼容端点（只有 ECS 上的程序能用）
+    Value:
+      Fn::Sub: 'https://s3.oss-${ALIYUN::Region}-internal.aliyuncs.com'
