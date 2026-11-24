@@ -1673,23 +1673,39 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: closed,
         };
-        // 最老那条带着确认事实（可能也是唯一有效的密码快照）。
+        // 直接落盘（不走 add 的「事实并进新条目」），让未确认的条目保持未确认：
+        // 最老那条带着确认事实（可能也是唯一有效的密码快照），后面 5 条都没确认。
         let oldest = entry("aa", true);
-        pending_close_save(&ctx.paths, &[oldest.clone()]).unwrap();
+        let mut seeded = vec![oldest.clone()];
         for index in 0..5 {
-            pending_close_add(&ctx.paths, entry(&format!("bb{index}"), false))
-                .await
-                .unwrap();
+            seeded.push(entry(&format!("bb{index}"), false));
         }
+        pending_close_save(&ctx.paths, &seeded).unwrap();
+        // 读入时封顶：裁到 4 条，且淘汰的是最老的**未确认**那条（bb0）。
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 4);
+        assert!(closes.iter().any(|close| close.id == oldest.id));
+        assert!(!closes
+            .iter()
+            .any(|close| close.storage.webdav.pinned_cert_sha256 == "bb0"));
+        // 落盘结果一致。
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 4);
-        // 带着确认事实的最老条目还在；被淘汰的是没有确认的最老一条。
         assert!(closes.iter().any(|close| close.id == oldest.id));
-        assert!(closes
+
+        // 全都未确认时也一样：最老那条仍然留着，淘汰的是第二老的。
+        let mut plain = Vec::new();
+        for index in 0..5 {
+            plain.push(entry(&format!("cc{index}"), false));
+        }
+        let oldest_plain = plain[0].id.clone();
+        pending_close_save(&ctx.paths, &plain).unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 4);
+        assert!(closes.iter().any(|close| close.id == oldest_plain));
+        assert!(!closes
             .iter()
-            .find(|close| close.id == oldest.id)
-            .unwrap()
-            .closed_seen);
+            .any(|close| close.storage.webdav.pinned_cert_sha256 == "cc1"));
     }
 
     /// 同一位置的历史条目各留各的快照（旧密码未必错），事实随目标走，成功时一起清。
@@ -1857,13 +1873,16 @@ mod tests {
             .unwrap();
         assert!(!other_now.closed_seen);
         // 「本批判定没开始关闭」只清本批里的未确认条目：批次之后新入队的别动。
+        // 直接落盘而不是 add，否则 add 会把 fresh 的确认事实并进来、这里就测不到批次判据。
         let later = PendingClose {
             id: crate::ids::random_hex::<8>(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
         };
-        pending_close_add(&ctx.paths, later.clone()).await.unwrap();
+        let mut queued = pending_close_load(&ctx.paths).unwrap();
+        queued.push(later.clone());
+        pending_close_save(&ctx.paths, &queued).unwrap();
         let batch: std::collections::HashSet<String> =
             [fresh.id.clone()].into_iter().collect();
         pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, true, Some(&batch))
