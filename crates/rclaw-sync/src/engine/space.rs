@@ -596,6 +596,23 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
                 changed = true;
             }
         }
+        // 「已确认关闭」是**目标**的事实，不是某条记录私有的：同目标（同空间 + 同位置）
+        // 里只要有一条确认过，其余条目也带着这个事实去补写——否则有效密码那条可能被
+        // 当成「远端没开始关闭」删掉，只剩失效密码那条永远补不完。
+        for index in 0..closes.len() {
+            if closes[index].closed_seen {
+                continue;
+            }
+            let storage = closes[index].storage.clone();
+            let space_id = closes[index].previous.space_id.clone();
+            if closes
+                .iter()
+                .any(|other| other.closed_seen && same_close_target(other, &storage, &space_id))
+            {
+                closes[index].closed_seen = true;
+                changed = true;
+            }
+        }
         let mut closes = closes;
         changed |= cap_close_history(&mut closes);
         if changed {
@@ -638,6 +655,27 @@ async fn pending_close_finish_target(
             }
             false
         });
+        pending_close_save(&paths, &closes)
+    })
+    .await
+}
+
+/// 一次补写失败时把这条记录重新落盘：并发的成功清理可能刚好把同目标清掉，但这次
+/// 失败之后墓碑/兼容标记可能已经被中途改坏，还需要这条记录继续重试。按身份 upsert，
+/// 不会造出重复条目。
+async fn pending_close_restore(paths: &SyncPaths, close: &PendingClose) -> Result<()> {
+    let paths = paths.clone();
+    let close = close.clone();
+    blocking(move || {
+        let _lock = CloseQueueLock::acquire(&paths)?;
+        let mut closes = pending_close_load(&paths)?;
+        match closes.iter_mut().find(|entry| entry.id == close.id) {
+            Some(entry) => entry.closed_seen |= close.closed_seen,
+            None => {
+                closes.push(close);
+                cap_close_history(&mut closes);
+            }
+        }
         pending_close_save(&paths, &closes)
     })
     .await
@@ -885,10 +923,19 @@ async fn finish_one_close(
         remote::CloseAttempt::ConfirmedButFailed(error) => {
             if !close.closed_seen {
                 pending_close_mark_seen(paths, &close.id, &close.storage, &space_id).await?;
+                close.closed_seen = true;
+            }
+            if let Err(restore) = pending_close_restore(paths, close).await {
+                tracing::warn!("把失败的空间关闭记录重新落盘失败: {restore}");
             }
             Err(error)
         }
-        remote::CloseAttempt::Failed(error) => Err(error),
+        remote::CloseAttempt::Failed(error) => {
+            if let Err(restore) = pending_close_restore(paths, close).await {
+                tracing::warn!("把失败的空间关闭记录重新落盘失败: {restore}");
+            }
+            Err(error)
+        }
     }
 }
 
@@ -1655,6 +1702,80 @@ mod tests {
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
+    /// 「已确认关闭」是目标的事实：同目标里只要有一条确认过，其余条目也带着它补写。
+    #[tokio::test]
+    async fn the_confirmed_close_fact_is_shared_across_one_target() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.webdav.url = "https://dav.example.com/rclaw/".into();
+        config.webdav.username = "me".into();
+        let entry = |fingerprint: &str, closed: bool| PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: {
+                let mut storage = config.clone();
+                storage.webdav.pinned_cert_sha256 = fingerprint.into();
+                storage
+            },
+            previous: secrets.clone(),
+            closed_seen: closed,
+        };
+        // 先写的 A 已确认关闭但密码失效；后写的 B 密码有效却没确认过。
+        pending_close_save(&ctx.paths, &[entry("aa", true), entry("bb", false)]).unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 2);
+        assert!(closes.iter().all(|close| close.closed_seen));
+        // 落盘结果一致：B 也带着事实（否则它会被 NotStarted 当成「没开始」删掉）。
+        let again = pending_close_load(&ctx.paths).unwrap();
+        assert!(again.iter().all(|close| close.closed_seen));
+        // 另一个不同空间/位置不受影响。
+        let other = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: paired(),
+            closed_seen: false,
+        };
+        pending_close_save(&ctx.paths, &[other.clone()]).unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 1);
+        assert!(!closes[0].closed_seen);
+    }
+
+    /// 失败时把记录重新落盘：并发的成功清理删掉了它，也要把重试依据补回来。
+    #[tokio::test]
+    async fn a_failed_close_restores_its_record_after_a_concurrent_cleanup() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let entry = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        pending_close_save(&ctx.paths, &[entry.clone()]).unwrap();
+        // 并发的成功清理把同目标全删了。
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None)
+            .await
+            .unwrap();
+        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+        // 这次失败把它按身份补回去，事实保留。
+        pending_close_restore(&ctx.paths, &entry).await.unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].id, entry.id);
+        assert!(closes[0].closed_seen);
+        // 已经存在时只更新事实，不造重复条目。
+        let mut updated = entry.clone();
+        updated.closed_seen = false;
+        pending_close_restore(&ctx.paths, &updated).await.unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 1);
+        assert!(closes[0].closed_seen);
+    }
+
     /// 同目标封顶：最老那条一定留着，优先淘汰最老的未确认条目，都确认过淘汰第二老。
     #[tokio::test]
     async fn the_per_target_cap_keeps_the_oldest_and_prefers_unconfirmed() {
@@ -1677,11 +1798,10 @@ mod tests {
             close.storage.webdav.pinned_cert_sha256.clone()
         };
 
-        // 场景一（读入封顶，混合）：最老两条已确认，后三条未确认。优先淘汰最老的
-        // **未确认**（bb2），而不是第二老的（bb1）——后者是「全确认回退」的行为。
+        // 场景一（读入封顶，全未确认）：最老那条一定留着，淘汰第二老的未确认项。
         let seeded = vec![
-            entry("aa", true),
-            entry("bb1", true),
+            entry("aa", false),
+            entry("bb1", false),
             entry("bb2", false),
             entry("bb3", false),
             entry("bb4", false),
@@ -1691,13 +1811,8 @@ mod tests {
         let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
         assert_eq!(closes.len(), 4);
         assert!(closes.iter().any(|close| close.id == oldest));
-        assert!(closes
-            .iter()
-            .find(|close| close.id == oldest)
-            .unwrap()
-            .closed_seen);
-        assert!(closes.iter().any(|close| fingerprint(close) == "bb1"));
-        assert!(!closes.iter().any(|close| fingerprint(close) == "bb2"));
+        assert!(!closes.iter().any(|close| fingerprint(close) == "bb1"));
+        assert!(closes.iter().any(|close| fingerprint(close) == "bb2"));
         assert!(closes.iter().any(|close| fingerprint(close) == "bb3"));
         assert!(closes.iter().any(|close| fingerprint(close) == "bb4"));
         // 封顶结果也要落盘（不只是改内存）：回读一遍。
@@ -1732,12 +1847,17 @@ mod tests {
         assert!(closes.iter().any(|close| close.id == oldest));
         assert!(!closes.iter().any(|close| fingerprint(close) == "ee1"));
 
-        // 场景四（入队路径也封顶）：先落盘一条未确认的，再 add 5 条，超限时淘汰的
-        // 是第二老的未确认条目，最老那条仍在。
-        let seeded = vec![entry("ff0", false)];
+        // 场景四（入队路径，混合组）：直接落盘 [确认, 确认, 未确认]（跳过读入时的
+        // 目标级事实传播），再 add 两条；超限时优先淘汰最老的**未确认**那条（ff2），
+        // 而不是第二老的（ff1）——全确认回退才会选 ff1。
+        let seeded = vec![
+            entry("ff0", true),
+            entry("ff1", true),
+            entry("ff2", false),
+        ];
         let oldest = seeded[0].id.clone();
         pending_close_save(&ctx.paths, &seeded).unwrap();
-        for index in 1..=5 {
+        for index in 3..=4 {
             pending_close_add(&ctx.paths, entry(&format!("ff{index}"), false))
                 .await
                 .unwrap();
@@ -1745,8 +1865,9 @@ mod tests {
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 4);
         assert!(closes.iter().any(|close| close.id == oldest));
-        assert!(!closes.iter().any(|close| fingerprint(close) == "ff1"));
-        assert!(closes.iter().any(|close| fingerprint(close) == "ff5"));
+        assert!(closes.iter().any(|close| fingerprint(close) == "ff1"));
+        assert!(!closes.iter().any(|close| fingerprint(close) == "ff2"));
+        assert!(closes.iter().any(|close| fingerprint(close) == "ff4"));
     }
 
     /// 同一位置的历史条目各留各的快照（旧密码未必错），事实随目标走，成功时一起清。
