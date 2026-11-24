@@ -725,6 +725,9 @@ struct Worker {
     next_tick: Instant,
     /// 没连上同步空间时，下次再试的时刻；`None` = 等用户动手（改配置、填密码、配对）。
     reopen_at: Option<Instant>,
+    /// 退出时留下的「补完空间关闭」记录还没做完：下次再试的时刻（与是否连着当前
+    /// 空间无关——记录里的空间可能已经不在本机了）。
+    close_retry_at: Option<Instant>,
     standby_tries: u32,
     /// 换了存储设置但上一刻还有在途提交：连接还没重建，下一轮开头再试。
     pending_switch: bool,
@@ -773,6 +776,7 @@ impl Worker {
             next_poll: now,
             next_tick: now,
             reopen_at: None,
+            close_retry_at: None,
             standby_tries: 0,
             pending_switch: false,
             switch_tries: 0,
@@ -809,6 +813,9 @@ impl Worker {
     /// 下一件定了时间的事。
     fn deadline(&self) -> Option<Instant> {
         let mut wake = self.reopen_at;
+        if let Some(at) = self.close_retry_at {
+            wake = Some(wake.map_or(at, |old| old.min(at)));
+        }
         if self.session.is_some() && !self.paused {
             let mut earliest = |at: Instant| wake = Some(wake.map_or(at, |old| old.min(at)));
             earliest(self.next_poll);
@@ -820,8 +827,23 @@ impl Worker {
         wake
     }
 
+    /// 把退出时留下的「补完空间关闭」记录做完；做不完就过一会儿再试（与当前连接无关）。
+    async fn finish_pending_close(&mut self) {
+        match space::finish_pending_close(&self.shared.ctx.paths, &self.config, &self.secrets).await {
+            Ok(()) => self.close_retry_at = None,
+            Err(error) => {
+                tracing::warn!("补完上次没做完的空间关闭失败（稍后再试）: {error}");
+                self.close_retry_at = Some(Instant::now() + STANDBY_RETRY);
+            }
+        }
+    }
+
     async fn on_timer(&mut self) {
         let now = Instant::now();
+        if self.close_retry_at.is_some_and(|at| at <= now) {
+            self.close_retry_at = None;
+            self.finish_pending_close().await;
+        }
         if self.session.is_none() {
             if self.reopen_at.is_some_and(|at| at <= now) {
                 self.reopen_at = None;
@@ -1257,6 +1279,9 @@ impl Worker {
         }
         // 配置、密钥与意图都已经收敛到同一套：保存协议锁到这里就可以放了。
         drop(protocol_lock);
+        // 退出时没能补完的空间关闭（重置的记录在退出时被丢掉了）：之后只靠那条记录
+        // 收尾。放在空间切换恢复之前做，那个记录自己坏了也不挡着这里。
+        self.finish_pending_close().await;
         // 上一次重置 / 退出没做完：按落盘的记录与远端的实际状态接着做（重置可能已经把
         // 本机换到了新空间），再按正常打开往下走。
         if let Err(error) =
@@ -1266,11 +1291,6 @@ impl Worker {
                 format!("上一次的空间切换没有做完: {error}（修好后会自动接着做）"),
                 Some(OPEN_RETRY),
             );
-        }
-        // 退出时没能补完的空间关闭（重置的记录在退出时被丢掉了）：之后只靠这条记录
-        // 收尾。做不完就留着，下次打开再试。
-        if let Err(error) = space::finish_pending_close(&shared.ctx.paths).await {
-            tracing::warn!("补完上次没做完的空间关闭失败（下次打开再试）: {error}");
         }
         let paired = self.secrets.is_paired();
         shared.paired.store(paired, Ordering::Relaxed);
