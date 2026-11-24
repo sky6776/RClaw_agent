@@ -487,6 +487,11 @@ async fn finish_reset(
         } else if open {
             let old = load_live(&at, &old_secrets).await?;
             remote::close_space(old.transport(), &old.keys, &old.space_id).await?;
+        } else {
+            // 标记已是关闭版，但上一次关闭可能只写成了标记（墓碑那次 PUT 失败）：
+            // 提交重置之前把墓碑补上，否则迟到创建覆盖标记后旧空间又能被接受。
+            let old = load_live(&at, &old_secrets).await?;
+            remote::ensure_closed(old.transport(), &old.keys, &old.space_id).await?;
         }
     }
     // 3. 本机切到新空间（记「这个空间是本机建的」+ secrets 落盘），做完才删记录。

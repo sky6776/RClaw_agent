@@ -156,6 +156,24 @@ pub async fn close_space(transport: &dyn SyncTransport, keys: &Keys, space_id: &
     Ok(())
 }
 
+/// 确认关闭墓碑在：兼容标记已经是关闭版、墓碑却没写成（上一次关闭写到一半）时补写。
+///
+/// 只凭「标记已关闭」就往下走的话，迟到创建把标记覆盖回开放后，新版也会重新接受这个
+/// 旧空间；墓碑才是迟到覆盖拿不掉的关闭证据，提交重置前必须在。
+pub async fn ensure_closed(
+    transport: &dyn SyncTransport,
+    keys: &Keys,
+    space_id: &str,
+) -> Result<()> {
+    if read_closed(transport, keys, space_id).await? {
+        return Ok(());
+    }
+    let mut file = SpaceFile::new(keys, space_id);
+    file.closed = true;
+    transport::put_checked(transport, SPACE_CLOSED_FILE, file.encode()?).await?;
+    Ok(())
+}
+
 /// 列出各设备的 head（一次空闲轮询就是这一个请求）。
 ///
 /// 存储端不可信：`heads/` 里可以被放进任意多个名字像设备 id 的文件，每个名字都要本机去读
@@ -325,8 +343,8 @@ mod tests {
         let transport = FileTransport::new(dir.path());
         let keys = Keys::derive(&SpaceKey::generate());
         let space_id = crate::secrets::new_space_id();
-        // 另一设备已经关了这个空间（先写墓碑），本机的创建还没出发：既没有标记可读，
-        // 「仅创建」也不会失败，只有写完再查墓碑能拦住。
+        // 另一设备已经关了这个空间（最后写的是墓碑），本机的创建还没出发：既没有
+        // 标记可读，「仅创建」也不会失败，只有写完再查墓碑能拦住。
         let mut closed = SpaceFile::new(&keys, &space_id);
         closed.closed = true;
         transport
@@ -335,6 +353,36 @@ mod tests {
             .unwrap();
         assert!(matches!(
             create_marker(&transport, &keys, &space_id).await,
+            Err(SyncError::SpaceClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_half_done_close_is_completed_before_the_reset_is_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FileTransport::new(dir.path());
+        let keys = Keys::derive(&SpaceKey::generate());
+        let space_id = crate::secrets::new_space_id();
+        open_space(&transport, &keys, &space_id, true)
+            .await
+            .unwrap();
+        // 上一次关闭只写成了兼容标记（墓碑那次 PUT 失败）。
+        let mut closed = SpaceFile::new(&keys, &space_id);
+        closed.closed = true;
+        transport
+            .put(SPACE_FILE, closed.encode().unwrap())
+            .await
+            .unwrap();
+        ensure_closed(&transport, &keys, &space_id).await.unwrap();
+        // 幂等：墓碑已经在就不重复写。
+        ensure_closed(&transport, &keys, &space_id).await.unwrap();
+        // 补上墓碑之后，迟到创建把标记覆盖回开放也拒绝打开。
+        transport
+            .put(SPACE_FILE, SpaceFile::new(&keys, &space_id).encode().unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            open_space(&transport, &keys, &space_id, false).await,
             Err(SyncError::SpaceClosed)
         ));
     }
