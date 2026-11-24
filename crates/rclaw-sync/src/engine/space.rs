@@ -554,17 +554,18 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
                 changed = true;
             }
         }
-        // 同一个实际位置的旧记录合掉（升级前可能因连接设置不同留下几条）：确认过的
-        // 事实并进留下的一条，其余删掉，免得旧指纹那条永远补不上、又没人合并。
+        // 同一个实际位置的旧记录合掉（升级前可能因连接设置不同留下几条）：留下**后写
+        // 那条**的连接快照与凭据（凭据/指纹后来可能换过，旧的那份可能已经连不上），
+        // 确认过的事实并入；其余删掉。
         let mut unique: Vec<PendingClose> = Vec::with_capacity(closes.len());
         for close in closes.drain(..) {
-            match unique.iter_mut().find(|kept| {
+            match unique.iter_mut().position(|kept| {
                 same_close_target(kept, &close.storage, &close.previous.space_id)
             }) {
-                Some(kept) => {
-                    if close.closed_seen && !kept.closed_seen {
-                        kept.closed_seen = true;
-                    }
+                Some(slot) => {
+                    let mut newer = close;
+                    newer.closed_seen |= unique[slot].closed_seen;
+                    unique[slot] = newer;
                     changed = true;
                 }
                 None => unique.push(close),
@@ -645,7 +646,13 @@ pub(crate) async fn finish_pending_close(
             // 单条也限时：卡住的一条不能把后面的健康记录一直饿着。
             match tokio::time::timeout(
                 CLOSE_ENTRY_TIMEOUT,
-                finish_one_close(&mut close, paths, current.as_ref(), secrets.as_ref()),
+                finish_one_close(
+                    &mut close,
+                    paths,
+                    current.as_ref(),
+                    secrets.as_ref(),
+                    refresh.as_ref(),
+                ),
             )
             .await
             {
@@ -672,6 +679,7 @@ async fn finish_one_close(
     paths: &SyncPaths,
     current: Option<&SyncConfig>,
     current_secrets: Option<&Secrets>,
+    refresh: Option<&crate::engine::ConfigRefresh>,
 ) -> Result<()> {
     if !close.previous.is_paired() {
         pending_close_finish(paths, &close.id).await?;
@@ -692,6 +700,39 @@ async fn finish_one_close(
                     refresh_credentials(&mut previous, secrets);
                 }
             }
+        }
+    }
+    // 取样到建连之间设置可能又变了（保存方不与我们共用这段时间的锁）：建连前再核对
+    // 一次敏感项（明文开关、证书指纹、区域），变了就这一轮先不做，下次重新取样。
+    if let Some(current) = current {
+        let at_expected = at.clone();
+        let paths_for_check = paths.clone();
+        let refresh_for_check = refresh.cloned();
+        let unchanged = blocking(move || {
+            let Some(_lock) = super::worker::StorageLock::try_acquire(&paths_for_check)? else {
+                return Ok(false);
+            };
+            let latest = match &refresh_for_check {
+                Some(refresh) => match refresh() {
+                    Ok(config) => config,
+                    Err(()) => return Ok(false),
+                },
+                None => return Ok(false),
+            };
+            let Some(latest) = latest else {
+                return Ok(false);
+            };
+            if !same_close_location(&at_expected, &latest) {
+                return Ok(false);
+            }
+            Ok(at_expected.webdav.allow_http == latest.webdav.allow_http
+                && at_expected.webdav.pinned_cert_sha256 == latest.webdav.pinned_cert_sha256
+                && at_expected.s3.allow_http == latest.s3.allow_http
+                && at_expected.s3.region == latest.s3.region)
+        })
+        .await?;
+        if !unchanged {
+            return Err(SyncError::other("同步设置刚变过，稍后再补完空间关闭"));
         }
     }
     let space_id = previous.space_id.clone();
@@ -1525,9 +1566,18 @@ mod tests {
         let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
         assert_eq!(closes.len(), 1);
         assert!(closes[0].closed_seen);
+        // 留下的是后写那条的连接快照（旧指纹那份可能已经连不上）。
+        assert_eq!(
+            closes[0].storage.webdav.pinned_cert_sha256,
+            config.webdav.pinned_cert_sha256
+        );
         let again = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(again.len(), 1);
         assert!(again[0].closed_seen);
+        assert_eq!(
+            again[0].storage.webdav.pinned_cert_sha256,
+            config.webdav.pinned_cert_sha256
+        );
         // 新入队时也要把同一位置的每一条都并进来。
         pending_close_add(&ctx.paths, entry(&old, false))
             .await
