@@ -59,7 +59,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         with LOCK:
             exists = key in STORE
-            if forbid and exists and not IGNORE:
+            if OSS and forbid and exists and not IGNORE:
                 self.log_message("PUT %s forbid-overwrite -> 409 (exists)", key)
                 self._send(409, b"<Error><Code>FileAlreadyExists</Code></Error>")
                 return

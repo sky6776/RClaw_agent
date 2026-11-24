@@ -291,6 +291,8 @@ pub struct PairingInfoDto {
     pub endpoint: Option<String>,
     /// 配对码没带存储设置、本机配置的存储又需要密码而没存着：加入之前要先问用户。
     pub needs_secret: bool,
+    /// 自带的 S3 设置是不是阿里云 OSS 模式（加入页要提示「桶不能开启过版本控制」）。
+    pub oss_forbid_overwrite: bool,
 }
 
 /// 检查一段配对码，并说出它带了什么。`config` 是表单上正在填的设置（不给就用当前生效的）。
@@ -307,23 +309,28 @@ pub async fn sync_pairing_info(
         let parsed = PairingCode::parse(&code).map_err(fail)?;
         let needs_secret =
             rclaw_sync::engine::join_needs_secret(&home, &config, &code).map_err(fail)?;
-        let (transport, endpoint) = match &parsed.storage {
+        let (transport, endpoint, oss_forbid_overwrite) = match &parsed.storage {
             Some(rclaw_sync::pairing::PairedStorage::Webdav { url, .. }) => {
-                (Some("webdav".to_string()), Some(url.clone()))
+                (Some("webdav".to_string()), Some(url.clone()), false)
             }
             Some(rclaw_sync::pairing::PairedStorage::S3 {
-                endpoint, bucket, ..
+                endpoint,
+                bucket,
+                oss_forbid_overwrite,
+                ..
             }) => (
                 Some("s3".to_string()),
                 Some(format!("{endpoint}（存储桶 {bucket}）")),
+                *oss_forbid_overwrite,
             ),
-            None => (None, None),
+            None => (None, None, false),
         };
         Ok(PairingInfoDto {
             has_storage: parsed.storage.is_some(),
             transport,
             endpoint,
             needs_secret,
+            oss_forbid_overwrite,
         })
     })
     .await

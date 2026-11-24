@@ -44,7 +44,7 @@ pub enum PairedStorage {
         #[serde(default)]
         path_style: bool,
         /// 阿里云 OSS：仅创建改用 `x-oss-forbid-overwrite`（见 `S3Section`）。
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "crate::config::is_false")]
         oss_forbid_overwrite: bool,
         #[serde(default)]
         allow_http: bool,
@@ -103,9 +103,17 @@ impl PairingCode {
             Some(PairedStorage::S3 {
                 endpoint,
                 allow_http,
+                path_style,
+                oss_forbid_overwrite,
                 ..
             }) => {
                 check_endpoint(endpoint, *allow_http)?;
+                // OSS 只支持虚拟主机式：这两个开关同时为真一定是手改过的码。
+                if *oss_forbid_overwrite && *path_style {
+                    return Err(SyncError::other(
+                        "配对码里的存储设置要求阿里云 OSS 模式（虚拟主机式），但又勾了路径风格",
+                    ));
+                }
             }
             None => {}
         }
@@ -181,7 +189,7 @@ mod tests {
 
         let full = code(Some(PairedStorage::S3 {
             endpoint: "https://s3.oss-cn-hangzhou.aliyuncs.com".into(),
-            region: "oss-cn-hangzhou".into(),
+            region: "cn-hangzhou".into(),
             bucket: "rclaw-test".into(),
             prefix: "rclaw".into(),
             access_key_id: "ak".into(),
@@ -199,6 +207,25 @@ mod tests {
         assert_eq!(config.transport, "s3");
         assert!(config.s3.oss_forbid_overwrite, "配对码要带上 OSS 开关");
         assert_eq!(secrets.s3_secret_key, "sk");
+    }
+
+    #[test]
+    fn a_pairing_code_with_oss_mode_and_path_style_is_rejected() {
+        let text = code(Some(PairedStorage::S3 {
+            endpoint: "https://s3.oss-cn-hangzhou.aliyuncs.com".into(),
+            region: "cn-hangzhou".into(),
+            bucket: "rclaw-test".into(),
+            prefix: String::new(),
+            access_key_id: "ak".into(),
+            secret_key: "sk".into(),
+            path_style: true,
+            oss_forbid_overwrite: true,
+            allow_http: false,
+        }))
+        .encode()
+        .unwrap();
+        let error = PairingCode::parse(&text).unwrap_err();
+        assert!(error.to_string().contains("虚拟主机式"), "{error}");
     }
 
     #[test]

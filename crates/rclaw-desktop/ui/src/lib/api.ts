@@ -738,8 +738,9 @@ export interface SyncConfig {
     prefix: string;
     access_key_id: string;
     path_style: boolean;
-    /** 阿里云 OSS：用 x-oss-forbid-overwrite 代替 If-None-Match（OSS 会拒绝条件头）。 */
-    oss_forbid_overwrite: boolean;
+    /** 阿里云 OSS：用 x-oss-forbid-overwrite 代替 If-None-Match（OSS 会拒绝条件头）。
+     * 老后端没有这个字段：读侧按 `?? false` 处理，写侧只在勾选时带上。 */
+    oss_forbid_overwrite?: boolean;
     allow_http: boolean;
   };
 }
@@ -832,6 +833,8 @@ export interface SyncPairingInfo {
   endpoint: string | null;
   /** 加入之前要先填存储的密码。 */
   needs_secret: boolean;
+  /** 自带的是阿里云 OSS 模式：加入页提示「桶不能开启过版本控制」。 */
+  oss_forbid_overwrite: boolean;
 }
 
 /** 「添加设备」要显示的配对码。 */

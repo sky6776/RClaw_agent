@@ -93,11 +93,19 @@ pub struct S3Section {
     /// 阿里云 OSS：`PutObject` 拒绝条件头（`If-None-Match` 返回 400），改用 OSS 专有的
     /// `x-oss-forbid-overwrite: true` 做「仅创建」（已存在时 409 `FileAlreadyExists`）。
     /// 这个头在桶开启或暂停过版本控制后失效；OSS 也只支持虚拟主机式寻址。
-    #[serde(default)]
+    ///
+    /// 默认 `false` 时不写进 TOML / 恢复记录：`S3Section` 是 `deny_unknown_fields`，
+    /// 老版本读到不认识的键会整份拒绝（恢复记录还会被当成损坏删掉）。
+    #[serde(default, skip_serializing_if = "is_false")]
     pub oss_forbid_overwrite: bool,
     /// 明文 HTTP：只对局域网地址有效。公网地址必须 HTTPS。
     #[serde(default)]
     pub allow_http: bool,
+}
+
+/// serde 用：`false` 不落盘（见 `S3Section::oss_forbid_overwrite`）。
+pub(crate) fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_transport() -> String {
@@ -241,6 +249,11 @@ impl SyncConfig {
         if self.background_interval_sec < 60 {
             return Err(SyncError::other(
                 "[sync] background_interval_sec 不能小于 60",
+            ));
+        }
+        if self.transport == "s3" && self.s3.oss_forbid_overwrite && self.s3.path_style {
+            return Err(SyncError::other(
+                "[sync.s3] 阿里云 OSS 只支持虚拟主机式：oss_forbid_overwrite 与 path_style 不能同时开启",
             ));
         }
         // 存储密码只放在 `<数据根>/sync/secrets.json`，不进 rclaw.toml（§11.2）。地址里夹带
@@ -418,6 +431,20 @@ oss_forbid_overwrite = true
 endpoint = \"https://s3.example.com\"
 ").unwrap();
         assert!(!old.s3.oss_forbid_overwrite);
+    }
+
+    #[test]
+    fn oss_mode_cannot_be_combined_with_path_style() {
+        let mut config = SyncConfig::default();
+        config.transport = "s3".into();
+        config.s3.endpoint = "https://s3.oss-cn-hangzhou.aliyuncs.com".into();
+        config.s3.bucket = "rclaw-test".into();
+        config.s3.oss_forbid_overwrite = true;
+        config.s3.path_style = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("虚拟主机式"), "{error}");
+        config.s3.path_style = false;
+        config.validate().unwrap();
     }
 
     #[test]

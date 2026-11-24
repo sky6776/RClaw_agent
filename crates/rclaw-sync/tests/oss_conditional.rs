@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! RCLAW_OSS_ENDPOINT=https://s3.oss-cn-hangzhou.aliyuncs.com
-//! RCLAW_OSS_REGION=oss-cn-hangzhou
+//! RCLAW_OSS_REGION=cn-hangzhou          # 区域 ID，不是端点里的 oss-cn- 前缀
 //! RCLAW_OSS_BUCKET=<桶名>
 //! RCLAW_OSS_ACCESS_KEY_ID=<RAM 子账号 AK>
 //! RCLAW_OSS_SECRET_KEY=<RAM 子账号 SK>
@@ -82,7 +82,22 @@ async fn oss_conditional_create_double_write() {
                 String::from_utf8_lossy(&kept)
             );
         }
-        Err(error) => println!("第二次 put_new 被拒（期望 412 或 OSS 的 409）: {error}"),
+        Err(error) => {
+            // 只认「已存在」这一种失败：别的错误（403、超时、签名错）不能算通过。
+            let text = error.to_string();
+            if oss_forbid_overwrite {
+                assert!(
+                    text.contains("409") && text.contains("FileAlreadyExists"),
+                    "OSS 模式期望 409 FileAlreadyExists，实际: {text}"
+                );
+            } else {
+                assert!(
+                    text.contains("412"),
+                    "标准模式期望 412 Precondition Failed，实际: {text}"
+                );
+            }
+            println!("第二次 put_new 被拒（冲突码正确）: {error}");
+        }
     }
 
     let kept = transport

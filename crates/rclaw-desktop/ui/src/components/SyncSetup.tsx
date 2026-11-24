@@ -514,6 +514,9 @@ export default function SyncSetup({
               这个配对码自带存储设置（{info.transport === "s3" ? "对象存储" : "WebDAV"}）：
               <span className="break-all font-mono">{info.endpoint}</span>
               。加入之后，这台设备的数据会加密后传到这个地址，请确认它是你自己的存储。
+              {info.oss_forbid_overwrite
+                ? "这是阿里云 OSS 模式：存储桶必须从未开启过版本控制，否则防覆盖会失效。"
+                : ""}
             </div>
           )}
           {info && !info.has_storage && (

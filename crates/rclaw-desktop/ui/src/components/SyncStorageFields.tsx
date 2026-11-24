@@ -368,7 +368,7 @@ export default function SyncStorageFields({
             hint="MinIO 等自建服务一般要勾上；云厂商的对象存储一般不勾。"
           />
           <SyncCheck
-            checked={config.s3.oss_forbid_overwrite}
+            checked={config.s3.oss_forbid_overwrite ?? false}
             disabled={disabled}
             onChange={(on) => setS3({ oss_forbid_overwrite: on })}
             label="阿里云 OSS（用 x-oss-forbid-overwrite 防覆盖）"

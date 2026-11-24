@@ -224,17 +224,40 @@ GetObject / PutObject / DeleteObject，以及创建空间用的条件 `PutObject
   OSS 的 `PutObject` 会直接拒绝标准条件头（`If-None-Match` 等返回 `400
   NotImplemented`，官方错误码 0017-00000245），所以 RClaw 在这个模式下改用 OSS 专有的
   `x-oss-forbid-overwrite: true` 做「仅创建」（已存在返回 409 `FileAlreadyExists`）。
-  三个硬约束：
-  1. 桶**从未开启/暂停过版本控制**——开启过之后这个头会失效（允许覆盖），条件创建就不成立；
-  2. OSS 只支持**虚拟主机式**寻址，**不要**勾「路径风格的地址」；
-  3. 服务地址用 **S3 兼容端点**（如 `https://s3.oss-cn-hangzhou.aliyuncs.com`），区域填
-     `oss-cn-hangzhou` 这种形式；2025-03-20 起新 OSS 用户访问内地地域桶的默认公网域名可能
-     受限，先核对账户策略（必要时用自定义域名，且 `<bucket>.<域名>` 要能被证书覆盖）。
-  权限：RAM 子账号只需要该桶（或桶内目录）的 ListObjects / GetObject / PutObject /
-  DeleteObject。不勾这个选项时，OSS 会让**创建空间直接失败**（不是退化成墓碑兜底）。
+  按下面填：
+  1. **服务地址**：`https://s3.oss-cn-hangzhou.aliyuncs.com`（换成你的地域；这是 **S3
+     兼容端点**，不是普通 OSS 端点，也不要带桶名或路径）。设备在**同地域 ECS** 上时可换
+     `-internal` 端点，但不经过 ECS 的客户端用不了内网端点。
+  2. **区域**：填**区域 ID** `cn-hangzhou`（不是端点里的 `oss-cn-hangzhou`）。RClaw 把它
+     原样写进 SigV4 的签名范围，填错会 `SignatureDoesNotMatch`。
+  3. **桶**：`从未开启/暂停过版本控制`——开启过之后 `x-oss-forbid-overwrite` 会失效
+     （允许覆盖），「仅创建」就不成立了。**这是 OSS 上线的硬条件**。
+  4. **不要勾**「路径风格的地址」：OSS 只支持虚拟主机式。
+  5. **账号**：先确认该账号能用 S3 兼容的 V4 签名（未开通时请求报 `0002-00000033`，
+     要联系阿里云技术支持开通）。
+  6. **权限**（RAM 子账号，最小集）：`oss:ListObjects` 授在**桶** ARN 上、用条件
+     `oss:Prefix` 限制到桶内目录（例如 `rclaw/*`）——RClaw 是在桶路径上带 `prefix` 列举的，
+     只授对象前缀会「列目录」失败；对象 ARN `<bucket>/rclaw/*` 授 `oss:GetObject` /
+     `oss:PutObject` / `oss:DeleteObject`，范围要覆盖 `selftest/` 和空间对象。
+  7. **2025-03-20 之后开通的账号**：访问**中国内地桶的默认公网域名**做数据 API 会被拒
+     （`400 PublicEndpointForbidden`）。这时要用自定义域名，而且注意 RClaw 会按虚拟主机式
+     **在填写的域名前再拼桶名**：桶 `rclaw-sync`、填 `https://oss.example.com`，实际请求的是
+     `https://rclaw-sync.oss.example.com`——OSS 绑定、CNAME 和证书都要按这个主机名配置。
+  8. **版本**：OSS 空间的所有设备都要升到带这个开关的版本（2.8.34 起）；旧设备会发
+     `If-None-Match` 被 400 拒绝。不勾这个选项时，OSS 会让**创建空间直接失败**（不是退化成
+     墓碑兜底）。
+  验证：隔离前缀下跑手动验收（会写一个几十字节的对象再删）：
+
+  ```bash
+  RCLAW_OSS_ENDPOINT=https://s3.oss-cn-hangzhou.aliyuncs.com   RCLAW_OSS_REGION=cn-hangzhou   RCLAW_OSS_BUCKET=<桶> RCLAW_OSS_ACCESS_KEY_ID=<AK> RCLAW_OSS_SECRET_KEY=<SK>   RCLAW_OSS_FORBID_OVERWRITE=1   cargo test -p rclaw-sync --test oss_conditional -- --ignored --nocapture
+  ```
+
+  通过的标准是：第一次写入成功；第二次被拒且错误里是 **409** + `FileAlreadyExists`；读回仍是
+  第一次的内容。桶开过版本控制时第二次会成功，验收会明确失败。
 - **COS**：2024-01-01 之后创建的桶必须关闭路径式寻址，更早的桶也推荐关闭。
 - 自检通过不等于条件写可用：先用同一套配置**实际创建并加入一个空空间**，再按第 1 节做
-  双写读回验收（创建/加入只证明条件请求被接受，不证明已有对象不会被覆盖）。
+  双写读回验收（创建/加入只证明条件请求被接受，不证明已有对象不会被覆盖；OSS 的完整验收
+  命令见上）。
 
 ## 7. RClaw 端配置（各设备按需）
 
@@ -307,6 +330,10 @@ GetObject / PutObject / DeleteObject，以及创建空间用的条件 `PutObject
 | 测试连接 401 / 403 | 用户名或应用密码不对；账号没有该目录权限；服务端禁了 `PUT`/`PROPFIND`。按失败步骤检查 Basic 凭据与对应目录权限 |
 | 测试连接 404，或"列目录里没有刚写入的对象" | 地址不是刚建的专用目录，或代理没把 DAV 路由到后端。客户端会自动补末尾斜杠，手补 `/` 不解决 404 |
 | 测试连接 409 / "上级目录不存在" | 父目录缺失：客户端只补建有限层级。先在服务端建好存储根与父目录，再确认 `MKCOL`/`PUT` 送到正确后端 |
+| OSS 报 `0002-00000033` | 账号没开通 S3 兼容的 V4 签名：联系阿里云技术支持开通，或改用 Apache WebDAV |
+| OSS 报 `PublicEndpointForbidden` | 2025-03-20 之后开通的账号访问内地桶的默认公网域名受限：用自定义域名（按 `<bucket>.<域名>` 绑定并配证书），或在同地域 VPC 内用 `-internal` 端点 |
+| OSS 报 `NotImplemented`（400） | 没勾「阿里云 OSS」开关，客户端发的仍是 `If-None-Match`（见第 6 节） |
+| OSS 上第二次写同一对象仍成功 | 桶开启/暂停过版本控制，`x-oss-forbid-overwrite` 失效；换一个从未开过版本控制的桶 |
 | 提示"这个地址不支持 WebDAV（服务端拒绝了 PROPFIND），请检查地址" | 路由不对，或服务端缺 DAV 扩展模块（如 nginx 自带 dav 模块不支持 `PROPFIND`，换 Apache / Caddy / rclone） |
 | 提示"公网地址必须使用 HTTPS" | 没勾选允许明文，或指定 IP / 域名的**任一 DNS 解析地址**超出第 8 节允许范围。改用 HTTPS，或让地址及所有解析结果符合第 8 节并勾选允许明文 |
 | 提示证书错误 | 自签证书没带外核对并信任指纹，或指纹已变；公网证书检查域名/有效期/证书链 |
@@ -366,7 +393,10 @@ GetObject / PutObject / DeleteObject，以及创建空间用的条件 `PutObject
 - [ ] 请求体上限按密文对象核对，并覆盖汇总包；按计划上限实际传过一个大对象
 - [ ] 条件创建已验收（第二次 `PUT If-None-Match: *` 返回 412、读回仍是第一次的内容；
       OSS 模式下对应的是 409 `FileAlreadyExists`），或已知服务端不实现并接受墓碑兜底的边界
-- [ ] 用 OSS 时：勾选「阿里云 OSS」开关、桶从未开启过版本控制、未勾路径风格、S3 兼容端点
+- [ ] 用 OSS 时：勾选「阿里云 OSS」开关、桶从未开启过版本控制、未勾路径风格；服务地址是
+      S3 兼容端点、区域填 `cn-hangzhou` 这种区域 ID；账号已开通 S3 V4 签名；RAM 授权
+      `oss:ListObjects`（桶 ARN + `oss:Prefix`）与对象读写删；所有设备 ≥ 2.8.34；隔离前缀
+      下的双写验收通过（409 + `FileAlreadyExists`、读回第一次内容）
 - [ ] 防火墙只放行需要的端口；公网暴露时限制来源 IP。云服务器要放行**两处**：云控制台的
       安全组（如阿里云 ECS 的 入方向规则）和机内 firewalld/ufw
 - [ ] 在 RClaw 里「测试连接」六项全过，并实际创建 / 加入一个空空间

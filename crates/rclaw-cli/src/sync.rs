@@ -1241,6 +1241,7 @@ mod tests {
         after.poll_interval_sec = 30;
         after.webdav.url = "https://dav.example.com/rclaw/".into();
         after.webdav.username = "me".into();
+        after.s3.oss_forbid_overwrite = true;
         save_sync_config(&path, &before, &after).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1254,6 +1255,10 @@ mod tests {
             "没变的键不动: {text}"
         );
         assert!(text.contains("[sync.webdav]"), "{text}");
+        assert!(
+            text.contains("oss_forbid_overwrite = true"),
+            "OSS 开关要写回: {text}"
+        );
         assert!(!text.contains("trash_days"), "没变的默认值不写进去: {text}");
         assert_eq!(Config::load_from_dir(dir.path()).unwrap().sync, after);
 
