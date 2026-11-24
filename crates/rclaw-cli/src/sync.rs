@@ -759,6 +759,7 @@ fn sync_edits(before: &SyncConfig, after: &SyncConfig) -> Result<Vec<(String, Ed
         prefix,
         access_key_id,
         path_style,
+        oss_forbid_overwrite,
         allow_http: s3_allow_http,
     } = s3;
 
@@ -837,6 +838,11 @@ fn sync_edits(before: &SyncConfig, after: &SyncConfig) -> Result<Vec<(String, Ed
             "s3.path_style",
             before.s3.path_style != *path_style,
             EditValue::Bool(*path_style),
+        ),
+        (
+            "s3.oss_forbid_overwrite",
+            before.s3.oss_forbid_overwrite != *oss_forbid_overwrite,
+            EditValue::Bool(*oss_forbid_overwrite),
         ),
         (
             "s3.allow_http",

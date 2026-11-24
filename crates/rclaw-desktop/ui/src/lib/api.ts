@@ -738,6 +738,8 @@ export interface SyncConfig {
     prefix: string;
     access_key_id: string;
     path_style: boolean;
+    /** 阿里云 OSS：用 x-oss-forbid-overwrite 代替 If-None-Match（OSS 会拒绝条件头）。 */
+    oss_forbid_overwrite: boolean;
     allow_http: boolean;
   };
 }

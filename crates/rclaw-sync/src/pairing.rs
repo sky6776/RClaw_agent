@@ -43,6 +43,9 @@ pub enum PairedStorage {
         secret_key: String,
         #[serde(default)]
         path_style: bool,
+        /// 阿里云 OSS：仅创建改用 `x-oss-forbid-overwrite`（见 `S3Section`）。
+        #[serde(default)]
+        oss_forbid_overwrite: bool,
         #[serde(default)]
         allow_http: bool,
     },
@@ -169,6 +172,33 @@ mod tests {
         // Debug 不泄露密钥与密码。
         let shown = format!("{full:?}");
         assert!(!shown.contains(&full.key) && !shown.contains("pw"));
+    }
+
+    #[test]
+    fn s3_storage_carries_the_oss_switch_into_the_config() {
+        use crate::config::SyncConfig;
+        use crate::secrets::Secrets;
+
+        let full = code(Some(PairedStorage::S3 {
+            endpoint: "https://s3.oss-cn-hangzhou.aliyuncs.com".into(),
+            region: "oss-cn-hangzhou".into(),
+            bucket: "rclaw-test".into(),
+            prefix: "rclaw".into(),
+            access_key_id: "ak".into(),
+            secret_key: "sk".into(),
+            path_style: false,
+            oss_forbid_overwrite: true,
+            allow_http: false,
+        }));
+        let text = full.encode().unwrap();
+        let parsed = PairingCode::parse(&text).unwrap();
+        assert_eq!(parsed, full);
+
+        let mut secrets = Secrets::default();
+        let config = crate::engine::apply_pairing(&SyncConfig::default(), &mut secrets, &parsed);
+        assert_eq!(config.transport, "s3");
+        assert!(config.s3.oss_forbid_overwrite, "配对码要带上 OSS 开关");
+        assert_eq!(secrets.s3_secret_key, "sk");
     }
 
     #[test]

@@ -16,6 +16,7 @@
 //! # 可选：
 //! RCLAW_OSS_PREFIX=rclaw-cond-test-<随机>   # 默认 rclaw-cond-test-<pid>，测试对象都在它下面
 //! RCLAW_OSS_PATH_STYLE=0                    # 1 = 路径式寻址（自建 MinIO 常用）
+//! RCLAW_OSS_FORBID_OVERWRITE=0              # 1 = 阿里云 OSS：改用 x-oss-forbid-overwrite
 //! ```
 //!
 //! 只在该前缀下写一个几十字节的测试对象，结束时删除；不要用生产前缀跑。
@@ -42,6 +43,7 @@ async fn oss_conditional_create_double_write() {
     let prefix = env("RCLAW_OSS_PREFIX")
         .unwrap_or_else(|| format!("rclaw-cond-test-{}", std::process::id()));
     let path_style = env("RCLAW_OSS_PATH_STYLE").as_deref() == Some("1");
+    let oss_forbid_overwrite = env("RCLAW_OSS_FORBID_OVERWRITE").as_deref() == Some("1");
     // 本地 mock / 局域网 MinIO 用 http 时需要显式允许；公网地址仍然强制 HTTPS。
     let allow_http = env("RCLAW_OSS_ALLOW_HTTP").as_deref() == Some("1");
 
@@ -53,6 +55,7 @@ async fn oss_conditional_create_double_write() {
         access_key,
         secret_key,
         path_style,
+        oss_forbid_overwrite,
         allow_http,
     })
     .unwrap_or_else(|error| panic!("构造 S3 传输失败（检查端点/区域/桶名）: {error}"));
@@ -61,7 +64,9 @@ async fn oss_conditional_create_double_write() {
     // 清理上一次的残留：删不掉也不影响后续（下面第一次条件写会拿到 412，能看出来）。
     let _ = transport.delete(key).await;
 
-    println!("endpoint={endpoint} region={region} bucket={bucket} prefix={prefix} path_style={path_style}");
+    println!(
+        "endpoint={endpoint} region={region} bucket={bucket} prefix={prefix} path_style={path_style} oss_forbid_overwrite={oss_forbid_overwrite}"
+    );
 
     transport
         .put_new(key, b"first".to_vec())
@@ -73,11 +78,11 @@ async fn oss_conditional_create_double_write() {
         Ok(()) => {
             let kept = transport.get(key, 64 * 1024).await.unwrap_or_default();
             panic!(
-                "服务端忽略了 If-None-Match（第二次 put_new 返回成功，内容={:?}）——不满足条件创建",
+                "服务端没有执行「仅创建」（第二次 put_new 返回成功，内容={:?}）——不满足条件创建",
                 String::from_utf8_lossy(&kept)
             );
         }
-        Err(error) => println!("第二次 put_new 被拒: {error}"),
+        Err(error) => println!("第二次 put_new 被拒（期望 412 或 OSS 的 409）: {error}"),
     }
 
     let kept = transport

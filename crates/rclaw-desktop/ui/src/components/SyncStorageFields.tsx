@@ -367,6 +367,13 @@ export default function SyncStorageFields({
             label="路径风格的地址（path-style）"
             hint="MinIO 等自建服务一般要勾上；云厂商的对象存储一般不勾。"
           />
+          <SyncCheck
+            checked={config.s3.oss_forbid_overwrite}
+            disabled={disabled}
+            onChange={(on) => setS3({ oss_forbid_overwrite: on })}
+            label="阿里云 OSS（用 x-oss-forbid-overwrite 防覆盖）"
+            hint="OSS 会拒绝 If-None-Match（400），开启后改用 OSS 专有头（已存在返回 409）。要求：桶从未开启过版本控制、用 S3 兼容端点、不要勾选路径风格。"
+          />
           {isPlainHttp(config.s3.endpoint) && (
             <div className={SYNC_WARN_BOX}>
               <SyncCheck

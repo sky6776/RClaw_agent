@@ -4,6 +4,8 @@
 只实现本测试用到的路径式请求：PUT/GET/DELETE /<bucket>/<key>。
 MOCK_IGNORE=1 时故意忽略 If-None-Match（模拟不支持条件写的服务端），用来验证
 RClaw 的验收逻辑会把这种情况判为失败。
+MOCK_OSS=1 时模拟阿里云 OSS：PutObject 带 If-None-Match 直接 400 NotImplemented，
+只有 x-oss-forbid-overwrite: true 才生效（已存在返回 409 FileAlreadyExists）。
 """
 import os
 import sys
@@ -13,6 +15,7 @@ from urllib.parse import urlparse, unquote
 
 PORT = int(os.environ.get("MOCK_PORT", "19000"))
 IGNORE = os.environ.get("MOCK_IGNORE") == "1"
+OSS = os.environ.get("MOCK_OSS") == "1"
 STORE = {}
 LOCK = threading.Lock()
 
@@ -44,11 +47,24 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         cond = self.headers.get("If-None-Match")
+        forbid = (self.headers.get("x-oss-forbid-overwrite") or "").lower() == "true"
+        if OSS and cond is not None:
+            self.log_message("PUT %s if-none-match=%s -> 400 NotImplemented (OSS)", key, cond)
+            self._send(
+                400,
+                b"<Error><Code>NotImplemented</Code>"
+                b"<Message>A header you provided implies functionality that is not implemented.</Message>"
+                b"</Error>",
+            )
+            return
         with LOCK:
             exists = key in STORE
+            if forbid and exists and not IGNORE:
+                self.log_message("PUT %s forbid-overwrite -> 409 (exists)", key)
+                self._send(409, b"<Error><Code>FileAlreadyExists</Code></Error>")
+                return
             if cond == "*" and exists and not IGNORE:
-                n = self.headers.get("If-None-Match")
-                self.log_message("PUT %s if-none-match=%s -> 412 (exists)", key, n)
+                self.log_message("PUT %s if-none-match=%s -> 412 (exists)", key, cond)
                 self._send(412, b"<Error><Code>PreconditionFailed</Code></Error>")
                 return
             STORE[key] = body
@@ -95,5 +111,9 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = HTTPServer(("127.0.0.1", PORT), Handler)
-    print("mock-s3 listening on 127.0.0.1:%d ignore_conditional=%s" % (PORT, IGNORE), flush=True)
+    print(
+        "mock-s3 listening on 127.0.0.1:%d ignore_conditional=%s oss_mode=%s"
+        % (PORT, IGNORE, OSS),
+        flush=True,
+    )
     server.serve_forever()

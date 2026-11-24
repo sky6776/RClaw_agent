@@ -172,6 +172,9 @@ export function storageProblem(config: SyncConfig): string | null {
       if (!config.s3.endpoint.trim()) return "请填写对象存储的地址";
       if (!config.s3.bucket.trim()) return "请填写存储桶的名字";
       if (!config.s3.access_key_id.trim()) return "请填写 Access Key ID";
+      if (config.s3.oss_forbid_overwrite && config.s3.path_style) {
+        return "阿里云 OSS 只支持虚拟主机式：请取消勾选「路径风格的地址」";
+      }
       return null;
     default:
       return "请选择存储类型";

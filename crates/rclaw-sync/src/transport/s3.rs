@@ -35,6 +35,9 @@ pub struct S3Options {
     pub secret_key: String,
     /// 路径式寻址（`<地址>/<桶>/<键>`）。自建的 MinIO 等通常需要；默认用虚拟主机式。
     pub path_style: bool,
+    /// 阿里云 OSS：用 `x-oss-forbid-overwrite: true` 代替 `If-None-Match: *`。
+    /// OSS 的 PutObject 会直接拒绝条件头（400 NotImplemented）。
+    pub oss_forbid_overwrite: bool,
     /// 明文 HTTP：只对局域网地址有效。
     pub allow_http: bool,
 }
@@ -54,6 +57,8 @@ pub struct S3Transport {
     region: String,
     access_key: String,
     secret_key: String,
+    /// 「仅创建」用 OSS 的 `x-oss-forbid-overwrite` 而不是标准条件头。
+    oss_forbid_overwrite: bool,
 }
 
 /// SigV4 的 URI 编码：只保留 `A-Z a-z 0-9 - _ . ~`。
@@ -305,6 +310,8 @@ impl S3Transport {
             format!("{prefix}/")
         };
 
+        // OSS 只支持虚拟主机式；这里不硬拦（本地 mock / 自建网关常是 IP + 路径式），
+        // 由界面校验与部署文档提示，真用错时由服务端拒绝。
         let mut url = endpoint.url.clone();
         let bucket_path = if options.path_style {
             format!("/{bucket}/")
@@ -336,6 +343,7 @@ impl S3Transport {
             region: region.to_string(),
             access_key: options.access_key.clone(),
             secret_key: options.secret_key.clone(),
+            oss_forbid_overwrite: options.oss_forbid_overwrite,
         })
     }
 
@@ -523,13 +531,19 @@ impl SyncTransport for S3Transport {
     }
 
     async fn put_new(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
-        // 仅创建：`If-None-Match: *`（S3 及兼容实现的新版 PutObject 支持）。不支持
-        // 该条件的后端会返回错误，调用方按「创建失败」读回并校验已有标记。
+        // 仅创建：标准 S3 用 `If-None-Match: *`（已存在返回 412）。阿里云 OSS 的
+        // PutObject 会直接拒绝条件头（400 NotImplemented），改用它的专有头
+        // `x-oss-forbid-overwrite: true`（已存在返回 409 FileAlreadyExists）——注意这个
+        // 头在桶开启/暂停过版本控制后失效，部署时要保持桶从未开启版本控制。
+        // 两种情况下的「已存在」都返回错误，调用方按「创建失败」读回并校验已有标记。
         let path = self.object_path(key)?;
         let hash = sha256_hex(&body);
-        let request = self
-            .request(Method::PUT, &path, "", &hash)?
-            .header("If-None-Match", "*");
+        let request = self.request(Method::PUT, &path, "", &hash)?;
+        let request = if self.oss_forbid_overwrite {
+            request.header("x-oss-forbid-overwrite", "true")
+        } else {
+            request.header("If-None-Match", "*")
+        };
         let response = net::send_upload(request, Upload::Bytes(Bytes::from(body))).await?;
         if response.status().is_success() {
             Ok(())
@@ -660,6 +674,7 @@ mod tests {
             access_key: "ak".into(),
             secret_key: "sk".into(),
             path_style: false,
+            oss_forbid_overwrite: false,
             allow_http: false,
         }
     }

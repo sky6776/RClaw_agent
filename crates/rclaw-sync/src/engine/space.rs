@@ -89,6 +89,7 @@ pub(crate) fn root_transport(
                 access_key: s3.access_key_id.trim().to_string(),
                 secret_key: secrets.storage_secret(config).to_string(),
                 path_style: s3.path_style,
+                oss_forbid_overwrite: s3.oss_forbid_overwrite,
                 allow_http: s3.allow_http,
             })?))
         }
@@ -186,6 +187,7 @@ pub fn apply_pairing(config: &SyncConfig, secrets: &mut Secrets, code: &PairingC
             access_key_id,
             secret_key,
             path_style,
+            oss_forbid_overwrite,
             allow_http,
         }) => {
             config.transport = "s3".into();
@@ -196,6 +198,7 @@ pub fn apply_pairing(config: &SyncConfig, secrets: &mut Secrets, code: &PairingC
                 prefix: prefix.clone(),
                 access_key_id: access_key_id.clone(),
                 path_style: *path_style,
+                oss_forbid_overwrite: *oss_forbid_overwrite,
                 allow_http: *allow_http,
             };
             secrets.s3_account = Secrets::storage_account(&config).unwrap_or_default();
@@ -232,6 +235,7 @@ pub(crate) fn pairing_code(
             access_key_id: config.s3.access_key_id.trim().to_string(),
             secret_key: secrets.storage_secret(config).to_string(),
             path_style: config.s3.path_style,
+            oss_forbid_overwrite: config.s3.oss_forbid_overwrite,
             allow_http: config.s3.allow_http,
         }),
         _ => None,
@@ -505,6 +509,8 @@ fn refresh_connection_settings(target: &mut SyncConfig, current: &SyncConfig) {
         "s3" => {
             target.s3.allow_http = current.s3.allow_http;
             target.s3.region = current.s3.region.clone();
+            // 「仅创建」的实现方式跟后端绑定：用户在设置里改了，收尾也要按新的来。
+            target.s3.oss_forbid_overwrite = current.s3.oss_forbid_overwrite;
         }
         _ => {}
     }

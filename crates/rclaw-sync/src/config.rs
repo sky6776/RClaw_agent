@@ -90,6 +90,11 @@ pub struct S3Section {
     pub access_key_id: String,
     #[serde(default)]
     pub path_style: bool,
+    /// 阿里云 OSS：`PutObject` 拒绝条件头（`If-None-Match` 返回 400），改用 OSS 专有的
+    /// `x-oss-forbid-overwrite: true` 做「仅创建」（已存在时 409 `FileAlreadyExists`）。
+    /// 这个头在桶开启或暂停过版本控制后失效；OSS 也只支持虚拟主机式寻址。
+    #[serde(default)]
+    pub oss_forbid_overwrite: bool,
     /// 明文 HTTP：只对局域网地址有效。公网地址必须 HTTPS。
     #[serde(default)]
     pub allow_http: bool,
@@ -392,6 +397,27 @@ username = "me@example.com"
         assert!(scopes.sessions && scopes.memory && scopes.attachments && !scopes.persona);
         assert!(toml::from_str::<SyncConfig>("enabeld = true").is_err());
         assert!(toml::from_str::<SyncConfig>("[webdav]\npassword = \"x\"").is_err());
+    }
+
+    #[test]
+    fn s3_parses_the_oss_switch() {
+        let config: SyncConfig = toml::from_str(
+            r#"
+transport = "s3"
+
+[s3]
+endpoint = "https://s3.oss-cn-hangzhou.aliyuncs.com"
+bucket = "rclaw-test"
+oss_forbid_overwrite = true
+"#,
+        )
+        .unwrap();
+        assert!(config.s3.oss_forbid_overwrite);
+        // 老配置没有这个键：默认关。
+        let old: SyncConfig = toml::from_str("[s3]
+endpoint = \"https://s3.example.com\"
+").unwrap();
+        assert!(!old.s3.oss_forbid_overwrite);
     }
 
     #[test]
