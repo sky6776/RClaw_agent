@@ -1059,10 +1059,17 @@ async fn finish_reset(
             .await
             {
                 remote::CloseAttempt::Done => {
-                    if added.is_ok() {
-                        if let Err(error) = pending_close_finish(&ctx.paths, &close.id).await {
-                            tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
-                        }
+                    // 关闭已完成：同目标的历史快照一起收掉（撤不掉留给后台再验一遍）。
+                    if let Err(error) = pending_close_finish_target(
+                        &ctx.paths,
+                        &close.storage,
+                        &old.space_id,
+                        false,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
                     }
                 }
                 remote::CloseAttempt::NotStarted => {}
