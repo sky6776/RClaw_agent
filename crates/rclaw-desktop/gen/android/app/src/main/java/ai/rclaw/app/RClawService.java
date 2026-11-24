@@ -64,8 +64,11 @@ public final class RClawService extends Service {
     private final android.os.Handler mainHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
     private volatile boolean nativeStarted;
-    /** 服务第一次看到 rclaw.toml 的时刻（0 = 还没看到过；待配置态会清回 0）。 */
+    /** 待配置态转成有配置后的装配宽限起点（单调时钟毫秒；0 = 这次宽限还没开始）。 */
     private volatile long configFirstSeenAtMs;
+    /** 本服务实例见过「还没有 rclaw.toml」的待配置态：只有这种「向导刚写完配置」的
+     *  转换才需要装配宽限；本来就带着配置启动的服务不享受宽限。 */
+    private volatile boolean sawPendingConfig;
     private volatile long nativeStartedAtMs;
     private PowerManager.WakeLock startupWakeLock;
     private PowerManager.WakeLock turnWakeLock;
@@ -291,6 +294,7 @@ public final class RClawService extends Service {
         // 首次运行、rclaw.toml 还没有：原生运行时本来就不装配（等向导写完配置），
         // 没有心跳是正常的。按「心跳过期」杀进程会让向导开着一分钟就被杀掉重来。
         if (!AppConfig.hasConfig(this)) {
+            sawPendingConfig = true;
             configFirstSeenAtMs = 0;
             AppConfig.trace(this, "health-check pending-config (skip)");
             WatchdogScheduler.markHealthy(this, now - nativeStartedAtMs);
@@ -298,13 +302,19 @@ public final class RClawService extends Service {
         }
         try {
             boolean healthy = NativeBridge.nativeIsHealthy();
-            if (!healthy) {
+            if (healthy) {
+                // 装配完成了：这次宽限结束，后续不健康按正常看门狗处理。
+                configFirstSeenAtMs = 0;
+                sawPendingConfig = false;
+            } else if (sawPendingConfig) {
                 // 向导刚发布 rclaw.toml、装配还没置位健康信号（文件已存在、begin_assembly
                 // 还没执行）：给装配一点时间，别在这个缝隙里杀掉刚提交的向导。
+                // 只用单调时钟：改系统时间不能延长这个宽限。
+                long monotonic = android.os.SystemClock.elapsedRealtime();
                 if (configFirstSeenAtMs == 0) {
-                    configFirstSeenAtMs = now;
+                    configFirstSeenAtMs = monotonic;
                 }
-                if (now - configFirstSeenAtMs <= CONFIG_GRACE_MS) {
+                if (monotonic - configFirstSeenAtMs <= CONFIG_GRACE_MS) {
                     AppConfig.trace(this,
                             "health-check config-grace (skip) uptimeMs="
                                     + (now - nativeStartedAtMs));

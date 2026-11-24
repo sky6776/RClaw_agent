@@ -189,26 +189,32 @@ pub async fn marker_closed_state(
 ///
 /// 只凭「标记已关闭」就往下走的话，迟到创建把标记覆盖回开放后，新版也会重新接受这个
 /// 旧空间；墓碑才是迟到覆盖拿不掉的关闭证据，提交重置前必须在。
+/// 返回是否**写入了**墓碑：只核对已有墓碑时，后续复读失败不需要为此保留重试依据。
 pub async fn ensure_closed(
     transport: &dyn SyncTransport,
     keys: &Keys,
     space_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     match read_closed(transport, keys, space_id).await {
-        Ok(true) => Ok(()),
-        Ok(false) => write_closed_tombstone(transport, keys, space_id).await,
+        Ok(true) => Ok(false),
+        Ok(false) => {
+            write_closed_tombstone(transport, keys, space_id).await?;
+            Ok(true)
+        }
         // 上一次 PUT 断开留下的半截墓碑（§10 允许非原子 PUT）：这里要写的就是关闭版，
         // 覆盖一个解析不了的对象不会把关闭变成开放。
         Err(SyncError::Corrupt(error)) => {
             tracing::warn!("关闭墓碑损坏，重写: {error}");
-            write_closed_tombstone(transport, keys, space_id).await
+            write_closed_tombstone(transport, keys, space_id).await?;
+            Ok(true)
         }
         // 读不出来（权限、网络）不能挡住关闭：到这里来的调用点都已经确认这个空间该关，
         // 要写的本来就是关闭版。但身份不符、版本过高说明位置上不是这个空间，不能改写。
         Err(error @ SyncError::Upgrade(_)) | Err(error @ SyncError::Other(_)) => Err(error),
         Err(error) => {
             tracing::warn!("关闭墓碑读不出来，直接写: {error}");
-            write_closed_tombstone(transport, keys, space_id).await
+            write_closed_tombstone(transport, keys, space_id).await?;
+            Ok(true)
         }
     }
 }
@@ -236,11 +242,18 @@ async fn finish_known_closed(
             Err(error) => return Failed(error),
         },
         Ok(None) | Err(SyncError::Corrupt(_)) => false,
+        // 只读失败：这次没改过远端。并发的成功清理过的同目标不需要为它留记录。
+        Err(error) => return Failed(error),
+    };
+    let tombstone_written = match ensure_closed(transport, keys, space_id).await {
+        Ok(written) => written,
+        // 身份不符/版本过高：没有写入，远端没被改过。
+        Err(error @ SyncError::Upgrade(_)) | Err(error @ SyncError::Other(_)) => {
+            return Failed(error)
+        }
+        // 尝试过写墓碑（读错也会照写），可能已经改动远端。
         Err(error) => return ConfirmedButFailed(error),
     };
-    if let Err(error) = ensure_closed(transport, keys, space_id).await {
-        return ConfirmedButFailed(error);
-    }
     // 本来就是关闭版的标记不再重写（非原子 PUT 重复写可能把好的标记截断）；但复核
     // 读出来的错误不能当成「需要补写」——身份不符/版本过高说明位置上不是这个空间，
     // 网络/权限错误下覆写也可能把一份有效的标记截断。两种都留待重试。
@@ -251,8 +264,15 @@ async fn finish_known_closed(
             Err(error @ SyncError::Upgrade(_)) | Err(error @ SyncError::Other(_)) => {
                 return Failed(error)
             }
-            // 复读失败：这次还没写过远端（留待重试即可）。
-            Err(error) => return Failed(error),
+            // 复读失败：刚写过墓碑的，标记可能仍需要补写，保留重试依据；只核对过已有
+            // 墓碑的，这次没有改动远端，不需要为它留记录。
+            Err(error) => {
+                return if tombstone_written {
+                    WriteFailed(error)
+                } else {
+                    Failed(error)
+                }
+            }
         }
     }
     if let Err(error) = write_closed_marker(transport, keys, space_id).await {
