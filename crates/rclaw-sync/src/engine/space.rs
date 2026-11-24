@@ -461,12 +461,36 @@ fn rev_seq_path(paths: &SyncPaths) -> PathBuf {
     paths.root.join("pending-close.seq")
 }
 
-/// 已分配版本的最大值（独立于队列文件：删光记录/清空队列也不回退）。
-fn rev_seq_load(paths: &SyncPaths) -> u64 {
-    std::fs::read_to_string(rev_seq_path(paths))
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
+/// 原子写兜底路径（备份替换）的 crash 窗口里主文件会缺失、旧值还在备份里。
+fn rev_seq_backup_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join(".pending-close.seq.bak")
+}
+
+fn rev_seq_parse(text: &str) -> Result<u64> {
+    text.trim().parse().map_err(|error| {
+        SyncError::other(format!(
+            "同步收尾队列的版本序号读不出来（{error}）：先确认上界再分配新版本"
+        ))
+    })
+}
+
+/// 已分配版本的最大值（独立于队列文件：删光记录/清空队列也不回退）。`None` = 从未
+/// 分配过（首次使用）；读/解析失败要报错：当成 0 会让后续分配从更小的值重来，而在途
+/// 尝试还拿着旧上界结算，失败恢复回来的记录会被当成旧记录清掉。
+fn rev_seq_load(paths: &SyncPaths) -> Result<Option<u64>> {
+    match std::fs::read_to_string(rev_seq_path(paths)) {
+        Ok(text) => rev_seq_parse(&text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 备份替换的 crash 窗口：主文件已改名走、新文件还没就位。备份是上一份
+            // 有效值，按它算上界；直接当首次会丢掉已分配的最大版本。
+            match std::fs::read_to_string(rev_seq_backup_path(paths)) {
+                Ok(text) => rev_seq_parse(&text).map(Some),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn rev_seq_save(paths: &SyncPaths, rev: u64) -> Result<()> {
@@ -476,21 +500,39 @@ fn rev_seq_save(paths: &SyncPaths, rev: u64) -> Result<()> {
 
 /// 队列锁内：给缺版本的存量记录按盘上顺序补版本（补完再取上界，避免「取样之后才补」
 /// 让旧记录拿到更高版本、逃过成功清理），返回当前最大已分配版本。
+///
+/// 只在真的要推进已分配上界（或补写老版本）时才写序号文件：队列没有变化时（每批开头、
+/// 每条尝试各取样一次）这份读改写只是读，不该给整批多出一个写失败点——它只记「已分配
+/// 上界」，不是推进收尾的前置条件。
 fn rev_normalize_locked(paths: &SyncPaths, closes: &mut Vec<PendingClose>) -> Result<u64> {
-    let mut next = rev_seq_load(paths)
-        .max(closes.iter().map(|entry| entry.rev).max().unwrap_or(0));
+    let stored = rev_seq_load(paths)?.unwrap_or(0);
+    let mut next = stored.max(closes.iter().map(|entry| entry.rev).max().unwrap_or(0));
     let mut changed = false;
     for entry in closes.iter_mut() {
         if entry.rev == 0 {
-            next += 1;
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| SyncError::other("同步收尾队列的版本序号已用尽"))?;
             entry.rev = next;
             changed = true;
         }
     }
-    rev_seq_save(paths, next)?;
+    if changed || next > stored {
+        rev_seq_save(paths, next)?;
+    }
     if changed {
         pending_close_save(paths, closes)?;
     }
+    Ok(next)
+}
+
+/// 队列锁内分配下一个版本：先把分配值写进序号文件再保存队列——队列随后保存失败或
+/// 进程退出，这个值也不会被再次分配。
+fn rev_allocate_locked(paths: &SyncPaths, closes: &mut Vec<PendingClose>) -> Result<u64> {
+    let next = rev_normalize_locked(paths, closes)?
+        .checked_add(1)
+        .ok_or_else(|| SyncError::other("同步收尾队列的版本序号已用尽"))?;
+    rev_seq_save(paths, next)?;
     Ok(next)
 }
 
@@ -578,10 +620,8 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
                 old.id = crate::ids::random_hex::<8>();
             }
         }
-        let next = rev_normalize_locked(&paths, &mut closes)?;
         let mut close = close;
-        close.rev = next + 1;
-        rev_seq_save(&paths, close.rev)?;
+        close.rev = rev_allocate_locked(&paths, &mut closes)?;
         // 确认事实是目标的性质：并进新条目的同时，留在旧的里面也不算丢。
         for old in closes
             .iter()
@@ -733,8 +773,7 @@ async fn pending_close_restore(paths: &SyncPaths, close: &PendingClose) -> Resul
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
-        let rev = rev_normalize_locked(&paths, &mut closes)? + 1;
-        rev_seq_save(&paths, rev)?;
+        let rev = rev_allocate_locked(&paths, &mut closes)?;
         match closes.iter_mut().find(|entry| entry.id == close.id) {
             Some(entry) => {
                 entry.closed_seen |= close.closed_seen;
@@ -1976,6 +2015,99 @@ mod tests {
             .await
             .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+    }
+
+    /// 序号文件读不出来（内容坏了 / 连读都读不出来）时按错误处理，不当成首次使用的 0：
+    /// 已分配上界丢失后继续分配，可能复用把在途尝试救回来的版本。
+    #[tokio::test]
+    async fn an_unreadable_revision_sequence_fails_instead_of_restarting_from_zero() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let entry = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            rev: 7,
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        pending_close_save(&ctx.paths, &[entry]).unwrap();
+        std::fs::write(rev_seq_path(&ctx.paths), b"not-a-rev").unwrap();
+        assert!(
+            pending_close_rev_limit(&ctx.paths).await.is_err(),
+            "序号内容解析不了时要报错，不能从 0 重新分配"
+        );
+        // 坏值原样留着：一次成功的写盘不能把它悄悄换成更小的上界。
+        assert_eq!(
+            std::fs::read_to_string(rev_seq_path(&ctx.paths)).unwrap(),
+            "not-a-rev"
+        );
+        // 连读都读不出来（目录占位）也是错误。
+        std::fs::remove_file(rev_seq_path(&ctx.paths)).unwrap();
+        std::fs::create_dir(rev_seq_path(&ctx.paths)).unwrap();
+        assert!(pending_close_rev_limit(&ctx.paths).await.is_err());
+    }
+
+    /// 备份替换的 crash 窗口：主序号文件缺失、旧值还在备份里时按备份算上界，不当成首次。
+    #[tokio::test]
+    async fn a_missing_sequence_file_falls_back_to_its_backup() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let entry = |rev: u64| PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            rev,
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        std::fs::write(rev_seq_backup_path(&ctx.paths), b"5").unwrap();
+        pending_close_save(&ctx.paths, &[entry(1)]).unwrap();
+        assert_eq!(pending_close_rev_limit(&ctx.paths).await.unwrap(), 5);
+        // 分配从备份里的上界之后开始。
+        let restored = entry(1);
+        pending_close_restore(&ctx.paths, &restored).await.unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        let rev = closes
+            .iter()
+            .find(|close| close.id == restored.id)
+            .map(|close| close.rev)
+            .expect("恢复的记录还在盘上");
+        assert!(rev > 5, "备份里的上界之后才该分配：{rev}");
+    }
+
+    /// 队列没变化时取样不写序号文件：那份「读改写」只是读，不该给整批多出一个写失败点。
+    #[tokio::test]
+    async fn a_read_only_sampling_leaves_the_sequence_file_untouched() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        std::fs::write(rev_seq_path(&ctx.paths), b"5").unwrap();
+        // 残留备份：真去写序号文件时，原子写会把主文件换掉并顺带删掉它。
+        std::fs::write(rev_seq_backup_path(&ctx.paths), b"9").unwrap();
+        let entry = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            rev: 1,
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        pending_close_save(&ctx.paths, &[entry]).unwrap();
+        assert_eq!(pending_close_rev_limit(&ctx.paths).await.unwrap(), 5);
+        assert!(
+            rev_seq_backup_path(&ctx.paths).exists(),
+            "取样不该写序号文件"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rev_seq_path(&ctx.paths)).unwrap(),
+            "5"
+        );
     }
 
     /// 成功清理只删版本不高于尝试开始时上界的记录：并发失败刚补回来的（版本更高）要留着。
