@@ -291,11 +291,11 @@ struct PendingClose {
     /// 这条记录的身份：收尾结果按它结算，不按目标——期间同目标可能已经被新记录替代。
     #[serde(default)]
     id: String,
-    /// 这条记录（或它最近一次被失败恢复）落盘时的队列版本（队列锁内递增分配）：
-    /// 成功的按目标清理只删**版本不高于尝试开始时上界**的记录，不把并发失败刚补回来
-    /// 的重试依据一起删掉；也不受墙钟回拨/同毫秒影响。
+    /// 这条记录（或它最近一次被失败恢复）落盘时的工作标记（随机、每次入队/恢复重发）：
+    /// 成功的按目标清理只删**标记在尝试开始时已经存在**的记录，不把并发失败刚补回来
+    /// 的重试依据一起删掉；也不受墙钟回拨/同毫秒影响，且不依赖任何跨批次的全局序号。
     #[serde(default)]
-    rev: u64,
+    mark: String,
     /// 关闭时用的存储配置（来自那条没做完的重置记录）。
     storage: SyncConfig,
     /// 旧空间的密钥与存储凭据。
@@ -457,83 +457,14 @@ fn same_close_location(a: &SyncConfig, b: &SyncConfig) -> bool {
     }
 }
 
-fn rev_seq_path(paths: &SyncPaths) -> PathBuf {
-    paths.root.join("pending-close.seq")
-}
-
-/// 原子写兜底路径（备份替换）的 crash 窗口里主文件会缺失、旧值还在备份里。
-fn rev_seq_backup_path(paths: &SyncPaths) -> PathBuf {
-    paths.root.join(".pending-close.seq.bak")
-}
-
-fn rev_seq_parse(text: &str) -> Result<u64> {
-    text.trim().parse().map_err(|error| {
-        SyncError::other(format!(
-            "同步收尾队列的版本序号读不出来（{error}）：先确认上界再分配新版本"
-        ))
-    })
-}
-
-/// 已分配版本的最大值（独立于队列文件：删光记录/清空队列也不回退）。`None` = 从未
-/// 分配过（首次使用）；读/解析失败要报错：当成 0 会让后续分配从更小的值重来，而在途
-/// 尝试还拿着旧上界结算，失败恢复回来的记录会被当成旧记录清掉。
-fn rev_seq_load(paths: &SyncPaths) -> Result<Option<u64>> {
-    match std::fs::read_to_string(rev_seq_path(paths)) {
-        Ok(text) => rev_seq_parse(&text).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // 备份替换的 crash 窗口：主文件已改名走、新文件还没就位。备份是上一份
-            // 有效值，按它算上界；直接当首次会丢掉已分配的最大版本。
-            match std::fs::read_to_string(rev_seq_backup_path(paths)) {
-                Ok(text) => rev_seq_parse(&text).map(Some),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e.into()),
-            }
-        }
-        Err(e) => Err(e.into()),
+/// 记录的清理标记：入队/失败恢复时重发的随机值。老版本写下的记录没有它，退化成身份
+/// （身份在取样前已补齐）。
+fn close_mark(close: &PendingClose) -> &str {
+    if close.mark.is_empty() {
+        &close.id
+    } else {
+        &close.mark
     }
-}
-
-fn rev_seq_save(paths: &SyncPaths, rev: u64) -> Result<()> {
-    rclaw_store::atomic_write_private(&rev_seq_path(paths), rev.to_string().as_bytes())?;
-    Ok(())
-}
-
-/// 队列锁内：给缺版本的存量记录按盘上顺序补版本（补完再取上界，避免「取样之后才补」
-/// 让旧记录拿到更高版本、逃过成功清理），返回当前最大已分配版本。
-///
-/// 只在真的要推进已分配上界（或补写老版本）时才写序号文件：队列没有变化时（每批开头、
-/// 每条尝试各取样一次）这份读改写只是读，不该给整批多出一个写失败点——它只记「已分配
-/// 上界」，不是推进收尾的前置条件。
-fn rev_normalize_locked(paths: &SyncPaths, closes: &mut Vec<PendingClose>) -> Result<u64> {
-    let stored = rev_seq_load(paths)?.unwrap_or(0);
-    let mut next = stored.max(closes.iter().map(|entry| entry.rev).max().unwrap_or(0));
-    let mut changed = false;
-    for entry in closes.iter_mut() {
-        if entry.rev == 0 {
-            next = next
-                .checked_add(1)
-                .ok_or_else(|| SyncError::other("同步收尾队列的版本序号已用尽"))?;
-            entry.rev = next;
-            changed = true;
-        }
-    }
-    if changed || next > stored {
-        rev_seq_save(paths, next)?;
-    }
-    if changed {
-        pending_close_save(paths, closes)?;
-    }
-    Ok(next)
-}
-
-/// 队列锁内分配下一个版本：先把分配值写进序号文件再保存队列——队列随后保存失败或
-/// 进程退出，这个值也不会被再次分配。
-fn rev_allocate_locked(paths: &SyncPaths, closes: &mut Vec<PendingClose>) -> Result<u64> {
-    let next = rev_normalize_locked(paths, closes)?
-        .checked_add(1)
-        .ok_or_else(|| SyncError::other("同步收尾队列的版本序号已用尽"))?;
-    rev_seq_save(paths, next)?;
-    Ok(next)
 }
 
 fn same_close_target(close: &PendingClose, storage: &SyncConfig, space_id: &str) -> bool {
@@ -621,7 +552,7 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
             }
         }
         let mut close = close;
-        close.rev = rev_allocate_locked(&paths, &mut closes)?;
+        close.mark = crate::ids::random_hex::<8>();
         // 确认事实是目标的性质：并进新条目的同时，留在旧的里面也不算丢。
         for old in closes
             .iter()
@@ -685,8 +616,6 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
         // 提前传播会让封顶的回退规则淘汰错人（可能丢掉唯一带有效凭据的快照）。
         let mut closes = closes;
         changed |= cap_close_history(&mut closes);
-        // 老记录没有版本：按盘上顺序补上，之后的清理边界才有意义。
-        rev_normalize_locked(&paths, &mut closes)?;
         // 「已确认关闭」是**目标**的事实，不是某条记录私有的：同目标（同空间 + 同位置）
         // 里只要有一条确认过，保留下来的其余条目也带着这个事实去补写——否则有效密码
         // 那条可能被当成「远端没开始关闭」删掉，只剩失效密码那条永远补不完。
@@ -721,13 +650,15 @@ async fn pending_close_finish_target(
     space_id: &str,
     keep_confirmed: bool,
     only_batch: Option<&std::collections::HashSet<String>>,
-    // 只删版本不高于它的记录（`u64::MAX` = 不设限）：这次尝试期间/之后被并发失败
-    // 恢复回来的记录版本更高，要留着。
-    rev_limit: u64,
+    // 这次尝试开始时盘上已有的清理标记：不在这里面的记录是期间/之后才入队或被并发
+    // 失败恢复回来的（那是尝试之后的活，旧结论不做数），不归这批删，留着下一轮。
+    // `None` = 不设边界。
+    marks: Option<&std::collections::HashSet<String>>,
 ) -> Result<()> {
     let paths = paths.clone();
     let (storage, space_id) = (storage.clone(), space_id.to_string());
     let batch = only_batch.cloned();
+    let marks = marks.cloned();
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
@@ -741,8 +672,13 @@ async fn pending_close_finish_target(
             if !same_close_target(close, &storage, &space_id) {
                 return true;
             }
-            if close.rev > rev_limit {
-                return true;
+            if let Some(marks) = &marks {
+                // 标记为空的老记录算「尝试之前就在」（恢复会重发标记），别让它永远
+                // 清不掉。
+                let mark = close_mark(close);
+                if !mark.is_empty() && !marks.contains(mark) {
+                    return true;
+                }
             }
             if any_confirmed {
                 return true;
@@ -773,15 +709,17 @@ async fn pending_close_restore(paths: &SyncPaths, close: &PendingClose) -> Resul
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
-        let rev = rev_allocate_locked(&paths, &mut closes)?;
+        // 恢复等于「这次失败之后还有活要干」：换一个新标记，这次尝试开始时的清理
+        // 边界就管不到它了（那是旧尝试的结论，不能拿它当依据）。
+        let mark = crate::ids::random_hex::<8>();
         match closes.iter_mut().find(|entry| entry.id == close.id) {
             Some(entry) => {
                 entry.closed_seen |= close.closed_seen;
-                entry.rev = rev;
+                entry.mark = mark;
             }
             None => {
                 let mut close = close;
-                close.rev = rev;
+                close.mark = mark;
                 closes.push(close);
                 cap_close_history(&mut closes);
             }
@@ -791,14 +729,18 @@ async fn pending_close_restore(paths: &SyncPaths, close: &PendingClose) -> Resul
     .await
 }
 
-/// 这次尝试开始时的队列版本上界（在队列锁内读）：清理只删版本不高于它的记录，
-/// 期间/之后被并发失败恢复的记录（版本更高）留着。
-async fn pending_close_rev_limit(paths: &SyncPaths) -> Result<u64> {
+/// 这次尝试开始时的「已有工作」标记集（队列锁内只读，不写任何文件）：清理只删标记在
+/// 里面的记录，期间/之后被并发失败恢复或新入队的（换了标记）留着下一轮复核。
+async fn pending_close_marks(paths: &SyncPaths) -> Result<std::collections::HashSet<String>> {
     let paths = paths.clone();
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
-        let mut closes = pending_close_load(&paths)?;
-        rev_normalize_locked(&paths, &mut closes)
+        let closes = pending_close_load(&paths)?;
+        Ok(closes
+            .iter()
+            .map(|close| close_mark(close).to_string())
+            .filter(|mark| !mark.is_empty())
+            .collect())
     })
     .await
 }
@@ -867,7 +809,7 @@ pub(crate) async fn finish_pending_close(
             ));
             continue;
         };
-        let rev_limit = pending_close_rev_limit(paths).await?;
+        let marks = pending_close_marks(paths).await?;
         let closed = {
             // 单条也限时：卡住的一条不能把后面的健康记录一直饿着。
             match tokio::time::timeout(
@@ -876,7 +818,7 @@ pub(crate) async fn finish_pending_close(
                     &mut close,
                     paths,
                     &batch_ids,
-                    rev_limit,
+                    &marks,
                     current.as_ref(),
                     secrets.as_ref(),
                     refresh.as_ref(),
@@ -912,9 +854,9 @@ async fn finish_one_close(
     close: &mut PendingClose,
     paths: &SyncPaths,
     batch_ids: &std::collections::HashSet<String>,
-    // 这次尝试开始时的队列版本上界：成功清理只删版本不高于它的记录，这次尝试期间/
-    // 之后被并发失败恢复回来的记录留着。
-    rev_limit: u64,
+    // 这次尝试开始时盘上已有的清理标记：成功清理只删标记在里面的记录，这次尝试期间/
+    // 之后被并发失败恢复回来的（换了标记）留着。
+    marks: &std::collections::HashSet<String>,
     current: Option<&SyncConfig>,
     current_secrets: Option<&Secrets>,
     refresh: Option<&crate::engine::ConfigRefresh>,
@@ -1035,15 +977,15 @@ async fn finish_one_close(
     .await
     {
         remote::CloseAttempt::Done => {
-            // 关闭做完：同目标的历史快照都已完成使命。删除以这次尝试开始的时刻为界，
-            // 期间/之后被并发失败恢复回来的记录（`at_ms` 更晚）留着。
+            // 关闭做完：同目标的历史快照都已完成使命。删除以这次尝试开始时的标记集
+            // 为界，期间/之后被并发失败恢复回来的（换了标记）留着。
             pending_close_finish_target(
                 paths,
                 &close.storage,
                 &space_id,
                 false,
                 None,
-                rev_limit,
+                Some(marks),
             )
             .await?;
             Ok(())
@@ -1057,7 +999,7 @@ async fn finish_one_close(
                 &space_id,
                 true,
                 Some(batch_ids),
-                u64::MAX,
+                Some(marks),
             )
             .await?;
             Ok(())
@@ -1224,7 +1166,7 @@ async fn finish_reset(
             // 都不会丢；补墓碑成功再把这条记录撤掉。
             let close = PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                rev: 0,
+                mark: String::new(),
                 storage: at.clone(),
                 previous: old_secrets.clone(),
                 closed_seen: true,
@@ -1234,11 +1176,11 @@ async fn finish_reset(
                 tracing::warn!("记下没补完的空间关闭失败: {write_error}");
             }
             let old = load_live(&at, &old_secrets).await?;
-            // 上界读不到只影响「Done 之后清同目标旧记录」，不能挡远端复核与本机提交。
-            let rev_limit = match pending_close_rev_limit(&ctx.paths).await {
-                Ok(limit) => Some(limit),
+            // 标记集读不到只影响「Done 之后清同目标旧记录」，不能挡远端复核与本机提交。
+            let marks = match pending_close_marks(&ctx.paths).await {
+                Ok(marks) => Some(marks),
                 Err(error) => {
-                    tracing::warn!("读收尾队列版本上界失败（这次不清理旧记录）: {error}");
+                    tracing::warn!("读收尾队列标记失败（这次不清理旧记录）: {error}");
                     None
                 }
             };
@@ -1255,16 +1197,16 @@ async fn finish_reset(
             .await
             {
                 remote::CloseAttempt::Done => {
-                    // 关闭已完成：清同目标的历史快照。以这次尝试开始的版本上界为界，
-                    // 期间/之后被并发失败恢复回来的记录留着（下一轮复核会把它修好）。
-                    if let Some(rev_limit) = rev_limit {
+                    // 关闭已完成：清同目标的历史快照。以这次尝试开始时的标记集为界，
+                    // 期间/之后被并发失败恢复回来的（换了标记）留着（下一轮复核会把它修好）。
+                    if let Some(marks) = &marks {
                         if let Err(error) = pending_close_finish_target(
                             &ctx.paths,
                             &close.storage,
                             &old.space_id,
                             false,
                             None,
-                            rev_limit,
+                            Some(marks),
                         )
                         .await
                         {
@@ -1414,7 +1356,7 @@ pub(crate) async fn leave(
                     &ctx.paths,
                     PendingClose {
                         id: crate::ids::random_hex::<8>(),
-                        rev: 0,
+                        mark: String::new(),
                         storage: at,
                         previous,
                         closed_seen: false,
@@ -1842,7 +1784,7 @@ mod tests {
             &ctx.paths,
             &[PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                rev: 0,
+                mark: String::new(),
                 storage: config.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
@@ -1868,7 +1810,7 @@ mod tests {
         config.webdav.username = "me".into();
         let entry = |fingerprint: &str, closed: bool| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: {
                 let mut storage = config.clone();
                 storage.webdav.pinned_cert_sha256 = fingerprint.into();
@@ -1888,7 +1830,7 @@ mod tests {
         // 另一个不同空间/位置不受影响。
         let other = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: paired(),
             closed_seen: false,
@@ -1910,7 +1852,7 @@ mod tests {
         config.webdav.username = "me".into();
         let entry = |fingerprint: &str, closed: bool| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: {
                 let mut storage = config.clone();
                 storage.webdav.pinned_cert_sha256 = fingerprint.into();
@@ -1945,53 +1887,61 @@ mod tests {
             .all(|close| close.closed_seen));
     }
 
-    /// 版本不复用：清空队列/删掉最大版本后，新记录仍拿到更大的版本，不会被在途尝试的
-    /// 旧上界误删。
+    /// 清理边界按「工作标记」：清空队列之后恢复的记录带着新标记，旧尝试的标记集
+    /// 再清一次也删不掉它（那是失败之后才出现的活）。
     #[tokio::test]
-    async fn revision_numbers_are_not_reused_after_the_queue_is_cleared() {
+    async fn a_target_cleanup_keeps_new_work_made_after_it_started() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
         let mut config = SyncConfig::default();
         config.transport = "file".into();
         config.file.dir = "C:/sync-a".into();
-        let entry = |rev: u64| PendingClose {
+        let entry = || PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev,
+            mark: crate::ids::random_hex::<8>(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: true,
         };
-        let seeded = [entry(1), entry(2)];
-        pending_close_save(&ctx.paths, &seeded).unwrap();
-        // 在途尝试的上界：2。
-        let in_flight_limit = pending_close_rev_limit(&ctx.paths).await.unwrap();
-        assert_eq!(in_flight_limit, 2);
-        // 队列被清空（成功清理删掉整组 / 清空文件）。
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, 2)
-            .await
-            .unwrap();
-        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
-        // 清空之后恢复一条：版本必须大于 2，否则在途尝试的旧上界会把它删掉。
-        pending_close_restore(&ctx.paths, &entry(1)).await.unwrap();
-        let restored = pending_close_load(&ctx.paths).unwrap();
-        assert_eq!(restored.len(), 1);
-        assert!(restored[0].rev > in_flight_limit);
+        let older = entry();
+        pending_close_save(&ctx.paths, &[older.clone()]).unwrap();
+        let in_flight_marks = pending_close_marks(&ctx.paths).await.unwrap();
+        assert!(in_flight_marks.contains(close_mark(&older)));
+        // 队列被并发成功清理清空，随后一次失败把同一身份的记录恢复回来（换了标记）。
         pending_close_finish_target(
             &ctx.paths,
             &config,
             &secrets.space_id,
             false,
             None,
-            in_flight_limit,
+            Some(&in_flight_marks),
         )
         .await
         .unwrap();
-        assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 1);
+        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+        pending_close_restore(&ctx.paths, &older).await.unwrap();
+        let restored = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_ne!(close_mark(&restored[0]), close_mark(&older));
+        // 在途尝试按它开始时的标记集结算：恢复回来的这条留着。
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            false,
+            None,
+            Some(&in_flight_marks),
+        )
+        .await
+        .unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].id, older.id);
     }
 
-    /// 取样时先把老记录的版本补齐：不会出现「取样之后老记录才拿到更高版本」而逃过清理。
+    /// 老版本写下的记录没有标记：退化成按身份纳入尝试开始时的标记集，能被正常清理。
     #[tokio::test]
-    async fn legacy_records_get_their_revision_before_the_limit_is_taken() {
+    async fn a_legacy_record_without_a_mark_is_covered_by_the_marks() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
         let mut config = SyncConfig::default();
@@ -1999,118 +1949,28 @@ mod tests {
         config.file.dir = "C:/sync-a".into();
         let legacy = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: true,
         };
         pending_close_save(&ctx.paths, &[legacy.clone()]).unwrap();
-        let limit = pending_close_rev_limit(&ctx.paths).await.unwrap();
-        assert!(limit > 0);
-        // 老记录已经被补上版本并落盘，清理按这个上界能删掉它（它在尝试之前就存在）。
-        let closes = pending_close_load(&ctx.paths).unwrap();
-        assert!(closes[0].rev > 0, "取样时应把老记录的版本补上");
-        assert!(closes[0].rev <= limit);
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, limit)
-            .await
-            .unwrap();
+        let marks = pending_close_marks(&ctx.paths).await.unwrap();
+        assert!(marks.contains(&legacy.id));
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            false,
+            None,
+            Some(&marks),
+        )
+        .await
+        .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
-    /// 序号文件读不出来（内容坏了 / 连读都读不出来）时按错误处理，不当成首次使用的 0：
-    /// 已分配上界丢失后继续分配，可能复用把在途尝试救回来的版本。
-    #[tokio::test]
-    async fn an_unreadable_revision_sequence_fails_instead_of_restarting_from_zero() {
-        let (_tmp, ctx) = crate::testing::ctx();
-        let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
-        let entry = PendingClose {
-            id: crate::ids::random_hex::<8>(),
-            rev: 7,
-            storage: config.clone(),
-            previous: secrets.clone(),
-            closed_seen: true,
-        };
-        pending_close_save(&ctx.paths, &[entry]).unwrap();
-        std::fs::write(rev_seq_path(&ctx.paths), b"not-a-rev").unwrap();
-        assert!(
-            pending_close_rev_limit(&ctx.paths).await.is_err(),
-            "序号内容解析不了时要报错，不能从 0 重新分配"
-        );
-        // 坏值原样留着：一次成功的写盘不能把它悄悄换成更小的上界。
-        assert_eq!(
-            std::fs::read_to_string(rev_seq_path(&ctx.paths)).unwrap(),
-            "not-a-rev"
-        );
-        // 连读都读不出来（目录占位）也是错误。
-        std::fs::remove_file(rev_seq_path(&ctx.paths)).unwrap();
-        std::fs::create_dir(rev_seq_path(&ctx.paths)).unwrap();
-        assert!(pending_close_rev_limit(&ctx.paths).await.is_err());
-    }
-
-    /// 备份替换的 crash 窗口：主序号文件缺失、旧值还在备份里时按备份算上界，不当成首次。
-    #[tokio::test]
-    async fn a_missing_sequence_file_falls_back_to_its_backup() {
-        let (_tmp, ctx) = crate::testing::ctx();
-        let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
-        let entry = |rev: u64| PendingClose {
-            id: crate::ids::random_hex::<8>(),
-            rev,
-            storage: config.clone(),
-            previous: secrets.clone(),
-            closed_seen: true,
-        };
-        std::fs::write(rev_seq_backup_path(&ctx.paths), b"5").unwrap();
-        pending_close_save(&ctx.paths, &[entry(1)]).unwrap();
-        assert_eq!(pending_close_rev_limit(&ctx.paths).await.unwrap(), 5);
-        // 分配从备份里的上界之后开始。
-        let restored = entry(1);
-        pending_close_restore(&ctx.paths, &restored).await.unwrap();
-        let closes = pending_close_load(&ctx.paths).unwrap();
-        let rev = closes
-            .iter()
-            .find(|close| close.id == restored.id)
-            .map(|close| close.rev)
-            .expect("恢复的记录还在盘上");
-        assert!(rev > 5, "备份里的上界之后才该分配：{rev}");
-    }
-
-    /// 队列没变化时取样不写序号文件：那份「读改写」只是读，不该给整批多出一个写失败点。
-    #[tokio::test]
-    async fn a_read_only_sampling_leaves_the_sequence_file_untouched() {
-        let (_tmp, ctx) = crate::testing::ctx();
-        let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
-        std::fs::write(rev_seq_path(&ctx.paths), b"5").unwrap();
-        // 残留备份：真去写序号文件时，原子写会把主文件换掉并顺带删掉它。
-        std::fs::write(rev_seq_backup_path(&ctx.paths), b"9").unwrap();
-        let entry = PendingClose {
-            id: crate::ids::random_hex::<8>(),
-            rev: 1,
-            storage: config.clone(),
-            previous: secrets.clone(),
-            closed_seen: true,
-        };
-        pending_close_save(&ctx.paths, &[entry]).unwrap();
-        assert_eq!(pending_close_rev_limit(&ctx.paths).await.unwrap(), 5);
-        assert!(
-            rev_seq_backup_path(&ctx.paths).exists(),
-            "取样不该写序号文件"
-        );
-        assert_eq!(
-            std::fs::read_to_string(rev_seq_path(&ctx.paths)).unwrap(),
-            "5"
-        );
-    }
-
-    /// 成功清理只删版本不高于尝试开始时上界的记录：并发失败刚补回来的（版本更高）要留着。
+    /// 成功清理只删尝试开始时已在盘上的记录：并发失败刚补回来的（换了标记）要留着。
     #[tokio::test]
     async fn a_target_cleanup_keeps_records_restored_after_its_done() {
         let (_tmp, ctx) = crate::testing::ctx();
@@ -2118,20 +1978,29 @@ mod tests {
         let mut config = SyncConfig::default();
         config.transport = "file".into();
         config.file.dir = "C:/sync-a".into();
-        let entry = |rev: u64| PendingClose {
+        let entry = || PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev,
+            mark: crate::ids::random_hex::<8>(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: true,
         };
-        // 尝试开始时队列上界是 10：版本 5 的事前记录清掉，版本 20 的并发恢复记录留着。
-        let older = entry(5);
-        let newer = entry(20);
-        pending_close_save(&ctx.paths, &[older, newer.clone()]).unwrap();
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, 10)
-            .await
-            .unwrap();
+        // 尝试开始时盘上只有 older：它清掉；期间被失败恢复回来的 newer（新标记）留着。
+        let older = entry();
+        pending_close_save(&ctx.paths, &[older]).unwrap();
+        let marks = pending_close_marks(&ctx.paths).await.unwrap();
+        let newer = entry();
+        pending_close_restore(&ctx.paths, &newer).await.unwrap();
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            false,
+            None,
+            Some(&marks),
+        )
+        .await
+        .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 1);
         assert_eq!(closes[0].id, newer.id);
@@ -2147,14 +2016,14 @@ mod tests {
         config.file.dir = "C:/sync-a".into();
         let confirmed = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: true,
         };
         let unconfirmed = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2162,7 +2031,14 @@ mod tests {
         pending_close_save(&ctx.paths, &[confirmed.clone(), unconfirmed.clone()]).unwrap();
         let batch: std::collections::HashSet<String> =
             [unconfirmed.id.clone()].into_iter().collect();
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, true, Some(&batch), 0)
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            true,
+            Some(&batch),
+            None,
+        )
             .await
             .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
@@ -2180,7 +2056,7 @@ mod tests {
         config.file.dir = "C:/sync-a".into();
         let entry = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: true,
@@ -2193,7 +2069,7 @@ mod tests {
             &secrets.space_id,
             false,
             None,
-            u64::MAX,
+            None,
         )
             .await
             .unwrap();
@@ -2223,7 +2099,7 @@ mod tests {
         config.webdav.username = "me".into();
         let entry = |fingerprint: &str, closed: bool| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: {
                 let mut storage = config.clone();
                 storage.webdav.pinned_cert_sha256 = fingerprint.into();
@@ -2320,7 +2196,7 @@ mod tests {
         old.webdav.pinned_cert_sha256 = "aa".repeat(32);
         let entry = |storage: &SyncConfig, closed: bool| PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: storage.clone(),
             previous: secrets.clone(),
             closed_seen: closed,
@@ -2348,7 +2224,7 @@ mod tests {
             &secrets.space_id,
             false,
             None,
-            u64::MAX,
+            None,
         )
             .await
             .unwrap();
@@ -2365,7 +2241,7 @@ mod tests {
         second.webdav.pinned_cert_sha256 = "aa".repeat(32);
         let entry = |storage: &SyncConfig| PendingClose {
             id: String::new(),
-            rev: 0,
+            mark: String::new(),
             storage: storage.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2397,7 +2273,7 @@ mod tests {
         let second = paired();
         let entry = |space: &Secrets| PendingClose {
             id: String::new(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: space.clone(),
             closed_seen: false,
@@ -2443,7 +2319,7 @@ mod tests {
         let config = config_at("C:/sync-a");
         let old = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2451,7 +2327,7 @@ mod tests {
         pending_close_save(&ctx.paths, &[old.clone()]).unwrap();
         let fresh = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2462,7 +2338,7 @@ mod tests {
         // 另一条不同空间的记录。
         let other = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: other_space.clone(),
             closed_seen: false,
@@ -2489,7 +2365,7 @@ mod tests {
         // 直接落盘而不是 add，否则 add 会把 fresh 的确认事实并进来、这里就测不到批次判据。
         let later = PendingClose {
             id: crate::ids::random_hex::<8>(),
-            rev: 0,
+            mark: String::new(),
             storage: config.clone(),
             previous: secrets.clone(),
             closed_seen: false,
@@ -2499,7 +2375,14 @@ mod tests {
         pending_close_save(&ctx.paths, &queued).unwrap();
         let batch: std::collections::HashSet<String> =
             [fresh.id.clone()].into_iter().collect();
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, true, Some(&batch), 0)
+        pending_close_finish_target(
+            &ctx.paths,
+            &config,
+            &secrets.space_id,
+            true,
+            Some(&batch),
+            None,
+        )
             .await
             .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
@@ -2514,7 +2397,7 @@ mod tests {
             &secrets.space_id,
             false,
             None,
-            u64::MAX,
+            None,
         )
             .await
             .unwrap();
@@ -2539,7 +2422,7 @@ mod tests {
             &ctx.paths,
             PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                rev: 0,
+                mark: String::new(),
                 storage: first.clone(),
                 previous: secrets.clone(),
                 closed_seen: true,
@@ -2552,7 +2435,7 @@ mod tests {
             &ctx.paths,
             PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                rev: 0,
+                mark: String::new(),
                 storage: second.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
@@ -2568,7 +2451,7 @@ mod tests {
             &ctx.paths,
             PendingClose {
                 id: id.clone(),
-                rev: 0,
+                mark: String::new(),
                 storage: first.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
@@ -2603,7 +2486,7 @@ mod tests {
             &ctx.paths,
             &[PendingClose {
                 id: crate::ids::random_hex::<8>(),
-                rev: 0,
+                mark: String::new(),
                 storage: config.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
