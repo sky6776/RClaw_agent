@@ -25,6 +25,12 @@ public final class AppConfig {
         return context.getSharedPreferences("rclaw_service", Context.MODE_PRIVATE);
     }
 
+    /** 首次运行向导是否已经落盘配置（filesDir/rclaw.toml）。待配置态下原生运行时不装配，
+     *  看门狗不能把「没有心跳」当成故障。 */
+    public static boolean hasConfig(Context context) {
+        return new File(context.getFilesDir(), "rclaw.toml").isFile();
+    }
+
     /** 生命周期取证：vivo 裁剪 logcat，杀进程/健康检查的判定只能落盘才可回溯
      *  （files/lifecycle_trace.txt，run-as 读取）。追加写，单行一条；超过
      *  256KB 直接清空重来（取证日志可丢弃，防无限增长占满 files）。 */

@@ -283,6 +283,15 @@ public final class RClawService extends Service {
         if (stopping.get() || !nativeStarted) {
             return;
         }
+        // 首次运行、rclaw.toml 还没有：原生运行时本来就不装配（等向导写完配置），
+        // 没有心跳是正常的。按「心跳过期」杀进程会让向导开着一分钟就被杀掉重来。
+        if (!AppConfig.hasConfig(this)) {
+            AppConfig.trace(this, "health-check pending-config (skip)");
+            WatchdogScheduler.markHealthy(
+                    this,
+                    System.currentTimeMillis() - nativeStartedAtMs);
+            return;
+        }
         try {
             boolean healthy = NativeBridge.nativeIsHealthy();
             AppConfig.trace(this, "health-check healthy=" + healthy
