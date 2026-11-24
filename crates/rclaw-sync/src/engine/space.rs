@@ -4,7 +4,7 @@
 //! 这里的函数不知道引擎的线程与轮次：由 [`super::worker`] 在两轮之间调用。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rclaw_store::sync_db::{self, KV_SYNC_DEVICE, KV_SYNC_HLC, KV_SYNC_SCHEMA, SEAL_LOCAL};
@@ -284,7 +284,7 @@ struct PendingSpace {
     replacement: Option<Secrets>,
 }
 
-/// 退出前没能收尾的关闭（`sync/pending-close.json`）。本机马上要清掉旧空间的密钥，
+/// 退出前没能收尾的关闭（`sync/pending-close.v2.json`；旧版本的 `pending-close.json` 只读兼容）。本机马上要清掉旧空间的密钥，
 /// 之后只有这条记录里的凭据还能把旧空间关闭标记补齐；它只做远端关闭，不碰本机配对。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingClose {
@@ -378,24 +378,61 @@ fn pending_clear(paths: &SyncPaths) -> Result<()> {
     }
 }
 
+/// 收尾队列（当前版本）。文件名与旧版不同是有意的：旧版引擎停用后，它已经派出去的
+/// 结算闭包还会读旧文件，把新版的记录当成 `rev=0` 的存量记录删掉。换一个文件名，旧版
+/// 就看不见新记录，也就删不到；旧文件只读兼容，首次写入时并进来再删掉。
 fn pending_close_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join("pending-close.v2.json")
+}
+
+/// 旧版本队列文件（`rev` 时代；只剩迁移用）。
+fn pending_close_legacy_path(paths: &SyncPaths) -> PathBuf {
     paths.root.join("pending-close.json")
 }
 
-fn pending_close_load(paths: &SyncPaths) -> Result<Vec<PendingClose>> {
-    match std::fs::read(pending_close_path(paths)) {
+fn load_close_file(path: &Path) -> Result<Vec<PendingClose>> {
+    match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(close) => Ok(close),
             Err(error) => {
                 // 记录坏了就没法接着做；丢掉它，远端保持现在的样子。
-                tracing::warn!("sync/pending-close.json 损坏，丢弃: {error}");
-                let _ = std::fs::remove_file(pending_close_path(paths));
+                tracing::warn!("收尾队列 {} 损坏，丢弃: {error}", path.display());
+                let _ = std::fs::remove_file(path);
                 Ok(Vec::new())
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e.into()),
     }
+}
+
+fn remove_close_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn pending_close_load(paths: &SyncPaths) -> Result<Vec<PendingClose>> {
+    let closes = load_close_file(&pending_close_path(paths))?;
+    let legacy = load_close_file(&pending_close_legacy_path(paths))?;
+    if legacy.is_empty() {
+        return Ok(closes);
+    }
+    // 旧文件里的记录更老，排在前面（封顶按「最老那条一定留着」淘汰）；身份能对上的
+    // 以新文件为准（迁移可能只写了一半就退出了）。
+    let known: std::collections::HashSet<&str> = closes
+        .iter()
+        .filter(|close| !close.id.is_empty())
+        .map(|close| close.id.as_str())
+        .collect();
+    let mut merged: Vec<PendingClose> = legacy
+        .into_iter()
+        .filter(|close| close.id.is_empty() || !known.contains(close.id.as_str()))
+        .collect();
+    merged.extend(closes);
+    Ok(merged)
 }
 
 fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> {
@@ -407,15 +444,14 @@ fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> 
         &pending_close_path(paths),
         &serde_json::to_vec_pretty(closes)?,
     )?;
-    Ok(())
+    // 旧文件里的记录已经并进来了：删掉它（失败就报错重试）。留着一个旧文件，旧版在途
+    // 的结算闭包就还能按旧版规则动它。
+    remove_close_file(&pending_close_legacy_path(paths))
 }
 
 fn pending_close_clear(paths: &SyncPaths) -> Result<()> {
-    match std::fs::remove_file(pending_close_path(paths)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    remove_close_file(&pending_close_path(paths))?;
+    remove_close_file(&pending_close_legacy_path(paths))
 }
 
 /// 同一存储位置上，连接设置（证书指纹、区域、明文 HTTP）以当前这份为准：退出之后
@@ -1968,6 +2004,86 @@ mod tests {
         .await
         .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+    }
+
+    /// 旧版队列文件（`pending-close.json`）读进来兼容、首次写入时并进新文件并删掉：
+    /// 旧版停用后仍在途的结算闭包读不到新记录，也就删不到它。
+    #[tokio::test]
+    async fn a_legacy_queue_file_is_migrated_into_the_new_file() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let legacy = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            mark: String::new(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        // 旧版写的文件：带 rev 字段、没有 mark；再补一条没身份的。
+        let records = serde_json::json!([
+            {
+                "id": legacy.id,
+                "rev": 7,
+                "storage": legacy.storage,
+                "previous": legacy.previous,
+                "closed_seen": true,
+            },
+            {
+                "id": "",
+                "rev": 0,
+                "storage": legacy.storage,
+                "previous": legacy.previous,
+                "closed_seen": false,
+            },
+        ]);
+        std::fs::write(
+            pending_close_legacy_path(&ctx.paths),
+            serde_json::to_vec_pretty(&records).unwrap(),
+        )
+        .unwrap();
+        // 没有新文件时，旧文件里的记录照读。
+        assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 2);
+        // 首次写入：两条并进新文件（身份补齐），旧文件删掉。
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 2);
+        assert!(closes.iter().all(|close| !close.id.is_empty()));
+        assert!(pending_close_path(&ctx.paths).exists());
+        assert!(
+            !pending_close_legacy_path(&ctx.paths).exists(),
+            "迁移之后旧文件要删掉"
+        );
+        // 旧版在途结算闭包看到的旧文件是空的。
+        assert!(load_close_file(&pending_close_legacy_path(&ctx.paths))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// 新版入队的记录只写新文件：旧版在途结算闭包读旧文件时看不到它。
+    #[tokio::test]
+    async fn a_new_queue_record_is_invisible_to_old_engine_closures() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let close = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            mark: String::new(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: false,
+        };
+        pending_close_add(&ctx.paths, close.clone()).await.unwrap();
+        // 旧版清理闭包的整个视角：旧文件（不存在）→ 空队列 → 删不到任何东西。
+        assert!(load_close_file(&pending_close_legacy_path(&ctx.paths))
+            .unwrap()
+            .is_empty());
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].id, close.id);
     }
 
     /// 成功清理只删尝试开始时已在盘上的记录：并发失败刚补回来的（换了标记）要留着。
