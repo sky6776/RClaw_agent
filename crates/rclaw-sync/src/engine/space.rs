@@ -37,7 +37,7 @@ use crate::{blocking, Ctx};
 
 /// 一条收尾记录最多等这么久（传输层每个请求另有 60 秒上限）：要容得下一条记录正常
 /// 需要的几次读写，又不能真的无限等。
-const CLOSE_ENTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const CLOSE_ENTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// 一个打开的同步空间：套了空间子目录的传输，和这个空间的密钥。
 pub(crate) struct Live {
@@ -494,9 +494,11 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
             }
         }
         let mut close = close;
-        if let Some(old) = closes
+        // 同一目标可能因为连接设置变过而留下不止一条（升级前的队列）：确认过的事实
+        // 要把每一条都并进来，不能只看第一条。
+        for old in closes
             .iter()
-            .find(|old| same_close_target(old, &close.storage, &close.previous.space_id))
+            .filter(|old| same_close_target(old, &close.storage, &close.previous.space_id))
         {
             close.closed_seen |= old.closed_seen;
         }
@@ -552,6 +554,23 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
                 changed = true;
             }
         }
+        // 同一个实际位置的旧记录合掉（升级前可能因连接设置不同留下几条）：确认过的
+        // 事实并进留下的一条，其余删掉，免得旧指纹那条永远补不上、又没人合并。
+        let mut unique: Vec<PendingClose> = Vec::with_capacity(closes.len());
+        for close in closes.drain(..) {
+            match unique.iter_mut().find(|kept| {
+                same_close_target(kept, &close.storage, &close.previous.space_id)
+            }) {
+                Some(kept) => {
+                    if close.closed_seen && !kept.closed_seen {
+                        kept.closed_seen = true;
+                    }
+                    changed = true;
+                }
+                None => unique.push(close),
+            }
+        }
+        let closes = unique;
         if changed {
             pending_close_save(&paths, &closes)?;
         }
@@ -598,6 +617,11 @@ pub(crate) async fn finish_pending_close(
             let paths = paths.clone();
             let refresh = refresh.clone();
             blocking(move || {
+                // 配置与 secrets 是成套写的（保存方持存储协议锁）：拿不到锁就先跳过，
+                // 免得读到「新的开关 + 旧的密码」这种半新半旧的组合。
+                let Some(_lock) = super::worker::StorageLock::try_acquire(&paths)? else {
+                    return Ok(None);
+                };
                 let config = match &refresh {
                     Some(refresh) => match refresh() {
                         Ok(config) => config,
@@ -613,7 +637,7 @@ pub(crate) async fn finish_pending_close(
         };
         let Some((current, secrets)) = settings else {
             first_error.get_or_insert(SyncError::other(
-                "同步设置暂时读不出来，稍后再补完空间关闭",
+                "同步设置正在保存或暂时读不出来，稍后再补完空间关闭",
             ));
             continue;
         };
@@ -1478,6 +1502,39 @@ mod tests {
             Err(SyncError::SpaceClosed)
         ));
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+    }
+
+    /// 升级前同一个位置可能留下几条（连接设置不同）：读进来合掉，确认过的事实不能丢。
+    #[tokio::test]
+    async fn duplicate_records_at_one_location_are_coalesced_with_their_facts() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.webdav.url = "https://dav.example.com/rclaw/".into();
+        config.webdav.username = "me".into();
+        let mut old = config.clone();
+        old.webdav.pinned_cert_sha256 = "aa".repeat(32);
+        let entry = |storage: &SyncConfig, closed: bool| PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: storage.clone(),
+            previous: secrets.clone(),
+            closed_seen: closed,
+        };
+        // 升级前留下的两条：旧指纹那条不知道关闭已确认，新指纹那条知道。
+        pending_close_save(&ctx.paths, &[entry(&old, false), entry(&config, true)]).unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 1);
+        assert!(closes[0].closed_seen);
+        let again = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(again.len(), 1);
+        assert!(again[0].closed_seen);
+        // 新入队时也要把同一位置的每一条都并进来。
+        pending_close_add(&ctx.paths, entry(&old, false))
+            .await
+            .unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 1);
+        assert!(closes[0].closed_seen);
     }
 
     #[test]
