@@ -483,6 +483,46 @@ impl Drop for CloseQueueLock {
 /// 能用的那份；但也不能无限攒。
 const CLOSE_RECORDS_PER_TARGET: usize = 4;
 
+/// 同目标的历史封顶：优先淘汰**没有**确认事实的最老一条（带着确认的留着补写）；
+/// 都确认过才淘汰最老的。返回是否有改动。
+fn cap_close_history(closes: &mut Vec<PendingClose>) -> bool {
+    let mut changed = false;
+    loop {
+        let mut victim = None;
+        'search: for anchor in 0..closes.len() {
+            let storage = closes[anchor].storage.clone();
+            let space_id = closes[anchor].previous.space_id.clone();
+            let matching: Vec<usize> = closes
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| same_close_target(entry, &storage, &space_id))
+                .map(|(index, _)| index)
+                .collect();
+            if matching.len() > CLOSE_RECORDS_PER_TARGET {
+                // 最老那条留着（它可能是唯一有效的旧凭据）：优先淘汰最老的未确认条目，
+                // 都确认过就淘汰第二老的。
+                victim = Some(
+                    matching
+                        .iter()
+                        .copied()
+                        .skip(1)
+                        .find(|&index| !closes[index].closed_seen)
+                        .unwrap_or(matching[1]),
+                );
+                break 'search;
+            }
+        }
+        match victim {
+            Some(index) => {
+                closes.remove(index);
+                changed = true;
+            }
+            None => break,
+        }
+    }
+    changed
+}
+
 /// 记下一条「补完关闭」。同一目标不删旧条目（各条的凭据/连接设置都要留着试），
 /// 只把已经确认过的「标记是关闭版」事实并进这一条，并给同目标的历史封顶。
 async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()> {
@@ -504,26 +544,8 @@ async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()>
         {
             close.closed_seen |= old.closed_seen;
         }
-        let storage = close.storage.clone();
-        let space_id = close.previous.space_id.clone();
         closes.push(close);
-        // 同目标超过上限时从最老的开始丢。
-        let mut excess = closes
-            .iter()
-            .filter(|entry| same_close_target(entry, &storage, &space_id))
-            .count()
-            .saturating_sub(CLOSE_RECORDS_PER_TARGET);
-        if excess > 0 {
-            let mut kept = Vec::with_capacity(closes.len());
-            for entry in closes.drain(..) {
-                if excess > 0 && same_close_target(&entry, &storage, &space_id) {
-                    excess -= 1;
-                    continue;
-                }
-                kept.push(entry);
-            }
-            closes = kept;
-        }
+        cap_close_history(&mut closes);
         pending_close_save(&paths, &closes)
     })
     .await
@@ -574,7 +596,8 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
                 changed = true;
             }
         }
-        let closes = closes;
+        let mut closes = closes;
+        changed |= cap_close_history(&mut closes);
         if changed {
             pending_close_save(&paths, &closes)?;
         }
@@ -591,9 +614,11 @@ async fn pending_close_finish_target(
     storage: &SyncConfig,
     space_id: &str,
     keep_confirmed: bool,
+    only_batch: Option<&std::collections::HashSet<String>>,
 ) -> Result<()> {
     let paths = paths.clone();
     let (storage, space_id) = (storage.clone(), space_id.to_string());
+    let batch = only_batch.cloned();
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
@@ -601,7 +626,17 @@ async fn pending_close_finish_target(
             if !same_close_target(close, &storage, &space_id) {
                 return true;
             }
-            keep_confirmed && close.closed_seen
+            if keep_confirmed && close.closed_seen {
+                return true;
+            }
+            // 「远端没开始关闭」只是本批的这一条读到的：批次开始之后才入队的记录
+            //（比如前台刚失败的重置又留了一条）不归这批删。
+            if let Some(batch) = &batch {
+                if !batch.contains(&close.id) {
+                    return true;
+                }
+            }
+            false
         });
         pending_close_save(&paths, &closes)
     })
@@ -637,6 +672,8 @@ pub(crate) async fn finish_pending_close(
     if closes.is_empty() {
         return Ok(());
     }
+    let batch_ids: std::collections::HashSet<String> =
+        closes.iter().map(|close| close.id.clone()).collect();
     let mut first_error = None;
     for mut close in closes {
         // 当前配置与凭据逐条读（同一个阻塞任务里连着读，缩小两次读取之间的窗口）：
@@ -677,6 +714,7 @@ pub(crate) async fn finish_pending_close(
                 finish_one_close(
                     &mut close,
                     paths,
+                    &batch_ids,
                     current.as_ref(),
                     secrets.as_ref(),
                     refresh.as_ref(),
@@ -705,6 +743,7 @@ pub(crate) async fn finish_pending_close(
 async fn finish_one_close(
     close: &mut PendingClose,
     paths: &SyncPaths,
+    batch_ids: &std::collections::HashSet<String>,
     current: Option<&SyncConfig>,
     current_secrets: Option<&Secrets>,
     refresh: Option<&crate::engine::ConfigRefresh>,
@@ -730,50 +769,62 @@ async fn finish_one_close(
             }
         }
     }
-    // 取样到建连之间设置可能又变了（保存方不与我们共用这段时间的锁）：建连前再核对
-    // 一次敏感项（明文开关、证书指纹、区域），变了就这一轮先不做，下次重新取样。
+    // 取样到建连之间设置可能又变了（保存方不与我们共用这段时间的锁）：建连前在协议锁
+    // 内再读一次，比对该后端的敏感项（明文开关、证书指纹、区域），**客户端也就在这把
+    // 锁里建好**——锁一放，剩下的到首个请求之间只剩一次调度和一次对象包装。
     // 只在「记录位置就是当前设置的位置」（连接项是从当前设置刷新的）时核对；记录指向
     // 别的存储是正常情况，不能因为它和当前设置不同就永远跳过。
-    let refreshed = current.is_some_and(|current| same_close_location(&at, current)) && at.transport != "file";
-    if refreshed {
-        let at_expected = at.clone();
+    let refreshed = current.is_some_and(|current| storage_binding(&at) == storage_binding(current))
+        && at.transport != "file";
+    let root = if refreshed {
+        let at_build = at.clone();
+        let previous_build = previous.clone();
         let paths_for_check = paths.clone();
         let refresh_for_check = refresh.cloned();
-        let unchanged = blocking(move || {
+        let built = blocking(move || -> Result<Option<Box<dyn SyncTransport>>> {
             let Some(_lock) = super::worker::StorageLock::try_acquire(&paths_for_check)? else {
-                return Ok(false);
+                return Ok(None);
             };
             let latest = match &refresh_for_check {
                 Some(refresh) => match refresh() {
                     Ok(config) => config,
-                    Err(()) => return Ok(false),
+                    Err(()) => return Ok(None),
                 },
-                None => return Ok(false),
+                None => return Ok(None),
             };
             let Some(latest) = latest else {
-                return Ok(false);
+                return Ok(None);
             };
-            if !same_close_location(&at_expected, &latest) {
-                return Ok(false);
+            if storage_binding(&at_build) != storage_binding(&latest) {
+                return Ok(None);
             }
-            Ok(match at_expected.transport.as_str() {
+            let unchanged = match at_build.transport.as_str() {
                 "webdav" => {
-                    at_expected.webdav.allow_http == latest.webdav.allow_http
-                        && at_expected.webdav.pinned_cert_sha256
+                    at_build.webdav.allow_http == latest.webdav.allow_http
+                        && at_build.webdav.pinned_cert_sha256
                             == latest.webdav.pinned_cert_sha256
                 }
                 "s3" => {
-                    at_expected.s3.allow_http == latest.s3.allow_http
-                        && at_expected.s3.region == latest.s3.region
+                    at_build.s3.allow_http == latest.s3.allow_http
+                        && at_build.s3.region == latest.s3.region
                 }
                 _ => true,
-            })
+            };
+            if !unchanged {
+                return Ok(None);
+            }
+            Ok(Some(root_transport(&at_build, &previous_build)?))
         })
         .await?;
-        if !unchanged {
+        let Some(root) = built else {
             return Err(SyncError::other("同步设置刚变过，稍后再补完空间关闭"));
-        }
-    }
+        };
+        root
+    } else {
+        let at_build = at.clone();
+        let previous_build = previous.clone();
+        blocking(move || root_transport(&at_build, &previous_build)).await?
+    };
     let space_id = previous.space_id.clone();
     let keys = match previous.keys() {
         Ok(keys) => Arc::new(keys),
@@ -784,7 +835,6 @@ async fn finish_one_close(
             return Ok(());
         }
     };
-    let root = blocking(move || root_transport(&at, &previous)).await?;
     let transport = Scoped::new(root, &space_id);
     // 先看一眼标记：验证过是关闭版就立刻记进记录（这一批后面超时/取消也不丢）。
     if !close.closed_seen {
@@ -815,13 +865,20 @@ async fn finish_one_close(
     {
         remote::CloseAttempt::Done => {
             // 关闭做完：同目标的历史快照都已完成使命。
-            pending_close_finish_target(paths, &close.storage, &space_id, false).await?;
+            pending_close_finish_target(paths, &close.storage, &space_id, false, None).await?;
             Ok(())
         }
         remote::CloseAttempt::NotStarted => {
-            // 远端没有任何关闭依据：这一条不再需要；但别的条目要是记着「已确认关闭」，
-            // 留着它们继续补写。
-            pending_close_finish_target(paths, &close.storage, &space_id, true).await?;
+            // 远端没有任何关闭依据：本批的同目标未确认条目不再需要；带着「已确认关闭」
+            // 事实的、以及批次之后新入队的，都留着。
+            pending_close_finish_target(
+                paths,
+                &close.storage,
+                &space_id,
+                true,
+                Some(batch_ids),
+            )
+            .await?;
             Ok(())
         }
         // 这一遍补写里又确认了关闭（第一次读时还没写成）：事实同样要落盘。
@@ -1591,6 +1648,43 @@ mod tests {
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
+    /// 同目标封顶优先淘汰没有确认事实的最老一条，不丢带着确认的凭据快照。
+    #[tokio::test]
+    async fn the_per_target_cap_prefers_dropping_unconfirmed_old_records() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.webdav.url = "https://dav.example.com/rclaw/".into();
+        config.webdav.username = "me".into();
+        let entry = |fingerprint: &str, closed: bool| PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: {
+                let mut storage = config.clone();
+                storage.webdav.pinned_cert_sha256 = fingerprint.into();
+                storage
+            },
+            previous: secrets.clone(),
+            closed_seen: closed,
+        };
+        // 最老那条带着确认事实（可能也是唯一有效的密码快照）。
+        let oldest = entry("aa", true);
+        pending_close_save(&ctx.paths, &[oldest.clone()]).unwrap();
+        for index in 0..5 {
+            pending_close_add(&ctx.paths, entry(&format!("bb{index}"), false))
+                .await
+                .unwrap();
+        }
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 4);
+        // 带着确认事实的最老条目还在；被淘汰的是没有确认的最老一条。
+        assert!(closes.iter().any(|close| close.id == oldest.id));
+        assert!(closes
+            .iter()
+            .find(|close| close.id == oldest.id)
+            .unwrap()
+            .closed_seen);
+    }
+
     /// 同一位置的历史条目各留各的快照（旧密码未必错），事实随目标走，成功时一起清。
     #[tokio::test]
     async fn duplicate_records_at_one_location_keep_their_snapshots_and_facts() {
@@ -1624,7 +1718,7 @@ mod tests {
             old.webdav.pinned_cert_sha256
         );
         // 收尾成功：同目标的全部历史一起清掉。
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false)
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None)
             .await
             .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
@@ -1755,8 +1849,26 @@ mod tests {
             .find(|close| close.previous.space_id == other_space.space_id)
             .unwrap();
         assert!(!other_now.closed_seen);
+        // 「本批判定没开始关闭」只清本批里的未确认条目：批次之后新入队的别动。
+        let later = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: false,
+        };
+        pending_close_add(&ctx.paths, later.clone()).await.unwrap();
+        let batch: std::collections::HashSet<String> =
+            [fresh.id.clone()].into_iter().collect();
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, true, Some(&batch))
+            .await
+            .unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert!(closes.iter().any(|close| close.id == later.id));
+        // 带着确认事实的也不清（它是别的条目观察到的目标事实）。
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert!(closes.iter().any(|close| close.id == fresh.id && close.closed_seen));
         // 收尾成功清掉同目标的全部历史，别的目标不动。
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false)
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None)
             .await
             .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
