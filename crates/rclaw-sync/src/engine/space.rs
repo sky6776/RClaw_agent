@@ -596,9 +596,13 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
                 changed = true;
             }
         }
+        // 先按读入时的确认状态封顶，再把确认事实传播：传播会把同组全标成「已确认」，
+        // 提前传播会让封顶的回退规则淘汰错人（可能丢掉唯一带有效凭据的快照）。
+        let mut closes = closes;
+        changed |= cap_close_history(&mut closes);
         // 「已确认关闭」是**目标**的事实，不是某条记录私有的：同目标（同空间 + 同位置）
-        // 里只要有一条确认过，其余条目也带着这个事实去补写——否则有效密码那条可能被
-        // 当成「远端没开始关闭」删掉，只剩失效密码那条永远补不完。
+        // 里只要有一条确认过，保留下来的其余条目也带着这个事实去补写——否则有效密码
+        // 那条可能被当成「远端没开始关闭」删掉，只剩失效密码那条永远补不完。
         for index in 0..closes.len() {
             if closes[index].closed_seen {
                 continue;
@@ -613,8 +617,6 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
                 changed = true;
             }
         }
-        let mut closes = closes;
-        changed |= cap_close_history(&mut closes);
         if changed {
             pending_close_save(&paths, &closes)?;
         }
@@ -639,8 +641,17 @@ async fn pending_close_finish_target(
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
+        // 盘上同目标只要有一条记着「已确认关闭」，这一批的「没开始关闭」结论就不成立
+        //（可能刚被别的条目记下）：一条都别删，留下带可用凭据的那条去补写。
+        let any_confirmed = keep_confirmed
+            && closes
+                .iter()
+                .any(|close| close.closed_seen && same_close_target(close, &storage, &space_id));
         closes.retain(|close| {
             if !same_close_target(close, &storage, &space_id) {
+                return true;
+            }
+            if any_confirmed {
                 return true;
             }
             if keep_confirmed && close.closed_seen {
@@ -761,7 +772,13 @@ pub(crate) async fn finish_pending_close(
             .await
             {
                 Ok(result) => result,
-                Err(_) => Err(SyncError::other("补完这条空间关闭超时")),
+                Err(_) => {
+                    // 超时可能正卡在远端写入上：把记录补回去，留给下一轮复核。
+                    if let Err(restore) = pending_close_restore(paths, &close).await {
+                        tracing::warn!("把超时的空间关闭记录重新落盘失败: {restore}");
+                    }
+                    Err(SyncError::other("补完这条空间关闭超时"))
+                }
             }
         };
         if let Err(error) = closed {
@@ -920,7 +937,8 @@ async fn finish_one_close(
             Ok(())
         }
         // 这一遍补写里又确认了关闭（第一次读时还没写成）：事实同样要落盘。
-        remote::CloseAttempt::ConfirmedButFailed(error) => {
+        remote::CloseAttempt::ConfirmedButFailed(error)
+        | remote::CloseAttempt::WriteFailed(error) => {
             if !close.closed_seen {
                 pending_close_mark_seen(paths, &close.id, &close.storage, &space_id).await?;
                 close.closed_seen = true;
@@ -930,12 +948,8 @@ async fn finish_one_close(
             }
             Err(error)
         }
-        remote::CloseAttempt::Failed(error) => {
-            if let Err(restore) = pending_close_restore(paths, close).await {
-                tracing::warn!("把失败的空间关闭记录重新落盘失败: {restore}");
-            }
-            Err(error)
-        }
+        // 只读失败：这次没改远端，并发成功清理过的同目标不需要为它留重试记录。
+        remote::CloseAttempt::Failed(error) => Err(error),
     }
 }
 
@@ -1106,22 +1120,18 @@ async fn finish_reset(
             .await
             {
                 remote::CloseAttempt::Done => {
-                    // 关闭已完成：同目标的历史快照一起收掉（撤不掉留给后台再验一遍）。
-                    if let Err(error) = pending_close_finish_target(
-                        &ctx.paths,
-                        &close.storage,
-                        &old.space_id,
-                        false,
-                        None,
-                    )
-                    .await
-                    {
-                        tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
+                    // 只撤这一条：同目标的其它快照可能正在另一条任务里补写，这次成功
+                    // 不代表它们不会失败；留给后台成功时按目标清理（幂等）。
+                    if added.is_ok() {
+                        if let Err(error) = pending_close_finish(&ctx.paths, &close.id).await {
+                            tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
+                        }
                     }
                 }
                 remote::CloseAttempt::NotStarted => {}
                 remote::CloseAttempt::ConfirmedButFailed(error)
-                | remote::CloseAttempt::Failed(error) => return Err(error),
+                | remote::CloseAttempt::Failed(error)
+                | remote::CloseAttempt::WriteFailed(error) => return Err(error),
             }
         }
     }
@@ -1739,6 +1749,82 @@ mod tests {
         let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
         assert_eq!(closes.len(), 1);
         assert!(!closes[0].closed_seen);
+    }
+
+    /// 读入时先按原状态封顶、再传播事实：不能因为传播把同组都标成「已确认」，
+    /// 让封顶淘汰掉唯一带有效凭据的那条。
+    #[tokio::test]
+    async fn the_cap_runs_before_the_target_fact_is_shared() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.webdav.url = "https://dav.example.com/rclaw/".into();
+        config.webdav.username = "me".into();
+        let entry = |fingerprint: &str, closed: bool| PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: {
+                let mut storage = config.clone();
+                storage.webdav.pinned_cert_sha256 = fingerprint.into();
+                storage
+            },
+            previous: secrets.clone(),
+            closed_seen: closed,
+        };
+        let fingerprint = |close: &PendingClose| {
+            close.storage.webdav.pinned_cert_sha256.clone()
+        };
+        // 超限旧队列：A、B 已确认（B 带唯一有效凭据），C/D/E 未确认。
+        // 正确顺序：先淘汰最老的未确认 C，再把事实传播给 D/E；B 必须留着。
+        pending_close_save(
+            &ctx.paths,
+            &[
+                entry("aa", true),
+                entry("bb", true),
+                entry("cc", false),
+                entry("dd", false),
+                entry("ee", false),
+            ],
+        )
+        .unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 4);
+        assert!(closes.iter().any(|close| fingerprint(close) == "bb"));
+        assert!(!closes.iter().any(|close| fingerprint(close) == "cc"));
+        assert!(closes
+            .iter()
+            .filter(|close| ["dd", "ee"].contains(&fingerprint(close).as_str()))
+            .all(|close| close.closed_seen));
+    }
+
+    /// `NotStarted` 时盘上同目标已有确认事实：本批「没开始」的结论不成立，一条都别删。
+    #[tokio::test]
+    async fn not_started_keeps_the_target_when_a_confirmed_record_exists() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let secrets = paired();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let confirmed = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: true,
+        };
+        let unconfirmed = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: false,
+        };
+        pending_close_save(&ctx.paths, &[confirmed.clone(), unconfirmed.clone()]).unwrap();
+        let batch: std::collections::HashSet<String> =
+            [unconfirmed.id.clone()].into_iter().collect();
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, true, Some(&batch))
+            .await
+            .unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 2);
+        assert!(closes.iter().any(|close| close.id == unconfirmed.id));
     }
 
     /// 失败时把记录重新落盘：并发的成功清理删掉了它，也要把重试依据补回来。

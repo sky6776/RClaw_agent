@@ -34,6 +34,8 @@ public final class RClawService extends Service {
     private static final String FATAL_PROCESS_RESTART = "FATAL_PROCESS_RESTART:";
     private static final int NOTIFICATION_ID = 1001;
     private static final long HEALTH_CHECK_INTERVAL_SECONDS = 60L;
+    /** 向导刚把 rclaw.toml 落盘、GUI 装配还没置位健康信号的宽限期。 */
+    private static final long CONFIG_GRACE_MS = 120_000L;
     // wake lock 按需持有（此前 20 分钟租约每 10 分钟续 = CPU 永不休眠）：Doze 下
     // 非白名单应用的 wake lock 本就被系统忽略，常驻持锁只在非 Doze 时段实打实
     // 耗电，正是厂商「后台高耗电」杀手的识别特征。现在只在三个窗口持有：
@@ -62,6 +64,8 @@ public final class RClawService extends Service {
     private final android.os.Handler mainHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
     private volatile boolean nativeStarted;
+    /** 服务第一次看到 rclaw.toml 的时刻（0 = 还没看到过；待配置态会清回 0）。 */
+    private volatile long configFirstSeenAtMs;
     private volatile long nativeStartedAtMs;
     private PowerManager.WakeLock startupWakeLock;
     private PowerManager.WakeLock turnWakeLock;
@@ -283,17 +287,31 @@ public final class RClawService extends Service {
         if (stopping.get() || !nativeStarted) {
             return;
         }
+        long now = System.currentTimeMillis();
         // 首次运行、rclaw.toml 还没有：原生运行时本来就不装配（等向导写完配置），
         // 没有心跳是正常的。按「心跳过期」杀进程会让向导开着一分钟就被杀掉重来。
         if (!AppConfig.hasConfig(this)) {
+            configFirstSeenAtMs = 0;
             AppConfig.trace(this, "health-check pending-config (skip)");
-            WatchdogScheduler.markHealthy(
-                    this,
-                    System.currentTimeMillis() - nativeStartedAtMs);
+            WatchdogScheduler.markHealthy(this, now - nativeStartedAtMs);
             return;
         }
         try {
             boolean healthy = NativeBridge.nativeIsHealthy();
+            if (!healthy) {
+                // 向导刚发布 rclaw.toml、装配还没置位健康信号（文件已存在、begin_assembly
+                // 还没执行）：给装配一点时间，别在这个缝隙里杀掉刚提交的向导。
+                if (configFirstSeenAtMs == 0) {
+                    configFirstSeenAtMs = now;
+                }
+                if (now - configFirstSeenAtMs <= CONFIG_GRACE_MS) {
+                    AppConfig.trace(this,
+                            "health-check config-grace (skip) uptimeMs="
+                                    + (now - nativeStartedAtMs));
+                    WatchdogScheduler.markHealthy(this, now - nativeStartedAtMs);
+                    return;
+                }
+            }
             AppConfig.trace(this, "health-check healthy=" + healthy
                     + " uptimeMs=" + (System.currentTimeMillis() - nativeStartedAtMs));
             if (healthy) {

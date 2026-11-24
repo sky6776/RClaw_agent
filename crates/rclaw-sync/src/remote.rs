@@ -251,11 +251,12 @@ async fn finish_known_closed(
             Err(error @ SyncError::Upgrade(_)) | Err(error @ SyncError::Other(_)) => {
                 return Failed(error)
             }
-            Err(error) => return ConfirmedButFailed(error),
+            // 复读失败：这次还没写过远端（留待重试即可）。
+            Err(error) => return Failed(error),
         }
     }
     if let Err(error) = write_closed_marker(transport, keys, space_id).await {
-        return ConfirmedButFailed(error);
+        return WriteFailed(error);
     }
     Done
 }
@@ -269,8 +270,10 @@ pub enum CloseAttempt {
     NotStarted,
     /// 标记已验证关闭，但补写没完成。
     ConfirmedButFailed(SyncError),
-    /// 其它失败（读取、身份校验等）。
+    /// 只读阶段失败（读取、身份校验）：这次尝试没有改动远端。
     Failed(SyncError),
+    /// 写入阶段失败（墓碑/兼容标记 PUT）：远端可能留下半截对象，需要留记录重试。
+    WriteFailed(SyncError),
 }
 
 /// 观察到兼容标记确实是关闭版时立刻调用（在任何补写 I/O 之前）：调用方据此把
@@ -336,7 +339,7 @@ pub async fn ensure_closed_if_started(
     // 墓碑已经读成有效的了：只补兼容标记，不再重复读、写墓碑。
     match write_closed_marker(transport, keys, space_id).await {
         Ok(()) => Done,
-        Err(error) => Failed(error),
+        Err(error) => WriteFailed(error),
     }
 }
 
