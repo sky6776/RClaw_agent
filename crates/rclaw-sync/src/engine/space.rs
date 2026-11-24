@@ -1655,9 +1655,9 @@ mod tests {
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
-    /// 同目标封顶优先淘汰没有确认事实的最老一条，不丢带着确认的凭据快照。
+    /// 同目标封顶：最老那条一定留着，优先淘汰最老的未确认条目，都确认过淘汰第二老。
     #[tokio::test]
-    async fn the_per_target_cap_prefers_dropping_unconfirmed_old_records() {
+    async fn the_per_target_cap_keeps_the_oldest_and_prefers_unconfirmed() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
         let mut config = SyncConfig::default();
@@ -1673,39 +1673,76 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: closed,
         };
-        // 直接落盘（不走 add 的「事实并进新条目」），让未确认的条目保持未确认：
-        // 最老那条带着确认事实（可能也是唯一有效的密码快照），后面 5 条都没确认。
-        let oldest = entry("aa", true);
-        let mut seeded = vec![oldest.clone()];
-        for index in 0..5 {
-            seeded.push(entry(&format!("bb{index}"), false));
-        }
+        let fingerprint = |close: &PendingClose| {
+            close.storage.webdav.pinned_cert_sha256.clone()
+        };
+
+        // 场景一（读入封顶，混合）：最老两条已确认，后三条未确认。优先淘汰最老的
+        // **未确认**（bb2），而不是第二老的（bb1）——后者是「全确认回退」的行为。
+        let seeded = vec![
+            entry("aa", true),
+            entry("bb1", true),
+            entry("bb2", false),
+            entry("bb3", false),
+            entry("bb4", false),
+        ];
+        let oldest = seeded[0].id.clone();
         pending_close_save(&ctx.paths, &seeded).unwrap();
-        // 读入时封顶：裁到 4 条，且淘汰的是最老的**未确认**那条（bb0）。
         let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
         assert_eq!(closes.len(), 4);
-        assert!(closes.iter().any(|close| close.id == oldest.id));
-        assert!(!closes
+        assert!(closes.iter().any(|close| close.id == oldest));
+        assert!(closes
             .iter()
-            .any(|close| close.storage.webdav.pinned_cert_sha256 == "bb0"));
-        // 落盘结果一致。
+            .find(|close| close.id == oldest)
+            .unwrap()
+            .closed_seen);
+        assert!(closes.iter().any(|close| fingerprint(close) == "bb1"));
+        assert!(!closes.iter().any(|close| fingerprint(close) == "bb2"));
+        assert!(closes.iter().any(|close| fingerprint(close) == "bb3"));
+        assert!(closes.iter().any(|close| fingerprint(close) == "bb4"));
+
+        // 场景二（6 条 → 4 条）：两个 victim 都断言——先 bb0、再 bb1。
+        let seeded = vec![
+            entry("cc0", true),
+            entry("dd1", false),
+            entry("dd2", false),
+            entry("dd3", false),
+            entry("dd4", false),
+            entry("dd5", false),
+        ];
+        pending_close_save(&ctx.paths, &seeded).unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 4);
+        assert!(!closes.iter().any(|close| fingerprint(close) == "dd1"));
+        assert!(!closes.iter().any(|close| fingerprint(close) == "dd2"));
+        assert!(closes.iter().any(|close| fingerprint(close) == "dd3"));
+
+        // 场景三（全都已确认）：最老留着，淘汰第二老的。
+        let seeded: Vec<PendingClose> = (0..5)
+            .map(|index| entry(&format!("ee{index}"), true))
+            .collect();
+        let oldest = seeded[0].id.clone();
+        pending_close_save(&ctx.paths, &seeded).unwrap();
+        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
+        assert_eq!(closes.len(), 4);
+        assert!(closes.iter().any(|close| close.id == oldest));
+        assert!(!closes.iter().any(|close| fingerprint(close) == "ee1"));
+
+        // 场景四（入队路径也封顶）：先落盘一条未确认的，再 add 5 条，超限时淘汰的
+        // 是第二老的未确认条目，最老那条仍在。
+        let seeded = vec![entry("ff0", false)];
+        let oldest = seeded[0].id.clone();
+        pending_close_save(&ctx.paths, &seeded).unwrap();
+        for index in 1..=5 {
+            pending_close_add(&ctx.paths, entry(&format!("ff{index}"), false))
+                .await
+                .unwrap();
+        }
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 4);
-        assert!(closes.iter().any(|close| close.id == oldest.id));
-
-        // 全都未确认时也一样：最老那条仍然留着，淘汰的是第二老的。
-        let mut plain = Vec::new();
-        for index in 0..5 {
-            plain.push(entry(&format!("cc{index}"), false));
-        }
-        let oldest_plain = plain[0].id.clone();
-        pending_close_save(&ctx.paths, &plain).unwrap();
-        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
-        assert_eq!(closes.len(), 4);
-        assert!(closes.iter().any(|close| close.id == oldest_plain));
-        assert!(!closes
-            .iter()
-            .any(|close| close.storage.webdav.pinned_cert_sha256 == "cc1"));
+        assert!(closes.iter().any(|close| close.id == oldest));
+        assert!(!closes.iter().any(|close| fingerprint(close) == "ff1"));
+        assert!(closes.iter().any(|close| fingerprint(close) == "ff5"));
     }
 
     /// 同一位置的历史条目各留各的快照（旧密码未必错），事实随目标走，成功时一起清。
