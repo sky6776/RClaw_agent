@@ -10,6 +10,14 @@
 #
 # 注意：
 #   - 资源栈要建在你想用的地域（桶就建在那个地域）。
+#   - 账号要先能用 OSS 的 **Amazon S3 兼容 V4 签名**（未开通时请求报 0002-00000033，
+#     需联系阿里云技术支持）。
+#   - 默认公网端点（s3.oss-<地域>.aliyuncs.com）对部分账号受限：北京时间 2025-03-20 起
+#     新开通 OSS 服务的用户，访问中国内地桶时这些数据 API 会被拒（400
+#     PublicEndpointForbidden）。受限时用自定义域名（RClaw 会在你填的域名前再拼桶名），
+#     或从同地域、能访问 OSS 内网的 VPC 内客户端用 -internal 端点。
+#   - 桶**不开启版本控制**：RClaw 的「仅创建」依赖 x-oss-forbid-overwrite，桶一旦开启/暂停
+#     过版本控制，这个头就失效了。模板里不要加 VersioningConfiguration。
 #   - 桶名全局唯一，必须自己填；桶内目录默认 rclaw（和 RClaw 表单里的「桶内目录」一致）。
 #   - AccessKey 会出现在资源栈输出里（仅本账号可见）；复制到 RClaw 后建议按需轮换，
 #     或在 RAM 控制台另建一对密钥并禁用这一对。
@@ -29,8 +37,11 @@ Parameters:
   Prefix:
     Type: String
     Default: rclaw
-    Description: 桶内目录（RClaw 表单里的「桶内目录」填同一个值）
-    AllowedPattern: '^[a-z0-9][a-z0-9/_-]{0,62}$'
+    Description: 桶内目录，1–63 个 ASCII 字符。用单个斜杠分隔，首尾不加斜杠（RClaw 表单里的「桶内目录」填同一个值）
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^([a-zA-Z0-9_.-]{3,}|[a-zA-Z0-9_-][a-zA-Z0-9_.-]?|[.][a-zA-Z0-9_-])(/([a-zA-Z0-9_.-]{3,}|[a-zA-Z0-9_-][a-zA-Z0-9_.-]?|[.][a-zA-Z0-9_-]))*$'
+    ConstraintDescription: 每段用英文字母、数字、点、短划线或下划线；不要空段、单独的 . 或 ..，首尾不要斜杠
   UserName:
     Type: String
     Default: rclaw-oss
@@ -48,7 +59,10 @@ Resources:
         Ref: BucketName
       AccessControl: private
       StorageClass: Standard
-      DataRedundancyType: LRS
+      # ROS 的属性名是 RedundancyType（OSS 原生 API 里叫 DataRedundancyType）
+      RedundancyType: LRS
+      # 阻止以后被改成公共读/公共读写；与公网端点是否可用无关
+      BlockPublicAccess: true
 
   User:
     Type: ALIYUN::RAM::User
@@ -116,7 +130,7 @@ Outputs:
     Value:
       Ref: BucketName
   Endpoint:
-    Description: RClaw 表单里的「服务地址（S3 兼容端点，不带桶名/路径）」
+    Description: 默认公网 S3 兼容端点（不带桶名/路径）。受中国内地默认公网域名的数据 API 规则限制；受限时改用自定义域名或 -internal 端点
     Value:
       Fn::Sub: 'https://s3.oss-${ALIYUN::Region}.aliyuncs.com'
   Region:
@@ -134,12 +148,12 @@ Outputs:
         - AccessKey
         - AccessKeyId
   AccessKeySecret:
-    Description: RAM 子账号的 Access Key Secret（别发到聊天/仓库里）
+    Description: RAM 子账号的 Access Key Secret。能读取本资源栈的 RAM 身份都能看到它：别发到聊天/工单/日志，复制后建议轮换
     Value:
       Fn::GetAtt:
         - AccessKey
         - AccessKeySecret
   OssInternalEndpoint:
-    Description: 同地域 ECS 内网访问用的 S3 兼容端点（只有 ECS 上的程序能用）
+    Description: 同地域、能访问 OSS 内网的阿里云 VPC 内客户端（ECS/函数计算等）使用的 S3 兼容端点
     Value:
       Fn::Sub: 'https://s3.oss-${ALIYUN::Region}-internal.aliyuncs.com'

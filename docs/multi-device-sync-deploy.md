@@ -256,8 +256,10 @@ GetObject / PutObject / DeleteObject，以及创建空间用的条件 `PutObject
   export RCLAW_OSS_BUCKET="你的桶"
   export RCLAW_OSS_ACCESS_KEY_ID="你的AK"
   export RCLAW_OSS_SECRET_KEY="你的SK"
-  # 探针目录要落在 RAM 授权的前缀里（按第 6 节授权 rclaw/* 时用下面这个）
-  export RCLAW_OSS_PREFIX="rclaw/acceptance-$(date +%s)-$$"
+  # 探针目录要落在 RAM 授权的前缀里：改成你的「桶内目录」（ROS 模板输出的 Prefix，
+  # 或手填时与 RClaw 表单里的桶内目录一致）
+  rclaw_ros_prefix='rclaw'
+  export RCLAW_OSS_PREFIX="${rclaw_ros_prefix}/acceptance-$(date +%s)-$$"
 
   RCLAW_OSS_PATH_STYLE=0 RCLAW_OSS_FORBID_OVERWRITE=1 \
     cargo test -p rclaw-sync --test oss_conditional -- --ignored --nocapture
@@ -269,18 +271,31 @@ GetObject / PutObject / DeleteObject，以及创建空间用的条件 `PutObject
   （按本节第 7 点）：桶 `rclaw-sync`、填 `https://oss.example.com`，并为实际请求主机
   `rclaw-sync.oss.example.com` 配置 OSS 域名绑定、CNAME、证书（内地还需备案），再跑同一套
   验收命令——不要直接把已绑定的桶域名填进 `RCLAW_OSS_ENDPOINT`（虚拟主机式会再加一次桶名）。
-- **一键创建 OSS（ROS 模板）**：仓库里的 `scripts/aliyun-oss-rclaw-stack.yml` 是一个
-  资源编排模板，在 ROS 控制台「创建资源栈 → 使用模板」导入即可自动建好：私有桶（**不开启
-  版本控制**）、RAM 子账号、最小权限策略（`oss:ListObjects` 授桶 + `oss:Prefix` 限制到目录；
-  目录下对象读写删）、以及该子账号的 AccessKey。输出里直接给出 Bucket / Endpoint / Region /
-  Prefix / AK，填进 RClaw 的 S3 表单即可。
-  1. ROS 控制台 → 创建资源栈 → 使用模板 → 上传这个文件；**地域选你要用的地域**（桶建在那里）。
-  2. 填 `BucketName`（全局唯一）、`Prefix`（默认 `rclaw`，和 RClaw 表单里的桶内目录一致）。
-  3. 创建完成后在「输出」里复制那几项；AccessKey Secret 别发到聊天或提交进仓库。
-  4. 核对：OSS 控制台该桶「版本控制=未开启、读写权限=私有」；RAM 里策略只有上面那几项权限。
-  5. 回到本节前面的勾选与验收步骤（勾「阿里云 OSS」、跑双写验收）。
-  > 这个模板只在本地做过 YAML 结构与字段检查，**没有在真实账号里执行过**；创建前用 ROS 的
-  > 预览/校验确认一遍。
+- **一键创建 OSS（ROS 模板）**：仓库里的 `scripts/aliyun-oss-rclaw-stack.yml` 是资源编排
+  模板，导入后自动建好：私有桶（**不开启版本控制**、阻止公共访问）、RAM 子账号、最小权限
+  策略（`oss:ListObjects` 授桶 + `oss:Prefix` 限制到目录；目录下对象读写删）、以及该子账号
+  的 AccessKey。
+  1. 在 ROS 控制台选好**目标地域**（桶建在那里），进入「资源栈 → 创建资源栈 → 选择已有模板
+     → 输入模板」，把模板内容粘贴到 ROS 页签。
+  2. 填**资源栈名称**和全局唯一的 `BucketName`；`Prefix`、`UserName`、`PolicyName` 默认
+     `rclaw`、`rclaw-oss`、`rclaw-oss-sync`（同账号里重名就换一个）。
+  3. 确认当前部署身份（或栈执行角色）有权创建 OSS 桶、RAM 用户、自定义策略、策略关联和
+     AccessKey；在「检查并确认」页点「预览模板资源」（或 `ValidateTemplate`）再创建。
+  4. 创建完成后在「输出」里复制 Bucket / Endpoint / Region / Prefix / AK。**这个输出里有
+     长期有效的 AccessKey Secret**——能查询这个资源栈的 RAM 身份都能看到它（包括拥有
+     `AliyunROSReadOnlyAccess` 的人），别把输出发到聊天/工单/截图/仓库，复制后建议轮换；
+     怀疑泄露就立即禁用这对密钥。
+  5. 用管理身份核对：OSS 控制台该桶「版本控制=未开启、读写权限=私有」；RAM 里策略已附加给
+     新用户、内容只有上面那几项权限。
+  6. 回到本节前面的步骤：勾「阿里云 OSS」、填表单、跑双写验收（探针前缀用**你这个栈的
+     `Prefix` 输出**，见下面验收命令里的 `rclaw_ros_prefix`）。
+  前置条件（与模板是否成功无关，但要先确认）：账号已开通 OSS 的 S3 兼容 V4 签名（报
+  `0002-00000033` 要联系技术支持）；默认公网端点在 2025-03-20 之后新开通 OSS 的账号上访问
+  中国内地桶可能被拒（`PublicEndpointForbidden`），此时用自定义域名，或从同地域可访问 OSS
+  内网的 VPC 内客户端（ECS/函数计算等）用 `OssInternalEndpoint`。
+  > 这个模板只在本地做过 YAML 结构/字段检查，**没有在真实账号里执行过**，也没有经过 ROS 的
+  > 资源属性校验；请按第 3 步先预览/校验，再按第 6 步完成六项自检、空空间创建/加入与双写
+  > 验收。
 - **COS**：2024-01-01 之后创建的桶必须关闭路径式寻址，更早的桶也推荐关闭。
 - 自检通过不等于条件写可用：先用同一套配置**实际创建并加入一个空空间**，再按第 1 节做
   双写读回验收（创建/加入只证明条件请求被接受，不证明已有对象不会被覆盖；OSS 的完整验收
