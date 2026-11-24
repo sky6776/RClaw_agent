@@ -280,6 +280,16 @@ struct PendingSpace {
     replacement: Option<Secrets>,
 }
 
+/// 退出前没能收尾的关闭（`sync/pending-close.json`）。本机马上要清掉旧空间的密钥，
+/// 之后只有这条记录里的凭据还能把旧空间关闭标记补齐；它只做远端关闭，不碰本机配对。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingClose {
+    /// 关闭时用的存储配置（来自那条没做完的重置记录）。
+    storage: SyncConfig,
+    /// 旧空间的密钥与存储凭据。
+    previous: Secrets,
+}
+
 /// 规范化的存储位置标识：同一次空间切换必须在同一个位置上恢复。
 fn storage_binding(config: &SyncConfig) -> String {
     match config.transport.as_str() {
@@ -350,6 +360,87 @@ fn pending_clear(paths: &SyncPaths) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+fn pending_close_path(paths: &SyncPaths) -> PathBuf {
+    paths.root.join("pending-close.json")
+}
+
+fn pending_close_load(paths: &SyncPaths) -> Result<Vec<PendingClose>> {
+    match std::fs::read(pending_close_path(paths)) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(close) => Ok(close),
+            Err(error) => {
+                // 记录坏了就没法接着做；丢掉它，远端保持现在的样子。
+                tracing::warn!("sync/pending-close.json 损坏，丢弃: {error}");
+                let _ = std::fs::remove_file(pending_close_path(paths));
+                Ok(Vec::new())
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> {
+    if closes.is_empty() {
+        return pending_close_clear(paths);
+    }
+    paths.ensure_root()?;
+    rclaw_store::atomic_write_private(
+        &pending_close_path(paths),
+        &serde_json::to_vec_pretty(closes)?,
+    )?;
+    Ok(())
+}
+
+fn pending_close_clear(paths: &SyncPaths) -> Result<()> {
+    match std::fs::remove_file(pending_close_path(paths)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 把退出前没能收尾的关闭（[`PendingClose`]）补完：只在远端确实显示关闭已经开始时
+/// 动手（[`remote::ensure_closed_if_started`]），做完删记录，失败留着下次再试。
+///
+/// 退出时本机已经清掉了旧空间的密钥，之后只有这些记录能关掉那些空间：不补完的话，
+/// 迟到的创建把兼容标记覆盖回开放后，旧空间又能被当成可用。
+pub(crate) async fn finish_pending_close(paths: &SyncPaths) -> Result<()> {
+    let mut left = Vec::new();
+    let mut first_error = None;
+    for close in pending_close_load(paths)? {
+        match finish_one_close(&close).await {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "补完空间 {} 的关闭失败（下次打开再试）: {error}",
+                    close.previous.space_id
+                );
+                first_error.get_or_insert(error);
+                left.push(close);
+            }
+        }
+    }
+    pending_close_save(paths, &left)?;
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn finish_one_close(close: &PendingClose) -> Result<()> {
+    if !close.previous.is_paired() {
+        return Ok(());
+    }
+    let space_id = close.previous.space_id.clone();
+    let keys = Arc::new(close.previous.keys()?);
+    let (config, secrets) = (close.storage.clone(), close.previous.clone());
+    let root = blocking(move || root_transport(&config, &secrets)).await?;
+    let transport = Scoped::new(root, &space_id);
+    remote::ensure_closed_if_started(&transport, &keys, &space_id).await?;
+    Ok(())
 }
 
 /// 上一次的空间切换没做完：按记录与远端的实际状态接着做，做完删记录。没有记录就是
@@ -613,6 +704,25 @@ pub(crate) async fn leave(
             return Err(error);
         }
         tracing::warn!("退出前收尾未完成的切换失败，按本机退出继续: {error}");
+        // 没做完的可能是重置：旧空间也许已经关到一半（比如墓碑写成、兼容标记没写成）。
+        // 本机马上要清掉旧空间的密钥，之后没人能再补——先留一条只做远端关闭的收尾
+        // 记录，下一次打开时凭记录里的旧空间凭据把关闭补完，不碰本机配对。
+        if let Some(pending) = pending_load(&ctx.paths)? {
+            if pending.action == SpaceAction::Reset && pending.previous.is_paired() {
+                let at = pending.storage.clone().unwrap_or_else(|| config.clone());
+                let mut previous = pending.previous.clone();
+                if storage_binding(&at) == storage_binding(config) {
+                    refresh_credentials(&mut previous, secrets);
+                }
+                let mut closes = pending_close_load(&ctx.paths)?;
+                closes.retain(|close| close.previous.space_id != previous.space_id);
+                closes.push(PendingClose {
+                    storage: at,
+                    previous,
+                });
+                pending_close_save(&ctx.paths, &closes)?;
+            }
+        }
         status::notice(
             &ctx.paths,
             "leave-after-failed-resume",
@@ -620,7 +730,8 @@ pub(crate) async fn leave(
             "退出同步空间：上次未完成的切换没有收尾",
             &format!(
                 "本机已经退出同步空间，不会再同步。上次没做完的空间切换（重置或退出）\
-                 没能收尾，远端可能仍保留原空间的状态；其它设备不受影响。具体原因：{error}"
+                 没能收尾：如果旧空间已经关到一半，本机会在存储恢复后把它补完（其它设备\
+                 届时需要重新配对）；没有开始关闭的话，远端保持原样。具体原因：{error}"
             ),
         );
         pending_clear(&ctx.paths)?;
@@ -1006,6 +1117,74 @@ mod tests {
         config.webdav.url = "http://8.8.8.8/dav/".into();
         config.webdav.allow_http = true;
         assert!(root_transport(&config, &secrets).is_err());
+    }
+
+    /// 退出时没能收尾的关闭：本机已经没有旧空间的密钥了，只靠这条记录补完。
+    #[tokio::test]
+    async fn a_close_left_over_by_a_failed_exit_is_completed_later() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = storage.path().to_string_lossy().into_owned();
+        let secrets = paired();
+        let keys = secrets.keys().unwrap();
+        let root = root_transport(&config, &secrets).unwrap();
+        let space = Scoped::new(root, &secrets.space_id);
+        // 远端：上一次关闭只写成了墓碑（兼容标记还没写成）。
+        let mut file = SpaceFile::new(&keys, &secrets.space_id);
+        file.closed = true;
+        space
+            .put(crate::codec::SPACE_CLOSED_FILE, file.encode().unwrap())
+            .await
+            .unwrap();
+        pending_close_save(
+            &ctx.paths,
+            &[PendingClose {
+                storage: config.clone(),
+                previous: secrets.clone(),
+            }],
+        )
+        .unwrap();
+        finish_pending_close(&ctx.paths).await.unwrap();
+        // 兼容标记补上了、记录删了；旧空间对新版一律拒绝。
+        assert!(matches!(
+            remote::open_space(&space, &keys, &secrets.space_id, false).await,
+            Err(SyncError::SpaceClosed)
+        ));
+        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+    }
+
+    /// 重置可能压根没走到关闭那一步：退出后不能替用户关掉一个还在用的旧空间。
+    #[tokio::test]
+    async fn a_close_that_never_started_is_not_invented_by_the_leftover_record() {
+        let (_tmp, ctx) = crate::testing::ctx();
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = storage.path().to_string_lossy().into_owned();
+        let secrets = paired();
+        let keys = secrets.keys().unwrap();
+        let root = root_transport(&config, &secrets).unwrap();
+        let space = Scoped::new(root, &secrets.space_id);
+        let file = SpaceFile::new(&keys, &secrets.space_id);
+        space
+            .put(crate::codec::SPACE_FILE, file.encode().unwrap())
+            .await
+            .unwrap();
+        pending_close_save(
+            &ctx.paths,
+            &[PendingClose {
+                storage: config.clone(),
+                previous: secrets.clone(),
+            }],
+        )
+        .unwrap();
+        finish_pending_close(&ctx.paths).await.unwrap();
+        remote::open_space(&space, &keys, &secrets.space_id, false)
+            .await
+            .unwrap();
+        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
     #[test]

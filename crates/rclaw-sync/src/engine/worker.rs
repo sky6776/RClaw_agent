@@ -1267,6 +1267,11 @@ impl Worker {
                 Some(OPEN_RETRY),
             );
         }
+        // 退出时没能补完的空间关闭（重置的记录在退出时被丢掉了）：之后只靠这条记录
+        // 收尾。做不完就留着，下次打开再试。
+        if let Err(error) = space::finish_pending_close(&shared.ctx.paths).await {
+            tracing::warn!("补完上次没做完的空间关闭失败（下次打开再试）: {error}");
+        }
         let paired = self.secrets.is_paired();
         shared.paired.store(paired, Ordering::Relaxed);
         shared.set_space(

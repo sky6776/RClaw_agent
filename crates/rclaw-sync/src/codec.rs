@@ -80,7 +80,7 @@ pub fn snapshot_part_path(device_id: &str, name: &str, part: &str) -> String {
 }
 
 pub const SPACE_FILE: &str = "space.json";
-/// 空间已废弃的墓碑，关闭空间的设备最后写它。部分 WebDAV 服务端
+/// 空间已废弃的墓碑，关闭空间的设备先写它、再改 `space.json`。部分 WebDAV 服务端
 /// （文档里列出的 `rclone serve webdav`）不实现 `If-None-Match`，迟到的创建会把
 /// `space.json` 里的关闭标记无条件改回开放；墓碑只有关闭路径会写、创建路径从不碰，
 /// 写下去就不会被迟到创建抹掉。
