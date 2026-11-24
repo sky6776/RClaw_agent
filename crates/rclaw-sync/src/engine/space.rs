@@ -284,6 +284,9 @@ struct PendingSpace {
 /// 之后只有这条记录里的凭据还能把旧空间关闭标记补齐；它只做远端关闭，不碰本机配对。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingClose {
+    /// 这条记录的身份：收尾结果按它结算，不按目标——期间同目标可能已经被新记录替代。
+    #[serde(default)]
+    id: String,
     /// 关闭时用的存储配置（来自那条没做完的重置记录）。
     storage: SyncConfig,
     /// 旧空间的密钥与存储凭据。
@@ -406,29 +409,6 @@ fn pending_close_clear(paths: &SyncPaths) -> Result<()> {
     }
 }
 
-/// 同一空间、同一存储位置算同一条收尾：配对码只带空间 ID 与密钥，同一个空间可以
-/// 被复制到别的存储位置上，那两处要各留一条。
-fn same_close_target(close: &PendingClose, storage: &SyncConfig, space_id: &str) -> bool {
-    close.previous.space_id == space_id
-        && storage_binding(&close.storage) == storage_binding(storage)
-}
-
-/// 记下一条「补完关闭」。同一目标只留一条：后来写的凭据更新，但已经确认过的
-/// 「标记已是关闭版」这个事实不会因为后来的记录没有它而丢掉。
-fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()> {
-    let mut closes = pending_close_load(paths)?;
-    let mut close = close;
-    if let Some(old) = closes
-        .iter()
-        .find(|old| same_close_target(old, &close.storage, &close.previous.space_id))
-    {
-        close.closed_seen |= old.closed_seen;
-    }
-    closes.retain(|old| !same_close_target(old, &close.storage, &close.previous.space_id));
-    closes.push(close);
-    pending_close_save(paths, &closes)
-}
-
 /// 同一存储位置上，连接设置（证书指纹、区域、明文 HTTP）以当前这份为准：退出之后
 /// 用户可能改过它们。位置本身仍用记录里的——配对码只带空间 ID 与密钥，同一个空间
 /// 可以复制到别处；不能因为「位置标识相同」就把收尾改投到另一个副本上。
@@ -446,23 +426,84 @@ fn refresh_connection_settings(target: &mut SyncConfig, current: &SyncConfig) {
     }
 }
 
-/// 把收尾结果并回最新的队列：成功的目标删掉；失败的目标只把这次确认过的事实
-/// （`closed_seen`）并回去，别把开头的快照整批写回——期间别的进程可能追加了新条目。
-fn merge_close_outcomes(
-    latest: &mut Vec<PendingClose>,
-    outcomes: &[(PendingClose, bool)],
-) {
-    for (close, done) in outcomes {
-        let target = |entry: &PendingClose| {
-            same_close_target(entry, &close.storage, &close.previous.space_id)
-        };
-        if *done {
-            latest.retain(|entry| !target(entry));
-        } else if let Some(entry) = latest.iter_mut().find(|entry| target(entry)) {
-            entry.closed_seen |= close.closed_seen;
-        }
-        // 最新队列里已经没有这一条：另一进程的收尾做完了，不复活。
+/// 同一空间、同一存储位置算同一条收尾：配对码只带空间 ID 与密钥，同一个空间可以
+/// 被复制到别的存储位置上，那两处要各留一条。
+fn same_close_target(close: &PendingClose, storage: &SyncConfig, space_id: &str) -> bool {
+    close.previous.space_id == space_id
+        && storage_binding(&close.storage) == storage_binding(storage)
+}
+
+/// 收尾队列的跨进程互斥：读改写之间可能还有别的进程（或旧的后台任务）在加记录。
+struct CloseQueueLock(std::fs::File);
+
+impl CloseQueueLock {
+    fn acquire(paths: &SyncPaths) -> Result<CloseQueueLock> {
+        paths.ensure_root()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(paths.root.join("pending-close.lock"))?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(CloseQueueLock(file))
     }
+}
+
+impl Drop for CloseQueueLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+/// 记下一条「补完关闭」。同一目标只留一条（后写的凭据更新），但已经确认过的
+/// 「标记是关闭版」这个事实不会因为后来的记录没有它而丢掉。
+async fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()> {
+    let paths = paths.clone();
+    blocking(move || {
+        let _lock = CloseQueueLock::acquire(&paths)?;
+        let mut closes = pending_close_load(&paths)?;
+        let mut close = close;
+        if let Some(old) = closes
+            .iter()
+            .find(|old| same_close_target(old, &close.storage, &close.previous.space_id))
+        {
+            close.closed_seen |= old.closed_seen;
+        }
+        closes.retain(|old| !same_close_target(old, &close.storage, &close.previous.space_id));
+        closes.push(close);
+        pending_close_save(&paths, &closes)
+    })
+    .await
+}
+
+/// 把「本机确认过标记是关闭版」落到这条记录上（按记录身份，不按目标）：就算这一批
+/// 后面的补写超时、被取消、进程退出，下次也知道关闭已经开始。
+async fn pending_close_mark_seen(paths: &SyncPaths, id: &str) -> Result<()> {
+    let paths = paths.clone();
+    let id = id.to_string();
+    blocking(move || {
+        let _lock = CloseQueueLock::acquire(&paths)?;
+        let mut closes = pending_close_load(&paths)?;
+        let Some(close) = closes.iter_mut().find(|close| close.id == id) else {
+            return Ok(());
+        };
+        close.closed_seen = true;
+        pending_close_save(&paths, &closes)
+    })
+    .await
+}
+
+/// 结算一条收尾：只按记录身份删——期间同目标可能已经被一条新记录替代，不能顺手删掉。
+async fn pending_close_finish(paths: &SyncPaths, id: &str) -> Result<()> {
+    let paths = paths.clone();
+    let id = id.to_string();
+    blocking(move || {
+        let _lock = CloseQueueLock::acquire(&paths)?;
+        let mut closes = pending_close_load(&paths)?;
+        closes.retain(|close| close.id != id);
+        pending_close_save(&paths, &closes)
+    })
+    .await
 }
 
 /// 把退出前没能收尾的关闭（[`PendingClose`]）补完：只在远端确实显示关闭已经开始时
@@ -470,30 +511,35 @@ fn merge_close_outcomes(
 ///
 /// 退出时本机已经清掉了旧空间的密钥，之后只有这些记录能关掉那些空间：不补完的话，
 /// 迟到的创建把兼容标记覆盖回开放后，旧空间又能被当成可用。
+///
+/// 每一项的结算都（按记录身份）立刻落盘，不依赖整批跑完：超时、取消、进程退出都不会
+/// 丢掉已经得到的结论。当前配置从宿主重读入口拿，拿不到时用记录里的那份。
 pub(crate) async fn finish_pending_close(
     paths: &SyncPaths,
-    config: &SyncConfig,
-    secrets: &Secrets,
+    refresh: Option<crate::engine::ConfigRefresh>,
 ) -> Result<()> {
-    let mut outcomes = Vec::new();
+    let current = refresh.and_then(|refresh| refresh().ok().flatten());
+    let current_secrets = Secrets::load(paths).ok();
     let mut first_error = None;
     for mut close in pending_close_load(paths)? {
-        let done = match finish_one_close(&mut close, config, secrets).await {
-            Ok(()) => true,
+        match finish_one_close(
+            &mut close,
+            paths,
+            current.as_ref(),
+            current_secrets.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => {}
             Err(error) => {
                 tracing::warn!(
                     "补完空间 {} 的关闭失败（稍后再试）: {error}",
                     close.previous.space_id
                 );
                 first_error.get_or_insert(error);
-                false
             }
-        };
-        outcomes.push((close, done));
+        }
     }
-    let mut latest = pending_close_load(paths)?;
-    merge_close_outcomes(&mut latest, &outcomes);
-    pending_close_save(paths, &latest)?;
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
@@ -502,21 +548,29 @@ pub(crate) async fn finish_pending_close(
 
 async fn finish_one_close(
     close: &mut PendingClose,
-    config: &SyncConfig,
-    secrets: &Secrets,
+    paths: &SyncPaths,
+    current: Option<&SyncConfig>,
+    current_secrets: Option<&Secrets>,
 ) -> Result<()> {
     if !close.previous.is_paired() {
+        pending_close_finish(paths, &close.id).await?;
         return Ok(());
     }
     let mut previous = close.previous.clone();
     let mut at = close.storage.clone();
-    if storage_binding(&at) == storage_binding(config) {
-        // 同一个存储位置：当前设置里还有这个账户的凭据时凭据换成当前这份（退出之后
-        // 可能按「设备丢失」流程改过密码）——本机已经退出、没有凭据时，记录里的那份
-        // 才是能用的。连接设置同样以当前为准。
-        refresh_connection_settings(&mut at, config);
-        if !secrets.storage_secret(config).is_empty() {
-            refresh_credentials(&mut previous, secrets);
+    if let Some(current) = current {
+        if storage_binding(&at) == storage_binding(current) {
+            // 同一个存储位置：连接设置以当前这份为准（退出之后可能换过证书指纹）；
+            // 当前设置里确实有这个记录账户的凭据时凭据也换（可能按「设备丢失」流程
+            // 改过密码）——本机已经退出、没有凭据时，记录里的那份才是能用的。
+            refresh_connection_settings(&mut at, current);
+            if let Some(secrets) = current_secrets {
+                // 当前设置里确实有「记录里那个账户」的凭据才换（可能按「设备丢失」
+                // 流程改过密码）；本机已经退出、没有凭据时，记录里的才是能用的。
+                if !secrets.storage_secret(&at).is_empty() {
+                    refresh_credentials(&mut previous, secrets);
+                }
+            }
         }
     }
     let space_id = previous.space_id.clone();
@@ -525,18 +579,22 @@ async fn finish_one_close(
         // 记录里的密钥读不出来：这条永远补不了，丢掉别每 30 秒重试。
         Err(error) => {
             tracing::warn!("收尾记录里的空间密钥无法读取，丢弃这条: {error}");
+            pending_close_finish(paths, &close.id).await?;
             return Ok(());
         }
     };
     let root = blocking(move || root_transport(&at, &previous)).await?;
     let transport = Scoped::new(root, &space_id);
-    // 先看一眼标记：验证过是关闭版就把这个事实记进记录（本次补写再失败，下一次读到
-    // 被迟到创建改回开放的标记时，仍能按关闭补完）。
+    // 先看一眼标记：验证过是关闭版就立刻记进记录（这一批后面超时/取消也不丢）。
     if !close.closed_seen {
-        close.closed_seen =
-            remote::marker_closed_state(&transport, &keys, &space_id).await? == Some(true);
+        let observed = remote::marker_closed_state(&transport, &keys, &space_id).await?;
+        if observed == Some(true) {
+            pending_close_mark_seen(paths, &close.id).await?;
+            close.closed_seen = true;
+        }
     }
     remote::ensure_closed_if_started(&transport, &keys, &space_id, close.closed_seen).await?;
+    pending_close_finish(paths, &close.id).await?;
     Ok(())
 }
 
@@ -686,11 +744,12 @@ async fn finish_reset(
                 // 可能退出并清掉旧空间密钥，只有它能保证迟到创建把标记改回开放之后，
                 // 收尾仍按「关闭已经开始」补完。
                 let close = PendingClose {
+                    id: crate::ids::random_hex::<8>(),
                     storage: at.clone(),
                     previous: old_secrets.clone(),
                     closed_seen: true,
                 };
-                if let Err(write_error) = pending_close_add(&ctx.paths, close) {
+                if let Err(write_error) = pending_close_add(&ctx.paths, close).await {
                     tracing::warn!("记下没补完的空间关闭失败: {write_error}");
                 }
                 return Err(error);
@@ -829,11 +888,13 @@ pub(crate) async fn leave(
                 pending_close_add(
                     &ctx.paths,
                     PendingClose {
+                        id: crate::ids::random_hex::<8>(),
                         storage: at,
                         previous,
                         closed_seen: false,
                     },
-                )?;
+                )
+                .await?;
             }
         }
         status::notice(
@@ -1254,13 +1315,14 @@ mod tests {
         pending_close_save(
             &ctx.paths,
             &[PendingClose {
+                id: crate::ids::random_hex::<8>(),
                 storage: config.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
             }],
         )
         .unwrap();
-        finish_pending_close(&ctx.paths, &config, &secrets).await.unwrap();
+        finish_pending_close(&ctx.paths, None).await.unwrap();
         // 兼容标记补上了、记录删了；旧空间对新版一律拒绝。
         assert!(matches!(
             remote::open_space(&space, &keys, &secrets.space_id, false).await,
@@ -1269,43 +1331,47 @@ mod tests {
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
-    #[test]
-    fn close_outcomes_merge_into_the_latest_queue() {
+    /// 结算按记录身份：旧的「未开始」结果不能删掉/改写同目标的新记录。
+    #[tokio::test]
+    async fn close_results_are_settled_by_record_id() {
+        let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let config_at = |dir: &str| {
-            let mut config = SyncConfig::default();
-            config.transport = "file".into();
-            config.file.dir = dir.into();
-            config
-        };
-        let first = config_at("C:/sync-a");
-        let second = config_at("C:/sync-b");
-        let entry = |storage: &SyncConfig, closed_seen: bool| PendingClose {
-            storage: storage.clone(),
+        let mut config = SyncConfig::default();
+        config.transport = "file".into();
+        config.file.dir = "C:/sync-a".into();
+        let old = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
             previous: secrets.clone(),
-            closed_seen,
+            closed_seen: false,
         };
-        // 开头的快照里有一条失败、一条成功；期间另一进程又追加了一条。
-        let mut latest = vec![entry(&first, false), entry(&second, false)];
-        latest.push(entry(&config_at("C:/sync-c"), false));
-        merge_close_outcomes(&mut latest, &[(entry(&first, true), false), (entry(&second, false), true)]);
-        // 失败的那条留着，并带上这次确认过的事实；成功的那条删掉；新追加的不动。
-        assert_eq!(latest.len(), 2);
-        let kept = latest
-            .iter()
-            .find(|close| same_close_target(close, &first, &secrets.space_id))
-            .unwrap();
-        assert!(kept.closed_seen);
-        assert!(!latest
-            .iter()
-            .any(|close| same_close_target(close, &second, &secrets.space_id)));
-        assert!(latest
-            .iter()
-            .any(|close| close.storage.file.dir == "C:/sync-c"));
+        pending_close_save(&ctx.paths, &[old.clone()]).unwrap();
+        // 同目标的新记录替代旧记录。
+        let fresh = PendingClose {
+            id: crate::ids::random_hex::<8>(),
+            storage: config.clone(),
+            previous: secrets.clone(),
+            closed_seen: false,
+        };
+        pending_close_add(&ctx.paths, fresh.clone()).await.unwrap();
+        assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 1);
+        // 旧记录的「完成」结算不能删掉这条新记录。
+        pending_close_finish(&ctx.paths, &old.id).await.unwrap();
+        let closes = pending_close_load(&ctx.paths).unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].id, fresh.id);
+        // 「确认关闭」只落在它自己的身份上。
+        pending_close_mark_seen(&ctx.paths, &old.id).await.unwrap();
+        assert!(!pending_close_load(&ctx.paths).unwrap()[0].closed_seen);
+        pending_close_mark_seen(&ctx.paths, &fresh.id).await.unwrap();
+        assert!(pending_close_load(&ctx.paths).unwrap()[0].closed_seen);
+        // 按身份结算才删得掉。
+        pending_close_finish(&ctx.paths, &fresh.id).await.unwrap();
+        assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
     }
 
-    #[test]
-    fn close_records_keep_each_storage_and_remember_a_confirmed_close() {
+    #[tokio::test]
+    async fn close_records_keep_each_storage_and_remember_a_confirmed_close() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
         let config_at = |dir: &str| {
@@ -1319,38 +1385,48 @@ mod tests {
         pending_close_add(
             &ctx.paths,
             PendingClose {
+                id: crate::ids::random_hex::<8>(),
                 storage: first.clone(),
                 previous: secrets.clone(),
                 closed_seen: true,
             },
         )
+        .await
         .unwrap();
         // 同一个空间复制到另一个存储位置：两处各留一条。
         pending_close_add(
             &ctx.paths,
             PendingClose {
+                id: crate::ids::random_hex::<8>(),
                 storage: second.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
             },
         )
+        .await
         .unwrap();
         assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 2);
         // 同一目标再来一条（这次不知道关闭已确认）：合并成一条，但确认过的事实不丢。
+        let id = crate::ids::random_hex::<8>();
         pending_close_add(
             &ctx.paths,
             PendingClose {
+                id: id.clone(),
                 storage: first.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
             },
         )
+        .await
         .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 2);
-        assert!(closes.iter().any(|close| {
-            same_close_target(close, &first, &secrets.space_id) && close.closed_seen
-        }));
+        let kept = closes
+            .iter()
+            .find(|close| same_close_target(close, &first, &secrets.space_id))
+            .unwrap();
+        assert_eq!(kept.id, id);
+        assert!(kept.closed_seen);
     }
 
     /// 重置可能压根没走到关闭那一步：退出后不能替用户关掉一个还在用的旧空间。
@@ -1373,13 +1449,14 @@ mod tests {
         pending_close_save(
             &ctx.paths,
             &[PendingClose {
+                id: crate::ids::random_hex::<8>(),
                 storage: config.clone(),
                 previous: secrets.clone(),
                 closed_seen: false,
             }],
         )
         .unwrap();
-        finish_pending_close(&ctx.paths, &config, &secrets).await.unwrap();
+        finish_pending_close(&ctx.paths, None).await.unwrap();
         remote::open_space(&space, &keys, &secrets.space_id, false)
             .await
             .unwrap();

@@ -716,8 +716,10 @@ struct Worker {
     downloads: Option<JoinHandle<()>>,
     /// 「补完空间关闭」的后台任务与它的回传（旧存储卡住时不占住主循环）。
     close_task: Option<JoinHandle<()>>,
-    close_done_tx: mpsc::UnboundedSender<std::result::Result<(), String>>,
-    close_done: mpsc::UnboundedReceiver<std::result::Result<(), String>>,
+    close_done_tx: mpsc::UnboundedSender<(u64, std::result::Result<(), String>)>,
+    close_done: mpsc::UnboundedReceiver<(u64, std::result::Result<(), String>)>,
+    /// 收尾任务的代号：迟到的旧报告不能动新任务的状态。
+    close_generation: u64,
     /// 约好的下一轮。
     next: Option<(Kind, Instant)>,
     /// 出错之后，在这之前不自动重试。
@@ -777,6 +779,7 @@ impl Worker {
             close_task: None,
             close_done_tx,
             close_done,
+            close_generation: 0,
             next: None,
             hold_until: None,
             failures: 0,
@@ -849,16 +852,16 @@ impl Worker {
             self.close_retry_at = None;
             return;
         }
-        let (paths, config, secrets) = (
-            self.shared.ctx.paths.clone(),
-            self.config.clone(),
-            self.secrets.clone(),
-        );
+        let paths = self.shared.ctx.paths.clone();
+        let refresh = self.shared.refresh_config.clone();
         let done = self.close_done_tx.clone();
+        self.close_generation += 1;
+        let generation = self.close_generation;
         self.close_task = Some(tokio::spawn(async move {
+            // 当前配置从宿主重读入口拿（任务跑起来之后设置可能又改过），拿不到用记录里的。
             let report = match tokio::time::timeout(
                 CLOSE_TIMEOUT,
-                space::finish_pending_close(&paths, &config, &secrets),
+                space::finish_pending_close(&paths, refresh),
             )
             .await
             {
@@ -866,11 +869,14 @@ impl Worker {
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(_) => Err("补完空间关闭超时".to_string()),
             };
-            let _ = done.send(report);
+            let _ = done.send((generation, report));
         }));
     }
 
-    fn on_close_done(&mut self, report: std::result::Result<(), String>) {
+    fn on_close_done(&mut self, (generation, report): (u64, std::result::Result<(), String>)) {
+        if generation != self.close_generation {
+            return;
+        }
         self.close_task = None;
         match report {
             Ok(()) => self.close_retry_at = None,

@@ -203,8 +203,9 @@ pub async fn ensure_closed(
             tracing::warn!("关闭墓碑损坏，重写: {error}");
             write_closed_tombstone(transport, keys, space_id).await
         }
-        // 读不出来（权限、网络、身份不符）也不能挡住关闭：到这里来的调用点都已经确认
-        // 这个空间该关。要写的本来就是关闭版，不会把开放变封闭。
+        // 读不出来（权限、网络）不能挡住关闭：到这里来的调用点都已经确认这个空间该关，
+        // 要写的本来就是关闭版。但身份不符、版本过高说明位置上不是这个空间，不能改写。
+        Err(error @ SyncError::Upgrade(_)) | Err(error @ SyncError::Other(_)) => Err(error),
         Err(error) => {
             tracing::warn!("关闭墓碑读不出来，直接写: {error}");
             write_closed_tombstone(transport, keys, space_id).await
@@ -235,14 +236,20 @@ pub async fn ensure_closed_if_started(
 ) -> Result<bool> {
     if known_closed {
         // 本机在关闭现场确认过标记已是关闭版：迟到创建可能把它改回开放，但「关闭已经
-        // 开始」这个事实不受影响，直接补完。标记还在就核对身份，缺失或坏了都重写成
-        // 关闭版（写的本来就是关闭，不会把开放变封闭）。
-        match read_space(transport).await {
-            Ok(Some(file)) => file.verify(keys, space_id)?,
-            Ok(None) | Err(SyncError::Corrupt(_)) => {}
+        // 开始」这个事实不受影响，直接补完。标记还在就核对身份；本来就是关闭版的
+        // 标记不再重写（非原子 PUT 重复写可能把好的标记截断）。
+        let marker_closed = match read_space(transport).await {
+            Ok(Some(file)) => {
+                file.verify(keys, space_id)?;
+                file.closed
+            }
+            Ok(None) | Err(SyncError::Corrupt(_)) => false,
             Err(error) => return Err(error),
+        };
+        ensure_closed(transport, keys, space_id).await?;
+        if !marker_closed {
+            write_closed_marker(transport, keys, space_id).await?;
         }
-        close_space(transport, keys, space_id).await?;
         return Ok(true);
     }
     let marker_closed = match read_space(transport).await {
