@@ -583,19 +583,26 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
     .await
 }
 
-/// 一条收尾成功后，把同一目标的记录**全部**删掉：关闭是幂等的，同目标的历史快照
-/// （旧指纹、旧密码）都已完成使命。
+/// 一条收尾完成后清同目标的记录：关闭做完（`Done`）就全删；确认远端没有关闭依据
+/// （`NotStarted`）时只删**没有确认过关闭**的条目——带着「已确认关闭」事实的条目还
+/// 要留着补写（迟到创建可能刚把标记改回开放）。
 async fn pending_close_finish_target(
     paths: &SyncPaths,
     storage: &SyncConfig,
     space_id: &str,
+    keep_confirmed: bool,
 ) -> Result<()> {
     let paths = paths.clone();
     let (storage, space_id) = (storage.clone(), space_id.to_string());
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
-        closes.retain(|close| !same_close_target(close, &storage, &space_id));
+        closes.retain(|close| {
+            if !same_close_target(close, &storage, &space_id) {
+                return true;
+            }
+            keep_confirmed && close.closed_seen
+        });
         pending_close_save(&paths, &closes)
     })
     .await
@@ -806,9 +813,15 @@ async fn finish_one_close(
     )
     .await
     {
-        remote::CloseAttempt::Done | remote::CloseAttempt::NotStarted => {
-            // 关闭做完（或确认没开始）就把同目标的历史快照一起收掉。
-            pending_close_finish_target(paths, &close.storage, &space_id).await?;
+        remote::CloseAttempt::Done => {
+            // 关闭做完：同目标的历史快照都已完成使命。
+            pending_close_finish_target(paths, &close.storage, &space_id, false).await?;
+            Ok(())
+        }
+        remote::CloseAttempt::NotStarted => {
+            // 远端没有任何关闭依据：这一条不再需要；但别的条目要是记着「已确认关闭」，
+            // 留着它们继续补写。
+            pending_close_finish_target(paths, &close.storage, &space_id, true).await?;
             Ok(())
         }
         // 这一遍补写里又确认了关闭（第一次读时还没写成）：事实同样要落盘。
@@ -1611,7 +1624,7 @@ mod tests {
             old.webdav.pinned_cert_sha256
         );
         // 收尾成功：同目标的全部历史一起清掉。
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id)
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false)
             .await
             .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
@@ -1743,7 +1756,7 @@ mod tests {
             .unwrap();
         assert!(!other_now.closed_seen);
         // 收尾成功清掉同目标的全部历史，别的目标不动。
-        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id)
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false)
             .await
             .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
