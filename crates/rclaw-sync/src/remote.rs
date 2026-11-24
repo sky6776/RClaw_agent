@@ -222,69 +222,96 @@ pub async fn close_space(transport: &dyn SyncTransport, keys: &Keys, space_id: &
     write_closed_marker(transport, keys, space_id).await
 }
 
+/// 补一次关闭尝试的结果。`ConfirmedButFailed` 带着「标记已验证为关闭版、只是没补完」
+/// 这个事实——调用方要把它落盘（迟到创建可能随后把标记改回开放）。
+pub enum CloseAttempt {
+    /// 两份关闭对象都已在（墓碑与复核过的标记状态一致）。
+    Done,
+    /// 远端没有任何关闭依据，什么也没做。
+    NotStarted,
+    /// 标记已验证关闭，但补写没完成。
+    ConfirmedButFailed(SyncError),
+    /// 其它失败（读取、身份校验等）。
+    Failed(SyncError),
+}
+
 /// 只在远端确实显示「关闭已经开始」时把关闭补完：兼容标记已关闭，或墓碑已经写下。
 ///
 /// 重置的记录可能在本机退出时被丢掉，之后靠一条独立的收尾记录调用这里；重置也可能
 /// 压根没走到关闭这一步，那时不能替用户关掉一个还在用的旧空间。`known_closed` 用于
 /// 本机在关闭现场确认过标记是关闭版、但墓碑没补上的情况：这个事实已经落盘，迟到的
-/// 创建把标记改回开放也不影响，直接补完。返回是否补了关闭。
+/// 创建把标记改回开放也不影响，直接补完。
+///
+/// 标记一验证为关闭版就通过 `CloseAttempt::ConfirmedButFailed` 把事实交回调用方
+/// （补写接着失败时调用方仍能落盘），不靠补写完再复读一次。
 pub async fn ensure_closed_if_started(
     transport: &dyn SyncTransport,
     keys: &Keys,
     space_id: &str,
     known_closed: bool,
-) -> Result<bool> {
+) -> CloseAttempt {
+    use CloseAttempt::*;
     if known_closed {
-        // 本机在关闭现场确认过标记已是关闭版：迟到创建可能把它改回开放，但「关闭已经
-        // 开始」这个事实不受影响，直接补完。标记还在就核对身份；本来就是关闭版的
-        // 标记不再重写（非原子 PUT 重复写可能把好的标记截断）。
+        // 标记还在就核对身份；本来就是关闭版的标记不再重写（非原子 PUT 重复写可能把
+        // 好的标记截断）。
         let marker_closed = match read_space(transport).await {
-            Ok(Some(file)) => {
-                file.verify(keys, space_id)?;
-                file.closed
-            }
+            Ok(Some(file)) => match file.verify(keys, space_id) {
+                Ok(()) => file.closed,
+                Err(error) => return Failed(error),
+            },
             Ok(None) | Err(SyncError::Corrupt(_)) => false,
-            Err(error) => return Err(error),
+            Err(error) => return Failed(error),
         };
-        ensure_closed(transport, keys, space_id).await?;
+        if let Err(error) = ensure_closed(transport, keys, space_id).await {
+            return ConfirmedButFailed(error);
+        }
         // 墓碑补写期间兼容标记可能被迟到创建改回开放：补完再看一眼，只有它现在还
         // 不是关闭版才写（已经关闭的不重写）。
         let still_closed = marker_closed
-            && marker_closed_state(transport, keys, space_id).await? == Some(true);
+            && matches!(
+                marker_closed_state(transport, keys, space_id).await,
+                Ok(Some(true))
+            );
         if !still_closed {
-            write_closed_marker(transport, keys, space_id).await?;
+            if let Err(error) = write_closed_marker(transport, keys, space_id).await {
+                return ConfirmedButFailed(error);
+            }
         }
-        return Ok(true);
+        return Done;
     }
     let marker_closed = match read_space(transport).await {
-        Ok(Some(file)) => {
-            file.verify(keys, space_id)?;
-            file.closed
-        }
+        Ok(Some(file)) => match file.verify(keys, space_id) {
+            Ok(()) => file.closed,
+            Err(error) => return Failed(error),
+        },
         // 标记缺失或坏了都不算关闭证据；坏标记后面由墓碑证据决定要不要重写成关闭版。
         Ok(None) | Err(SyncError::Corrupt(_)) => false,
-        Err(error) => return Err(error),
+        Err(error) => return Failed(error),
     };
     if marker_closed {
-        ensure_closed(transport, keys, space_id).await?;
-        return Ok(true);
+        if let Err(error) = ensure_closed(transport, keys, space_id).await {
+            return ConfirmedButFailed(error);
+        }
+        return Done;
     }
     let started = match read_closed(transport, keys, space_id).await {
         Ok(closed) => closed,
         // 解析不了的墓碑（半截 PUT、超限、身份字段缺失）分不清是写坏的关闭还是别处
-        // 误放的残片：不据此关掉一个可能还在用的空间。标记已关闭的分支上面已经补过墓碑。
+        // 误放的残片：不据此关掉一个可能还在用的空间。
         Err(SyncError::Corrupt(error)) => {
             tracing::warn!("关闭墓碑损坏，不据此补关闭: {error}");
             false
         }
-        Err(error) => return Err(error),
+        Err(error) => return Failed(error),
     };
     if !started {
-        return Ok(false);
+        return NotStarted;
     }
     // 墓碑已经读成有效的了：只补兼容标记，不再重复读、写墓碑。
-    write_closed_marker(transport, keys, space_id).await?;
-    Ok(true)
+    match write_closed_marker(transport, keys, space_id).await {
+        Ok(()) => Done,
+        Err(error) => Failed(error),
+    }
 }
 
 /// 列出各设备的 head（一次空闲轮询就是这一个请求）。
@@ -562,11 +589,10 @@ mod tests {
         open_space(&transport, &keys, &space_id, true)
             .await
             .unwrap();
-        assert!(
-            !ensure_closed_if_started(&transport, &keys, &space_id, false)
-                .await
-                .unwrap()
-        );
+        assert!(matches!(
+            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            CloseAttempt::NotStarted
+        ));
         // 关闭开了个头（墓碑先写成、兼容标记没写成）→ 补完两件。
         let mut closed = SpaceFile::new(&keys, &space_id);
         closed.closed = true;
@@ -574,28 +600,25 @@ mod tests {
             .put(SPACE_CLOSED_FILE, closed.encode().unwrap())
             .await
             .unwrap();
-        assert!(
-            ensure_closed_if_started(&transport, &keys, &space_id, false)
-                .await
-                .unwrap()
-        );
+        assert!(matches!(
+            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            CloseAttempt::Done
+        ));
         assert!(matches!(
             open_space(&transport, &keys, &space_id, false).await,
             Err(SyncError::SpaceClosed)
         ));
         // 幂等。
-        assert!(
-            ensure_closed_if_started(&transport, &keys, &space_id, false)
-                .await
-                .unwrap()
-        );
+        assert!(matches!(
+            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            CloseAttempt::Done
+        ));
         // 旧版关闭只写了兼容标记：补墓碑。
         transport.delete(SPACE_CLOSED_FILE).await.unwrap();
-        assert!(
-            ensure_closed_if_started(&transport, &keys, &space_id, false)
-                .await
-                .unwrap()
-        );
+        assert!(matches!(
+            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            CloseAttempt::Done
+        ));
         assert!(matches!(
             open_space(&transport, &keys, &space_id, false).await,
             Err(SyncError::SpaceClosed)
@@ -606,11 +629,10 @@ mod tests {
             .await
             .unwrap();
         transport.delete(SPACE_CLOSED_FILE).await.unwrap();
-        assert!(
-            ensure_closed_if_started(&transport, &keys, &space_id, true)
-                .await
-                .unwrap()
-        );
+        assert!(matches!(
+            ensure_closed_if_started(&transport, &keys, &space_id, true).await,
+            CloseAttempt::Done
+        ));
         assert!(matches!(
             open_space(&transport, &keys, &space_id, false).await,
             Err(SyncError::SpaceClosed)
@@ -632,11 +654,10 @@ mod tests {
             .put(SPACE_CLOSED_FILE, b"{\"format\":1,\"space".to_vec())
             .await
             .unwrap();
-        assert!(
-            !ensure_closed_if_started(&transport, &keys, &space_id, false)
-                .await
-                .unwrap()
-        );
+        assert!(matches!(
+            ensure_closed_if_started(&transport, &keys, &space_id, false).await,
+            CloseAttempt::NotStarted
+        ));
         assert!(!read_space(&transport).await.unwrap().unwrap().closed);
     }
 

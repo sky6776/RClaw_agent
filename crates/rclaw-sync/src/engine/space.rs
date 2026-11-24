@@ -35,8 +35,9 @@ use crate::trash;
 use crate::wire::{self, StoredRefs};
 use crate::{blocking, Ctx};
 
-/// 一条收尾记录最多等这么久：卡住的一条不能把后面的健康记录一直饿着。
-const CLOSE_ENTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// 一条收尾记录最多等这么久（传输层每个请求另有 60 秒上限）：要容得下一条记录正常
+/// 需要的几次读写，又不能真的无限等。
+const CLOSE_ENTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// 一个打开的同步空间：套了空间子目录的传输，和这个空间的密钥。
 pub(crate) struct Live {
@@ -432,8 +433,9 @@ fn refresh_connection_settings(target: &mut SyncConfig, current: &SyncConfig) {
 /// 同一空间、同一存储位置算同一条收尾：配对码只带空间 ID 与密钥，同一个空间可以
 /// 被复制到别的存储位置上，那两处要各留一条。
 fn same_close_target(close: &PendingClose, storage: &SyncConfig, space_id: &str) -> bool {
-    close.previous.space_id == space_id
-        && storage_binding(&close.storage) == storage_binding(storage)
+    // 按配置逐字段相等判同一目标（不用规范化的位置标识）：规范化会把「末尾字面反斜杠」
+    // 「用户名首尾空白」这类不同的实际位置当成同一处，确认事实会串到另一个副本上。
+    close.previous.space_id == space_id && close.storage == *storage
 }
 
 /// 收尾队列的跨进程互斥：读改写之间可能还有别的进程（或旧的后台任务）在加记录。
@@ -569,26 +571,31 @@ pub(crate) async fn finish_pending_close(
     }
     let mut first_error = None;
     for mut close in closes {
-        // 当前配置与凭据逐条读：一批里可能等很久，期间设置可能又改过。读不出来就
-        // 不拿旧设置去连（可能已经不允许明文了），留着下次再试。
-        let current = match &refresh {
-            Some(refresh) => {
-                let refresh = refresh.clone();
-                match blocking(move || Ok::<_, SyncError>((refresh)())).await? {
-                    Ok(config) => config,
-                    Err(()) => {
-                        first_error.get_or_insert(SyncError::other(
-                            "同步设置暂时读不出来，稍后再补完空间关闭",
-                        ));
-                        continue;
-                    }
-                }
-            }
-            None => None,
-        };
-        let secrets = {
+        // 当前配置与凭据逐条读（同一个阻塞任务里连着读，缩小两次读取之间的窗口）：
+        // 一批里可能等很久，期间设置可能又改过。配置读不出来就不拿旧设置去连（可能
+        // 已经不允许明文了），留着下次再试。
+        let settings = {
             let paths = paths.clone();
-            blocking(move || Secrets::load(&paths)).await.ok()
+            let refresh = refresh.clone();
+            blocking(move || {
+                let config = match &refresh {
+                    Some(refresh) => match refresh() {
+                        Ok(config) => config,
+                        Err(()) => return Ok(None),
+                    },
+                    None => None,
+                };
+                Ok(Some((config, Secrets::load(&paths).ok())))
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let Some((current, secrets)) = settings else {
+            first_error.get_or_insert(SyncError::other(
+                "同步设置暂时读不出来，稍后再补完空间关闭",
+            ));
+            continue;
         };
         let closed = {
             // 单条也限时：卡住的一条不能把后面的健康记录一直饿着。
@@ -662,24 +669,22 @@ async fn finish_one_close(
             close.closed_seen = true;
         }
     }
-    if let Err(error) =
-        remote::ensure_closed_if_started(&transport, &keys, &space_id, close.closed_seen).await
+    match remote::ensure_closed_if_started(&transport, &keys, &space_id, close.closed_seen)
+        .await
     {
-        // 补写失败时再看一眼标记：关闭可能刚好在两次观察之间写成（ensure 内部第二次
-        // 读到的就是关闭版）。这时的确认同样要落盘。
-        if !close.closed_seen
-            && matches!(
-                remote::marker_closed_state(&transport, &keys, &space_id).await,
-                Ok(Some(true))
-            )
-        {
-            pending_close_mark_seen(paths, &close.id, &close.storage, &space_id).await?;
-            close.closed_seen = true;
+        remote::CloseAttempt::Done | remote::CloseAttempt::NotStarted => {
+            pending_close_finish(paths, &close.id).await?;
+            Ok(())
         }
-        return Err(error);
+        // 这一遍补写里又确认了关闭（第一次读时还没写成）：事实同样要落盘。
+        remote::CloseAttempt::ConfirmedButFailed(error) => {
+            if !close.closed_seen {
+                pending_close_mark_seen(paths, &close.id, &close.storage, &space_id).await?;
+            }
+            Err(error)
+        }
+        remote::CloseAttempt::Failed(error) => Err(error),
     }
-    pending_close_finish(paths, &close.id).await?;
-    Ok(())
 }
 
 /// 上一次的空间切换没做完：按记录与远端的实际状态接着做，做完删记录。没有记录就是
@@ -836,9 +841,26 @@ async fn finish_reset(
                 tracing::warn!("记下没补完的空间关闭失败: {write_error}");
             }
             let old = load_live(&at, &old_secrets).await?;
-            remote::ensure_closed(old.transport(), &old.keys, &old.space_id).await?;
-            if added.is_ok() {
-                pending_close_finish(&ctx.paths, &close.id).await?;
+            // 两份对象都确认了才撤这条记录；撤记录只是收尾，撤不掉留给后台再验一遍
+            //（幂等），不能把本机提交挡在后面。
+            match remote::ensure_closed_if_started(
+                old.transport(),
+                &old.keys,
+                &old.space_id,
+                true,
+            )
+            .await
+            {
+                remote::CloseAttempt::Done => {
+                    if added.is_ok() {
+                        if let Err(error) = pending_close_finish(&ctx.paths, &close.id).await {
+                            tracing::warn!("撤掉已完成的收尾记录失败（留给后台重试）: {error}");
+                        }
+                    }
+                }
+                remote::CloseAttempt::NotStarted => {}
+                remote::CloseAttempt::ConfirmedButFailed(error)
+                | remote::CloseAttempt::Failed(error) => return Err(error),
             }
         }
     }
