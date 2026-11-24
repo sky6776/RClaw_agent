@@ -312,7 +312,13 @@ async fn retrying_reopens_and_replaces_an_engine_thread_that_died() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while second.status().state != "setup" {
         assert!(Instant::now() < deadline, "重试没有让待命的引擎接手");
-        second.apply_config(config.clone()).unwrap();
+        match second.apply_config(config.clone()) {
+            Ok(()) => {}
+            // 待命的引擎接手时会持有存储协议锁读盘，正好撞上就是「正在保存」：
+            // 下一次轮询重试即可，别的错误照样算失败。
+            Err(error) if error.to_string().contains("正在保存") => {}
+            Err(error) => panic!("重试发布失败: {error}"),
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 

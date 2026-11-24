@@ -5,8 +5,8 @@
 
 use crate::codec::{
     self, Head, Rollup, Segment, SpaceFile, DEVICES_MAX, HEADS_DIR, HEAD_OBJECT_MAX,
-    ROLLUP_OBJECT_MAX, ROLLUP_PLAIN_MAX, SEGMENT_OBJECT_MAX, SEGMENT_PLAIN_MAX, SPACE_FILE,
-    SPACE_FILE_MAX,
+    ROLLUP_OBJECT_MAX, ROLLUP_PLAIN_MAX, SEGMENT_OBJECT_MAX, SEGMENT_PLAIN_MAX, SPACE_CLOSED_FILE,
+    SPACE_FILE, SPACE_FILE_MAX,
 };
 use std::sync::Arc;
 
@@ -23,6 +23,26 @@ pub async fn read_space(transport: &dyn SyncTransport) -> Result<Option<SpaceFil
     }
 }
 
+/// 读关闭墓碑：存在且能对上本空间的密钥，就说明这个空间已经被废弃。
+///
+/// 「仅创建」在部分 WebDAV 服务端上会被当成普通覆盖，`space.json` 里的关闭标记因此
+/// 可能被迟到的创建改回开放；墓碑只有关闭路径写，读过 `space.json` 之后再查它一次，
+/// 就能认出这种覆盖。
+async fn read_closed(
+    transport: &dyn SyncTransport,
+    keys: &Keys,
+    space_id: &str,
+) -> Result<bool> {
+    let Some(bytes) =
+        transport::get_opt(transport, SPACE_CLOSED_FILE, SPACE_FILE_MAX as u64).await?
+    else {
+        return Ok(false);
+    };
+    let file = SpaceFile::decode(&bytes)?;
+    file.verify(keys, space_id)?;
+    Ok(file.closed)
+}
+
 /// 仅创建空间标记；目标已存在（另一个进程刚写入）时读回并核对，而不是把底层
 /// 创建错误直接抛给调用方。
 async fn create_marker(
@@ -31,19 +51,27 @@ async fn create_marker(
     space_id: &str,
 ) -> Result<()> {
     let file = SpaceFile::new(keys, space_id);
-    if let Err(error) = transport::put_new_checked(transport, SPACE_FILE, file.encode()?).await {
-        match read_space(transport).await {
+    let written = transport::put_new_checked(transport, SPACE_FILE, file.encode()?).await;
+    // 不管「仅创建」成功还是撞上已有标记，写完都再看一眼墓碑：不实现 `If-None-Match`
+    // 的服务端会把这次创建当成普通覆盖，另一设备先写下的关闭标记会被改回开放。
+    let closed = read_closed(transport, keys, space_id).await?;
+    match written {
+        Ok(()) => {
+            if closed {
+                return Err(SyncError::SpaceClosed);
+            }
+            Ok(())
+        }
+        Err(error) => match read_space(transport).await {
             Ok(Some(existing)) => {
                 existing.verify(keys, space_id)?;
-                if existing.closed {
+                if existing.closed || closed {
                     return Err(SyncError::SpaceClosed);
                 }
                 Ok(())
             }
             _ => Err(error.into()),
-        }
-    } else {
-        Ok(())
+        },
     }
 }
 
@@ -65,7 +93,7 @@ pub async fn open_space(
                 Some(bytes) => match SpaceFile::decode(&bytes) {
                     Ok(file) => {
                         file.verify(keys, space_id)?;
-                        if file.closed {
+                        if file.closed || read_closed(transport, keys, space_id).await? {
                             return Err(SyncError::SpaceClosed);
                         }
                         return Ok(());
@@ -73,6 +101,9 @@ pub async fn open_space(
                     Err(_) => {
                         // 二次读仍损坏：不覆盖（另一设备可能刚写成有效的关闭标记，
                         // 无条件重建会把它改回开放）。保留损坏状态、给出恢复路径。
+                        if read_closed(transport, keys, space_id).await? {
+                            return Err(SyncError::SpaceClosed);
+                        }
                         tracing::warn!("空间标记损坏（{error}）");
                         return Err(SyncError::other(format!(
                             "存储上的空间标记 {SPACE_FILE} 损坏（{error}）；请确认这不是别的设备正在写的标记后，删除或修复它再重试"
@@ -90,15 +121,20 @@ pub async fn open_space(
     match existing {
         Some(file) => {
             file.verify(keys, space_id)?;
-            if file.closed {
+            if file.closed || read_closed(transport, keys, space_id).await? {
                 return Err(SyncError::SpaceClosed);
             }
             Ok(())
         }
         None if create => create_marker(transport, keys, space_id).await,
-        None => Err(SyncError::other(
-            "存储目录里还没有这个同步空间（可能文件还没同步过来，或存储地址填的不是同一个目录）",
-        )),
+        None => {
+            if read_closed(transport, keys, space_id).await? {
+                return Err(SyncError::SpaceClosed);
+            }
+            Err(SyncError::other(
+                "存储目录里还没有这个同步空间（可能文件还没同步过来，或存储地址填的不是同一个目录）",
+            ))
+        }
     }
 }
 
@@ -106,7 +142,11 @@ pub async fn open_space(
 pub async fn close_space(transport: &dyn SyncTransport, keys: &Keys, space_id: &str) -> Result<()> {
     let mut file = SpaceFile::new(keys, space_id);
     file.closed = true;
-    transport::put_checked(transport, SPACE_FILE, file.encode()?).await?;
+    let body = file.encode()?;
+    // 先写墓碑再改标记：不实现条件写入的服务端上，迟到的创建能把 space.json 改回
+    // 开放；墓碑不会被创建路径碰到，写下去这个空间的废弃状态就有了据。
+    transport::put_checked(transport, SPACE_CLOSED_FILE, body.clone()).await?;
+    transport::put_checked(transport, SPACE_FILE, body).await?;
     Ok(())
 }
 
@@ -240,6 +280,52 @@ mod tests {
         close_space(&transport, &keys, &space_id).await.unwrap();
         assert!(matches!(
             open_space(&transport, &keys, &space_id, false).await,
+            Err(SyncError::SpaceClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_late_marker_overwrite_does_not_reopen_a_closed_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FileTransport::new(dir.path());
+        let keys = Keys::derive(&SpaceKey::generate());
+        let space_id = crate::secrets::new_space_id();
+        open_space(&transport, &keys, &space_id, true)
+            .await
+            .unwrap();
+        close_space(&transport, &keys, &space_id).await.unwrap();
+        // 不支持 `If-None-Match` 的服务端上，迟到的创建会把 space.json 无条件改回
+        // 开放；墓碑还在，读标记之后必须仍判为已关闭。
+        transport
+            .put(SPACE_FILE, SpaceFile::new(&keys, &space_id).encode().unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            open_space(&transport, &keys, &space_id, false).await,
+            Err(SyncError::SpaceClosed)
+        ));
+        assert!(matches!(
+            open_space(&transport, &keys, &space_id, true).await,
+            Err(SyncError::SpaceClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn creating_over_a_tombstone_is_refused_after_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FileTransport::new(dir.path());
+        let keys = Keys::derive(&SpaceKey::generate());
+        let space_id = crate::secrets::new_space_id();
+        // 另一设备已经关了这个空间（先写墓碑），本机的创建还没出发：既没有标记可读，
+        // 「仅创建」也不会失败，只有写完再查墓碑能拦住。
+        let mut closed = SpaceFile::new(&keys, &space_id);
+        closed.closed = true;
+        transport
+            .put(SPACE_CLOSED_FILE, closed.encode().unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            create_marker(&transport, &keys, &space_id).await,
             Err(SyncError::SpaceClosed)
         ));
     }
