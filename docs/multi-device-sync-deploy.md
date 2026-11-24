@@ -125,13 +125,17 @@ WantedBy=multi-user.target
 ## 4. 方案 B：Apache httpd + mod_dav（最标准，条件创建完整）
 
 > 阿里云 ECS（Alibaba Cloud Linux / Ubuntu / Debian）：仓库里的
-> `scripts/deploy-rclaw-webdav-aliyun.sh` 把本节这一套做成一键脚本——装包、建目录与账号、
-> 自签证书、SELinux/firewalld、重启与条件创建自检都做完，最后打印地址、账号和证书指纹；
-> 只剩云平台的安全组要手动放行（见下）。脚本头注释里有可选环境变量。
+> `scripts/deploy-rclaw-webdav-aliyun.sh` 配置 Apache WebDAV——装包、建目录与账号、自签证书、
+> SELinux/firewalld 都做完。**首次建账号或提供 `RCLAW_PASS` 时**会跑本机自检（PROPFIND、
+> MKCOL、条件创建双写 + 读回）；输出「未自检」时，按第 1 节手动补做双写和读回验收。
+> 之后用脚本打印的地址、账号和证书指纹配置客户端；脚本头注释里有可选环境变量
+> （`RCLAW_ALLOW_IPS` 会自动放行本机回环，客户端来源要自己填）。
 >
 > **阿里云安全组**（脚本跑完必须做，否则外网连不上）：控制台 → `ECS` → 实例 → 该实例的
 > 「安全组」→「配置规则」→ 入方向 → 手动添加：协议 `TCP`、端口范围 `8443/8443`（脚本改了
-> `RCLAW_PORT` 就填对应端口）、授权对象填你常用网络的出口 IP（图省事可 `0.0.0.0/0`）。
+> `RCLAW_PORT` 就填对应端口）、授权对象填**各客户端的可信公网出口 IP/CIDR**（单个地址写
+> `x.x.x.x/32`）。出口 IP 经常变（换网络、运营商 NAT）时，按第 10 节用私有组网，不要图省事
+> 开 `0.0.0.0/0`——那等于把这个只靠 Basic 认证的私人 WebDAV 暴露给全网。
 > 云服务器是**两层**防火墙：云平台安全组 + 机内 firewalld/ufw，两边都要放行。
 
 ```apache

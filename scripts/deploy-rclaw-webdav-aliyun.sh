@@ -20,7 +20,8 @@
 #   RCLAW_HOST        客户端填写的主机名/IP；不填则自动探测公网 IP
 #   RCLAW_DOMAIN      有域名时填（配合 RCLAW_CERT/RCLAW_KEY；本脚本不代办 ACME）
 #   RCLAW_CERT/KEY    已有证书/私钥路径（不填则自签，10 年，SAN 含公网 IP）
-#   RCLAW_ALLOW_IPS   只允许这些来源（空格分隔的 IP/CIDR），不填则不限制
+#   RCLAW_ALLOW_IPS   只允许这些来源（空格分隔的 IP/CIDR），不填则不限制；本机回环
+#                     自动放行（脚本要用它做自检）
 #   RCLAW_REGENERATE_CERT=1  强制重新自签（会让所有设备已固定的指纹失效，慎用）
 set -euo pipefail
 
@@ -109,7 +110,7 @@ CONF
         cat <<CONF
         <RequireAll>
             Require valid-user
-            Require ip ${ALLOW_IPS}
+            Require ip 127.0.0.1 ::1 ${ALLOW_IPS}
         </RequireAll>
 CONF
     else
@@ -227,21 +228,29 @@ code=$(curl -sk -o /dev/null -w '%{http_code}' "${basic[@]}" -X PROPFIND \
     -H 'Depth: 0' "https://127.0.0.1:${PORT}/rclaw/") || true
 [ "$code" = 207 ] || fail "PROPFIND 自检失败（HTTP ${code:-无响应}），请看 systemctl status ${SERVICE}"
 
+# 先建 selftest/ 目录（RClaw 自己的自检也用它；已存在时 Apache 返回 405，照常继续）。
+dir_code=$(curl -sk -o /dev/null -w '%{http_code}' "${basic[@]}" -X MKCOL \
+    "https://127.0.0.1:${PORT}/rclaw/selftest/") || true
+case "$dir_code" in
+    200|201|204|301|302|405) ;;
+    *) fail "MKCOL 自检失败（HTTP ${dir_code:-无响应}）：服务端不允许建目录，RClaw 的目录补建会失败" ;;
+esac
+
 probe="https://127.0.0.1:${PORT}/rclaw/selftest/cond-$(date +%s)-$$.txt"
 first=$(curl -sk -o /dev/null -w '%{http_code}' "${basic[@]}" -X PUT \
     -H 'If-None-Match: *' --data-binary 'first' "$probe") || true
 second=$(curl -sk -o /dev/null -w '%{http_code}' "${basic[@]}" -X PUT \
     -H 'If-None-Match: *' --data-binary 'second' "$probe") || true
-kept=$(curl -sk "${basic[@]}" "$probe") || true
+kept=$(curl -fsk "${basic[@]}" "$probe") || kept=''
 curl -sk "${basic[@]}" -X DELETE "$probe" >/dev/null || true
 case "$first" in
     200|201|204) ;;
     *) fail "条件创建首次写入失败（HTTP ${first:-无响应}）" ;;
 esac
-if [ "$second" = 412 ]; then
-    say "    条件创建：第二次写入被拒（412），原内容保留 —— 正确"
+if [ "$second" = 412 ] && [ "$kept" = first ]; then
+    say "    条件创建：第二次写入被拒（412）、读回仍是第一次的内容 —— 正确"
 else
-    fail "条件创建没有被服务端执行（第二次写入 HTTP ${second:-无响应}，内容=$kept）。这会让关闭标记可能被迟到创建覆盖，请检查 mod_dav 配置"
+    fail "条件创建验收未通过（第二次写入 HTTP ${second:-无响应}，读回内容=$kept）。这会让关闭标记可能被迟到创建覆盖，请检查 mod_dav 配置"
 fi
 
 FP=$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 | sed 's/^.*=//')
