@@ -156,6 +156,35 @@ async fn write_closed_tombstone(
     Ok(())
 }
 
+/// 写一份关闭版兼容标记（旧版只认它）。
+async fn write_closed_marker(
+    transport: &dyn SyncTransport,
+    keys: &Keys,
+    space_id: &str,
+) -> Result<()> {
+    let mut file = SpaceFile::new(keys, space_id);
+    file.closed = true;
+    transport::put_checked(transport, SPACE_FILE, file.encode()?).await?;
+    Ok(())
+}
+
+/// 读兼容标记的关闭状态：已验证关闭 `Some(true)`、已验证开放 `Some(false)`，
+/// 缺失或解析不了 `None`（都不算依据）。身份不符、读取失败照常传播。
+pub async fn marker_closed_state(
+    transport: &dyn SyncTransport,
+    keys: &Keys,
+    space_id: &str,
+) -> Result<Option<bool>> {
+    match read_space(transport).await {
+        Ok(Some(file)) => {
+            file.verify(keys, space_id)?;
+            Ok(Some(file.closed))
+        }
+        Ok(None) | Err(SyncError::Corrupt(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// 确认关闭墓碑在：兼容标记已经是关闭版、墓碑却没写成（上一代关闭或半次关闭）时补写。
 ///
 /// 只凭「标记已关闭」就往下走的话，迟到创建把标记覆盖回开放后，新版也会重新接受这个
@@ -174,7 +203,12 @@ pub async fn ensure_closed(
             tracing::warn!("关闭墓碑损坏，重写: {error}");
             write_closed_tombstone(transport, keys, space_id).await
         }
-        Err(error) => Err(error),
+        // 读不出来（权限、网络、身份不符）也不能挡住关闭：到这里来的调用点都已经确认
+        // 这个空间该关。要写的本来就是关闭版，不会把开放变封闭。
+        Err(error) => {
+            tracing::warn!("关闭墓碑读不出来，直接写: {error}");
+            write_closed_tombstone(transport, keys, space_id).await
+        }
     }
 }
 
@@ -184,10 +218,7 @@ pub async fn close_space(transport: &dyn SyncTransport, keys: &Keys, space_id: &
     // 半途失败都已经留下它；旧版的兼容标记随后补，写不成也不影响新版判关闭。
     // 已经有效的墓碑不重写：非原子 PUT 重复写可能把好的墓碑截断，而它正是关闭的依据。
     ensure_closed(transport, keys, space_id).await?;
-    let mut file = SpaceFile::new(keys, space_id);
-    file.closed = true;
-    transport::put_checked(transport, SPACE_FILE, file.encode()?).await?;
-    Ok(())
+    write_closed_marker(transport, keys, space_id).await
 }
 
 /// 只在远端确实显示「关闭已经开始」时把关闭补完：兼容标记已关闭，或墓碑已经写下。
@@ -240,7 +271,8 @@ pub async fn ensure_closed_if_started(
     if !started {
         return Ok(false);
     }
-    close_space(transport, keys, space_id).await?;
+    // 墓碑已经读成有效的了：只补兼容标记，不再重复读、写墓碑。
+    write_closed_marker(transport, keys, space_id).await?;
     Ok(true)
 }
 
@@ -455,6 +487,36 @@ mod tests {
             open_space(&transport, &keys, &space_id, false).await,
             Err(SyncError::SpaceClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn the_marker_state_is_read_only_when_it_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = FileTransport::new(dir.path());
+        let keys = Keys::derive(&SpaceKey::generate());
+        let space_id = crate::secrets::new_space_id();
+        assert_eq!(
+            marker_closed_state(&transport, &keys, &space_id)
+                .await
+                .unwrap(),
+            None
+        );
+        open_space(&transport, &keys, &space_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            marker_closed_state(&transport, &keys, &space_id)
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        close_space(&transport, &keys, &space_id).await.unwrap();
+        assert_eq!(
+            marker_closed_state(&transport, &keys, &space_id)
+                .await
+                .unwrap(),
+            Some(true)
+        );
     }
 
     #[tokio::test]

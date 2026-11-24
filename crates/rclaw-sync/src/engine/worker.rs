@@ -53,6 +53,9 @@ const FOCUS_RETRY: Duration = Duration::from_secs(15);
 /// 拿不到引擎锁：第一次很快再试（多半是上一个引擎线程还在收尾），之后慢慢试。
 const STANDBY_FIRST: Duration = Duration::from_secs(2);
 const STANDBY_RETRY: Duration = Duration::from_secs(30);
+/// 「补完空间关闭」放到后台做时最多等这么久：卡住的旧存储不能把这个任务永远挂着，
+/// 记录本来就留着重试。
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 本机这边没准备好（目录、数据库出错）：隔这么久再试。
 const OPEN_RETRY: Duration = Duration::from_secs(30);
 /// 拆任务时等已经开始的附件提交阶段结束最多这么久（换空间 / 清理之前）。等不到也往下
@@ -711,6 +714,10 @@ struct Worker {
     /// 附件的上传、下载任务。
     uploads: Option<JoinHandle<()>>,
     downloads: Option<JoinHandle<()>>,
+    /// 「补完空间关闭」的后台任务与它的回传（旧存储卡住时不占住主循环）。
+    close_task: Option<JoinHandle<()>>,
+    close_done_tx: mpsc::UnboundedSender<std::result::Result<(), String>>,
+    close_done: mpsc::UnboundedReceiver<std::result::Result<(), String>>,
     /// 约好的下一轮。
     next: Option<(Kind, Instant)>,
     /// 出错之后，在这之前不自动重试。
@@ -756,6 +763,7 @@ impl Worker {
         commands: mpsc::UnboundedReceiver<Cmd>,
     ) -> Worker {
         let now = Instant::now();
+        let (close_done_tx, close_done) = mpsc::unbounded_channel();
         Worker {
             shared,
             config,
@@ -766,6 +774,9 @@ impl Worker {
             session: None,
             uploads: None,
             downloads: None,
+            close_task: None,
+            close_done_tx,
+            close_done,
             next: None,
             hold_until: None,
             failures: 0,
@@ -801,6 +812,7 @@ impl Worker {
                     None | Some(Cmd::Stop) => break,
                     Some(cmd) => self.handle(cmd).await,
                 },
+                Some(report) = self.close_done.recv() => self.on_close_done(report),
                 _ = self.shared.kick.notified() => self.request(Kind::Full, Duration::ZERO),
                 _ = sleep_until(wake) => self.on_timer().await,
             }
@@ -827,13 +839,48 @@ impl Worker {
         wake
     }
 
-    /// 把退出时留下的「补完空间关闭」记录做完；做不完就过一会儿再试（与当前连接无关）。
-    async fn finish_pending_close(&mut self) {
-        match space::finish_pending_close(&self.shared.ctx.paths, &self.config, &self.secrets).await {
+    /// 把「补完空间关闭」放到后台做：旧存储卡住时不能占住这一轮的轮询与命令。
+    fn spawn_pending_close(&mut self) {
+        if self.close_task.is_some() {
+            return;
+        }
+        if self.lock.is_none() {
+            // 没有引擎锁（别的进程接手 / 同步被关）：不动记录，也不发远端请求。
+            self.close_retry_at = None;
+            return;
+        }
+        let (paths, config, secrets) = (
+            self.shared.ctx.paths.clone(),
+            self.config.clone(),
+            self.secrets.clone(),
+        );
+        let done = self.close_done_tx.clone();
+        self.close_task = Some(tokio::spawn(async move {
+            let report = match tokio::time::timeout(
+                CLOSE_TIMEOUT,
+                space::finish_pending_close(&paths, &config, &secrets),
+            )
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("补完空间关闭超时".to_string()),
+            };
+            let _ = done.send(report);
+        }));
+    }
+
+    fn on_close_done(&mut self, report: std::result::Result<(), String>) {
+        self.close_task = None;
+        match report {
             Ok(()) => self.close_retry_at = None,
             Err(error) => {
                 tracing::warn!("补完上次没做完的空间关闭失败（稍后再试）: {error}");
-                self.close_retry_at = Some(Instant::now() + STANDBY_RETRY);
+                // 已经不拿着引擎锁了就别再排期：不是本进程该做的事。
+                self.close_retry_at = self
+                    .lock
+                    .is_some()
+                    .then(|| Instant::now() + STANDBY_RETRY);
             }
         }
     }
@@ -842,7 +889,7 @@ impl Worker {
         let now = Instant::now();
         if self.close_retry_at.is_some_and(|at| at <= now) {
             self.close_retry_at = None;
-            self.finish_pending_close().await;
+            self.spawn_pending_close();
         }
         if self.session.is_none() {
             if self.reopen_at.is_some_and(|at| at <= now) {
@@ -1207,6 +1254,7 @@ impl Worker {
                     self.open_note = Some(CLOSED_NOTE.into());
                     self.shared.set_state("off", None);
                     self.reopen_at = None;
+                    self.close_retry_at = None;
                     return;
                 }
             }
@@ -1280,8 +1328,9 @@ impl Worker {
         // 配置、密钥与意图都已经收敛到同一套：保存协议锁到这里就可以放了。
         drop(protocol_lock);
         // 退出时没能补完的空间关闭（重置的记录在退出时被丢掉了）：之后只靠那条记录
-        // 收尾。放在空间切换恢复之前做，那个记录自己坏了也不挡着这里。
-        self.finish_pending_close().await;
+        // 收尾。放在空间切换恢复之前做，那个记录自己坏了也不挡着这里；放到后台做，
+        // 旧存储卡住时不挡这一轮。
+        self.spawn_pending_close();
         // 上一次重置 / 退出没做完：按落盘的记录与远端的实际状态接着做（重置可能已经把
         // 本机换到了新空间），再按正常打开往下走。
         if let Err(error) =
@@ -1381,6 +1430,10 @@ impl Worker {
     /// 一个任务）。把停了的那个重新起起来——上传任务等下一次被叫醒（一轮同步成功）再干活；
     /// 下载任务手上排着的请求丢了，用户再点一次就又排上。
     fn revive_transfers(&mut self) {
+        // 后台收尾任务意外退出（没能回传结果）时清掉标志：记录本来就在，下次打开再试。
+        if self.close_task.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.close_task = None;
+        }
         let Some(live) = self.session.as_ref().map(|session| session.live.clone()) else {
             return;
         };

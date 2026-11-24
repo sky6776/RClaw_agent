@@ -429,6 +429,42 @@ fn pending_close_add(paths: &SyncPaths, close: PendingClose) -> Result<()> {
     pending_close_save(paths, &closes)
 }
 
+/// 同一存储位置上，连接设置（证书指纹、区域、明文 HTTP）以当前这份为准：退出之后
+/// 用户可能改过它们。位置本身仍用记录里的——配对码只带空间 ID 与密钥，同一个空间
+/// 可以复制到别处；不能因为「位置标识相同」就把收尾改投到另一个副本上。
+fn refresh_connection_settings(target: &mut SyncConfig, current: &SyncConfig) {
+    match target.transport.as_str() {
+        "webdav" => {
+            target.webdav.allow_http = current.webdav.allow_http;
+            target.webdav.pinned_cert_sha256 = current.webdav.pinned_cert_sha256.clone();
+        }
+        "s3" => {
+            target.s3.allow_http = current.s3.allow_http;
+            target.s3.region = current.s3.region.clone();
+        }
+        _ => {}
+    }
+}
+
+/// 把收尾结果并回最新的队列：成功的目标删掉；失败的目标只把这次确认过的事实
+/// （`closed_seen`）并回去，别把开头的快照整批写回——期间别的进程可能追加了新条目。
+fn merge_close_outcomes(
+    latest: &mut Vec<PendingClose>,
+    outcomes: &[(PendingClose, bool)],
+) {
+    for (close, done) in outcomes {
+        let target = |entry: &PendingClose| {
+            same_close_target(entry, &close.storage, &close.previous.space_id)
+        };
+        if *done {
+            latest.retain(|entry| !target(entry));
+        } else if let Some(entry) = latest.iter_mut().find(|entry| target(entry)) {
+            entry.closed_seen |= close.closed_seen;
+        }
+        // 最新队列里已经没有这一条：另一进程的收尾做完了，不复活。
+    }
+}
+
 /// 把退出前没能收尾的关闭（[`PendingClose`]）补完：只在远端确实显示关闭已经开始时
 /// 动手（[`remote::ensure_closed_if_started`]），做完删记录，失败留着下次再试。
 ///
@@ -439,22 +475,25 @@ pub(crate) async fn finish_pending_close(
     config: &SyncConfig,
     secrets: &Secrets,
 ) -> Result<()> {
-    let mut left = Vec::new();
+    let mut outcomes = Vec::new();
     let mut first_error = None;
-    for close in pending_close_load(paths)? {
-        match finish_one_close(&close, config, secrets).await {
-            Ok(()) => {}
+    for mut close in pending_close_load(paths)? {
+        let done = match finish_one_close(&mut close, config, secrets).await {
+            Ok(()) => true,
             Err(error) => {
                 tracing::warn!(
                     "补完空间 {} 的关闭失败（稍后再试）: {error}",
                     close.previous.space_id
                 );
                 first_error.get_or_insert(error);
-                left.push(close);
+                false
             }
-        }
+        };
+        outcomes.push((close, done));
     }
-    pending_close_save(paths, &left)?;
+    let mut latest = pending_close_load(paths)?;
+    merge_close_outcomes(&mut latest, &outcomes);
+    pending_close_save(paths, &latest)?;
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
@@ -462,7 +501,7 @@ pub(crate) async fn finish_pending_close(
 }
 
 async fn finish_one_close(
-    close: &PendingClose,
+    close: &mut PendingClose,
     config: &SyncConfig,
     secrets: &Secrets,
 ) -> Result<()> {
@@ -472,10 +511,10 @@ async fn finish_one_close(
     let mut previous = close.previous.clone();
     let mut at = close.storage.clone();
     if storage_binding(&at) == storage_binding(config) {
-        // 同一个存储位置：连接设置以当前这份为准（退出之后可能换过 TLS 指纹）；当前
-        // 设置里还有这个账户的凭据时凭据也换（可能按「设备丢失」流程改过密码）——
-        // 本机已经退出、没有凭据时，记录里的那份才是能用的。
-        at = config.clone();
+        // 同一个存储位置：当前设置里还有这个账户的凭据时凭据换成当前这份（退出之后
+        // 可能按「设备丢失」流程改过密码）——本机已经退出、没有凭据时，记录里的那份
+        // 才是能用的。连接设置同样以当前为准。
+        refresh_connection_settings(&mut at, config);
         if !secrets.storage_secret(config).is_empty() {
             refresh_credentials(&mut previous, secrets);
         }
@@ -489,16 +528,14 @@ async fn finish_one_close(
             return Ok(());
         }
     };
-    let root = match blocking(move || root_transport(&at, &previous)).await {
-        Ok(root) => root,
-        // 记录里的存储设置本身用不了（地址不合法、缺凭据）：同样补不了，丢掉。
-        Err(error @ SyncError::Transport(crate::error::TransportError::Config(_))) => {
-            tracing::warn!("收尾记录里的存储设置不可用，丢弃这条: {error}");
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
+    let root = blocking(move || root_transport(&at, &previous)).await?;
     let transport = Scoped::new(root, &space_id);
+    // 先看一眼标记：验证过是关闭版就把这个事实记进记录（本次补写再失败，下一次读到
+    // 被迟到创建改回开放的标记时，仍能按关闭补完）。
+    if !close.closed_seen {
+        close.closed_seen =
+            remote::marker_closed_state(&transport, &keys, &space_id).await? == Some(true);
+    }
     remote::ensure_closed_if_started(&transport, &keys, &space_id, close.closed_seen).await?;
     Ok(())
 }
@@ -1230,6 +1267,41 @@ mod tests {
             Err(SyncError::SpaceClosed)
         ));
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_outcomes_merge_into_the_latest_queue() {
+        let secrets = paired();
+        let config_at = |dir: &str| {
+            let mut config = SyncConfig::default();
+            config.transport = "file".into();
+            config.file.dir = dir.into();
+            config
+        };
+        let first = config_at("C:/sync-a");
+        let second = config_at("C:/sync-b");
+        let entry = |storage: &SyncConfig, closed_seen: bool| PendingClose {
+            storage: storage.clone(),
+            previous: secrets.clone(),
+            closed_seen,
+        };
+        // 开头的快照里有一条失败、一条成功；期间另一进程又追加了一条。
+        let mut latest = vec![entry(&first, false), entry(&second, false)];
+        latest.push(entry(&config_at("C:/sync-c"), false));
+        merge_close_outcomes(&mut latest, &[(entry(&first, true), false), (entry(&second, false), true)]);
+        // 失败的那条留着，并带上这次确认过的事实；成功的那条删掉；新追加的不动。
+        assert_eq!(latest.len(), 2);
+        let kept = latest
+            .iter()
+            .find(|close| same_close_target(close, &first, &secrets.space_id))
+            .unwrap();
+        assert!(kept.closed_seen);
+        assert!(!latest
+            .iter()
+            .any(|close| same_close_target(close, &second, &secrets.space_id)));
+        assert!(latest
+            .iter()
+            .any(|close| close.storage.file.dir == "C:/sync-c"));
     }
 
     #[test]
