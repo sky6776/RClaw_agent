@@ -415,29 +415,16 @@ fn remove_close_file(path: &Path) -> Result<()> {
 }
 
 fn pending_close_load(paths: &SyncPaths) -> Result<Vec<PendingClose>> {
-    let mut closes = load_close_file(&pending_close_path(paths))?;
-    for legacy in load_close_file(&pending_close_legacy_path(paths))? {
-        if legacy.id.is_empty() {
-            // 没有身份的没法按身份对上：追加到队尾。旧版的失败恢复也是往队尾追加，
-            // 前置会挤掉封顶时受保护的最老凭据（第一条）。
-            closes.push(legacy);
-            continue;
-        }
-        match closes.iter_mut().find(|close| close.id == legacy.id) {
-            Some(current) => {
-                // 同一个身份，旧文件里可能有旧版在途闭包后来写下的东西：确认事实取并
-                //（丢了这个事实，重读标记可能已经读不到关闭版了）；标记不一致说明它
-                // 被旧版后来当成新活恢复过——换一个确定的新标记，这次清理边界认不出
-                // 它，下一轮再结算。
-                current.closed_seen |= legacy.closed_seen;
-                if !legacy.mark.is_empty() && legacy.mark != current.mark {
-                    current.mark = format!("dup-{}", legacy.mark);
-                }
-            }
-            None => closes.push(legacy),
-        }
+    let closes = load_close_file(&pending_close_path(paths))?;
+    if pending_close_path(paths).exists() {
+        // 新文件已经在，它就是唯一的队列。旧文件里只可能是旧版停用后它的闭包后来
+        // 写下的东西（失败恢复的新标记、迟到的确认）；把它们合并进来会被旧标记
+        // 盖住新版恢复刚换发的标记、重复条目还会挤掉封顶时受保护的凭据。旧版这些
+        // 晚到写入一律不采用——等价于旧进程当场退出、没写成。
+        return Ok(closes);
     }
-    Ok(closes)
+    // 第一次迁移：队列还只在旧文件里。
+    load_close_file(&pending_close_legacy_path(paths))
 }
 
 fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> {
@@ -449,14 +436,17 @@ fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> 
         &pending_close_path(paths),
         &serde_json::to_vec_pretty(closes)?,
     )?;
-    // 旧文件里的记录已经并进来了：删掉它（失败就报错重试）。留着一个旧文件，旧版在途
-    // 的结算闭包就还能按旧版规则动它。
-    remove_close_file(&pending_close_legacy_path(paths))
+    // 旧文件从此不参与加载，删得掉就删（删不掉只是留个没人读的文件，不报错）。
+    if let Err(error) = remove_close_file(&pending_close_legacy_path(paths)) {
+        tracing::warn!("删除旧版收尾队列文件失败（已不再使用，忽略）: {error}");
+    }
+    Ok(())
 }
 
 fn pending_close_clear(paths: &SyncPaths) -> Result<()> {
-    // 先删旧文件、再删新文件：中途退出时新文件还在，下一次加载还能按记录身份清掉它
-    // 们；反过来先删新文件，旧文件里已结算目标的失效凭据会孤零零留下，再没人结算。
+    // 先删旧文件、再删新文件：新文件删了而旧文件还在时，下一次加载会把它当成「第一次
+    // 迁移」读回来（已结算目标的失效凭据又活了）；反过来中途退出，新文件还在，下一轮
+    // 还能按记录身份重清。
     remove_close_file(&pending_close_legacy_path(paths))?;
     remove_close_file(&pending_close_path(paths))
 }
@@ -2093,9 +2083,10 @@ mod tests {
         assert_eq!(closes[0].id, close.id);
     }
 
-    /// 旧版在途闭包在迁移之后仍往旧文件写：确认事实要并进来，不能整条旧副本丢掉。
+    /// 第一次迁移之后旧文件不再参与加载：旧版闭包的晚到写入（新标记、迟到的确认）
+    /// 一律不采用——用了会盖掉新版恢复刚换发的标记、重复条目还会挤掉受保护的凭据。
     #[tokio::test]
-    async fn a_late_legacy_confirmation_is_merged_into_the_new_record() {
+    async fn a_late_legacy_write_is_ignored_after_the_first_migration() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
         let mut config = SyncConfig::default();
@@ -2109,26 +2100,29 @@ mod tests {
             closed_seen: false,
         };
         pending_close_save(&ctx.paths, &[close.clone()]).unwrap();
-        // 迁移之后旧版闭包才把它验证到的「已确认关闭」写回旧文件。
+        // 迁移之后旧版闭包又把同一条（带它验证到的确认事实、换了标记）和一条独有
+        // 记录写回旧文件。
         let mut late = close.clone();
         late.closed_seen = true;
+        late.mark = crate::ids::random_hex::<8>();
+        let mut legacy_only = close.clone();
+        legacy_only.id = crate::ids::random_hex::<8>();
         std::fs::write(
             pending_close_legacy_path(&ctx.paths),
-            serde_json::to_vec_pretty(&[late]).unwrap(),
+            serde_json::to_vec_pretty(&[late, legacy_only]).unwrap(),
         )
         .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
-        assert_eq!(closes.len(), 1);
-        assert!(closes[0].closed_seen, "旧版后来写下的确认事实不能丢");
-        // 下一次保存把事实写进新文件并清掉旧文件。
-        pending_close_save(&ctx.paths, &closes).unwrap();
-        assert!(!pending_close_legacy_path(&ctx.paths).exists());
-        assert!(pending_close_load(&ctx.paths).unwrap()[0].closed_seen);
+        assert_eq!(closes.len(), 1, "旧文件不再参与加载");
+        assert_eq!(closes[0].id, close.id);
+        assert_eq!(closes[0].mark, close.mark);
+        assert!(!closes[0].closed_seen);
     }
 
-    /// 旧版失败恢复在迁移之后重建同 ID 记录：新标记算「尝试之后的活」，这次不删。
+    /// 新版自己的失败恢复换发的新标记，不会被旧文件里残留的旧标记盖掉（这次清理边界
+    /// 认不出它，记录留着）。
     #[tokio::test]
-    async fn a_late_legacy_restore_keeps_its_record_for_another_round() {
+    async fn a_new_restore_is_not_masked_by_a_stale_legacy_copy() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
         let mut config = SyncConfig::default();
@@ -2143,14 +2137,17 @@ mod tests {
         };
         pending_close_save(&ctx.paths, &[close.clone()]).unwrap();
         let marks = pending_close_marks(&ctx.paths).await.unwrap();
-        // 旧版闭包在迁移之后把同一条记录按新标记写回旧文件（它的失败恢复）。
-        let mut restored = close.clone();
-        restored.mark = crate::ids::random_hex::<8>();
+        // 旧文件里先有一份旧标记的副本，随后新版失败恢复把标记换掉（写进新文件）。
+        let mut stale = close.clone();
+        stale.mark = crate::ids::random_hex::<8>();
         std::fs::write(
             pending_close_legacy_path(&ctx.paths),
-            serde_json::to_vec_pretty(&[restored]).unwrap(),
+            serde_json::to_vec_pretty(&[stale]).unwrap(),
         )
         .unwrap();
+        pending_close_restore(&ctx.paths, &close).await.unwrap();
+        let restored = pending_close_load(&ctx.paths).unwrap();
+        assert_ne!(restored[0].mark, close.mark, "恢复要换发新标记");
         pending_close_finish_target(
             &ctx.paths,
             &config,
@@ -2162,47 +2159,7 @@ mod tests {
         .await
         .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
-        assert_eq!(closes.len(), 1, "旧版恢复之后出现的活不能在这次删掉");
-        // 事实也并进来了；标记换成一个确定值（下一轮能正常结算）。
-        assert!(closes[0].closed_seen);
-        let next_marks = pending_close_marks(&ctx.paths).await.unwrap();
-        assert!(next_marks.contains(close_mark(&closes[0]).to_string().as_str()));
-    }
-
-    /// 旧文件独有记录追加在队尾：封顶不会因此淘汰靠前的最老（可能是唯一有效）凭据。
-    #[tokio::test]
-    async fn a_legacy_only_record_is_appended_after_the_new_queue() {
-        let (_tmp, ctx) = crate::testing::ctx();
-        let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
-        let entry = || PendingClose {
-            id: crate::ids::random_hex::<8>(),
-            mark: crate::ids::random_hex::<8>(),
-            storage: config.clone(),
-            previous: secrets.clone(),
-            closed_seen: true,
-        };
-        // 新文件已封到四条：A 是最老、也是唯一有效的那条。
-        let (a, c, d, e) = (entry(), entry(), entry(), entry());
-        pending_close_save(&ctx.paths, &[a.clone(), c, d, e]).unwrap();
-        // 旧版闭包后来又恢复了一条 B（同目标、身份不同）。
-        let b = entry();
-        std::fs::write(
-            pending_close_legacy_path(&ctx.paths),
-            serde_json::to_vec_pretty(&[b.clone()]).unwrap(),
-        )
-        .unwrap();
-        let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
-        assert!(
-            closes.iter().any(|close| close.id == a.id),
-            "最老那条不能被封顶淘汰"
-        );
-        // 封顶只淘汰一条（队首之外的），B 的恢复也在。
-        assert_eq!(closes.len(), 4);
-        assert!(closes.iter().any(|close| close.id == b.id));
-        assert_eq!(pending_close_load(&ctx.paths).unwrap().len(), 4);
+        assert_eq!(closes.len(), 1, "取样之后的新版恢复不能当作旧记录删掉");
     }
 
     /// 成功清理只删尝试开始时已在盘上的记录：并发失败刚补回来的（换了标记）要留着。
