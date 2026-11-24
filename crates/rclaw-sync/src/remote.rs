@@ -52,26 +52,32 @@ async fn create_marker(
 ) -> Result<()> {
     let file = SpaceFile::new(keys, space_id);
     let written = transport::put_new_checked(transport, SPACE_FILE, file.encode()?).await;
-    // 不管「仅创建」成功还是撞上已有标记，写完都再看一眼墓碑：不实现 `If-None-Match`
-    // 的服务端会把这次创建当成普通覆盖，另一设备先写下的关闭标记会被改回开放。
-    let closed = read_closed(transport, keys, space_id).await?;
     match written {
         Ok(()) => {
-            if closed {
+            // 墓碑在标记写入之后再查：最后一次观察留给只会从缺失变成存在的关闭证据。
+            if read_closed(transport, keys, space_id).await? {
                 return Err(SyncError::SpaceClosed);
             }
             Ok(())
         }
-        Err(error) => match read_space(transport).await {
-            Ok(Some(existing)) => {
-                existing.verify(keys, space_id)?;
-                if existing.closed || closed {
-                    return Err(SyncError::SpaceClosed);
+        Err(error) => {
+            // 读回顺序不能反：标记可能被迟到的创建覆盖，先读标记、最后查墓碑，
+            // 读到开放标记时关闭才确实还没完成。
+            let existing = read_space(transport).await;
+            let closed = read_closed(transport, keys, space_id).await?;
+            match existing {
+                Ok(Some(existing)) => {
+                    existing.verify(keys, space_id)?;
+                    if existing.closed || closed {
+                        return Err(SyncError::SpaceClosed);
+                    }
+                    Ok(())
                 }
-                Ok(())
+                // 标记已经读不到了（另一设备的关闭把目录收了），墓碑在就是关闭。
+                Ok(None) if closed => Err(SyncError::SpaceClosed),
+                _ => Err(error.into()),
             }
-            _ => Err(error.into()),
-        },
+        }
     }
 }
 
@@ -143,10 +149,10 @@ pub async fn close_space(transport: &dyn SyncTransport, keys: &Keys, space_id: &
     let mut file = SpaceFile::new(keys, space_id);
     file.closed = true;
     let body = file.encode()?;
-    // 先写墓碑再改标记：不实现条件写入的服务端上，迟到的创建能把 space.json 改回
-    // 开放；墓碑不会被创建路径碰到，写下去这个空间的废弃状态就有了据。
-    transport::put_checked(transport, SPACE_CLOSED_FILE, body.clone()).await?;
-    transport::put_checked(transport, SPACE_FILE, body).await?;
+    // 先改兼容标记、最后写墓碑：墓碑一出现，新版设备就按关闭处理；反过来先写墓碑
+    // 再改标记的话，后一步失败会留下「新版已关闭、旧版仍开放」的分歧状态。
+    transport::put_checked(transport, SPACE_FILE, body.clone()).await?;
+    transport::put_checked(transport, SPACE_CLOSED_FILE, body).await?;
     Ok(())
 }
 
@@ -254,6 +260,9 @@ mod tests {
     use super::*;
     use crate::crypto::SpaceKey;
     use crate::transport::file::FileTransport;
+    use crate::error::TransportError;
+    use crate::transport::TransportResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn space_file_is_created_once_and_checked_afterwards() {
@@ -324,6 +333,76 @@ mod tests {
             .put(SPACE_CLOSED_FILE, closed.encode().unwrap())
             .await
             .unwrap();
+        assert!(matches!(
+            create_marker(&transport, &keys, &space_id).await,
+            Err(SyncError::SpaceClosed)
+        ));
+    }
+
+    /// 测试存储：不支持条件写入；标记被读过之前墓碑不可见（模拟关闭正好落在仅创建
+    /// 失败之后的读回中途）；`put_new` 一律报错（本机的创建没落到存储上）。
+    struct LateClose {
+        inner: FileTransport,
+        marker_reads: AtomicUsize,
+        closed: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl SyncTransport for LateClose {
+        async fn list(&self, prefix: &str) -> TransportResult<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn get(&self, key: &str, max: u64) -> TransportResult<Vec<u8>> {
+            if key == SPACE_CLOSED_FILE {
+                if self.marker_reads.load(Ordering::SeqCst) == 0 {
+                    return Err(TransportError::NotFound(SPACE_CLOSED_FILE.into()));
+                }
+                return Ok(self.closed.clone());
+            }
+            if key == SPACE_FILE {
+                self.marker_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(key, max).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>) -> TransportResult<()> {
+            self.inner.put(key, body).await
+        }
+
+        async fn put_new(&self, _key: &str, _body: Vec<u8>) -> TransportResult<()> {
+            Err(TransportError::Other("写入在存储生效前失败".into()))
+        }
+
+        async fn delete(&self, key: &str) -> TransportResult<()> {
+            self.inner.delete(key).await
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_close_that_lands_during_the_readback_is_not_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = FileTransport::new(dir.path());
+        let keys = Keys::derive(&SpaceKey::generate());
+        let space_id = crate::secrets::new_space_id();
+        // 迟到的创建已经把 space.json 改回开放，本机的仅创建还没落到存储上。
+        inner
+            .put(SPACE_FILE, SpaceFile::new(&keys, &space_id).encode().unwrap())
+            .await
+            .unwrap();
+        let mut closed = SpaceFile::new(&keys, &space_id);
+        closed.closed = true;
+        let transport = LateClose {
+            inner,
+            marker_reads: AtomicUsize::new(0),
+            closed: closed.encode().unwrap(),
+        };
+        // 读回开放标记之后才看到墓碑：必须按已关闭处理，先查墓碑的旧顺序会把这次
+        // 关闭漏掉。
         assert!(matches!(
             create_marker(&transport, &keys, &space_id).await,
             Err(SyncError::SpaceClosed)
