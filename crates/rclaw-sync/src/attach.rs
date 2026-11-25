@@ -234,19 +234,6 @@ pub(crate) enum LocalObject {
     Intact(BlobRow),
 }
 
-/// 按对象名看本机的登记。`blob_id` 可能是旧版本按明文摘要登记的内联缓存：内容对得上
-/// 就当场归一（登记与消息清单一起改），返回的登记里已经是线上对象名。
-pub(crate) fn check_local_object(ctx: &Ctx, keys: &Keys, blob_id: &str) -> Result<LocalObject> {
-    let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob_id))?;
-    let Some(row) = row else {
-        return Ok(LocalObject::Unknown);
-    };
-    if row.state == BLOB_REMOTE {
-        return Ok(LocalObject::Unknown);
-    }
-    check_local_row(ctx, keys, row)
-}
-
 fn check_local_row(ctx: &Ctx, keys: &Keys, row: BlobRow) -> Result<LocalObject> {
     // 路径不安全（经过链接、拼不出本机的名字）：按「验不了」处理，由别处照常兜底。
     let Ok(path) = ctx.env.checked_path(&row.rel_path) else {

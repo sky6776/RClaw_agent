@@ -11,6 +11,7 @@ import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import {
   AttachmentCard,
+  markAttachmentChanged,
   messageFileRefs,
   useChatAttachmentsFailed,
   readableAtPath,
@@ -18,6 +19,12 @@ import {
   useChatAttachments,
   useChatAttachmentsReady,
 } from "./SyncAttachments";
+
+/** 后端的「内容对不上」错误（被就地改写过）。文案出自 commands::sync / commands 的
+ *  核对入口，改文案时要一起改这里；其他错误（不存在、太大、读不了）不算。 */
+function changedRead(e: unknown): boolean {
+  return String(e).includes("已经不是这条消息引用的那一份");
+}
 
 /** 会话流内嵌媒体预览条目。 */
 export interface PreviewItem {
@@ -347,11 +354,20 @@ export default function MediaPreviews({
       const itemKey = keyFor(item);
       if (videoRequested.current.has(itemKey)) continue;
       videoRequested.current.add(itemKey);
+      const blob = mine.get(item.path)?.blob;
       api
         // 海报帧用摘要缓存的结论核对（不整读整个视频）；点播时再直读核对一次。
-        .mediaStreamUrl(item.path, chatId, mine.get(item.path)?.blob, false)
+        .mediaStreamUrl(item.path, chatId, blob, false)
         .then((url) => setVideoUrls((prev) => ({ ...prev, [itemKey]: url })))
-        .catch(() => setVideoUrls((prev) => ({ ...prev, [itemKey]: "" })));
+        .catch((e) => {
+          // 失败不占着去重集合：清单核对出这一条之后 effect 要能再试一次（否则
+          // 预算外的视频永远出不来内联播放器）。
+          videoRequested.current.delete(itemKey);
+          // 内容对不上（缓存副本被改写过）：这张卡立刻换成附件卡（重新下载），
+          // 不等清单下一轮核对。
+          if (blob && changedRead(e)) markAttachmentChanged({ path: item.path, blob });
+          setVideoUrls((prev) => ({ ...prev, [itemKey]: "" }));
+        });
     }
   }, [shown, awayPaths, ready, mine, chatId]);
 
@@ -369,14 +385,21 @@ export default function MediaPreviews({
       const itemKey = keyFor(item);
       if (requested.current.has(itemKey)) continue;
       requested.current.add(itemKey);
+      const blob = mine.get(item.path)?.blob;
       void api
         // 卡片用屏幕级预览图（后端缩到长边 1440 并缓存）：不再传输/解码
         // 12MP 原图（9MB base64 + 全图解码是真机点开图片慢的源头）。
-        .mediaPreview(item.path, chatId, mine.get(item.path)?.blob)
+        .mediaPreview(item.path, chatId, blob)
         .then((r) =>
           setUrls((prev) => ({ ...prev, [itemKey]: `data:${r.mime};base64,${r.base64}` })),
         )
-        .catch(() => setUrls((prev) => ({ ...prev, [itemKey]: "" })));
+        .catch((e) => {
+          // 一次暂时性读失败不该把这张图永久降级成「点开」：去重集合释放，清单
+          // 下一次刷新时再试。
+          requested.current.delete(itemKey);
+          if (blob && changedRead(e)) markAttachmentChanged({ path: item.path, blob });
+          setUrls((prev) => ({ ...prev, [itemKey]: "" }));
+        });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shown, awayPaths, ready, mine, chatId]);
@@ -444,7 +467,12 @@ export default function MediaPreviews({
         : api.openMedia(item.path);
     void open.catch((e) => {
       onError?.(`打开媒体失败: ${String(e)}`);
-      // 核对没过（文件被就地改写过）：重取清单，把这张卡换成「重新下载」。
+      if (attachment && changedRead(e)) {
+        // 核对没过（文件被就地改写过）：这条立刻按「对不上」出附件卡（带重新
+        // 下载），不等清单下一轮核对（预算外的那条可能根本轮不到）。
+        markAttachmentChanged(attachment);
+      }
+      // 重取清单：核对过的条目状态会跟着变。
       refreshSyncAttachments();
     });
   };
@@ -593,8 +621,11 @@ export default function MediaPreviews({
                   .catch((e) => {
                     if (!mountedRef.current) return;
                     onError?.(`打开视频失败: ${String(e)}`);
-                    // 核对没过（文件被改写）：重取清单，卡片会换成「重新下载」，
-                    // 不再留一张每次点都失败的帧卡。
+                    // 核对没过（文件被改写）：这张卡立刻按「对不上」出附件卡，
+                    // 并重取清单核对过的状态会跟着变。
+                    if (blob && changedRead(e)) {
+                      markAttachmentChanged({ path: it.path, blob });
+                    }
                     refreshSyncAttachments();
                   });
               }}

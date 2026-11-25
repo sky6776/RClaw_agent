@@ -1017,9 +1017,17 @@ fn version_with(file: Option<&std::fs::File>, meta: &std::fs::Metadata) -> Optio
 }
 
 /// 这个文件的版本标识；修改时间读不出来（判不了有没有变）时返回 `None`。
+///
+/// 能打开就把字段全部取自这个句柄（Windows 的变更时间本来就只能从句柄取）：两次 stat
+/// 之间文件被原子替换时，也不会拼出一个「长度来自旧文件、变更时间来自新文件」的混合
+/// 版本。打不开（权限之类）时退回调用方给的那一份元数据。
 pub(crate) fn version_of(path: &Path, meta: &std::fs::Metadata) -> Option<FileVersion> {
-    let file = std::fs::File::open(path).ok();
-    version_with(file.as_ref(), meta)
+    if let Ok(file) = std::fs::File::open(path) {
+        if let Ok(own) = file.metadata() {
+            return version_with(Some(&file), &own);
+        }
+    }
+    version_with(None, meta)
 }
 
 /// 同一个文件的版本标识，但全部字段取自这个已经打开的句柄（流式发送时用：校验和
@@ -1041,7 +1049,7 @@ pub(crate) fn file_version_pin_of(file: &std::fs::File) -> Option<String> {
     pin_of_version(&version_of_open(file)?)
 }
 
-fn pin_of_version(version: &FileVersion) -> Option<String> {
+pub(crate) fn pin_of_version(version: &FileVersion) -> Option<String> {
     Some(format!(
         "{}-{}-{}",
         version.size,

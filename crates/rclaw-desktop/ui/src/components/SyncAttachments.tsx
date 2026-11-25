@@ -80,6 +80,37 @@ const EMPTY: SyncAttachment[] = [];
 /** `消息行 id:blob` → 上一份清单里的状态（看得出哪些附件是刚下载下来的）。 */
 let known: Record<string, string> = {};
 let cards: CardState = noCardState();
+/** 读的时候发现「内容对不上」的条目（`blob:path`）。清单里的这一条还没轮到核对
+ *  （`checked=false`）时，读的入口（预览/点开/播放）在这里记一笔，界面立刻按「对不上」
+ *  出附件卡（带重新下载），不再内联一个每次点都失败的卡；重新下载/存进工作区成功之后
+ *  这笔撤掉（内容已经是登记的那份了）。清单核对过（`checked=true`）的以清单为准。 */
+const changedKeys = new Set<string>();
+
+/** 某个附件读出来发现内容对不上：界面按「已改写」处理（见 [`changedKeys`]）。 */
+export function markAttachmentChanged(item: { path: string; blob: string }) {
+  const key = `${item.blob}:${item.path}`;
+  if (changedKeys.has(key)) return;
+  changedKeys.add(key);
+  // 清单数组换一个身份：订阅者（消息里的媒体卡、画廊）重算一遍可读性。
+  all = [...all];
+  emit();
+}
+
+/** 重新下载 / 存进工作区成功之后：这个对象之前「对不上」的覆盖撤掉。 */
+function clearChanged(blob: string) {
+  let cleared = false;
+  for (const key of [...changedKeys]) {
+    if (key.startsWith(`${blob}:`)) {
+      changedKeys.delete(key);
+      cleared = true;
+    }
+  }
+  if (cleared) {
+    all = [...all];
+    emit();
+  }
+}
+
 /** 让当前会话的清单重新取一遍（装载器在的时候才有）。 */
 let reload: (() => void) | null = null;
 const busyTimers: Record<string, number> = {};
@@ -196,6 +227,10 @@ function markStale(chatId: string) {
 
 /** 一个附件的下载有了结果（或者请求本身没发出去）。 */
 function settle(blob: string, error: string | null) {
+  if (error === null) {
+    // 重新下载成功：这个对象之前「读出来对不上」的覆盖撤掉。
+    clearChanged(blob);
+  }
   const timer = busyTimers[blob];
   if (timer !== undefined) {
     window.clearTimeout(timer);
@@ -256,6 +291,9 @@ function save(chatId: string, item: SyncAttachment) {
     .syncAttachmentSave(chatId, item.blob, item.path)
     .then((rel) => {
       if (chat !== chatId) return;
+      // 存下去的就是核对过的字节：这个对象「读出来对不上」的覆盖撤掉（消息里的卡
+      // 换回正常图片/视频卡）。
+      clearChanged(item.blob);
       setCards((prev) => ({ ...prev, saved: { ...prev.saved, [key]: rel } }));
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
       // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。
@@ -290,6 +328,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       failed = null;
       known = {};
       cards = noCardState();
+      changedKeys.clear();
       emit();
     }
     let alive = true;
@@ -325,7 +364,13 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         }
         // 一直取不到：保持「未就绪」并把状态标成失败（界面给一个重试入口）。不能拿
         // 旧清单或者空清单冒充「核对好了」——那会让同步消息回退到工作区路径。
+        // 之前取到过的旧清单也一并清掉：那一轮之后文件可能已经被改写，拿旧的
+        // `path_present` 继续判断等于永远按旧结论走。
         failed = chatId;
+        loaded = null;
+        all = EMPTY;
+        allSig = "";
+        bar = NONE;
         emit();
         return;
       }
@@ -358,7 +403,13 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => void load(), 150);
     };
-    reload = schedule;
+    // 用户点「重试」：退避重新算（一直失败之后的重试要真的再试几轮，不是立刻又
+    // 判定失败）。
+    const retry = () => {
+      loadFails = 0;
+      schedule();
+    };
+    reload = retry;
     void load();
     const un = api.onSync((event) => {
       if (event.kind === "attachment") {
@@ -391,7 +442,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         loaded = null;
         emit();
       }
-      if (reload === schedule) reload = null;
+      if (reload === retry) reload = null;
       void un.then((fn) => fn());
     };
   }, [chatId]);
@@ -420,7 +471,7 @@ export function useChatAttachments(chatId: string | null): SyncAttachment[] {
 export function useChatAttachmentsReady(chatId: string | null): boolean {
   return useSyncExternalStore(
     subscribe,
-    () => chatId !== null && chat === chatId && loaded === chatId,
+    () => chatId !== null && chat === chatId && loaded === chatId && failed !== chatId,
   );
 }
 
@@ -465,9 +516,11 @@ export function readableAtPath(item: SyncAttachment): boolean {
   // 核对过的看「消息路径上真有这份内容」（包括已存回原位置的快照）；没核对过的只在
   // 落点就是消息路径时才按能读处理——`local` 只说明登记的落点存在，可能根本不是这条
   // 消息写的那个路径。
-  return item.checked
-    ? item.path_present
-    : item.state === "local" && item.rel_path === item.path;
+  if (item.checked) return item.path_present;
+  // 读的时候已经发现对不上的（预算外/还没轮到核对的那条）：按对不上处理，出附件卡
+  // 给「重新下载」，不再内联一个每次点都失败的卡。
+  if (changedKeys.has(`${item.blob}:${item.path}`)) return false;
+  return item.state === "local" && item.rel_path === item.path;
 }
 
 /** 一条消息登记的文件里，消息路径上并没有这份内容的（按路径索引）：界面出附件卡，

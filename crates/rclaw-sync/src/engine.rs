@@ -53,6 +53,38 @@ pub use crate::transport::SelfTestStep;
 pub use crate::trash::{MemoryTrashItem, TrashItem};
 pub use local::{AttachmentInfo, SessionMark};
 
+/// 边读边算 SHA-256 的读取器：调用方读走的字节和读完时的摘要是同一份内容。
+struct HashingReader<R> {
+    inner: R,
+    ctx: ring::digest::Context,
+    total: u64,
+}
+
+impl<R: std::io::Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        HashingReader {
+            inner,
+            ctx: ring::digest::Context::new(&ring::digest::SHA256),
+            total: 0,
+        }
+    }
+
+    fn finish(self) -> ring::digest::Digest {
+        self.ctx.finish()
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.ctx.update(&buf[..n]);
+            self.total += n as u64;
+        }
+        Ok(n)
+    }
+}
+
 /// 一次「按对象核对并读出一份内容」的结果：`Bytes` 里的字节就是核对过的那些
 /// （同一次读里算的摘要）。预览、导出、转发都用它，不再「先核对路径、再重新打开」。
 #[derive(Debug)]
@@ -63,6 +95,17 @@ pub enum AttachmentBytes {
     /// 内容对不上（被就地改写过）、路径不安全、读失败。
     Rejected,
     /// 核不了（没有登记/引用、读不出密钥）：按老行为处理。
+    Unverifiable,
+}
+
+/// 「边核对边交给调用方」的结果：保存快照、读缓存副本用。
+#[derive(Debug, Clone, Copy)]
+pub enum AttachmentCopy {
+    /// 交出去的字节就是 `blob` 这个对象（摘要来自同一次读）。
+    Copied,
+    /// 内容对不上（缓存副本被原地改写过）：调用方写出去的东西要作废。
+    Rejected,
+    /// 核不了（没有登记、不在本机、读不出密钥）：按老行为处理。
     Unverifiable,
 }
 
@@ -1115,22 +1158,79 @@ impl SyncEngine {
         local::attachments(&self.inner.ctx, keys.as_ref(), channel, chat_id, blob)
     }
 
-    /// 本机缓存的一份附件现在还是不是它登记的那个对象。打开缓存副本的入口用它拦下被
-    /// 原地改写的文件：内容不符就不当「有」，用户重新下载会走缺附件的路径。旧版本按
-    /// 明文摘要登记的内联缓存按本机文件内容归一（换成线上对象名），不判坏。验不了
-    /// （没配对、读不出密钥、没有登记）时不算坏——那有别的说法。
-    pub fn cached_attachment_intact(&self, blob: &str) -> bool {
-        let secrets = match Secrets::load(&self.inner.ctx.paths) {
-            Ok(secrets) => secrets,
-            Err(_) => return true,
+    /// 本机缓存里 `blob` 副本的一次「边核对边交给调用方」的读：`consume` 读走的字节
+    /// 与读完时的摘要是同一份内容，摘要要和 `blob` 对上。保存快照用它——调用方写出去
+    /// 的字节就是核对过的那些，不给「核对完再按路径重新打开」留窗口。
+    ///
+    /// `Unverifiable` 表示核不了（没有登记、不在本机、读不出密钥）：调用方按老行为处理。
+    pub fn copy_cached_blob(
+        &self,
+        blob: &str,
+        consume: &mut dyn FnMut(&mut dyn std::io::Read) -> std::io::Result<()>,
+    ) -> std::io::Result<AttachmentCopy> {
+        let ctx = &self.inner.ctx;
+        let Some(keys) = Secrets::load(&ctx.paths)
+            .ok()
+            .and_then(|secrets| secrets.keys().ok())
+        else {
+            return Ok(AttachmentCopy::Unverifiable);
         };
-        let Ok(keys) = secrets.keys() else {
-            return true;
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .ok()
+            .flatten();
+        let Some(row) = row else {
+            return Ok(AttachmentCopy::Unverifiable);
         };
-        matches!(
-            crate::attach::check_local_object(&self.inner.ctx, &keys, blob),
-            Ok(crate::attach::LocalObject::Intact(_)) | Ok(crate::attach::LocalObject::Unknown)
-        )
+        if row.state == db::BLOB_REMOTE {
+            return Ok(AttachmentCopy::Unverifiable);
+        }
+        let Ok(path) = ctx.env.checked_path(&row.rel_path) else {
+            return Ok(AttachmentCopy::Rejected);
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Ok(AttachmentCopy::Rejected);
+        };
+        // 最多读「登记长度 + 允许的误差 + 1」：缓存里的文件被换成超大文件时不会把
+        // 调用方的内存/磁盘写爆。
+        let cap = row.size.saturating_add(local::SIZE_SLACK).saturating_add(1);
+        let mut reader = HashingReader::new(file.take(cap));
+        consume(&mut reader)?;
+        let total = reader.total;
+        let digest: [u8; 32] = reader
+            .finish()
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 是 32 字节");
+        if total.abs_diff(row.size) > local::SIZE_SLACK || keys.blob_id(&digest) != blob {
+            return Ok(AttachmentCopy::Rejected);
+        }
+        Ok(AttachmentCopy::Copied)
+    }
+
+    /// 读出本机缓存里 `blob` 副本的字节（与 [`Self::copy_cached_blob`] 同一次读核对）。
+    pub fn read_cached_blob_bytes(&self, blob: &str, limit: u64) -> AttachmentBytes {
+        // 先按登记长度挡掉读进内存会爆的大文件（预览只处理小图）。
+        let ctx = &self.inner.ctx;
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .ok()
+            .flatten();
+        if let Some(row) = &row {
+            if row.size > limit {
+                return AttachmentBytes::TooLarge;
+            }
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let outcome = match self.copy_cached_blob(blob, &mut |reader| {
+            std::io::copy(reader, &mut bytes).map(|_| ())
+        }) {
+            Ok(outcome) => outcome,
+            Err(_) => return AttachmentBytes::Rejected,
+        };
+        match outcome {
+            AttachmentCopy::Copied => AttachmentBytes::Bytes(bytes),
+            AttachmentCopy::Rejected => AttachmentBytes::Rejected,
+            AttachmentCopy::Unverifiable => AttachmentBytes::Unverifiable,
+        }
     }
 
     /// 按对象核对一次「要读/要导出的文件」，并给出被核对的那一份的版本针。
@@ -1278,8 +1378,10 @@ impl SyncEngine {
         if keys.blob_id(&digest) != blob {
             return AttachmentReadCheck::Mismatch;
         }
-        // 与直读核对、流式服务用同一套版本针（长度-修改时间-变更时间）。
-        match local::file_version_pin(&path) {
+        // 版本针必须出自「缓存里那份摘要对应的版本」这一份元数据，不能重新按路径再
+        // stat 一次：两次之间文件被原子替换的话，签出去的就是新版本的针，流式服务拿
+        // 它比对打开的新文件正好通过——等于放行了没核对过的那一版。
+        match local::pin_of_version(&version) {
             Some(pin) => AttachmentReadCheck::Verified { pin },
             None => AttachmentReadCheck::Unverifiable,
         }

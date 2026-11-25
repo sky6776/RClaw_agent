@@ -853,15 +853,9 @@ fn cached_snapshot(
         .ok_or_else(|| {
             "这个附件不在本机的同步缓存里（可能还没有下载，或者已经被清理）".to_string()
         })?;
-    // 缓存的副本要还是登记的那个对象（摘要对得上）才给用：被原地改写的文件不当作
-    // 它——用户重新下载会走缺附件的路径，由持有正确内容的设备重新传。
-    if !engine.cached_attachment_intact(&info.blob) {
-        return Err(
-            "这份缓存副本的内容已经和登记的不一致（可能被本机的程序改写过）。\
-             请重新下载这个附件。"
-                .to_string(),
-        );
-    }
+    // 这里只定位、不核对：预览和保存都改成「读出来的字节顺手核对」（缓存副本被原地
+    // 改写时，用到的就是被改写后的内容——所以核对必须和这次读同源，不能先核对路径、
+    // 再按路径重新打开一遍）。
     let local = info
         .local_path
         .as_deref()
@@ -907,7 +901,22 @@ pub async fn sync_attachment_preview(
         if !super::MEDIA_EXTENSIONS.contains(&extension.as_str()) {
             return Err(format!("不支持的媒体类型: {extension}"));
         }
-        super::image_preview_payload(&home, &full, &format!("sync-blob:{blob}"), &extension)
+        // 预览用的就是这次读出来、顺带核对过的那份字节：不再核对路径之后按路径重读
+        // 一遍缓存文件（两次之间被改写的话，预览就成了另一份内容）。
+        match engine.read_cached_blob_bytes(&blob, super::MEDIA_MAX_BYTES) {
+            rclaw_sync::AttachmentBytes::Bytes(bytes) => {
+                super::image_preview_bytes(&home, &bytes, &format!("sync-blob:{blob}"), &extension)
+            }
+            rclaw_sync::AttachmentBytes::TooLarge => Err(format!(
+                "媒体超过大小上限（{} MB）",
+                super::MEDIA_MAX_BYTES / 1024 / 1024
+            )),
+            rclaw_sync::AttachmentBytes::Rejected => Err(CHANGED_SNAPSHOT.into()),
+            // 核不了（没有密钥）：按老行为按路径出预览。
+            rclaw_sync::AttachmentBytes::Unverifiable => {
+                super::image_preview_payload(&home, &full, &format!("sync-blob:{blob}"), &extension)
+            }
+        }
     })
     .await
 }
@@ -1017,7 +1026,9 @@ pub async fn sync_attachment_save(
         } else {
             info.path.clone()
         };
-        save_snapshot(&home, &target, &full)
+        // 写出去的字节必须是核对过的那些：保存时边读边核对，写完摘要对不上就把这份
+        // 撤掉（不再「先核对路径、再按路径重新打开来复制」）。
+        save_snapshot_checked(&home, &target, &engine, &blob, &full)
     })
     .await
 }
@@ -1054,7 +1065,7 @@ fn workspace_rel_for(path: &str) -> Result<String, String> {
 }
 
 /// 读满缓冲区或读到文件尾，返回读到的字节数。
-fn read_full(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+fn read_full(reader: &mut (impl Read + ?Sized), buffer: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buffer.len() {
         match reader.read(&mut buffer[filled..]) {
@@ -1094,14 +1105,13 @@ fn same_content(target: &Path, source: &Path) -> bool {
     }
 }
 
-/// [`sync_attachment_save`] 的核心：把 `cached` 的内容存到工作区里 `path` 的位置。
-///
-/// - 那个位置空着：就存在那里，消息里的引用从此直接指向它。
-/// - 那里已经有一份一模一样的：什么都不做。
-/// - 那里是别的内容：不覆盖，另存为「原名-快照」。
-///
-/// 路径上的目录逐级核对 / 新建，不跟随链接；文件用不跟随链接的「必须新建」方式写。
-fn save_snapshot(home: &Path, path: &str, cached: &Path) -> Result<String, String> {
+/// 缓存里的副本和登记的已经对不上了（被本机程序原地改写过）。
+const CHANGED_SNAPSHOT: &str =
+    "这份缓存副本的内容已经和登记的不一致（可能被本机的程序改写过）。请重新下载这个附件。";
+
+/// 快照要存到的工作区位置：返回（目录的规范路径、目录相对路径、文件名）。路径上的
+/// 目录逐级核对 / 新建，不跟随链接；越出工作区、路径不合规的都拒绝。
+fn snapshot_dir(home: &Path, path: &str) -> Result<(PathBuf, String, String), String> {
     let rel = workspace_rel_for(path)?;
     let (dir_rel, name) = rel
         .rsplit_once('/')
@@ -1128,23 +1138,39 @@ fn save_snapshot(home: &Path, path: &str, cached: &Path) -> Result<String, Strin
     if !dir.starts_with(&root) {
         return Err("附件的路径越出工作区".into());
     }
-    if same_content(&dir.join(name), cached) {
-        return Ok(rel);
-    }
+    Ok((dir, dir_rel.to_string(), name.to_string()))
+}
+
+/// 「那里已经有别的内容」时另存的名字：`原名-快照`、`原名-快照2`……
+fn snapshot_name(n: u32, name: &str) -> String {
     let (stem, extension) = match name.rsplit_once('.') {
         Some((stem, extension)) if !stem.is_empty() => (stem, Some(extension)),
         _ => (name, None),
     };
+    match (n, extension) {
+        (1, _) => name.to_string(),
+        (2, Some(extension)) => format!("{stem}-快照.{extension}"),
+        (2, None) => format!("{stem}-快照"),
+        (n, Some(extension)) => format!("{stem}-快照{}.{extension}", n - 1),
+        (n, None) => format!("{stem}-快照{}", n - 1),
+    }
+}
+
+/// [`sync_attachment_save`] 的核心（核对不了时的老行为）：把 `cached` 的内容存到工作区
+/// 里 `path` 的位置。
+///
+/// - 那个位置空着：就存在那里，消息里的引用从此直接指向它。
+/// - 那里已经有一份一模一样的：什么都不做。
+/// - 那里是别的内容：不覆盖，另存为「原名-快照」。
+fn save_snapshot(home: &Path, path: &str, cached: &Path) -> Result<String, String> {
+    let (dir, dir_rel, name) = snapshot_dir(home, path)?;
+    if same_content(&dir.join(&name), cached) {
+        return Ok(format!("{dir_rel}/{name}"));
+    }
     let dest = super::write_fresh_file(
         &dir,
         "存进工作区失败",
-        |n| match (n, extension) {
-            (1, _) => name.to_string(),
-            (2, Some(extension)) => format!("{stem}-快照.{extension}"),
-            (2, None) => format!("{stem}-快照"),
-            (n, Some(extension)) => format!("{stem}-快照{}.{extension}", n - 1),
-            (n, None) => format!("{stem}-快照{}", n - 1),
-        },
+        |n| snapshot_name(n, &name),
         |file| {
             let mut from = std::fs::File::open(cached)?;
             std::io::copy(&mut from, file).map(|_| ())
@@ -1155,6 +1181,84 @@ fn save_snapshot(home: &Path, path: &str, cached: &Path) -> Result<String, Strin
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| "结果路径异常".to_string())?;
     Ok(format!("{dir_rel}/{file_name}"))
+}
+
+/// [`sync_attachment_save`] 的核心（核对版）：同 [`save_snapshot`]，但写出去的字节与
+/// 核对是**同一次读**——目标已经有一份一模一样的、或者写下去的内容摘要对不上，都在
+/// 同一次读里发现；对不上的那份写完就撤掉（`write_fresh_file` 失败即删）。
+fn save_snapshot_checked(
+    home: &Path,
+    path: &str,
+    engine: &SyncEngine,
+    blob: &str,
+    cached: &Path,
+) -> Result<String, String> {
+    let (dir, dir_rel, name) = snapshot_dir(home, path)?;
+    let target = dir.join(&name);
+    if std::fs::symlink_metadata(&target).is_ok() {
+        // 目标位置已经有一份：同一次读里比较它和缓存副本、并核对缓存副本的摘要。
+        let mut same = true;
+        match engine
+            .copy_cached_blob(blob, &mut |reader| compare_snapshot(reader, &target, &mut same))
+            .map_err(|e| format!("存进工作区失败: {e}"))?
+        {
+            rclaw_sync::AttachmentCopy::Copied if same => return Ok(format!("{dir_rel}/{name}")),
+            // 内容不同不是错：往下照「另存一份」处理。
+            rclaw_sync::AttachmentCopy::Copied => {}
+            rclaw_sync::AttachmentCopy::Rejected => return Err(CHANGED_SNAPSHOT.into()),
+            // 核不了（没有登记/密钥）：按老行为只看内容一不一样。
+            rclaw_sync::AttachmentCopy::Unverifiable => return save_snapshot(home, path, cached),
+        }
+    }
+    let dest = super::write_fresh_file(
+        &dir,
+        "存进工作区失败",
+        |n| snapshot_name(n, &name),
+        |file| {
+            // 读出来的字节直接写进目标文件，摘要就在这同一次读里算、读完后核对；
+            // 对不上时返回错误，`write_fresh_file` 会把刚写的这份删掉。
+            match engine.copy_cached_blob(blob, &mut |reader| {
+                std::io::copy(reader, file).map(|_| ())
+            }) {
+                Ok(rclaw_sync::AttachmentCopy::Copied | rclaw_sync::AttachmentCopy::Unverifiable) => {
+                    Ok(())
+                }
+                Ok(rclaw_sync::AttachmentCopy::Rejected) => {
+                    Err(std::io::Error::other(CHANGED_SNAPSHOT))
+                }
+                Err(e) => Err(e),
+            }
+        },
+    )?;
+    let file_name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| "结果路径异常".to_string())?;
+    Ok(format!("{dir_rel}/{file_name}"))
+}
+
+/// 把 `reader`（核对过的缓存副本）与 `target` 逐块比较，读到来源结尾为止（摘要要覆盖
+/// 全部内容）；不一样、或者目标读不了，就把 `same` 置 false。
+fn compare_snapshot(
+    reader: &mut dyn Read,
+    target: &Path,
+    same: &mut bool,
+) -> std::io::Result<()> {
+    let mut other = std::fs::File::open(target).ok();
+    let (mut left, mut right) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let n = read_full(reader, &mut left)?;
+        let m = match other.as_mut() {
+            Some(other) => read_full(other, &mut right)?,
+            None => 0,
+        };
+        if n != m || left[..n] != right[..m] {
+            *same = false;
+        }
+        if n == 0 {
+            return Ok(());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

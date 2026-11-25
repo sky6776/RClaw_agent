@@ -99,11 +99,6 @@ pub fn stream_url(path: &str, pin: Option<&str>) -> Option<String> {
     ))
 }
 
-/// 文件版本针：与附件核对同一套（长度 + 修改时间 + 变更时间）。
-fn file_version(path: &Path) -> Option<String> {
-    rclaw_sync::file_version_pin(path)
-}
-
 /// 扩展名白名单（与 media_base64 的媒体扩展守卫同一防御纵深）：工作区里的
 /// 非媒体文件（会话记录 / 配置等）不进 HTTP 面。
 fn is_streamable(path: &str) -> bool {
