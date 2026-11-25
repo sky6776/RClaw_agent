@@ -979,6 +979,15 @@ impl Session {
             }
             let mut fetched = 0usize;
             for blob in &untried {
+                // 取起时的现场：结算「存储上没有」之前要先确认期间没有别的取回路径
+                // 落过盘（下载队列与这里可能同时在取同一个对象）。
+                let (start_state, start_landed) = db::read(ctx.db(), |conn| {
+                    Ok((
+                        db::blob_get(conn, blob)?.map(|row| row.state),
+                        db::state_get(conn, crate::db::scope::BLOB_LANDED, blob)?
+                            .and_then(|row| row.value),
+                    ))
+                })?;
                 let download =
                     attach::download(ctx, live.transport(), &live.keys, blob, s.attachment_max);
                 match download.await {
@@ -992,10 +1001,19 @@ impl Session {
                         let (device, blob) = (s.device.clone(), blob.clone());
                         let missing = on_pool(ctx, move |ctx| {
                             db::write(ctx.db(), |tx| {
-                                attach::on_missing(tx, &device, &blob, false, now_ms())
+                                attach::settle_missing(
+                                    tx,
+                                    &device,
+                                    &blob,
+                                    false,
+                                    now_ms(),
+                                    start_state,
+                                    start_landed.as_deref(),
+                                )
                             })
                         })
-                        .await?;
+                        .await?
+                        .unwrap_or(attach::Missing::Lost { gone: false });
                         if let attach::Missing::Waiting { asked, .. } = missing {
                             // 刚排进队列的 `blob.want` 下一轮封段上传。
                             out.again |= asked;

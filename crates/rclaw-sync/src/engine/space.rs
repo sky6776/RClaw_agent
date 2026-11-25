@@ -1637,6 +1637,10 @@ fn rekey_blobs(ctx: &Ctx, keys: &Keys) -> Result<()> {
     // 三、换掉登记。
     db::write(ctx.db(), |tx| {
         tx.execute("DELETE FROM sync_blob", [])?;
+        tx.execute(
+            "DELETE FROM sync_state WHERE scope = ?1",
+            rusqlite::params![crate::db::scope::BLOB_LANDED],
+        )?;
         for row in &kept {
             db::blob_register(tx, &row.blob_id, &row.rel_path, row.size, BLOB_HELD)?;
         }

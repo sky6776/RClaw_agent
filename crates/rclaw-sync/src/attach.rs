@@ -234,10 +234,9 @@ pub(crate) enum LocalObject {
     Intact(BlobRow),
 }
 
-fn check_local_row(ctx: &Ctx, keys: &Keys, row: BlobRow) -> Result<LocalObject> {
-    // 同步代在取登记、读文件**之前**取：读的过程中换了空间，这次读到的对象名是旧
-    // 密钥算的，归一必须作废（事务里还会再核一次）。
-    let epoch = ctx.space.epoch();
+fn check_local_row(ctx: &Ctx, keys: &Keys, row: BlobRow, epoch: u64) -> Result<LocalObject> {
+    // `epoch` 是调用方在把密钥交出去之前取的同步代：读文件期间换了空间的话，这次
+    // 算出的对象名是旧密钥的，归一必须作废（事务里还会再核一次）。
     // 路径不安全（经过链接、拼不出本机的名字）：按「验不了」处理，由别处照常兜底。
     let Ok(path) = ctx.env.checked_path(&row.rel_path) else {
         return Ok(LocalObject::Unknown);
@@ -312,6 +311,8 @@ pub(crate) fn normalize_registration(
         }
         replace_refs_blob(tx, old, new)?;
         tx.execute("DELETE FROM sync_blob WHERE blob_id = ?1", params![old])?;
+        // 落盘标识跟着旧对象名一起清（新名字下次落盘会重新记）。
+        db::state_del(tx, scope::BLOB_LANDED, old)?;
         db::blob_get(tx, new)?.ok_or_else(|| SyncError::other("附件登记刚刚被清理"))
     })
 }
@@ -506,7 +507,7 @@ enum Lookup {
 /// 取回一个附件之前先看本机：有没有它的登记，文件是不是已经在本机了。本机的那一份要
 /// 内容核对得上——被人原地改过的不能拿去充当这个对象，改去存储上取原来的那份。旧版本
 /// 按明文摘要登记的内联缓存在这里一并归一，不判坏。
-fn lookup(ctx: &Ctx, keys: &Keys, blob_id: &str) -> Result<Lookup> {
+fn lookup(ctx: &Ctx, keys: &Keys, blob_id: &str, epoch: u64) -> Result<Lookup> {
     let (row, was_mine) = db::read(ctx.db(), |conn| {
         let row = db::blob_get(conn, blob_id)?;
         let was_mine = row.is_none() && db::state_get(conn, scope::BLOB_GONE, blob_id)?.is_some();
@@ -522,7 +523,7 @@ fn lookup(ctx: &Ctx, keys: &Keys, blob_id: &str) -> Result<Lookup> {
         }));
     };
     if row.state != BLOB_REMOTE {
-        match check_local_row(ctx, keys, row.clone())? {
+        match check_local_row(ctx, keys, row.clone(), epoch)? {
             LocalObject::Intact(row) => {
                 return Ok(Lookup::Here(ctx.env.checked_path(&row.rel_path)?))
             }
@@ -547,10 +548,13 @@ pub async fn download(
     blob_id: &str,
     max_size: u64,
 ) -> Result<PathBuf> {
+    // 同步代与密钥在提交阻塞任务**之前**配对：阻塞闭包可能在换代之后才被执行，
+    // 在闭包里再取代就会拿新代配旧密钥。
+    let epoch = ctx.space.epoch();
     let found = {
         let blob_id = blob_id.to_string();
         let keys = keys.clone();
-        offload(ctx, move |ctx| lookup(ctx, &keys, &blob_id)).await?
+        offload(ctx, move |ctx| lookup(ctx, &keys, &blob_id, epoch)).await?
     };
     let row = match found {
         // 本机就有也不用白拿一趟：同一个对象登记过的其他落点（占位）顺手补上。补别名会写
@@ -1155,6 +1159,9 @@ fn settle(
                 "DELETE FROM sync_blob WHERE blob_id = ?1 AND state = ?2",
                 params![blob.blob_id, BLOB_PENDING],
             )?;
+            if removed > 0 {
+                db::state_del(tx, scope::BLOB_LANDED, &blob.blob_id)?;
+            }
             let said = removed > 0 && announce_gone(tx, blob)?;
             (true, false, said)
         }
@@ -1412,6 +1419,26 @@ pub enum Missing {
     /// 不再自动去取了。`gone`：有设备说过它已经拿不出这份内容；否则是等了很久没有设备
     /// 传上来。
     Lost { gone: bool },
+}
+
+/// 缺件结算（下载队列与轮次共用）：从取起到现在登记状态与落盘版本都没变过，才按
+/// 「存储上没有」记账（发 `blob.want` / `blob.gone`）。变过说明期间已经有别的取回
+/// 路径落了盘（或登记被别的操作改了），这次晚到的结论作废、返回 `None`。
+pub(crate) fn settle_missing(
+    conn: &rusqlite::Connection,
+    device: &str,
+    blob_id: &str,
+    user: bool,
+    now: i64,
+    start_state: Option<i64>,
+    start_landed: Option<&str>,
+) -> Result<Option<Missing>> {
+    let state_now = db::blob_get(conn, blob_id)?.map(|row| row.state);
+    let landed_now = db::state_get(conn, scope::BLOB_LANDED, blob_id)?.and_then(|row| row.value);
+    if state_now != start_state || landed_now.as_deref() != start_landed {
+        return Ok(None);
+    }
+    on_missing(conn, device, blob_id, user, now).map(Some)
 }
 
 /// 去取一个附件，存储上没有这个对象：向别的设备要（`blob.want`），要了很久没有、或者

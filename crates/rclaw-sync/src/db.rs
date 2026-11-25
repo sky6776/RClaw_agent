@@ -668,6 +668,11 @@ pub fn blob_register(
 /// 删掉一个对象的登记（`gone` 记录另存，不在这里）。
 pub fn blob_delete(conn: &Connection, blob_id: &str) -> Result<()> {
     conn.execute("DELETE FROM sync_blob WHERE blob_id = ?1", params![blob_id])?;
+    // 落盘版本跟着登记一起清：登记没了它也没有意义（重新登记/落盘会重新记）。
+    conn.execute(
+        "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+        params![scope::BLOB_LANDED, blob_id],
+    )?;
     Ok(())
 }
 

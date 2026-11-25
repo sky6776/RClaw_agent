@@ -1339,11 +1339,17 @@ impl SyncEngine {
         if let Some(new) = self.normalize_cached_blob(blob) {
             return new;
         }
-        let exists = db::read(self.inner.ctx.db(), |conn| db::blob_get(conn, keyed))
-            .ok()
-            .flatten()
-            .is_some_and(|row| row.state != db::BLOB_REMOTE);
-        if exists {
+        // 归一没做成：只有「旧登记已经没了」（说明别的请求归一过、消息引用也换成了
+        // 新名）并且新登记在、不是「等待取回」时，才按新名字回执；否则消息引用还是
+        // 旧名，落点只能记在旧名下。
+        let (old_gone, new_ready) = db::read(self.inner.ctx.db(), |conn| {
+            Ok((
+                db::blob_get(conn, blob)?.is_none(),
+                db::blob_get(conn, keyed)?.is_some_and(|row| row.state != db::BLOB_REMOTE),
+            ))
+        })
+        .unwrap_or((false, false));
+        if old_gone && new_ready {
             keyed.to_string()
         } else {
             blob.to_string()

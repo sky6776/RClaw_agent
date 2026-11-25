@@ -334,17 +334,8 @@ async fn finish(
                     {
                         return Ok(None);
                     }
-                    // 期间已经有别的取回路径落了盘：这次晚到的「没取到」作废，不能把
-                    // 刚取回的登记改回远端。三样都要没变过（只看状态的话，
-                    // FETCHED→FETCHED 这种「又落了一次盘」看不出来）：
-                    // - 登记状态没变；- 落盘标识没变；- 这次尝试还认领着自己的标记
-                    //   （成功落盘会清标记，别的尝试会换标记）。
-                    let state_now = db::blob_get(tx, &wanted)?.map(|row| row.state);
-                    let landed_now = db::state_get(tx, crate::db::scope::BLOB_LANDED, &wanted)?
-                        .and_then(|row| row.value);
-                    if state_now != start_state || landed_now != start_landed {
-                        return Ok(None);
-                    }
+                    // 这次尝试还认领着自己的标记吗（成功落盘会清标记，别的尝试会换
+                    // 标记）：不是了就说明期间已经有结论，这次晚到的「没取到」作废。
                     if attempt.is_some() && !probe_matches(tx, &wanted, attempt.as_deref())? {
                         return Ok(None);
                     }
@@ -363,7 +354,17 @@ async fn finish(
                     let Some(device) = sync_db::device_id(tx)? else {
                         return Ok(None);
                     };
-                    attach::on_missing(tx, &device, &wanted, user, attach::now_ms()).map(Some)
+                    // 从取起到现在登记状态与落盘版本都没变过才记账（下载队列与轮次共用
+                    // 这一份判断）：期间别的取回路径落了盘，这次晚到的结论作废。
+                    attach::settle_missing(
+                        tx,
+                        &device,
+                        &wanted,
+                        user,
+                        attach::now_ms(),
+                        start_state,
+                        start_landed.as_deref(),
+                    )
                 })
             })
             .await;

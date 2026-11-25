@@ -1262,7 +1262,11 @@ fn save_snapshot_checked(
                     let _ = std::fs::remove_file(&tmp);
                     return Err(CHANGED_SNAPSHOT.into());
                 }
-                Err(e) => Err(format!("存进工作区失败: {e}")),
+                Err(e) => {
+                    // 已经建好、写了一半的暂存文件不能留下。
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(format!("存进工作区失败: {e}"))
+                }
             }
         }
     };
@@ -1271,7 +1275,8 @@ fn save_snapshot_checked(
         // 核对一遍复用现有落点——旧行为里这种情况本来就不用写。内容不同/核不了时
         // 保留原来的写错误。
         if target_is_file() {
-            let mut same = false;
+            // 先当「一样」，比较发现不同或目标读不了再置 false。
+            let mut same = true;
             match engine.copy_cached_blob(blob, &mut |reader| {
                 compare_snapshot(reader, &target, &mut same)
             }) {
