@@ -459,8 +459,11 @@ endpoint = \"https://s3.example.com\"
             ..Default::default()
         };
         assert!(config.validate().is_err());
+        // 默认范围之上追加一个拼错的（不是换掉默认范围）。
+        let mut scopes = SyncConfig::default().scopes;
+        scopes.push("everything".into());
         let config = SyncConfig {
-            scopes: vec!["everything".into()],
+            scopes,
             ..Default::default()
         };
         assert!(config.validate().is_err());

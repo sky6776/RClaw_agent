@@ -1064,6 +1064,9 @@ export default function Chat({
     for (let i = 0; i < e.changedTouches.length; i++) {
       st.ids.add(e.changedTouches[i].identifier);
     }
+    // 第二指按下就是捏合（双指轻点、手指没移动也要算）：不参与「回到底部」的
+    // 轻点判定。
+    if (e.touches.length > 1) st.pinched = true;
     armTouchWatchdog();
   };
   const handleListTouchMove = (e: React.TouchEvent) => {
