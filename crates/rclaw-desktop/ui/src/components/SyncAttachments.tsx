@@ -53,6 +53,12 @@ const noCardState = (): CardState => ({ busy: {}, saving: {}, errors: {}, saved:
 /** 清单属于哪个会话；换会话时整份换掉。 */
 let chat: string | null = null;
 let bar: BarView = NONE;
+/** 当前会话的完整附件清单（含本机已有的）：消息里的媒体卡按路径查它，不在这台设备
+ *  上的文件才出同步卡（[`useChatAttachments`]）。 */
+let all: SyncAttachment[] = [];
+let allSig = "";
+/** 清单不是这个会话的 / 还没取到时给的空数组（引用要稳定，别每次渲染新建）。 */
+const EMPTY: SyncAttachment[] = [];
 /** `消息行 id:blob` → 上一份清单里的状态（看得出哪些附件是刚下载下来的）。 */
 let known: Record<string, string> = {};
 let cards: CardState = noCardState();
@@ -91,14 +97,20 @@ function setCards(update: (prev: CardState) => CardState) {
 /** 换上一份新取的清单。 */
 function apply(chatId: string, list: SyncAttachment[]) {
   if (chat !== chatId) return;
+  const usable = list.filter((item) => item.kind === "file" || item.kind === "artifact");
+  const nextAllSig = JSON.stringify(usable);
+  const changedAll = nextAllSig !== allSig;
+  if (changedAll) {
+    all = usable;
+    allSig = nextAllSig;
+  }
   const nextKnown: Record<string, string> = {};
   const pending: SyncAttachment[] = [];
   const pendingKeys = new Set<string>();
   const landed = [...bar.landed];
-  list.forEach((item) => {
+  usable.forEach((item) => {
     // 工具结果全文（artifact）也列出来：它落到同步缓存时，消息里原有的路径句柄指向的
     // 可能是工作区里的另一个同名文件，用户得能从这儿打开同步来的那份准确内容。
-    if (item.kind !== "file" && item.kind !== "artifact") return;
     const id = `${item.message_id}:${item.blob}`;
     const before = known[id];
     nextKnown[id] = item.state;
@@ -118,7 +130,7 @@ function apply(chatId: string, list: SyncAttachment[]) {
   // 下载下来之后又不见了的（被删了）会重新出现在 pending 里：不再算「已下载」。
   const stillLanded = landed.filter((item) => !pendingKeys.has(fileKey(item)));
   const sig = JSON.stringify([pending, stillLanded]);
-  if (sig === bar.sig) return;
+  if (sig === bar.sig && !changedAll) return;
   bar = { pending, landed: stillLanded, sig };
   emit();
 }
@@ -193,6 +205,8 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       // 等新清单到了再换，不闪一下。
       chat = chatId;
       bar = NONE;
+      all = EMPTY;
+      allSig = "";
       known = {};
       cards = noCardState();
       emit();
@@ -239,6 +253,16 @@ export function useSyncAttachmentLoader(chatId: string | null) {
   }, [chatId]);
 }
 
+/**
+ * 当前会话的完整附件清单（同一份清单，[`SyncChatBar`] 与消息里的媒体卡共用）。
+ * 不在对话页、或者清单还没取到：空列表。消息里的媒体卡按路径在这份清单里查——
+ * 文件在别的设备上（或只在同步缓存里）时，MediaPreviews 改出附件卡，而不是一个
+ * 点了只报「媒体文件不存在」的「点开」卡。
+ */
+export function useChatAttachments(chatId: string | null): SyncAttachment[] {
+  return useSyncExternalStore(subscribe, () => (chatId !== null && chat === chatId ? all : EMPTY));
+}
+
 const CARD =
   "flex items-center gap-2 rounded-xl border border-[#2a2f3a] bg-[#0f131b] px-3 py-2 text-left";
 const CARD_ICON = "flex h-9 w-9 shrink-0 items-center justify-center rounded-full";
@@ -275,17 +299,22 @@ function awayText(state: string, where: string): { note: string; action: string 
   }
 }
 
-function AttachmentCard({
+/** 一个不在本机原位置上的附件（下载 / 存进工作区 / 重试）。会话顶部的一条与消息里
+ *  的媒体卡共用：同一种状态在两处说法一致，点按的行为也一致。 */
+export function AttachmentCard({
   chatId,
   item,
+  name,
   onError,
 }: {
   chatId: string;
   item: SyncAttachment;
+  /** 卡片上展示的文件名（消息里媒体回执行给了 name 时用那个；缺省取路径末段）。 */
+  name?: string;
   onError: (message: string) => void;
 }) {
   const state = useSyncExternalStore(subscribe, () => cards);
-  const name = item.path.split("/").pop() || item.path;
+  const shown = name ?? (item.path.split("/").pop() || item.path);
   const where = item.origin ? `「${item.origin}」` : "别的设备";
   const isImage = IMAGE_RE.test(item.path);
   const error = state.errors[item.blob];
@@ -298,9 +327,9 @@ function AttachmentCard({
       <div className={CARD}>
         <span className={`${CARD_ICON} bg-emerald-500/10 text-emerald-400`}>✓</span>
         <span className="min-w-0 flex-1">
-          <span className={CARD_NAME}>{name}</span>
+          <span className={CARD_NAME}>{shown}</span>
           <span className={CARD_NOTE}>
-            {formatBytes(item.size)} · 已下载到 {item.path}
+            {formatBytes(item.size)} · 已下载到 {item.rel_path ?? item.path}
           </span>
         </span>
         {/* 打开只按工作区相对路径：`open_media` 不收绝对路径（安卓与 Windows 都会拒）。
@@ -317,14 +346,14 @@ function AttachmentCard({
     const saving = Boolean(state.saving[item.blob]);
     return (
       <div>
-        {isImage && <SnapshotImage chatId={chatId} blob={item.blob} alt={name} />}
+        {isImage && <SnapshotImage chatId={chatId} blob={item.blob} alt={shown} />}
         <div
           className={CARD}
           title="这是从别的设备取回的一份文件快照，放在同步缓存里（这台设备的工作区里可能另有同名文件，所以不往原位置写）。存进工作区之后，助手才能按路径读到它。"
         >
           <span className={`${CARD_ICON} bg-indigo-600 text-white`}>📄</span>
           <span className="min-w-0 flex-1">
-            <span className={CARD_NAME}>{name}</span>
+            <span className={CARD_NAME}>{shown}</span>
             <span className={CARD_NOTE}>
               {formatBytes(item.size)} · 来自{where}的文件快照
               {savedTo ? ` · 已存到 ${savedTo}` : "，存进工作区之后助手才读得到"}
@@ -365,7 +394,7 @@ function AttachmentCard({
       <div className={CARD}>
         <span className={`${CARD_ICON} bg-[#1a1f29] text-gray-300`}>{isImage ? "🖼" : "📎"}</span>
         <span className="min-w-0 flex-1">
-          <span className={CARD_NAME}>{name}</span>
+          <span className={CARD_NAME}>{shown}</span>
           <span className={CARD_NOTE}>
             {formatBytes(item.size)} · {away.note}
           </span>

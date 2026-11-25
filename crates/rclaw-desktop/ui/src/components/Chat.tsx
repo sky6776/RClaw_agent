@@ -1799,6 +1799,8 @@ export default function Chat({
                 </div>
                 <MediaPreviews
                   content={e.content}
+                  chatId={sessionKey}
+                  msgId={e.msgId}
                   onError={onError}
                   selectMode={!!selectIds}
                   onMediaMenu={(media, x, y, fromTouch) =>
@@ -1865,6 +1867,8 @@ export default function Chat({
               />
               <MediaPreviews
                 content={e.content}
+                chatId={sessionKey}
+                msgId={e.msgId}
                 onError={onError}
                 selectMode={!!selectIds}
                 onMediaMenu={(media, x, y, fromTouch) =>

@@ -6,9 +6,10 @@ import {
   type MouseEvent,
   type TouchEvent,
 } from "react";
-import { api } from "../lib/api";
+import { api, type SyncAttachment } from "../lib/api";
 import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
+import { AttachmentCard, useChatAttachments } from "./SyncAttachments";
 
 /** 会话流内嵌媒体预览条目。 */
 export interface PreviewItem {
@@ -128,6 +129,8 @@ export function parseMediaItems(content: string): PreviewItem[] {
  *  加载失败静默留空（失败降级为「点开」卡交给系统应用）。 */
 export default function MediaPreviews({
   content,
+  chatId,
+  msgId,
   onError,
   selectMode = false,
   onMediaMenu,
@@ -135,6 +138,10 @@ export default function MediaPreviews({
   onOpenVideo,
 }: {
   content: string;
+  /** 会话（多端同步的附件清单按它取）。没有就不查清单，全部按工作区路径出卡。 */
+  chatId?: string;
+  /** 消息行 id（= Entry.msgId）：同一路径被几条消息引用时优先本消息登记的那份。 */
+  msgId?: number;
   onError?: (message: string) => void;
   selectMode?: boolean;
   onMediaMenu?: (media: MediaMenuPayload, x: number, y: number, fromTouch: boolean) => void;
@@ -161,9 +168,33 @@ export default function MediaPreviews({
 
   const items = useMemo(() => parseMediaItems(content), [content]);
 
+  // 同步来的会话：消息里引用的文件可能不在这台设备上（还在别的设备上，或者只在同步
+  // 缓存里）。界面先查这个会话的附件清单，命中的按附件卡出卡（下载 / 存进工作区），
+  // 不再出一个点了只报「媒体文件不存在」的「点开」卡；清单里没有（本机文件、没开同步）
+  // 的照旧按工作区路径出卡。
+  const synced = useChatAttachments(chatId ?? null);
+  const away = useMemo(() => {
+    const map = new Map<string, SyncAttachment>();
+    if (!chatId) return map;
+    for (const item of synced) {
+      if (item.kind !== "file") continue;
+      // 本机有、且就落在消息写的这个路径上：照旧按工作区路径出卡。同一份内容在
+      // 本机的另一个落点上（同对象被引用到两个路径，别名还没补上）时消息路径依旧
+      // 打不开——按附件卡给出能用的那个路径。
+      const onThisPath =
+        item.state === "local" && (item.rel_path === null || item.rel_path === item.path);
+      if (onThisPath) continue;
+      // 同一条路径被几条消息引用：本消息登记的优先，其次取较晚的那条。
+      if (!map.has(item.path) || item.message_id === msgId) map.set(item.path, item);
+    }
+    return map;
+  }, [chatId, synced, msgId]);
+  const awayPaths = useMemo(() => new Set(away.keys()), [away]);
+
   // 视频卡：拉本地流式 URL（含首帧由 <video preload=metadata> 显示）。
   useEffect(() => {
     for (const item of items) {
+      if (awayPaths.has(item.path)) continue;
       if (item.kind !== "open") continue;
       if (!/\.(?:mp4|webm|m4v|mov)$/i.test(item.path)) continue; // 音频等仍走系统播放器
       if (videoRequested.current.has(item.key)) continue;
@@ -173,11 +204,12 @@ export default function MediaPreviews({
         .then((url) => setVideoUrls((prev) => ({ ...prev, [item.key]: url })))
         .catch(() => setVideoUrls((prev) => ({ ...prev, [item.key]: "" })));
     }
-  }, [items]);
+  }, [items, awayPaths]);
 
   useEffect(() => {
     for (const item of items) {
       if (item.kind !== "image") continue; // 视频/文档不预载：点卡片经系统应用打开
+      if (awayPaths.has(item.path)) continue; // 不在这台设备上：附件卡自己出预览
       if (requested.current.has(item.key)) continue;
       requested.current.add(item.key);
       void api
@@ -190,7 +222,7 @@ export default function MediaPreviews({
         .catch(() => setUrls((prev) => ({ ...prev, [item.key]: "" })));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items]);
+  }, [items, awayPaths]);
 
   // ---- 长按 / 右键上抛（菜单在 Chat 层统一渲染） ----
 
@@ -250,14 +282,31 @@ export default function MediaPreviews({
   };
 
   // 图片读取完成（无论成败）即出卡：失败（urls[p] === ""，如超 25MB 上限、
-  // 文件已被清理）降级为「点开」卡交给系统应用，正文引用不再凭空消失。
-  const rendered = items.filter((it) => it.kind === "open" || urls[it.key] !== undefined);
+  // 文件已被清理）降级为「点开」卡交给系统应用，正文引用不再凭空消失。不在这台设备
+  // 上的附件（附件清单里有它）始终出卡——按清单状态给「下载」/「存进工作区」。
+  const rendered = items
+    .map((it) => ({ it, away: away.get(it.path) }))
+    .filter(
+      ({ it, away }) =>
+        away !== undefined || it.kind === "open" || urls[it.key] !== undefined,
+    );
   if (rendered.length === 0) return null;
   return (
     // max-w-full 压住容器的 fit-content：长文件名的「点开」卡不受卡片自身
     // max-w-full 约束（百分比相对本容器，会循环撑开），把消息列撑出屏幕。
     <div className="mt-1 flex max-w-full flex-col gap-2">
-      {rendered.map((it) => {
+      {rendered.map(({ it, away: awayItem }) => {
+        if (awayItem && chatId) {
+          return (
+            <AttachmentCard
+              key={it.key}
+              chatId={chatId}
+              item={awayItem}
+              name={it.display}
+              onError={onError ?? (() => {})}
+            />
+          );
+        }
         // 长按 / 右键 handlers（各媒体卡共用）。选择模式下点击交给消息列的
         // 选中切换，本组件只拦截触摸冒泡（防消息气泡长按守卫同时上抛）。
         const handlers = {
