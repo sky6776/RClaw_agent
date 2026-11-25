@@ -13,6 +13,7 @@ import {
   AttachmentCard,
   messageFileRefs,
   readableAtPath,
+  refreshSyncAttachments,
   useChatAttachments,
   useChatAttachmentsReady,
 } from "./SyncAttachments";
@@ -211,9 +212,16 @@ export default function MediaPreviews({
     path: string;
     display: string;
     card?: HTMLImageElement;
+    /** 这条消息引用的附件对象名（画廊按它定位到点的那一份）。 */
+    blob?: string;
   }) => void;
   /** 视频：应用内播放器（本地流式 URL，边下边播）。 */
-  onOpenVideo?: (payload: { url: string; path: string; display: string }) => void;
+  onOpenVideo?: (payload: {
+    url: string;
+    path: string;
+    display: string;
+    blob?: string;
+  }) => void;
 }) {
   const [urls, setUrls] = useState<Record<string, string>>({});
   const requested = useRef<Set<string>>(new Set());
@@ -256,6 +264,10 @@ export default function MediaPreviews({
     return map;
   }, [mine]);
   const awayPaths = useMemo(() => new Set(away.keys()), [away]);
+  // 预览/视频的请求与结果按「路径 + 期望的对象名」记：清单晚到时对象名才出现，同一
+  // 条路径上的不同版本不能共用一次请求的结论。
+  const keyFor = (item: PreviewItem) =>
+    `${item.path}|${mine.get(item.path)?.blob ?? ""}`;
   // 文本解析没认出来、但这条消息确实登记了的附件（`attach::extract_refs` 认正文里
   // 裸写的 `output/report.pdf`，媒体卡的正则只认带反引号的文档）：补一张卡，否则
   // 用户在这台设备上没有取回入口。补齐按「这条消息登记的全部附件」算——只按缺卡的
@@ -290,18 +302,19 @@ export default function MediaPreviews({
       if (awayPaths.has(item.path)) {
         // 清单比首屏晚到时，预览可能已经按本机路径试过一遍（文件不在，记成失败）。
         // 允许重新取：下载完成、清单刷新后这张卡要能自己换回视频/图片。
-        videoRequested.current.delete(item.key);
+        videoRequested.current.delete(keyFor(item));
         continue;
       }
       if (item.kind !== "open") continue;
       if (!/\.(?:mp4|webm|m4v|mov)$/i.test(item.path)) continue; // 音频等仍走系统播放器
-      if (videoRequested.current.has(item.key)) continue;
-      videoRequested.current.add(item.key);
+      const itemKey = keyFor(item);
+      if (videoRequested.current.has(itemKey)) continue;
+      videoRequested.current.add(itemKey);
       api
         // 带上这条消息登记的对象名：按路径读之前后端先核对一下内容。
         .mediaStreamUrl(item.path, chatId, mine.get(item.path)?.blob)
-        .then((url) => setVideoUrls((prev) => ({ ...prev, [item.key]: url })))
-        .catch(() => setVideoUrls((prev) => ({ ...prev, [item.key]: "" })));
+        .then((url) => setVideoUrls((prev) => ({ ...prev, [itemKey]: url })))
+        .catch(() => setVideoUrls((prev) => ({ ...prev, [itemKey]: "" })));
     }
   }, [shown, awayPaths, ready, mine, chatId]);
 
@@ -313,19 +326,20 @@ export default function MediaPreviews({
       if (awayPaths.has(item.path)) {
         // 不在这台设备上：附件卡自己出预览。首屏清单还没到时可能已按本机路径试过
         // 一次并记成失败，这里把去重记下，取回之后要能重新出图。
-        requested.current.delete(item.key);
+        requested.current.delete(keyFor(item));
         continue;
       }
-      if (requested.current.has(item.key)) continue;
-      requested.current.add(item.key);
+      const itemKey = keyFor(item);
+      if (requested.current.has(itemKey)) continue;
+      requested.current.add(itemKey);
       void api
         // 卡片用屏幕级预览图（后端缩到长边 1440 并缓存）：不再传输/解码
         // 12MP 原图（9MB base64 + 全图解码是真机点开图片慢的源头）。
         .mediaPreview(item.path, chatId, mine.get(item.path)?.blob)
         .then((r) =>
-          setUrls((prev) => ({ ...prev, [item.key]: `data:${r.mime};base64,${r.base64}` })),
+          setUrls((prev) => ({ ...prev, [itemKey]: `data:${r.mime};base64,${r.base64}` })),
         )
-        .catch(() => setUrls((prev) => ({ ...prev, [item.key]: "" })));
+        .catch(() => setUrls((prev) => ({ ...prev, [itemKey]: "" })));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shown, awayPaths, ready, mine, chatId]);
@@ -391,7 +405,11 @@ export default function MediaPreviews({
       attachment && chatId
         ? api.syncOpenAttachment(chatId, attachment.blob, item.path)
         : api.openMedia(item.path);
-    void open.catch((e) => onError?.(`打开媒体失败: ${String(e)}`));
+    void open.catch((e) => {
+      onError?.(`打开媒体失败: ${String(e)}`);
+      // 核对没过（文件被就地改写过）：重取清单，把这张卡换成「重新下载」。
+      refreshSyncAttachments();
+    });
   };
 
   // 图片读取完成（无论成败）即出卡：失败（urls[p] === ""，如超 25MB 上限、
@@ -401,7 +419,7 @@ export default function MediaPreviews({
     .map((it) => ({ it, away: away.get(it.path) }))
     .filter(
       ({ it, away }) =>
-        away !== undefined || it.kind === "open" || urls[it.key] !== undefined,
+        away !== undefined || it.kind === "open" || urls[keyFor(it)] !== undefined,
     );
   if (rendered.length === 0) return null;
   return (
@@ -409,13 +427,14 @@ export default function MediaPreviews({
     // max-w-full 约束（百分比相对本容器，会循环撑开），把消息列撑出屏幕。
     <div className="mt-1 flex max-w-full flex-col gap-2">
       {rendered.map(({ it, away: awayItem }) => {
+        const itemKey = keyFor(it);
         if (!ready) {
           // 清单还没核对好（刚合进新消息、正在重取）：这一步连已经加载过的图片/
           // 视频也不再出可点的卡——这时按工作区路径看到、打开或存下的可能是同名的
           // 另一个版本。清单到了再换回来。
           return (
             <div
-              key={it.key}
+              key={itemKey}
               className="flex max-w-full items-center gap-2 self-start rounded-xl border border-[#2a2f3a] bg-[#0f131b] px-3 py-2 text-left opacity-60"
             >
               <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#1a1f29] text-gray-400">
@@ -432,7 +451,7 @@ export default function MediaPreviews({
           return (
             // 多选模式下点卡片 = 选中这条消息（与图片/视频卡一致）：卡片上的按钮
             // 不吃点击，事件落到消息行。
-            <div key={it.key} className={selectMode ? "pointer-events-none" : undefined}>
+            <div key={itemKey} className={selectMode ? "pointer-events-none" : undefined}>
               <AttachmentCard
                 chatId={chatId}
                 item={awayItem}
@@ -488,11 +507,11 @@ export default function MediaPreviews({
         // 视频容器：本地流式 URL 就绪 → 内嵌首帧视频卡（点击应用内播放）；
         // 未就绪/获取失败 → 旧的「点开」卡交给系统播放器。
         const isVideoFile = it.kind === "open" && /\.(?:mp4|webm|m4v|mov)$/i.test(it.path);
-        const streamUrl = isVideoFile ? videoUrls[it.key] : undefined;
+        const streamUrl = isVideoFile ? videoUrls[itemKey] : undefined;
         if (isVideoFile && streamUrl) {
           return (
             <video
-              key={it.key}
+              key={itemKey}
               src={`${streamUrl}#t=0.1`}
               preload="metadata"
               muted
@@ -501,7 +520,7 @@ export default function MediaPreviews({
               onError={() => {
                 // 流断开 / 容器解不了（如个别 MOV）：降级为「点开」卡交给系统
                 // 播放器，不留一块空黑板。
-                setVideoUrls((prev) => ({ ...prev, [it.key]: "" }));
+                setVideoUrls((prev) => ({ ...prev, [itemKey]: "" }));
               }}
               onClick={() => {
                 if (selectMode) return; // 冒泡到消息列的选中切换
@@ -515,6 +534,7 @@ export default function MediaPreviews({
                   url: streamUrl,
                   path: it.path,
                   display: it.display || it.path,
+                  blob: mine.get(it.path)?.blob,
                 });
               }}
               className="max-h-72 w-auto max-w-full cursor-pointer self-start rounded-xl border border-[#2a2f3a]"
@@ -522,9 +542,9 @@ export default function MediaPreviews({
             />
           );
         }
-        return it.kind === "open" || (urls[it.key] ?? "") === "" ? (
+        return it.kind === "open" || (urls[itemKey] ?? "") === "" ? (
           <button
-            key={it.key}
+            key={itemKey}
             {...handlers}
             onClick={() => {
               if (selectMode) return; // 冒泡到消息列的选中切换
@@ -543,8 +563,8 @@ export default function MediaPreviews({
           </button>
         ) : (
           <img
-            key={it.key}
-            src={urls[it.key]}
+            key={itemKey}
+            src={urls[itemKey]}
             alt={it.display || it.path}
             // 视口外不加载不解码（1440 预览也有数百 KB），列表滚动不卡顿。
             loading="lazy"
@@ -561,10 +581,11 @@ export default function MediaPreviews({
               // 卡片元素一并上抛（已解码，查看器 canvas 即时预览用）；
               // src 即预览图，放大看原图时查看器再按 path 加载原图。
               onViewImage?.({
-                src: urls[it.key],
+                src: urls[itemKey],
                 path: it.path,
                 display: it.display || it.path,
                 card: e.currentTarget,
+                blob: mine.get(it.path)?.blob,
               });
             }}
             {...handlers}

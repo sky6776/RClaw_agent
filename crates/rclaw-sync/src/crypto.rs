@@ -308,6 +308,32 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex(digest::digest(&digest::SHA256, data).as_ref())
 }
 
+/// 边读边写边算 SHA-256：把 `reader` 的内容写进 `writer`，返回（摘要, 字节数）。
+/// 分享/导出前的暂存副本用它——复制出来的字节和算过的摘要来自同一次读。
+pub fn copy_hash(reader: &mut dyn Read, writer: &mut dyn Write) -> Result<([u8; 32], u64)> {
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                ctx.update(&buf[..n]);
+                writer.write_all(&buf[..n])?;
+                total += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let digest: [u8; 32] = ctx
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 是 32 字节");
+    Ok((digest, total))
+}
+
 /// 流式 SHA-256：返回 `(摘要字节, 长度)`。
 pub fn sha256_reader(reader: &mut dyn Read) -> Result<([u8; 32], u64)> {
     let mut ctx = digest::Context::new(&digest::SHA256);

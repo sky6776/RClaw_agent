@@ -6,6 +6,8 @@ import VideoPlayer from "./VideoPlayer";
 
 /** 会话媒体画廊条目（Chat 从全部消息解析后传入，见 parseMediaItems）。 */
 export interface GalleryItem {
+  /** 条目的稳定身份：路径 + 期望的对象名（同一路径的不同版本是两条）。 */
+  key: string;
   path: string;
   display: string;
   kind: "image" | "video";
@@ -16,6 +18,8 @@ export interface GalleryItem {
 /** 打开画廊时的种子数据（点击的媒体卡已在手的资源，首屏免重复取数）。 */
 export interface GallerySeed {
   path: string;
+  /** 期望的对象名：只有点到的那一份用这个种子。 */
+  blob?: string;
   /** 图片预览 data URL（卡片同款）。 */
   src?: string;
   /** 媒体卡 <img> 元素（查看器 canvas 即时预览用，只有点开的这一张有）。 */
@@ -31,24 +35,36 @@ export interface GallerySeed {
  *  spinner，失败（如文件已被清理）给提示，两种画面都可左右滑走不卡死。
  *  条目切换用 key 强制重建查看器——缩放/平移状态不跨张携带；Chat 侧再以
  *  key={start} 挂载本组件，画廊开着时点另一张卡也能正确定位。 */
+function seedMatches(seed: GallerySeed, item: GalleryItem): boolean {
+  return seed.path === item.path && (seed.blob === undefined || seed.blob === item.blob);
+}
+
 export default function MediaGallery({
   items,
   start,
   seed,
   chatId,
+  startBlob,
   onError,
   onClose,
 }: {
   items: GalleryItem[];
   /** 打开时点击的条目路径（时间线定位起点）。 */
   start: string;
+  /** 点击的那一份的对象名（同一路径有多个版本时定位到点的那一份）。 */
+  startBlob?: string;
   seed?: GallerySeed | null;
   /** 会话（按对象核对附件读取用）。 */
   chatId?: string;
   onError?: (message: string) => void;
   onClose: () => void;
 }) {
-  const startIndex = Math.max(0, items.findIndex((it) => it.path === start));
+  const startIndex = Math.max(
+    0,
+    items.findIndex(
+      (it) => it.path === start && (startBlob === undefined || it.blob === startBlob),
+    ),
+  );
   const [index, setIndex] = useState(startIndex);
   const item = items[index];
   // 图片预览 data URL：null=取数中，""=失败。
@@ -62,7 +78,7 @@ export default function MediaGallery({
     if (!item) return;
     let alive = true;
     if (item.kind === "video") {
-      if (seed && seed.path === item.path && seed.url) {
+      if (seed && seedMatches(seed, item) && seed.url) {
         setVideoUrl(seed.url);
         return;
       }
@@ -75,7 +91,7 @@ export default function MediaGallery({
           if (alive) setVideoUrl("");
         });
     } else {
-      if (seed && seed.path === item.path && seed.src) {
+      if (seed && seedMatches(seed, item) && seed.src) {
         setImgSrc(seed.src);
         return;
       }
@@ -105,13 +121,13 @@ export default function MediaGallery({
   if (item.kind === "image" && imgSrc) {
     return (
       <ImageViewer
-        key={item.path}
+        key={item.key}
         src={imgSrc}
         path={item.path}
         chatId={chatId}
         blob={item.blob}
         display={item.display}
-        preview={seed && seed.path === item.path ? seed.preview ?? null : null}
+        preview={seed && seedMatches(seed, item) ? seed.preview ?? null : null}
         onError={onError}
         onClose={onClose}
         onPrev={onPrev}
@@ -122,7 +138,7 @@ export default function MediaGallery({
   if (item.kind === "video" && videoUrl) {
     return (
       <VideoPlayer
-        key={item.path}
+        key={item.key}
         url={videoUrl}
         display={item.display}
         onClose={onClose}

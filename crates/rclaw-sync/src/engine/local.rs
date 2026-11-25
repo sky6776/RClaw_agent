@@ -830,7 +830,7 @@ pub(crate) fn attachments(
     }
     // 文件在不在、还是不是登记的那份内容：库锁之外看。路径先过 `check_path`（工作区里
     // 的链接不能把读取带到别处），内容核对按（路径、长度、mtime）记忆摘要。
-    let mut list: Vec<AttachmentInfo> = found
+    let list: Vec<AttachmentInfo> = found
         .into_iter()
         .enumerate()
         .map(|(index, found)| {
@@ -990,7 +990,7 @@ fn version_of(meta: &std::fs::Metadata) -> Option<FileVersion> {
 
 /// 登记长度允许的误差：长度是别的设备报来的，下载本身宽出约一个分块（见
 /// `attach::download_max`）。超出这么多的文件不可能是这个对象，连读都不读。
-const SIZE_SLACK: u64 = 1024 * 1024;
+pub(crate) const SIZE_SLACK: u64 = 1024 * 1024;
 
 /// 读文件算摘要，最多读 `limit` 字节：路径上被换成一个超大文件时不能整读（清单在
 /// 打开会话的关键路径上）。读满了上限还没到文件尾就返回 `None`——判不了它是哪个对象。

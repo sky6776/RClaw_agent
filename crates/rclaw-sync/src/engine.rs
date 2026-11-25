@@ -50,6 +50,17 @@ pub use crate::files::memory::MemoryRestored;
 pub use crate::transport::SelfTestStep;
 pub use crate::trash::{MemoryTrashItem, TrashItem};
 pub use local::{AttachmentInfo, SessionMark};
+
+/// 一次「按对象核对要读/要导出的文件」的结果（§8.7）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachmentReadCheck {
+    /// 内容就是它；`pin` 是核对到的那一份的版本（`长度-修改时间`，流式入口用它钉住）。
+    Verified { pin: String },
+    /// 内容对不上（被就地改写过），或者路径不安全。
+    Mismatch,
+    /// 没有登记/引用、读不出密钥、文件读不了：核不了，按老行为处理。
+    Unverifiable,
+}
 pub use space::{apply_pairing, pairing_config};
 pub use worker::{
     storage_intent_clear_if, storage_intent_config, storage_intent_plan, storage_intent_save,
@@ -247,6 +258,25 @@ impl Shared {
             .as_ref()
             .is_some_and(|sender| sender.send(FetchReq { blob, user }).is_ok())
     }
+}
+
+/// 撤掉一条为「重新下载」临时补的 `BLOB_REMOTE` 登记（只撤还是这个状态的）。
+pub(crate) fn drop_remote_registration(ctx: &crate::Ctx, blob: &str) {
+    let commit = ctx.space.begin();
+    if !commit.valid() {
+        return;
+    }
+    let _ = db::write(ctx.db(), |tx| {
+        if !commit.valid() {
+            return Ok(());
+        }
+        if let Some(row) = db::blob_get(tx, blob)? {
+            if row.state == crate::db::BLOB_REMOTE {
+                db::blob_delete(tx, blob)?;
+            }
+        }
+        Ok(())
+    });
 }
 
 /// 一次等引擎线程回话的调用。
@@ -1018,6 +1048,104 @@ impl SyncEngine {
         )
     }
 
+    /// 按对象核对一次「要读/要导出的文件」，并给出被核对的那一份的版本针。
+    /// 发布顺序：先看路径守卫，再取长度（登记或消息引用），读前后各取一次版本——
+    /// 两次不一致说明读的时候文件在变，核的是哪一份说不清，按对不上处理。
+    pub fn check_attachment_read(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        blob: &str,
+        rel_path: &str,
+        fresh: bool,
+    ) -> AttachmentReadCheck {
+        let ctx = &self.inner.ctx;
+        let Some(keys) = Secrets::load(&ctx.paths)
+            .ok()
+            .and_then(|secrets| secrets.keys().ok())
+        else {
+            return AttachmentReadCheck::Unverifiable;
+        };
+        let path = match ctx.env.checked_path(rel_path) {
+            Ok(path) => path,
+            // 路径不安全（链接/越界）：不能当「核不了就放行」。
+            Err(_) => return AttachmentReadCheck::Mismatch,
+        };
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .ok()
+            .flatten();
+        let Some(size) = row.map(|row| row.size).or_else(|| {
+            local::referenced_attachment(ctx, channel, chat_id, blob).map(|(_, size, _)| size)
+        }) else {
+            return AttachmentReadCheck::Unverifiable;
+        };
+        let stamp = |path: &std::path::Path| -> Option<String> {
+            let meta = std::fs::metadata(path).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_nanos())
+                .unwrap_or(0);
+            Some(format!("{}-{}", meta.len(), mtime))
+        };
+        let before = stamp(&path);
+        let matches = if fresh {
+            local::same_blob_now(&keys, &path, blob, size)
+        } else {
+            local::same_blob(&keys, &path, blob, size)
+        };
+        let after = stamp(&path);
+        match after {
+            Some(pin) if matches && before.as_ref() == Some(&pin) => {
+                AttachmentReadCheck::Verified { pin }
+            }
+            _ => AttachmentReadCheck::Mismatch,
+        }
+    }
+
+    /// 把 `rel_path` 复制到 `dest_rel`（工作区相对路径），边读边写边算摘要：复制出来的
+    /// 字节必须就是 `blob`。返回是否一致；没有登记/引用、读不出密钥、路径不安全 → None。
+    /// 分享前的暂存副本用它——安卓的 chooser 打开后才读文件，不能把可变的工作区路径
+    /// 直接交出去。
+    pub fn stage_attachment_copy(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        blob: &str,
+        rel_path: &str,
+        dest_rel: &str,
+    ) -> Option<bool> {
+        let ctx = &self.inner.ctx;
+        let keys = Secrets::load(&ctx.paths)
+            .ok()
+            .and_then(|secrets| secrets.keys().ok())?;
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .ok()
+            .flatten();
+        let size = row.map(|row| row.size).or_else(|| {
+            local::referenced_attachment(ctx, channel, chat_id, blob).map(|(_, size, _)| size)
+        })?;
+        let source = ctx.env.checked_path(rel_path).ok()?;
+        let dest = ctx.env.resolve(dest_rel);
+        if !dest.starts_with(ctx.env.base()) && !dest.starts_with(&ctx.env.sync_root) {
+            return None;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        let mut input = std::fs::File::open(&source).ok()?;
+        let mut output = std::fs::File::create(&dest).ok()?;
+        let (digest, copied) = crate::crypto::copy_hash(&mut input, &mut output).ok()?;
+        drop(output);
+        let ok = copied <= size.saturating_add(local::SIZE_SLACK)
+            && keys.blob_id(&digest) == blob;
+        if !ok {
+            let _ = std::fs::remove_file(&dest);
+        }
+        Some(ok)
+    }
+
     /// 工作区里 `rel_path` 上的文件是不是 `blob` 这个对象（点开前按需核对）。
     /// 没有登记、读不出密钥、路径不安全时返回 `None`：核不了，按老行为打开。
     pub fn attachment_file_matches(
@@ -1066,6 +1194,7 @@ impl SyncEngine {
         let missing = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
             .map(|row| row.is_none())
             .unwrap_or(false);
+        let mut registered = false;
         if missing {
             if let Some((path, size, artifact)) =
                 local::referenced_attachment(ctx, channel, chat_id, blob)
@@ -1087,14 +1216,25 @@ impl SyncEngine {
                         db::blob_register(tx, blob, &rel_path, size, crate::db::BLOB_REMOTE)?;
                         Ok(())
                     })?;
+                    registered = true;
                 }
             }
         }
-        // 读引用之后换过空间：这次要的旧对象不属于新空间，别排队去取。
+        // 读引用之后换过空间：这次要的旧对象不属于新空间，别排队去取（刚补的临时登记
+        // 也撤掉——旧空间的登记不能留在新空间里）。
         if ctx.space.epoch() != epoch_before {
+            if registered {
+                drop_remote_registration(ctx, blob);
+            }
             return Err(SyncError::other("同步空间刚换过，请重试一次"));
         }
-        self.fetch_attachment(blob)
+        let queued = self.fetch_attachment(blob);
+        if queued.is_err() && registered {
+            // 没排上队（没连上同步空间、引擎在重连）：撤掉刚补的临时登记，别挡住
+            // `BLOB_GONE` 记录「文件放回原处后重新上传」的那条路。
+            drop_remote_registration(ctx, blob);
+        }
+        queued
     }
 
     /// 用户点了一个还没下载的附件：排到下载队列的最前面。结果经

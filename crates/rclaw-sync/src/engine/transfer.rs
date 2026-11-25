@@ -227,6 +227,20 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
         }
         Err(error) => {
             tracing::debug!("取回附件 {blob} 失败: {error}");
+            // 为 `gone` 记录补的临时登记：这次没取成（连接断了/超时），撤掉它，别挡住
+            // 「文件放回原处后重新上传」的那条路。
+            let (ctx, wanted) = (shared.ctx.clone(), blob.clone());
+            let cleanup = blocking(move || {
+                let has_note = db::read(ctx.db(), |conn| {
+                    Ok(db::state_get(conn, crate::db::scope::BLOB_GONE, &wanted)?.is_some())
+                })
+                .unwrap_or(false);
+                if has_note {
+                    crate::engine::drop_remote_registration(&ctx, &wanted);
+                }
+                Ok(())
+            });
+            cleanup.await.ok();
             Some(format!("取回附件失败：{error}"))
         }
     };

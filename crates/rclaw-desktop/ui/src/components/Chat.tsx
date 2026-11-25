@@ -721,6 +721,7 @@ export default function Chat({
   const [gallery, setGallery] = useState<{
     items: GalleryItem[];
     start: string;
+    startBlob?: string;
     seed?: GallerySeed | null;
   } | null>(null);
   // 媒体操作反馈气泡（保存成功 / 已复制；错误走 App toast）。
@@ -1538,10 +1539,12 @@ export default function Chat({
   // 与应用内可播的视频按出现顺序去重入列，start 定位到点击的那条。只扫
   // 用户/助手消息——工具行、思考行不出媒体卡，塞进画廊会出现「滑到一张
   // 聊天里没见过的图」。
-  const openGallery = useCallback((start: string, seed?: GallerySeed | null) => {
+  const openGallery = useCallback(
+    (start: string, seed?: GallerySeed | null, startBlob?: string) => {
     // 清单还没核对好（刚合进新消息、正在重取）：这时按工作区路径拼时间线可能把同名
     // 却不是这份内容的文件放进去，索性先不开——卡片自己会显示「核对附件…」。
     if (!syncedReady) return;
+    const keyOf = (path: string, blob?: string) => `${path}|${blob ?? ""}`;
     const items: GalleryItem[] = [];
     const seen = new Set<string>();
     for (const e of entries) {
@@ -1553,11 +1556,13 @@ export default function Chat({
       const byPath = new Map(refs.map((ref) => [ref.path, ref]));
       for (const it of parseMediaItems(e.content)) {
         const ref = byPath.get(it.path);
-        if (seen.has(it.path) || (ref && !readableAtPath(ref))) continue;
+        const itemKey = keyOf(it.path, ref?.blob);
+        if (seen.has(itemKey) || (ref && !readableAtPath(ref))) continue;
         const isVideo = it.kind === "open" && /\.(?:mp4|webm|m4v|mov)$/i.test(it.path);
         if (it.kind !== "image" && !isVideo) continue;
-        seen.add(it.path);
+        seen.add(keyOf(it.path, ref?.blob));
         items.push({
+          key: keyOf(it.path, ref?.blob),
           path: it.path,
           display: it.display || it.path,
           kind: isVideo ? "video" : "image",
@@ -1567,14 +1572,15 @@ export default function Chat({
       // 清单里有、正文解析漏掉的图片/视频（已在本机）：也放进时间线，否则内联卡
       // 点不开（画廊里没有它，`openGallery` 会直接返回）。
       for (const item of refs) {
-        if (!readableAtPath(item) || seen.has(item.path)) continue;
+        if (!readableAtPath(item) || seen.has(keyOf(item.path, item.blob))) continue;
         // 附件清单是从整行数据里抽的：工具参数、思考里提到的文件也在里面，只有正文
         // 里真的写到的才进时间线（与 MediaPreviews 的补卡同一口径）。
         if (!mentionsPath(e.content, item.path)) continue;
         const video = /\.(?:mp4|webm|m4v|mov)$/i.test(item.path);
         if (!video && !/\.(?:png|jpe?g|webp|gif)$/i.test(item.path)) continue;
-        seen.add(item.path);
+        seen.add(keyOf(item.path, item.blob));
         items.push({
+          key: keyOf(item.path, item.blob),
           path: item.path,
           display: item.path.split("/").pop() || item.path,
           kind: video ? "video" : "image",
@@ -1582,9 +1588,14 @@ export default function Chat({
         });
       }
     }
-    if (!seen.has(start)) return;
-    setGallery({ items, start, seed: seed ?? null });
-  }, [entries, syncedAttachments, syncedReady]);
+    // 点的那一份要真的在时间线里（同路径多个版本时按对象名对）。
+    if (!items.some((it) => it.path === start && (startBlob === undefined || it.blob === startBlob))) {
+      return;
+    }
+    setGallery({ items, start, startBlob, seed: seed ?? null });
+    },
+    [entries, syncedAttachments, syncedReady],
+  );
 
   // 菜单媒体动作：保存 / 转发 / 系统打开 / 放大（放大按需拉 base64，媒体卡
   // 已加载的 data URL 不在 Chat 手里）。
@@ -1619,7 +1630,11 @@ export default function Chat({
     void api
       .mediaPreview(path, sessionKey, ref?.blob)
       .then((r) =>
-        openGallery(path, { path, src: `data:${r.mime};base64,${r.base64}` }),
+        openGallery(
+          path,
+          { path, blob: ref?.blob, src: `data:${r.mime};base64,${r.base64}` },
+          ref?.blob,
+        ),
       )
       .catch((e) => onError?.(`读取图片失败: ${String(e)}`));
   };
@@ -1865,7 +1880,7 @@ export default function Chat({
                   onViewImage={({ src, path, card }) =>
                     openGallery(path, { path, src, preview: card ?? null })
                   }
-                  onOpenVideo={({ url, path }) => openGallery(path, { path, url })}
+                  onOpenVideo={({ url, path, blob }) => openGallery(path, { path, blob, url }, blob)}
                 />
                 {/* 操作行：复制 / 引用 / 分叉图标 + 时间（时间在最右），单行排列；
                     窄屏（手机）走长按菜单，图标行隐藏、只留时间（上边距各自带，
@@ -1933,7 +1948,7 @@ export default function Chat({
                 onViewImage={({ src, path, card }) =>
                   openGallery(path, { path, src, preview: card ?? null })
                 }
-                onOpenVideo={({ url, path }) => openGallery(path, { path, url })}
+                onOpenVideo={({ url, path, blob }) => openGallery(path, { path, blob, url }, blob)}
               />
               {/* 操作行：复制 / 引用 / 分叉图标 + 时间（时间在最右），单行排列；
                   窄屏（手机）走长按菜单，图标行隐藏、只留时间（上边距各自带，
@@ -3032,6 +3047,7 @@ export default function Chat({
           key={gallery.start}
           items={gallery.items}
           start={gallery.start}
+          startBlob={gallery.startBlob}
           seed={gallery.seed}
           chatId={sessionKey}
           onError={onError}

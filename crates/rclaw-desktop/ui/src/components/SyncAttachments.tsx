@@ -448,11 +448,11 @@ export function messageFileRefs(
 /** 这条引用能按消息里的路径直接读吗。`checked=false`（还没轮到核对）的按「能读」
  *  处理——读取前后端会再核一次；核对过且对不上的才出附件卡。 */
 export function readableAtPath(item: SyncAttachment): boolean {
-  return (
-    item.kind === "file" &&
-    item.state === "local" &&
-    (!item.checked || item.path_present)
-  );
+  if (item.kind !== "file") return false;
+  // 核对过的看「消息路径上真有这份内容」（包括已存回原位置的快照：登记还指着
+  // 同步缓存，但原位置的内容核对得上）；没核对过的只有落点就在本机时才按能读处理
+  // （读取前后端还会再核一次）。
+  return item.checked ? item.path_present : item.state === "local";
 }
 
 /** 一条消息登记的文件里，消息路径上并没有这份内容的（按路径索引）：界面出附件卡，

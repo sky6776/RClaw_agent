@@ -5252,6 +5252,34 @@ const MEDIA_PREVIEW_CACHE_DIR: &str = "media/cache/preview";
 /// 带会话上下文的媒体读取：给了 `chat_id`/`blob` 就按对象核对一下这个文件——内联卡
 /// 与画廊都是按路径读的，清单核对过之后文件仍可能被别的程序改写，读之前再对它一次。
 /// 没有登记、读不出密钥时核不了，按老行为继续。
+async fn check_media_read(
+    state: &AppState,
+    chat_id: Option<String>,
+    blob: Option<String>,
+    path: &str,
+    fresh: bool,
+) -> Result<Option<String>, String> {
+    let (Some(chat_id), Some(blob)) = (chat_id, blob) else {
+        return Ok(None);
+    };
+    let Some(engine) = state.sync() else {
+        return Ok(None);
+    };
+    let check_path = path.to_string();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        engine.check_attachment_read(CHANNEL_DESKTOP, &chat_id, &blob, &check_path, fresh)
+    })
+    .await
+    .map_err(|e| format!("核对附件失败: {e}"))?;
+    match outcome {
+        rclaw_sync::AttachmentReadCheck::Verified { pin } => Ok(Some(pin)),
+        rclaw_sync::AttachmentReadCheck::Unverifiable => Ok(None),
+        rclaw_sync::AttachmentReadCheck::Mismatch => Err(
+            "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
+        ),
+    }
+}
+
 async fn verify_media_read(
     state: &AppState,
     chat_id: Option<String>,
@@ -5259,22 +5287,9 @@ async fn verify_media_read(
     path: &str,
     fresh: bool,
 ) -> Result<(), String> {
-    let (Some(chat_id), Some(blob)) = (chat_id, blob) else {
-        return Ok(());
-    };
-    let Some(engine) = state.sync() else {
-        return Ok(());
-    };
-    let check_path = path.to_string();
-    let verified = tauri::async_runtime::spawn_blocking(move || {
-        engine.attachment_file_matches(CHANNEL_DESKTOP, &chat_id, &blob, &check_path, fresh)
-    })
-    .await
-    .map_err(|e| format!("核对附件失败: {e}"))?;
-    if verified == Some(false) {
-        return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into());
-    }
-    Ok(())
+    check_media_read(state, chat_id, blob, path, fresh)
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -5899,19 +5914,53 @@ pub async fn share_media(
     chat_id: Option<String>,
     blob: Option<String>,
 ) -> Result<(), String> {
-    verify_media_read(&state, chat_id, blob, &path, true).await?;
-    // 路径校验同 open_media（canonicalize + 工作区前缀），防越区分享。
-    let _abs = resolve_media_file(&state.home, &path)?;
     #[cfg(target_os = "android")]
     {
-        rclaw_android::share_file(&path).map_err(|e| format!("转发失败: {e}"))
+        // 转发的 chooser 打开之后对方才来读文件：不能把可变的工作区路径交出去。
+        // 先把核对过的那份内容复制到分享缓存（边复制边核对字节），转发的是这份副本。
+        let mut share_path = path.clone();
+        if let (Some(chat_id), Some(blob), Some(engine)) =
+            (chat_id.clone(), blob.clone(), state.sync())
+        {
+            let name = path.rsplit('/').next().unwrap_or("share.bin");
+            let dest = format!(
+                "media/cache/share/{}-{}",
+                &rclaw_sync::ids::random_hex::<6>(),
+                name
+            );
+            let (source, target) = (path.clone(), dest.clone());
+            let staged = run_blocking("准备转发", move || {
+                Ok(engine.stage_attachment_copy(
+                    CHANNEL_DESKTOP,
+                    &chat_id,
+                    &blob,
+                    &source,
+                    &target,
+                ))
+            })
+            .await?;
+            match staged {
+                // 复制出来的就是核对过的那一份：转发它。
+                Some(true) => share_path = dest,
+                // 对不上：别转发另一个版本。
+                Some(false) => {
+                    return Err(
+                        "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
+                    )
+                }
+                // 核不了（没有登记/读不出密钥）：按老行为转发原路径。
+                None => {}
+            }
+        }
+        return rclaw_android::share_file(&share_path).map_err(|e| format!("转发失败: {e}"));
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _ = (chat_id, blob);
+        verify_media_read(&state, None, None, &path, true).await?;
         Err("转发到其它应用仅安卓支持".into())
     }
 }
-
 /// 把纯文本分享到其它应用（安卓 ACTION_SEND text/plain：微信/QQ 收为聊天
 /// 文字）。会话「选择导出到微信/QQ」的文本通道。
 #[tauri::command]
@@ -6099,10 +6148,11 @@ pub async fn media_stream_url(
     chat_id: Option<String>,
     blob: Option<String>,
 ) -> Result<String, String> {
-    // 视频可能很大：这里按摘要缓存的结论核对，不整读。
-    verify_media_read(&state, chat_id, blob, &path, false).await?;
+    // 视频可能很大，但播放是一次明确的动作：整读核对一遍，拿到「被核对的那一份」的
+    // 版本针，URL 钉住它——播放期间文件被改写，后续 Range 请求一律拒绝。
+    let pin = check_media_read(&state, chat_id, blob, &path, true).await?;
     let agent_root = state.home.join("agent");
-    match crate::media_stream::stream_url_with_root(agent_root, &path) {
+    match crate::media_stream::stream_url_with_root(agent_root, &path, pin.as_deref()) {
         Some(url) => Ok(url),
         None => Err("媒体文件不存在或路径越出工作区".into()),
     }

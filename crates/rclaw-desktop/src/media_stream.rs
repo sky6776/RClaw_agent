@@ -68,12 +68,16 @@ pub fn server(agent_root: PathBuf) -> &'static StreamServer {
 
 /// 生成某工作区媒体路径的流式 URL（含 token）。路径守卫失败返回 None。
 /// 命令入口：确保服务已按 agent 根目录启动，再取流式 URL。
-pub fn stream_url_with_root(agent_root: PathBuf, path: &str) -> Option<String> {
+pub fn stream_url_with_root(
+    agent_root: PathBuf,
+    path: &str,
+    pin: Option<&str>,
+) -> Option<String> {
     server(agent_root);
-    stream_url(path)
+    stream_url(path, pin)
 }
 
-pub fn stream_url(path: &str) -> Option<String> {
+pub fn stream_url(path: &str, pin: Option<&str>) -> Option<String> {
     let server = SERVER.get()?;
     // 与 media_base64 相同的守卫，提前校验（请求期还会再验一次）。
     let full = resolve_media_path(&server.agent_root, path)?;
@@ -82,9 +86,13 @@ pub fn stream_url(path: &str) -> Option<String> {
     }
     // URL 钉住当前文件的版本（长度 + 修改时间）：播放期间文件被就地改写了，后续
     // Range 请求一律拒绝——不能让用户看着「核对过的那个视频」，放出来的却是别的。
-    let pin = file_version(&full)
-        .map(|version| format!("&v={version}"))
-        .unwrap_or_default();
+    // 版本针用调用方核对时那一份的（`check_attachment_read` 的 `pin`），没有再现场取。
+    let pin = match pin {
+        Some(pin) => format!("&v={pin}"),
+        None => file_version(&full)
+            .map(|version| format!("&v={version}"))
+            .unwrap_or_default(),
+    };
     Some(format!(
         "http://127.0.0.1:{}/m?t={}&p={}{}",
         server.port,
