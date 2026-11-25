@@ -1554,8 +1554,13 @@ export default function Chat({
       // 对象名，读取前由后端核对。
       const refs = messageFileRefs(syncedAttachments, e.msgId);
       const byPath = new Map(refs.map((ref) => [ref.path, ref]));
+      // 正文里的裸文件名猜成 `media/<名字>` 的，遇到同名的登记就让位（与内联卡同口径）。
+      const refNames = new Set(
+        refs.map((ref) => ref.path.split("/").pop() ?? ref.path),
+      );
       for (const it of parseMediaItems(e.content)) {
         const ref = byPath.get(it.path);
+        if (!ref && refNames.has(it.path.split("/").pop() ?? it.path)) continue;
         const itemKey = keyOf(it.path, ref?.blob);
         if (seen.has(itemKey) || (ref && !readableAtPath(ref))) continue;
         const isVideo = it.kind === "open" && /\.(?:mp4|webm|m4v|mov)$/i.test(it.path);

@@ -233,6 +233,17 @@ export default function MediaPreviews({
   const isMobile = useIsMobile();
   // 长按触发后吞掉紧随的 click（长按松手仍会派发 click，会误触「点开」/查看器）。
   const suppressClickRef = useRef(false);
+  // 组件还活着、还是同一个会话：点播/预览这类异步结果回来时再确认一次，别把上一个
+  // 会话的画廊开到新会话上。
+  const mountedRef = useRef(true);
+  const chatRef = useRef(chatId);
+  chatRef.current = chatId;
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+    },
+    [],
+  );
 
   const items = useMemo(() => parseMediaItems(content), [content]);
 
@@ -275,8 +286,19 @@ export default function MediaPreviews({
   // 用户在这台设备上没有取回入口。补齐按「这条消息登记的全部附件」算——只按缺卡的
   // 补的话，下载完成、文件落回原位置之后这张卡会凭空消失，而不是变成「点开」。
   const shown = useMemo(() => {
-    if (mine.size === 0) return items;
-    const seen = new Set(items.map((item) => item.path));
+    // 正文里的裸文件名会被解析成 `media/<名字>` 的猜测；这条消息登记的是另一个完整
+    // 路径（同名）时，猜测让位——否则本机恰好有 `media/<名字>` 时会显示一个不相干的
+    // 文件（绕过了按对象的核对）。
+    const refNames = new Set(
+      [...mine.keys()].map((path) => path.split("/").pop() ?? path),
+    );
+    const parsed = items.filter((item) => {
+      if (mine.has(item.path)) return true;
+      const name = item.path.split("/").pop() ?? item.path;
+      return !refNames.has(name);
+    });
+    if (mine.size === 0) return parsed;
+    const seen = new Set(parsed.map((item) => item.path));
     const extra: PreviewItem[] = [];
     for (const path of mine.keys()) {
       if (seen.has(path)) continue;
@@ -293,7 +315,7 @@ export default function MediaPreviews({
         kind: image ? "image" : "open",
       });
     }
-    return extra.length === 0 ? items : [...items, ...extra];
+    return extra.length === 0 ? parsed : [...parsed, ...extra];
   }, [items, mine, content]);
 
   // 视频卡：拉本地流式 URL（含首帧由 <video preload=metadata> 显示）。
@@ -546,15 +568,19 @@ export default function MediaPreviews({
                 const blob = mine.get(it.path)?.blob;
                 api
                   .mediaStreamUrl(it.path, chatId, blob, true)
-                  .then((url) =>
+                  .then((url) => {
+                    if (!mountedRef.current || chatRef.current !== chatId) return;
                     onOpenVideo?.({
                       url,
                       path: it.path,
                       display: it.display || it.path,
                       blob,
-                    }),
-                  )
-                  .catch((e) => onError?.(`打开视频失败: ${String(e)}`));
+                    });
+                  })
+                  .catch((e) => {
+                    if (!mountedRef.current) return;
+                    onError?.(`打开视频失败: ${String(e)}`);
+                  });
               }}
               className="max-h-72 w-auto max-w-full cursor-pointer self-start rounded-xl border border-[#2a2f3a]"
               title={`${it.display || it.path}（点击播放；长按 / 右键更多操作）`}

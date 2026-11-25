@@ -6141,6 +6141,11 @@ pub(crate) fn stage_bytes_for_export(
         return Err("暂存目录越出工作区".into());
     }
     let name = original.rsplit('/').next().unwrap_or("export.bin");
+    // 只接受一个普通的文件名段（不允许盘符、分隔符、备用数据流——否则 join 之后可能
+    // 写到暂存目录之外）。
+    if name.is_empty() || !rclaw_store::is_portable_file_name(name) {
+        return Err("暂存文件名不合规，不能打开".into());
+    }
     let staged = dir.join(name);
     let mut file = std::fs::OpenOptions::new()
         .write(true)

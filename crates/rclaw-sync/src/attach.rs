@@ -1186,18 +1186,31 @@ fn settle(
 /// `blob.gone`。问的那台设备也许没看到上一次说的（它是后来加入的，那段日志已经回收），
 /// 不能让它干等。一条 `blob.want` 至多换来一条 `blob.gone`，`blob.want` 自己是限流的。
 pub fn on_blob_want(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
-    // 「重新下载」临时补的登记（重启后仍留着的那种）：撤掉它，让下面照常走
-    // `BLOB_GONE` 的恢复路径——文件放回原处时这台设备还能重新上传。
-    if db::state_get(conn, scope::BLOB_PROBE, blob_id)?.is_some() {
-        if let Some(row) = db::blob_get(conn, blob_id)? {
-            if row.state == BLOB_REMOTE {
-                db::blob_delete(conn, blob_id)?;
+    // 「重新下载」临时补的登记（带 `blob-probe` 标记）：刚点下去、下载可能还在跑，
+    // 这时不能撤（`place` 落盘还要这条登记）；只有陈旧的（超过 10 分钟，不可能还有
+    // 在途下载）才撤掉，让下面照常走 `BLOB_GONE` 的恢复路径。
+    if let Some(marker) = db::state_get(conn, scope::BLOB_PROBE, blob_id)? {
+        let started = marker
+            .value
+            .as_deref()
+            .and_then(|value| value.rsplit_once('|'))
+            .and_then(|(_, ts)| ts.parse::<i64>().ok())
+            .unwrap_or(0);
+        if now_ms().saturating_sub(started) > 10 * 60 * 1000 {
+            if let Some(row) = db::blob_get(conn, blob_id)? {
+                if row.state == BLOB_REMOTE {
+                    db::blob_delete(conn, blob_id)?;
+                }
             }
+            conn.execute(
+                "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+                params![scope::BLOB_PROBE, blob_id],
+            )?;
+        } else {
+            // 在途：照常点名，但别动登记。
+            mark_named(conn, blob_id)?;
+            return Ok(());
         }
-        conn.execute(
-            "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
-            params![scope::BLOB_PROBE, blob_id],
-        )?;
     }
     let requeued = conn.execute(
         "UPDATE sync_blob SET state = ?2 WHERE blob_id = ?1 AND state IN (?3, ?4, ?5)",
