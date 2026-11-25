@@ -5416,6 +5416,19 @@ fn image_preview_bytes(
             .map(|b| format!("{b:02x}"))
             .collect()
     };
+    // 内容寻址的缩略图缓存：同一份内容已经算过就直接用（重开会话、画廊来回滑不重解码）。
+    let cache_dir = home
+        .join("agent")
+        .join(MEDIA_PREVIEW_CACHE_DIR);
+    let cache_base = cache_dir.join(&key);
+    for (ext, cache_mime) in [("jpg", "image/jpeg"), ("png", "image/png")] {
+        if let Ok(cached) = std::fs::read(cache_base.with_extension(ext)) {
+            return Ok(MediaPayload {
+                mime: cache_mime.into(),
+                base64: encode_base64(&cached),
+            });
+        }
+    }
     image_preview_encode(home, bytes, &key, mime)
 }
 
@@ -6111,16 +6124,63 @@ pub(crate) fn stage_bytes_for_export(
     original: &str,
     bytes: &[u8],
 ) -> Result<std::path::PathBuf, String> {
-    let dir = home
-        .join("agent")
-        .join("media/cache/export")
+    // 目录逐级建、每级都要求是普通目录（链接的祖先不写）；文件必须新建。
+    let dir = ensure_workspace_dir(home, "media/cache/export")?
         .join(rclaw_sync::ids::random_hex::<6>());
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    std::fs::create_dir(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let root = home
+        .join("agent")
+        .canonicalize()
+        .map_err(|e| format!("工作区不可用: {e}"))?;
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("创建目录失败: {e}"))?;
+    if !dir.starts_with(&root) {
+        return Err("暂存目录越出工作区".into());
+    }
     let name = original.rsplit('/').next().unwrap_or("export.bin");
     let staged = dir.join(name);
-    std::fs::write(&staged, bytes).map_err(|e| format!("写入暂存文件失败: {e}"))?;
-    prune_cache_dir(&home.join("agent").join("media/cache/export"), 8);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|e| format!("写入暂存文件失败: {e}"))?;
+    use std::io::Write as _;
+    file.write_all(bytes)
+        .map_err(|e| format!("写入暂存文件失败: {e}"))?;
+    drop(file);
+    prune_cache_dir(&ensure_workspace_dir(home, "media/cache/export")?, 8);
     Ok(staged)
+}
+
+/// 在工作区里逐级建目录（每级都必须是普通目录，不跟随链接），返回 `agent/<rel>`。
+fn ensure_workspace_dir(
+    home: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf, String> {
+    let root = home.join("agent");
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| format!("工作区不可用: {e}"))?;
+    let mut dir = root_canon.clone();
+    for segment in rel.split('/') {
+        dir.push(segment);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("工作区里的 {rel} 不是普通目录")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+            }
+            Err(e) => return Err(format!("创建目录失败: {e}")),
+        }
+    }
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("创建目录失败: {e}"))?;
+    if !dir.starts_with(&root_canon) {
+        return Err("暂存目录越出工作区".into());
+    }
+    Ok(dir)
 }
 
 /// 清理缓存目录：删掉一小时前的，最多留 `keep` 个条目（新的在前）。
@@ -6168,9 +6228,10 @@ pub async fn share_media(
         if let (Some(chat_id), Some(blob), Some(engine)) =
             (chat_id.clone(), blob.clone(), state.sync())
         {
+            // 随机标识放在目录上，文件名保持原样（安卓 FileProvider 用它当展示名）。
             let name = path.rsplit('/').next().unwrap_or("share.bin");
             let dest = format!(
-                "media/cache/share/{}-{}",
+                "media/cache/share/{}/{}",
                 &rclaw_sync::ids::random_hex::<6>(),
                 name
             );
@@ -6396,10 +6457,48 @@ pub async fn media_stream_url(
     blob: Option<String>,
     fresh: Option<bool>,
 ) -> Result<String, String> {
-    // 点播（`fresh`）整读核对一遍，拿到「被核对的那一份」的版本针；海报帧用摘要缓存
-    // 的结论（不然每张挂载的视频卡都要整读一遍）。播放期间文件被改写，后续 Range
-    // 请求一律拒绝。
-    let pin = check_media_read(&state, chat_id, blob, &path, fresh.unwrap_or(true)).await?;
+    let playback = fresh.unwrap_or(true);
+    // 点播：把核对过的内容复制成暂存副本，流从这份副本出——播放期间原路径被改写也
+    // 影响不到已经在播的这一份（副本就是边复制边核对过的字节）。
+    if playback {
+        if let (Some(chat_id), Some(blob), Some(engine)) =
+            (chat_id.clone(), blob.clone(), state.sync())
+        {
+            let name = path.rsplit('/').next().unwrap_or("stream.bin");
+            let dest = format!(
+                "media/cache/stream/{}/{}",
+                rclaw_sync::ids::random_hex::<6>(),
+                name
+            );
+            let (source, target) = (path.clone(), dest.clone());
+            let staged = run_blocking("准备播放", move || {
+                Ok(engine.stage_attachment_copy(
+                    CHANNEL_DESKTOP,
+                    &chat_id,
+                    &blob,
+                    &source,
+                    &target,
+                ))
+            })
+            .await?;
+            match staged {
+                rclaw_sync::AttachmentStage::Staged(rel) => {
+                    let agent_root = state.home.join("agent");
+                    return crate::media_stream::stream_url_with_root(agent_root, &rel, None)
+                        .ok_or_else(|| "这个文件不能应用内播放".to_string());
+                }
+                rclaw_sync::AttachmentStage::Rejected => {
+                    return Err(
+                        "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
+                    )
+                }
+                rclaw_sync::AttachmentStage::Unverifiable => {}
+            }
+        }
+    }
+    // 海报帧（或核不了的）：按路径 + 版本针。核得上的钉住版本（海报按摘要缓存结论核，
+    // 不整读）；核不了的**不钉版本**。
+    let pin = check_media_read(&state, chat_id, blob, &path, !playback).await?;
     let agent_root = state.home.join("agent");
     match crate::media_stream::stream_url_with_root(agent_root, &path, pin.as_deref()) {
         Some(url) => Ok(url),

@@ -524,8 +524,9 @@ export default function MediaPreviews({
               playsInline
               {...handlers}
               onError={() => {
-                // 流断开 / 容器解不了（如个别 MOV）：降级为「点开」卡交给系统
-                // 播放器，不留一块空黑板。
+                // 流断开 / 容器解不了（如个别 MOV），或者核对过的版本已经被改写
+                // （409）：降级为「点开」卡交给系统播放器；去重记录也清掉，下次能重取。
+                videoRequested.current.delete(itemKey);
                 setVideoUrls((prev) => ({ ...prev, [itemKey]: "" }));
               }}
               onClick={() => {

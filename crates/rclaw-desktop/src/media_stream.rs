@@ -80,19 +80,16 @@ pub fn stream_url_with_root(
 pub fn stream_url(path: &str, pin: Option<&str>) -> Option<String> {
     let server = SERVER.get()?;
     // 与 media_base64 相同的守卫，提前校验（请求期还会再验一次）。
-    let full = resolve_media_path(&server.agent_root, path)?;
+    // 只为路径守卫（越界/链接的请求在生成 URL 这一步就拒掉）。
+    let _full = resolve_media_path(&server.agent_root, path)?;
     if !is_streamable(path) {
         return None;
     }
     // URL 钉住当前文件的版本（长度 + 修改时间）：播放期间文件被就地改写了，后续
     // Range 请求一律拒绝——不能让用户看着「核对过的那个视频」，放出来的却是别的。
-    // 版本针用调用方核对时那一份的（`check_attachment_read` 的 `pin`），没有再现场取。
-    let pin = match pin {
-        Some(pin) => format!("&v={pin}"),
-        None => file_version(&full)
-            .map(|version| format!("&v={version}"))
-            .unwrap_or_default(),
-    };
+    // 版本针只用调用方核对时那一份的（`check_attachment_read` 的 `pin`）：没有核对过
+    // 的流**不钉版本**——否则工作区里的普通视频被工具改写后，旧地址会 409。
+    let pin = pin.map(|pin| format!("&v={pin}")).unwrap_or_default();
     Some(format!(
         "http://127.0.0.1:{}/m?t={}&p={}{}",
         server.port,

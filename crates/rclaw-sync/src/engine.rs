@@ -193,9 +193,6 @@ pub(crate) struct Shared {
     pub kick: Notify,
     /// 有点名要过的附件：以后的轮次隔一阵去取一次。
     pub wants: AtomicBool,
-    /// 为「重新下载」临时补了登记、正在等下载结果的附件。下载失败时只撤这些登记
-    /// （`Blob` 的登记可能是别的消息正常登记进来的，不能误删）。
-    pub probes: Mutex<std::collections::HashSet<String>>,
     /// 本机设置的附件大小上限（字节）。比它大的附件不取回（§11.3）；下载任务不经引擎
     /// 线程的命令循环，所以放在这里，配置改了由引擎线程更新。
     pub attachment_max: AtomicU64,
@@ -228,7 +225,6 @@ impl Shared {
             uploads: Notify::new(),
             kick: Notify::new(),
             wants: AtomicBool::new(false),
-            probes: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -333,6 +329,10 @@ pub(crate) fn drop_remote_registration(ctx: &crate::Ctx, blob: &str) {
                 db::blob_delete(tx, blob)?;
             }
         }
+        tx.execute(
+            "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+            rusqlite::params![crate::db::scope::BLOB_PROBE, blob],
+        )?;
         Ok(())
     });
 }
@@ -1347,6 +1347,16 @@ impl SyncEngine {
                             return Ok(());
                         }
                         db::blob_register(tx, blob, &rel_path, size, crate::db::BLOB_REMOTE)?;
+                        // 这条登记是「重新下载」临时补的：在同一个事务里记下标识，
+                        // 下载失败时只撤带标识的登记；重启之后也认得出。
+                        db::state_put(
+                            tx,
+                            crate::db::scope::BLOB_PROBE,
+                            blob,
+                            db::HLC_ZERO,
+                            None,
+                            Some(&rel_path),
+                        )?;
                         Ok(())
                     })?;
                     registered = true;
@@ -1360,15 +1370,6 @@ impl SyncEngine {
                 drop_remote_registration(ctx, blob);
             }
             return Err(SyncError::other("同步空间刚换过，请重试一次"));
-        }
-        if registered {
-            // 记下「这条登记是这次重试临时补的」：下载失败时 `transfer::finish` 只撤
-            // 这些，不会误删别的消息正常登记进来的同一个对象。
-            if let Some((_, shared)) = self.live(true) {
-                if let Ok(mut probes) = shared.probes.lock() {
-                    probes.insert(blob.to_string());
-                }
-            }
         }
         let queued = self.fetch_attachment(blob);
         if queued.is_err() && registered {

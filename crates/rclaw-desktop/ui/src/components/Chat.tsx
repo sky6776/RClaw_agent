@@ -1588,8 +1588,8 @@ export default function Chat({
         });
       }
     }
-    // 点的那一份要真的在时间线里（同路径多个版本时按对象名对）。
-    if (!items.some((it) => it.path === start && (startBlob === undefined || it.blob === startBlob))) {
+    // 点的那一份要真的在时间线里（同路径多个版本时按对象名对，`undefined` 也是一份）。
+    if (!items.some((it) => it.path === start && it.blob === startBlob)) {
       return;
     }
     setGallery({ items, start, startBlob, seed: seed ?? null });

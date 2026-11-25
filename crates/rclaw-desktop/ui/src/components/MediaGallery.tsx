@@ -36,7 +36,8 @@ export interface GallerySeed {
  *  条目切换用 key 强制重建查看器——缩放/平移状态不跨张携带；Chat 侧再以
  *  key={start} 挂载本组件，画廊开着时点另一张卡也能正确定位。 */
 function seedMatches(seed: GallerySeed, item: GalleryItem): boolean {
-  return seed.path === item.path && (seed.blob === undefined || seed.blob === item.blob);
+  // 种子只给「同一路径、同一对象」的那一份用（`undefined` 只匹配未登记的那一份）。
+  return seed.path === item.path && seed.blob === item.blob;
 }
 
 export default function MediaGallery({
@@ -61,9 +62,8 @@ export default function MediaGallery({
 }) {
   const startIndex = Math.max(
     0,
-    items.findIndex(
-      (it) => it.path === start && (startBlob === undefined || it.blob === startBlob),
-    ),
+    // 对象名按原样比（`undefined` 也是一种身份：未登记的那一份）。
+    items.findIndex((it) => it.path === start && it.blob === startBlob),
   );
   const [index, setIndex] = useState(startIndex);
   const item = items[index];

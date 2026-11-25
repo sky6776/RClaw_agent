@@ -293,6 +293,9 @@ pub mod scope {
     pub const SKIP: &str = "skip";
     /// 被隔离的线程：键 `<sid>`，值是原因。
     pub const QUARANTINE: &str = "quarantine";
+    /// 为「重新下载」临时补的附件登记：键是对象名，值是落点。下载失败时只撤这些
+    /// （别的消息正常登记进来的同一个对象不能误删），重启之后也认得出。
+    pub const BLOB_PROBE: &str = "blob-probe";
     /// 本机已封的段：键 `<止:012>`。
     pub const SEG: &str = "seg";
     /// 读到的别的设备的段：键 `<设备>/<止:012>`。

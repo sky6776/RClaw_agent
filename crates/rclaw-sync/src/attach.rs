@@ -1180,6 +1180,19 @@ fn settle(
 /// `blob.gone`。问的那台设备也许没看到上一次说的（它是后来加入的，那段日志已经回收），
 /// 不能让它干等。一条 `blob.want` 至多换来一条 `blob.gone`，`blob.want` 自己是限流的。
 pub fn on_blob_want(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
+    // 「重新下载」临时补的登记（重启后仍留着的那种）：撤掉它，让下面照常走
+    // `BLOB_GONE` 的恢复路径——文件放回原处时这台设备还能重新上传。
+    if db::state_get(conn, scope::BLOB_PROBE, blob_id)?.is_some() {
+        if let Some(row) = db::blob_get(conn, blob_id)? {
+            if row.state == BLOB_REMOTE {
+                db::blob_delete(conn, blob_id)?;
+            }
+        }
+        conn.execute(
+            "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+            params![scope::BLOB_PROBE, blob_id],
+        )?;
+    }
     let requeued = conn.execute(
         "UPDATE sync_blob SET state = ?2 WHERE blob_id = ?1 AND state IN (?3, ?4, ?5)",
         params![
