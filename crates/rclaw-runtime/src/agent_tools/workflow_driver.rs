@@ -37,7 +37,10 @@ pub(crate) async fn drive(
     let row = match service.inner.store.get_run(&run_id) {
         Ok(Some(row)) => row,
         Ok(None) => {
-            tracing::warn!("工作流 driver 找不到 run {run_id}");
+            // run 行已经不在了（典型：终态后被用户删除，而配额名册里还留着它）：
+            // 归还名额，别让一个不存在的 run 占着并发名额直到重启。
+            tracing::warn!("工作流 driver 找不到 run {run_id}（已归还配额）");
+            service.release_capacity(&run_id);
             return;
         }
         Err(error) => {

@@ -17,7 +17,7 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Result;
 
 /// 当前 schema 版本（`PRAGMA user_version`）。
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// v1 → v2：`file_checkpoint` 加 `anchor_message_id` 列（checkpoint 与同事务写入的
 /// tool_result 消息行的关联；「fork + 文件回滚到锚点」按它切回滚集。旧行 NULL =
@@ -454,6 +454,13 @@ pub fn register_scalar_functions(conn: &Connection) -> Result<()> {
     register_functions(conn)
 }
 
+/// v4 → v5：删除运行用的墓碑表。
+///
+/// `journal_event` 是唯一事实源：光删投影行，下一轮启动折叠（游标之后的事件重放）
+/// 会把 run 原样建回来。墓碑按 run_id 让折叠直接跳过被用户删掉的运行。
+const SCHEMA_V5_MIGRATION: &str =
+    "CREATE TABLE IF NOT EXISTS workflow_deleted (run_id TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL);";
+
 /// 读取 `user_version`，高于本程序支持的版本则拒绝。
 fn supported_schema_version(conn: &Connection) -> Result<i64> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -495,6 +502,9 @@ fn migrate(conn: &Connection, path: &Path) -> Result<()> {
         }
         if version < 4 {
             conn.execute_batch(SCHEMA_V4)?;
+        }
+        if version < 5 {
+            conn.execute_batch(SCHEMA_V5_MIGRATION)?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())

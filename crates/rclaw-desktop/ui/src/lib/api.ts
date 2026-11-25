@@ -1047,6 +1047,9 @@ export const api = {
   /** 取消 running/queued 工作流。 */
   workflowCancel: (runId: string) => invoke<unknown>("workflow_cancel", { runId }),
 
+  /** 删除一条已结束的工作流运行（从属记录与脚本快照一并删除，结果产物保留）。 */
+  workflowDelete: (runId: string) => invoke<unknown>("workflow_delete", { runId }),
+
   /** 续跑 stopped 工作流（用户来源；用户取消过的 run 由 UI 代签一次性授权）。 */
   workflowResume: (runId: string) => invoke<unknown>("workflow_resume", { runId }),
 

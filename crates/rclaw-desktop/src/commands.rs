@@ -1330,6 +1330,15 @@ pub async fn workflow_cancel(run_id: String) -> Result<serde_json::Value, String
     rclaw_runtime::agent_tools::workflow_api::cancel(&run_id).await
 }
 
+/// 桌面删除一条已结束的运行（从属记录与脚本快照一并删除，结果产物保留）。
+#[tauri::command]
+pub async fn workflow_delete(run_id: String) -> Result<serde_json::Value, String> {
+    run_blocking("删除工作流运行", move || {
+        rclaw_runtime::agent_tools::workflow_api::delete(&run_id)
+    })
+    .await
+}
+
 /// 桌面续跑（用户来源；用户取消过的 run 由 UI 代签一次性授权）。
 #[tauri::command]
 pub async fn workflow_resume(run_id: String) -> Result<serde_json::Value, String> {

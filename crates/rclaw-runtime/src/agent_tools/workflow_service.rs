@@ -23,7 +23,7 @@ use super::workflow::{
 use super::workflow_paths::{resolve_under, session_key, WorkflowPaths};
 use super::workflow_snapshot;
 use super::workflow_store::{
-    self, RunRow, WorkflowStore, STATUS_COMPLETED, STATUS_ERRORED, STATUS_QUEUED, STATUS_RUNNING,
+    self, DeleteOutcome, RunRow, WorkflowStore, STATUS_COMPLETED, STATUS_ERRORED, STATUS_QUEUED, STATUS_RUNNING,
     STATUS_STOPPED, STATUS_STOPPING, STOP_INTERRUPTED, STOP_MODEL, STOP_SUPERSEDED, STOP_USER,
 };
 use super::*;
@@ -521,13 +521,30 @@ impl WorkflowService {
             self.rollback_sync_successor(predecessor, row, "", "");
             return;
         }
-        let _ = self.inner.store.transfer_capacity(predecessor, &row.run_id);
+        // 交接与名册登记放进同一个名册锁区间：避免「交接已提交、登记前被取消并删除」把
+        // 名额记在一个不存在的 run 上。删除侧也会在删除成功后从名册摘掉该 id，两边任一
+        // 顺序都不会留下悬空名额。
         let mut capacity = self
             .inner
             .capacity
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        capacity.insert(row.run_id.clone());
+        match self.inner.store.transfer_capacity(predecessor, &row.run_id) {
+            Ok(true) => {
+                capacity.insert(row.run_id.clone());
+            }
+            // 后继行已被删（交接 0 行）：不登记、不拉 driver。
+            Ok(false) => return,
+            Err(error) => {
+                // 写锁超时等：按原语义「照常启动」，但名额必须先记上，否则启动后的
+                // driver 不计入并发上限（既有路径也是先记名册再启动）。
+                tracing::warn!(
+                    "重启恢复：{} 的配额交接失败（照常启动并计入名额）: {error}",
+                    row.run_id
+                );
+                capacity.insert(row.run_id.clone());
+            }
+        }
         drop(capacity);
         self.start_recovered_driver(&row.run_id, row.exec_generation.max(1), Some(predecessor));
     }
@@ -793,7 +810,7 @@ impl WorkflowService {
             workflow_snapshot::write_snapshot(&self.inner.paths, &run_id, 1, &prepared.script)
                 .map_err(|error| WorkflowError::new("internal", "internal", error))?;
         let display_snapshot = workflow_snapshot::display_path(&self.inner.paths, &snapshot_path);
-        let acquired = self.acquire_capacity(&run_id)?;
+        let acquired = self.acquire_capacity(&run_id, false)?;
         if !acquired {
             return Err(WorkflowError::new(
                 "capacity_exceeded",
@@ -879,6 +896,9 @@ impl WorkflowService {
             Ok(response)
         } else {
             let outcome = super::workflow_driver::run_sync(self.clone(), &run_id, 1, None).await;
+            // 注：run_sync 在 unregister_active 之后才回读主行；删除入口已用 is_active
+            // 拦住「执行中」的 run，但这两步之间仍有微秒级窗口——真撞上会把这个「run 缺失」
+            // 缓存进幂等响应。要彻底消除需要让 driver 直接交回终态结果（不在删除功能范围）。
             // 同步模式：request 行缓存同步契约的最终响应（重试返回同一结果）。
             let text = outcome.to_string();
             let _ = self.inner.store.transaction(|tx| {
@@ -1362,7 +1382,7 @@ impl WorkflowService {
                 .store
                 .set_capacity_claim(&successor_id, Some(&successor_id))
                 .map_err(internal_error)?;
-        } else if !self.acquire_capacity(&successor_id)? {
+        } else if !self.acquire_capacity(&successor_id, false)? {
             return Err(WorkflowError::new(
                 "capacity_exceeded",
                 "capacity",
@@ -1819,7 +1839,7 @@ impl WorkflowService {
         }
         let snapshot = resolve_snapshot(&self.inner.paths, &row)?;
         workflow_snapshot::read_snapshot(&snapshot, &row.snapshot_hash).map_err(snapshot_error)?;
-        if !self.acquire_capacity(run_id)? {
+        if !self.acquire_capacity(run_id, true)? {
             return Err(WorkflowError::new(
                 "capacity_exceeded",
                 "capacity",
@@ -3087,6 +3107,80 @@ impl WorkflowService {
         Ok(json!({"status":"rescheduled","id":notification_id}))
     }
 
+    /// 删除一条已结束的运行（桌面 UI 专用）：从属记录与脚本快照一并清掉，结果产物与
+    /// CreateWorkflow 的幂等键保留。
+    ///
+    /// 权限 / 项目 / 会话校验沿用 `load_run_checked`；「确实可删」的判定（终态、无排队
+    /// 后继、没被续跑占用）与删除本身在 store 的同一个事务里做，避免状态与配额竞态。
+    pub(crate) fn delete(
+        &self,
+        run_id: &str,
+        channel: String,
+        chat_id: String,
+        tool_access: ToolAccess,
+    ) -> Result<Value, WorkflowError> {
+        self.check_writable()?;
+        self.load_run_checked(run_id, tool_access, &channel, &chat_id, true)?;
+        // 本进程正在执行它（同步模式的 driver 跑在工具 future 里）：等它收尾再删，避免
+        // 「终态已提交、调用方还没回读结果」的窗口里把 run 删掉。
+        if self.is_active(run_id) {
+            return Err(WorkflowError::new(
+                "run_active",
+                "conflict",
+                "这条运行正在执行，等它结束后再删",
+            ));
+        }
+        match self.inner.store.delete_run(run_id).map_err(internal_error)? {
+            DeleteOutcome::Deleted => {
+                // 名额名册里若还有它，一并摘掉：行已经没了，名额不该记在它头上等到重启。
+                self.inner
+                    .capacity
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(run_id);
+                // 脚本快照是运行的内部状态；删不掉（占用 / 权限）不影响结果，注释里不承诺必删。
+                // 递归删除前确认草稿根没被重定向（符号链接 / junction）：它若指向
+                // workflow-artifacts，会把承诺保留的产物一起删掉。
+                let drafts_root = &self.inner.paths.drafts_dir;
+                // 只认「当前项目根下真实的 workflow-drafts」：解析后完整路径必须等于
+                // project_root/workflow-drafts；指向别处同名目录的链接 / junction 一律跳过，
+                // 解析失败（权限等）也跳过——这是尽力清理，宁可不删也不能删错。
+                // 基准用服务初始化时保存的规范根（WorkflowPaths::project_root 已规范化），
+                // 不再二次解析：否则项目根本身被换成目录链接时，两边会一起指向新位置。
+                let expected = self.inner.paths.project_root.join("workflow-drafts");
+                let cleanup_ok = matches!(
+                    std::fs::canonicalize(drafts_root),
+                    Ok(real) if real == expected
+                );
+                if cleanup_ok {
+                    let _ = std::fs::remove_dir_all(drafts_root.join(run_id));
+                } else {
+                    tracing::debug!(
+                        "跳过脚本快照清理（草稿目录不存在或已被重定向）: {}",
+                        drafts_root.display()
+                    );
+                }
+                Ok(json!({ "run_id": run_id, "deleted": true }))
+            }
+            DeleteOutcome::NotFound => Err(WorkflowError::not_found(run_id)),
+            DeleteOutcome::Active => Err(WorkflowError::new(
+                "run_active",
+                "conflict",
+                "只有已结束的运行可以删除（运行中的请先取消，等它结束后再删）",
+            )),
+            DeleteOutcome::SuccessorActive => Err(WorkflowError::new(
+                "run_successor_active",
+                "conflict",
+                "这条运行还有排队 / 运行中的修订后继：等后继结束或先取消后继再删",
+            )),
+            DeleteOutcome::Busy => Err(WorkflowError::new(
+                "run_busy",
+                "conflict",
+                "这条运行正被续跑占用，稍后再删",
+            )),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // 状态 / 配额 / driver 协作
     // -----------------------------------------------------------------------
@@ -3136,7 +3230,16 @@ impl WorkflowService {
         Ok(row)
     }
 
-    pub(crate) fn acquire_capacity(&self, run_id: &str) -> Result<bool, WorkflowError> {
+    /// 占一个并发名额。
+    ///
+    /// `expect_existing`：新 run（CreateWorkflow / AmendWorkflow 后继）在插入行**之前**
+    /// 预留名额，此时库里的 UPDATE 必然 0 行，不能当失败；只有续跑是在已有行上预留，
+    /// 需要确认那一行还在（否则删除与续跑并发会让 driver 带着不存在的 run 跑）。
+    pub(crate) fn acquire_capacity(
+        &self,
+        run_id: &str,
+        expect_existing: bool,
+    ) -> Result<bool, WorkflowError> {
         let mut capacity = self
             .inner
             .capacity
@@ -3146,13 +3249,25 @@ impl WorkflowService {
             return Ok(false);
         }
         capacity.insert(run_id.to_string());
-        self.inner
+        let updated = self
+            .inner
             .store
             .set_capacity_owner(run_id, Some(run_id))
             .map_err(internal_error)?;
+        // 续跑：行可能在「读状态」与「占配额」之间被删（删除与续跑并发），更新 0 行说明
+        // run 已不存在——回滚内存名册并报错，别让 driver 带着不存在的 run 继续跑。
+        if expect_existing && !updated {
+            capacity.remove(run_id);
+            return Err(WorkflowError::not_found(run_id));
+        }
         Ok(true)
     }
 
+    /// 释放名额。注意这里对库里的 `capacity_owner` 是无条件清空：若上一代 driver 的收尾
+    /// 释放与一次续跑的预留（两者写的都是同一个 run_id 值）撞车，可能擦掉续跑刚写下的
+    /// 预留；随后并发的 delete 会因占用检查放行，留下一条孤儿请求和内存名额（重启时
+    /// `clear_stale_capacity_owners` 回收）。要彻底消除需要给预留加执行代数 / 预留令牌，
+    /// 属于配额账本的改造，不在「删除运行」这个功能的范围内。
     pub(crate) fn release_capacity(&self, run_id: &str) {
         {
             let mut capacity = self
@@ -3179,8 +3294,19 @@ impl WorkflowService {
             capacity.remove(from);
             capacity.insert(to.to_string());
         }
-        if let Err(error) = self.inner.store.transfer_capacity(from, to) {
-            tracing::warn!("交接工作流许可失败: {error}");
+        match self.inner.store.transfer_capacity(from, to) {
+            Ok(true) => {}
+            Ok(false) => {
+                // 后继已被删除（终态后被用户删掉）：名额不能继续记在它头上，否则要到
+                // 重启才回收。
+                let mut capacity = self
+                    .inner
+                    .capacity
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                capacity.remove(to);
+            }
+            Err(error) => tracing::warn!("交接工作流许可失败: {error}"),
         }
     }
 
@@ -3658,8 +3784,28 @@ impl WorkflowService {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         capacity.remove(&row.run_id);
+        // 后继在「事务提交」与「登记内存名册」之间可能被取消（库里的占位已清）甚至被
+        // 删除：持锁核对它此刻仍持有配额再登记，否则名额会记在一个不存在的 run 上，
+        // 要等重启才回收。极端交错下仍可能漏网，由启动时的 clear_stale_capacity_owners
+        // 兜底。
         if let Some(successor) = successor {
-            capacity.insert(successor);
+            match self.inner.store.capacity_owner(&successor) {
+                // 仍持有配额：正常登记。
+                Ok(Some(owner)) if owner == successor => {
+                    capacity.insert(successor);
+                }
+                // 已无归属（被取消 / 删除）：不登记，名额不该记在它头上。
+                Ok(_) => {}
+                // 查询失败无法判定：宁可先记着（少算一个名额会突破并发上限），
+                // 由下一轮交接 / 启动时的 clear_stale_capacity_owners 校正。
+                Err(error) => {
+                    tracing::warn!(
+                        "读取 {} 的配额归属失败，先保留名额: {error}",
+                        successor
+                    );
+                    capacity.insert(successor);
+                }
+            }
         }
         Ok(true)
     }

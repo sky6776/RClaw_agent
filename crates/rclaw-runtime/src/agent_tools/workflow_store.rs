@@ -33,6 +33,19 @@ fn db_err(error: impl std::fmt::Display) -> String {
     format!("工作流状态库操作失败: {error}")
 }
 
+/// [`WorkflowStore::delete_run`] 的结果：拒绝原因分类由服务层映射成具体错误码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    Deleted,
+    NotFound,
+    /// 还没进终态（queued / running / stopping）。
+    Active,
+    /// 有排队 / 运行中的修订后继。
+    SuccessorActive,
+    /// 正被续跑占着配额宿主。
+    Busy,
+}
+
 /// 一行 run 投影。
 #[derive(Debug, Clone)]
 pub struct RunRow {
@@ -246,6 +259,97 @@ impl WorkflowStore {
         self.db
             .transaction(|tx| f(tx).map_err(rclaw_store::StoreError::Other))
             .map_err(db_err)
+    }
+
+    /// 删除一条运行及其从属记录（脚本版本 / 副作用 / 进程 / hole / 问题 / 通知）。
+    ///
+    /// 全部在**同一个事务**里完成：状态与配额宿主在事务内复核（DELETE 与续跑互斥）、
+    /// 写墓碑（启动折叠按 journal 重放时据此跳过，删掉的 run 不会复活）、清 kv 里的
+    /// 运行级授权，最后删主行。
+    ///
+    /// 两个例外：
+    /// - `workflow_request` 行保留（只清 run_id 关联）：它是 CreateWorkflow 的幂等键，
+    ///   清掉会让同一 request_id 的延迟重试再执行一次写副作用。
+    /// - `workflow-artifacts/<run_id>` 结果产物保留（用户可能要取用）。
+    pub fn delete_run(&self, run_id: &str) -> Result<DeleteOutcome> {
+        self.transaction(|tx| {
+            let row: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT status, capacity_owner FROM workflow_run WHERE run_id = ?1",
+                    params![run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?;
+            let Some((status, capacity_owner)) = row else {
+                return Ok(DeleteOutcome::NotFound);
+            };
+            if !matches!(
+                status.as_str(),
+                STATUS_COMPLETED | STATUS_ERRORED | STATUS_STOPPED
+            ) {
+                return Ok(DeleteOutcome::Active);
+            }
+            // 配额宿主非空 = 正在续跑（内存名册已占位）：删了会留下孤儿请求与名额。
+            if capacity_owner.is_some() {
+                return Ok(DeleteOutcome::Busy);
+            }
+            // 有排队 / 运行中的修订后继：删前驱会让后继永远等不到前驱（重启恢复会把它停掉）。
+            let successors: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_run                      WHERE resumed_from = ?1 AND status IN (?2, ?3, ?4)",
+                    params![run_id, STATUS_QUEUED, STATUS_RUNNING, STATUS_STOPPING],
+                    |row| row.get(0),
+                )
+                .map_err(db_err)?;
+            if successors > 0 {
+                return Ok(DeleteOutcome::SuccessorActive);
+            }
+            // 墓碑先写：折叠与删除交错时，游标之后的事件重放会被它挡住。
+            tx.execute(
+                "INSERT OR REPLACE INTO workflow_deleted (run_id, deleted_at) VALUES (?1, ?2)",
+                params![run_id, now_ms()],
+            )
+            .map_err(db_err)?;
+            for table in [
+                "workflow_script_version",
+                "workflow_effect",
+                "workflow_process",
+                "workflow_hole",
+                "workflow_question",
+                "workflow_notification",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+            }
+            // 幂等键保留，只断开与已删 run 的关联。
+            tx.execute(
+                "UPDATE workflow_request SET run_id = NULL WHERE run_id = ?1",
+                params![run_id],
+            )
+            .map_err(db_err)?;
+            // 运行级短期授权（续跑 / 修订放行）随 run 一起作废。
+            for key in [
+                format!("workflow-auth/{run_id}"),
+                format!("workflow-amend-confirm/{run_id}"),
+            ] {
+                tx.execute("DELETE FROM kv WHERE key = ?1", params![key])
+                    .map_err(db_err)?;
+            }
+            let removed = tx
+                .execute(
+                    "DELETE FROM workflow_run WHERE run_id = ?1",
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+            if removed == 0 {
+                return Ok(DeleteOutcome::NotFound);
+            }
+            Ok(DeleteOutcome::Deleted)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -507,7 +611,25 @@ impl WorkflowStore {
     // 配额所有权
     // -----------------------------------------------------------------------
 
-    pub fn set_capacity_owner(&self, run_id: &str, owner: Option<&str>) -> Result<()> {
+    /// 读某条 run 当前的配额宿主（用于确认交接对象是否还持有名额）。
+    pub fn capacity_owner(&self, run_id: &str) -> Result<Option<String>> {
+        self.db
+            .with(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT capacity_owner FROM workflow_run WHERE run_id = ?1",
+                        params![run_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten())
+            })
+            .map_err(db_err)
+    }
+
+    /// 写配额宿主。返回是否真的更新到一行——行已被删除时为 false，调用方要据此回滚
+    /// 内存名册（否则会带着一个不存在的 run 占住名额，直到进程重启）。
+    pub fn set_capacity_owner(&self, run_id: &str, owner: Option<&str>) -> Result<bool> {
         self.db
             .with(|conn| {
                 Ok(conn.execute(
@@ -515,8 +637,8 @@ impl WorkflowStore {
                     params![run_id, owner, now_ms()],
                 )?)
             })
-            .map_err(db_err)?;
-        Ok(())
+            .map(|updated| updated > 0)
+            .map_err(db_err)
     }
 
     pub fn set_capacity_claim(&self, run_id: &str, claim_for: Option<&str>) -> Result<()> {
@@ -606,26 +728,30 @@ impl WorkflowStore {
             .map_err(db_err)
     }
 
-    pub fn transfer_capacity(&self, from: &str, to: &str) -> Result<()> {
+    /// 交接配额：返回后继行是否真的更新到了——后继在交接口被删掉时为 false，调用方
+    /// 要据此回收内存名额（否则名额记在一个不存在的 run 上，直到重启才释放）。
+    pub fn transfer_capacity(&self, from: &str, to: &str) -> Result<bool> {
         self.transaction(|tx| {
             tx.execute(
                 "UPDATE workflow_run SET capacity_owner = NULL WHERE run_id = ?1",
                 params![from],
             )
             .map_err(db_err)?;
+            let handoff = tx
+                .execute(
+                    "UPDATE workflow_run SET capacity_owner = ?2, capacity_claim_for = NULL \n                     WHERE run_id = ?1",
+                    params![to, to],
+                )
+                .map_err(db_err)?;
+            if handoff == 0 {
+                return Ok(false);
+            }
             tx.execute(
-                "UPDATE workflow_run SET capacity_owner = ?2, capacity_claim_for = NULL \
-                 WHERE run_id = ?1",
-                params![to, to],
-            )
-            .map_err(db_err)?;
-            tx.execute(
-                "UPDATE workflow_run SET capacity_claim_for = NULL, updated_at = ?2 \
-                 WHERE capacity_claim_for = ?1",
+                "UPDATE workflow_run SET capacity_claim_for = NULL, updated_at = ?2 \n                 WHERE capacity_claim_for = ?1",
                 params![to, now_ms()],
             )
             .map_err(db_err)?;
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -1258,6 +1384,21 @@ impl WorkflowStore {
 // ---------------------------------------------------------------------------
 
 pub fn insert_run_tx(tx: &Transaction<'_>, run: &RunRow) -> Result<()> {
+    // 已删除的 run_id 有墓碑：折叠会跳过这个 ID 的所有事件，若还允许插入新行（理论上
+    // 只会在 ID 生成器极端碰撞时发生），这一行会「活着但永远不再更新」。直接拒绝。
+    let tombstoned: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_deleted WHERE run_id = ?1",
+            params![run.run_id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if tombstoned > 0 {
+        return Err(db_err(format!(
+            "run_id 已被一条已删除的运行占用（墓碑在案），不能复用: {}",
+            run.run_id
+        )));
+    }
     tx.execute(
         "INSERT INTO workflow_run (run_id, cwd, session_key, label, source_path, snapshot_path, \
          snapshot_hash, script_generation, exec_generation, legacy, resumable, status, queued_reason, \
@@ -1415,6 +1556,17 @@ pub fn apply_event_tx(
     event: &Value,
     event_id: i64,
 ) -> Result<()> {
+    // 被用户删掉的运行有墓碑：journal 里的历史事件不再折回投影（否则启动重放会让它复活）。
+    let tombstoned: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_deleted WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if tombstoned > 0 {
+        return Ok(());
+    }
     let now = now_ms();
     let kind = event
         .get("event")
@@ -1726,4 +1878,189 @@ pub fn apply_event_tx(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use rclaw_store::journal::JournalStore;
+
+    /// 临时库 + WorkflowStore（每个测试独立目录，互不干扰）。
+    ///
+    /// 目录建在 `target/` 下而不是系统临时目录：本机（以及部分 CI 沙箱）对
+    /// `%TEMP%` 的建目录会被拒绝，那是环境问题，不该让单元测试跟着失败。目录本身
+    /// 是一次性的构建产物，不做清理（SQLite 连接仍开着时删目录在 Windows 上会失败）。
+    fn temp_store(tag: &str) -> WorkflowStore {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/wf-delete-tests")
+            .join(format!("{tag}-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let db = Db::open(&dir.join("state.sqlite")).expect("打开临时库");
+        WorkflowStore::new(&JournalStore::from_db(db))
+    }
+
+    fn insert_run(store: &WorkflowStore, run_id: &str, status: &str, capacity_owner: Option<&str>) {
+        store
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO workflow_run (run_id, cwd, session_key, label, status, \
+                     capacity_owner, created_at, updated_at, last_event_id) \
+                     VALUES (?1, 'p', 's', ?1, ?2, ?3, 1, 1, 0)",
+                    params![run_id, status, capacity_owner],
+                )
+                .map_err(db_err)?;
+                // 6 张从属表各插一行，验证删除覆盖全部。
+                tx.execute(
+                    "INSERT INTO workflow_script_version (run_id, script_generation, path, hash, reason, created_at) \
+                     VALUES (?1, 1, 'p', 'h', 'initial', 1)",
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "INSERT INTO workflow_effect (run_id, effect_key, first_script_generation, \
+                     last_exec_generation, call_index, op, is_write, args_hash, status, created_at, updated_at) \
+                     VALUES (?1, 'e1', 1, 0, 0, 'write', 1, 'h', 'applied', 1, 1)",
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "INSERT INTO workflow_process (run_id, exec_generation, process_id, root_pid, state, created_at) \
+                     VALUES (?1, 0, 'p1', 1, 'exited', 1)",
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "INSERT INTO workflow_hole (run_id, hole_id, script_generation, name, state, created_at, updated_at) \
+                     VALUES (?1, 'h1', 1, 'fn', 'filled', 1, 1)",
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "INSERT INTO workflow_question (question_id, run_id, exec_generation, actor, question, state, created_at) \
+                     VALUES (?1, ?1, 0, 'a', 'q', 'answered', 1)",
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "INSERT INTO workflow_notification (id, run_id, session_key, channel, chat_id, \
+                     payload, state, attempts, next_at, created_at) \
+                     VALUES (?1, ?1, 's', 'desktop', 'c', '{}', 'sent', 0, 1, 1)",
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "INSERT INTO workflow_request (scope, request_id, digest, state, run_id, response, created_at, updated_at) \
+                     VALUES ('create', ?1, 'd', 'done', ?1, '{\"run_id\":\"kept\"}', 1, 1)",
+                    params![run_id],
+                )
+                .map_err(db_err)?;
+                Ok(())
+            })
+            .expect("插入样例");
+    }
+
+    fn count_for(store: &WorkflowStore, table: &str, run_id: &str) -> i64 {
+        store
+            .db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1"),
+                    params![run_id],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .expect("统计行数")
+    }
+
+    /// 主行与 6 张从属表的同 run 行都删掉；幂等请求行保留但断开关联；别的 run 不受影响；
+    /// 删后重放 journal 事件也不会把它建回来（墓碑）；续跑占用 / 排队后继 / 非终态一律拒绝。
+    #[test]
+    fn delete_run_removes_dependents_and_blocks_replay() {
+        let store = temp_store("remove");
+        insert_run(&store, "run-a", STATUS_COMPLETED, None);
+        insert_run(&store, "run-b", STATUS_COMPLETED, None);
+
+        assert_eq!(store.delete_run("run-a").expect("删除 run-a"), DeleteOutcome::Deleted);
+        assert!(store.get_run("run-a").expect("查 run-a").is_none());
+        assert!(store.get_run("run-b").expect("查 run-b").is_some());
+
+        for table in [
+            "workflow_script_version",
+            "workflow_effect",
+            "workflow_process",
+            "workflow_hole",
+            "workflow_question",
+            "workflow_notification",
+        ] {
+            assert_eq!(count_for(&store, table, "run-a"), 0, "{table} 里 run-a 的行应一并删除");
+            assert!(count_for(&store, table, "run-b") > 0, "{table} 里 run-b 不应被牵连");
+        }
+
+        // 幂等键保留：只断开 run 关联，缓存响应原样留着（否则同一 request_id 重试会
+        // 再跑一次写副作用；重试方拿到的仍是原来那次 CreateWorkflow 的结果）。
+        let (request_run, response): (Option<String>, Option<String>) = store
+            .db
+            .with(|conn| {
+                Ok(conn.query_row(
+                    "SELECT run_id, response FROM workflow_request WHERE request_id = 'run-a'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .expect("读请求行");
+        assert!(request_run.is_none(), "请求行应保留但 run_id 置空");
+        assert!(
+            response.as_deref().is_some_and(|value| value.contains("kept")),
+            "原响应应原样保留（幂等重试返回它）"
+        );
+
+        // 墓碑挡住 journal 重放：即使再折一次 run_started，run 也不会复活。
+        store
+            .transaction(|tx| {
+                apply_event_tx(
+                    tx,
+                    "run-a",
+                    &json!({"event": "run_started", "label": "run-a", "cwd": "p"}),
+                    999,
+                )
+            })
+            .expect("重放事件");
+        assert!(
+            store.get_run("run-a").expect("查 run-a").is_none(),
+            "有墓碑的 run 不应被 journal 重放建回来"
+        );
+
+        // 重复删除：主行已不在 → NotFound。
+        assert_eq!(store.delete_run("run-a").expect("重复删除"), DeleteOutcome::NotFound);
+    }
+
+    #[test]
+    fn delete_run_refuses_active_busy_and_successor() {
+        let store = temp_store("refuse");
+
+        insert_run(&store, "run-run", STATUS_RUNNING, None);
+        assert_eq!(store.delete_run("run-run").expect("删运行中"), DeleteOutcome::Active);
+
+        insert_run(&store, "run-busy", STATUS_STOPPED, Some("run-busy"));
+        assert_eq!(store.delete_run("run-busy").expect("删续跑占用"), DeleteOutcome::Busy);
+
+        // 前驱已终态，但后继还在排队：删前驱会让后继永远等不到前驱。
+        insert_run(&store, "run-prev", STATUS_STOPPED, None);
+        insert_run(&store, "run-next", STATUS_QUEUED, None);
+        store
+            .db
+            .with(|conn| {
+                Ok(conn.execute(
+                    "UPDATE workflow_run SET resumed_from = 'run-prev' WHERE run_id = 'run-next'",
+                    [],
+                )?)
+            })
+            .expect("挂后继");
+        assert_eq!(
+            store.delete_run("run-prev").expect("删有后继的前驱"),
+            DeleteOutcome::SuccessorActive
+        );
+
+        assert_eq!(store.delete_run("run-missing").expect("删不存在"), DeleteOutcome::NotFound);
+    }
 }

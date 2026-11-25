@@ -164,6 +164,7 @@ pub fn run() {
             commands::workflow_answer_command_confirm,
             commands::workflow_detail,
             commands::workflow_cancel,
+            commands::workflow_delete,
             commands::workflow_resume,
             commands::workflow_confirm_effects,
             commands::workflow_confirm_process_gone,

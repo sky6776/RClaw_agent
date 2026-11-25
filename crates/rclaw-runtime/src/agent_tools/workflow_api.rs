@@ -49,6 +49,19 @@ pub fn detail(run_id: &str, include_effects: bool) -> Result<Value, String> {
         .map_err(error_to_string)
 }
 
+/// 桌面删除：把一条已结束的运行（含从属记录与脚本快照）彻底删掉。
+pub fn delete(run_id: &str) -> Result<Value, String> {
+    let service = service()?;
+    service
+        .delete(
+            run_id,
+            "desktop".to_string(),
+            "console".to_string(),
+            ToolAccess::Unrestricted,
+        )
+        .map_err(error_to_string)
+}
+
 /// 桌面取消（`user` 来源）。
 pub async fn cancel(run_id: &str) -> Result<Value, String> {
     let service = service()?;
