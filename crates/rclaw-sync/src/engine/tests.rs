@@ -397,6 +397,7 @@ async fn attachments_upload_after_the_backlog_choice_and_download_on_request() {
     let listed = b.engine.attachments("desktop", "c1").unwrap();
     assert_eq!(listed[0].path, "uploads/a.txt");
     assert_eq!(listed[0].state, "remote");
+    assert!(!listed[0].path_present);
     assert!(!b.agent().join("uploads").join("a.txt").exists());
 
     b.engine.fetch_attachment(&listed[0].blob).unwrap();
@@ -415,10 +416,10 @@ async fn attachments_upload_after_the_backlog_choice_and_download_on_request() {
         })
     })
     .await;
-    assert_eq!(
-        b.engine.attachments("desktop", "c1").unwrap()[0].state,
-        "local"
-    );
+    let landed = b.engine.attachments("desktop", "c1").unwrap();
+    assert_eq!(landed[0].state, "local");
+    // 取回到原位置之后，界面按工作区路径出的卡就能直接打开了。
+    assert!(landed[0].path_present);
 }
 
 #[tokio::test]

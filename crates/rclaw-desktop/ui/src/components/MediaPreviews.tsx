@@ -9,7 +9,11 @@ import {
 import { api, type SyncAttachment } from "../lib/api";
 import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
-import { AttachmentCard, useChatAttachments } from "./SyncAttachments";
+import {
+  AttachmentCard,
+  useChatAttachments,
+  useChatAttachmentsReady,
+} from "./SyncAttachments";
 
 /** 会话流内嵌媒体预览条目。 */
 export interface PreviewItem {
@@ -173,28 +177,53 @@ export default function MediaPreviews({
   // 不再出一个点了只报「媒体文件不存在」的「点开」卡；清单里没有（本机文件、没开同步）
   // 的照旧按工作区路径出卡。
   const synced = useChatAttachments(chatId ?? null);
-  const away = useMemo(() => {
+  const ready = useChatAttachmentsReady(chatId ?? null);
+  // 只认这条消息自己登记的附件：同一个路径在不同消息里可能指向不同内容（文件改过），
+  // 拿别的消息的对象来下载会把错的版本落到这条消息头上。消息还没落库（没有 msgId）
+  // 时按工作区路径出卡，落库之后清单刷新再换成附件卡。
+  const mine = useMemo(() => {
     const map = new Map<string, SyncAttachment>();
-    if (!chatId) return map;
+    if (!chatId || msgId === undefined) return map;
     for (const item of synced) {
-      if (item.kind !== "file") continue;
-      // 本机有、且就落在消息写的这个路径上：照旧按工作区路径出卡。同一份内容在
-      // 本机的另一个落点上（同对象被引用到两个路径，别名还没补上）时消息路径依旧
-      // 打不开——按附件卡给出能用的那个路径。
-      const onThisPath =
-        item.state === "local" && (item.rel_path === null || item.rel_path === item.path);
-      if (onThisPath) continue;
-      // 同一条路径被几条消息引用：本消息登记的优先，其次取较晚的那条。
-      if (!map.has(item.path) || item.message_id === msgId) map.set(item.path, item);
+      if (item.kind !== "file" || item.message_id !== msgId) continue;
+      map.set(item.path, item);
     }
     return map;
-  }, [chatId, synced, msgId]);
+  }, [chatId, msgId, synced]);
+  // 消息路径本机真有这个文件（包括同一对象的别名已经补到原位置）：照旧按工作区路径
+  // 出卡，图片/视频照常内联。其余的按附件卡给出取回入口。
+  const away = useMemo(() => {
+    const map = new Map<string, SyncAttachment>();
+    for (const [path, item] of mine) {
+      if (!item.path_present) map.set(path, item);
+    }
+    return map;
+  }, [mine]);
   const awayPaths = useMemo(() => new Set(away.keys()), [away]);
+  // 文本解析没认出来、但这条消息确实登记了的附件（`attach::extract_refs` 认正文里
+  // 裸写的 `output/report.pdf`，媒体卡的正则只认带反引号的文档）：补一张卡，否则
+  // 用户在这台设备上没有取回入口。
+  const shown = useMemo(() => {
+    if (away.size === 0) return items;
+    const seen = new Set(items.map((item) => item.path));
+    const extra: PreviewItem[] = [];
+    for (const path of away.keys()) {
+      if (seen.has(path)) continue;
+      seen.add(path);
+      extra.push({ key: path, path, display: path.split("/").pop() || path, kind: "open" });
+    }
+    return extra.length === 0 ? items : [...items, ...extra];
+  }, [items, away]);
 
   // 视频卡：拉本地流式 URL（含首帧由 <video preload=metadata> 显示）。
   useEffect(() => {
-    for (const item of items) {
-      if (awayPaths.has(item.path)) continue;
+    for (const item of shown) {
+      if (awayPaths.has(item.path)) {
+        // 清单比首屏晚到时，预览可能已经按本机路径试过一遍（文件不在，记成失败）。
+        // 允许重新取：下载完成、清单刷新后这张卡要能自己换回视频/图片。
+        videoRequested.current.delete(item.key);
+        continue;
+      }
       if (item.kind !== "open") continue;
       if (!/\.(?:mp4|webm|m4v|mov)$/i.test(item.path)) continue; // 音频等仍走系统播放器
       if (videoRequested.current.has(item.key)) continue;
@@ -204,12 +233,17 @@ export default function MediaPreviews({
         .then((url) => setVideoUrls((prev) => ({ ...prev, [item.key]: url })))
         .catch(() => setVideoUrls((prev) => ({ ...prev, [item.key]: "" })));
     }
-  }, [items, awayPaths]);
+  }, [shown, awayPaths]);
 
   useEffect(() => {
-    for (const item of items) {
+    for (const item of shown) {
       if (item.kind !== "image") continue; // 视频/文档不预载：点卡片经系统应用打开
-      if (awayPaths.has(item.path)) continue; // 不在这台设备上：附件卡自己出预览
+      if (awayPaths.has(item.path)) {
+        // 不在这台设备上：附件卡自己出预览。首屏清单还没到时可能已按本机路径试过
+        // 一次并记成失败，这里把去重记下，取回之后要能重新出图。
+        requested.current.delete(item.key);
+        continue;
+      }
       if (requested.current.has(item.key)) continue;
       requested.current.add(item.key);
       void api
@@ -222,7 +256,7 @@ export default function MediaPreviews({
         .catch(() => setUrls((prev) => ({ ...prev, [item.key]: "" })));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items, awayPaths]);
+  }, [shown, awayPaths]);
 
   // ---- 长按 / 右键上抛（菜单在 Chat 层统一渲染） ----
 
@@ -284,7 +318,7 @@ export default function MediaPreviews({
   // 图片读取完成（无论成败）即出卡：失败（urls[p] === ""，如超 25MB 上限、
   // 文件已被清理）降级为「点开」卡交给系统应用，正文引用不再凭空消失。不在这台设备
   // 上的附件（附件清单里有它）始终出卡——按清单状态给「下载」/「存进工作区」。
-  const rendered = items
+  const rendered = shown
     .map((it) => ({ it, away: away.get(it.path) }))
     .filter(
       ({ it, away }) =>
@@ -298,13 +332,17 @@ export default function MediaPreviews({
       {rendered.map(({ it, away: awayItem }) => {
         if (awayItem && chatId) {
           return (
-            <AttachmentCard
-              key={it.key}
-              chatId={chatId}
-              item={awayItem}
-              name={it.display}
-              onError={onError ?? (() => {})}
-            />
+            // 多选模式下点卡片 = 选中这条消息（与图片/视频卡一致）：卡片上的按钮
+            // 不吃点击，事件落到消息行。
+            <div key={it.key} className={selectMode ? "pointer-events-none" : undefined}>
+              <AttachmentCard
+                chatId={chatId}
+                item={awayItem}
+                name={it.display}
+                inactive={selectMode}
+                onError={onError ?? (() => {})}
+              />
+            </div>
           );
         }
         // 长按 / 右键 handlers（各媒体卡共用）。选择模式下点击交给消息列的
@@ -384,6 +422,25 @@ export default function MediaPreviews({
               className="max-h-72 w-auto max-w-full cursor-pointer self-start rounded-xl border border-[#2a2f3a]"
               title={`${it.display || it.path}（点击播放；长按 / 右键更多操作）`}
             />
+          );
+        }
+        // 附件清单还没回来：这次要按工作区路径打开的可能正是别的设备上的文件（或者
+        // 同名、却不是这条消息引用的那一份）。先出不可点的占位，清单到了再换成正常
+        // 卡片——不把「核对中」当成「本机有」。
+        if (!ready && (it.kind === "open" || (urls[it.key] ?? "") === "")) {
+          return (
+            <div
+              key={it.key}
+              className="flex max-w-full items-center gap-2 self-start rounded-xl border border-[#2a2f3a] bg-[#0f131b] px-3 py-2 text-left opacity-60"
+            >
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#1a1f29] text-gray-400">
+                …
+              </span>
+              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-gray-400">
+                {it.display || it.path}
+              </span>
+              <span className="shrink-0 text-[10px] text-gray-500">核对附件…</span>
+            </div>
           );
         }
         return it.kind === "open" || (urls[it.key] ?? "") === "" ? (

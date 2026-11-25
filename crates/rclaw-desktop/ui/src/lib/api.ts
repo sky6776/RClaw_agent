@@ -890,6 +890,9 @@ export interface SyncAttachment {
   rel_path: string | null;
   /** 产生这条消息的设备名；本机产生的为空。 */
   origin: string | null;
+  /** 消息里写的那个路径在本机工作区里是否真的原样存在（同一对象的别名补到原位置
+   *  之后就是 true）。false 时界面按附件卡给取回入口。 */
+  path_present: boolean;
 }
 
 /** 回收站里的一个会话。 */

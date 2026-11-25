@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { api, type SyncAttachment } from "../lib/api";
 import { formatBytes } from "../lib/syncUi";
 
@@ -57,6 +57,9 @@ let bar: BarView = NONE;
  *  上的文件才出同步卡（[`useChatAttachments`]）。 */
 let all: SyncAttachment[] = [];
 let allSig = "";
+/** 清单已经取到的会话（取失败也算：按「没有清单」处理）。区分「还没取到」与「取到
+ *  是空的」——前者消息里的附件还没核对过，工作区路径不能当可用的打开入口。 */
+let loaded: string | null = null;
 /** 清单不是这个会话的 / 还没取到时给的空数组（引用要稳定，别每次渲染新建）。 */
 const EMPTY: SyncAttachment[] = [];
 /** `消息行 id:blob` → 上一份清单里的状态（看得出哪些附件是刚下载下来的）。 */
@@ -97,6 +100,7 @@ function setCards(update: (prev: CardState) => CardState) {
 /** 换上一份新取的清单。 */
 function apply(chatId: string, list: SyncAttachment[]) {
   if (chat !== chatId) return;
+  loaded = chatId;
   const usable = list.filter((item) => item.kind === "file" || item.kind === "artifact");
   const nextAllSig = JSON.stringify(usable);
   const changedAll = nextAllSig !== allSig;
@@ -207,6 +211,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       bar = NONE;
       all = EMPTY;
       allSig = "";
+      loaded = null;
       known = {};
       cards = noCardState();
       emit();
@@ -220,7 +225,12 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       try {
         list = await api.syncAttachments(chatId);
       } catch {
-        // agent 没启动、引擎不可用：当作没有清单，消息照旧按工作区路径显示。
+        // agent 没启动、引擎不可用：当作没有清单，消息照旧按工作区路径显示（不能
+        // 一直停在「核对附件…」）。
+        if (alive && mine === seq && chat === chatId) {
+          loaded = chatId;
+          emit();
+        }
         return;
       }
       if (alive && mine === seq) apply(chatId, list);
@@ -261,6 +271,18 @@ export function useSyncAttachmentLoader(chatId: string | null) {
  */
 export function useChatAttachments(chatId: string | null): SyncAttachment[] {
   return useSyncExternalStore(subscribe, () => (chatId !== null && chat === chatId ? all : EMPTY));
+}
+
+/**
+ * 这个会话的附件清单取到了没有（取失败也算取到——按「没有清单」处理）。还没取到
+ * 时消息里的工作区路径不能当作可用的打开入口：那可能是别的设备上的文件，只是清单
+ * 还没回来。
+ */
+export function useChatAttachmentsReady(chatId: string | null): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => chatId !== null && chat === chatId && loaded === chatId,
+  );
 }
 
 const CARD =
@@ -305,12 +327,15 @@ export function AttachmentCard({
   chatId,
   item,
   name,
+  inactive = false,
   onError,
 }: {
   chatId: string;
   item: SyncAttachment;
   /** 卡片上展示的文件名（消息里媒体回执行给了 name 时用那个；缺省取路径末段）。 */
   name?: string;
+  /** 消息多选模式：卡片的按钮不能用（指针事件已由外层让开，键盘回车也不能触发）。 */
+  inactive?: boolean;
   onError: (message: string) => void;
 }) {
   const state = useSyncExternalStore(subscribe, () => cards);
@@ -334,7 +359,11 @@ export function AttachmentCard({
         </span>
         {/* 打开只按工作区相对路径：`open_media` 不收绝对路径（安卓与 Windows 都会拒）。
             工具结果（artifact）的登记落点就在这个会话的 artifact 目录下。 */}
-        <button onClick={() => open(item.rel_path ?? item.path)} className={CARD_BTN}>
+        <button
+          onClick={() => open(item.rel_path ?? item.path)}
+          disabled={inactive}
+          className={CARD_BTN}
+        >
           打开
         </button>
       </div>
@@ -360,13 +389,13 @@ export function AttachmentCard({
             </span>
           </span>
           {savedTo ? (
-            <button onClick={() => open(savedTo)} className={CARD_BTN}>
+            <button onClick={() => open(savedTo)} disabled={inactive} className={CARD_BTN}>
               打开
             </button>
           ) : (
             <button
               onClick={() => save(chatId, item.blob)}
-              disabled={saving}
+              disabled={inactive || saving}
               className={CARD_BTN}
             >
               {saving ? "保存中…" : "存进工作区"}
@@ -378,7 +407,7 @@ export function AttachmentCard({
             <div className={`min-w-0 flex-1 ${CARD_ERROR}`}>{error}</div>
             {/* 快照核对不过（内容被本机改写过）或其他取用失败：重新下载走缺附件的
                 路径，由持有正确内容的设备核对摘要后重传。 */}
-            <button onClick={() => download(item.blob)} className={CARD_BTN}>
+            <button onClick={() => download(item.blob)} disabled={inactive} className={CARD_BTN}>
               重新下载
             </button>
           </div>
@@ -399,7 +428,11 @@ export function AttachmentCard({
             {formatBytes(item.size)} · {away.note}
           </span>
         </span>
-        <button onClick={() => download(item.blob)} disabled={busy} className={CARD_BTN}>
+        <button
+          onClick={() => download(item.blob)}
+          disabled={inactive || busy}
+          className={CARD_BTN}
+        >
           {busy ? "下载中…" : away.action}
         </button>
       </div>
@@ -408,23 +441,64 @@ export function AttachmentCard({
   );
 }
 
-/** 同步缓存里一张图片快照的预览。出不了预览图就不显示，下面的卡片还在。 */
+/** 已生成的快照预览（对象名 → data URL）。对象名是内容摘要：同一份内容在多条消息
+ *  里出现只经一次 IPC；打开一个同步来的会话，缓存里的图往往不只一张。 */
+const snapshotPreviews = new Map<string, string>();
+const SNAPSHOT_PREVIEWS_MAX = 32;
+
+function rememberSnapshot(blob: string, src: string) {
+  if (snapshotPreviews.size >= SNAPSHOT_PREVIEWS_MAX) {
+    const oldest = snapshotPreviews.keys().next().value;
+    if (oldest !== undefined) snapshotPreviews.delete(oldest);
+  }
+  snapshotPreviews.set(blob, src);
+}
+
+/** 同步缓存里一张图片快照的预览。出不了预览图就不显示，下面的卡片还在。
+ *
+ *  卡片快进视口时才经 IPC 生成预览：`sync_attachment_preview` 每次都要重建这个会话
+ *  的附件清单并核对摘要，而一个会话可能同时挂出几十张快照卡——都在挂载时请求的话，
+ *  打开会话要白等一长串 IPC（`loading="lazy"` 只管字节，不管这次调用）。 */
 function SnapshotImage({ chatId, blob, alt }: { chatId: string; blob: string; alt: string }) {
-  const [src, setSrc] = useState<string | null>(null);
+  const [src, setSrc] = useState<string | null>(() => snapshotPreviews.get(blob) ?? null);
+  const box = useRef<HTMLSpanElement | null>(null);
   useEffect(() => {
+    if (src) return;
     let alive = true;
-    setSrc(null);
-    api
-      .syncAttachmentPreview(chatId, blob)
-      .then((r) => {
-        if (alive) setSrc(`data:${r.mime};base64,${r.base64}`);
-      })
-      .catch(() => {});
+    const load = () => {
+      api
+        .syncAttachmentPreview(chatId, blob)
+        .then((r) => {
+          if (!alive) return;
+          const url = `data:${r.mime};base64,${r.base64}`;
+          rememberSnapshot(blob, url);
+          setSrc(url);
+        })
+        .catch(() => {});
+    };
+    const el = box.current;
+    if (!el || typeof IntersectionObserver === "undefined") {
+      load();
+      return () => {
+        alive = false;
+      };
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        observer.disconnect();
+        load();
+      },
+      { rootMargin: "300px" },
+    );
+    observer.observe(el);
     return () => {
       alive = false;
+      observer.disconnect();
     };
-  }, [chatId, blob]);
-  if (!src) return null;
+  }, [chatId, blob, src]);
+  // 没加载出来时不占位，只留一个 1px 的观察点（在卡片正上方，随卡片滚进视口）。
+  if (!src) return <span ref={box} className="block h-1 w-full" aria-hidden="true" />;
   return (
     <img
       src={src}

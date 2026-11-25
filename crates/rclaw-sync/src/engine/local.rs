@@ -672,6 +672,10 @@ pub struct AttachmentInfo {
     pub rel_path: Option<String>,
     /// 产生这条消息的设备的名字；本机产生的为空。
     pub origin: Option<String>,
+    /// 消息里写的那个路径（[`Self::path`]）在本机工作区里是否真的原样存在。同内容的
+    /// 多个落点里，本机可能只有其中一个：别名补到消息路径上之后这里就变成 true，
+    /// 界面按工作区路径出卡（图片/视频照常内联），不必再让用户「存进工作区」。
+    pub path_present: bool,
 }
 
 struct FoundRef {
@@ -793,6 +797,14 @@ pub(crate) fn attachments(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<Vec
                 },
                 None => ("missing", None, None),
             };
+            // 消息路径是不是本机真有这个文件：`local` 的落点可能是同一个对象的另一个
+            // 路径（别名还没补过来），`cached` 也可能用户已经把它存回过原位置。工具
+            // 结果（artifact）在消息里只有一个文件名，按状态算。
+            let path_present = if found.kind == "file" {
+                present(&found.path).is_some()
+            } else {
+                state == "local"
+            };
             AttachmentInfo {
                 message_id: found.message_id,
                 kind: found.kind,
@@ -803,6 +815,7 @@ pub(crate) fn attachments(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<Vec
                 local_path,
                 rel_path,
                 origin: found.origin,
+                path_present,
             }
         })
         .collect())
