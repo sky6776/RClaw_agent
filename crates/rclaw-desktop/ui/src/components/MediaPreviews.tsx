@@ -238,12 +238,14 @@ export default function MediaPreviews({
   const mountedRef = useRef(true);
   const chatRef = useRef(chatId);
   chatRef.current = chatId;
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // StrictMode 会「setup → cleanup → setup」各跑一次：setup 里必须复位，
+    // 否则开发环境里点播的异步结果会被当成「组件已卸载」丢掉。
+    mountedRef.current = true;
+    return () => {
       mountedRef.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
 
   const items = useMemo(() => parseMediaItems(content), [content]);
 
@@ -292,10 +294,16 @@ export default function MediaPreviews({
     const refNames = new Set(
       [...mine.keys()].map((path) => path.split("/").pop() ?? path),
     );
+    // 只有「裸文件名猜成 media/<名字>」的才让位；正文里明确写出来的其他路径
+    // （如 `reports/report.pdf`）照常出卡。
+    const isGuess = (path: string) => {
+      const rest = path.startsWith("media/") ? path.slice("media/".length) : null;
+      return rest !== null && !rest.includes("/");
+    };
     const parsed = items.filter((item) => {
       if (mine.has(item.path)) return true;
       const name = item.path.split("/").pop() ?? item.path;
-      return !refNames.has(name);
+      return !(isGuess(item.path) && refNames.has(name));
     });
     if (mine.size === 0) return parsed;
     const seen = new Set(parsed.map((item) => item.path));

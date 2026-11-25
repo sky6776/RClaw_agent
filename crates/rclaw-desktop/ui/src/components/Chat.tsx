@@ -1167,6 +1167,8 @@ export default function Chat({
     }
   };
   const handleListWheel = (e: React.WheelEvent) => {
+    // Ctrl+滚轮是缩放文字（见下面的原生监听）：那不是滚动，别把「跟到底部」关掉。
+    if (e.ctrlKey) return;
     const el = listRef.current;
     if (!el || el.scrollHeight - el.clientHeight <= 0) return;
     if (e.deltaY < 0) {
@@ -1618,9 +1620,19 @@ export default function Chat({
       const refNames = new Set(
         refs.map((ref) => ref.path.split("/").pop() ?? ref.path),
       );
+      const isGuess = (path: string) => {
+        const rest = path.startsWith("media/") ? path.slice("media/".length) : null;
+        return rest !== null && !rest.includes("/");
+      };
       for (const it of parseMediaItems(e.content)) {
         const ref = byPath.get(it.path);
-        if (!ref && refNames.has(it.path.split("/").pop() ?? it.path)) continue;
+        if (
+          !ref &&
+          isGuess(it.path) &&
+          refNames.has(it.path.split("/").pop() ?? it.path)
+        ) {
+          continue;
+        }
         const itemKey = keyOf(it.path, ref?.blob);
         if (seen.has(itemKey) || (ref && !readableAtPath(ref))) continue;
         const isVideo = it.kind === "open" && /\.(?:mp4|webm|m4v|mov)$/i.test(it.path);

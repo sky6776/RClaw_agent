@@ -5280,6 +5280,34 @@ async fn check_media_read(
     }
 }
 
+/// 只看摘要缓存的核对（不读文件）：海报帧用。
+async fn check_media_read_cached(
+    state: &AppState,
+    chat_id: Option<String>,
+    blob: Option<String>,
+    path: &str,
+) -> Result<Option<String>, String> {
+    let (Some(chat_id), Some(blob)) = (chat_id, blob) else {
+        return Ok(None);
+    };
+    let Some(engine) = state.sync() else {
+        return Ok(None);
+    };
+    let check_path = path.to_string();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        engine.check_attachment_read_cached(CHANNEL_DESKTOP, &chat_id, &blob, &check_path)
+    })
+    .await
+    .map_err(|e| format!("核对附件失败: {e}"))?;
+    match outcome {
+        rclaw_sync::AttachmentReadCheck::Verified { pin } => Ok(Some(pin)),
+        rclaw_sync::AttachmentReadCheck::Unverifiable => Ok(None),
+        rclaw_sync::AttachmentReadCheck::Mismatch => Err(
+            "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
+        ),
+    }
+}
+
 async fn verify_media_read(
     state: &AppState,
     chat_id: Option<String>,
@@ -6512,9 +6540,9 @@ pub async fn media_stream_url(
             }
         }
     }
-    // 海报帧（或核不了的）：按路径 + 版本针。海报按**摘要缓存**的结论核（不整读大
-    // 视频）；核不了的**不钉版本**。
-    let pin = check_media_read(&state, chat_id, blob, &path, false).await?;
+    // 海报帧（或核不了的）：按路径 + 版本针。海报**只查摘要缓存**（缓存里没有就
+    // 不核、也不整读大视频）；核不了的**不钉版本**。
+    let pin = check_media_read_cached(&state, chat_id, blob, &path).await?;
     let agent_root = state.home.join("agent");
     match crate::media_stream::stream_url_with_root(agent_root, &path, pin.as_deref()) {
         Some(url) => Ok(url),

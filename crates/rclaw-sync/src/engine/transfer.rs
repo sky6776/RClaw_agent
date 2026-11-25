@@ -196,14 +196,14 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
                             .is_some_and(|row| row.state == crate::db::BLOB_REMOTE);
                     if probe {
                         db::blob_delete(tx, &wanted)?;
+                        // 撤掉临时登记之后继续走下面的常规路径：仍然向别的设备发一条
+                        // 限流的 `blob.want`（持有文件但没上传的设备才有机会补传），
+                        // `gone` 记录留着不动。
                     }
                     tx.execute(
                         "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
                         rusqlite::params![crate::db::scope::BLOB_PROBE, &wanted],
                     )?;
-                    if probe {
-                        return Ok(None);
-                    }
                     let Some(device) = sync_db::device_id(tx)? else {
                         return Ok(None);
                     };

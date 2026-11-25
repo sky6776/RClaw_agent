@@ -291,25 +291,27 @@ fn prune_share_cache(dir: &std::path::Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+    // 每个请求一个随机子目录（暂存文件名保持原样），也有直接放的普通文件：两种都算。
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf, bool)> = entries
         .flatten()
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
-            if !meta.is_file() {
-                return None;
-            }
-            Some((meta.modified().ok()?, entry.path()))
+            Some((meta.modified().ok()?, entry.path(), meta.is_file()))
         })
         .collect();
     files.sort_by(|a, b| b.0.cmp(&a.0));
     let now = std::time::SystemTime::now();
-    for (index, (mtime, path)) in files.into_iter().enumerate() {
+    for (index, (mtime, path, is_file)) in files.into_iter().enumerate() {
         let stale = now
             .duration_since(mtime)
             .map(|age| age.as_secs() > 3600)
             .unwrap_or(false);
         if index >= keep || stale {
-            let _ = std::fs::remove_file(&path);
+            let _ = if is_file {
+                std::fs::remove_file(&path)
+            } else {
+                std::fs::remove_dir_all(&path)
+            };
         }
     }
 }
@@ -324,15 +326,20 @@ pub(crate) fn drop_remote_registration(ctx: &crate::Ctx, blob: &str) {
         if !commit.valid() {
             return Ok(());
         }
-        if let Some(row) = db::blob_get(tx, blob)? {
-            if row.state == crate::db::BLOB_REMOTE {
-                db::blob_delete(tx, blob)?;
+        // 只撤「这次重试临时补的」那一条：标记还在、行还是等待取回。并发登记进来的
+        // 普通登记（没有标记，或已变成取回完成）不动。
+        let probe = db::state_get(tx, crate::db::scope::BLOB_PROBE, blob)?.is_some();
+        if probe {
+            if let Some(row) = db::blob_get(tx, blob)? {
+                if row.state == crate::db::BLOB_REMOTE {
+                    db::blob_delete(tx, blob)?;
+                }
             }
+            tx.execute(
+                "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+                rusqlite::params![crate::db::scope::BLOB_PROBE, blob],
+            )?;
         }
-        tx.execute(
-            "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
-            rusqlite::params![crate::db::scope::BLOB_PROBE, blob],
-        )?;
         Ok(())
     });
 }
@@ -1210,6 +1217,65 @@ impl SyncEngine {
         AttachmentBytes::Bytes(bytes)
     }
 
+    /// 只看摘要缓存里已有的结论（不读文件）：海报帧这类「顺带核对一下」的入口用，
+    /// 不能因为打开一个多视频会话就把每个视频整读一遍。缓存里没有/过期 → `Unverifiable`
+    /// （不钉版本，按老行为放行）。
+    pub fn check_attachment_read_cached(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        blob: &str,
+        rel_path: &str,
+    ) -> AttachmentReadCheck {
+        let ctx = &self.inner.ctx;
+        let Some(keys) = Secrets::load(&ctx.paths)
+            .ok()
+            .and_then(|secrets| secrets.keys().ok())
+        else {
+            return AttachmentReadCheck::Unverifiable;
+        };
+        let path = match ctx.env.checked_path(rel_path) {
+            Ok(path) => path,
+            Err(_) => return AttachmentReadCheck::Mismatch,
+        };
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .ok()
+            .flatten();
+        let Some(size) = row.map(|row| row.size).or_else(|| {
+            local::referenced_attachment(ctx, channel, chat_id, blob).map(|(_, size, _)| size)
+        }) else {
+            return AttachmentReadCheck::Unverifiable;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            return AttachmentReadCheck::Mismatch;
+        };
+        if meta.len().abs_diff(size) > local::SIZE_SLACK {
+            return AttachmentReadCheck::Mismatch;
+        }
+        let Some(version) = local::version_of(&meta) else {
+            return AttachmentReadCheck::Unverifiable;
+        };
+        let key = path.to_string_lossy().into_owned();
+        let Some((digest, at)) = local::cached_digest(&key, &version) else {
+            return AttachmentReadCheck::Unverifiable;
+        };
+        if at.elapsed() >= local::DIGEST_TRUST {
+            return AttachmentReadCheck::Unverifiable;
+        }
+        if keys.blob_id(&digest) != blob {
+            return AttachmentReadCheck::Mismatch;
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        AttachmentReadCheck::Verified {
+            pin: format!("{}-{}", meta.len(), mtime),
+        }
+    }
+
     /// 把核对过的内容写到 `dest_rel`（工作区相对路径）：边读边写边算摘要，写出来的
     /// 字节必须就是 `blob`；写入按上限截断、目标必须新建、目录不允许是链接。写完把
     /// 目录里过期的旧副本清掉。
@@ -1346,28 +1412,26 @@ impl SyncEngine {
                 // 之后别的设备来要还能重新上传。
                 let commit = ctx.space.begin();
                 if commit.valid() && ctx.space.epoch() == epoch_before {
-                    db::write(ctx.db(), |tx| {
+                    // 只有真的插入了这一行才算「这次补的登记」；标记里带开始时间，
+                    // `on_blob_want` 据此区分「刚点的、还在下载」与「陈旧残留」。
+                    registered = db::write(ctx.db(), |tx| {
                         if !commit.valid() {
-                            return Ok(());
+                            return Ok(false);
                         }
-                        // 别人（别的消息/别的任务）已经登记过这个对象：不改、不打标记。
                         if db::blob_get(tx, blob)?.is_some() {
-                            return Ok(());
+                            return Ok(false);
                         }
                         db::blob_register(tx, blob, &rel_path, size, crate::db::BLOB_REMOTE)?;
-                        // 这条登记是「重新下载」临时补的：在同一个事务里记下标识，
-                        // 下载失败时只撤带标识的登记；重启之后也认得出。
                         db::state_put(
                             tx,
                             crate::db::scope::BLOB_PROBE,
                             blob,
                             db::HLC_ZERO,
                             None,
-                            Some(&rel_path),
+                            Some(&format!("{}|{}", rel_path, crate::attach::now_ms())),
                         )?;
-                        Ok(())
+                        Ok(true)
                     })?;
-                    registered = true;
                 }
             }
         }

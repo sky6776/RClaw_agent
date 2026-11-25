@@ -944,7 +944,7 @@ struct DigestEntry {
 
 /// 文件版本：任何一项变了都重新整读。修改时间读不出来时判断不了它有没有变，不记。
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FileVersion {
+pub(crate) struct FileVersion {
     size: u64,
     mtime: i128,
     created: Option<i128>,
@@ -958,7 +958,7 @@ static DIGEST_CACHE: Mutex<Vec<DigestEntry>> = Mutex::new(Vec::new());
 const DIGEST_CACHE_MAX: usize = 8192;
 /// 「内容就是它」的结论最多信这么久。时间戳被还原过的替换（还原工具会保留长度、
 /// mtime、创建时间）只能靠重新整读发现；元数据没变的版本每这么久重新确认一次。
-const DIGEST_TRUST: Duration = Duration::from_secs(60);
+pub(crate) const DIGEST_TRUST: Duration = Duration::from_secs(60);
 
 fn timestamp(time: std::io::Result<SystemTime>) -> Option<i128> {
     time.ok()
@@ -979,7 +979,7 @@ fn changed_stamp(_meta: &std::fs::Metadata) -> Option<i128> {
 }
 
 /// 这个文件的版本标识；修改时间读不出来（判不了有没有变）时返回 `None`。
-fn version_of(meta: &std::fs::Metadata) -> Option<FileVersion> {
+pub(crate) fn version_of(meta: &std::fs::Metadata) -> Option<FileVersion> {
     Some(FileVersion {
         size: meta.len(),
         mtime: timestamp(meta.modified())?,
@@ -1003,7 +1003,10 @@ fn hash_file_digest(path: &Path, limit: u64) -> Option<[u8; 32]> {
 }
 
 /// 这个版本的摘要与「读完的时刻」。缓存命中不算读（不刷新时刻）。
-fn cached_digest(path: &str, version: &FileVersion) -> Option<([u8; 32], Instant)> {
+pub(crate) fn cached_digest(
+    path: &str,
+    version: &FileVersion,
+) -> Option<([u8; 32], Instant)> {
     let mut cache = DIGEST_CACHE.lock().ok()?;
     let at = cache.iter().position(|entry| {
         entry.path == path && entry.version == *version
