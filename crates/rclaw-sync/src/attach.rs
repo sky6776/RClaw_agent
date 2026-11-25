@@ -309,6 +309,16 @@ pub(crate) fn normalize_registration(
                 db::blob_register(tx, new, rel_path, size, BLOB_FETCHED)?;
             }
         }
+        // 这次归一让「新对象」在本机有了着落：推进它的落盘版本——正在取同一个对象的
+        // 另一条路径（缺件结算）据此知道「期间已经有人处理过」，不会把它改回远端。
+        db::state_put(
+            tx,
+            scope::BLOB_LANDED,
+            new,
+            db::HLC_ZERO,
+            None,
+            Some(&ids::random_hex::<8>()),
+        )?;
         replace_refs_blob(tx, old, new)?;
         tx.execute("DELETE FROM sync_blob WHERE blob_id = ?1", params![old])?;
         // 落盘标识跟着旧对象名一起清（新名字下次落盘会重新记）。

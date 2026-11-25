@@ -1342,11 +1342,15 @@ impl SyncEngine {
         // 归一没做成：只有「旧登记已经没了」（说明别的请求归一过、消息引用也换成了
         // 新名）并且新登记在、不是「等待取回」时，才按新名字回执；否则消息引用还是
         // 旧名，落点只能记在旧名下。
+        //
+        // 两个判据放在**同一条 SQL** 里：两条语句各自取快照的话，另一个进程可以在
+        // 中间提交归一（旧登记没了、新登记就绪），回执和消息引用就对不上。
         let (old_gone, new_ready) = db::read(self.inner.ctx.db(), |conn| {
-            Ok((
-                db::blob_get(conn, blob)?.is_none(),
-                db::blob_get(conn, keyed)?.is_some_and(|row| row.state != db::BLOB_REMOTE),
-            ))
+            Ok(conn.query_row(
+                "SELECT                    (SELECT COUNT(*) FROM sync_blob WHERE blob_id = ?1),                    (SELECT COUNT(*) FROM sync_blob WHERE blob_id = ?2 AND state != ?3)",
+                rusqlite::params![blob, keyed, db::BLOB_REMOTE],
+                |row| Ok((row.get::<_, i64>(0)? == 0, row.get::<_, i64>(1)? > 0)),
+            )?)
         })
         .unwrap_or((false, false));
         if old_gone && new_ready {
