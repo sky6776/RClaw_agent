@@ -18,7 +18,7 @@ import WorkflowCard from "./WorkflowCard";
 import MediaGallery, { type GalleryItem, type GallerySeed } from "./MediaGallery";
 import ToolBatchRows from "./ToolCallRow";
 import { RoundNavButton, RoundNavSheet, RoundRail, useWidePointer, type RoundNavItem } from "./RoundNav";
-import { CheckIcon, CopyIcon, GearIcon, PencilIcon, ShieldIcon } from "./icons";
+import { CheckIcon, CopyIcon, ForkIcon, GearIcon, PencilIcon, QuoteIcon, ShieldIcon } from "./icons";
 
 export type Role = "user" | "assistant" | "status" | "thinking";
 export interface Entry {
@@ -355,9 +355,10 @@ function formatEntryTime(d: Date): string {
   return sameDay ? hm : `${two(d.getMonth() + 1)}-${two(d.getDate())} ${hm}`;
 }
 
-/** 消息正文下方的时间标签（小号、低对比度，跟随气泡左右对齐）。
+/** 消息正文下方的时间标签（小号、低对比度，与操作图标同一行、排在最右）。
  *  没有 ts 的条目（极旧数据）不渲染，也不留空行；无法构成有效日期的 ts（损坏
- *  行）同样不渲染——toISOString 对越界值会抛错，不能让一条坏数据把整个会话渲染打断。 */
+ *  行）同样不渲染——toISOString 对越界值会抛错，不能让一条坏数据把整个会话渲染打断。
+ *  上边距带在自身（与图标行各自的 mt-1 一致）：窄屏只留时间时缩进与改动前相同。 */
 function TimeTag({ ts }: { ts?: number }) {
   if (!ts) return null;
   const d = new Date(ts);
@@ -409,16 +410,17 @@ function buildQuoteText(content: string): string {
   return q;
 }
 
-/** 消息引用小按钮：点击把该消息原文（含媒体路径）填进输入区引用条。 */
+/** 消息引用小按钮：点击把该消息原文（含媒体路径）填进输入区引用条。
+ *  只显示符号（文字标签在悬停提示与 aria-label 里），与复制 / 分叉同一行。 */
 function QuoteButton({ onQuote }: { onQuote: () => void }) {
   return (
     <button
       onClick={onQuote}
       title="引用此消息"
       aria-label="引用"
-      className="mt-0.5 flex items-center gap-1 rounded px-1 py-0.5 text-[10px] text-gray-500 transition hover:text-gray-200"
+      className="flex items-center rounded px-1 py-0.5 text-gray-500 transition hover:text-gray-200"
     >
-      ❝ 引用
+      <QuoteIcon />
     </button>
   );
 }
@@ -448,7 +450,7 @@ function CopyButton({
       }}
       title={copied ? "已复制" : "复制"}
       aria-label="复制"
-      className="mt-0.5 flex items-center gap-1 rounded px-1 py-0.5 text-[10px] text-gray-500 transition hover:text-gray-200"
+      className="flex items-center gap-1 rounded px-1 py-0.5 text-[10px] text-gray-500 transition hover:text-gray-200"
     >
       {copied ? <CheckIcon /> : <CopyIcon />}
       {copied && <span>已复制</span>}
@@ -458,16 +460,16 @@ function CopyButton({
 
 /** 消息「分叉到新会话」小按钮（桌面内联形态）：从该消息（含）复制出一条新会话
  *  分支，并自动回滚锚点之后的文件改动，原会话不动（ZCode fork 同款语义）。
- *  移动端走长按菜单项。 */
+ *  只显示分支符号（文字标签在悬停提示与 aria-label 里）。移动端走长按菜单项。 */
 function ForkButton({ onFork }: { onFork: () => void }) {
   return (
     <button
       onClick={onFork}
       title="从这里分叉出新会话（原会话保留）"
       aria-label="分叉到新会话"
-      className="mt-0.5 flex items-center gap-1 rounded px-1 py-0.5 text-[10px] text-gray-500 transition hover:text-gray-200"
+      className="flex items-center rounded px-1 py-0.5 text-gray-500 transition hover:text-gray-200"
     >
-      ⑂ 分叉
+      <ForkIcon />
     </button>
   );
 }
@@ -1807,16 +1809,21 @@ export default function Chat({
                   }
                   onOpenVideo={({ url, path }) => openGallery(path, { path, url })}
                 />
-                <TimeTag ts={e.ts} />
-                {!selectIds && (
-                  <div className="flex items-center gap-1 max-md:hidden">
-                    <CopyButton text={e.content} onError={onError} />
-                    <QuoteButton
-                      onQuote={() => setQuote({ who: "用户", text: buildQuoteText(e.content) })}
-                    />
-                    {onFork && <ForkButton onFork={() => onFork(e)} />}
-                  </div>
-                )}
+                {/* 操作行：复制 / 引用 / 分叉图标 + 时间（时间在最右），单行排列；
+                    窄屏（手机）走长按菜单，图标行隐藏、只留时间（上边距各自带，
+                    没有有效时间的条目整行自然塌成 0 高度，不留空行）。 */}
+                <div className="flex items-center gap-1">
+                  {!selectIds && (
+                    <div className="mt-1 flex items-center gap-1 max-md:hidden">
+                      <CopyButton text={e.content} onError={onError} />
+                      <QuoteButton
+                        onQuote={() => setQuote({ who: "用户", text: buildQuoteText(e.content) })}
+                      />
+                      {onFork && <ForkButton onFork={() => onFork(e)} />}
+                    </div>
+                  )}
+                  <TimeTag ts={e.ts} />
+                </div>
               </div>
             </div>
           );
@@ -1868,16 +1875,21 @@ export default function Chat({
                 }
                 onOpenVideo={({ url, path }) => openGallery(path, { path, url })}
               />
-              <TimeTag ts={e.ts} />
-              {!selectIds && (
-                <div className="flex items-center gap-1 max-md:hidden">
-                  <CopyButton text={stripMediaMarkers(e.content)} onError={onError} />
-                  <QuoteButton
-                    onQuote={() => setQuote({ who: "助手", text: buildQuoteText(e.content) })}
-                  />
-                  {onFork && <ForkButton onFork={() => onFork(e)} />}
-                </div>
-              )}
+              {/* 操作行：复制 / 引用 / 分叉图标 + 时间（时间在最右），单行排列；
+                  窄屏（手机）走长按菜单，图标行隐藏、只留时间（上边距各自带，
+                  没有有效时间的条目整行自然塌成 0 高度，不留空行）。 */}
+              <div className="flex items-center gap-1">
+                {!selectIds && (
+                  <div className="mt-1 flex items-center gap-1 max-md:hidden">
+                    <CopyButton text={stripMediaMarkers(e.content)} onError={onError} />
+                    <QuoteButton
+                      onQuote={() => setQuote({ who: "助手", text: buildQuoteText(e.content) })}
+                    />
+                    {onFork && <ForkButton onFork={() => onFork(e)} />}
+                  </div>
+                )}
+                <TimeTag ts={e.ts} />
+              </div>
             </div>
           </div>
         );

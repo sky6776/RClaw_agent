@@ -228,3 +228,26 @@ export function CheckIcon() {
     </Svg>
   );
 }
+
+/** 引用消息（回复箭头：左指箭头 + 折回正文的曲线）。 */
+export function QuoteIcon() {
+  return (
+    <Svg>
+      <path d="M6.4 5.4 2.6 8.4l3.8 3" />
+      <path d="M2.6 8.4h6.2a3.6 3.6 0 0 1 3.6 3.6v1.2" />
+    </Svg>
+  );
+}
+
+/** 分叉到新会话（一条主线分出东北 / 东南两支，实心箭头）。 */
+export function ForkIcon() {
+  return (
+    <Svg>
+      <path d="M2.4 13.6 6 10" />
+      <path d="M6 10 11.9 4.1" />
+      <path d="M6 10 11.9 12.1" />
+      <path d="M10.4 2.4h3.2v3.2z" fill="currentColor" stroke="none" />
+      <path d="M10.4 13.6h3.2v-3.2z" fill="currentColor" stroke="none" />
+    </Svg>
+  );
+}
