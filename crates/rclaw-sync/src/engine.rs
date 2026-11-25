@@ -1026,6 +1026,7 @@ impl SyncEngine {
         chat_id: &str,
         blob: &str,
         rel_path: &str,
+        fresh: bool,
     ) -> Option<bool> {
         let ctx = &self.inner.ctx;
         let keys = Secrets::load(&ctx.paths)
@@ -1040,8 +1041,13 @@ impl SyncEngine {
         let size = row.map(|row| row.size).or_else(|| {
             local::referenced_attachment(ctx, channel, chat_id, blob).map(|(_, size, _)| size)
         })?;
-        // 用户点开的这一下直接读一遍当前内容：不走摘要缓存那 60 秒的窗口。
-        Some(local::same_blob_now(&keys, &path, blob, size))
+        // 用户点开的那一下直接读一遍当前内容（不走摘要缓存那 60 秒的窗口）；
+        // 预览/播放按缓存结论核对，避免每张图、每个视频都整读一遍。
+        Some(if fresh {
+            local::same_blob_now(&keys, &path, blob, size)
+        } else {
+            local::same_blob(&keys, &path, blob, size)
+        })
     }
 
     /// 点「重新下载」：登记被回收过的（很少见）先按消息里的引用补一条「等待取回」，
@@ -1049,6 +1055,9 @@ impl SyncEngine {
     /// 写库（换空间的那段窗口里旧对象名不该被写进新空间）。
     pub fn fetch_attachment_at(&self, channel: &str, chat_id: &str, blob: &str) -> Result<()> {
         let ctx = &self.inner.ctx;
+        // 读引用之前记下同步空间的代：读完之后补登记要核对的是**同一代**（换空间之后
+        // 旧引用里的对象名不该被写进新空间）。
+        let epoch_before = ctx.space.epoch();
         let missing = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
             .map(|row| row.is_none())
             .unwrap_or(false);
@@ -1064,7 +1073,7 @@ impl SyncEngine {
                 // 上传失败留下的 `BLOB_GONE` 记录：留着它，文件放回原处后别的设备来要
                 // 时会重新上传；这里不补登记。
                 let commit = ctx.space.begin();
-                if commit.valid() {
+                if commit.valid() && ctx.space.epoch() == epoch_before {
                     db::write(ctx.db(), |tx| {
                         if !commit.valid() {
                             return Ok(());
@@ -1077,6 +1086,10 @@ impl SyncEngine {
                     })?;
                 }
             }
+        }
+        // 读引用之后换过空间：这次要的旧对象不属于新空间，别排队去取。
+        if ctx.space.epoch() != epoch_before {
+            return Err(SyncError::other("同步空间刚换过，请重试一次"));
         }
         self.fetch_attachment(blob)
     }

@@ -5249,11 +5249,43 @@ const MEDIA_PREVIEW_CACHE_DIR: &str = "media/cache/preview";
 /// JPEG，避免前端解码 12MP 原图（真机实测 4032×3024 全图解码 + 光栅 2~3s，
 /// 是会话里点开图片卡顿的根因）。缓存键 = 路径 + 文件大小 + mtime 的哈希，
 /// 文件更新自动失效；GIF（动画丢帧）与小图（长边不超上限）原样返回不重编码。
+/// 带会话上下文的媒体读取：给了 `chat_id`/`blob` 就按对象核对一下这个文件——内联卡
+/// 与画廊都是按路径读的，清单核对过之后文件仍可能被别的程序改写，读之前再对它一次。
+/// 没有登记、读不出密钥时核不了，按老行为继续。
+async fn verify_media_read(
+    state: &AppState,
+    chat_id: Option<String>,
+    blob: Option<String>,
+    path: &str,
+    fresh: bool,
+) -> Result<(), String> {
+    let (Some(chat_id), Some(blob)) = (chat_id, blob) else {
+        return Ok(());
+    };
+    let Some(engine) = state.sync() else {
+        return Ok(());
+    };
+    let check_path = path.to_string();
+    let verified = tauri::async_runtime::spawn_blocking(move || {
+        engine.attachment_file_matches(CHANNEL_DESKTOP, &chat_id, &blob, &check_path, fresh)
+    })
+    .await
+    .map_err(|e| format!("核对附件失败: {e}"))?;
+    if verified == Some(false) {
+        return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn media_preview(
     state: State<'_, AppState>,
     path: String,
+    chat_id: Option<String>,
+    blob: Option<String>,
 ) -> Result<MediaPayload, String> {
+    // 预览按摘要缓存的结论核对（每张图都整读一遍太重）；点开那一下才是直读。
+    verify_media_read(&state, chat_id, blob, &path, false).await?;
     let home = state.home.clone();
     tauri::async_runtime::spawn_blocking(move || media_preview_blocking(&home, &path))
         .await
@@ -6037,7 +6069,14 @@ pub async fn app_versions() -> AppVersionsDto {
 /// Range/206 分段），WebView `<video>` 据此边下边播并显示首帧——data URL
 /// 整包注入对视频不可行。路径守卫与 media_base64 相同。
 #[tauri::command]
-pub async fn media_stream_url(state: State<'_, AppState>, path: String) -> Result<String, String> {
+pub async fn media_stream_url(
+    state: State<'_, AppState>,
+    path: String,
+    chat_id: Option<String>,
+    blob: Option<String>,
+) -> Result<String, String> {
+    // 视频可能很大：这里按摘要缓存的结论核对，不整读。
+    verify_media_read(&state, chat_id, blob, &path, false).await?;
     let agent_root = state.home.join("agent");
     match crate::media_stream::stream_url_with_root(agent_root, &path) {
         Some(url) => Ok(url),

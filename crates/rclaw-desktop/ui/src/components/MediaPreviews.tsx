@@ -85,7 +85,15 @@ function boundaryBefore(content: string, at: number): boolean {
   const end = at - 1;
   let start = end;
   while (start > 0 && !/[/\\]/.test(content[start - 1])) start -= 1;
-  return content.slice(start, end).toLowerCase() === "agent";
+  if (content.slice(start, end).toLowerCase() !== "agent") return false;
+  // `agent/` 必须属于一条绝对路径（`/…/agent/`、`C:/…/agent/`）：
+  // `output/agent/…` 这种相对路径里的 `agent` 不是工作区根。
+  let token = start;
+  while (token > 0 && /[A-Za-z0-9_.\-/\\]/.test(content[token - 1])) {
+    token -= 1;
+  }
+  const root = content.slice(token, start);
+  return root.startsWith("/") || /^[A-Za-z]:[/\\]/.test(root);
 }
 
 
@@ -287,11 +295,12 @@ export default function MediaPreviews({
       if (videoRequested.current.has(item.key)) continue;
       videoRequested.current.add(item.key);
       api
-        .mediaStreamUrl(item.path)
+        // 带上这条消息登记的对象名：按路径读之前后端先核对一下内容。
+        .mediaStreamUrl(item.path, chatId, mine.get(item.path)?.blob)
         .then((url) => setVideoUrls((prev) => ({ ...prev, [item.key]: url })))
         .catch(() => setVideoUrls((prev) => ({ ...prev, [item.key]: "" })));
     }
-  }, [shown, awayPaths, ready]);
+  }, [shown, awayPaths, ready, mine, chatId]);
 
   useEffect(() => {
     for (const item of shown) {
@@ -309,14 +318,14 @@ export default function MediaPreviews({
       void api
         // 卡片用屏幕级预览图（后端缩到长边 1440 并缓存）：不再传输/解码
         // 12MP 原图（9MB base64 + 全图解码是真机点开图片慢的源头）。
-        .mediaPreview(item.path)
+        .mediaPreview(item.path, chatId, mine.get(item.path)?.blob)
         .then((r) =>
           setUrls((prev) => ({ ...prev, [item.key]: `data:${r.mime};base64,${r.base64}` })),
         )
         .catch(() => setUrls((prev) => ({ ...prev, [item.key]: "" })));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shown, awayPaths, ready]);
+  }, [shown, awayPaths, ready, mine, chatId]);
 
   // ---- 长按 / 右键上抛（菜单在 Chat 层统一渲染） ----
 
@@ -372,7 +381,14 @@ export default function MediaPreviews({
       suppressClickRef.current = false;
       return;
     }
-    void api.openMedia(item.path).catch((e) => onError?.(`打开媒体失败: ${String(e)}`));
+    // 这条消息登记过的附件：带上对象名打开，后端先核对内容——清单核过之后文件仍可能
+    // 被改写，这是不让用户看到另一个版本的最后一道关。
+    const attachment = mine.get(item.path);
+    const open =
+      attachment && chatId
+        ? api.syncOpenAttachment(chatId, attachment.blob, item.path)
+        : api.openMedia(item.path);
+    void open.catch((e) => onError?.(`打开媒体失败: ${String(e)}`));
   };
 
   // 图片读取完成（无论成败）即出卡：失败（urls[p] === ""，如超 25MB 上限、

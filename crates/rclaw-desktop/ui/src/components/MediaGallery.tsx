@@ -9,6 +9,8 @@ export interface GalleryItem {
   path: string;
   display: string;
   kind: "image" | "video";
+  /** 这条消息引用的附件对象名：读取（预览/播放）前按它核对文件内容。 */
+  blob?: string;
 }
 
 /** 打开画廊时的种子数据（点击的媒体卡已在手的资源，首屏免重复取数）。 */
@@ -33,6 +35,7 @@ export default function MediaGallery({
   items,
   start,
   seed,
+  chatId,
   onError,
   onClose,
 }: {
@@ -40,6 +43,8 @@ export default function MediaGallery({
   /** 打开时点击的条目路径（时间线定位起点）。 */
   start: string;
   seed?: GallerySeed | null;
+  /** 会话（按对象核对附件读取用）。 */
+  chatId?: string;
   onError?: (message: string) => void;
   onClose: () => void;
 }) {
@@ -62,7 +67,7 @@ export default function MediaGallery({
         return;
       }
       api
-        .mediaStreamUrl(item.path)
+        .mediaStreamUrl(item.path, chatId, item.blob)
         .then((u) => {
           if (alive) setVideoUrl(u);
         })
@@ -75,7 +80,7 @@ export default function MediaGallery({
         return;
       }
       api
-        .mediaPreview(item.path)
+        .mediaPreview(item.path, chatId, item.blob)
         .then((r) => {
           if (alive) setImgSrc(`data:${r.mime};base64,${r.base64}`);
         })
@@ -86,7 +91,7 @@ export default function MediaGallery({
     return () => {
       alive = false;
     };
-  }, [item, seed]);
+  }, [item, seed, chatId]);
 
   // 边界方向不传回调：查看器把该方向的滑动当普通拖拽，松手弹回（不循环）。
   const onPrev = index > 0 ? () => setIndex(index - 1) : undefined;

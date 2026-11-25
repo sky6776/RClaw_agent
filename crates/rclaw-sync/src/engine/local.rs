@@ -809,8 +809,8 @@ pub(crate) fn attachments(
     // 媒体卡可用不该等一场整库大小的顺序读。
     const VERIFY_BUDGET: u64 = 128 * 1024 * 1024;
     let mut budget = VERIFY_BUDGET;
+    let mut spent = 0u64;
     let mut verify = vec![false; found.len()];
-    let mut verified_any = false;
     for (index, item) in found.iter().enumerate().rev() {
         if item.kind != "file" {
             continue;
@@ -818,13 +818,15 @@ pub(crate) fn attachments(
         // 成本按「这一条要读多少」算：摘要缓存里已经有一份新鲜的就不要钱（同一次会话
         // 里反复重取清单时，后面几轮会把预算让给还没核对过的文件）。
         let cost = verification_cost(ctx, item);
-        // 最新的一条无论多大都要核对（单个大视频不能被预算永远挡在外面）。
-        if cost > budget && verified_any {
+        // 这一轮还没真读过东西时，单个再大的文件也核一次（不会被预算永远挡在外面）；
+        // 已经读过别的文件了，就等下一轮——缓存命中的零成本条目不算读过，不会把大文件
+        // 一直饿死。
+        if cost > budget && spent > 0 {
             continue;
         }
         budget = budget.saturating_sub(cost);
+        spent = spent.saturating_add(cost);
         verify[index] = true;
-        verified_any = true;
     }
     // 文件在不在、还是不是登记的那份内容：库锁之外看。路径先过 `check_path`（工作区里
     // 的链接不能把读取带到别处），内容核对按（路径、长度、mtime）记忆摘要。
@@ -871,18 +873,20 @@ pub(crate) fn attachments(
                     Some(path) => ("local", Some(path), Some(row.rel_path.clone())),
                     None => ("missing", None, None),
                 },
-                // 登记被回收过、留下「原本在这台设备上」的记录：照实说取不回来。
-                None if found.was_mine => ("gone", None, None),
-                // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上才算
-                // 本机有。
+                // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上就算
+                // 本机有——文件被放回原处之后不该还按「取不回来」说。
                 None if found.kind == "file" => match exact(&found.path) {
                     // 不在核对窗口里的只能按存在性说（老消息，不渲染）。
                     Some(path) if !deep || verified(&path) => {
                         ("local", Some(path), Some(found.path.clone()))
                     }
                     Some(_) => ("changed", None, None),
+                    // 文件没了、又留着「原本在这台设备上」的记录：照实说取不回来。
+                    None if found.was_mine => ("gone", None, None),
                     None => ("missing", None, None),
                 },
+                // 工具结果全文：登记被回收过、留下记录的，照实说取不回来。
+                None if found.was_mine => ("gone", None, None),
                 None => ("missing", None, None),
             };
             let local_path = local_path.map(|path| path.to_string_lossy().into_owned());

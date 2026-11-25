@@ -544,23 +544,39 @@ export function AttachmentCard({
 
   if (item.state === "local") {
     return (
-      <div className={CARD}>
-        <span className={`${CARD_ICON} bg-emerald-500/10 text-emerald-400`}>✓</span>
-        <span className="min-w-0 flex-1">
-          <span className={CARD_NAME}>{shown}</span>
-          <span className={CARD_NOTE}>
-            {formatBytes(item.size)} · 已下载到 {item.rel_path ?? item.path}
+      <div>
+        <div className={CARD}>
+          <span className={`${CARD_ICON} bg-emerald-500/10 text-emerald-400`}>✓</span>
+          <span className="min-w-0 flex-1">
+            <span className={CARD_NAME}>{shown}</span>
+            <span className={CARD_NOTE}>
+              {formatBytes(item.size)} · 已下载到 {item.rel_path ?? item.path}
+            </span>
           </span>
-        </span>
-        {/* 打开只按工作区相对路径：`open_media` 不收绝对路径（安卓与 Windows 都会拒）。
-            工具结果（artifact）的登记落点就在这个会话的 artifact 目录下。 */}
-        <button
-          onClick={() => open(item.rel_path ?? item.path)}
-          disabled={inactive}
-          className={CARD_BTN}
-        >
-          打开
-        </button>
+          {/* 打开只按工作区相对路径：`open_media` 不收绝对路径（安卓与 Windows 都会拒）。
+              工具结果（artifact）的登记落点就在这个会话的 artifact 目录下。 */}
+          <button
+            onClick={() => open(item.rel_path ?? item.path)}
+            disabled={inactive}
+            className={CARD_BTN}
+          >
+            打开
+          </button>
+        </div>
+        {/* 点开前的内容核对没过（文件被就地改写过）：给一条能走的路——重新下载，
+            否则就只剩一个反复失败的「打开」。 */}
+        {error && (
+          <div className="mt-1 flex items-start justify-between gap-2">
+            <div className={`min-w-0 flex-1 ${CARD_ERROR}`}>{error}</div>
+            <button
+              onClick={() => download(chatId, item.blob)}
+              disabled={inactive}
+              className={CARD_BTN}
+            >
+              重新下载
+            </button>
+          </div>
+        )}
       </div>
     );
   }

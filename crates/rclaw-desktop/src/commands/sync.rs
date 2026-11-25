@@ -920,7 +920,13 @@ pub async fn sync_open_attachment(
     let engine = handle(&state)?;
     let (check_chat, check_blob, check_path) = (chat_id, blob, path.clone());
     let matches = run_blocking("核对附件", move || {
-        Ok(engine.attachment_file_matches(CHANNEL_DESKTOP, &check_chat, &check_blob, &check_path))
+        Ok(engine.attachment_file_matches(
+            CHANNEL_DESKTOP,
+            &check_chat,
+            &check_blob,
+            &check_path,
+            true,
+        ))
     })
     .await?;
     if matches == Some(false) {

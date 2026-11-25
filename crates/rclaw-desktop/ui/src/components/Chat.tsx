@@ -16,7 +16,6 @@ import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { mentionsPath, parseMediaItems } from "./MediaPreviews";
 import {
-  awayAttachments,
   messageFileRefs,
   refreshSyncAttachments,
   useChatAttachments,
@@ -1546,11 +1545,14 @@ export default function Chat({
     const seen = new Set<string>();
     for (const e of entries) {
       if (e.role !== "user" && e.role !== "assistant") continue;
-      // 不在这台设备上（或者本机同名文件已经不是这条消息引用那份）的不进时间线：
-      // 画廊按工作区路径取图，放进去会滑到一张同名、不同内容的图。
-      const away = awayAttachments(syncedAttachments, e.msgId);
+      // 这条消息登记的附件：不在这台设备上（或本机同名文件已经不是这一份）的不进
+      // 时间线——画廊按路径读取，放进去会滑到一张同名、不同内容的图；进了的带上
+      // 对象名，读取前由后端核对。
+      const refs = messageFileRefs(syncedAttachments, e.msgId);
+      const byPath = new Map(refs.map((ref) => [ref.path, ref]));
       for (const it of parseMediaItems(e.content)) {
-        if (seen.has(it.path) || away.has(it.path)) continue;
+        const ref = byPath.get(it.path);
+        if (seen.has(it.path) || (ref && !ref.path_present)) continue;
         const isVideo = it.kind === "open" && /\.(?:mp4|webm|m4v|mov)$/i.test(it.path);
         if (it.kind !== "image" && !isVideo) continue;
         seen.add(it.path);
@@ -1558,11 +1560,12 @@ export default function Chat({
           path: it.path,
           display: it.display || it.path,
           kind: isVideo ? "video" : "image",
+          blob: ref?.blob,
         });
       }
       // 清单里有、正文解析漏掉的图片/视频（已在本机）：也放进时间线，否则内联卡
       // 点不开（画廊里没有它，`openGallery` 会直接返回）。
-      for (const item of messageFileRefs(syncedAttachments, e.msgId)) {
+      for (const item of refs) {
         if (!item.path_present || seen.has(item.path)) continue;
         // 附件清单是从整行数据里抽的：工具参数、思考里提到的文件也在里面，只有正文
         // 里真的写到的才进时间线（与 MediaPreviews 的补卡同一口径）。
@@ -1574,6 +1577,7 @@ export default function Chat({
           path: item.path,
           display: item.path.split("/").pop() || item.path,
           kind: video ? "video" : "image",
+          blob: item.blob,
         });
       }
     }
@@ -1598,12 +1602,17 @@ export default function Chat({
   const menuShareMedia = (path: string) => {
     api.shareMedia(path).catch((e) => onError?.(`转发失败: ${String(e)}`));
   };
-  const menuOpenMedia = (path: string) => {
-    api.openMedia(path).catch((e) => onError?.(`打开媒体失败: ${String(e)}`));
+  const menuOpenMedia = (path: string, msgId?: number) => {
+    const ref = messageFileRefs(syncedAttachments, msgId).find((item) => item.path === path);
+    const open = ref
+      ? api.syncOpenAttachment(sessionKey, ref.blob, path)
+      : api.openMedia(path);
+    open.catch((e) => onError?.(`打开媒体失败: ${String(e)}`));
   };
-  const menuViewImage = (path: string) => {
+  const menuViewImage = (path: string, msgId?: number) => {
+    const ref = messageFileRefs(syncedAttachments, msgId).find((item) => item.path === path);
     void api
-      .mediaPreview(path)
+      .mediaPreview(path, sessionKey, ref?.blob)
       .then((r) =>
         openGallery(path, { path, src: `data:${r.mime};base64,${r.base64}` }),
       )
@@ -2888,7 +2897,7 @@ export default function Chat({
                   <button
                     className={MENU_ITEM}
                     onClick={closeMenuAnd((m) =>
-                      m.media && menuViewImage(m.media.path),
+                      m.media && menuViewImage(m.media.path, m.entry.msgId),
                     )}
                   >
                     放大查看
@@ -2910,7 +2919,7 @@ export default function Chat({
                 )}
                 <button
                   className={MENU_ITEM}
-                  onClick={closeMenuAnd((m) => m.media && menuOpenMedia(m.media.path))}
+                  onClick={closeMenuAnd((m) => m.media && menuOpenMedia(m.media.path, m.entry.msgId))}
                 >
                   用系统应用打开
                 </button>
@@ -3019,6 +3028,7 @@ export default function Chat({
           items={gallery.items}
           start={gallery.start}
           seed={gallery.seed}
+          chatId={sessionKey}
           onError={onError}
           onClose={() => setGallery(null)}
         />

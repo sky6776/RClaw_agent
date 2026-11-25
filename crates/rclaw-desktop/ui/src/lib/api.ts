@@ -1249,10 +1249,14 @@ export const api = {
 
   /** 媒体的屏幕级预览图（大图缩到长边 1440 缓存于 media/cache/preview）。
    *  卡片与查看器 1x 显示都用它，避免前端解码 12MP 原图。 */
-  mediaPreview: (path: string) => invoke<MediaPayload>("media_preview", { path }),
+  /** 图片预览。`chatId`/`blob` 给定时先按对象核对这个文件（内联卡与画廊按路径读的
+   *  最后一道核对）。 */
+  mediaPreview: (path: string, chatId?: string, blob?: string) =>
+    invoke<MediaPayload>("media_preview", { path, chatId, blob }),
 
   /** 视频/音频的本地流式 URL（127.0.0.1 + 随机 token，支持 Range 边下边播）。 */
-  mediaStreamUrl: (path: string) => invoke<string>("media_stream_url", { path }),
+  mediaStreamUrl: (path: string, chatId?: string, blob?: string) =>
+    invoke<string>("media_stream_url", { path, chatId, blob }),
 
   openMedia: (path: string) => invoke<void>("open_media", { path }),
 
