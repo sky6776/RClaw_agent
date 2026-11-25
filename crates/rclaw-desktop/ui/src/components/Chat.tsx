@@ -1072,13 +1072,15 @@ export default function Chat({
     // 关掉贴底、弹出「回到最新」）；基线挪到当前主触点，回到单指后不会把捏合
     // 期间的位移当成拖动。看门狗也续上（长捏合不算「静止」）。
     if (e.touches.length > 1) {
+      // 双指出现过就算捏合（不要求 active：看门狗可能已把手势清掉，finish 的
+      // 轻点判定仍要能看见它）。
+      st.pinched = true;
       const t = e.touches[0];
       if (t && st.active) {
         st.startX = t.clientX;
         st.startY = t.clientY;
         const el = listRef.current;
         if (el) st.startScrollTop = el.scrollTop;
-        st.pinched = true;
       }
       lastTouchAtRef.current = performance.now();
       armTouchWatchdog();
@@ -1104,6 +1106,7 @@ export default function Chat({
       st.startY = t.clientY;
       st.startScrollTop = el.scrollTop;
       st.moved = true; // 中途接管：松手按「拖动过」处理，不做轻点让位
+      st.pinched = false; // 上一次手势的捏合记录不带进来
       lastTouchAtRef.current = performance.now();
       armTouchWatchdog();
       return; // 起点刚重置，本事件不做脱离判定

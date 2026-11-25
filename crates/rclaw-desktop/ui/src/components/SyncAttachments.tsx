@@ -311,8 +311,13 @@ function save(chatId: string, item: SyncAttachment) {
     .then(({ rel, verified }) => {
       if (chat !== chatId) return;
       // 只有「写下去的字节核对过」才撤「读出来对不上」的覆盖；核不了按老行为复制时
-      // 照样记下已存到，但不撤（那份副本可能仍不是这条消息引用的内容）。
-      if (verified) clearChanged(item.blob);
+      // 照样记下已存到，但不撤（那份副本可能仍不是这条消息引用的内容）。这种时候
+      // 卡片上「内容对不上」的说明要放回去（保存开始时按常规清过一次）。
+      if (verified) {
+        clearChanged(item.blob);
+      } else if (changedKeys.has(key)) {
+        cards = { ...cards, saveErrors: { ...cards.saveErrors, [key]: CHANGED_CARD_NOTE } };
+      }
       setCards((prev) => ({ ...prev, saved: { ...prev.saved, [key]: rel } }));
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
       // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。
