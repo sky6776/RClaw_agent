@@ -1032,7 +1032,12 @@ impl SyncEngine {
         let keys = Secrets::load(&ctx.paths)
             .ok()
             .and_then(|secrets| secrets.keys().ok())?;
-        let path = ctx.env.checked_path(rel_path).ok()?;
+        let path = match ctx.env.checked_path(rel_path) {
+            Ok(path) => path,
+            // 路径不安全（工作区里的链接、越界）：不能当成「核不了就放行」——普通媒体
+            // 解析会跟着链接走，那样打开的就是别处的文件。
+            Err(_) => return Some(false),
+        };
         let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
             .ok()
             .flatten();
@@ -1070,15 +1075,13 @@ impl SyncEngine {
                 } else {
                     crate::wire::landing_path(&path, blob)
                 };
-                // 上传失败留下的 `BLOB_GONE` 记录：留着它，文件放回原处后别的设备来要
-                // 时会重新上传；这里不补登记。
+                // 补一条临时登记去存储上看一眼。`BLOB_GONE` 记录**不删**：存储上确实
+                // 没有的时候（`transfer::finish`）登记会被撤掉、记录留着，文件放回原处
+                // 之后别的设备来要还能重新上传。
                 let commit = ctx.space.begin();
                 if commit.valid() && ctx.space.epoch() == epoch_before {
                     db::write(ctx.db(), |tx| {
                         if !commit.valid() {
-                            return Ok(());
-                        }
-                        if db::state_get(tx, crate::db::scope::BLOB_GONE, blob)?.is_some() {
                             return Ok(());
                         }
                         db::blob_register(tx, blob, &rel_path, size, crate::db::BLOB_REMOTE)?;

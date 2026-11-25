@@ -103,6 +103,10 @@ interface Props {
   src: string;
   /** 工作区路径：「查看原图」/放大时按需加载原图（media_base64）。 */
   path: string;
+  /** 会话（同步附件读取前的核对用）。 */
+  chatId?: string;
+  /** 这条消息引用的附件对象名：原图读取前按它核对内容，缓存也按它区分版本。 */
+  blob?: string;
   /** 展示名（顶栏文件名）。 */
   display: string;
   /** 会话里媒体卡的 <img> 元素（已按小尺寸解码）。给定时就地画 canvas 即时
@@ -121,6 +125,8 @@ interface Props {
 export default function ImageViewer({
   src,
   path,
+  chatId,
+  blob,
   display,
   preview,
   onError,
@@ -142,6 +148,8 @@ export default function ImageViewer({
   const [previewReady, setPreviewReady] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   /** 微信式「查看原图」：原图 blob（已加载）/加载中/已上屏。 */
+  // 同一路径上的不同版本（blob 不同）不能共用原图缓存。
+  const cacheKey = blob ? `${path}:${blob}` : path;
   const [full, setFull] = useState<{ url: string } | null>(null);
   const [fullLoading, setFullLoading] = useState(false);
   const [fullVisible, setFullVisible] = useState(false);
@@ -181,7 +189,7 @@ export default function ImageViewer({
     // 预览 data→blob 转换放常驻 Worker 线程（见 getBlobWorker）：主线程不碰
     // base64 解码，遮罩/canvas 首帧不被拖住。Worker 不可用时直接 data URL
     // 兜底（setAttribute ~374ms，仅限极端环境）。
-    const cached = cachedFullBlob(path);
+    const cached = cachedFullBlob(cacheKey);
     if (cached) {
       wantFullRef.current = true;
       // 会话里已加载过原图：直接原图上屏（微信「再打开就直接是原图」）。
@@ -216,7 +224,7 @@ export default function ImageViewer({
     wantFullRef.current = true;
     setFullLoading(true);
     api
-      .mediaBase64(path)
+      .mediaBase64(path, chatId, blob)
       .then((r) => {
         const dataUrl = `data:${r.mime};base64,${r.base64}`;
         return dataUrlToBlob(dataUrl).then((b) => ({ b, dataUrl }));
@@ -225,7 +233,7 @@ export default function ImageViewer({
         // Worker 不可用（如 CSP 拦 blob:）时拿 data URL 直挂原图：慢一点
         // （setAttribute 阻塞主线程）但「查看原图」不至于整个失败。
         const u = b ? URL.createObjectURL(b) : dataUrl;
-        cacheFullBlob(path, u);
+        cacheFullBlob(cacheKey, u);
         setFull({ url: u });
         setFullLoading(false);
       })

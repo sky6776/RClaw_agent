@@ -5285,14 +5285,21 @@ pub async fn media_preview(
     blob: Option<String>,
 ) -> Result<MediaPayload, String> {
     // 预览按摘要缓存的结论核对（每张图都整读一遍太重）；点开那一下才是直读。
-    verify_media_read(&state, chat_id, blob, &path, false).await?;
+    verify_media_read(&state, chat_id, blob.clone(), &path, false).await?;
     let home = state.home.clone();
-    tauri::async_runtime::spawn_blocking(move || media_preview_blocking(&home, &path))
+    // 核对过的同步附件：预览缓存的键带上对象名——同一个路径上换成同长度、同一秒写
+    // 下的另一个版本时，不能拿到旧缩略图。
+    let seed = blob.map(|blob| format!("sync-blob:{blob}"));
+    tauri::async_runtime::spawn_blocking(move || media_preview_blocking(&home, &path, seed))
         .await
         .map_err(|e| format!("生成预览任务失败: {e}"))?
 }
 
-fn media_preview_blocking(home: &std::path::Path, path: &str) -> Result<MediaPayload, String> {
+fn media_preview_blocking(
+    home: &std::path::Path,
+    path: &str,
+    seed: Option<String>,
+) -> Result<MediaPayload, String> {
     if path.contains("..") || path.contains('\\') || path.starts_with('/') {
         return Err("非法媒体路径".into());
     }
@@ -5315,7 +5322,7 @@ fn media_preview_blocking(home: &std::path::Path, path: &str) -> Result<MediaPay
     if !full.starts_with(&root_canon) {
         return Err("媒体路径越出工作区".into());
     }
-    image_preview_payload(home, &full, path, &extension)
+    image_preview_payload(home, &full, seed.as_deref().unwrap_or(path), &extension)
 }
 
 /// 预览图的核心：`full` 是调用方已经校验过的图片文件，`extension` 是它的小写扩展名
@@ -5432,7 +5439,11 @@ fn image_preview_payload(
 pub async fn media_base64(
     state: State<'_, AppState>,
     path: String,
+    chat_id: Option<String>,
+    blob: Option<String>,
 ) -> Result<MediaPayload, String> {
+    // 放大看原图也是一次按路径读取：同步附件先按对象核对（摘要缓存，不整读）。
+    verify_media_read(&state, chat_id, blob, &path, false).await?;
     // 最大 25MB 的同步读 + 编码挪到阻塞线程池（与同文件其他命令一致），
     // 避免卡住 Tauri 命令线程（低端安卓设备上明显）。
     let home = state.home.clone();
@@ -5831,7 +5842,14 @@ pub(crate) fn open_media_path(home: &std::path::Path, path: &str) -> Result<(), 
 /// 桌面 Pictures/RClaw）；文档（pdf/md/xlsx…）安卓写入系统下载目录
 /// （MediaStore.Downloads）、桌面拷贝到「下载/RClaw」。返回 "ok" / "permission_requested"。
 #[tauri::command]
-pub async fn save_media(state: State<'_, AppState>, path: String) -> Result<String, String> {
+pub async fn save_media(
+    state: State<'_, AppState>,
+    path: String,
+    chat_id: Option<String>,
+    blob: Option<String>,
+) -> Result<String, String> {
+    // 导出前按对象直读核对一次：保存/转发的不能是另一个版本。
+    verify_media_read(&state, chat_id, blob, &path, true).await?;
     let kind = media_kind_of(&path);
     if kind != "file" {
         // 会话媒体（agent 生成的 media/out/…、文件面板里的图片/视频）不限于 uploads/，
@@ -5875,7 +5893,13 @@ pub async fn save_media(state: State<'_, AppState>, path: String) -> Result<Stri
 
 /// 转发工作区媒体到其它应用（安卓系统分享面板：微信/QQ / 保存到文件等）。
 #[tauri::command]
-pub async fn share_media(state: State<'_, AppState>, path: String) -> Result<(), String> {
+pub async fn share_media(
+    state: State<'_, AppState>,
+    path: String,
+    chat_id: Option<String>,
+    blob: Option<String>,
+) -> Result<(), String> {
+    verify_media_read(&state, chat_id, blob, &path, true).await?;
     // 路径校验同 open_media（canonicalize + 工作区前缀），防越区分享。
     let _abs = resolve_media_file(&state.home, &path)?;
     #[cfg(target_os = "android")]

@@ -108,6 +108,8 @@ export default function MediaGallery({
         key={item.path}
         src={imgSrc}
         path={item.path}
+        chatId={chatId}
+        blob={item.blob}
         display={item.display}
         preview={seed && seed.path === item.path ? seed.preview ?? null : null}
         onError={onError}

@@ -812,9 +812,15 @@ pub async fn sync_fetch_attachment(
     blob: String,
 ) -> Result<(), String> {
     check_chat_id(&chat_id)?;
-    handle(&state)?
-        .fetch_attachment_at(CHANNEL_DESKTOP, &chat_id, &blob)
-        .map_err(fail)
+    let engine = handle(&state)?;
+    // 可能扫这个会话的引用、还要写一条补登记：放阻塞线程池，别人一个进程点「全部
+    // 下载」时别把 Tauri 的命令线程堵住。
+    run_blocking("下载附件", move || {
+        engine
+            .fetch_attachment_at(CHANNEL_DESKTOP, &chat_id, &blob)
+            .map_err(fail)
+    })
+    .await
 }
 
 /// 在会话的附件清单里找到 `blob` 对应的那份文件快照，返回清单项与它在同步缓存里的真实

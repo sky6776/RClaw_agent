@@ -12,6 +12,7 @@ import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import {
   AttachmentCard,
   messageFileRefs,
+  readableAtPath,
   useChatAttachments,
   useChatAttachmentsReady,
 } from "./SyncAttachments";
@@ -248,7 +249,9 @@ export default function MediaPreviews({
   const away = useMemo(() => {
     const map = new Map<string, SyncAttachment>();
     for (const [path, item] of mine) {
-      if (!item.path_present) map.set(path, item);
+      // 核对过、消息路径上没有这份内容：出附件卡。还没核对过的按「能读」处理
+      // （读取前后端再核一次），不然大文件会被预算一直挡在附件卡后面。
+      if (!readableAtPath(item)) map.set(path, item);
     }
     return map;
   }, [mine]);

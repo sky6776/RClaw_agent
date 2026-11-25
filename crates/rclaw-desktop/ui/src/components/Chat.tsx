@@ -17,6 +17,7 @@ import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { mentionsPath, parseMediaItems } from "./MediaPreviews";
 import {
   messageFileRefs,
+  readableAtPath,
   refreshSyncAttachments,
   useChatAttachments,
   useChatAttachmentsReady,
@@ -1552,7 +1553,7 @@ export default function Chat({
       const byPath = new Map(refs.map((ref) => [ref.path, ref]));
       for (const it of parseMediaItems(e.content)) {
         const ref = byPath.get(it.path);
-        if (seen.has(it.path) || (ref && !ref.path_present)) continue;
+        if (seen.has(it.path) || (ref && !readableAtPath(ref))) continue;
         const isVideo = it.kind === "open" && /\.(?:mp4|webm|m4v|mov)$/i.test(it.path);
         if (it.kind !== "image" && !isVideo) continue;
         seen.add(it.path);
@@ -1566,7 +1567,7 @@ export default function Chat({
       // 清单里有、正文解析漏掉的图片/视频（已在本机）：也放进时间线，否则内联卡
       // 点不开（画廊里没有它，`openGallery` 会直接返回）。
       for (const item of refs) {
-        if (!item.path_present || seen.has(item.path)) continue;
+        if (!readableAtPath(item) || seen.has(item.path)) continue;
         // 附件清单是从整行数据里抽的：工具参数、思考里提到的文件也在里面，只有正文
         // 里真的写到的才进时间线（与 MediaPreviews 的补卡同一口径）。
         if (!mentionsPath(e.content, item.path)) continue;
@@ -1587,9 +1588,10 @@ export default function Chat({
 
   // 菜单媒体动作：保存 / 转发 / 系统打开 / 放大（放大按需拉 base64，媒体卡
   // 已加载的 data URL 不在 Chat 手里）。
-  const menuSaveMedia = (path: string) => {
+  const menuSaveMedia = (path: string, msgId?: number) => {
+    const ref = messageFileRefs(syncedAttachments, msgId).find((item) => item.path === path);
     api
-      .saveMedia(path)
+      .saveMedia(path, sessionKey, ref?.blob)
       .then((r) => {
         if (r === "permission_requested") {
           onError?.("请在系统授权弹窗允许后重试保存");
@@ -1599,8 +1601,11 @@ export default function Chat({
       })
       .catch((e) => onError?.(`保存失败: ${String(e)}`));
   };
-  const menuShareMedia = (path: string) => {
-    api.shareMedia(path).catch((e) => onError?.(`转发失败: ${String(e)}`));
+  const menuShareMedia = (path: string, msgId?: number) => {
+    const ref = messageFileRefs(syncedAttachments, msgId).find((item) => item.path === path);
+    api
+      .shareMedia(path, sessionKey, ref?.blob)
+      .catch((e) => onError?.(`转发失败: ${String(e)}`));
   };
   const menuOpenMedia = (path: string, msgId?: number) => {
     const ref = messageFileRefs(syncedAttachments, msgId).find((item) => item.path === path);
@@ -2905,14 +2910,14 @@ export default function Chat({
                 )}
                 <button
                   className={MENU_ITEM}
-                  onClick={closeMenuAnd((m) => m.media && menuSaveMedia(m.media.path))}
+                  onClick={closeMenuAnd((m) => m.media && menuSaveMedia(m.media.path, m.entry.msgId))}
                 >
                   保存到本地
                 </button>
                 {isAndroidDevice() && (
                   <button
                     className={MENU_ITEM}
-                    onClick={closeMenuAnd((m) => m.media && menuShareMedia(m.media.path))}
+                    onClick={closeMenuAnd((m) => m.media && menuShareMedia(m.media.path, m.entry.msgId))}
                   >
                     转发到其它应用
                   </button>

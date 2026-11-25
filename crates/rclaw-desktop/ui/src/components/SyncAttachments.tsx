@@ -445,6 +445,16 @@ export function messageFileRefs(
   return indexByMessage(list).get(msgId) ?? [];
 }
 
+/** 这条引用能按消息里的路径直接读吗。`checked=false`（还没轮到核对）的按「能读」
+ *  处理——读取前后端会再核一次；核对过且对不上的才出附件卡。 */
+export function readableAtPath(item: SyncAttachment): boolean {
+  return (
+    item.kind === "file" &&
+    item.state === "local" &&
+    (!item.checked || item.path_present)
+  );
+}
+
 /** 一条消息登记的文件里，消息路径上并没有这份内容的（按路径索引）：界面出附件卡，
  *  画廊也要跳过——按工作区路径取会拿到同名却不是这份内容的文件。 */
 export function awayAttachments(

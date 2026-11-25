@@ -76,16 +76,34 @@ pub fn stream_url_with_root(agent_root: PathBuf, path: &str) -> Option<String> {
 pub fn stream_url(path: &str) -> Option<String> {
     let server = SERVER.get()?;
     // 与 media_base64 相同的守卫，提前校验（请求期还会再验一次）。
-    resolve_media_path(&server.agent_root, path)?;
+    let full = resolve_media_path(&server.agent_root, path)?;
     if !is_streamable(path) {
         return None;
     }
+    // URL 钉住当前文件的版本（长度 + 修改时间）：播放期间文件被就地改写了，后续
+    // Range 请求一律拒绝——不能让用户看着「核对过的那个视频」，放出来的却是别的。
+    let pin = file_version(&full)
+        .map(|version| format!("&v={version}"))
+        .unwrap_or_default();
     Some(format!(
-        "http://127.0.0.1:{}/m?t={}&p={}",
+        "http://127.0.0.1:{}/m?t={}&p={}{}",
         server.port,
         server.token,
-        percent_encode_path(path)
+        percent_encode_path(path),
+        pin
     ))
+}
+
+/// 文件版本针：长度 + 修改时间（纳秒）。取不到修改时间的只带长度。
+fn file_version(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    Some(format!("{}-{}", meta.len(), mtime))
 }
 
 /// 扩展名白名单（与 media_base64 的媒体扩展守卫同一防御纵深）：工作区里的
@@ -140,7 +158,9 @@ fn content_type(path: &Path) -> &'static str {
 
 /// 解析请求首行与头（只需 Range 与路径 query），返回 (path, range)。
 /// token 不符 / 畸形请求返回 None（调用方回 403）。
-fn parse_request(socket: &mut std::net::TcpStream) -> Option<(String, Option<(u64, u64)>)> {
+fn parse_request(
+    socket: &mut std::net::TcpStream,
+) -> Option<(String, Option<(u64, u64)>, Option<String>)> {
     let mut buf = [0u8; 4096];
     let n = std::io::Read::read(socket, &mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -163,6 +183,7 @@ fn parse_request(socket: &mut std::net::TcpStream) -> Option<(String, Option<(u6
         return None;
     }
     let path = percent_decode(path_encoded)?;
+    let version = params.get("v").cloned();
     // Range: bytes=start-end（end 可省略 = 到文件尾）。
     let mut range = None;
     for line in lines {
@@ -180,7 +201,7 @@ fn parse_request(socket: &mut std::net::TcpStream) -> Option<(String, Option<(u6
             }
         }
     }
-    Some((path, range))
+    Some((path, range, version))
 }
 
 // %XX 手工解码（路径只含安全字符 + %XX 转义的 CJK/空格）。必须按字节收集
@@ -205,7 +226,7 @@ fn percent_decode(encoded: &str) -> Option<String> {
 }
 
 fn handle_conn(mut socket: std::net::TcpStream) {
-    let Some((path, range)) = parse_request(&mut socket) else {
+    let Some((path, range, version)) = parse_request(&mut socket) else {
         let _ = write_all(
             &mut socket,
             b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
@@ -238,6 +259,16 @@ fn handle_conn(mut socket: std::net::TcpStream) {
         );
         return;
     };
+    // URL 上钉的版本和当前文件不一致：这个流对应的内容已经不是当时核对过的那一个了。
+    if let Some(expected) = &version {
+        if file_version(&full).as_ref() != Some(expected) {
+            let _ = write_all(
+                &mut socket,
+                b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n",
+            );
+            return;
+        }
+    }
     let total = meta.len();
     if total == 0 {
         // 空文件：Content-Length 必须为 0（否则承诺 1 字节发 0 字节，客户端按

@@ -183,6 +183,13 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
                     if !commit.valid() {
                         return Ok(None);
                     }
+                    // 「原本在这台设备上、文件拿不出来」的记录还在、存储上又确实没有：
+                    // 撤掉这次为「重新下载」补的临时登记，记录留着——文件放回原处之后
+                    // 别的设备来要时还能重新上传（界面照实说「现在取不回来」）。
+                    if db::state_get(tx, crate::db::scope::BLOB_GONE, &wanted)?.is_some() {
+                        db::blob_delete(tx, &wanted)?;
+                        return Ok(None);
+                    }
                     let Some(device) = sync_db::device_id(tx)? else {
                         return Ok(None);
                     };

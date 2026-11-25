@@ -1245,7 +1245,9 @@ export const api = {
   skillConfigWrite: (path: string, content: string) =>
     invoke<void>("skill_config_write", { path, content }),
 
-  mediaBase64: (path: string) => invoke<MediaPayload>("media_base64", { path }),
+  /** 原图（放大看）。`chatId`/`blob` 给定时先按对象核对，读到的才是核对过的那个版本。 */
+  mediaBase64: (path: string, chatId?: string, blob?: string) =>
+    invoke<MediaPayload>("media_base64", { path, chatId, blob }),
 
   /** 媒体的屏幕级预览图（大图缩到长边 1440 缓存于 media/cache/preview）。
    *  卡片与查看器 1x 显示都用它，避免前端解码 12MP 原图。 */
@@ -1266,10 +1268,12 @@ export const api = {
 
   /** 会话媒体保存到本地：图片/视频/音频进相册（桌面 Pictures/RClaw），
    *  文档进下载目录（安卓 MediaStore.Downloads / 桌面「下载/RClaw」）。 */
-  saveMedia: (path: string) => invoke<string>("save_media", { path }),
+  saveMedia: (path: string, chatId?: string, blob?: string) =>
+    invoke<string>("save_media", { path, chatId, blob }),
 
   /** 转发工作区媒体到其它应用（安卓系统分享面板：微信/QQ 等）。 */
-  shareMedia: (path: string) => invoke<void>("share_media", { path }),
+  shareMedia: (path: string, chatId?: string, blob?: string) =>
+    invoke<void>("share_media", { path, chatId, blob }),
 
   /** 把纯文本分享到其它应用（安卓 ACTION_SEND：微信/QQ 收为聊天文字）。 */
   shareText: (title: string, text: string) =>

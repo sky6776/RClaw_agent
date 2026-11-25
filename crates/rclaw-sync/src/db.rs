@@ -659,6 +659,12 @@ pub fn blob_register(
     )?)
 }
 
+/// 删掉一个对象的登记（`gone` 记录另存，不在这里）。
+pub fn blob_delete(conn: &Connection, blob_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM sync_blob WHERE blob_id = ?1", params![blob_id])?;
+    Ok(())
+}
+
 pub fn blob_set_state(conn: &Connection, blob_id: &str, state: i64) -> Result<()> {
     conn.execute(
         "UPDATE sync_blob SET state = ?2 WHERE blob_id = ?1",
