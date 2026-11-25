@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { clearAttachmentChanged } from "./SyncAttachments";
 import { useBackClose } from "../lib/backNav";
 
 /** 全屏图片查看器（WebView83 无手势库，touch 自算）：
@@ -230,6 +231,8 @@ export default function ImageViewer({
         return dataUrlToBlob(dataUrl).then((b) => ({ b, dataUrl }));
       })
       .then(({ b, dataUrl }) => {
+        // 原图读成功（按对象核对过）：这条之前「对不上」的覆盖撤掉。
+        if (blob) clearAttachmentChanged({ path, blob });
         // Worker 不可用（如 CSP 拦 blob:）时拿 data URL 直挂原图：慢一点
         // （setAttribute 阻塞主线程）但「查看原图」不至于整个失败。
         const u = b ? URL.createObjectURL(b) : dataUrl;

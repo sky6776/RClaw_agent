@@ -1221,9 +1221,11 @@ pub fn on_blob_want_at(
             // 必须核对内容再算「放回原处」：原地那个文件可能已经被改写过，换成上传只会
             // 让上传端拒掉、连自动重取也一起没了。
             let restored = env.resolve_exact(&note.path).is_some_and(|path| {
-                keys.is_some_and(|keys| {
-                    crate::engine::file_is_blob(keys, &path, blob_id, note.size)
-                })
+                // 路径中间的链接也不能跟：工作区外的同名内容不能当成「放回原处」。
+                env.check_path(&note.path, &path).is_ok()
+                    && keys.is_some_and(|keys| {
+                        crate::engine::file_is_blob(keys, &path, blob_id, note.size)
+                    })
             });
             if restored {
                 if let Some(row) = db::blob_get(conn, blob_id)? {

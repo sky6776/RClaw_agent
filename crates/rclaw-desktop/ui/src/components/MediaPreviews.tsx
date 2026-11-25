@@ -355,6 +355,7 @@ export default function MediaPreviews({
         // 海报帧用摘要缓存的结论核对（不整读整个视频）；点播时再直读核对一次。
         .mediaStreamUrl(item.path, chatId, blob, false)
         .then((url) => {
+          if (!mountedRef.current || chatRef.current !== chatId) return;
           if (blob) clearAttachmentChanged({ path: item.path, blob });
           setVideoUrls((prev) => ({ ...prev, [itemKey]: url }));
         })
@@ -393,6 +394,7 @@ export default function MediaPreviews({
         // 12MP 原图（9MB base64 + 全图解码是真机点开图片慢的源头）。
         .mediaPreview(item.path, chatId, blob)
         .then((r) => {
+          if (!mountedRef.current || chatRef.current !== chatId) return;
           // 读成功（内容核对通过）：这条之前「对不上」的覆盖撤掉（修好之后能回到内联）。
           if (blob) clearAttachmentChanged({ path: item.path, blob });
           setUrls((prev) => ({ ...prev, [itemKey]: `data:${r.mime};base64,${r.base64}` }));

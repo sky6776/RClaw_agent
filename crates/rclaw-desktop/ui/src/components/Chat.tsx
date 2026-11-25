@@ -1062,6 +1062,9 @@ export default function Chat({
     armTouchWatchdog();
   };
   const handleListTouchMove = (e: React.TouchEvent) => {
+    // 双指（会话文字缩放）：捏合的移动不参与列表的拖动/贴底判定（免得缩放顺带
+    // 关掉贴底、弹出「回到最新」）。
+    if (e.touches.length > 1) return;
     const st = touchStateRef.current;
     if (!st.active || st.zombie) {
       // 两种「无主手指」都会继续来 move：看门狗把仍按住的手指误清了（静止

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useSwipeNav } from "../lib/swipeNav";
 import {
+  clearAttachmentChanged,
   isAttachmentChangedError,
   markAttachmentChanged,
   refreshSyncAttachments,
@@ -96,7 +97,9 @@ export default function MediaGallery({
       api
         .mediaStreamUrl(item.path, chatId, item.blob, true)
         .then((u) => {
-          if (alive) setVideoUrl(u);
+          if (!alive) return;
+          if (item.blob) clearAttachmentChanged({ path: item.path, blob: item.blob });
+          setVideoUrl(u);
         })
         .catch((e) => {
           if (!alive) return;
@@ -116,7 +119,9 @@ export default function MediaGallery({
       api
         .mediaPreview(item.path, chatId, item.blob)
         .then((r) => {
-          if (alive) setImgSrc(`data:${r.mime};base64,${r.base64}`);
+          if (!alive) return;
+          if (item.blob) clearAttachmentChanged({ path: item.path, blob: item.blob });
+          setImgSrc(`data:${r.mime};base64,${r.base64}`);
         })
         .catch((e) => {
           if (!alive) return;

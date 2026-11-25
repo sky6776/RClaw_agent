@@ -6518,6 +6518,11 @@ pub async fn media_stream_url(
     // 点播时「核不了」（没有登记/密钥、登记在别的设备上）：按老行为不钉版本放行，
     // 与其他读取入口的「核不了按老行为」一致；画廊里不会因此永远放不出来。
     let mut playback_unverifiable = false;
+    // 清单给了对象名、却没有能核对的环境（没有同步引擎/会话上下文）：同样按老行为
+    // 放行（海报仍然拒绝未核对的帧）。
+    if playback && blob.is_some() && (chat_id.is_none() || state.sync().is_none()) {
+        playback_unverifiable = true;
+    }
     // 点播：把核对过的内容复制成暂存副本，流从这份副本出——播放期间原路径被改写也
     // 影响不到已经在播的这一份（副本就是边复制边核对过的字节）。
     if playback {

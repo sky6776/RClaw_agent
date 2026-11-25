@@ -105,10 +105,7 @@ export function markAttachmentChanged(item: { path: string; blob: string }) {
   changedKeys.add(key);
   // 清单数组换一个身份：订阅者（消息里的媒体卡、画廊）重算一遍可读性。
   all = [...all];
-  setCards((prev) => ({
-    ...prev,
-    saveErrors: { ...prev.saveErrors, [key]: CHANGED_CARD_NOTE },
-  }));
+  cards = { ...cards, saveErrors: { ...cards.saveErrors, [key]: CHANGED_CARD_NOTE } };
   emit();
 }
 
@@ -117,7 +114,7 @@ export function clearAttachmentChanged(item: { path: string; blob: string }) {
   const key = `${item.blob}:${item.path}`;
   if (!changedKeys.delete(key)) return;
   all = [...all];
-  setCards((prev) => ({ ...prev, saveErrors: without(prev.saveErrors, key) }));
+  cards = { ...cards, saveErrors: without(cards.saveErrors, key) };
   emit();
 }
 
@@ -127,11 +124,9 @@ function clearChanged(blob: string) {
   if (cleared.length === 0) return;
   for (const key of cleared) changedKeys.delete(key);
   all = [...all];
-  setCards((prev) => {
-    let saveErrors = prev.saveErrors;
-    for (const key of cleared) saveErrors = without(saveErrors, key);
-    return saveErrors === prev.saveErrors ? prev : { ...prev, saveErrors };
-  });
+  let saveErrors = cards.saveErrors;
+  for (const key of cleared) saveErrors = without(saveErrors, key);
+  cards = { ...cards, saveErrors };
   emit();
 }
 
@@ -432,8 +427,9 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     // 判定失败）。
     const retry = () => {
       loadFails = 0;
-      // 预算外的条目也要重新轮一遍（一直核不完的看几次就停，用户点了重试就再来一轮）。
+      // 预算外的条目 / 补落点也要重新轮一遍（都是「看几次就停」，用户点了重试就再来一轮）。
       uncheckedTries = 0;
+      aliasTries.clear();
       schedule();
     };
     reload = retry;
@@ -634,7 +630,9 @@ export function AttachmentCard({
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
     api
       .syncOpenAttachment(chatId, item.blob, path)
-      .then(() => clearAttachmentChanged(item))
+      // 打开成功只说明**打开的这个落点**是对的：按它清覆盖（别把消息路径上的标记
+      // 也清了，那条可能仍然对不上）。
+      .then(() => clearAttachmentChanged({ path, blob: item.blob }))
       .catch((e) => {
         onError(`打开文件失败: ${String(e)}`);
         // 核对没过（文件被改写/删掉）：这次保存的落点不能再「打开」，收回去让用户
@@ -652,8 +650,11 @@ export function AttachmentCard({
   if (item.state === "local") {
     // 同一份内容被两条消息引用成不同的路径：登记只落到其中一条上，另一条消息的路径
     // 上没有它。给个入口把内容存过去（后端按核对过的字节复制，不覆盖已有不同文件）。
-    const elsewhere = item.rel_path !== undefined && item.rel_path !== item.path;
+    // 工具结果（artifact）在消息里只有一个文件名，没有「这条消息的路径」可存，不算。
+    const elsewhere =
+      item.kind === "file" && item.rel_path !== undefined && item.rel_path !== item.path;
     const saving = Boolean(state.saving[fileKey(item)]);
+    const savedTo = state.saved[fileKey(item)];
     return (
       <div>
         <div className={CARD}>
@@ -662,9 +663,10 @@ export function AttachmentCard({
             <span className={CARD_NAME}>{shown}</span>
             <span className={CARD_NOTE}>
               {formatBytes(item.size)} · 已下载到 {item.rel_path ?? item.path}
+              {savedTo ? ` · 已存到 ${savedTo}` : ""}
             </span>
           </span>
-          {elsewhere && (
+          {elsewhere && !savedTo && (
             <button
               onClick={() => save(chatId, item)}
               disabled={inactive || saving}

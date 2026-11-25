@@ -247,9 +247,12 @@ fn handle_conn(mut socket: std::net::TcpStream) {
     };
     // 先打开文件，长度与版本都取自「就要发送的这个句柄」：检查和发送不能是两个不同的
     // 文件（期间被原子替换的话，头发的是旧版本、身体是新的）。
-    // 无版本针的流（点播用的暂存副本）带上写权限打开：下面要刷新 mtime，Windows 上
-    // SetFileTime 需要写属性权限（失败就退回只读打开，只是不能被回收保护）。
-    let opened = if version.is_none() {
+    // 只有点播用的暂存副本（`media/cache/stream/…`）才刷新 mtime：工作区原文件
+    // （普通本机视频、核不了时的回落）不能因为播放/出海报被改写时间戳。
+    let staged = version.is_none() && path.starts_with("media/cache/stream/");
+    // 暂存副本带上写权限打开：下面要刷新 mtime，Windows 上 SetFileTime 需要写属性
+    // 权限（失败就退回只读打开，只是不能被回收保护）。
+    let opened = if staged {
         std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -286,7 +289,7 @@ fn handle_conn(mut socket: std::net::TcpStream) {
     // 没有版本针的流（点播用的暂存副本）每读一段刷新一下 mtime：正在播放的副本因此
     // 不会被暂存目录的定期回收删掉（后续 Range 请求不会 404）。有版本针的（海报/工作区
     // 原文件）不动——改时间戳会破坏钉住的版本。
-    if version.is_none() {
+    if staged {
         let _ = file.set_modified(std::time::SystemTime::now());
     }
     let total = meta.len();
