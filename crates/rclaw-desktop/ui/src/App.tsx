@@ -172,7 +172,7 @@ const THEMES: Array<{
 // 会话文字大小（百分比）：界面偏好，存 localStorage。桌面 Ctrl+滚轮、安卓在会话里
 // 双指捏合也能改（手势在 Chat 里处理，夹取与持久化在这里统一做）。
 const CHAT_FONT_KEY = "rclaw_chat_font";
-const CHAT_FONT_MIN = 80;
+const CHAT_FONT_MIN = 50;
 const CHAT_FONT_MAX = 220;
 const CHAT_FONT_DEFAULT = 100;
 
