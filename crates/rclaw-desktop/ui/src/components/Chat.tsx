@@ -77,6 +77,10 @@ interface Props {
   onCapture?: (kind: "photo" | "video" | "audio") => void;
   /** 消息选择「发送到会话」：把打包文本交 App 弹目标会话选择器（并入草稿）。 */
   onForwardToChat?: (text: string) => void;
+  /** 会话文字大小（百分比，100 = 默认）：消息正文按它缩放；桌面 Ctrl+滚轮 / 安卓
+   *  双指捏合改它（由 App 持有并持久化）。 */
+  fontScale: number;
+  onFontScale: (next: number) => void;
   /** 当前会话 id：变化时重置滚动跟随并直达新会话底部（Chat 不随会话重挂载）。 */
   sessionKey: string;
   /** 从该消息锚点分叉出新会话（复制可见历史 + 自动回滚之后的文件改动，原会话不动）。 */
@@ -194,7 +198,7 @@ const AssistantMarkdown = React.memo(function AssistantMarkdown({
 }) {
   return (
     <div
-      className={`md-body w-full text-sm text-gray-200 max-md:text-[15px] max-md:leading-relaxed ${
+      className={`chat-text md-body w-full text-sm text-gray-200 max-md:text-[15px] max-md:leading-relaxed ${
         selected ? "rounded-md ring-2 ring-indigo-400" : ""
       } ${selectable ? "text-selectable" : ""}`}
     >
@@ -654,9 +658,65 @@ export default function Chat({
   queue,
   onQueueEnqueue,
   onQueueRemove,
+  fontScale,
+  onFontScale,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // 会话文字大小：桌面 Ctrl+滚轮、安卓双指捏合。监听走原生 addEventListener——
+  // React 的 wheel/touchmove 在根上是 passive 的，preventDefault 不生效（浏览器会
+  // 自己缩放页面/回弹）。
+  const fontRef = useRef(fontScale);
+  fontRef.current = fontScale;
+  const fontScaleRef = useRef(onFontScale);
+  fontScaleRef.current = onFontScale;
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      fontScaleRef.current(fontRef.current + (e.deltaY < 0 ? 5 : -5));
+    };
+    let pinch: { distance: number; scale: number } | null = null;
+    const distance = (touches: TouchList) =>
+      Math.hypot(
+        touches[0].clientX - touches[1].clientX,
+        touches[0].clientY - touches[1].clientY,
+      );
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 2) return;
+      // 两指落下：取消消息气泡的长按菜单（否则捏合结束可能顺带弹出菜单）。
+      pressGuardRef.current?.cancel();
+      pinch = { distance: Math.max(1, distance(e.touches)), scale: fontRef.current };
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (!pinch) return;
+      if (e.touches.length !== 2) {
+        pinch = null;
+        return;
+      }
+      e.preventDefault();
+      const ratio = distance(e.touches) / pinch.distance;
+      // 按 5% 吸附，避免手指抖动导致字号连续闪动。
+      fontScaleRef.current(Math.round((pinch.scale * ratio) / 5) * 5);
+    };
+    const onTouchEnd = () => {
+      pinch = null;
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: false });
+    el.addEventListener("touchend", onTouchEnd);
+    el.addEventListener("touchcancel", onTouchEnd);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("touchend", onTouchEnd);
+      el.removeEventListener("touchcancel", onTouchEnd);
+    };
+  }, []);
   // 上传附件（已写入工作区）与上传中标志；附件随消息发送后清空。
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   // 这个会话的附件清单（多端同步）：画廊与消息里的媒体卡用同一份，判断哪些路径在这台
@@ -1867,7 +1927,7 @@ export default function Chat({
                     助手消息分不开（同色同号、右对齐在满宽时消失），底色随换行块
                     延伸始终可见；浅色主题由 index.css 对 bg-[#1a1f29] 的定向覆盖接管。 */}
                 <div
-                  className={`whitespace-pre-wrap rounded-lg bg-[#1a1f29] px-4 py-2 text-sm text-gray-200 [overflow-wrap:anywhere] max-md:px-3.5 max-md:text-[15px] max-md:leading-relaxed ${
+                  className={`chat-text whitespace-pre-wrap rounded-lg bg-[#1a1f29] px-4 py-2 text-sm text-gray-200 [overflow-wrap:anywhere] max-md:px-3.5 max-md:text-[15px] max-md:leading-relaxed ${
                     selectIds && selected ? "ring-2 ring-indigo-300" : ""
                   } ${textSelectId === e.id ? "text-selectable" : ""}`}
                 >
@@ -2252,6 +2312,7 @@ export default function Chat({
           onTouchEndCapture={handleListTouchFinish}
           onTouchCancelCapture={handleListTouchFinish}
           onWheel={handleListWheel}
+          style={{ ["--chat-font-scale" as string]: String(fontScale / 100) }}
           className={`chat-msg-list flex-1 space-y-3 overflow-y-auto py-4 max-md:space-y-2.5 max-md:px-3 max-md:py-3 ${
             railVisible ? "pl-14 pr-6" : "px-6"
           }`}

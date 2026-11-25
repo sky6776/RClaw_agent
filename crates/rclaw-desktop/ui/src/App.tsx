@@ -169,6 +169,23 @@ const THEMES: Array<{
   { id: "cream", name: "奶油暖阳", base: "light", desc: "暖阳奶油", swatch: ["#faf3e6", "#fffaf0"] },
 ];
 
+// 会话文字大小（百分比）：界面偏好，存 localStorage。桌面 Ctrl+滚轮、安卓在会话里
+// 双指捏合也能改（手势在 Chat 里处理，夹取与持久化在这里统一做）。
+const CHAT_FONT_KEY = "rclaw_chat_font";
+const CHAT_FONT_MIN = 80;
+const CHAT_FONT_MAX = 220;
+const CHAT_FONT_DEFAULT = 100;
+
+function clampChatFont(value: number): number {
+  if (!Number.isFinite(value)) return CHAT_FONT_DEFAULT;
+  return Math.min(CHAT_FONT_MAX, Math.max(CHAT_FONT_MIN, Math.round(value)));
+}
+
+function readStoredChatFont(): number {
+  const raw = localStorage.getItem(CHAT_FONT_KEY);
+  return raw === null ? CHAT_FONT_DEFAULT : clampChatFont(Number.parseInt(raw, 10));
+}
+
 const THEME_IDS: ThemeId[] = THEMES.map((t) => t.id);
 
 /** 会话右键菜单项统一样式。 */
@@ -416,6 +433,14 @@ ${event.payload.command}
     setThemePickerOpen(false);
   }, []);
   const [themePickerOpen, setThemePickerOpen] = useState(false);
+  const [chatFont, setChatFont] = useState(readStoredChatFont);
+  const applyChatFont = useCallback((next: number) => {
+    setChatFont((prev) => {
+      const clamped = clampChatFont(next);
+      if (clamped !== prev) localStorage.setItem(CHAT_FONT_KEY, String(clamped));
+      return clamped;
+    });
+  }, []);
   const toggleTheme = useCallback(() => {
     setThemePickerOpen((v) => !v);
   }, []);
@@ -2672,6 +2697,8 @@ ${event.payload.command}
                   onCapture={isMobile ? handleCaptureAction : undefined}
                   onForwardToChat={forwardToChat}
                   sessionKey={activeId}
+                  fontScale={chatFont}
+                  onFontScale={applyChatFont}
                   onFork={handleFork}
                   plans={plans}
                   onPlanPause={handlePlanPause}
@@ -3331,6 +3358,39 @@ ${event.payload.command}
                   <span className="block text-[10px] text-gray-500">{t.desc}</span>
                 </button>
               ))}
+            </div>
+            <div className="mt-3 border-t border-[#2a2f3a] pt-2.5">
+              <h2 className="mb-1.5 text-sm font-semibold text-gray-100">会话文字大小</h2>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => applyChatFont(chatFont - 5)}
+                  disabled={chatFont <= CHAT_FONT_MIN}
+                  className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 disabled:opacity-40"
+                  aria-label="缩小文字"
+                >
+                  A−
+                </button>
+                <span className="min-w-0 flex-1 text-center text-xs tabular-nums text-gray-300">
+                  {chatFont}%
+                </span>
+                <button
+                  onClick={() => applyChatFont(chatFont + 5)}
+                  disabled={chatFont >= CHAT_FONT_MAX}
+                  className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 disabled:opacity-40"
+                  aria-label="放大文字"
+                >
+                  A+
+                </button>
+                <button
+                  onClick={() => applyChatFont(CHAT_FONT_DEFAULT)}
+                  className="rounded-lg border border-[#2a2f3a] px-2 py-1 text-[11px] text-gray-400 transition hover:border-indigo-500/50 hover:text-indigo-300"
+                >
+                  重置
+                </button>
+              </div>
+              <p className="mt-1.5 text-[10px] leading-relaxed text-gray-500">
+                桌面上还可以 Ctrl + 鼠标滚轮；手机在会话里双指捏合。只影响消息文字，不动图片/视频。
+              </p>
             </div>
           </div>
         </div>

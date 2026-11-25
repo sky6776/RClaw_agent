@@ -564,3 +564,15 @@ html.theme-light #root {
 .theme-light.theme-cream .topbar-bg {
   background: #fffaf0;
 }
+
+/* ---- 会话文字大小：消息正文按 --chat-font-scale 缩放（图片/视频卡不缩放） ---- */
+.chat-msg-list .chat-text {
+  font-size: calc(0.875rem * var(--chat-font-scale, 1));
+  line-height: 1.65;
+}
+@media (max-width: 768px) {
+  .chat-msg-list .chat-text {
+    font-size: calc(0.9375rem * var(--chat-font-scale, 1));
+    line-height: 1.7;
+  }
+}
