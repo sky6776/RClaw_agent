@@ -4,7 +4,9 @@
 //! 都是阻塞调用：宿主从阻塞线程上调（桌面端的命令都包在 `spawn_blocking` 里）。
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rclaw_store::session::raw::SessionDeleteSync;
 use rclaw_store::sync_db::{self, INBOX_PENDING, INBOX_QUEUED, SEAL_LOCAL, SEAL_SEALED};
@@ -14,6 +16,7 @@ use serde::Serialize;
 
 use crate::attach::{self, now_ms, Backlog};
 use crate::config::{Scopes, SyncConfig, SCOPE_NAMES};
+use crate::crypto::{sha256_reader, Keys};
 use crate::db::{self, scope, BlobRow, BLOB_HELD, BLOB_PENDING, BLOB_REMOTE};
 use crate::error::{Result, SyncError};
 use crate::files::cron::{self, RemoteJob};
@@ -690,7 +693,12 @@ struct FoundRef {
     origin: Option<String>,
 }
 
-pub(crate) fn attachments(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<Vec<AttachmentInfo>> {
+pub(crate) fn attachments(
+    ctx: &Ctx,
+    keys: Option<&Keys>,
+    channel: &str,
+    chat_id: &str,
+) -> Result<Vec<AttachmentInfo>> {
     // 旧消息的附件索引可能只有一半（那时还没有 artifact 记录）：打开会话时把能准确
     // 重建的补上，否则清单里会缺掉那些工具结果。补不成不算错，清单照常给。
     if let Err(error) = crate::wire::backfill_artifact_refs(&ctx.env, channel, chat_id) {
@@ -797,11 +805,31 @@ pub(crate) fn attachments(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<Vec
                 },
                 None => ("missing", None, None),
             };
-            // 消息路径是不是本机真有这个文件：`local` 的落点可能是同一个对象的另一个
-            // 路径（别名还没补过来），`cached` 也可能用户已经把它存回过原位置。工具
-            // 结果（artifact）在消息里只有一个文件名，按状态算。
+            // 消息路径上这个文件是不是就是这条消息登记的那份内容：
+            // - 登记说这份内容就落在消息路径上（`state == local` 且 `rel_path` 就是它）：
+            //   取回时同名文件内容不同的会改落同步缓存（`attach::place`），所以落在这里
+            //   的就是登记的那一份，不必再整读一遍文件；
+            // - 别的落点（同步缓存、同一对象的另一个路径）上有这份内容、消息路径上另有
+            //   一个同名文件：核对长度与摘要，是同一个对象才算「本机真有」，否则打开的是
+            //   一个不相干的文件；
+            // - 登记已经回收：只能核对内容本身。
+            // 工具结果（artifact）在消息里只有一个文件名，按状态算。
             let path_present = if found.kind == "file" {
-                present(&found.path).is_some()
+                match present(&found.path) {
+                    None => false,
+                    Some(path) => {
+                        let same_size = std::fs::symlink_metadata(&path)
+                            .is_ok_and(|meta| meta.is_file() && meta.len() == found.size);
+                        let landed_here = found.row.is_some()
+                            && state == "local"
+                            && rel_path.as_deref() == Some(found.path.as_str());
+                        same_size
+                            && (landed_here
+                                || keys.is_some_and(|keys| {
+                                    same_blob(keys, Path::new(&path), &found.blob)
+                                }))
+                    }
+                }
             } else {
                 state == "local"
             };
@@ -819,6 +847,52 @@ pub(crate) fn attachments(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<Vec
             }
         })
         .collect())
+}
+
+/// 核对「消息路径上的文件就是登记的那个对象」时算过的摘要：按（路径、长度、
+/// mtime 纳秒）记住。打开会话、每次同步动静之后 [`attachments`] 都会被调用
+/// 一遍，同一个文件不重复整读；文件被改过（长度或 mtime 变了）就重算。
+static DIGEST_CACHE: Mutex<Vec<(String, u64, i128, [u8; 32])>> = Mutex::new(Vec::new());
+const DIGEST_CACHE_MAX: usize = 128;
+
+/// 文件内容的 SHA-256（未加密钥；对象名是它在空间密钥下的摘要）。读不了不算。
+fn path_digest(path: &Path) -> Option<[u8; 32]> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos() as i128)
+        .unwrap_or(0);
+    let key = path.to_string_lossy().into_owned();
+    if let Ok(cache) = DIGEST_CACHE.lock() {
+        if let Some((_, cached_size, cached_mtime, digest)) =
+            cache.iter().find(|(cached, ..)| *cached == key)
+        {
+            if *cached_size == size && *cached_mtime == mtime {
+                return Some(*digest);
+            }
+        }
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let (digest, _) = sha256_reader(&mut file).ok()?;
+    if let Ok(mut cache) = DIGEST_CACHE.lock() {
+        cache.retain(|(cached, ..)| *cached != key);
+        if cache.len() >= DIGEST_CACHE_MAX {
+            cache.remove(0);
+        }
+        cache.push((key, size, mtime, digest));
+    }
+    Some(digest)
+}
+
+/// `path` 上的文件是不是 `blob` 这个对象（调用方已经比对过长度，这里核对摘要）。
+fn same_blob(keys: &Keys, path: &Path, blob: &str) -> bool {
+    path_digest(path).is_some_and(|digest| keys.blob_id(&digest) == blob)
 }
 
 /// 一个会话最后 `tail` 条消息引用的、还在别的设备上的附件（打开会话、续聊之前补齐用）。
@@ -1115,9 +1189,13 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let got = attachments(ctx, "desktop", "c1").unwrap();
+        let got = attachments(ctx, None, "desktop", "c1").unwrap();
         let states: Vec<&str> = got.iter().map(|item| item.state).collect();
         assert_eq!(states, ["local", "cached", "remote"]);
+        // 消息路径上真有这份内容的只有第一个：cached 的那份在同步缓存里，消息写的
+        // 原位置（output/b.txt）本机没有；remote 的哪个位置都没有。
+        let at_path: Vec<bool> = got.iter().map(|item| item.path_present).collect();
+        assert_eq!(at_path, [true, false, false]);
         assert!(got[0].local_path.is_some() && got[2].local_path.is_none());
         assert!(got
             .iter()
@@ -1131,11 +1209,11 @@ mod tests {
         assert!(tail_remote_blobs(ctx, "desktop", "c1", 20, 4, start)
             .unwrap()
             .is_empty());
-        assert!(attachments(ctx, "desktop", "nope").unwrap().is_empty());
+        assert!(attachments(ctx, None, "desktop", "nope").unwrap().is_empty());
 
         // 去取过、同步空间里没有的：照它现在的情况说（§8.7）。
         let (hour, day) = (3600 * 1000, 24 * 3600 * 1000);
-        let remote = || attachments(ctx, "desktop", "c1").unwrap()[2].state;
+        let remote = || attachments(ctx, None, "desktop", "c1").unwrap()[2].state;
         let tail = |at: i64| tail_remote_blobs(ctx, "desktop", "c1", 20, 5, at).unwrap();
         let me = device.settings.device.clone();
         let missing = |at: i64| {

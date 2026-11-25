@@ -172,27 +172,34 @@ function download(blob: string) {
   api.syncFetchAttachment(blob).catch((e) => settle(blob, String(e)));
 }
 
-/** 把同步缓存里的一份文件快照存进工作区。 */
-function save(chatId: string, blob: string) {
-  if (cards.saving[blob]) return;
+/** 把同步缓存里的一份文件快照存进工作区（存到这条消息写的那个路径上）。
+ *
+ *  同一份内容可能被几条消息引用到不同的路径：按对象 + 目标路径记状态、也按它发请求，
+ *  否则从 `b.pdf` 那张卡存下去，后端会拿清单里第一条缓存记录写到 `a.pdf`。 */
+function save(chatId: string, item: SyncAttachment) {
+  const key = fileKey(item);
+  if (cards.saving[key]) return;
   setCards((prev) => ({
     ...prev,
-    saving: { ...prev.saving, [blob]: true },
-    errors: without(prev.errors, blob),
+    saving: { ...prev.saving, [key]: true },
+    errors: without(prev.errors, item.blob),
   }));
   api
-    .syncAttachmentSave(chatId, blob)
+    .syncAttachmentSave(chatId, item.blob, item.path)
     .then((rel) => {
       if (chat !== chatId) return;
-      setCards((prev) => ({ ...prev, saved: { ...prev.saved, [blob]: rel } }));
+      setCards((prev) => ({ ...prev, saved: { ...prev.saved, [key]: rel } }));
+      // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
+      // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。
+      reload?.();
     })
     .catch((e) => {
       if (chat !== chatId) return;
-      setCards((prev) => ({ ...prev, errors: { ...prev.errors, [blob]: String(e) } }));
+      setCards((prev) => ({ ...prev, errors: { ...prev.errors, [item.blob]: String(e) } }));
     })
     .finally(() => {
       setCards((prev) =>
-        prev.saving[blob] ? { ...prev, saving: without(prev.saving, blob) } : prev,
+        prev.saving[key] ? { ...prev, saving: without(prev.saving, key) } : prev,
       );
     });
 }
@@ -371,8 +378,8 @@ export function AttachmentCard({
   }
 
   if (item.state === "cached") {
-    const savedTo = state.saved[item.blob];
-    const saving = Boolean(state.saving[item.blob]);
+    const savedTo = state.saved[fileKey(item)];
+    const saving = Boolean(state.saving[fileKey(item)]);
     return (
       <div>
         {isImage && <SnapshotImage chatId={chatId} blob={item.blob} alt={shown} />}
@@ -394,7 +401,7 @@ export function AttachmentCard({
             </button>
           ) : (
             <button
-              onClick={() => save(chatId, item.blob)}
+              onClick={() => save(chatId, item)}
               disabled={inactive || saving}
               className={CARD_BTN}
             >
@@ -442,16 +449,31 @@ export function AttachmentCard({
 }
 
 /** 已生成的快照预览（对象名 → data URL）。对象名是内容摘要：同一份内容在多条消息
- *  里出现只经一次 IPC；打开一个同步来的会话，缓存里的图往往不只一张。 */
+ *  里出现只经一次 IPC；打开一个同步来的会话，缓存里的图往往不只一张。
+ *
+ *  按字节数限额：GIF 与不超上限的小图是原样返回的（最大 25 MB）再转 base64，按条数
+ *  限几十条就能留住上 GB；超过总预算时先丢最早的，单张超过上限的不记（这张卡自己
+ *  照样显示，只是离开会话再回来要重取）。 */
 const snapshotPreviews = new Map<string, string>();
-const SNAPSHOT_PREVIEWS_MAX = 32;
+let snapshotPreviewBytes = 0;
+const SNAPSHOT_PREVIEWS_BUDGET = 8 * 1024 * 1024;
+const SNAPSHOT_PREVIEW_ONE = 2 * 1024 * 1024;
+/** 正在取的（同一对象多张卡一起进视口时只发一次 IPC，失败后不留在表里）。 */
+const snapshotPending = new Map<string, Promise<string>>();
 
 function rememberSnapshot(blob: string, src: string) {
-  if (snapshotPreviews.size >= SNAPSHOT_PREVIEWS_MAX) {
+  if (src.length > SNAPSHOT_PREVIEW_ONE || snapshotPreviews.has(blob)) return;
+  while (
+    snapshotPreviews.size > 0 &&
+    snapshotPreviewBytes + src.length > SNAPSHOT_PREVIEWS_BUDGET
+  ) {
     const oldest = snapshotPreviews.keys().next().value;
-    if (oldest !== undefined) snapshotPreviews.delete(oldest);
+    if (oldest === undefined) break;
+    snapshotPreviewBytes -= snapshotPreviews.get(oldest)?.length ?? 0;
+    snapshotPreviews.delete(oldest);
   }
   snapshotPreviews.set(blob, src);
+  snapshotPreviewBytes += src.length;
 }
 
 /** 同步缓存里一张图片快照的预览。出不了预览图就不显示，下面的卡片还在。
@@ -466,13 +488,30 @@ function SnapshotImage({ chatId, blob, alt }: { chatId: string; blob: string; al
     if (src) return;
     let alive = true;
     const load = () => {
-      api
-        .syncAttachmentPreview(chatId, blob)
-        .then((r) => {
-          if (!alive) return;
+      // 别的卡可能已经取到了（或者正在取）：直接用，不再发一遍。
+      const known = snapshotPreviews.get(blob);
+      if (known) {
+        setSrc(known);
+        return;
+      }
+      let request = snapshotPending.get(blob);
+      if (!request) {
+        const started = api.syncAttachmentPreview(chatId, blob).then((r) => {
           const url = `data:${r.mime};base64,${r.base64}`;
           rememberSnapshot(blob, url);
-          setSrc(url);
+          return url;
+        });
+        request = started;
+        snapshotPending.set(blob, started);
+        void started
+          .catch(() => {})
+          .then(() => {
+            if (snapshotPending.get(blob) === started) snapshotPending.delete(blob);
+          });
+      }
+      void request
+        .then((url) => {
+          if (alive) setSrc(url);
         })
         .catch(() => {});
     };

@@ -812,11 +812,16 @@ pub async fn sync_fetch_attachment(state: State<'_, AppState>, blob: String) -> 
 
 /// 在会话的附件清单里找到 `blob` 对应的那份文件快照，返回清单项与它在同步缓存里的真实
 /// 路径。路径从引擎的登记里来，不信界面传的；再核对一遍它确实落在同步缓存目录里。
+///
+/// `path` 给定时只认消息里写的正是这个路径的那一条：同一份内容可能被两条消息引用到
+/// 两个不同的路径（`output/a.pdf` 与 `output/b.pdf`），「存进工作区」要存到用户点的那
+/// 张卡对应的路径上，不能拿清单里第一条缓存记录去顶。
 fn cached_snapshot(
     engine: &SyncEngine,
     home: &Path,
     chat_id: &str,
     blob: &str,
+    path: Option<&str>,
 ) -> Result<(AttachmentInfo, PathBuf), String> {
     let info = engine
         .attachments(CHANNEL_DESKTOP, chat_id)
@@ -830,6 +835,7 @@ fn cached_snapshot(
             item.blob == blob
                 && (item.kind == "file" || item.kind == "artifact")
                 && item.state == "cached"
+                && path.is_none_or(|want| item.path == want)
         })
         .ok_or_else(|| {
             "这个附件不在本机的同步缓存里（可能还没有下载，或者已经被清理）".to_string()
@@ -872,7 +878,7 @@ pub async fn sync_attachment_preview(
     let engine = handle(&state)?;
     let home = state.home.clone();
     run_blocking("生成预览", move || {
-        let (info, full) = cached_snapshot(&engine, &home, &chat_id, &blob)?;
+        let (info, full) = cached_snapshot(&engine, &home, &chat_id, &blob, None)?;
         let extension = info
             .path
             .rsplit('.')
@@ -893,12 +899,16 @@ pub async fn sync_attachment_save(
     state: State<'_, AppState>,
     chat_id: String,
     blob: String,
+    path: String,
 ) -> Result<String, String> {
     check_chat_id(&chat_id)?;
+    if path.trim().is_empty() {
+        return Err("没有指定要存到哪个路径".into());
+    }
     let engine = handle(&state)?;
     let home = state.home.clone();
     run_blocking("存进工作区", move || {
-        let (info, full) = cached_snapshot(&engine, &home, &chat_id, &blob)?;
+        let (info, full) = cached_snapshot(&engine, &home, &chat_id, &blob, Some(&path))?;
         // 工具结果（artifact）在消息里只有一个文件名，没有 uploads/ 这类前缀：导出到
         // 专用的 output/ 路径（工作区只认 uploads/、media/、output/ 之下的落点）。
         let target = if info.kind == "artifact" {

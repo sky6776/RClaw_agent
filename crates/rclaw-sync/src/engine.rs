@@ -969,8 +969,15 @@ impl SyncEngine {
     }
 
     /// 一个会话里各条消息引用的附件在本机的情况（§8.7）。
+    ///
+    /// 清单要能回答「消息里写的那个路径本机是不是真有这份内容」：落点不是消息路径的
+    /// （同步缓存里的副本、同一对象的另一个路径），要核对内容摘要，所以这里取出空间
+    /// 密钥。没配对、读不出密钥时按「验不了」处理（那种文件不算本机有）。
     pub fn attachments(&self, channel: &str, chat_id: &str) -> Result<Vec<AttachmentInfo>> {
-        local::attachments(&self.inner.ctx, channel, chat_id)
+        let keys = Secrets::load(&self.inner.ctx.paths)
+            .ok()
+            .and_then(|secrets| secrets.keys().ok());
+        local::attachments(&self.inner.ctx, keys.as_ref(), channel, chat_id)
     }
 
     /// 本机缓存的一份附件现在还是不是它登记的那个对象。打开缓存副本的入口用它拦下被

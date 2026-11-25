@@ -202,22 +202,25 @@ export default function MediaPreviews({
   const awayPaths = useMemo(() => new Set(away.keys()), [away]);
   // 文本解析没认出来、但这条消息确实登记了的附件（`attach::extract_refs` 认正文里
   // 裸写的 `output/report.pdf`，媒体卡的正则只认带反引号的文档）：补一张卡，否则
-  // 用户在这台设备上没有取回入口。
+  // 用户在这台设备上没有取回入口。补齐按「这条消息登记的全部附件」算——只按缺卡的
+  // 补的话，下载完成、文件落回原位置之后这张卡会凭空消失，而不是变成「点开」。
   const shown = useMemo(() => {
-    if (away.size === 0) return items;
+    if (mine.size === 0) return items;
     const seen = new Set(items.map((item) => item.path));
     const extra: PreviewItem[] = [];
-    for (const path of away.keys()) {
+    for (const path of mine.keys()) {
       if (seen.has(path)) continue;
       seen.add(path);
       extra.push({ key: path, path, display: path.split("/").pop() || path, kind: "open" });
     }
     return extra.length === 0 ? items : [...items, ...extra];
-  }, [items, away]);
+  }, [items, mine]);
 
   // 视频卡：拉本地流式 URL（含首帧由 <video preload=metadata> 显示）。
   useEffect(() => {
     for (const item of shown) {
+      // 清单还没回来：这时按工作区路径取视频可能取到同名但不是这条消息引用的文件。
+      if (!ready) break;
       if (awayPaths.has(item.path)) {
         // 清单比首屏晚到时，预览可能已经按本机路径试过一遍（文件不在，记成失败）。
         // 允许重新取：下载完成、清单刷新后这张卡要能自己换回视频/图片。
@@ -233,11 +236,13 @@ export default function MediaPreviews({
         .then((url) => setVideoUrls((prev) => ({ ...prev, [item.key]: url })))
         .catch(() => setVideoUrls((prev) => ({ ...prev, [item.key]: "" })));
     }
-  }, [shown, awayPaths]);
+  }, [shown, awayPaths, ready]);
 
   useEffect(() => {
     for (const item of shown) {
       if (item.kind !== "image") continue; // 视频/文档不预载：点卡片经系统应用打开
+      // 清单还没回来：先不按工作区路径取图（可能是同名却不是这条消息引用的那份）。
+      if (!ready) break;
       if (awayPaths.has(item.path)) {
         // 不在这台设备上：附件卡自己出预览。首屏清单还没到时可能已按本机路径试过
         // 一次并记成失败，这里把去重记下，取回之后要能重新出图。
@@ -256,7 +261,7 @@ export default function MediaPreviews({
         .catch(() => setUrls((prev) => ({ ...prev, [item.key]: "" })));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shown, awayPaths]);
+  }, [shown, awayPaths, ready]);
 
   // ---- 长按 / 右键上抛（菜单在 Chat 层统一渲染） ----
 
