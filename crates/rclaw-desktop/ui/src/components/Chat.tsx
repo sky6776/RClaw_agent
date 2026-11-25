@@ -14,9 +14,10 @@ import type { ToolCallView } from "../lib/toolCalls";
 import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
-import MediaPreviews, { parseMediaItems } from "./MediaPreviews";
+import MediaPreviews, { mentionsPath, parseMediaItems } from "./MediaPreviews";
 import {
   awayAttachments,
+  refreshSyncAttachments,
   useChatAttachments,
   useChatAttachmentsReady,
 } from "./SyncAttachments";
@@ -661,6 +662,14 @@ export default function Chat({
   // 设备上真有这份内容（同名的别的文件不算）。
   const syncedAttachments = useChatAttachments(sessionKey);
   const syncedReady = useChatAttachmentsReady(sessionKey);
+  // 一轮对话结束：工具可能就地改写过会话里引用的文件，附件清单（含内容核对）要重取
+  // 一遍，否则消息里的图片/卡片会一直按改写前的判断显示。
+  const lastBusy = useRef<{ chat: string; busy: boolean }>({ chat: sessionKey, busy });
+  useEffect(() => {
+    const last = lastBusy.current;
+    if (last.chat === sessionKey && last.busy && !busy) refreshSyncAttachments();
+    lastBusy.current = { chat: sessionKey, busy };
+  }, [busy, sessionKey]);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   // 输入历史（当前会话已发送的用户消息，按发送序）：↑↓ 遍历回填到输入框。
@@ -1557,7 +1566,7 @@ export default function Chat({
         if (!item.path_present || seen.has(item.path)) continue;
         // 附件清单是从整行数据里抽的：工具参数、思考里提到的文件也在里面，只有正文
         // 里真的写到的才进时间线（与 MediaPreviews 的补卡同一口径）。
-        if (!e.content.includes(item.path)) continue;
+        if (!mentionsPath(e.content, item.path)) continue;
         const video = /\.(?:mp4|webm|m4v|mov)$/i.test(item.path);
         if (!video && !/\.(?:png|jpe?g|webp|gif)$/i.test(item.path)) continue;
         seen.add(item.path);

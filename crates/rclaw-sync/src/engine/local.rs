@@ -791,11 +791,26 @@ pub(crate) fn attachments(
         }
         Ok(out)
     })?;
+    // 内容核对要整读文件，可能很贵：从最新的一条消息往前排，整个会话一次最多读这么
+    // 多字节。落在预算外面的（都在界面上看不到的老消息里）只按存在性说——打开会话、
+    // 媒体卡可用不该等一场整库大小的顺序读。
+    const VERIFY_BUDGET: u64 = 128 * 1024 * 1024;
+    let mut budget = VERIFY_BUDGET;
+    let mut verify = vec![false; found.len()];
+    for (index, item) in found.iter().enumerate().rev() {
+        if item.kind != "file" || item.size > budget {
+            continue;
+        }
+        budget -= item.size;
+        verify[index] = true;
+    }
     // 文件在不在、还是不是登记的那份内容：库锁之外看。路径先过 `check_path`（工作区里
     // 的链接不能把读取带到别处），内容核对按（路径、长度、mtime）记忆摘要。
-    Ok(found
+    let mut list: Vec<AttachmentInfo> = found
         .into_iter()
-        .map(|found| {
+        .enumerate()
+        .map(|(index, found)| {
+            let deep = verify[index];
             // 只认原样存在的文件：名字要改写才拼得上的路径（别的系统上的文件名），本机
             // 工作区里不会有它；中间的目录是链接的也不算。
             //
@@ -814,8 +829,9 @@ pub(crate) fn attachments(
             };
             // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
             // 里、密钥读不出来）时验不了：按登记说它在（老行为）。
+            // 不在核对预算里的（老消息）：只按存在性说它在。
             let verified = |path: &Path| -> bool {
-                keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
+                !deep || keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
             };
             let (state, local_path, rel_path) = match &found.row {
                 Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
@@ -873,7 +889,36 @@ pub(crate) fn attachments(
                 path_present,
             }
         })
-        .collect())
+        .collect();
+    // 消息还引用着、本机又没有这份内容、列表里说「取不回来」的：把登记补成「等待取
+    // 回」——`attach::lookup` 没有登记时直接报错，界面上的「重新下载」按下去就只会
+    // 得到「没有这个附件的登记」。已经有登记的不受影响（`blob_register` 不覆盖）。
+    let restore: Vec<(String, String, u64)> = list
+        .iter()
+        .filter(|item| {
+            item.kind == "file"
+                && !item.path_present
+                && matches!(item.state, "missing" | "changed")
+        })
+        .map(|item| {
+            (
+                item.blob.clone(),
+                crate::wire::landing_path(&item.path, &item.blob),
+                item.size,
+            )
+        })
+        .collect();
+    if !restore.is_empty() {
+        if let Err(error) = db::write(ctx.db(), |tx| {
+            for (blob, rel_path, size) in &restore {
+                db::blob_register(tx, blob, rel_path, *size, BLOB_REMOTE)?;
+            }
+            Ok(())
+        }) {
+            tracing::debug!("补登记被回收的附件失败（清单照常）: {error}");
+        }
+    }
+    Ok(list)
 }
 
 /// 核对「某个路径上的文件就是登记的那个对象」时算过的摘要：按文件版本（路径、长度、

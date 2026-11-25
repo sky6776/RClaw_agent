@@ -1410,6 +1410,7 @@ ${event.payload.command}
   // 对话页开着时装载这个会话的附件清单（多端同步；没开同步时是空的）。
   useSyncAttachmentLoader(agentState === "ready" && page === "chat" ? activeId : null);
 
+
   // 同步事件的处理函数经 ref 取最新的，订阅只跟着 agent 的启停建一次。把它们直接列进
   // 依赖的话，每次切会话（refreshChats 等跟着 activeId 变）都要退订再订阅，而订阅是
   // 异步建立的，这中间到的事件就丢了。

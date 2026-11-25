@@ -144,8 +144,33 @@ function apply(chatId: string, list: SyncAttachment[]) {
   known = nextKnown;
   // 下载下来之后又不见了的（被删了）会重新出现在 pending 里：不再算「已下载」。
   const stillLanded = landed.filter((item) => !pendingKeys.has(fileKey(item)));
+  // 存好的落点又对不上了（被改写/删除）：不能再给「打开 savedTo」，让用户重新存。
+  // 只处理文件引用——工具结果全文的登记位置不是消息路径，不按它判断。
+  const fileKeys = new Set(
+    usable.filter((item) => item.kind === "file").map((item) => fileKey(item)),
+  );
+  const presentKeys = new Set(
+    usable
+      .filter((item) => item.kind === "file" && item.path_present)
+      .map((item) => fileKey(item)),
+  );
+  const prune = (map: Record<string, string>) => {
+    let dropped = false;
+    const next = { ...map };
+    for (const key of Object.keys(next)) {
+      if (fileKeys.has(key) && !presentKeys.has(key)) {
+        delete next[key];
+        dropped = true;
+      }
+    }
+    return dropped ? next : map;
+  };
+  const saved = prune(cards.saved);
+  const saveErrors = prune(cards.saveErrors);
+  const cardsChanged = saved !== cards.saved || saveErrors !== cards.saveErrors;
+  if (cardsChanged) cards = { ...cards, saved, saveErrors };
   const sig = JSON.stringify([pending, stillLanded]);
-  if (sig === bar.sig && !changedAll && wasLoaded) return;
+  if (sig === bar.sig && !changedAll && !cardsChanged && wasLoaded) return;
   bar = { pending, landed: stillLanded, sig };
   emit();
 }
@@ -260,10 +285,11 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     let seq = 0;
     let timer: number | undefined;
     // 「补落点」的复制发生在会话事件之后（`settle_aliases`），成功时不一定再有事件：
-    // 清单里还有「这份内容本机有、但消息路径上没有」的条目时过几秒再看一眼。最多看
-    // 几次——目标被另一份文件占着的，复制会一直不成功。
+    // 清单里还有「这份内容本机有、但消息路径上没有」的条目时过几秒再看一眼。次数按
+    // 对象记——别的对象早先冲突过，不该把这个对象的补看额度用掉；目标被另一份文件
+    // 占着的，复制会一直不成功，看几次就停。
     let aliasTimer: number | undefined;
-    let aliasTries = 0;
+    const aliasTries = new Map<string, number>();
     const load = async () => {
       const mine = ++seq;
       let list: SyncAttachment[];
@@ -280,11 +306,18 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       }
       if (!alive || mine !== seq) return;
       apply(chatId, list);
-      const pendingAlias = list.some(
+      const pendingAlias = list.filter(
         (item) => item.kind === "file" && item.state === "local" && !item.path_present,
       );
-      if (pendingAlias && aliasTries < 3) {
-        aliasTries += 1;
+      let retry = false;
+      for (const item of pendingAlias) {
+        const tries = aliasTries.get(item.blob) ?? 0;
+        if (tries < 3) {
+          aliasTries.set(item.blob, tries + 1);
+          retry = true;
+        }
+      }
+      if (retry) {
         window.clearTimeout(aliasTimer);
         aliasTimer = window.setTimeout(() => void load(), 3000);
       }
@@ -299,6 +332,10 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     const un = api.onSync((event) => {
       if (event.kind === "attachment") {
         settle(event.blob, event.error);
+        schedule();
+      } else if (event.kind === "status") {
+        // 每一轮同步的状态变化：别名补落点、登记回收都可能在这时完成，借机重取一次
+        // 清单（下面 schedule 会合并）。
         schedule();
       } else if (
         event.kind === "sessions" &&
@@ -320,6 +357,11 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       void un.then((fn) => fn());
     };
   }, [chatId]);
+}
+
+/** 让当前会话的清单立刻重取一遍（一轮对话结束、工具可能改写过文件时用）。 */
+export function refreshSyncAttachments() {
+  reload?.();
 }
 
 /**
@@ -344,13 +386,30 @@ export function useChatAttachmentsReady(chatId: string | null): boolean {
   );
 }
 
+/** 清单按消息行索引（同一份清单只建一次：消息组件很多，别每个都扫一遍清单）。 */
+const byMessage = new WeakMap<SyncAttachment[], Map<number, SyncAttachment[]>>();
+
+function indexByMessage(list: SyncAttachment[]): Map<number, SyncAttachment[]> {
+  const cached = byMessage.get(list);
+  if (cached) return cached;
+  const index = new Map<number, SyncAttachment[]>();
+  for (const item of list) {
+    if (item.kind !== "file") continue;
+    const bucket = index.get(item.message_id);
+    if (bucket) bucket.push(item);
+    else index.set(item.message_id, [item]);
+  }
+  byMessage.set(list, index);
+  return index;
+}
+
 /** 一条消息登记的文件附件（只认消息里写的路径；工具结果全文不在此列）。 */
 export function messageFileRefs(
   list: SyncAttachment[],
   msgId: number | undefined,
 ): SyncAttachment[] {
   if (msgId === undefined) return [];
-  return list.filter((item) => item.kind === "file" && item.message_id === msgId);
+  return indexByMessage(list).get(msgId) ?? [];
 }
 
 /** 一条消息登记的文件里，消息路径上并没有这份内容的（按路径索引）：界面出附件卡，

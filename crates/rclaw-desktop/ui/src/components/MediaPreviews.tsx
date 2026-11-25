@@ -44,6 +44,29 @@ function toWorkspacePath(p: string): string {
   return (i >= 0 ? p.slice(i + "/agent/".length) : p).replace(/^\/+/, "");
 }
 
+/** 正文里是否真的写出了这个路径：两侧要有边界（`report.pdf` 不能命中
+ *  `report.pdf.bak`，也不能命中 `my_media/x.png` 的尾巴）。补卡与画廊的清单兜底
+ *  共用这一把尺子。 */
+export function mentionsPath(content: string, path: string): boolean {
+  const word = /[A-Za-z0-9_.\-]/;
+  let from = 0;
+  for (;;) {
+    const at = content.indexOf(path, from);
+    if (at < 0) return false;
+    const before = at === 0 ? "" : content[at - 1];
+    const after = content[at + path.length] ?? "";
+    const okBefore =
+      before === "" || before === "/" || before === "\\" || !word.test(before);
+    // 句末的「.」后面是空白/汉字时算边界；后面还接着文件名成分（`pdf.bak`）就不算。
+    const okAfter =
+      after === "" ||
+      !/[A-Za-z0-9_\-/\\]/.test(after) ||
+      (after === "." && !/[A-Za-z0-9_]/.test(content[at + path.length + 1] ?? ""));
+    if (okBefore && okAfter) return true;
+    from = at + 1;
+  }
+}
+
 /** 从消息正文解析媒体引用条目（媒体回执行 + 工作区路径 + 裸文件名兜底）。
  *  顺序即出现顺序，同路径去重。除本组件出卡外，Chat 的全屏媒体画廊也用
  *  同一解析把全会话的图片/视频拼成可左右滑切换的时间线（口径必须一致，
@@ -211,7 +234,7 @@ export default function MediaPreviews({
       // 只补「这条消息的正文里真的写到了」的路径：附件清单是从整行的数据里抽的，
       // 工具调用的参数、思考里提到的文件也在里面，它们不该以图片/文件卡的形式挂到
       // 这条可见消息下面。
-      if (!content.includes(path)) continue;
+      if (!mentionsPath(content, path)) continue;
       seen.add(path);
       const image = /\.(?:png|jpe?g|webp|gif)$/i.test(path);
       extra.push({
