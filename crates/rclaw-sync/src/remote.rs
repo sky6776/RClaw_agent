@@ -28,11 +28,7 @@ pub async fn read_space(transport: &dyn SyncTransport) -> Result<Option<SpaceFil
 /// 「仅创建」在部分 WebDAV 服务端上会被当成普通覆盖，`space.json` 里的关闭标记因此
 /// 可能被迟到的创建改回开放；墓碑只有关闭路径写，读过 `space.json` 之后再查它一次，
 /// 就能认出这种覆盖。
-async fn read_closed(
-    transport: &dyn SyncTransport,
-    keys: &Keys,
-    space_id: &str,
-) -> Result<bool> {
+async fn read_closed(transport: &dyn SyncTransport, keys: &Keys, space_id: &str) -> Result<bool> {
     let Some(bytes) =
         transport::get_opt(transport, SPACE_CLOSED_FILE, SPACE_FILE_MAX as u64).await?
     else {
@@ -45,11 +41,7 @@ async fn read_closed(
 
 /// 仅创建空间标记；目标已存在（另一个进程刚写入）时读回并核对，而不是把底层
 /// 创建错误直接抛给调用方。
-async fn create_marker(
-    transport: &dyn SyncTransport,
-    keys: &Keys,
-    space_id: &str,
-) -> Result<()> {
+async fn create_marker(transport: &dyn SyncTransport, keys: &Keys, space_id: &str) -> Result<()> {
     let file = SpaceFile::new(keys, space_id);
     let written = transport::put_new_checked(transport, SPACE_FILE, file.encode()?).await;
     match written {
@@ -298,10 +290,9 @@ pub enum CloseAttempt {
 
 /// 观察到兼容标记确实是关闭版时立刻调用（在任何补写 I/O 之前）：调用方据此把
 /// 「已确认关闭」落盘，之后补写失败或这次尝试被取消都不会丢这个事实。
-pub type ConfirmClosed<'a> = &'a (dyn Fn() -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>,
-> + Send
-              + Sync);
+pub type ConfirmClosed<'a> = &'a (dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>
+         + Send
+         + Sync);
 
 /// 只在远端确实显示「关闭已经开始」时把关闭补完：兼容标记已关闭，或墓碑已经写下。
 ///
@@ -466,8 +457,8 @@ pub async fn fetch_rollup(
 mod tests {
     use super::*;
     use crate::crypto::SpaceKey;
-    use crate::transport::file::FileTransport;
     use crate::error::TransportError;
+    use crate::transport::file::FileTransport;
     use crate::transport::TransportResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -513,7 +504,10 @@ mod tests {
         // 不支持 `If-None-Match` 的服务端上，迟到的创建会把 space.json 无条件改回
         // 开放；墓碑还在，读标记之后必须仍判为已关闭。
         transport
-            .put(SPACE_FILE, SpaceFile::new(&keys, &space_id).encode().unwrap())
+            .put(
+                SPACE_FILE,
+                SpaceFile::new(&keys, &space_id).encode().unwrap(),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -567,7 +561,10 @@ mod tests {
         ensure_closed(&transport, &keys, &space_id).await.unwrap();
         // 补上墓碑之后，迟到创建把标记覆盖回开放也拒绝打开。
         transport
-            .put(SPACE_FILE, SpaceFile::new(&keys, &space_id).encode().unwrap())
+            .put(
+                SPACE_FILE,
+                SpaceFile::new(&keys, &space_id).encode().unwrap(),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -624,9 +621,7 @@ mod tests {
         // 复核时读到另一个空间的可解析标记：不能拿我们的关闭版把它盖掉。
         let other_keys = Keys::derive(&SpaceKey::generate());
         let other_space = crate::secrets::new_space_id();
-        let foreign = SpaceFile::new(&other_keys, &other_space)
-            .encode()
-            .unwrap();
+        let foreign = SpaceFile::new(&other_keys, &other_space).encode().unwrap();
         let transport = ForeignAfterFirst {
             inner,
             marker_reads: AtomicUsize::new(0),
@@ -743,7 +738,10 @@ mod tests {
         ));
         // 关闭在现场确认过：迟到创建把标记改回开放也照样补完。
         transport
-            .put(SPACE_FILE, SpaceFile::new(&keys, &space_id).encode().unwrap())
+            .put(
+                SPACE_FILE,
+                SpaceFile::new(&keys, &space_id).encode().unwrap(),
+            )
             .await
             .unwrap();
         transport.delete(SPACE_CLOSED_FILE).await.unwrap();
@@ -831,7 +829,10 @@ mod tests {
         let space_id = crate::secrets::new_space_id();
         // 迟到的创建已经把 space.json 改回开放，本机的仅创建还没落到存储上。
         inner
-            .put(SPACE_FILE, SpaceFile::new(&keys, &space_id).encode().unwrap())
+            .put(
+                SPACE_FILE,
+                SpaceFile::new(&keys, &space_id).encode().unwrap(),
+            )
             .await
             .unwrap();
         let mut closed = SpaceFile::new(&keys, &space_id);

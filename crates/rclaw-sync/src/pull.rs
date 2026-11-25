@@ -661,15 +661,17 @@ impl DevicePull<'_> {
             }
             let loaded = match preloaded {
                 Some(pack) => Ok((pack, false, 0)),
-                None => load_pack(
-                self.ctx,
-                self.transport,
-                self.keys,
-                self.device,
-                    &link.name,
-                    &link.digest,
-                )
-                .await,
+                None => {
+                    load_pack(
+                        self.ctx,
+                        self.transport,
+                        self.keys,
+                        self.device,
+                        &link.name,
+                        &link.digest,
+                    )
+                    .await
+                }
             };
             let (pack, downloaded, network) = match loaded {
                 Ok(loaded) => loaded,
@@ -1023,9 +1025,9 @@ impl Memo {
 
     /// 版本不可靠的设备现在还不必再读（上次重读还不到间隔）。
     fn unstable_waits(&self, device: &str, now: i64) -> bool {
-        self.unstable_ms.get(device).is_some_and(|checked| {
-            (0..UNSTABLE_HEAD_RECHECK_MS).contains(&(now - checked))
-        })
+        self.unstable_ms
+            .get(device)
+            .is_some_and(|checked| (0..UNSTABLE_HEAD_RECHECK_MS).contains(&(now - checked)))
     }
 
     fn unstable_read(&mut self, device: &str, now: i64) {

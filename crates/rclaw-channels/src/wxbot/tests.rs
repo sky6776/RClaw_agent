@@ -370,13 +370,12 @@ async fn webhook_message_on_unbound_does_not_bind_account() {
         axum::http::header::AUTHORIZATION,
         axum::http::HeaderValue::from_static("Bearer sec"),
     );
-    let res = super::webhook_handler(
-        axum::extract::State(st),
-        headers,
-        body,
-    )
-    .await;
-    assert_eq!(res.status(), axum::http::StatusCode::OK, "unbound 事件应放行入队");
+    let res = super::webhook_handler(axum::extract::State(st), headers, body).await;
+    assert_eq!(
+        res.status(),
+        axum::http::StatusCode::OK,
+        "unbound 事件应放行入队"
+    );
 
     // 事件确实进了队列（不静默丢）。
     let got = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -396,11 +395,11 @@ fn constant_time_eq_basic_cases() {
     // 评审 R4 P2-3：best-effort CT 的三组行为锁定（非形式化 constant-time，只挡
     // 朴素逐字节时序侧信道；长度差异提前返回是记录在案的取舍）。
     assert!(super::constant_time_eq(b"sec", b"sec"), "等长等值必须为真");
+    assert!(!super::constant_time_eq(b"sec", b"sed"), "等长差值必须为假");
     assert!(
-        !super::constant_time_eq(b"sec", b"sed"),
-        "等长差值必须为假"
+        !super::constant_time_eq(b"sec", b"secretx"),
+        "长度不同必须为假"
     );
-    assert!(!super::constant_time_eq(b"sec", b"secretx"), "长度不同必须为假");
     assert!(super::constant_time_eq(b"", b""), "空对空为真");
     assert!(!super::constant_time_eq(b"", b"x"), "空与非空为假");
 }
@@ -417,7 +416,10 @@ async fn webhook_body_over_limit_rejected_413() {
         account: Arc::new(std::sync::Mutex::new(WxbotState::default())),
     };
     let app = axum::Router::new()
-        .route("/wxbot/webhook", axum::routing::post(super::webhook_handler))
+        .route(
+            "/wxbot/webhook",
+            axum::routing::post(super::webhook_handler),
+        )
         .with_state(st)
         .layer(axum::extract::DefaultBodyLimit::max(1_000_000));
 
@@ -691,7 +693,10 @@ fn humanize_segments_long_chinese_without_whitespace() {
     let s = "你好。".repeat(60); // 540 bytes, no whitespace
     let segs = humanize_segments(&s, 60, 2000);
     assert_eq!(segs.concat(), s);
-    assert!(segs.len() > 1, "普通中文长文本不应被当成受保护 token: {segs:?}");
+    assert!(
+        segs.len() > 1,
+        "普通中文长文本不应被当成受保护 token: {segs:?}"
+    );
 }
 
 #[test]
@@ -711,7 +716,10 @@ fn humanize_segments_keep_url_and_decimal() {
     let segs = humanize_segments(s, 16, 2000);
     assert_eq!(segs.concat(), s);
     let joined = segs.join("|");
-    assert!(joined.contains("https://example.com/path?x=1.5"), "URL 被切开: {joined}");
+    assert!(
+        joined.contains("https://example.com/path?x=1.5"),
+        "URL 被切开: {joined}"
+    );
     assert!(joined.contains("12.34"), "小数被切开: {joined}");
 }
 

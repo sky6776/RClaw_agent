@@ -367,10 +367,7 @@ fn pending_load(paths: &SyncPaths) -> Result<Option<PendingSpace>> {
 
 fn pending_save(paths: &SyncPaths, pending: &PendingSpace) -> Result<()> {
     paths.ensure_root()?;
-    rclaw_store::atomic_write_private(
-        &pending_path(paths),
-        &serde_json::to_vec_pretty(pending)?,
-    )?;
+    rclaw_store::atomic_write_private(&pending_path(paths), &serde_json::to_vec_pretty(pending)?)?;
     Ok(())
 }
 
@@ -662,14 +659,11 @@ async fn pending_close_mark_seen(
     blocking(move || {
         let _lock = CloseQueueLock::acquire(&paths)?;
         let mut closes = pending_close_load(&paths)?;
-        let slot = closes
-            .iter()
-            .position(|close| close.id == id)
-            .or_else(|| {
-                closes
-                    .iter()
-                    .position(|close| same_close_target(close, &storage, &space_id))
-            });
+        let slot = closes.iter().position(|close| close.id == id).or_else(|| {
+            closes
+                .iter()
+                .position(|close| same_close_target(close, &storage, &space_id))
+        });
         let Some(slot) = slot else {
             return Ok(());
         };
@@ -1007,8 +1001,7 @@ async fn finish_one_close(
             let unchanged = match at_build.transport.as_str() {
                 "webdav" => {
                     at_build.webdav.allow_http == latest.webdav.allow_http
-                        && at_build.webdav.pinned_cert_sha256
-                            == latest.webdav.pinned_cert_sha256
+                        && at_build.webdav.pinned_cert_sha256 == latest.webdav.pinned_cert_sha256
                 }
                 "s3" => {
                     at_build.s3.allow_http == latest.s3.allow_http
@@ -1050,16 +1043,15 @@ async fn finish_one_close(
         }
     }
     // 补写过程中再读到「已验证关闭」时，先落盘（按 id，缺 id 按同目标）再动远端。
-    let confirm = || -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<()>> + Send + '_>,
-    > {
-        Box::pin(pending_close_mark_seen(
-            paths,
-            &close.id,
-            &close.storage,
-            &space_id,
-        ))
-    };
+    let confirm =
+        || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+            Box::pin(pending_close_mark_seen(
+                paths,
+                &close.id,
+                &close.storage,
+                &space_id,
+            ))
+        };
     match remote::ensure_closed_if_started(
         &transport,
         &keys,
@@ -1072,15 +1064,8 @@ async fn finish_one_close(
         remote::CloseAttempt::Done => {
             // 关闭做完：同目标的历史快照都已完成使命。删除以这次尝试开始时的标记集
             // 为界，期间/之后被并发失败恢复回来的（换了标记）留着。
-            pending_close_finish_target(
-                paths,
-                &close.storage,
-                &space_id,
-                false,
-                None,
-                Some(marks),
-            )
-            .await?;
+            pending_close_finish_target(paths, &close.storage, &space_id, false, None, Some(marks))
+                .await?;
             Ok(())
         }
         remote::CloseAttempt::NotStarted => {
@@ -1334,11 +1319,7 @@ fn refresh_credentials(target: &mut Secrets, current: &Secrets) {
 /// 进——共享目录还在而旧空间子目录没了（被清掉、没同步过来）时，读不到 `space.json`
 /// 就是「已关闭」，恢复照常收敛。
 async fn read_old_space(config: &SyncConfig, secrets: &Secrets) -> Result<Option<SpaceFile>> {
-    let (config, secrets, space_id) = (
-        config.clone(),
-        secrets.clone(),
-        secrets.space_id.clone(),
-    );
+    let (config, secrets, space_id) = (config.clone(), secrets.clone(), secrets.space_id.clone());
     let root = blocking(move || root_transport(&config, &secrets)).await?;
     let transport = Scoped::new(root, &space_id);
     remote::read_space(&transport).await
@@ -1954,9 +1935,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: closed,
         };
-        let fingerprint = |close: &PendingClose| {
-            close.storage.webdav.pinned_cert_sha256.clone()
-        };
+        let fingerprint = |close: &PendingClose| close.storage.webdav.pinned_cert_sha256.clone();
         // 超限旧队列：A、B 已确认（B 带唯一有效凭据），C/D/E 未确认。
         // 正确顺序：先淘汰最老的未确认 C，再把事实传播给 D/E；B 必须留着。
         pending_close_save(
@@ -2425,8 +2404,8 @@ mod tests {
             Some(&batch),
             None,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(closes.len(), 2);
         assert!(closes.iter().any(|close| close.id == unconfirmed.id));
@@ -2449,14 +2428,7 @@ mod tests {
         };
         pending_close_save(&ctx.paths, &[entry.clone()]).unwrap();
         // 并发的成功清理把同目标全删了。
-        pending_close_finish_target(
-            &ctx.paths,
-            &config,
-            &secrets.space_id,
-            false,
-            None,
-            None,
-        )
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, None)
             .await
             .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
@@ -2494,9 +2466,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: closed,
         };
-        let fingerprint = |close: &PendingClose| {
-            close.storage.webdav.pinned_cert_sha256.clone()
-        };
+        let fingerprint = |close: &PendingClose| close.storage.webdav.pinned_cert_sha256.clone();
 
         // 场景一（读入封顶，全未确认）：最老那条一定留着，淘汰第二老的未确认项。
         let seeded = vec![
@@ -2550,11 +2520,7 @@ mod tests {
         // 场景四（入队路径，混合组）：直接落盘 [确认, 确认, 未确认]（跳过读入时的
         // 目标级事实传播），再 add 两条；超限时优先淘汰最老的**未确认**那条（ff2），
         // 而不是第二老的（ff1）——全确认回退才会选 ff1。
-        let seeded = vec![
-            entry("ff0", true),
-            entry("ff1", true),
-            entry("ff2", false),
-        ];
+        let seeded = vec![entry("ff0", true), entry("ff1", true), entry("ff2", false)];
         let oldest = seeded[0].id.clone();
         pending_close_save(&ctx.paths, &seeded).unwrap();
         for index in 3..=4 {
@@ -2604,14 +2570,7 @@ mod tests {
             old.webdav.pinned_cert_sha256
         );
         // 收尾成功：同目标的全部历史一起清掉。
-        pending_close_finish_target(
-            &ctx.paths,
-            &config,
-            &secrets.space_id,
-            false,
-            None,
-            None,
-        )
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, None)
             .await
             .unwrap();
         assert!(pending_close_load(&ctx.paths).unwrap().is_empty());
@@ -2674,7 +2633,9 @@ mod tests {
         assert_eq!(again[0].id, closes[0].id);
         assert_eq!(again[1].id, closes[1].id);
         // 结算一条不会删掉另一条。
-        pending_close_finish(&ctx.paths, &closes[0].id).await.unwrap();
+        pending_close_finish(&ctx.paths, &closes[0].id)
+            .await
+            .unwrap();
         let left = pending_close_load(&ctx.paths).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, closes[1].id);
@@ -2759,8 +2720,7 @@ mod tests {
         let mut queued = pending_close_load(&ctx.paths).unwrap();
         queued.push(later.clone());
         pending_close_save(&ctx.paths, &queued).unwrap();
-        let batch: std::collections::HashSet<String> =
-            [fresh.id.clone()].into_iter().collect();
+        let batch: std::collections::HashSet<String> = [fresh.id.clone()].into_iter().collect();
         pending_close_finish_target(
             &ctx.paths,
             &config,
@@ -2769,22 +2729,17 @@ mod tests {
             Some(&batch),
             None,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();
         assert!(closes.iter().any(|close| close.id == later.id));
         // 带着确认事实的也不清（它是别的条目观察到的目标事实）。
         let closes = pending_close_load(&ctx.paths).unwrap();
-        assert!(closes.iter().any(|close| close.id == fresh.id && close.closed_seen));
+        assert!(closes
+            .iter()
+            .any(|close| close.id == fresh.id && close.closed_seen));
         // 收尾成功清掉同目标的全部历史，别的目标不动。
-        pending_close_finish_target(
-            &ctx.paths,
-            &config,
-            &secrets.space_id,
-            false,
-            None,
-            None,
-        )
+        pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, None)
             .await
             .unwrap();
         let closes = pending_close_load(&ctx.paths).unwrap();

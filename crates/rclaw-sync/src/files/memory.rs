@@ -98,8 +98,8 @@ pub(crate) fn mark_clearing(conn: &Connection, target: &str, ids: &[String]) -> 
 /// 返回假。撤销之后这个目标回到普通对比：文件里少了什么就照常发布或者问用户
 /// （`mem-wipe`）。
 pub(crate) fn abort_clearing(conn: &Connection, target: &str, op: &str) -> Result<bool> {
-    let current = db::state_get(conn, SCOPE_CLEARING, target)?
-        .and_then(|row| row.json::<Clearing>());
+    let current =
+        db::state_get(conn, SCOPE_CLEARING, target)?.and_then(|row| row.json::<Clearing>());
     match current {
         Some(clearing) if clearing.op == op => {
             db::state_del(conn, SCOPE_CLEARING, target)?;
@@ -119,8 +119,8 @@ pub(crate) fn abort_clearing(conn: &Connection, target: &str, op: &str) -> Resul
 /// 这一轮整个让路（下一轮重新读）。旧的没有操作标识的记录读出来是空串，只有等待态才
 /// 会走到这里，按空串比较与以前一致。
 pub(crate) fn settle_clearing(conn: &Connection, target: &str, op: &str) -> Result<bool> {
-    let current = db::state_get(conn, SCOPE_CLEARING, target)?
-        .and_then(|row| row.json::<Clearing>());
+    let current =
+        db::state_get(conn, SCOPE_CLEARING, target)?.and_then(|row| row.json::<Clearing>());
     match current {
         Some(clearing) if !clearing.staged && clearing.op == op => {
             db::state_del(conn, SCOPE_CLEARING, target)?;

@@ -508,16 +508,17 @@ impl TurnManager {
             }
             ClearScope::All => {
                 let sessions = sync.clone();
-                let deleted = tokio::task::spawn_blocking(move || sessions.delete_published_sessions())
-                    .await
-                    .map_err(|error| format!("⚠️ 清空任务执行异常: {error}"))?
-                    .map_err(|error| {
-                        format!(
-                            "⚠️ 把会话删除同步给其他设备时出错，/clear 已中止：{error}\n\n\
+                let deleted =
+                    tokio::task::spawn_blocking(move || sessions.delete_published_sessions())
+                        .await
+                        .map_err(|error| format!("⚠️ 清空任务执行异常: {error}"))?
+                        .map_err(|error| {
+                            format!(
+                                "⚠️ 把会话删除同步给其他设备时出错，/clear 已中止：{error}\n\n\
                              已登记的会话删除可能会同步出去。可以重试：\
                              /clear confirm all"
-                        )
-                    })?;
+                            )
+                        })?;
                 // 记忆的条目先留副本并登记清理意图（意图耐久落库之后调用方才删本机文件；
                 // 还没有任何可发布的副作用）。本地清空成功后才提交，提交时复核这次登记的
                 // 操作标识。

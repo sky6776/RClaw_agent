@@ -405,7 +405,9 @@ pub(crate) fn detail(ctx: &Ctx, item: &PendingItem) -> Result<serde_json::Value>
         Op::FilePut { content, .. } => Some(content),
         _ => None,
     };
-    Ok(serde_json::json!({ "path": path, "local_path": local_path, "local": local, "remote": remote }))
+    Ok(
+        serde_json::json!({ "path": path, "local_path": local_path, "local": local, "remote": remote }),
+    )
 }
 
 /// 用户在本机接受或拒绝了一个远端版本。
@@ -456,7 +458,14 @@ pub(crate) fn decide(ctx: &Ctx, _s: &Settings, item: &PendingItem, accept: bool)
             let rejected = remote.as_deref().unwrap_or(REJ_DEL);
             db::state_put(tx, SCOPE_REJ, &path, db::HLC_ZERO, None, Some(rejected))?;
             if aliased {
-                db::state_put(tx, SCOPE_REJ, &local_path, db::HLC_ZERO, None, Some(rejected))?;
+                db::state_put(
+                    tx,
+                    SCOPE_REJ,
+                    &local_path,
+                    db::HLC_ZERO,
+                    None,
+                    Some(rejected),
+                )?;
             }
             // 还没有基线（刚加入的设备）：记成本机当前的内容，免得反过来把本机的版本推给
             // 别的设备。之后本机再改，照常发布。

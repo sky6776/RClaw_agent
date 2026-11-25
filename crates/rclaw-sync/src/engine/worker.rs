@@ -98,7 +98,11 @@ pub(crate) struct StorageIntent {
     pub(crate) toml_written: bool,
     /// 旧版本（round19/20）的「明确设备名」字段：读进来避免解析失败。归属有歧义时
     /// 不应用（保留磁盘现值），凭据照常结算。
-    #[serde(default, alias = "device_name", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "device_name",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) legacy_device_name: Option<String>,
 }
 
@@ -182,7 +186,10 @@ pub(crate) fn storage_commit_advance(paths: &SyncPaths, storage: &SyncConfig) ->
         file.storage = storage.clone();
         storage_commit_write(paths, &file)?;
         // 只淘汰「存储段不同」的记录；同一存储段的待补密码保留。
-        for path in [storage_intent_path(paths), storage_intent_backup_path(paths)] {
+        for path in [
+            storage_intent_path(paths),
+            storage_intent_backup_path(paths),
+        ] {
             if let Ok(Some(intent)) = storage_intent_read(path.clone()) {
                 if !same_storage_cfg(&intent.config, storage) {
                     let _ = std::fs::remove_file(path);
@@ -215,10 +222,7 @@ fn storage_intent_store(paths: &SyncPaths, intent: &StorageIntent) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn storage_intent_backup_save(
-    paths: &SyncPaths,
-    intent: &StorageIntent,
-) -> Result<()> {
+pub(crate) fn storage_intent_backup_save(paths: &SyncPaths, intent: &StorageIntent) -> Result<()> {
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
         &storage_intent_backup_path(paths),
@@ -323,10 +327,7 @@ pub(crate) fn storage_intent_last_written(
 
 /// 两套配置的存储段是否指向同一处。
 fn same_storage_cfg(a: &SyncConfig, b: &SyncConfig) -> bool {
-    a.transport == b.transport
-        && a.webdav == b.webdav
-        && a.file == b.file
-        && a.s3 == b.s3
+    a.transport == b.transport && a.webdav == b.webdav && a.file == b.file && a.s3 == b.s3
 }
 
 pub(crate) struct EffectiveIntent {
@@ -361,7 +362,9 @@ pub(crate) fn storage_intent_effective(
             None => true,
             // 请求序号是协议锁内全局单调的（跨存储代次也递增），先按它排；代次只做
             // 平局时的次序。这样提交文件缺失（代次读成 0）时新请求不会输给旧备份。
-            Some(current) => (intent.req, intent.commit) > (current.intent.req, current.intent.commit),
+            Some(current) => {
+                (intent.req, intent.commit) > (current.intent.req, current.intent.commit)
+            }
         };
         if replace {
             best = Some(EffectiveIntent {
@@ -397,10 +400,7 @@ pub(crate) fn storage_intent_settle(paths: &SyncPaths, from_backup: bool) -> Res
 
 /// 后续一次显式改名（通用配置保存/导入）发布到 `current_name` 时，取消仍在等待的
 /// 设备名编辑。凭据部分保留。
-pub(crate) fn storage_intent_cancel_name_edit(
-    paths: &SyncPaths,
-    current_name: &str,
-) -> Result<()> {
+pub(crate) fn storage_intent_cancel_name_edit(paths: &SyncPaths, current_name: &str) -> Result<()> {
     for (path, is_backup) in [
         (storage_intent_path(paths), false),
         (storage_intent_backup_path(paths), true),
@@ -436,17 +436,19 @@ pub fn storage_intent_plan(
     paths: &SyncPaths,
     disk: &SyncConfig,
 ) -> Result<Option<StorageIntentPlan>> {
-    Ok(storage_intent_effective(paths, disk)?.map(|effective| StorageIntentPlan {
-        config: effective.intent.config,
-        device_name_edit: effective
-            .intent
-            .device_name_edit
-            .map(|edit| IntentDeviceNameEdit {
-                from: edit.from,
-                to: edit.to,
-            }),
-        from_backup: effective.from_backup,
-    }))
+    Ok(
+        storage_intent_effective(paths, disk)?.map(|effective| StorageIntentPlan {
+            config: effective.intent.config,
+            device_name_edit: effective
+                .intent
+                .device_name_edit
+                .map(|edit| IntentDeviceNameEdit {
+                    from: edit.from,
+                    to: edit.to,
+                }),
+            from_backup: effective.from_backup,
+        }),
+    )
 }
 
 /// 存储保存协议的跨进程锁：意图、`rclaw.toml`、secrets 与提交状态的整套提交必须
@@ -875,10 +877,7 @@ impl Worker {
             Err(error) => {
                 tracing::warn!("补完上次没做完的空间关闭失败（稍后再试）: {error}");
                 // 已经不拿着引擎锁了就别再排期：不是本进程该做的事。
-                self.close_retry_at = self
-                    .lock
-                    .is_some()
-                    .then(|| Instant::now() + STANDBY_RETRY);
+                self.close_retry_at = self.lock.is_some().then(|| Instant::now() + STANDBY_RETRY);
             }
         }
     }
@@ -1433,7 +1432,11 @@ impl Worker {
     /// 下载任务手上排着的请求丢了，用户再点一次就又排上。
     fn revive_transfers(&mut self) {
         // 后台收尾任务意外退出（没能回传结果）时清掉标志：记录本来就在，下次打开再试。
-        if self.close_task.as_ref().is_some_and(JoinHandle::is_finished) {
+        if self
+            .close_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
             self.close_task = None;
         }
         let Some(live) = self.session.as_ref().map(|session| session.live.clone()) else {
@@ -1465,19 +1468,8 @@ impl Worker {
         // 再等最终写入段退场 → 换代。任何一步超时都不换代，恢复提交入口让调用方重试
         // （下载入口也原样留着，中止的切换不影响正在用的连接）。
         self.shared.ctx.space.seal();
-        let idle = self
-            .shared
-            .ctx
-            .space
-            .wait_idle(TEARDOWN_SETTLE)
-            .await;
-        let writers = idle
-            && self
-                .shared
-                .ctx
-                .space
-                .wait_writers(TEARDOWN_SETTLE)
-                .await;
+        let idle = self.shared.ctx.space.wait_idle(TEARDOWN_SETTLE).await;
+        let writers = idle && self.shared.ctx.space.wait_writers(TEARDOWN_SETTLE).await;
         if !writers {
             tracing::warn!("还有在途的提交阶段，暂不换空间（稍后重试）");
             self.shared.ctx.space.reopen();
@@ -1765,10 +1757,8 @@ impl Worker {
                 self.pending_switch = true;
                 self.switch_failed = false;
                 self.switch_tries = 0;
-                self.shared.set_state(
-                    "syncing",
-                    Some("重新尝试重建同步连接".into()),
-                );
+                self.shared
+                    .set_state("syncing", Some("重新尝试重建同步连接".into()));
                 self.request(Kind::Full, Duration::ZERO);
             }
             return;
@@ -1932,13 +1922,8 @@ impl Worker {
             }
             let verified = match space::load_live(&joined, &next).await {
                 Ok(live) => {
-                    crate::remote::open_space(
-                        live.transport(),
-                        &live.keys,
-                        &next.space_id,
-                        false,
-                    )
-                    .await
+                    crate::remote::open_space(live.transport(), &live.keys, &next.space_id, false)
+                        .await
                 }
                 Err(error) => Err(error),
             };
@@ -1986,8 +1971,7 @@ impl Worker {
         let plan =
             space::join_verify(&self.shared.ctx.paths, &self.config, &self.secrets, code).await?;
         let lock_paths = self.shared.ctx.paths.clone();
-        let Some(_storage_lock) =
-            blocking(move || StorageLock::try_acquire(&lock_paths)).await?
+        let Some(_storage_lock) = blocking(move || StorageLock::try_acquire(&lock_paths)).await?
         else {
             return Err(SyncError::other("存储设置正在保存，请稍后重试加入"));
         };
@@ -2012,8 +1996,7 @@ impl Worker {
             // secrets——另一个进程可能刚做完退出的一半，不能凭本机旧副本清任何东西。
             let paths = self.shared.ctx.paths.clone();
             let (lock, mut secrets) = blocking(move || {
-                let lock =
-                    take_lock(&paths)?.ok_or_else(|| SyncError::other(STANDBY_HINT))?;
+                let lock = take_lock(&paths)?.ok_or_else(|| SyncError::other(STANDBY_HINT))?;
                 let secrets = Secrets::load(&paths)?;
                 Ok((lock, secrets))
             })
@@ -2098,11 +2081,7 @@ impl Worker {
     /// 调用方在派发之前已把「更新意图」落盘（[`storage_intent_save`]）：本方法失败
     /// （worker 待机、secrets 写失败）时两个文件不会都换好，重启后的 [`Self::open`]
     /// 按记录把剩下的一半补上，两边收敛到同一套。
-    async fn save_storage(
-        &mut self,
-        config: SyncConfig,
-        secret: Option<String>,
-    ) -> Result<u64> {
+    async fn save_storage(&mut self, config: SyncConfig, secret: Option<String>) -> Result<u64> {
         self.require_owner()?;
         // 换连接前先确认在途提交能退场：退不了时本机什么都不改（TOML 已经是新的，
         // 意图还在，重启时由恢复流程收敛）。
@@ -2165,10 +2144,8 @@ impl Worker {
         let disk = if locked {
             self.config.clone()
         } else if let Some(refresh) = self.shared.refresh_config.clone() {
-            match blocking(move || {
-                refresh().map_err(|()| SyncError::other("读取同步设置失败"))
-            })
-            .await
+            match blocking(move || refresh().map_err(|()| SyncError::other("读取同步设置失败")))
+                .await
             {
                 Ok(Some(config)) => config,
                 // 文件暂时读不出来：保留意图，等下一次权威打开。
@@ -2187,7 +2164,12 @@ impl Worker {
             return Ok(true);
         }
         let mut next = self.secrets.clone();
-        if let Some(secret) = intent.intent.secret.as_deref().filter(|secret| !secret.is_empty()) {
+        if let Some(secret) = intent
+            .intent
+            .secret
+            .as_deref()
+            .filter(|secret| !secret.is_empty())
+        {
             if intent.intent.config.transport != "file" {
                 next.set_storage_secret(&intent.intent.config, secret.to_string())?;
             }

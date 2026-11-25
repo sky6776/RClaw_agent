@@ -221,8 +221,7 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
                     // 不是这次补的登记（别的消息正常登记进来的）走下面的常规路径。
                     // 标记还在、行也还是「等待取回」：这条登记确实是这次重试临时补的。
                     // （取回成功会清标记并把行改成 FETCHED；并发登记进来的行状态也不同。）
-                    let probe = db::state_get(tx, crate::db::scope::BLOB_PROBE, &wanted)?
-                        .is_some()
+                    let probe = db::state_get(tx, crate::db::scope::BLOB_PROBE, &wanted)?.is_some()
                         && db::blob_get(tx, &wanted)?
                             .is_some_and(|row| row.state == crate::db::BLOB_REMOTE);
                     // 只撤「这次重试临时补」的身份，**保留登记行**：`on_missing` 需要

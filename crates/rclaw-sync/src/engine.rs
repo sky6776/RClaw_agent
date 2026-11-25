@@ -165,8 +165,7 @@ const REVIVE_AFTER: Duration = Duration::from_secs(60);
 
 /// 从宿主的配置文件重读 `[sync]`（见 [`SyncDeps::refresh_config`]）。`Err` = 文件在但
 /// 这次读不出来（稍后重试）；`Ok(None)` = 还没有这个文件（按当前配置，与首次运行一致）。
-pub type ConfigRefresh =
-    Arc<dyn Fn() -> std::result::Result<Option<SyncConfig>, ()> + Send + Sync>;
+pub type ConfigRefresh = Arc<dyn Fn() -> std::result::Result<Option<SyncConfig>, ()> + Send + Sync>;
 
 /// 宿主注入的依赖。
 pub struct SyncDeps {
@@ -560,9 +559,11 @@ impl SyncEngine {
             }
             return;
         }
-        let delivered = running
-            .as_ref()
-            .is_some_and(|live| live.commands.send(Cmd::Reconfigure(config.clone(), host_seq)).is_ok());
+        let delivered = running.as_ref().is_some_and(|live| {
+            live.commands
+                .send(Cmd::Reconfigure(config.clone(), host_seq))
+                .is_ok()
+        });
         if !delivered {
             *running = self.spawn(config);
         }
@@ -876,8 +877,14 @@ impl SyncEngine {
     /// 一半补上。命令成功才把新配置公布给宿主、清掉意图——失败时宿主内存里仍是旧配置，
     /// 界面上看到的与实际生效的一致。
     pub async fn save_storage(&self, config: SyncConfig, secret: Option<String>) -> Result<()> {
-        self.save_storage_with(config, secret, None, |config| Ok(config.clone()), |_| Ok(()))
-            .await
+        self.save_storage_with(
+            config,
+            secret,
+            None,
+            |config| Ok(config.clone()),
+            |_| Ok(()),
+        )
+        .await
     }
 
     /// 保存存储设置与密码的完整协议：`persist` 在这一段里把设置写回宿主的配置文件
@@ -923,8 +930,7 @@ impl SyncEngine {
         if let Some(prev) = worker::storage_intent_last_written(&paths, &merged)? {
             worker::storage_intent_backup_save(&paths, &prev)?;
         }
-        let id =
-            worker::storage_intent_save(&paths, &merged, secret.as_deref(), device_edit)?;
+        let id = worker::storage_intent_save(&paths, &merged, secret.as_deref(), device_edit)?;
         let written = {
             let target = merged.clone();
             blocking(move || write(&target).map_err(SyncError::other)).await
@@ -1080,7 +1086,12 @@ impl SyncEngine {
     pub fn delete_published_sessions(&self) -> Result<usize> {
         let config = self.config();
         let keep_trash = config.trash_days > 0;
-        let deleted = local::delete_published(&self.inner.ctx, &config, self.inner.sessions_supported, keep_trash)?;
+        let deleted = local::delete_published(
+            &self.inner.ctx,
+            &config,
+            self.inner.sessions_supported,
+            keep_trash,
+        )?;
         self.notify(Trigger::LocalChange);
         Ok(deleted)
     }
@@ -1330,7 +1341,8 @@ impl SyncEngine {
         let Ok((digest, read)) = crate::crypto::copy_hash(&mut reader, &mut bytes) else {
             return AttachmentBytes::Rejected;
         };
-        if read > limit || read.abs_diff(size) > local::SIZE_SLACK || keys.blob_id(&digest) != blob {
+        if read > limit || read.abs_diff(size) > local::SIZE_SLACK || keys.blob_id(&digest) != blob
+        {
             return AttachmentBytes::Rejected;
         }
         AttachmentBytes::Bytes(bytes)
@@ -1529,7 +1541,11 @@ impl SyncEngine {
                 local::referenced_attachment(ctx, channel, chat_id, blob)
             {
                 let rel_path = if artifact {
-                    format!("{}{}", crate::wire::artifact_rel_dir(channel, chat_id), path)
+                    format!(
+                        "{}{}",
+                        crate::wire::artifact_rel_dir(channel, chat_id),
+                        path
+                    )
                 } else {
                     crate::wire::landing_path(&path, blob)
                 };

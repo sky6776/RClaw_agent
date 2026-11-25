@@ -572,7 +572,9 @@ impl Wxbot {
                 let body = match resp.text().await {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::info!("wxbot：self/info HTTP {status} 但读 body 失败（{e}），保持 unbound");
+                        tracing::info!(
+                            "wxbot：self/info HTTP {status} 但读 body 失败（{e}），保持 unbound"
+                        );
                         return false;
                     }
                 };
@@ -591,7 +593,9 @@ impl Wxbot {
         let val: Value = match serde_json::from_str(&body) {
             Ok(v) => v,
             Err(e) => {
-                tracing::info!("wxbot：self/info HTTP {status} 但 JSON 解析失败（{e}），保持 unbound");
+                tracing::info!(
+                    "wxbot：self/info HTTP {status} 但 JSON 解析失败（{e}），保持 unbound"
+                );
                 return false;
             }
         };
@@ -639,7 +643,7 @@ impl Wxbot {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| (d.subsec_nanos() as u64) % (quarter + 1))
                 .unwrap_or(0))
-                .min(quarter);
+            .min(quarter);
             tokio::time::sleep(Duration::from_secs(delay.saturating_add(jitter))).await;
             delay = (delay * 2).min(60);
         }
@@ -1855,10 +1859,13 @@ fn humanize_segments(text: &str, target_chars: usize, hard_bytes: usize) -> Vec<
             chars_in_seg += 3;
             continue;
         }
-        let Some(ch) = text[i..].chars().next() else { break };
+        let Some(ch) = text[i..].chars().next() else {
+            break;
+        };
         chars_in_seg += 1;
         let next_i = i + ch.len_utf8();
-        let sentence_end = !in_code && matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';' | '…' | '\n');
+        let sentence_end =
+            !in_code && matches!(ch, '。' | '！' | '？' | '!' | '?' | '；' | ';' | '…' | '\n');
         let code_newline = in_code && ch == '\n';
         // Inside a fenced block only line breaks may split; the hard byte
         // limit still applies later via utf8_chunks.
@@ -1903,7 +1910,9 @@ fn extend_closing(text: &str, mut end: usize) -> usize {
     // every candidate break (O(n²)).
     let limit = end.saturating_add(PROTECT_SCAN);
     while end < limit {
-        let Some(c) = text[end..].chars().next() else { break };
+        let Some(c) = text[end..].chars().next() else {
+            break;
+        };
         if matches!(c, '”' | '"' | '\'' | '）' | ')' | '】' | ']' | '}' | '》') {
             end += c.len_utf8();
         } else {
@@ -1995,8 +2004,7 @@ fn protected_interval(text: &str, end: usize) -> Option<(usize, usize)> {
             let token = &text[start..stop];
             if token.contains("://")
                 || token.starts_with("www.")
-                || (token.contains('.')
-                    && token.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                || (token.contains('.') && token.chars().all(|c| c.is_ascii_digit() || c == '.'))
             {
                 return Some((start, stop));
             }
@@ -2016,11 +2024,7 @@ fn inside_protected(text: &str, end: usize) -> bool {
         if full_token.contains("://") || full_token.starts_with("www.") {
             return true;
         }
-        if full_token.contains('.')
-            && full_token
-                .chars()
-                .all(|c| c.is_ascii_digit() || c == '.')
-        {
+        if full_token.contains('.') && full_token.chars().all(|c| c.is_ascii_digit() || c == '.') {
             return true;
         }
     }

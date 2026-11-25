@@ -29,7 +29,9 @@ use rclaw_sync::transport::s3::{S3Options, S3Transport};
 use rclaw_sync::transport::SyncTransport;
 
 fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 #[tokio::test]
@@ -114,7 +116,8 @@ async fn oss_conditional_create_double_write() {
         .await
         .unwrap_or_else(|error| panic!("读回失败: {error}"));
     assert_eq!(
-        kept, b"first",
+        kept,
+        b"first",
         "第二次写入被拒了，但读回内容不是第一次的：{:?}",
         String::from_utf8_lossy(&kept)
     );

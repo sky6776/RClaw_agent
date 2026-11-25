@@ -123,9 +123,9 @@ async fn save_with_secret(
     let write_home = home.clone();
     // 只有向导里真的编辑过（草稿与打开时的名字不同）才算这次请求明确改了设备名。
     // 只传「用户明确改过名」的目标；原值由引擎在锁内按磁盘最新一名判定。
-    let explicit_device_name = device_name_baseline.as_deref().and_then(|baseline| {
-        (config.device_name != baseline).then(|| config.device_name.clone())
-    });
+    let explicit_device_name = device_name_baseline
+        .as_deref()
+        .and_then(|baseline| (config.device_name != baseline).then(|| config.device_name.clone()));
     engine
         .save_storage_with(
             config,
@@ -858,7 +858,10 @@ fn cached_snapshot(
         .ok_or_else(|| {
             // 有这一条、但本机那份已经被改写过：说清楚是内容对不上，别让用户以为
             // 从来没下载过。
-            if items.iter().any(|item| matching(&item) && item.state == "changed") {
+            if items
+                .iter()
+                .any(|item| matching(&item) && item.state == "changed")
+            {
                 CHANGED_SNAPSHOT.to_string()
             } else {
                 "这个附件不在本机的同步缓存里（可能还没有下载，或者已经被清理）".to_string()
@@ -1228,7 +1231,9 @@ fn save_snapshot_checked(
         // 目标位置已经有一份：同一次读里比较它和缓存副本、并核对缓存副本的摘要。
         let mut same = true;
         match engine
-            .copy_cached_blob(blob, &mut |reader| compare_snapshot(reader, &target, &mut same))
+            .copy_cached_blob(blob, &mut |reader| {
+                compare_snapshot(reader, &target, &mut same)
+            })
             .map_err(|e| format!("存进工作区失败: {e}"))?
         {
             rclaw_sync::AttachmentCopy::Copied if same => {
@@ -1260,9 +1265,9 @@ fn save_snapshot_checked(
         |file| {
             // 读出来的字节直接写进目标文件，摘要就在这同一次读里算、读完后核对；
             // 对不上时返回错误，`write_fresh_file` 会把刚写的这份删掉。
-            match engine.copy_cached_blob(blob, &mut |reader| {
-                std::io::copy(reader, file).map(|_| ())
-            }) {
+            match engine
+                .copy_cached_blob(blob, &mut |reader| std::io::copy(reader, file).map(|_| ()))
+            {
                 Ok(rclaw_sync::AttachmentCopy::Copied) => Ok(()),
                 Ok(other) => {
                     outcome.set(Some(other));
@@ -1297,11 +1302,7 @@ fn save_snapshot_checked(
 
 /// 把 `reader`（核对过的缓存副本）与 `target` 逐块比较，读到来源结尾为止（摘要要覆盖
 /// 全部内容）；不一样、或者目标读不了，就把 `same` 置 false。
-fn compare_snapshot(
-    reader: &mut dyn Read,
-    target: &Path,
-    same: &mut bool,
-) -> std::io::Result<()> {
+fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> std::io::Result<()> {
     let mut other = std::fs::File::open(target).ok();
     if other.is_none() {
         // 打不开（被占用/没有权限）：算不上「一样」，按「另存一份」走；来源照读到底，

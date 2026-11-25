@@ -196,13 +196,11 @@ fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<()> {
     let parent = path
         .parent()
         .and_then(|parent| std::fs::canonicalize(parent).ok())
-        .ok_or_else(|| {
-            std::io::Error::other(format!("无法规范化目标父目录 {}", path.display()))
-        })?;
+        .ok_or_else(|| std::io::Error::other(format!("无法规范化目标父目录 {}", path.display())))?;
     let leaf = |leaf: &Path| -> std::io::Result<Vec<u16>> {
-        let name = leaf.file_name().ok_or_else(|| {
-            std::io::Error::other(format!("路径没有文件名 {}", leaf.display()))
-        })?;
+        let name = leaf
+            .file_name()
+            .ok_or_else(|| std::io::Error::other(format!("路径没有文件名 {}", leaf.display())))?;
         Ok(parent
             .join(name)
             .as_os_str()

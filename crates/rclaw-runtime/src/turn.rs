@@ -2815,7 +2815,8 @@ impl TurnManager {
                 ensure_dir_is_real(&layout.memory_dir, &layout.base)
             })
             .await;
-            if let Err(message) = checked.unwrap_or_else(|e| Err(format!("任务执行异常: {e}"))) {
+            if let Err(message) = checked.unwrap_or_else(|e| Err(format!("任务执行异常: {e}")))
+            {
                 return format!(
                     "⚠️ 记忆目录安全检查未通过，没有清空任何内容、也没有同步任何删除：\
                      {message}\n\n请检查目录之后重试：{retry}"
@@ -2825,10 +2826,12 @@ impl TurnManager {
         // 同步侧先做（退出同步空间，或把会话删除传给其他设备）：它失败就什么都不清。
         // 记忆的删除在这里只留副本、登记清理意图（不可发布），等本地清空成功后才提交。
         let (mut sync_note, memory_clear) = match (&control, scope) {
-            (Some(control), Some(scope)) => match self.prepare_clear(control.clone(), scope).await {
-                Ok(result) => result,
-                Err(reply) => return reply,
-            },
+            (Some(control), Some(scope)) => {
+                match self.prepare_clear(control.clone(), scope).await {
+                    Ok(result) => result,
+                    Err(reply) => return reply,
+                }
+            }
             _ => (String::new(), None),
         };
         let session = self.session.clone();
@@ -2856,10 +2859,8 @@ impl TurnManager {
         if all_scope && control.is_some() && matches!(&cleared, Ok(Ok(_))) {
             if let Some((ids, op)) = memory_clear {
                 let sync = control.as_ref().unwrap().clone();
-                let committed = tokio::task::spawn_blocking(move || {
-                    sync.commit_memory_clear(&ids, &op)
-                })
-                .await;
+                let committed =
+                    tokio::task::spawn_blocking(move || sync.commit_memory_clear(&ids, &op)).await;
                 match committed {
                     Ok(Ok(0)) => {}
                     Ok(Ok(count)) => {

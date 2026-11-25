@@ -68,11 +68,7 @@ pub fn server(agent_root: PathBuf) -> &'static StreamServer {
 
 /// 生成某工作区媒体路径的流式 URL（含 token）。路径守卫失败返回 None。
 /// 命令入口：确保服务已按 agent 根目录启动，再取流式 URL。
-pub fn stream_url_with_root(
-    agent_root: PathBuf,
-    path: &str,
-    pin: Option<&str>,
-) -> Option<String> {
+pub fn stream_url_with_root(agent_root: PathBuf, path: &str, pin: Option<&str>) -> Option<String> {
     server(agent_root);
     stream_url(path, pin)
 }

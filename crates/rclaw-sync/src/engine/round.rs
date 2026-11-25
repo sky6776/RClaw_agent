@@ -23,7 +23,8 @@ use crate::attach::{self, now_ms, Backlog};
 use crate::codec;
 use crate::config::SyncConfig;
 use crate::db::{self, scope, Range, BLOB_REMOTE};
-use crate::error::{Result, SyncError};use crate::files;
+use crate::error::{Result, SyncError};
+use crate::files;
 use crate::identity::{self, Identity};
 use crate::map;
 use crate::merge::{self, MergeReport};
@@ -502,7 +503,10 @@ impl Session {
             }
             self.aliases_due = None;
             on_pool(ctx, |ctx| wire::settle_aliases(&ctx.env, None, None)).await?;
-        } else if self.aliases_due.is_none_or(|at| at.elapsed() >= ALIAS_RETRY_EVERY) {
+        } else if self
+            .aliases_due
+            .is_none_or(|at| at.elapsed() >= ALIAS_RETRY_EVERY)
+        {
             // 别的轮次不再自动补别名：但暂缓的落点（目标一时占用、读不了）得有机会在
             // 空闲轮里补上——有界的间隔重试，占用的目标解除后自己接上。
             self.aliases_due = Some(Instant::now());

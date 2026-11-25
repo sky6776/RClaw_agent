@@ -588,8 +588,8 @@ pub async fn download(
         let blob_id = blob_id.to_string();
         let repair_ctx = ctx.clone();
         let token = commit.token();
-        let (result, sealed, plain) = tokio::task::spawn_blocking(
-            move || -> (Result<()>, Scratch, Scratch) {
+        let (result, sealed, plain) =
+            tokio::task::spawn_blocking(move || -> (Result<()>, Scratch, Scratch) {
                 let outcome = (|| -> Result<()> {
                     let mut reader = std::io::BufReader::new(std::fs::File::open(&sealed.0)?);
                     let mut writer = std::io::BufWriter::new(std::fs::File::create(&plain.0)?);
@@ -612,10 +612,9 @@ pub async fn download(
                     Ok(())
                 })();
                 (outcome, sealed, plain)
-            },
-        )
-        .await
-        .map_err(|e| SyncError::other(format!("附件解密任务失败: {e}")))?;
+            })
+            .await
+            .map_err(|e| SyncError::other(format!("附件解密任务失败: {e}")))?;
         result?;
         Ok((sealed, plain, commit))
     }
@@ -674,8 +673,7 @@ fn place(ctx: &Ctx, commit: &Commit, blob_id: &str, plain: &Path) -> Result<Path
     let target = if original.as_ref().is_ok_and(|target| {
         !target.exists()
             || target.is_file()
-                && (is_artifact && is_placeholder(target, row.size)
-                    || same_content(target, plain))
+                && (is_artifact && is_placeholder(target, row.size) || same_content(target, plain))
     }) {
         original?
     } else {
@@ -1215,8 +1213,8 @@ pub fn on_blob_want_at(
     // 本地文件已经放回原处：撤掉占着位置的「等待取回」登记，让下面照常按 `gone`
     // 记录重新登记成待上传（重试落空留下的 REMOTE 行不再挡住恢复）。
     if let Some(env) = env {
-        if let Some(note) = db::state_get(conn, scope::BLOB_GONE, blob_id)?
-            .and_then(|row| row.json::<GoneNote>())
+        if let Some(note) =
+            db::state_get(conn, scope::BLOB_GONE, blob_id)?.and_then(|row| row.json::<GoneNote>())
         {
             // 必须核对内容再算「放回原处」：原地那个文件可能已经被改写过，换成上传只会
             // 让上传端拒掉、连自动重取也一起没了。

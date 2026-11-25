@@ -428,7 +428,9 @@ pub(crate) fn stash_memory_clear(
     // 留了下来——重启后的普通对比会把缺掉的一两条当成正常删除发给别的设备。落盘失败就
     // 返回错误，调用方不会继续删文件；重试走的也是这条路，同样要先落盘。
     db::flush(ctx.db()).map_err(|error| {
-        SyncError::other(format!("「正在清理记忆」的意图没能落盘（{error}），没有删本机文件"))
+        SyncError::other(format!(
+            "「正在清理记忆」的意图没能落盘（{error}），没有删本机文件"
+        ))
     })?;
     Ok((ids, op))
 }
@@ -747,8 +749,7 @@ pub(crate) fn attachments(
             };
             // 没有登记、却留着「原本在这台设备上、后来拿不出来」的记录：照实说，
             // 别给一个必然失败的「重新下载」。
-            let was_mine = row.is_none()
-                && db::state_get(conn, scope::BLOB_GONE, blob)?.is_some();
+            let was_mine = row.is_none() && db::state_get(conn, scope::BLOB_GONE, blob)?.is_some();
             Ok((row, remote, was_mine))
         };
         for (message_id, gid, refs) in rows {
@@ -1085,14 +1086,11 @@ fn open_regular(path: &Path) -> Option<std::fs::File> {
 }
 
 /// 这个版本的摘要与「读完的时刻」。缓存命中不算读（不刷新时刻）。
-pub(crate) fn cached_digest(
-    path: &str,
-    version: &FileVersion,
-) -> Option<([u8; 32], Instant)> {
+pub(crate) fn cached_digest(path: &str, version: &FileVersion) -> Option<([u8; 32], Instant)> {
     let mut cache = DIGEST_CACHE.lock().ok()?;
-    let at = cache.iter().position(|entry| {
-        entry.path == path && entry.version == *version
-    })?;
+    let at = cache
+        .iter()
+        .position(|entry| entry.path == path && entry.version == *version)?;
     let entry = cache.remove(at);
     let found = (entry.digest, entry.at);
     cache.push(entry);
@@ -1162,8 +1160,8 @@ fn verification_cost(ctx: &Ctx, found: &FoundRef) -> u64 {
             continue;
         };
         let key = path.to_string_lossy().into_owned();
-        let fresh = cached_digest(&key, &version)
-            .is_some_and(|(_, at)| at.elapsed() < DIGEST_TRUST);
+        let fresh =
+            cached_digest(&key, &version).is_some_and(|(_, at)| at.elapsed() < DIGEST_TRUST);
         if !fresh {
             cost = cost.saturating_add(meta.len());
         }
@@ -1588,7 +1586,9 @@ mod tests {
         assert!(tail_remote_blobs(ctx, "desktop", "c1", 20, 4, start)
             .unwrap()
             .is_empty());
-        assert!(attachments(ctx, None, "desktop", "nope", None).unwrap().is_empty());
+        assert!(attachments(ctx, None, "desktop", "nope", None)
+            .unwrap()
+            .is_empty());
 
         // 去取过、同步空间里没有的：照它现在的情况说（§8.7）。
         let (hour, day) = (3600 * 1000, 24 * 3600 * 1000);

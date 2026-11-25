@@ -78,10 +78,10 @@ pub(crate) fn lock_is_contended(error: &std::io::Error) -> bool {
 pub use bundle::{export_session, import_session, ImportOptions, Imported};
 pub use config::{Scopes, SyncConfig, SyncPaths};
 pub use engine::{
-    pairing_config, storage_intent_clear_if, storage_intent_config, storage_intent_plan,
-    storage_intent_save, AttachmentBytes, AttachmentCopy, AttachmentReadCheck, AttachmentStage,
-    ConfigRefresh, IntentDeviceNameEdit, StorageIntentPlan, StorageLock, SyncDeps, SyncEngine,
-    file_version_pin, file_version_pin_of,
+    file_version_pin, file_version_pin_of, pairing_config, storage_intent_clear_if,
+    storage_intent_config, storage_intent_plan, storage_intent_save, AttachmentBytes,
+    AttachmentCopy, AttachmentReadCheck, AttachmentStage, ConfigRefresh, IntentDeviceNameEdit,
+    StorageIntentPlan, StorageLock, SyncDeps, SyncEngine,
 };
 pub use error::{Result, SyncError, TransportError};
 pub use pairing::PairingCode;
@@ -331,7 +331,8 @@ impl SpaceEpoch {
 
     /// 连上了新的空间：重新打开提交入口。
     pub fn reopen(&self) {
-        self.sealed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.sealed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 开始一个提交阶段（落文件、记账）：结算之前 `teardown` 会等它。入口关着时拿到的

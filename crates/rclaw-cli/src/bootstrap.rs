@@ -611,11 +611,7 @@ pub async fn assemble_core_with(
                             }
                         }
                         if merged != base {
-                            match crate::sync::save_sync_config(
-                                &sync_config_path,
-                                &base,
-                                &merged,
-                            ) {
+                            match crate::sync::save_sync_config(&sync_config_path, &base, &merged) {
                                 Ok(()) => sync_config = merged,
                                 Err(error) => {
                                     // 没写成就按磁盘上这一份启动：意图留着，worker 的

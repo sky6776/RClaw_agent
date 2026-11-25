@@ -427,9 +427,12 @@ oss_forbid_overwrite = true
         .unwrap();
         assert!(config.s3.oss_forbid_overwrite);
         // 老配置没有这个键：默认关。
-        let old: SyncConfig = toml::from_str("[s3]
+        let old: SyncConfig = toml::from_str(
+            "[s3]
 endpoint = \"https://s3.example.com\"
-").unwrap();
+",
+        )
+        .unwrap();
         assert!(!old.s3.oss_forbid_overwrite);
     }
 

@@ -5277,9 +5277,9 @@ async fn check_media_read(
     match outcome {
         rclaw_sync::AttachmentReadCheck::Verified { pin } => Ok(Some(pin)),
         rclaw_sync::AttachmentReadCheck::Unverifiable => Ok(None),
-        rclaw_sync::AttachmentReadCheck::Mismatch => Err(
-            "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
-        ),
+        rclaw_sync::AttachmentReadCheck::Mismatch => {
+            Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
+        }
     }
 }
 
@@ -5305,9 +5305,9 @@ async fn check_media_read_cached(
     match outcome {
         rclaw_sync::AttachmentReadCheck::Verified { pin } => Ok(Some(pin)),
         rclaw_sync::AttachmentReadCheck::Unverifiable => Ok(None),
-        rclaw_sync::AttachmentReadCheck::Mismatch => Err(
-            "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
-        ),
+        rclaw_sync::AttachmentReadCheck::Mismatch => {
+            Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
+        }
     }
 }
 
@@ -5356,9 +5356,7 @@ pub async fn media_preview(
                     ))
                 }
                 rclaw_sync::AttachmentBytes::Rejected => {
-                    return Err(
-                        "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
-                    )
+                    return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
                 rclaw_sync::AttachmentBytes::Unverifiable => None,
             }
@@ -5449,9 +5447,7 @@ fn image_preview_bytes(
             .collect()
     };
     // 内容寻址的缩略图缓存：同一份内容已经算过就直接用（重开会话、画廊来回滑不重解码）。
-    let cache_dir = home
-        .join("agent")
-        .join(MEDIA_PREVIEW_CACHE_DIR);
+    let cache_dir = home.join("agent").join(MEDIA_PREVIEW_CACHE_DIR);
     let cache_base = cache_dir.join(&key);
     for (ext, cache_mime) in [("jpg", "image/jpeg"), ("png", "image/png")] {
         if let Ok(cached) = std::fs::read(cache_base.with_extension(ext)) {
@@ -5602,18 +5598,11 @@ pub async fn media_base64(
     blob: Option<String>,
 ) -> Result<MediaPayload, String> {
     // 同步附件：读到内存里、核对过的那份字节直接编码（同一次读里算的摘要）。
-    if let (Some(chat_id), Some(blob), Some(engine)) =
-        (chat_id.clone(), blob.clone(), state.sync())
+    if let (Some(chat_id), Some(blob), Some(engine)) = (chat_id.clone(), blob.clone(), state.sync())
     {
         let source = path.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || {
-            engine.read_attachment_bytes(
-                CHANNEL_DESKTOP,
-                &chat_id,
-                &blob,
-                &source,
-                MEDIA_MAX_BYTES,
-            )
+            engine.read_attachment_bytes(CHANNEL_DESKTOP, &chat_id, &blob, &source, MEDIA_MAX_BYTES)
         })
         .await
         .map_err(|e| format!("读取媒体任务失败: {e}"))?;
@@ -5633,9 +5622,7 @@ pub async fn media_base64(
                 ))
             }
             rclaw_sync::AttachmentBytes::Rejected => {
-                return Err(
-                    "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
-                )
+                return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
             }
             rclaw_sync::AttachmentBytes::Unverifiable => {}
         }
@@ -6066,16 +6053,19 @@ pub async fn save_media(
     let kind = media_kind_of(&path);
     // 同步附件：保存的必须是核对过的那份内容——先把它按对象核对并复制成暂存副本
     // （流式，大文件也行），再保存这份副本（不再「核对路径 → 再按路径复制」）。
-    if let (Some(chat_id), Some(blob), Some(engine)) =
-        (chat_id.clone(), blob.clone(), state.sync())
+    if let (Some(chat_id), Some(blob), Some(engine)) = (chat_id.clone(), blob.clone(), state.sync())
     {
         let dest_rel = format!(
             "media/cache/export/{}/{}",
             rclaw_sync::ids::random_hex::<6>(),
             path.rsplit('/').next().unwrap_or("export.bin")
         );
-        let (source, target, blob_id, chat) =
-            (path.clone(), dest_rel.clone(), blob.clone(), chat_id.clone());
+        let (source, target, blob_id, chat) = (
+            path.clone(),
+            dest_rel.clone(),
+            blob.clone(),
+            chat_id.clone(),
+        );
         let staged = run_blocking("核对附件", move || {
             Ok(engine.stage_attachment_copy(
                 CHANNEL_DESKTOP,
@@ -6106,9 +6096,7 @@ pub async fn save_media(
                 .await;
             }
             rclaw_sync::AttachmentStage::Rejected => {
-                return Err(
-                    "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
-                )
+                return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
             }
             rclaw_sync::AttachmentStage::Unverifiable => {}
         }
@@ -6310,7 +6298,7 @@ pub async fn share_media(
                     &chat_id,
                     &blob,
                     &source,
-                "media/cache/share",
+                    "media/cache/share",
                     &target,
                 ))
             })
@@ -6321,9 +6309,7 @@ pub async fn share_media(
                 // 对不上、或者暂存失败（磁盘满、路径不安全）：别转发——转发原路径可能
                 // 是另一个版本。
                 rclaw_sync::AttachmentStage::Rejected => {
-                    return Err(
-                        "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
-                    )
+                    return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
                 // 核不了（没有登记/读不出密钥）：按老行为转发原路径。
                 rclaw_sync::AttachmentStage::Unverifiable => {}
@@ -6581,9 +6567,7 @@ pub async fn media_stream_url(
                     });
                 }
                 rclaw_sync::AttachmentStage::Rejected => {
-                    return Err(
-                        "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
-                    )
+                    return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
                 rclaw_sync::AttachmentStage::Unverifiable => playback_unverifiable = true,
             }

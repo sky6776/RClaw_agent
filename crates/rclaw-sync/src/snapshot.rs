@@ -345,7 +345,9 @@ struct Maint {
 }
 
 /// `floor_abandoned` 的兼容读法：老版本存的是单个 `(键, 摘要)`，新版本是它们的列表。
-fn deserialize_abandoned<'de, D>(deserializer: D) -> std::result::Result<Vec<(String, String)>, D::Error>
+fn deserialize_abandoned<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<(String, String)>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -541,7 +543,8 @@ impl Memo {
         if self.backoff.len() > MEMO_MANIFESTS * 4 {
             self.backoff.clear();
         }
-        self.backoff.insert(key.to_string(), now + MANIFEST_BACKOFF_MS);
+        self.backoff
+            .insert(key.to_string(), now + MANIFEST_BACKOFF_MS);
     }
 }
 
@@ -702,11 +705,9 @@ fn settled(conn: &Connection, s: &Settings, now: i64) -> Result<bool> {
     if !s.scopes.sessions {
         return Ok(false);
     }
-    let busy: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sync_inbox)",
-        [],
-        |row| row.get(0),
-    )?;
+    let busy: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_inbox)", [], |row| {
+        row.get(0)
+    })?;
     if busy || seal::has_sendable(conn, s)? {
         return Ok(false);
     }
@@ -939,9 +940,7 @@ impl Producer {
         let now = now_ms();
         let ok = db::read(self.ctx.db(), |conn| settled(conn, &self.s, now))?;
         if !ok {
-            return Err(SyncError::other(
-                "写快照期间队列或范围变了，这份快照作废",
-            ));
+            return Err(SyncError::other("写快照期间队列或范围变了，这份快照作废"));
         }
         fn push(plain: &mut String, origin: &str, line: &str) {
             plain.push_str(origin);
@@ -1358,9 +1357,7 @@ impl Writer {
         // 快照的内容按开始时的范围与计划生成。范围（会话/记忆/技能/附件/通道）在这期间
         // 变了，已经写出去的分片就是旧范围的内容——整份作废，不能收尾发布。
         if !self.settings_match(s) {
-            return Err(SyncError::other(
-                "写快照期间同步范围变了，这份快照作废",
-            ));
+            return Err(SyncError::other("写快照期间同步范围变了，这份快照作废"));
         }
         let started = Instant::now();
         loop {
@@ -1551,9 +1548,7 @@ impl Writer {
                     // 队的行、因范围暂缓的行、范围被收窄）时整份作废。寄存器在写分片时
                     // 就读过了，只有事务里的复核能把「检查与读取之间新登记的行」挡住。
                     if !settled(tx, &s, now_ms())? {
-                        return Err(SyncError::other(
-                            "写快照期间队列或范围变了，这份快照作废",
-                        ));
+                        return Err(SyncError::other("写快照期间队列或范围变了，这份快照作废"));
                     }
                     record.writing = None;
                     record.covers.insert(snap_key(&dev, &name), covered);
@@ -2312,9 +2307,7 @@ async fn sweep_due(
             // orphan 行必须同时带来历记录：只有「从没公布过」的候选才有资格走无依据
             // 删除。旧版本写的行、来源不明的对象（没有记录）一律交给停放逻辑，不删。
             let proven = |path: &str| {
-                snap_key_of_path(path)
-                    .and_then(|key| origins.get(&key).copied())
-                    == Some(false)
+                snap_key_of_path(path).and_then(|key| origins.get(&key).copied()) == Some(false)
             };
             let due: Vec<Due> = rows
                 .into_iter()
@@ -2345,7 +2338,8 @@ async fn sweep_due(
     // 轮不到失败退避）。
     let manifest_deferred = |path: &str| {
         path.ends_with(".snap")
-            && snap_key_of_path(path).is_some_and(|key| snap_rows.get(&key).copied().unwrap_or(0) > 1)
+            && snap_key_of_path(path)
+                .is_some_and(|key| snap_rows.get(&key).copied().unwrap_or(0) > 1)
     };
     // 这一轮核验哪一份依据/包：把到期行里的证据去重、按证据键排序，从游标之后的第一份
     // 接着选（没有游标或已经到末尾就回绕到第一份）。
@@ -2450,10 +2444,7 @@ async fn sweep_due(
                     }
                 }
                 _ => {
-                    tracing::debug!(
-                        "汇总包 {} 这轮读不回来，押着它的零散段先不删",
-                        pack.name
-                    );
+                    tracing::debug!("汇总包 {} 这轮读不回来，押着它的零散段先不删", pack.name);
                     retry_keys.insert(key);
                 }
             }
@@ -2463,8 +2454,7 @@ async fn sweep_due(
         if target_key.as_deref() != Some(key.as_str()) {
             continue;
         }
-        if checked_basis == Some(BasisCheck::Intact)
-            && target_key.as_deref() == Some(key.as_str())
+        if checked_basis == Some(BasisCheck::Intact) && target_key.as_deref() == Some(key.as_str())
         {
             target_had_rows = true;
         }
@@ -2494,10 +2484,19 @@ async fn sweep_due(
     let had_plain = !plain.is_empty();
     let mut sequence: Vec<(String, Option<String>, Option<String>, bool)> = Vec::new();
     if memo.gc_plain_first && had_plain {
-        sequence.push((plain[0].0.clone(), plain[0].1.clone(), plain[0].2.clone(), true));
+        sequence.push((
+            plain[0].0.clone(),
+            plain[0].1.clone(),
+            plain[0].2.clone(),
+            true,
+        ));
         plain.remove(0);
     }
-    sequence.extend(deletable.into_iter().map(|(path, b, p)| (path, b, p, false)));
+    sequence.extend(
+        deletable
+            .into_iter()
+            .map(|(path, b, p)| (path, b, p, false)),
+    );
     sequence.extend(plain.into_iter().map(|(path, b, p)| (path, b, p, true)));
     let mut done: Vec<String> = Vec::new();
     let mut plain_attempted = false;
@@ -2518,10 +2517,9 @@ async fn sweep_due(
         if is_plain {
             plain_attempted = true;
         }
-        if target_key
-            .as_deref()
-            .is_some_and(|key| basis_key.as_deref() == Some(key) || pack_key.as_deref() == Some(key))
-        {
+        if target_key.as_deref().is_some_and(|key| {
+            basis_key.as_deref() == Some(key) || pack_key.as_deref() == Some(key)
+        }) {
             target_attempted = true;
         }
         match transport.delete(&path).await {
@@ -2664,7 +2662,11 @@ async fn basis_intact(
             }
             _ => false,
         };
-        if !trusted && verify_snapshot_part(transport, keys, dev, name, part).await.is_err() {
+        if !trusted
+            && verify_snapshot_part(transport, keys, dev, name, part)
+                .await
+                .is_err()
+        {
             return BasisCheck::Broken;
         }
     }
@@ -2709,9 +2711,11 @@ async fn basis_seed(ctx: &Ctx, key: &str, digest: &str) -> Result<Vec<String>> {
 /// 新快照的向量是否覆盖了旧快照的每一段：每个设备记的位置都不比旧的少。只有这样才能
 /// 说「旧快照能恢复的，新快照也恢复得了」，删旧对象不会减少可达的历史。
 fn covers_dominates(new: &Manifest, old: &Manifest) -> bool {
-    old.vector
-        .iter()
-        .all(|(device, entry)| new.vector.get(device).is_some_and(|mine| mine.seq >= entry.seq))
+    old.vector.iter().all(|(device, entry)| {
+        new.vector
+            .get(device)
+            .is_some_and(|mine| mine.seq >= entry.seq)
+    })
 }
 
 /// 一个快照覆盖了本机日志到哪里。它的向量里记的必须确实是本机这条日志上的位置。
@@ -2755,12 +2759,17 @@ async fn refresh_covers(
             refs.extend(log.snap.clone().map(|snap| (me.clone(), snap)));
             // 候选快照还没接管 head：把它也放进名单，分批核验才有预算轮到它。
             if let Some(pending) = &record.snap_pending {
-                if log.snap.as_ref().map(|snap| snap.name.as_str()) != Some(pending.name.as_str())
-                {
+                if log.snap.as_ref().map(|snap| snap.name.as_str()) != Some(pending.name.as_str()) {
                     refs.push((me.clone(), pending.clone()));
                 }
             }
-            Ok((refs, record.covers, record.covers_checked, log, seal::seg_entries(conn)?))
+            Ok((
+                refs,
+                record.covers,
+                record.covers_checked,
+                log,
+                seal::seg_entries(conn)?,
+            ))
         })
     })
     .await?;
@@ -2782,7 +2791,8 @@ async fn refresh_covers(
         let need_cover = known.get(&key).is_none();
         // 核验还没做完的也要清单（分片名单在清单里）：只读内存里有的，不额外占预算。
         let label = checked.get(&key);
-        let need_verify = label.is_none_or(|entry| !entry.complete() || entry.digest != snap.digest);
+        let need_verify =
+            label.is_none_or(|entry| !entry.complete() || entry.digest != snap.digest);
         if !need_cover && !need_verify {
             covers.insert(key.clone(), known[&key]);
             continue;
@@ -3147,7 +3157,10 @@ async fn promote_floor(
                 return Ok(None);
             }
             let mut log = db::log_state(tx)?;
-            for entry in seal::seg_entries(tx)?.iter().filter(|entry| entry.to <= floor) {
+            for entry in seal::seg_entries(tx)?
+                .iter()
+                .filter(|entry| entry.to <= floor)
+            {
                 seal::del_seg_entry(tx, entry.to)?;
             }
             let packs = upload::pack_entries(tx)?;
@@ -3263,7 +3276,10 @@ async fn promote_snap(
     let manifest = match fetch_manifest(transport, keys, memo, &s.device, &pending).await {
         Ok(manifest) => manifest,
         Err(error) if skippable(&error) => {
-            tracing::debug!("读候选快照 {} 的清单失败（下一轮再试）: {error}", pending.name);
+            tracing::debug!(
+                "读候选快照 {} 的清单失败（下一轮再试）: {error}",
+                pending.name
+            );
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -3276,7 +3292,11 @@ async fn promote_snap(
                 let log = db::log_state(conn)?;
                 let entries = seal::seg_entries(conn)?;
                 let covered = coverage(&manifest, &device, &log, &entries);
-                Ok((covered >= log.floor, log.snap.clone(), snapshot_dir(&device)))
+                Ok((
+                    covered >= log.floor,
+                    log.snap.clone(),
+                    snapshot_dir(&device),
+                ))
             })
         }
     })
@@ -3299,7 +3319,10 @@ async fn promote_snap(
     // 上一份快照的覆盖不能比候选多：逐个设备比清单里的向量，候选都覆盖到了才允许
     // 退位。读不出上一份的清单时无法证明替代关系——不晋升：撤走旧指针会让新设备
     // 找不到那段历史（候选留在原地，下一轮再试）。
-    let dominates = match previous.as_ref().filter(|previous| previous.name != pending.name) {
+    let dominates = match previous
+        .as_ref()
+        .filter(|previous| previous.name != pending.name)
+    {
         Some(previous) => match fetch_manifest(transport, keys, memo, &s.device, previous).await {
             Ok(old) => covers_dominates(&manifest, &old),
             Err(error) if skippable(&error) => {
@@ -3316,10 +3339,7 @@ async fn promote_snap(
     if !dominates {
         // 候选覆盖不到上一份的某些设备：保留旧指针（head 仍指向能恢复更多历史的那份），
         // 候选留在 snap_pending，等后续同步补齐或下一份候选。
-        tracing::debug!(
-            "候选快照 {} 的向量不支配上一份，保留旧指针",
-            pending.name
-        );
+        tracing::debug!("候选快照 {} 的向量不支配上一份，保留旧指针", pending.name);
         return Ok(());
     }
     let device = s.device.clone();
@@ -3771,7 +3791,12 @@ mod tests {
             .unwrap()?;
             let snap = loop {
                 if let Some(snap) = writer
-                    .step(self.ctx(), transport, &self.device.settings, Duration::from_secs(60))
+                    .step(
+                        self.ctx(),
+                        transport,
+                        &self.device.settings,
+                        Duration::from_secs(60),
+                    )
                     .await
                     .unwrap()
                 {

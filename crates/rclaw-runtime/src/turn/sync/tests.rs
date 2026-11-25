@@ -450,7 +450,10 @@ async fn clear_in_a_sync_space_needs_a_scope() {
     // all：先把会话删除传给其他设备，再清本机；清完通知引擎发布。
     let done = rig.mgr.handle_clear("/clear confirm ALL").await;
     assert!(done.starts_with("✅"), "{done}");
-    assert!(done.contains("已把 3 个已发布会话的删除传给其他设备"), "{done}");
+    assert!(
+        done.contains("已把 3 个已发布会话的删除传给其他设备"),
+        "{done}"
+    );
     assert!(wiped(&rig));
     assert_eq!(sync.purged.load(Ordering::SeqCst), 1);
     assert_eq!(sync.left.load(Ordering::SeqCst), 0);

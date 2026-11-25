@@ -125,9 +125,7 @@ const BATCH_ROWS: usize = 500;
 fn in_range(range: &Option<db::Range>, channel: &str) -> bool {
     match range {
         None => true,
-        Some(range) => {
-            range.sessions && range.channels.iter().any(|known| known == channel)
-        }
+        Some(range) => range.sessions && range.channels.iter().any(|known| known == channel),
     }
 }
 
@@ -138,9 +136,8 @@ pub(crate) fn has_sendable(conn: &Connection, s: &crate::publish::Settings) -> R
     let range = db::Range::of(s);
     let mut after = i64::MIN;
     loop {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, op FROM sync_outbox WHERE id > ?1 ORDER BY id LIMIT ?2",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT id, op FROM sync_outbox WHERE id > ?1 ORDER BY id LIMIT ?2")?;
         let mut rows = stmt.query(params![after, BATCH_ROWS as i64])?;
         let mut fetched = 0usize;
         while let Some(row) = rows.next()? {
@@ -175,9 +172,8 @@ pub(crate) fn has_deferred(conn: &Connection, s: &crate::publish::Settings) -> R
     let range = db::Range::of(s);
     let mut after = i64::MIN;
     loop {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, op FROM sync_outbox WHERE id > ?1 ORDER BY id LIMIT ?2",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT id, op FROM sync_outbox WHERE id > ?1 ORDER BY id LIMIT ?2")?;
         let mut rows = stmt.query(params![after, BATCH_ROWS as i64])?;
         let mut fetched = 0usize;
         while let Some(row) = rows.next()? {
@@ -280,10 +276,19 @@ fn read_pending(conn: &Connection, ctx: &Ctx, budget: usize) -> Result<Vec<Pendi
                 });
                 continue;
             };
-            let kind = value.get("t").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let kind = value
+                .get("t")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
             // 完整的线上行（设备轮换重排的 msg 没有引用）与带引用的消息行都带着线程 id，
             // 统一按范围过滤；带引用的消息在载入之后还有一道按会话通道的核对。
-            if !in_scope(conn, &range, &kind, value.get("sid").and_then(|v| v.as_str()))? {
+            if !in_scope(
+                conn,
+                &range,
+                &kind,
+                value.get("sid").and_then(|v| v.as_str()),
+            )? {
                 continue;
             }
             let body = match (kind.as_str(), value.get("ref").and_then(|v| v.as_i64())) {

@@ -1980,7 +1980,10 @@ mod delete_tests {
         insert_run(&store, "run-a", STATUS_COMPLETED, None);
         insert_run(&store, "run-b", STATUS_COMPLETED, None);
 
-        assert_eq!(store.delete_run("run-a").expect("删除 run-a"), DeleteOutcome::Deleted);
+        assert_eq!(
+            store.delete_run("run-a").expect("删除 run-a"),
+            DeleteOutcome::Deleted
+        );
         assert!(store.get_run("run-a").expect("查 run-a").is_none());
         assert!(store.get_run("run-b").expect("查 run-b").is_some());
 
@@ -1992,8 +1995,15 @@ mod delete_tests {
             "workflow_question",
             "workflow_notification",
         ] {
-            assert_eq!(count_for(&store, table, "run-a"), 0, "{table} 里 run-a 的行应一并删除");
-            assert!(count_for(&store, table, "run-b") > 0, "{table} 里 run-b 不应被牵连");
+            assert_eq!(
+                count_for(&store, table, "run-a"),
+                0,
+                "{table} 里 run-a 的行应一并删除"
+            );
+            assert!(
+                count_for(&store, table, "run-b") > 0,
+                "{table} 里 run-b 不应被牵连"
+            );
         }
 
         // 幂等键保留：只断开 run 关联，缓存响应原样留着（否则同一 request_id 重试会
@@ -2010,7 +2020,9 @@ mod delete_tests {
             .expect("读请求行");
         assert!(request_run.is_none(), "请求行应保留但 run_id 置空");
         assert!(
-            response.as_deref().is_some_and(|value| value.contains("kept")),
+            response
+                .as_deref()
+                .is_some_and(|value| value.contains("kept")),
             "原响应应原样保留（幂等重试返回它）"
         );
 
@@ -2031,7 +2043,10 @@ mod delete_tests {
         );
 
         // 重复删除：主行已不在 → NotFound。
-        assert_eq!(store.delete_run("run-a").expect("重复删除"), DeleteOutcome::NotFound);
+        assert_eq!(
+            store.delete_run("run-a").expect("重复删除"),
+            DeleteOutcome::NotFound
+        );
     }
 
     #[test]
@@ -2039,10 +2054,16 @@ mod delete_tests {
         let store = temp_store("refuse");
 
         insert_run(&store, "run-run", STATUS_RUNNING, None);
-        assert_eq!(store.delete_run("run-run").expect("删运行中"), DeleteOutcome::Active);
+        assert_eq!(
+            store.delete_run("run-run").expect("删运行中"),
+            DeleteOutcome::Active
+        );
 
         insert_run(&store, "run-busy", STATUS_STOPPED, Some("run-busy"));
-        assert_eq!(store.delete_run("run-busy").expect("删续跑占用"), DeleteOutcome::Busy);
+        assert_eq!(
+            store.delete_run("run-busy").expect("删续跑占用"),
+            DeleteOutcome::Busy
+        );
 
         // 前驱已终态，但后继还在排队：删前驱会让后继永远等不到前驱。
         insert_run(&store, "run-prev", STATUS_STOPPED, None);
@@ -2061,6 +2082,9 @@ mod delete_tests {
             DeleteOutcome::SuccessorActive
         );
 
-        assert_eq!(store.delete_run("run-missing").expect("删不存在"), DeleteOutcome::NotFound);
+        assert_eq!(
+            store.delete_run("run-missing").expect("删不存在"),
+            DeleteOutcome::NotFound
+        );
     }
 }

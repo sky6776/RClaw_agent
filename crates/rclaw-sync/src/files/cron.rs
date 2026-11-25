@@ -1833,10 +1833,7 @@ pub(crate) fn release_parked(ctx: &Ctx) -> Result<()> {
                                         &ctx.paths,
                                         "cron-handover-unknown",
                                         &key,
-                                        &format!(
-                                            "{}放回了本机，但保持停用",
-                                            title_of(&parked.job)
-                                        ),
+                                        &format!("{}放回了本机，但保持停用", title_of(&parked.job)),
                                         "本机曾把这个任务交给另一台设备，退出 / 重置时没能确认\
                                          它有没有接手。为了不出现两台设备同时执行，放回的这份\
                                          是停用的；到那台设备上核对过之后，在本机的任务表里\

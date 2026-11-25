@@ -378,7 +378,11 @@ impl<R: Read> HashingReader<R> {
     /// 读到头之后的 `(摘要字节, 长度)`。
     pub fn finish(self) -> ([u8; 32], u64) {
         (
-            self.ctx.finish().as_ref().try_into().expect("SHA-256 是 32 字节"),
+            self.ctx
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 是 32 字节"),
             self.total,
         )
     }

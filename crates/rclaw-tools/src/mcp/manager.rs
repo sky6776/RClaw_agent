@@ -674,11 +674,7 @@ mod http_integration_tests {
         /// 成功路径的守门：mock 侧一旦记录过非法请求就立刻失败（否则该错误可能被
         /// 「跳过失败服务器」语义吞掉，测试反而通过）。
         fn assert_no_error(&self) {
-            let error = self
-                .first_error
-                .lock()
-                .expect("错误记录锁未被毒化")
-                .clone();
+            let error = self.first_error.lock().expect("错误记录锁未被毒化").clone();
             assert!(error.is_none(), "mock 收到了非法请求：{error:?}");
         }
 
@@ -691,10 +687,7 @@ mod http_integration_tests {
                     .lock()
                     .expect("tools/list 计数锁未被毒化")
                     .clone(),
-                self.first_error
-                    .lock()
-                    .expect("错误记录锁未被毒化")
-                    .clone(),
+                self.first_error.lock().expect("错误记录锁未被毒化").clone(),
             )
         }
 
@@ -855,9 +848,7 @@ mod http_integration_tests {
                         .to_string(),
                 )
             }
-            MockRequest::Notification { .. } => {
-                ("202 Accepted", "application/json", String::new())
-            }
+            MockRequest::Notification { .. } => ("202 Accepted", "application/json", String::new()),
             MockRequest::Call { method, id } => match method.as_str() {
                 "initialize" => {
                     shared
@@ -1003,7 +994,9 @@ data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}
         {
             let clients = manager.clients.lock().await;
             for i in 0..COUNT {
-                let slot = clients.get(&format!("srv{i}")).expect("per-server 槽应已建立");
+                let slot = clients
+                    .get(&format!("srv{i}"))
+                    .expect("per-server 槽应已建立");
                 let guard = slot.try_lock().expect("空闲槽应可立即取锁");
                 assert!(guard.is_some(), "srv{i} 的 client 应已在 load() 内写入");
             }

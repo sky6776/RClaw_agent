@@ -226,7 +226,9 @@ impl CronHost for CronAdapter {
     }
 
     fn set_enabled(&self, id: &str, enabled: bool) -> std::result::Result<(), String> {
-        self.0.set_enabled(id, enabled).map_err(|error| error.to_string())
+        self.0
+            .set_enabled(id, enabled)
+            .map_err(|error| error.to_string())
     }
 
     fn remove(&self, id: &str) -> std::result::Result<bool, String> {

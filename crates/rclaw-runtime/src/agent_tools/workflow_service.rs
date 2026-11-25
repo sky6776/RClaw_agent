@@ -23,8 +23,9 @@ use super::workflow::{
 use super::workflow_paths::{resolve_under, session_key, WorkflowPaths};
 use super::workflow_snapshot;
 use super::workflow_store::{
-    self, DeleteOutcome, RunRow, WorkflowStore, STATUS_COMPLETED, STATUS_ERRORED, STATUS_QUEUED, STATUS_RUNNING,
-    STATUS_STOPPED, STATUS_STOPPING, STOP_INTERRUPTED, STOP_MODEL, STOP_SUPERSEDED, STOP_USER,
+    self, DeleteOutcome, RunRow, WorkflowStore, STATUS_COMPLETED, STATUS_ERRORED, STATUS_QUEUED,
+    STATUS_RUNNING, STATUS_STOPPED, STATUS_STOPPING, STOP_INTERRUPTED, STOP_MODEL, STOP_SUPERSEDED,
+    STOP_USER,
 };
 use super::*;
 
@@ -3130,7 +3131,12 @@ impl WorkflowService {
                 "这条运行正在执行，等它结束后再删",
             ));
         }
-        match self.inner.store.delete_run(run_id).map_err(internal_error)? {
+        match self
+            .inner
+            .store
+            .delete_run(run_id)
+            .map_err(internal_error)?
+        {
             DeleteOutcome::Deleted => {
                 // 名额名册里若还有它，一并摘掉：行已经没了，名额不该记在它头上等到重启。
                 self.inner
@@ -3799,10 +3805,7 @@ impl WorkflowService {
                 // 查询失败无法判定：宁可先记着（少算一个名额会突破并发上限），
                 // 由下一轮交接 / 启动时的 clear_stale_capacity_owners 校正。
                 Err(error) => {
-                    tracing::warn!(
-                        "读取 {} 的配额归属失败，先保留名额: {error}",
-                        successor
-                    );
+                    tracing::warn!("读取 {} 的配额归属失败，先保留名额: {error}", successor);
                     capacity.insert(successor);
                 }
             }

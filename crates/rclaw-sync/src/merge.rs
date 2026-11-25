@@ -1350,12 +1350,7 @@ impl Round<'_> {
                             let keys = crate::secrets::Secrets::load(&self.ctx.paths)
                                 .ok()
                                 .and_then(|secrets| secrets.keys().ok());
-                            attach::on_blob_want_at(
-                                tx,
-                                Some(&self.ctx.env),
-                                keys.as_ref(),
-                                &blob,
-                            )?
+                            attach::on_blob_want_at(tx, Some(&self.ctx.env), keys.as_ref(), &blob)?
                         }
                     }
                     settle(tx, row, None)
@@ -1662,7 +1657,9 @@ impl Round<'_> {
         for session in &matching {
             // 占住之后再确认一次：占到之前这条分支可能又往下写了，远端的删除没覆盖到续写
             // 的部分。会话还在这个线程里、末条没变才删，用的是这时墓碑里的彻底删除标记。
-            let current = db::read(ctx.db(), |conn| recheck_tombstone(conn, sid, session.session_id))?;
+            let current = db::read(ctx.db(), |conn| {
+                recheck_tombstone(conn, sid, session.session_id)
+            })?;
             match current {
                 Some((session, purge, now_tip)) if now_tip == tip.map(str::to_string) => {
                     self.remove_session(&session, purge)?;
@@ -2105,7 +2102,9 @@ impl Round<'_> {
             }
             // 占住之后再确认一次：占到之前它可能又往下写了。是不是彻底删除也按这时生效的
             // 墓碑算。
-            let current = db::read(ctx.db(), |conn| recheck_tombstone(conn, sid, session.session_id))?;
+            let current = db::read(ctx.db(), |conn| {
+                recheck_tombstone(conn, sid, session.session_id)
+            })?;
             if let Some((session, purge, _)) = current {
                 self.remove_session(&session, purge)?;
             }
