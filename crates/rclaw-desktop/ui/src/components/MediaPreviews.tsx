@@ -208,6 +208,10 @@ export default function MediaPreviews({
     const extra: PreviewItem[] = [];
     for (const path of mine.keys()) {
       if (seen.has(path)) continue;
+      // 只补「这条消息的正文里真的写到了」的路径：附件清单是从整行的数据里抽的，
+      // 工具调用的参数、思考里提到的文件也在里面，它们不该以图片/文件卡的形式挂到
+      // 这条可见消息下面。
+      if (!content.includes(path)) continue;
       seen.add(path);
       const image = /\.(?:png|jpe?g|webp|gif)$/i.test(path);
       extra.push({
@@ -218,7 +222,7 @@ export default function MediaPreviews({
       });
     }
     return extra.length === 0 ? items : [...items, ...extra];
-  }, [items, mine]);
+  }, [items, mine, content]);
 
   // 视频卡：拉本地流式 URL（含首帧由 <video preload=metadata> 显示）。
   useEffect(() => {

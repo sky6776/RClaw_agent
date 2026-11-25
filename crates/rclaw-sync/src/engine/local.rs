@@ -4,6 +4,7 @@
 //! 都是阻塞调用：宿主从阻塞线程上调（桌面端的命令都包在 `spawn_blocking` 里）。
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -814,7 +815,7 @@ pub(crate) fn attachments(
             // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
             // 里、密钥读不出来）时验不了：按登记说它在（老行为）。
             let verified = |path: &Path| -> bool {
-                keys.is_none_or(|keys| same_blob(keys, path, &found.blob))
+                keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
             };
             let (state, local_path, rel_path) = match &found.row {
                 Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
@@ -935,9 +936,18 @@ fn version_of(meta: &std::fs::Metadata) -> Option<FileVersion> {
     })
 }
 
-fn hash_file_digest(path: &Path) -> Option<[u8; 32]> {
-    let mut file = std::fs::File::open(path).ok()?;
-    sha256_reader(&mut file).ok().map(|(digest, _)| digest)
+/// 登记长度允许的误差：长度是别的设备报来的，下载本身宽出约一个分块（见
+/// `attach::download_max`）。超出这么多的文件不可能是这个对象，连读都不读。
+const SIZE_SLACK: u64 = 1024 * 1024;
+
+/// 读文件算摘要，最多读 `limit` 字节：路径上被换成一个超大文件时不能整读（清单在
+/// 打开会话的关键路径上）。读满了上限还没到文件尾就返回 `None`——判不了它是哪个对象。
+fn hash_file_digest(path: &Path, limit: u64) -> Option<[u8; 32]> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = file.take(limit);
+    let (digest, read) = sha256_reader(&mut reader).ok()?;
+    (read < limit || std::fs::metadata(path).is_ok_and(|meta| meta.len() == limit))
+        .then_some(digest)
 }
 
 /// 这个版本的摘要与「读完的时刻」。缓存命中不算读（不刷新时刻）。
@@ -953,8 +963,8 @@ fn cached_digest(path: &str, version: &FileVersion) -> Option<([u8; 32], Instant
 }
 
 /// 整读一遍并记下这个版本的摘要（同一路径的旧版本被顶掉）。
-fn read_digest(path: &Path, version: &FileVersion) -> Option<[u8; 32]> {
-    let digest = hash_file_digest(path)?;
+fn read_digest(path: &Path, version: &FileVersion, limit: u64) -> Option<[u8; 32]> {
+    let digest = hash_file_digest(path, limit)?;
     if let Ok(mut cache) = DIGEST_CACHE.lock() {
         let key = path.to_string_lossy().into_owned();
         cache.retain(|entry| entry.path != key);
@@ -978,16 +988,23 @@ fn read_digest(path: &Path, version: &FileVersion) -> Option<[u8; 32]> {
 /// 同步动静之后会被反复查询，每次都整读一遍上百个文件不可接受；而时间戳被还原过的
 /// 替换只能靠过期后的重新整读发现，所以两个方向都设了期限——还原成正确内容之后，
 /// 卡上最多一分钟就会自己变回可用。
-fn same_blob(keys: &Keys, path: &Path, blob: &str) -> bool {
+fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
     if !meta.is_file() {
         return false;
     }
+    // 长度差太多的（路径上换成了一个更大的文件之类）不可能是这个对象：连读都不读，
+    // 不能让一个超大文件拖住整份清单。
+    if meta.len().abs_diff(size) > SIZE_SLACK {
+        return false;
+    }
+    let limit = size.saturating_add(SIZE_SLACK);
     let Some(version) = version_of(&meta) else {
         // 判不了有没有变：直接读一遍，不记结论。
-        return hash_file_digest(path).is_some_and(|digest| keys.blob_id(&digest) == blob);
+        return hash_file_digest(path, limit)
+            .is_some_and(|digest| keys.blob_id(&digest) == blob);
     };
     let key = path.to_string_lossy().into_owned();
     if let Some((digest, at)) = cached_digest(&key, &version) {
@@ -995,7 +1012,8 @@ fn same_blob(keys: &Keys, path: &Path, blob: &str) -> bool {
             return keys.blob_id(&digest) == blob;
         }
     }
-    read_digest(path, &version).is_some_and(|digest| keys.blob_id(&digest) == blob)
+    read_digest(path, &version, limit)
+        .is_some_and(|digest| keys.blob_id(&digest) == blob)
 }
 
 /// 一个会话最后 `tail` 条消息引用的、还在别的设备上的附件（打开会话、续聊之前补齐用）。

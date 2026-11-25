@@ -170,8 +170,21 @@ function settle(blob: string, error: string | null) {
     const busy = without(prev.busy, blob);
     const errors =
       error === null ? without(prev.errors, blob) : { ...prev.errors, [blob]: error };
-    if (busy === prev.busy && errors === prev.errors) return prev;
-    return { ...prev, busy, errors };
+    // 重新下载成功：这个对象在各个落点上的旧失败（缓存副本被改写过之类）一并清掉，
+    // 修好的卡不该还挂着上一条错误。
+    let saveErrors = prev.saveErrors;
+    if (error === null) {
+      const prefix = `${blob}:`;
+      const stale = Object.keys(saveErrors).filter((key) => key.startsWith(prefix));
+      if (stale.length > 0) {
+        saveErrors = { ...saveErrors };
+        for (const key of stale) delete saveErrors[key];
+      }
+    }
+    if (busy === prev.busy && errors === prev.errors && saveErrors === prev.saveErrors) {
+      return prev;
+    }
+    return { ...prev, busy, errors, saveErrors };
   });
 }
 
@@ -246,6 +259,11 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     let alive = true;
     let seq = 0;
     let timer: number | undefined;
+    // 「补落点」的复制发生在会话事件之后（`settle_aliases`），成功时不一定再有事件：
+    // 清单里还有「这份内容本机有、但消息路径上没有」的条目时过几秒再看一眼。最多看
+    // 几次——目标被另一份文件占着的，复制会一直不成功。
+    let aliasTimer: number | undefined;
+    let aliasTries = 0;
     const load = async () => {
       const mine = ++seq;
       let list: SyncAttachment[];
@@ -260,7 +278,16 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         }
         return;
       }
-      if (alive && mine === seq) apply(chatId, list);
+      if (!alive || mine !== seq) return;
+      apply(chatId, list);
+      const pendingAlias = list.some(
+        (item) => item.kind === "file" && item.state === "local" && !item.path_present,
+      );
+      if (pendingAlias && aliasTries < 3) {
+        aliasTries += 1;
+        window.clearTimeout(aliasTimer);
+        aliasTimer = window.setTimeout(() => void load(), 3000);
+      }
     };
     // 一次下载、一轮合入会连着来几条事件：合并成一次查询。
     const schedule = () => {
@@ -288,6 +315,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     return () => {
       alive = false;
       window.clearTimeout(timer);
+      window.clearTimeout(aliasTimer);
       if (reload === schedule) reload = null;
       void un.then((fn) => fn());
     };
@@ -516,8 +544,8 @@ const SNAPSHOT_PREVIEW_ONE = 2 * 1024 * 1024;
 /** 正在取的（同一对象多张卡一起进视口时只发一次 IPC，失败后不留在表里）。 */
 const snapshotPending = new Map<string, Promise<string>>();
 
-function rememberSnapshot(blob: string, src: string) {
-  if (src.length > SNAPSHOT_PREVIEW_ONE || snapshotPreviews.has(blob)) return;
+function rememberSnapshot(key: string, src: string) {
+  if (src.length > SNAPSHOT_PREVIEW_ONE || snapshotPreviews.has(key)) return;
   while (
     snapshotPreviews.size > 0 &&
     snapshotPreviewBytes + src.length > SNAPSHOT_PREVIEWS_BUDGET
@@ -527,7 +555,7 @@ function rememberSnapshot(blob: string, src: string) {
     snapshotPreviewBytes -= snapshotPreviews.get(oldest)?.length ?? 0;
     snapshotPreviews.delete(oldest);
   }
-  snapshotPreviews.set(blob, src);
+  snapshotPreviews.set(key, src);
   snapshotPreviewBytes += src.length;
 }
 
@@ -548,14 +576,20 @@ function SnapshotImage({
   path: string;
   alt: string;
 }) {
-  const [src, setSrc] = useState<string | null>(() => snapshotPreviews.get(blob) ?? null);
+  // 预览的样子取决于按哪个路径取（同一个对象引用成 `copy.png` 与 `animation.gif`，
+  // 后者原样返回动画、前者是静态缩略图）：缓存键带上格式。
+  const format = (path.split(".").pop() ?? "").toLowerCase();
+  const cacheKey = `${blob}:${format}`;
+  const [src, setSrc] = useState<string | null>(
+    () => snapshotPreviews.get(cacheKey) ?? null,
+  );
   const box = useRef<HTMLSpanElement | null>(null);
   useEffect(() => {
     if (src) return;
     let alive = true;
     const load = () => {
       // 别的卡可能已经取到了（或者正在取）：直接用，不再发一遍。
-      const known = snapshotPreviews.get(blob);
+      const known = snapshotPreviews.get(cacheKey);
       if (known) {
         setSrc(known);
         return;
@@ -567,7 +601,7 @@ function SnapshotImage({
       if (!request) {
         const started = api.syncAttachmentPreview(chatId, blob, path).then((r) => {
           const url = `data:${r.mime};base64,${r.base64}`;
-          rememberSnapshot(blob, url);
+          rememberSnapshot(cacheKey, url);
           return url;
         });
         request = started;
@@ -604,7 +638,7 @@ function SnapshotImage({
       alive = false;
       observer.disconnect();
     };
-  }, [chatId, blob, path, src]);
+  }, [chatId, blob, path, cacheKey, src]);
   // 没加载出来时不占位，只留一个 1px 的观察点（在卡片正上方，随卡片滚进视口）。
   if (!src) return <span ref={box} className="block h-1 w-full" aria-hidden="true" />;
   return (

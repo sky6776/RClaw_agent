@@ -1555,6 +1555,9 @@ export default function Chat({
       for (const item of syncedAttachments) {
         if (item.kind !== "file" || item.message_id !== e.msgId) continue;
         if (!item.path_present || seen.has(item.path)) continue;
+        // 附件清单是从整行数据里抽的：工具参数、思考里提到的文件也在里面，只有正文
+        // 里真的写到的才进时间线（与 MediaPreviews 的补卡同一口径）。
+        if (!e.content.includes(item.path)) continue;
         const video = /\.(?:mp4|webm|m4v|mov)$/i.test(item.path);
         if (!video && !/\.(?:png|jpe?g|webp|gif)$/i.test(item.path)) continue;
         seen.add(item.path);
