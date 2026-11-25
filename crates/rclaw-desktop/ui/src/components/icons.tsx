@@ -239,13 +239,16 @@ export function QuoteIcon() {
   );
 }
 
-/** 分叉到新会话（一条主线分出东北 / 东南两支，实心箭头）。 */
+/** 分叉到新会话（一条主线分出东北 / 东南两支，缓弧过渡 + 实心箭头）。 */
 export function ForkIcon() {
   return (
     <Svg>
-      <path d="M2.4 13.6 6 10" />
-      <path d="M6 10 11.9 4.1" />
-      <path d="M6 10 11.9 12.1" />
+      {/* 主干：左下 → 分叉点，轻微外弓 */}
+      <path d="M2.4 13.6Q4.7 12.7 6 10" />
+      {/* 上支：分叉点 → 东北（向上缓弧） */}
+      <path d="M6 10Q8.6 6.6 11.9 4.1" />
+      {/* 下支：分叉点 → 东南（向下缓弧） */}
+      <path d="M6 10Q9.2 11.9 11.9 12.1" />
       <path d="M10.4 2.4h3.2v3.2z" fill="currentColor" stroke="none" />
       <path d="M10.4 13.6h3.2v-3.2z" fill="currentColor" stroke="none" />
     </Svg>
