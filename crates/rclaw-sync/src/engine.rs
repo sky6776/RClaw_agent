@@ -1252,7 +1252,7 @@ impl SyncEngine {
         if meta.len().abs_diff(size) > local::SIZE_SLACK {
             return AttachmentReadCheck::Mismatch;
         }
-        let Some(version) = local::version_of(&meta) else {
+        let Some(version) = local::version_of(&path, &meta) else {
             return AttachmentReadCheck::Unverifiable;
         };
         let key = path.to_string_lossy().into_owned();

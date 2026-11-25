@@ -194,16 +194,15 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
                         .is_some()
                         && db::blob_get(tx, &wanted)?
                             .is_some_and(|row| row.state == crate::db::BLOB_REMOTE);
+                    // 只撤「这次重试临时补」的身份，**保留登记行**：`on_missing` 需要
+                    // 这一行才记得到「等待别的设备传上来」，也只有这样才会发限流的
+                    // `blob.want`（`gone` 记录留着不动）。行从此按常规登记对待。
                     if probe {
-                        db::blob_delete(tx, &wanted)?;
-                        // 撤掉临时登记之后继续走下面的常规路径：仍然向别的设备发一条
-                        // 限流的 `blob.want`（持有文件但没上传的设备才有机会补传），
-                        // `gone` 记录留着不动。
+                        tx.execute(
+                            "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+                            rusqlite::params![crate::db::scope::BLOB_PROBE, &wanted],
+                        )?;
                     }
-                    tx.execute(
-                        "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
-                        rusqlite::params![crate::db::scope::BLOB_PROBE, &wanted],
-                    )?;
                     let Some(device) = sync_db::device_id(tx)? else {
                         return Ok(None);
                     };

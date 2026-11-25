@@ -29,6 +29,9 @@ export interface PreviewItem {
   display: string;
   /** image = 内嵌 <img>；open = 点击交系统应用打开（视频 / 文档）。 */
   kind: "image" | "open";
+  /** true = 正文里只有裸文件名、按惯例猜成 `media/<名字>` 的条目（不是正文明确写出的
+   *  路径）。同名登记存在时这种猜测要让位。 */
+  inferred?: boolean;
 }
 
 /** 上抛给 Chat 统一菜单的媒体引用。 */
@@ -107,7 +110,12 @@ function boundaryBefore(content: string, at: number): boolean {
 export function parseMediaItems(content: string): PreviewItem[] {
   const found: PreviewItem[] = [];
   const seen = new Set<string>();
-  const push = (path: string, display: string, kind?: "image" | "open") => {
+  const push = (
+    path: string,
+    display: string,
+    kind?: "image" | "open",
+    inferred?: boolean,
+  ) => {
     if (seen.has(path)) return;
     seen.add(path);
     const isImg = /\.(?:png|jpe?g|webp|gif)$/i.test(path);
@@ -116,6 +124,7 @@ export function parseMediaItems(content: string): PreviewItem[] {
       path,
       display,
       kind: kind ?? (isImg ? "image" : "open"),
+      inferred,
     });
   };
 
@@ -172,7 +181,7 @@ export function parseMediaItems(content: string): PreviewItem[] {
   while ((m = reBare.exec(content)) !== null) {
     const name = m[0];
     if (found.some((it) => it.display === name || it.path.endsWith("/" + name))) continue;
-    push("media/" + name, name);
+    push("media/" + name, name, undefined, true);
   }
   return found;
 }
@@ -294,16 +303,12 @@ export default function MediaPreviews({
     const refNames = new Set(
       [...mine.keys()].map((path) => path.split("/").pop() ?? path),
     );
-    // 只有「裸文件名猜成 media/<名字>」的才让位；正文里明确写出来的其他路径
-    // （如 `reports/report.pdf`）照常出卡。
-    const isGuess = (path: string) => {
-      const rest = path.startsWith("media/") ? path.slice("media/".length) : null;
-      return rest !== null && !rest.includes("/");
-    };
+    // 只有「解析器按裸文件名猜出来」的条目才让位；正文里明确写出的路径（哪怕也是
+    // `media/cover.png`）照常出卡。
     const parsed = items.filter((item) => {
-      if (mine.has(item.path)) return true;
+      if (mine.has(item.path) || !item.inferred) return true;
       const name = item.path.split("/").pop() ?? item.path;
-      return !(isGuess(item.path) && refNames.has(name));
+      return !refNames.has(name);
     });
     if (mine.size === 0) return parsed;
     const seen = new Set(parsed.map((item) => item.path));

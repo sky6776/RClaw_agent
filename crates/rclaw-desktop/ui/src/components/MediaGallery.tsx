@@ -78,12 +78,10 @@ export default function MediaGallery({
     if (!item) return;
     let alive = true;
     if (item.kind === "video") {
-      if (seed && seedMatches(seed, item) && seed.url) {
-        setVideoUrl(seed.url);
-        return;
-      }
+      // 不复用种子里的流地址：暂存副本会被回收（8 份/1 小时），划回来时旧地址
+      // 可能已经 404。每次重新取一个核对过的新地址（后端按对象复制+核对）。
       api
-        .mediaStreamUrl(item.path, chatId, item.blob)
+        .mediaStreamUrl(item.path, chatId, item.blob, true)
         .then((u) => {
           if (alive) setVideoUrl(u);
         })

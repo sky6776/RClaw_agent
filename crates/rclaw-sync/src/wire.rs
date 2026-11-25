@@ -1199,6 +1199,12 @@ pub(crate) fn expect_blob(
     if local && rel_path.starts_with(SYNC_FILES_PREFIX) {
         return Ok(());
     }
+    // 有别的消息引用了这个对象：这条登记从此按常规登记对待——重试的临时身份
+    // （`blob-probe` 标记）撤掉，失败清理不会再删它。
+    conn.execute(
+        "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+        params![crate::db::scope::BLOB_PROBE, blob],
+    )?;
     db::state_put(
         conn,
         SCOPE_BLOB_ALIAS,

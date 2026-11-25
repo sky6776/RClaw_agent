@@ -966,25 +966,53 @@ fn timestamp(time: std::io::Result<SystemTime>) -> Option<i128> {
         .map(|since| since.as_nanos() as i128)
 }
 
-/// 类 Unix 上的 ctime（秒 + 纳秒）：用户态改不了。
+/// 文件「变更时间」：用户态改不了、每次写入都会变。
+///
+/// - 类 Unix：ctime（写入、改名、utime 都会更新）。
+/// - Windows：ChangeTime（`FILE_BASIC_INFO`）。这里不能用 mtime/创建时间：实测同一秒
+///   内的同长度快速覆盖，两者的 100ns 值经常一个字节都不变（Windows 对目录项时间戳
+///   是懒更新的），摘要缓存会把新内容当成旧内容。
 #[cfg(unix)]
-fn changed_stamp(meta: &std::fs::Metadata) -> Option<i128> {
+fn changed_stamp(_path: &Path, meta: &std::fs::Metadata) -> Option<i128> {
     use std::os::unix::fs::MetadataExt;
     Some(meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128)
 }
 
-#[cfg(not(unix))]
-fn changed_stamp(_meta: &std::fs::Metadata) -> Option<i128> {
+#[cfg(windows)]
+fn changed_stamp(path: &Path, _meta: &std::fs::Metadata) -> Option<i128> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+    };
+    let file = std::fs::File::open(path).ok()?;
+    let mut info = std::mem::MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileBasicInfo,
+            info.as_mut_ptr() as _,
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some(info.ChangeTime as i128)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn changed_stamp(_path: &Path, _meta: &std::fs::Metadata) -> Option<i128> {
     None
 }
 
 /// 这个文件的版本标识；修改时间读不出来（判不了有没有变）时返回 `None`。
-pub(crate) fn version_of(meta: &std::fs::Metadata) -> Option<FileVersion> {
+pub(crate) fn version_of(path: &Path, meta: &std::fs::Metadata) -> Option<FileVersion> {
     Some(FileVersion {
         size: meta.len(),
         mtime: timestamp(meta.modified())?,
         created: timestamp(meta.created()),
-        changed: changed_stamp(meta),
+        changed: changed_stamp(path, meta),
     })
 }
 
@@ -1063,7 +1091,7 @@ fn verification_cost(ctx: &Ctx, found: &FoundRef) -> u64 {
         if meta.len().abs_diff(found.size) > SIZE_SLACK {
             continue;
         }
-        let Some(version) = version_of(&meta) else {
+        let Some(version) = version_of(&path, &meta) else {
             cost = cost.saturating_add(meta.len());
             continue;
         };
@@ -1088,7 +1116,7 @@ pub(crate) fn same_blob_now(keys: &Keys, path: &Path, blob: &str, size: u64) -> 
         return false;
     }
     let limit = size.saturating_add(SIZE_SLACK);
-    match version_of(&meta) {
+    match version_of(&path, &meta) {
         Some(version) => {
             read_digest(path, &version, limit).is_some_and(|digest| keys.blob_id(&digest) == blob)
         }
@@ -1117,7 +1145,7 @@ pub(crate) fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool
         return false;
     }
     let limit = size.saturating_add(SIZE_SLACK);
-    let Some(version) = version_of(&meta) else {
+    let Some(version) = version_of(&path, &meta) else {
         // 判不了有没有变：直接读一遍，不记结论。
         return hash_file_digest(path, limit)
             .is_some_and(|digest| keys.blob_id(&digest) == blob);

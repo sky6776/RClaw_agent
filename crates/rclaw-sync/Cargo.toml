@@ -49,6 +49,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 url = "2"
 
+# Windows 的文件「变更时间」（ChangeTime）：普通同长度快速覆盖也会更新它，而
+# mtime/ctime 可能被懒更新（实测同一秒内的覆盖经常一个字都不变）。只用于附件的内容
+# 版本判断，不新增编译单元（桌面端已在用 windows-sys 0.59）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 # 测试里用暂停的时钟（`start_paused`）：写 head 的最小间隔、退避等待不必真的等。
