@@ -5299,21 +5299,56 @@ pub async fn media_preview(
     chat_id: Option<String>,
     blob: Option<String>,
 ) -> Result<MediaPayload, String> {
-    // 预览按摘要缓存的结论核对（每张图都整读一遍太重）；点开那一下才是直读。
-    verify_media_read(&state, chat_id, blob.clone(), &path, false).await?;
     let home = state.home.clone();
-    // 核对过的同步附件：预览缓存的键带上对象名——同一个路径上换成同长度、同一秒写
-    // 下的另一个版本时，不能拿到旧缩略图。
+    // 同步附件：读到内存里、核对过的那份字节直接拿去编码（不再「核对路径 → 重新打开
+    // 路径」）。核不了（没有登记/密钥）时按老行为走路径。
+    let verified = match (chat_id.clone(), blob.clone(), state.sync()) {
+        (Some(chat_id), Some(blob), Some(engine)) => {
+            let source = path.clone();
+            let outcome = tauri::async_runtime::spawn_blocking(move || {
+                engine.read_attachment_bytes(
+                    CHANNEL_DESKTOP,
+                    &chat_id,
+                    &blob,
+                    &source,
+                    MEDIA_MAX_BYTES,
+                )
+            })
+            .await
+            .map_err(|e| format!("读取媒体任务失败: {e}"))?;
+            match outcome {
+                rclaw_sync::AttachmentBytes::Bytes(bytes) => Some(bytes),
+                rclaw_sync::AttachmentBytes::TooLarge => {
+                    return Err(format!(
+                        "媒体超过大小上限（{} MB）",
+                        MEDIA_MAX_BYTES / 1024 / 1024
+                    ))
+                }
+                rclaw_sync::AttachmentBytes::Rejected => {
+                    return Err(
+                        "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
+                    )
+                }
+                rclaw_sync::AttachmentBytes::Unverifiable => None,
+            }
+        }
+        _ => None,
+    };
+    // 核对过的同步附件：预览缓存的键带上对象名（内容寻址）——同一个路径上换成同长度、
+    // 同一秒写下的另一个版本时，不能拿到旧缩略图。
     let seed = blob.map(|blob| format!("sync-blob:{blob}"));
-    tauri::async_runtime::spawn_blocking(move || media_preview_blocking(&home, &path, seed))
-        .await
-        .map_err(|e| format!("生成预览任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        media_preview_blocking(&home, &path, seed, verified)
+    })
+    .await
+    .map_err(|e| format!("生成预览任务失败: {e}"))?
 }
 
 fn media_preview_blocking(
     home: &std::path::Path,
     path: &str,
     seed: Option<String>,
+    verified: Option<Vec<u8>>,
 ) -> Result<MediaPayload, String> {
     if path.contains("..") || path.contains('\\') || path.starts_with('/') {
         return Err("非法媒体路径".into());
@@ -5326,6 +5361,10 @@ fn media_preview_blocking(
     if !MEDIA_EXTENSIONS.contains(&extension.as_str()) {
         return Err(format!("不支持的媒体类型: {extension}"));
     }
+    let cache_seed = seed.unwrap_or_else(|| path.to_string());
+    if let Some(bytes) = verified {
+        return image_preview_bytes(home, &bytes, &cache_seed, &extension);
+    }
     let root = home.join("agent");
     let full = root
         .join(path)
@@ -5337,7 +5376,47 @@ fn media_preview_blocking(
     if !full.starts_with(&root_canon) {
         return Err("媒体路径越出工作区".into());
     }
-    image_preview_payload(home, &full, seed.as_deref().unwrap_or(path), &extension)
+    image_preview_payload(home, &full, &cache_seed, &extension)
+}
+
+/// 由「核对过的字节」出预览：字节已经和登记的对象对过，缓存键只按对象名（内容寻址），
+/// 不再掺路径的 mtime——路径上换成了同长度的另一个文件也影响不到这份内容。
+fn image_preview_bytes(
+    home: &std::path::Path,
+    bytes: &[u8],
+    cache_seed: &str,
+    extension: &str,
+) -> Result<MediaPayload, String> {
+    if bytes.len() as u64 > MEDIA_MAX_BYTES {
+        return Err(format!(
+            "媒体超过大小上限（{} MB）",
+            MEDIA_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    let mime = match extension {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/gif",
+    };
+    if mime == "image/gif" {
+        return Ok(MediaPayload {
+            mime: mime.into(),
+            base64: encode_base64(bytes),
+        });
+    }
+    let key: String = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(cache_seed.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update([b'p']);
+        hasher.finalize()[..12]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    image_preview_encode(home, bytes, &key, mime)
 }
 
 /// 预览图的核心：`full` 是调用方已经校验过的图片文件，`extension` 是它的小写扩展名
@@ -5404,11 +5483,21 @@ fn image_preview_payload(
         }
     }
 
+    image_preview_encode(home, &original, &key, mime)
+}
+
+/// 解码 → 缩到上限 → 编码，并写缓存（键 `key`）。
+fn image_preview_encode(
+    home: &std::path::Path,
+    original: &[u8],
+    key: &str,
+    mime: &str,
+) -> Result<MediaPayload, String> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MEDIA_DECODE_MAX_EDGE);
     limits.max_image_height = Some(MEDIA_DECODE_MAX_EDGE);
     limits.max_alloc = Some(MEDIA_DECODE_MAX_ALLOC);
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(&original))
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(original))
         .with_guessed_format()
         .map_err(|e| format!("识别图片格式失败: {e}"))?;
     reader.limits(limits);
@@ -5417,7 +5506,7 @@ fn image_preview_payload(
     if img.width() <= MEDIA_PREVIEW_MAX_EDGE && img.height() <= MEDIA_PREVIEW_MAX_EDGE {
         return Ok(MediaPayload {
             mime: mime.into(),
-            base64: encode_base64(&original),
+            base64: encode_base64(original),
         });
     }
     let thumb = img.thumbnail(MEDIA_PREVIEW_MAX_EDGE, MEDIA_PREVIEW_MAX_EDGE);
@@ -5435,7 +5524,11 @@ fn image_preview_payload(
             .write_with_encoder(encoder)
             .map_err(|e| format!("编码预览失败: {e}"))?;
     }
-    let cache_path = cache_base.with_extension(if has_alpha { "png" } else { "jpg" });
+    let root = home.join("agent");
+    let cache_dir = root.join(MEDIA_PREVIEW_CACHE_DIR);
+    let cache_path = cache_dir
+        .join(key)
+        .with_extension(if has_alpha { "png" } else { "jpg" });
     let _ = std::fs::create_dir_all(&cache_dir);
     let _ = std::fs::write(&cache_path, &encoded); // 缓存写失败只影响下次，不挡返回
     Ok(MediaPayload {
@@ -5457,14 +5550,68 @@ pub async fn media_base64(
     chat_id: Option<String>,
     blob: Option<String>,
 ) -> Result<MediaPayload, String> {
-    // 放大看原图也是一次按路径读取：同步附件先按对象核对（摘要缓存，不整读）。
-    verify_media_read(&state, chat_id, blob, &path, false).await?;
+    // 同步附件：读到内存里、核对过的那份字节直接编码（同一次读里算的摘要）。
+    if let (Some(chat_id), Some(blob), Some(engine)) =
+        (chat_id.clone(), blob.clone(), state.sync())
+    {
+        let source = path.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            engine.read_attachment_bytes(
+                CHANNEL_DESKTOP,
+                &chat_id,
+                &blob,
+                &source,
+                MEDIA_MAX_BYTES,
+            )
+        })
+        .await
+        .map_err(|e| format!("读取媒体任务失败: {e}"))?;
+        match outcome {
+            rclaw_sync::AttachmentBytes::Bytes(bytes) => {
+                let mime = media_mime(&path)?;
+                return Ok(MediaPayload {
+                    mime: mime.into(),
+                    base64: encode_base64(&bytes),
+                });
+            }
+            rclaw_sync::AttachmentBytes::TooLarge => {
+                return Err(format!(
+                    "媒体超过大小上限（{} MB）",
+                    MEDIA_MAX_BYTES / 1024 / 1024
+                ))
+            }
+            rclaw_sync::AttachmentBytes::Rejected => {
+                return Err(
+                    "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
+                )
+            }
+            rclaw_sync::AttachmentBytes::Unverifiable => {}
+        }
+    }
     // 最大 25MB 的同步读 + 编码挪到阻塞线程池（与同文件其他命令一致），
     // 避免卡住 Tauri 命令线程（低端安卓设备上明显）。
     let home = state.home.clone();
     tauri::async_runtime::spawn_blocking(move || media_base64_blocking(&home, &path))
         .await
         .map_err(|e| format!("读取媒体任务失败: {e}"))?
+}
+
+/// 扩展名 → MIME（只认预览支持的图片类型）。
+fn media_mime(path: &str) -> Result<&'static str, String> {
+    let extension = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !MEDIA_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(format!("不支持的媒体类型: {extension}"));
+    }
+    Ok(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/gif",
+    })
 }
 
 fn media_base64_blocking(home: &std::path::Path, path: &str) -> Result<MediaPayload, String> {
@@ -5863,9 +6010,55 @@ pub async fn save_media(
     chat_id: Option<String>,
     blob: Option<String>,
 ) -> Result<String, String> {
-    // 导出前按对象直读核对一次：保存/转发的不能是另一个版本。
-    verify_media_read(&state, chat_id, blob, &path, true).await?;
     let kind = media_kind_of(&path);
+    // 同步附件：保存的必须是核对过的那份内容——先把它按对象核对并复制成暂存副本
+    // （流式，大文件也行），再保存这份副本（不再「核对路径 → 再按路径复制」）。
+    if let (Some(chat_id), Some(blob), Some(engine)) =
+        (chat_id.clone(), blob.clone(), state.sync())
+    {
+        let dest_rel = format!(
+            "media/cache/export/{}/{}",
+            rclaw_sync::ids::random_hex::<6>(),
+            path.rsplit('/').next().unwrap_or("export.bin")
+        );
+        let (source, target, blob_id, chat) =
+            (path.clone(), dest_rel.clone(), blob.clone(), chat_id.clone());
+        let staged = run_blocking("核对附件", move || {
+            Ok(engine.stage_attachment_copy(
+                CHANNEL_DESKTOP,
+                &chat,
+                &blob_id,
+                &source,
+                &target,
+            ))
+        })
+        .await?;
+        match staged {
+            rclaw_sync::AttachmentStage::Staged(rel) => {
+                let home = state.home.clone();
+                let abs = home.join("agent").join(rel);
+                let kind = kind.to_string();
+                return run_blocking("保存到本地", move || {
+                    let result = if kind != "file" {
+                        save_to_gallery_abs(&home, &abs, &kind)
+                    } else {
+                        save_document(&home, &abs)
+                    };
+                    if let Some(parent) = abs.parent() {
+                        let _ = std::fs::remove_dir_all(parent);
+                    }
+                    result
+                })
+                .await;
+            }
+            rclaw_sync::AttachmentStage::Rejected => {
+                return Err(
+                    "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
+                )
+            }
+            rclaw_sync::AttachmentStage::Unverifiable => {}
+        }
+    }
     if kind != "file" {
         // 会话媒体（agent 生成的 media/out/…、文件面板里的图片/视频）不限于 uploads/，
         // 与 open/share 同一口径按工作区解析后再进相册；uploads/ 限制只属于采集入口
@@ -5884,8 +6077,14 @@ pub async fn save_media(
     } else {
         resolve_media_file(&state.home, &path)?
     };
+    save_document(&state.home, &abs)
+}
+
+/// 文档存到「下载/RClaw」（安卓走 MediaStore.Downloads）。
+fn save_document(home: &std::path::Path, abs: &std::path::Path) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
+        let _ = home;
         let result = rclaw_android::save_to_downloads(&abs.to_string_lossy())
             .map_err(|e| format!("保存到下载目录失败: {e}"))?;
         if let Some(reason) = result.strip_prefix("error:") {
@@ -5897,12 +6096,59 @@ pub async fn save_media(
     {
         let base = std::env::var("USERPROFILE")
             .map(|p| std::path::PathBuf::from(p).join("Downloads"))
-            .unwrap_or_else(|_| state.home.clone());
+            .unwrap_or_else(|_| home.to_path_buf());
         let dir = base.join("RClaw");
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
         let name = abs.file_name().ok_or("非法文件名")?;
-        std::fs::copy(&abs, dir.join(name)).map_err(|e| format!("保存失败: {e}"))?;
+        std::fs::copy(abs, dir.join(name)).map_err(|e| format!("保存失败: {e}"))?;
         Ok("ok".into())
+    }
+}
+
+/// 把（核对过的）字节写进导出暂存目录的一个新子目录（文件名保持原样），返回绝对路径。
+pub(crate) fn stage_bytes_for_export(
+    home: &std::path::Path,
+    original: &str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf, String> {
+    let dir = home
+        .join("agent")
+        .join("media/cache/export")
+        .join(rclaw_sync::ids::random_hex::<6>());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let name = original.rsplit('/').next().unwrap_or("export.bin");
+    let staged = dir.join(name);
+    std::fs::write(&staged, bytes).map_err(|e| format!("写入暂存文件失败: {e}"))?;
+    prune_cache_dir(&home.join("agent").join("media/cache/export"), 8);
+    Ok(staged)
+}
+
+/// 清理缓存目录：删掉一小时前的，最多留 `keep` 个条目（新的在前）。
+fn prune_cache_dir(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            Some((meta.modified().ok()?, entry.path()))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    let now = std::time::SystemTime::now();
+    for (index, (mtime, path)) in entries.into_iter().enumerate() {
+        let stale = now
+            .duration_since(mtime)
+            .map(|age| age.as_secs() > 3600)
+            .unwrap_or(false);
+        if index >= keep || stale {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
     }
 }
 
@@ -5941,15 +6187,16 @@ pub async fn share_media(
             .await?;
             match staged {
                 // 复制出来的就是核对过的那一份：转发它。
-                Some(true) => share_path = dest,
-                // 对不上：别转发另一个版本。
-                Some(false) => {
+                rclaw_sync::AttachmentStage::Staged(rel) => share_path = rel,
+                // 对不上、或者暂存失败（磁盘满、路径不安全）：别转发——转发原路径可能
+                // 是另一个版本。
+                rclaw_sync::AttachmentStage::Rejected => {
                     return Err(
                         "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
                     )
                 }
                 // 核不了（没有登记/读不出密钥）：按老行为转发原路径。
-                None => {}
+                rclaw_sync::AttachmentStage::Unverifiable => {}
             }
         }
         return rclaw_android::share_file(&share_path).map_err(|e| format!("转发失败: {e}"));
@@ -6147,10 +6394,12 @@ pub async fn media_stream_url(
     path: String,
     chat_id: Option<String>,
     blob: Option<String>,
+    fresh: Option<bool>,
 ) -> Result<String, String> {
-    // 视频可能很大，但播放是一次明确的动作：整读核对一遍，拿到「被核对的那一份」的
-    // 版本针，URL 钉住它——播放期间文件被改写，后续 Range 请求一律拒绝。
-    let pin = check_media_read(&state, chat_id, blob, &path, true).await?;
+    // 点播（`fresh`）整读核对一遍，拿到「被核对的那一份」的版本针；海报帧用摘要缓存
+    // 的结论（不然每张挂载的视频卡都要整读一遍）。播放期间文件被改写，后续 Range
+    // 请求一律拒绝。
+    let pin = check_media_read(&state, chat_id, blob, &path, fresh.unwrap_or(true)).await?;
     let agent_root = state.home.join("agent");
     match crate::media_stream::stream_url_with_root(agent_root, &path, pin.as_deref()) {
         Some(url) => Ok(url),

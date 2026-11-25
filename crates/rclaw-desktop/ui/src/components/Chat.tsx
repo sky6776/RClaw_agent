@@ -1877,8 +1877,8 @@ export default function Chat({
                   onMediaMenu={(media, x, y, fromTouch) =>
                     openMsgMenu({ entry: e, media, x, y }, fromTouch)
                   }
-                  onViewImage={({ src, path, card }) =>
-                    openGallery(path, { path, src, preview: card ?? null })
+                  onViewImage={({ src, path, card, blob }) =>
+                    openGallery(path, { path, blob, src, preview: card ?? null }, blob)
                   }
                   onOpenVideo={({ url, path, blob }) => openGallery(path, { path, blob, url }, blob)}
                 />
@@ -1945,8 +1945,8 @@ export default function Chat({
                 onMediaMenu={(media, x, y, fromTouch) =>
                   openMsgMenu({ entry: e, media, x, y }, fromTouch)
                 }
-                onViewImage={({ src, path, card }) =>
-                  openGallery(path, { path, src, preview: card ?? null })
+                onViewImage={({ src, path, card, blob }) =>
+                  openGallery(path, { path, blob, src, preview: card ?? null }, blob)
                 }
                 onOpenVideo={({ url, path, blob }) => openGallery(path, { path, blob, url }, blob)}
               />

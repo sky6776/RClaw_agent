@@ -72,6 +72,9 @@ let allSig = "";
 /** 清单已经取到的会话（取失败也算：按「没有清单」处理）。区分「还没取到」与「取到
  *  是空的」——前者消息里的附件还没核对过，工作区路径不能当可用的打开入口。 */
 let loaded: string | null = null;
+/** 清单取不到（重试完也失败）的会话：界面显示「核对附件…（点此重试）」，不拿旧清单
+ *  冒充当前判断。 */
+let failed: string | null = null;
 /** 清单不是这个会话的 / 还没取到时给的空数组（引用要稳定，别每次渲染新建）。 */
 const EMPTY: SyncAttachment[] = [];
 /** `消息行 id:blob` → 上一份清单里的状态（看得出哪些附件是刚下载下来的）。 */
@@ -284,6 +287,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       all = EMPTY;
       allSig = "";
       loaded = null;
+      failed = null;
       known = {};
       cards = noCardState();
       emit();
@@ -319,14 +323,15 @@ export function useSyncAttachmentLoader(chatId: string | null) {
           aliasTimer = window.setTimeout(() => void load(), delay);
           return;
         }
-        all = EMPTY;
-        allSig = "";
-        loaded = chatId;
+        // 一直取不到：保持「未就绪」并把状态标成失败（界面给一个重试入口）。不能拿
+        // 旧清单或者空清单冒充「核对好了」——那会让同步消息回退到工作区路径。
+        failed = chatId;
         emit();
         return;
       }
       if (!alive || mine !== seq) return;
       loadFails = 0;
+      failed = null;
       apply(chatId, list);
       const pendingAlias = list.filter(
         (item) => item.kind === "file" && item.state === "local" && !item.path_present,
@@ -434,6 +439,14 @@ function indexByMessage(list: SyncAttachment[]): Map<number, SyncAttachment[]> {
   }
   byMessage.set(list, index);
   return index;
+}
+
+/** 这个会话的附件清单这次是不是取不到（重试完也失败）。 */
+export function useChatAttachmentsFailed(chatId: string | null): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => chatId !== null && chat === chatId && failed === chatId,
+  );
 }
 
 /** 一条消息登记的文件附件（只认消息里写的路径；工具结果全文不在此列）。 */

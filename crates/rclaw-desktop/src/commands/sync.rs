@@ -924,24 +924,65 @@ pub async fn sync_open_attachment(
 ) -> Result<(), String> {
     check_chat_id(&chat_id)?;
     let engine = handle(&state)?;
-    let (check_chat, check_blob, check_path) = (chat_id, blob, path.clone());
-    let matches = run_blocking("核对附件", move || {
-        Ok(engine.attachment_file_matches(
+    // 小文件：按对象读出核对过的字节、写成暂存副本，打开的就是核对过的那份内容
+    // （不再「核对路径 → 交系统打开路径」）。大文件（视频等）读进内存不现实：
+    // 直读核对后打开原文件。
+    let (check_chat, check_blob, check_path) = (chat_id.clone(), blob.clone(), path.clone());
+    let bytes = run_blocking("核对附件", move || {
+        Ok(engine.read_attachment_bytes(
             CHANNEL_DESKTOP,
             &check_chat,
             &check_blob,
             &check_path,
-            true,
+            super::MEDIA_MAX_BYTES,
         ))
     })
     .await?;
-    if matches == Some(false) {
-        return Err(
-            "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）。             点「重新下载」取回原来的内容。"
+    match bytes {
+        rclaw_sync::AttachmentBytes::Bytes(bytes) => {
+            let home = state.home.clone();
+            let original = path.clone();
+            let staged = run_blocking("准备打开", move || {
+                Ok(super::stage_bytes_for_export(&home, &original, &bytes))
+            })
+            .await??;
+            let root = state.home.join("agent");
+            let rel = staged
+                .strip_prefix(&root)
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                .map_err(|_| "暂存路径异常".to_string())?;
+            super::open_media_path(&state.home, &rel)
+        }
+        rclaw_sync::AttachmentBytes::TooLarge => {
+            // 大文件：直读核对一次（不读进内存），通过后打开原文件。
+            let engine = handle(&state)?;
+            let (chat, blob_id, source) = (chat_id, blob, path.clone());
+            let check = run_blocking("核对附件", move || {
+                Ok(engine.attachment_file_matches(
+                    CHANNEL_DESKTOP,
+                    &chat,
+                    &blob_id,
+                    &source,
+                    true,
+                ))
+            })
+            .await?;
+            if check == Some(false) {
+                return Err(
+                    "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）。点「重新下载」取回原来的内容。"
+                        .into(),
+                );
+            }
+            super::open_media_path(&state.home, &path)
+        }
+        rclaw_sync::AttachmentBytes::Rejected => Err(
+            "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）。点「重新下载」取回原来的内容。"
                 .into(),
-        );
+        ),
+        rclaw_sync::AttachmentBytes::Unverifiable => {
+            super::open_media_path(&state.home, &path)
+        }
     }
-    super::open_media_path(&state.home, &path)
 }
 
 /// 把一份文件快照存进工作区（§8.7）。返回它在工作区里的相对路径。

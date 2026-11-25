@@ -12,6 +12,7 @@ import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import {
   AttachmentCard,
   messageFileRefs,
+  useChatAttachmentsFailed,
   readableAtPath,
   refreshSyncAttachments,
   useChatAttachments,
@@ -241,6 +242,7 @@ export default function MediaPreviews({
   // 的照旧按工作区路径出卡。
   const synced = useChatAttachments(chatId ?? null);
   const attachedReady = useChatAttachmentsReady(chatId ?? null);
+  const attachedFailed = useChatAttachmentsFailed(chatId ?? null);
   // 没有 chatId（不在会话里用这个组件）就不查清单：按工作区路径出卡，与文档一致。
   const ready = chatId === undefined ? true : attachedReady;
   // 只认这条消息自己登记的附件：同一个路径在不同消息里可能指向不同内容（文件改过），
@@ -311,8 +313,8 @@ export default function MediaPreviews({
       if (videoRequested.current.has(itemKey)) continue;
       videoRequested.current.add(itemKey);
       api
-        // 带上这条消息登记的对象名：按路径读之前后端先核对一下内容。
-        .mediaStreamUrl(item.path, chatId, mine.get(item.path)?.blob)
+        // 海报帧用摘要缓存的结论核对（不整读整个视频）；点播时再直读核对一次。
+        .mediaStreamUrl(item.path, chatId, mine.get(item.path)?.blob, false)
         .then((url) => setVideoUrls((prev) => ({ ...prev, [itemKey]: url })))
         .catch(() => setVideoUrls((prev) => ({ ...prev, [itemKey]: "" })));
     }
@@ -435,6 +437,8 @@ export default function MediaPreviews({
           return (
             <div
               key={itemKey}
+              role={attachedFailed ? "button" : undefined}
+              onClick={attachedFailed ? () => refreshSyncAttachments() : undefined}
               className="flex max-w-full items-center gap-2 self-start rounded-xl border border-[#2a2f3a] bg-[#0f131b] px-3 py-2 text-left opacity-60"
             >
               <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#1a1f29] text-gray-400">
@@ -443,7 +447,9 @@ export default function MediaPreviews({
               <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-gray-400">
                 {it.display || it.path}
               </span>
-              <span className="shrink-0 text-[10px] text-gray-500">核对附件…</span>
+              <span className="shrink-0 text-[10px] text-gray-500">
+                {attachedFailed ? "附件清单不可用 · 点此重试" : "核对附件…"}
+              </span>
             </div>
           );
         }
@@ -530,12 +536,19 @@ export default function MediaPreviews({
                   suppressClickRef.current = false;
                   return;
                 }
-                onOpenVideo?.({
-                  url: streamUrl,
-                  path: it.path,
-                  display: it.display || it.path,
-                  blob: mine.get(it.path)?.blob,
-                });
+                // 点播：重新取一个「直读核对过」的流地址（海报那个是按缓存结论核的）。
+                const blob = mine.get(it.path)?.blob;
+                api
+                  .mediaStreamUrl(it.path, chatId, blob, true)
+                  .then((url) =>
+                    onOpenVideo?.({
+                      url,
+                      path: it.path,
+                      display: it.display || it.path,
+                      blob,
+                    }),
+                  )
+                  .catch((e) => onError?.(`打开视频失败: ${String(e)}`));
               }}
               className="max-h-72 w-auto max-w-full cursor-pointer self-start rounded-xl border border-[#2a2f3a]"
               title={`${it.display || it.path}（点击播放；长按 / 右键更多操作）`}

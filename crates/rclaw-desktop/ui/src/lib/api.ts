@@ -1257,8 +1257,8 @@ export const api = {
     invoke<MediaPayload>("media_preview", { path, chatId, blob }),
 
   /** 视频/音频的本地流式 URL（127.0.0.1 + 随机 token，支持 Range 边下边播）。 */
-  mediaStreamUrl: (path: string, chatId?: string, blob?: string) =>
-    invoke<string>("media_stream_url", { path, chatId, blob }),
+  mediaStreamUrl: (path: string, chatId?: string, blob?: string, fresh?: boolean) =>
+    invoke<string>("media_stream_url", { path, chatId, blob, fresh }),
 
   openMedia: (path: string) => invoke<void>("open_media", { path }),
 

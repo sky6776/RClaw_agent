@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use rclaw_store::{sync_db, MemoryStore, SessionStore};
 use tokio::sync::{mpsc, oneshot, Notify};
 
+use std::io::Read;
+
 use crate::attach::now_ms;
 use crate::bundle::{self, ImportOptions, Imported};
 use crate::config::{SyncConfig, SyncPaths};
@@ -50,6 +52,30 @@ pub use crate::files::memory::MemoryRestored;
 pub use crate::transport::SelfTestStep;
 pub use crate::trash::{MemoryTrashItem, TrashItem};
 pub use local::{AttachmentInfo, SessionMark};
+
+/// 一次「按对象核对并读出一份内容」的结果：`Bytes` 里的字节就是核对过的那些
+/// （同一次读里算的摘要）。预览、导出、转发都用它，不再「先核对路径、再重新打开」。
+#[derive(Debug)]
+pub enum AttachmentBytes {
+    Bytes(Vec<u8>),
+    /// 登记的明文长度超过调用方给的上限（预览/原图这类读进内存的入口）。
+    TooLarge,
+    /// 内容对不上（被就地改写过）、路径不安全、读失败。
+    Rejected,
+    /// 核不了（没有登记/引用、读不出密钥）：按老行为处理。
+    Unverifiable,
+}
+
+/// 暂存一份「核对过的副本」的结果。
+#[derive(Debug)]
+pub enum AttachmentStage {
+    /// 副本已写好，字节核对过。
+    Staged(String),
+    /// 对不上/太大/写失败：调用方不能退回原路径。
+    Rejected,
+    /// 核不了（没有登记/引用、读不出密钥）：按老行为。
+    Unverifiable,
+}
 
 /// 一次「按对象核对要读/要导出的文件」的结果（§8.7）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +193,9 @@ pub(crate) struct Shared {
     pub kick: Notify,
     /// 有点名要过的附件：以后的轮次隔一阵去取一次。
     pub wants: AtomicBool,
+    /// 为「重新下载」临时补了登记、正在等下载结果的附件。下载失败时只撤这些登记
+    /// （`Blob` 的登记可能是别的消息正常登记进来的，不能误删）。
+    pub probes: Mutex<std::collections::HashSet<String>>,
     /// 本机设置的附件大小上限（字节）。比它大的附件不取回（§11.3）；下载任务不经引擎
     /// 线程的命令循环，所以放在这里，配置改了由引擎线程更新。
     pub attachment_max: AtomicU64,
@@ -199,6 +228,7 @@ impl Shared {
             uploads: Notify::new(),
             kick: Notify::new(),
             wants: AtomicBool::new(false),
+            probes: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -257,6 +287,34 @@ impl Shared {
         lock(&self.fetch)
             .as_ref()
             .is_some_and(|sender| sender.send(FetchReq { blob, user }).is_ok())
+    }
+}
+
+/// 清理分享缓存目录：删掉一小时前的旧副本，最多留 `keep` 份（新的在前）。
+fn prune_share_cache(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((meta.modified().ok()?, entry.path()))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    let now = std::time::SystemTime::now();
+    for (index, (mtime, path)) in files.into_iter().enumerate() {
+        let stale = now
+            .duration_since(mtime)
+            .map(|age| age.as_secs() > 3600)
+            .unwrap_or(false);
+        if index >= keep || stale {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -1104,10 +1162,57 @@ impl SyncEngine {
         }
     }
 
-    /// 把 `rel_path` 复制到 `dest_rel`（工作区相对路径），边读边写边算摘要：复制出来的
-    /// 字节必须就是 `blob`。返回是否一致；没有登记/引用、读不出密钥、路径不安全 → None。
-    /// 分享前的暂存副本用它——安卓的 chooser 打开后才读文件，不能把可变的工作区路径
-    /// 直接交出去。
+    /// 按对象核对并读完这份内容（最多 `limit` 字节）：返回的字节和算过的摘要来自同一次
+    /// 读，调用方直接编码/导出这份字节，不给「核对之后路径被换掉」留窗口。
+    pub fn read_attachment_bytes(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        blob: &str,
+        rel_path: &str,
+        limit: u64,
+    ) -> AttachmentBytes {
+        let ctx = &self.inner.ctx;
+        let Some(keys) = Secrets::load(&ctx.paths)
+            .ok()
+            .and_then(|secrets| secrets.keys().ok())
+        else {
+            return AttachmentBytes::Unverifiable;
+        };
+        let path = match ctx.env.checked_path(rel_path) {
+            Ok(path) => path,
+            Err(_) => return AttachmentBytes::Rejected,
+        };
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .ok()
+            .flatten();
+        let Some(size) = row.map(|row| row.size).or_else(|| {
+            local::referenced_attachment(ctx, channel, chat_id, blob).map(|(_, size, _)| size)
+        }) else {
+            return AttachmentBytes::Unverifiable;
+        };
+        if size > limit {
+            return AttachmentBytes::TooLarge;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            return AttachmentBytes::Rejected;
+        };
+        // 最多读「登记长度 + 允许的误差 + 1」：路径被换成超大文件时不会把内存读爆。
+        let cap = size.saturating_add(local::SIZE_SLACK).saturating_add(1);
+        let mut reader = file.take(cap);
+        let mut bytes: Vec<u8> = Vec::new();
+        let Ok((digest, read)) = crate::crypto::copy_hash(&mut reader, &mut bytes) else {
+            return AttachmentBytes::Rejected;
+        };
+        if read > limit || read.abs_diff(size) > local::SIZE_SLACK || keys.blob_id(&digest) != blob {
+            return AttachmentBytes::Rejected;
+        }
+        AttachmentBytes::Bytes(bytes)
+    }
+
+    /// 把核对过的内容写到 `dest_rel`（工作区相对路径）：边读边写边算摘要，写出来的
+    /// 字节必须就是 `blob`；写入按上限截断、目标必须新建、目录不允许是链接。写完把
+    /// 目录里过期的旧副本清掉。
     pub fn stage_attachment_copy(
         &self,
         channel: &str,
@@ -1115,35 +1220,63 @@ impl SyncEngine {
         blob: &str,
         rel_path: &str,
         dest_rel: &str,
-    ) -> Option<bool> {
+    ) -> AttachmentStage {
         let ctx = &self.inner.ctx;
-        let keys = Secrets::load(&ctx.paths)
+        let Some(keys) = Secrets::load(&ctx.paths)
             .ok()
-            .and_then(|secrets| secrets.keys().ok())?;
+            .and_then(|secrets| secrets.keys().ok())
+        else {
+            return AttachmentStage::Unverifiable;
+        };
         let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
             .ok()
             .flatten();
-        let size = row.map(|row| row.size).or_else(|| {
+        let Some(size) = row.map(|row| row.size).or_else(|| {
             local::referenced_attachment(ctx, channel, chat_id, blob).map(|(_, size, _)| size)
-        })?;
-        let source = ctx.env.checked_path(rel_path).ok()?;
+        }) else {
+            return AttachmentStage::Unverifiable;
+        };
+        let Ok(source) = ctx.env.checked_path(rel_path) else {
+            return AttachmentStage::Rejected;
+        };
         let dest = ctx.env.resolve(dest_rel);
-        if !dest.starts_with(ctx.env.base()) && !dest.starts_with(&ctx.env.sync_root) {
-            return None;
+        let Some(parent) = dest.parent() else {
+            return AttachmentStage::Rejected;
+        };
+        // 目录也不许是链接（不然明文副本会写到别处）。
+        if ctx.env.check_path(dest_rel, &dest).is_err() {
+            return AttachmentStage::Rejected;
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).ok()?;
+        if std::fs::create_dir_all(parent).is_err() {
+            return AttachmentStage::Rejected;
         }
-        let mut input = std::fs::File::open(&source).ok()?;
-        let mut output = std::fs::File::create(&dest).ok()?;
-        let (digest, copied) = crate::crypto::copy_hash(&mut input, &mut output).ok()?;
+        let Ok(input) = std::fs::File::open(&source) else {
+            return AttachmentStage::Rejected;
+        };
+        let mut output = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
+            Ok(file) => file,
+            Err(_) => return AttachmentStage::Rejected,
+        };
+        let cap = size.saturating_add(local::SIZE_SLACK).saturating_add(1);
+        let mut reader = input.take(cap);
+        let result = crate::crypto::copy_hash(&mut reader, &mut output);
         drop(output);
-        let ok = copied <= size.saturating_add(local::SIZE_SLACK)
-            && keys.blob_id(&digest) == blob;
+        let ok = matches!(
+            result,
+            Ok((digest, read)) if read <= size.saturating_add(local::SIZE_SLACK)
+                && keys.blob_id(&digest) == blob
+        );
         if !ok {
             let _ = std::fs::remove_file(&dest);
+            return AttachmentStage::Rejected;
         }
-        Some(ok)
+        // 过期的旧副本（接收方早就读完了）：一小时前的清掉，最多留 8 份。
+        prune_share_cache(parent, 8);
+        AttachmentStage::Staged(dest_rel.to_string())
     }
 
     /// 工作区里 `rel_path` 上的文件是不是 `blob` 这个对象（点开前按需核对）。
@@ -1227,6 +1360,15 @@ impl SyncEngine {
                 drop_remote_registration(ctx, blob);
             }
             return Err(SyncError::other("同步空间刚换过，请重试一次"));
+        }
+        if registered {
+            // 记下「这条登记是这次重试临时补的」：下载失败时 `transfer::finish` 只撤
+            // 这些，不会误删别的消息正常登记进来的同一个对象。
+            if let Some((_, shared)) = self.live(true) {
+                if let Ok(mut probes) = shared.probes.lock() {
+                    probes.insert(blob.to_string());
+                }
+            }
         }
         let queued = self.fetch_attachment(blob);
         if queued.is_err() && registered {

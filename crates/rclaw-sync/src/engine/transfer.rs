@@ -172,6 +172,13 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
             if !commit.valid() {
                 return;
             }
+            // 这条登记是不是「重新下载」临时补的？是才在失败时撤掉它（保留 `gone`
+            // 记录，文件放回原处后别的设备来要仍能重新上传）。
+            let probe = shared
+                .probes
+                .lock()
+                .map(|mut probes| probes.remove(&blob))
+                .unwrap_or(false);
             let (ctx, wanted) = (shared.ctx.clone(), blob.clone());
             let missing = blocking(move || {
                 if !commit.valid() {
@@ -183,10 +190,10 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
                     if !commit.valid() {
                         return Ok(None);
                     }
-                    // 「原本在这台设备上、文件拿不出来」的记录还在、存储上又确实没有：
-                    // 撤掉这次为「重新下载」补的临时登记，记录留着——文件放回原处之后
-                    // 别的设备来要时还能重新上传（界面照实说「现在取不回来」）。
-                    if db::state_get(tx, crate::db::scope::BLOB_GONE, &wanted)?.is_some() {
+                    // 这次是为「重新下载」临时补的登记、存储上又确实没有：撤掉它（保留
+                    // `gone` 记录——文件放回原处之后别的设备来要时还能重新上传）。
+                    // 不是这次补的登记（别的消息正常登记进来的）走下面的常规路径。
+                    if probe && db::state_get(tx, crate::db::scope::BLOB_GONE, &wanted)?.is_some() {
                         db::blob_delete(tx, &wanted)?;
                         return Ok(None);
                     }
@@ -227,20 +234,21 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
         }
         Err(error) => {
             tracing::debug!("取回附件 {blob} 失败: {error}");
-            // 为 `gone` 记录补的临时登记：这次没取成（连接断了/超时），撤掉它，别挡住
-            // 「文件放回原处后重新上传」的那条路。
-            let (ctx, wanted) = (shared.ctx.clone(), blob.clone());
-            let cleanup = blocking(move || {
-                let has_note = db::read(ctx.db(), |conn| {
-                    Ok(db::state_get(conn, crate::db::scope::BLOB_GONE, &wanted)?.is_some())
-                })
+            // 这次是「重新下载」临时补的登记、又没取成（连接断了/超时）：撤掉它，别
+            // 挡住「文件放回原处后重新上传」的那条路。
+            let probe = shared
+                .probes
+                .lock()
+                .map(|mut probes| probes.remove(&blob))
                 .unwrap_or(false);
-                if has_note {
+            if probe {
+                let (ctx, wanted) = (shared.ctx.clone(), blob.clone());
+                let cleanup = blocking(move || {
                     crate::engine::drop_remote_registration(&ctx, &wanted);
-                }
-                Ok(())
-            });
-            cleanup.await.ok();
+                    Ok(())
+                });
+                cleanup.await.ok();
+            }
             Some(format!("取回附件失败：{error}"))
         }
     };

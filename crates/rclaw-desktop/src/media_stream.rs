@@ -260,16 +260,31 @@ fn handle_conn(mut socket: std::net::TcpStream) {
         );
         return;
     };
-    let Ok(meta) = std::fs::metadata(&full) else {
+    // 先打开文件，长度与版本都取自「就要发送的这个句柄」：检查和发送不能是两个不同的
+    // 文件（期间被原子替换的话，头发的是旧版本、身体是新的）。
+    let Ok(mut file) = std::fs::File::open(&full) else {
         let _ = write_all(
             &mut socket,
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
         );
         return;
     };
-    // URL 上钉的版本和当前文件不一致：这个流对应的内容已经不是当时核对过的那一个了。
+    let Ok(meta) = file.metadata() else {
+        let _ = write_all(
+            &mut socket,
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        );
+        return;
+    };
+    // URL 上钉的版本和这个句柄不一致：这个流对应的内容已经不是当时核对过的那一个了。
     if let Some(expected) = &version {
-        if file_version(&full).as_ref() != Some(expected) {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
+        if format!("{}-{}", meta.len(), mtime) != *expected {
             let _ = write_all(
                 &mut socket,
                 b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n",
@@ -315,10 +330,7 @@ fn handle_conn(mut socket: std::net::TcpStream) {
     if write_all(&mut socket, header.as_bytes()).is_err() {
         return;
     }
-    // 分块读文件发送（64KB），Seek 到 start 起。
-    let Ok(mut file) = std::fs::File::open(&full) else {
-        return;
-    };
+    // 分块读文件发送（64KB），Seek 到 start 起（`file` 是上面打开、核过版本的那一个）。
     use std::io::{Read, Seek, SeekFrom};
     if file.seek(SeekFrom::Start(start)).is_err() {
         return;
