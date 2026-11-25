@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useSwipeNav } from "../lib/swipeNav";
+import {
+  isAttachmentChangedError,
+  markAttachmentChanged,
+  refreshSyncAttachments,
+} from "./SyncAttachments";
 import ImageViewer from "./ImageViewer";
 import VideoPlayer from "./VideoPlayer";
 
@@ -93,8 +98,15 @@ export default function MediaGallery({
         .then((u) => {
           if (alive) setVideoUrl(u);
         })
-        .catch(() => {
-          if (alive) setVideoUrl("");
+        .catch((e) => {
+          if (!alive) return;
+          // 读出来发现内容对不上：消息里的内联卡也换成附件卡（带重新下载），别让
+          // 用户只能在画廊里看到一个失败画面。
+          if (item.blob && isAttachmentChangedError(e)) {
+            markAttachmentChanged({ path: item.path, blob: item.blob });
+            refreshSyncAttachments();
+          }
+          setVideoUrl("");
         });
     } else {
       if (seed && seedMatches(seed, item) && seed.src) {
@@ -106,8 +118,13 @@ export default function MediaGallery({
         .then((r) => {
           if (alive) setImgSrc(`data:${r.mime};base64,${r.base64}`);
         })
-        .catch(() => {
-          if (alive) setImgSrc("");
+        .catch((e) => {
+          if (!alive) return;
+          if (item.blob && isAttachmentChangedError(e)) {
+            markAttachmentChanged({ path: item.path, blob: item.blob });
+            refreshSyncAttachments();
+          }
+          setImgSrc("");
         });
     }
     return () => {

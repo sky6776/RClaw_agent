@@ -272,6 +272,12 @@ fn handle_conn(mut socket: std::net::TcpStream) {
             return;
         }
     }
+    // 没有版本针的流（点播用的暂存副本）每读一段刷新一下 mtime：正在播放的副本因此
+    // 不会被暂存目录的定期回收删掉（后续 Range 请求不会 404）。有版本针的（海报/工作区
+    // 原文件）不动——改时间戳会破坏钉住的版本。
+    if version.is_none() {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
     let total = meta.len();
     if total == 0 {
         // 空文件：Content-Length 必须为 0（否则承诺 1 字节发 0 字节，客户端按

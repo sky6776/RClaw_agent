@@ -836,22 +836,33 @@ fn cached_snapshot(
     blob: &str,
     path: Option<&str>,
 ) -> Result<(AttachmentInfo, PathBuf), String> {
-    let info = engine
+    let items = engine
         .attachments_of(CHANNEL_DESKTOP, chat_id, blob)
-        .map_err(fail)?
-        .into_iter()
-        // 文件与工具结果全文（artifact）都可能有缓存副本：后者落到缓存时，工作区里的
-        // 原路径句柄指向的可能是另一个同名文件，用户从会话顶部的附件区打开的就是这份。
-        // 会话、对象、允许的类型一起选：拿第一条缓存记录去核对另一个 blob 的摘要，
-        // 预览和保存就会取错附件。
-        .find(|item| {
-            item.blob == blob
-                && (item.kind == "file" || item.kind == "artifact")
-                && item.state == "cached"
-                && path.is_none_or(|want| item.path == want)
-        })
+        .map_err(fail)?;
+    // 文件与工具结果全文（artifact）都可能有缓存副本：后者落到缓存时，工作区里的
+    // 原路径句柄指向的可能是另一个同名文件，用户从会话顶部的附件区打开的就是这份。
+    // 会话、对象、允许的类型一起选：拿第一条缓存记录去核对另一个 blob 的摘要，
+    // 预览和保存就会取错附件。
+    let matching = |item: &&AttachmentInfo| {
+        item.blob == blob
+            && (item.kind == "file" || item.kind == "artifact")
+            && path.is_none_or(|want| item.path == want)
+    };
+    // `cached` 是同步缓存里的副本；`local` 是同一对象落在本机工作区的另一个路径上
+    // （一条消息引用了 `uploads/a.png`，另一条把同一份内容引用成 `media/x.png`）：
+    // 「存到这条消息的路径」要从后者复制，不能只说「不在缓存里」。
+    let info = items
+        .iter()
+        .find(|item| matching(item) && (item.state == "cached" || item.state == "local"))
+        .cloned()
         .ok_or_else(|| {
-            "这个附件不在本机的同步缓存里（可能还没有下载，或者已经被清理）".to_string()
+            // 有这一条、但本机那份已经被改写过：说清楚是内容对不上，别让用户以为
+            // 从来没下载过。
+            if items.iter().any(|item| matching(&item) && item.state == "changed") {
+                CHANGED_SNAPSHOT.to_string()
+            } else {
+                "这个附件不在本机的同步缓存里（可能还没有下载，或者已经被清理）".to_string()
+            }
         })?;
     // 这里只定位、不核对：预览和保存都改成「读出来的字节顺手核对」（缓存副本被原地
     // 改写时，用到的就是被改写后的内容——所以核对必须和这次读同源，不能先核对路径、
@@ -860,16 +871,19 @@ fn cached_snapshot(
         .local_path
         .as_deref()
         .ok_or_else(|| "这个附件在本机没有文件".to_string())?;
-    let cache = home
-        .join("sync")
-        .join("files")
-        .canonicalize()
-        .map_err(|e| format!("同步缓存目录不可用: {e}"))?;
     let full = Path::new(local)
         .canonicalize()
         .map_err(|e| format!("附件文件不存在: {e}"))?;
-    if !full.starts_with(&cache) {
-        return Err("附件不在同步缓存目录里".into());
+    if info.state == "cached" {
+        // 同步缓存里的副本：核对它确实落在缓存目录里（别处的同名文件不是这一份）。
+        let cache = home
+            .join("sync")
+            .join("files")
+            .canonicalize()
+            .map_err(|e| format!("同步缓存目录不可用: {e}"))?;
+        if !full.starts_with(&cache) {
+            return Err("附件不在同步缓存目录里".into());
+        }
     }
     Ok((info, full))
 }
@@ -1212,7 +1226,11 @@ fn save_snapshot_checked(
             rclaw_sync::AttachmentCopy::Unverifiable => return save_snapshot(home, path, cached),
         }
     }
-    let dest = super::write_fresh_file(
+    // 写入闭包里只接受「核对通过」：核不了（`Unverifiable`）时 `copy_cached_blob` 根本
+    // 不会读文件，闭包必须报错让 `write_fresh_file` 把刚建的空文件删掉，再退回不核对的
+    // 老路径重来一次——不能把一个 0 字节的「快照」留在工作区。
+    let outcome = std::cell::Cell::new(None);
+    let dest = match super::write_fresh_file(
         &dir,
         "存进工作区失败",
         |n| snapshot_name(n, &name),
@@ -1222,16 +1240,26 @@ fn save_snapshot_checked(
             match engine.copy_cached_blob(blob, &mut |reader| {
                 std::io::copy(reader, file).map(|_| ())
             }) {
-                Ok(rclaw_sync::AttachmentCopy::Copied | rclaw_sync::AttachmentCopy::Unverifiable) => {
-                    Ok(())
-                }
-                Ok(rclaw_sync::AttachmentCopy::Rejected) => {
-                    Err(std::io::Error::other(CHANGED_SNAPSHOT))
+                Ok(rclaw_sync::AttachmentCopy::Copied) => Ok(()),
+                Ok(other) => {
+                    outcome.set(Some(other));
+                    Err(std::io::Error::other("这份快照核不了"))
                 }
                 Err(e) => Err(e),
             }
         },
-    )?;
+    ) {
+        Ok(dest) => dest,
+        Err(e) => {
+            return match outcome.get() {
+                Some(rclaw_sync::AttachmentCopy::Unverifiable) => {
+                    save_snapshot(home, path, cached)
+                }
+                Some(rclaw_sync::AttachmentCopy::Rejected) => Err(CHANGED_SNAPSHOT.into()),
+                _ => Err(e),
+            };
+        }
+    };
     let file_name = dest
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1247,6 +1275,11 @@ fn compare_snapshot(
     same: &mut bool,
 ) -> std::io::Result<()> {
     let mut other = std::fs::File::open(target).ok();
+    if other.is_none() {
+        // 打不开（被占用/没有权限）：算不上「一样」，按「另存一份」走；来源照读到底，
+        // 摘要要覆盖全部内容。
+        *same = false;
+    }
     let (mut left, mut right) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
     loop {
         let n = read_full(reader, &mut left)?;

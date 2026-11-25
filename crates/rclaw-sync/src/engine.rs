@@ -365,10 +365,16 @@ fn prune_share_cache(dir: &std::path::Path, keep: usize) {
     files.sort_by(|a, b| b.0.cmp(&a.0));
     let now = std::time::SystemTime::now();
     for (index, (mtime, path, is_file)) in files.into_iter().enumerate() {
-        let stale = now
+        let age = now
             .duration_since(mtime)
-            .map(|age| age.as_secs() > 3600)
-            .unwrap_or(false);
+            .map(|age| age.as_secs())
+            .unwrap_or(0);
+        // 刚写下 / 刚被读过的（播放中的流每读一段会刷新 mtime）不删：删掉正在播放、
+        // 正在分享（chooser 还开着）的副本会让后续 Range 请求 404。
+        if age <= 300 {
+            continue;
+        }
+        let stale = age > 3600;
         if index >= keep || stale {
             let _ = if is_file {
                 std::fs::remove_file(&path)
@@ -1457,7 +1463,16 @@ impl SyncEngine {
         if let Ok(cache_root) = ctx.env.checked_path(cache_root_rel) {
             prune_share_cache(&cache_root, 8);
         }
-        AttachmentStage::Staged(dest_rel.to_string())
+        // `resolve` 会把本机上拼不得的段按可移植规则改写掉：返回**实际**落点的相对
+        // 路径，调用方按它去打开/流式读（按改写前的名字会找不到文件）。
+        let staged = if let Ok(rest) = dest.strip_prefix(ctx.env.base()) {
+            rest.to_string_lossy().replace('\\', "/")
+        } else if let Ok(rest) = dest.strip_prefix(&ctx.env.sync_root) {
+            format!("sync/{}", rest.to_string_lossy().replace('\\', "/"))
+        } else {
+            dest_rel.to_string()
+        };
+        AttachmentStage::Staged(staged)
     }
 
     /// 工作区里 `rel_path` 上的文件是不是 `blob` 这个对象（点开前按需核对）。

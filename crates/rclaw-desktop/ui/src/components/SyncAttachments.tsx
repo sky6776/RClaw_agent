@@ -86,29 +86,53 @@ let cards: CardState = noCardState();
  *  这笔撤掉（内容已经是登记的那份了）。清单核对过（`checked=true`）的以清单为准。 */
 const changedKeys = new Set<string>();
 
-/** 某个附件读出来发现内容对不上：界面按「已改写」处理（见 [`changedKeys`]）。 */
+/** 读的时候发现内容对不上时，卡片上直接显示的说明。 */
+const CHANGED_CARD_NOTE =
+  "这台设备上的文件已经不是这条消息引用的那一份了（可能被就地改写过），点「重新下载」取回原来的内容";
+
+/** 后端的「内容对不上」错误（被就地改写过）。文案出自 commands::sync / commands 的
+ *  核对入口，改文案时要一起改这里；其他错误（不存在、太大、读不了）不算。 */
+export function isAttachmentChangedError(e: unknown): boolean {
+  return String(e).includes("已经不是这条消息引用的那一份");
+}
+
+/** 某个附件读出来发现内容对不上：界面按「已改写」处理（见 [`changedKeys`]），卡片上
+ *  立刻显示错误与「重新下载」（本地条目的卡本来只显示「已下载到」，不加这条错误就得多
+ *  点一次「打开」才看到失败）。 */
 export function markAttachmentChanged(item: { path: string; blob: string }) {
   const key = `${item.blob}:${item.path}`;
   if (changedKeys.has(key)) return;
   changedKeys.add(key);
   // 清单数组换一个身份：订阅者（消息里的媒体卡、画廊）重算一遍可读性。
   all = [...all];
+  setCards((prev) => ({
+    ...prev,
+    saveErrors: { ...prev.saveErrors, [key]: CHANGED_CARD_NOTE },
+  }));
   emit();
 }
 
-/** 重新下载 / 存进工作区成功之后：这个对象之前「对不上」的覆盖撤掉。 */
+/** 某一次读成功（内容核对通过）：这条「对不上」的覆盖与卡片错误一并撤掉。 */
+export function clearAttachmentChanged(item: { path: string; blob: string }) {
+  const key = `${item.blob}:${item.path}`;
+  if (!changedKeys.delete(key)) return;
+  all = [...all];
+  setCards((prev) => ({ ...prev, saveErrors: without(prev.saveErrors, key) }));
+  emit();
+}
+
+/** 重新下载 / 存进工作区成功之后：这个对象之前「对不上」的覆盖与卡片错误都撤掉。 */
 function clearChanged(blob: string) {
-  let cleared = false;
-  for (const key of [...changedKeys]) {
-    if (key.startsWith(`${blob}:`)) {
-      changedKeys.delete(key);
-      cleared = true;
-    }
-  }
-  if (cleared) {
-    all = [...all];
-    emit();
-  }
+  const cleared = [...changedKeys].filter((key) => key.startsWith(`${blob}:`));
+  if (cleared.length === 0) return;
+  for (const key of cleared) changedKeys.delete(key);
+  all = [...all];
+  setCards((prev) => {
+    let saveErrors = prev.saveErrors;
+    for (const key of cleared) saveErrors = without(saveErrors, key);
+    return saveErrors === prev.saveErrors ? prev : { ...prev, saveErrors };
+  });
+  emit();
 }
 
 /** 让当前会话的清单重新取一遍（装载器在的时候才有）。 */
@@ -370,7 +394,8 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         loaded = null;
         all = EMPTY;
         allSig = "";
-        bar = NONE;
+        // 顶栏「已下载」那几条是这一会儿刚落到工作区的，与清单是否取得到无关：留着。
+        bar = { pending: [], landed: bar.landed, sig: "" };
         emit();
         return;
       }
@@ -407,6 +432,8 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     // 判定失败）。
     const retry = () => {
       loadFails = 0;
+      // 预算外的条目也要重新轮一遍（一直核不完的看几次就停，用户点了重试就再来一轮）。
+      uncheckedTries = 0;
       schedule();
     };
     reload = retry;
@@ -607,6 +634,7 @@ export function AttachmentCard({
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
     api
       .syncOpenAttachment(chatId, item.blob, path)
+      .then(() => clearAttachmentChanged(item))
       .catch((e) => {
         onError(`打开文件失败: ${String(e)}`);
         // 核对没过（文件被改写/删掉）：这次保存的落点不能再「打开」，收回去让用户
@@ -622,6 +650,10 @@ export function AttachmentCard({
   };
 
   if (item.state === "local") {
+    // 同一份内容被两条消息引用成不同的路径：登记只落到其中一条上，另一条消息的路径
+    // 上没有它。给个入口把内容存过去（后端按核对过的字节复制，不覆盖已有不同文件）。
+    const elsewhere = item.rel_path !== undefined && item.rel_path !== item.path;
+    const saving = Boolean(state.saving[fileKey(item)]);
     return (
       <div>
         <div className={CARD}>
@@ -632,6 +664,15 @@ export function AttachmentCard({
               {formatBytes(item.size)} · 已下载到 {item.rel_path ?? item.path}
             </span>
           </span>
+          {elsewhere && (
+            <button
+              onClick={() => save(chatId, item)}
+              disabled={inactive || saving}
+              className={CARD_BTN}
+            >
+              {saving ? "保存中…" : "存到这条消息的路径"}
+            </button>
+          )}
           {/* 打开只按工作区相对路径：`open_media` 不收绝对路径（安卓与 Windows 都会拒）。
               工具结果（artifact）的登记落点就在这个会话的 artifact 目录下。 */}
           <button

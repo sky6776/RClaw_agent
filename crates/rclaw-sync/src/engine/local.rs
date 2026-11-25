@@ -1067,12 +1067,21 @@ pub(crate) const SIZE_SLACK: u64 = 1024 * 1024;
 
 /// 读文件算摘要，最多读 `limit` 字节：路径上被换成一个超大文件时不能整读（清单在
 /// 打开会话的关键路径上）。读满了上限还没到文件尾就返回 `None`——判不了它是哪个对象。
-fn hash_file_digest(path: &Path, limit: u64) -> Option<[u8; 32]> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = file.take(limit);
+/// 读这个已经打开的句柄算摘要（版本与摘要出自同一份内容），最多读 `limit` 字节。
+fn hash_file_digest_of(file: &mut std::fs::File, limit: u64) -> Option<[u8; 32]> {
+    let mut reader = file.by_ref().take(limit);
     let (digest, read) = sha256_reader(&mut reader).ok()?;
-    (read < limit || std::fs::metadata(path).is_ok_and(|meta| meta.len() == limit))
-        .then_some(digest)
+    (read < limit || file.metadata().is_ok_and(|meta| meta.len() == limit)).then_some(digest)
+}
+
+/// 打开一个普通文件（`symlink_metadata` 先确认最后一段不是链接）。路径中间的链接由
+/// 调用方的路径守卫（`check_path`）保证不存在。
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    std::fs::File::open(path).ok()
 }
 
 /// 这个版本的摘要与「读完的时刻」。缓存命中不算读（不刷新时刻）。
@@ -1091,8 +1100,20 @@ pub(crate) fn cached_digest(
 }
 
 /// 整读一遍并记下这个版本的摘要（同一路径的旧版本被顶掉）。
-fn read_digest(path: &Path, version: &FileVersion, limit: u64) -> Option<[u8; 32]> {
-    let digest = hash_file_digest(path, limit)?;
+///
+/// 读的就是 `file` 这个已经打开、`version` 也是从它身上取的那一份：读完再对一次
+/// 版本，变了就不记结论（读到的是哪一版说不清，下一次重新读）。
+fn read_digest(
+    path: &Path,
+    file: &mut std::fs::File,
+    version: &FileVersion,
+    limit: u64,
+) -> Option<[u8; 32]> {
+    let digest = hash_file_digest_of(file, limit)?;
+    let meta = file.metadata().ok()?;
+    if version_with(Some(file), &meta)? != *version {
+        return None;
+    }
     if let Ok(mut cache) = DIGEST_CACHE.lock() {
         let key = path.to_string_lossy().into_owned();
         cache.retain(|entry| entry.path != key);
@@ -1154,18 +1175,20 @@ fn verification_cost(ctx: &Ctx, found: &FoundRef) -> u64 {
 /// （时间戳被还原过的替换在缓存的 60 秒窗口里看不出来；这是用户点开的那一下，读一次
 /// 文件是值得的。）
 pub(crate) fn same_blob_now(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    let Some(mut file) = open_regular(path) else {
         return false;
     };
-    if !meta.is_file() || meta.len().abs_diff(size) > SIZE_SLACK {
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if meta.len().abs_diff(size) > SIZE_SLACK {
         return false;
     }
     let limit = size.saturating_add(SIZE_SLACK);
-    match version_of(&path, &meta) {
-        Some(version) => {
-            read_digest(path, &version, limit).is_some_and(|digest| keys.blob_id(&digest) == blob)
-        }
-        None => hash_file_digest(path, limit)
+    match version_with(Some(&file), &meta) {
+        Some(version) => read_digest(path, &mut file, &version, limit)
+            .is_some_and(|digest| keys.blob_id(&digest) == blob),
+        None => hash_file_digest_of(&mut file, limit)
             .is_some_and(|digest| keys.blob_id(&digest) == blob),
     }
 }
@@ -1178,21 +1201,23 @@ pub(crate) fn same_blob_now(keys: &Keys, path: &Path, blob: &str, size: u64) -> 
 /// 替换只能靠过期后的重新整读发现，所以两个方向都设了期限——还原成正确内容之后，
 /// 卡上最多一分钟就会自己变回可用。
 pub(crate) fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    // 版本字段与摘要都取自同一个句柄：先 stat 路径、再按路径打开读取时，两次之间
+    // 文件被原子替换会把「旧版本 + 新内容」配成一条缓存结论。
+    let Some(mut file) = open_regular(path) else {
         return false;
     };
-    if !meta.is_file() {
+    let Ok(meta) = file.metadata() else {
         return false;
-    }
+    };
     // 长度差太多的（路径上换成了一个更大的文件之类）不可能是这个对象：连读都不读，
     // 不能让一个超大文件拖住整份清单。
     if meta.len().abs_diff(size) > SIZE_SLACK {
         return false;
     }
     let limit = size.saturating_add(SIZE_SLACK);
-    let Some(version) = version_of(&path, &meta) else {
+    let Some(version) = version_with(Some(&file), &meta) else {
         // 判不了有没有变：直接读一遍，不记结论。
-        return hash_file_digest(path, limit)
+        return hash_file_digest_of(&mut file, limit)
             .is_some_and(|digest| keys.blob_id(&digest) == blob);
     };
     let key = path.to_string_lossy().into_owned();
@@ -1201,7 +1226,7 @@ pub(crate) fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool
             return keys.blob_id(&digest) == blob;
         }
     }
-    read_digest(path, &version, limit)
+    read_digest(path, &mut file, &version, limit)
         .is_some_and(|digest| keys.blob_id(&digest) == blob)
 }
 

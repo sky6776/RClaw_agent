@@ -182,8 +182,13 @@ function clampChatFont(value: number): number {
 }
 
 function readStoredChatFont(): number {
-  const raw = localStorage.getItem(CHAT_FONT_KEY);
-  return raw === null ? CHAT_FONT_DEFAULT : clampChatFont(Number.parseInt(raw, 10));
+  // localStorage 在隐私模式 / 配额满时可能直接抛：字号只是个偏好，读不到用默认值。
+  try {
+    const raw = localStorage.getItem(CHAT_FONT_KEY);
+    return raw === null ? CHAT_FONT_DEFAULT : clampChatFont(Number.parseInt(raw, 10));
+  } catch {
+    return CHAT_FONT_DEFAULT;
+  }
 }
 
 const THEME_IDS: ThemeId[] = THEMES.map((t) => t.id);
@@ -437,7 +442,13 @@ ${event.payload.command}
   const applyChatFont = useCallback((next: number) => {
     setChatFont((prev) => {
       const clamped = clampChatFont(next);
-      if (clamped !== prev) localStorage.setItem(CHAT_FONT_KEY, String(clamped));
+      if (clamped !== prev) {
+        try {
+          localStorage.setItem(CHAT_FONT_KEY, String(clamped));
+        } catch {
+          // 存不下不影响这次调整。
+        }
+      }
       return clamped;
     });
   }, []);

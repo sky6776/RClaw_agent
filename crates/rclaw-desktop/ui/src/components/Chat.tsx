@@ -3118,7 +3118,8 @@ export default function Chat({
       {/* 全屏媒体画廊：图片查看器 / 视频播放器 + 左右滑切换上一个/下一个。 */}
       {gallery && (
         <MediaGallery
-          key={gallery.start}
+          // 同一路径的不同对象也是两条：key 带上对象名，画廊重新按新起点定位。
+          key={`${gallery.start}|${gallery.startBlob ?? ""}`}
           items={gallery.items}
           start={gallery.start}
           startBlob={gallery.startBlob}

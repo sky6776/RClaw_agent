@@ -6248,10 +6248,16 @@ fn prune_cache_dir(dir: &std::path::Path, keep: usize) {
     entries.sort_by(|a, b| b.0.cmp(&a.0));
     let now = std::time::SystemTime::now();
     for (index, (mtime, path)) in entries.into_iter().enumerate() {
-        let stale = now
+        let age = now
             .duration_since(mtime)
-            .map(|age| age.as_secs() > 3600)
-            .unwrap_or(false);
+            .map(|age| age.as_secs())
+            .unwrap_or(0);
+        // 刚写下 / 刚被读过的（播放中的流每读一段会刷新 mtime）不删：删掉正在播放、
+        // 正在分享（chooser 还开着）的副本会让后续请求 404。
+        if age <= 300 {
+            continue;
+        }
+        let stale = age > 3600;
         if index >= keep || stale {
             let _ = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
@@ -6509,6 +6515,9 @@ pub async fn media_stream_url(
     fresh: Option<bool>,
 ) -> Result<String, String> {
     let playback = fresh.unwrap_or(true);
+    // 点播时「核不了」（没有登记/密钥、登记在别的设备上）：按老行为不钉版本放行，
+    // 与其他读取入口的「核不了按老行为」一致；画廊里不会因此永远放不出来。
+    let mut playback_unverifiable = false;
     // 点播：把核对过的内容复制成暂存副本，流从这份副本出——播放期间原路径被改写也
     // 影响不到已经在播的这一份（副本就是边复制边核对过的字节）。
     if playback {
@@ -6544,7 +6553,7 @@ pub async fn media_stream_url(
                         "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into(),
                     )
                 }
-                rclaw_sync::AttachmentStage::Unverifiable => {}
+                rclaw_sync::AttachmentStage::Unverifiable => playback_unverifiable = true,
             }
         }
     }
@@ -6552,7 +6561,7 @@ pub async fn media_stream_url(
     // 不核、也不整读大视频）。
     let named = blob.is_some();
     let pin = check_media_read_cached(&state, chat_id, blob, &path).await?;
-    if named && pin.is_none() {
+    if named && pin.is_none() && !playback_unverifiable {
         // 这条消息登记的附件还没核对完（缓存里没有结论）：先不出帧，界面保持通用的
         // 视频卡（点开时走核对过的暂存副本）。否则同长度替换的新版本会在这里露脸。
         return Err("这个视频还没有核对完，暂时不能应用内播放".into());
