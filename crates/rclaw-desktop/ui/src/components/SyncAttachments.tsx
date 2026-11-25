@@ -308,11 +308,11 @@ function save(chatId: string, item: SyncAttachment) {
   }));
   api
     .syncAttachmentSave(chatId, item.blob, item.path)
-    .then((rel) => {
+    .then(({ rel, verified }) => {
       if (chat !== chatId) return;
-      // 存下去的就是核对过的字节：这个对象「读出来对不上」的覆盖撤掉（消息里的卡
-      // 换回正常图片/视频卡）。
-      clearChanged(item.blob);
+      // 只有「写下去的字节核对过」才撤「读出来对不上」的覆盖；核不了按老行为复制时
+      // 照样记下已存到，但不撤（那份副本可能仍不是这条消息引用的内容）。
+      if (verified) clearChanged(item.blob);
       setCards((prev) => ({ ...prev, saved: { ...prev.saved, [key]: rel } }));
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
       // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。

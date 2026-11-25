@@ -1021,6 +1021,14 @@ pub async fn sync_open_attachment(
     }
 }
 
+/// 存进工作区的结果：`rel` 是落点，`verified` 表示这次写出去的字节是核对过的
+/// （核不了时按老行为复制，`rel` 照样有，但界面不能当成核对通过）。
+#[derive(Debug, Serialize)]
+pub struct SavedSnapshot {
+    pub rel: String,
+    pub verified: bool,
+}
+
 /// 把一份文件快照存进工作区（§8.7）。返回它在工作区里的相对路径。
 #[tauri::command]
 pub async fn sync_attachment_save(
@@ -1028,7 +1036,7 @@ pub async fn sync_attachment_save(
     chat_id: String,
     blob: String,
     path: String,
-) -> Result<String, String> {
+) -> Result<SavedSnapshot, String> {
     check_chat_id(&chat_id)?;
     if path.trim().is_empty() {
         return Err("没有指定要存到哪个路径".into());
@@ -1211,7 +1219,7 @@ fn save_snapshot_checked(
     engine: &SyncEngine,
     blob: &str,
     cached: &Path,
-) -> Result<String, String> {
+) -> Result<SavedSnapshot, String> {
     let (dir, dir_rel, name) = snapshot_dir(home, path)?;
     let target = dir.join(&name);
     // 只把普通文件当「那里已经有一份」：链接（或别的什么挡在名字上）不算，往下照
@@ -1223,12 +1231,22 @@ fn save_snapshot_checked(
             .copy_cached_blob(blob, &mut |reader| compare_snapshot(reader, &target, &mut same))
             .map_err(|e| format!("存进工作区失败: {e}"))?
         {
-            rclaw_sync::AttachmentCopy::Copied if same => return Ok(format!("{dir_rel}/{name}")),
+            rclaw_sync::AttachmentCopy::Copied if same => {
+                return Ok(SavedSnapshot {
+                    rel: format!("{dir_rel}/{name}"),
+                    verified: true,
+                })
+            }
             // 内容不同不是错：往下照「另存一份」处理。
             rclaw_sync::AttachmentCopy::Copied => {}
             rclaw_sync::AttachmentCopy::Rejected => return Err(CHANGED_SNAPSHOT.into()),
             // 核不了（没有登记/密钥）：按老行为只看内容一不一样。
-            rclaw_sync::AttachmentCopy::Unverifiable => return save_snapshot(home, path, cached),
+            rclaw_sync::AttachmentCopy::Unverifiable => {
+                return Ok(SavedSnapshot {
+                    rel: save_snapshot(home, path, cached)?,
+                    verified: false,
+                })
+            }
         }
     }
     // 写入闭包里只接受「核对通过」：核不了（`Unverifiable`）时 `copy_cached_blob` 根本
@@ -1257,9 +1275,11 @@ fn save_snapshot_checked(
         Ok(dest) => dest,
         Err(e) => {
             return match outcome.get() {
-                Some(rclaw_sync::AttachmentCopy::Unverifiable) => {
-                    save_snapshot(home, path, cached)
-                }
+                // 核不了：按老行为复制一份，但如实告诉界面这次没核对。
+                Some(rclaw_sync::AttachmentCopy::Unverifiable) => Ok(SavedSnapshot {
+                    rel: save_snapshot(home, path, cached)?,
+                    verified: false,
+                }),
                 Some(rclaw_sync::AttachmentCopy::Rejected) => Err(CHANGED_SNAPSHOT.into()),
                 _ => Err(e),
             };
@@ -1269,7 +1289,10 @@ fn save_snapshot_checked(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| "结果路径异常".to_string())?;
-    Ok(format!("{dir_rel}/{file_name}"))
+    Ok(SavedSnapshot {
+        rel: format!("{dir_rel}/{file_name}"),
+        verified: true,
+    })
 }
 
 /// 把 `reader`（核对过的缓存副本）与 `target` 逐块比较，读到来源结尾为止（摘要要覆盖

@@ -16,6 +16,7 @@ import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { mentionsPath, parseMediaItems } from "./MediaPreviews";
 import {
+  clearAttachmentChanged,
   messageFileRefs,
   readableAtPath,
   refreshSyncAttachments,
@@ -864,6 +865,9 @@ export default function Chat({
     startY: 0,
     startScrollTop: 0,
     moved: false,
+    // 这次手势里出现过双指（会话文字缩放）：与 moved 分开记——捏合不是拖动，但
+    // 也不算「回到底部」的轻点。
+    pinched: false,
   });
   // 最近一次滚动事件里的 scrollTop：只有朝底部方向（scrollTop 严格增大）的
   // 滚动才允许恢复跟随——「向上翻」手势自己产生的滚动事件不能把刚脱离的跟随
@@ -1055,6 +1059,7 @@ export default function Chat({
       st.startY = first.clientY;
       st.startScrollTop = el.scrollTop;
       st.moved = false;
+      st.pinched = false;
     }
     for (let i = 0; i < e.changedTouches.length; i++) {
       st.ids.add(e.changedTouches[i].identifier);
@@ -1073,7 +1078,7 @@ export default function Chat({
         st.startY = t.clientY;
         const el = listRef.current;
         if (el) st.startScrollTop = el.scrollTop;
-        st.moved = true; // 捏合不是轻点
+        st.pinched = true;
       }
       lastTouchAtRef.current = performance.now();
       armTouchWatchdog();
@@ -1164,7 +1169,12 @@ export default function Chat({
     // 先恢复跟随并隐藏按钮，随后的合成 click 落在已卸载节点上落空，滚动不会
     // 发生，交给按钮自己的 click（scrollListToBottom）。拖动过（moved）视为
     // 普通手势，正常重判。
-    if (!st.moved && e.target instanceof Element && e.target.closest("[data-jump-down]")) {
+    if (
+      !st.moved &&
+      !st.pinched &&
+      e.target instanceof Element &&
+      e.target.closest("[data-jump-down]")
+    ) {
       return;
     }
     // 依赖起点的完整结算：有残留触点（e.touches.length>0，可能在别的区域，
@@ -1711,20 +1721,26 @@ export default function Chat({
     const ref = messageFileRefs(syncedAttachments, msgId).find((item) => item.path === path);
     const open = ref
       ? api.syncOpenAttachment(sessionKey, ref.blob, path)
-      : api.openMedia(path);
-    open.catch((e) => onError?.(`打开媒体失败: ${String(e)}`));
+      : api.openMedia(path).then(() => false);
+    void open
+      .then((verified) => {
+        // 打开的是核对过的副本：这条「读出来对不上」的标记可以撤掉。
+        if (verified && ref) clearAttachmentChanged({ path, blob: ref.blob });
+      })
+      .catch((e) => onError?.(`打开媒体失败: ${String(e)}`));
   };
   const menuViewImage = (path: string, msgId?: number) => {
     const ref = messageFileRefs(syncedAttachments, msgId).find((item) => item.path === path);
     void api
       .mediaPreview(path, sessionKey, ref?.blob)
-      .then((r) =>
-        openGallery(
+      .then((r) => {
+        if (r.verified && ref) clearAttachmentChanged({ path, blob: ref.blob });
+        return openGallery(
           path,
           { path, blob: ref?.blob, src: `data:${r.mime};base64,${r.base64}` },
           ref?.blob,
-        ),
-      )
+        );
+      })
       .catch((e) => onError?.(`读取图片失败: ${String(e)}`));
   };
 

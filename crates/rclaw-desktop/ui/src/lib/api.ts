@@ -1648,10 +1648,15 @@ export const api = {
   syncOpenAttachment: (chatId: string, blob: string, path: string) =>
     invoke<boolean>("sync_open_attachment", { chatId, blob, path }),
 
-  /** 把一份文件快照存进工作区，返回它在工作区里的相对路径（不覆盖已有的不同文件）。
+  /** 把一份文件快照存进工作区（不覆盖已有的不同文件），返回落点与「写入的字节是不是
+   *  核对过的」（核不了时按老行为复制，verified=false）。
    *  `path` 是消息里写的那个路径：同一份内容被几条消息引用时，存到点的那条的位置上。 */
   syncAttachmentSave: (chatId: string, blob: string, path: string) =>
-    invoke<string>("sync_attachment_save", { chatId, blob, path }),
+    invoke<{ rel: string; verified: boolean }>("sync_attachment_save", {
+      chatId,
+      blob,
+      path,
+    }),
 
   /** 把一个会话导出成会话包（明文，含这个会话的全部内容）：落在 output/exports/，
    *  返回工作区相对路径；去向经 saveMedia / shareMedia 决定。不需要开启同步。 */
