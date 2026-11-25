@@ -1285,20 +1285,21 @@ fn save_snapshot_checked(
         // 目标位置已经有一份：同一次读里比较它和缓存副本、并核对缓存副本的摘要。
         let mut same = true;
         match engine
-            // 比较这一遍不归一：目标内容不同时下面还要按同一个对象名再读一遍。
-            .copy_cached_blob(blob, false, &mut |reader| {
+            .copy_cached_blob(blob, &mut |reader| {
                 compare_snapshot(reader, &target, &mut same)
             })
             .map_err(|e| format!("存进工作区失败: {e}"))?
         {
-            rclaw_sync::AttachmentCopy::Copied if same => {
+            rclaw_sync::AttachmentCopy::Copied | rclaw_sync::AttachmentCopy::CopiedLegacy
+                if same =>
+            {
                 return Ok(SavedSnapshot {
                     rel: format!("{dir_rel}/{name}"),
                     verified: true,
                 })
             }
             // 内容不同不是错：往下照「另存一份」处理。
-            rclaw_sync::AttachmentCopy::Copied => {}
+            rclaw_sync::AttachmentCopy::Copied | rclaw_sync::AttachmentCopy::CopiedLegacy => {}
             rclaw_sync::AttachmentCopy::Rejected => return Err(CHANGED_SNAPSHOT.into()),
             // 核不了（没有登记/密钥）：按老行为只看内容一不一样。
             rclaw_sync::AttachmentCopy::Unverifiable => {
@@ -1313,6 +1314,8 @@ fn save_snapshot_checked(
     // 不会读文件，闭包必须报错让 `write_fresh_file` 把刚建的空文件删掉，再退回不核对的
     // 老路径重来一次——不能把一个 0 字节的「快照」留在工作区。
     let outcome = std::cell::Cell::new(None);
+    // 这次读到的内容来自旧版明文摘要登记：保存发布成功之后再把登记归一。
+    let legacy = std::cell::Cell::new(false);
     let dest = match write_verified_file(
         &dir,
         |n| snapshot_name(n, &name),
@@ -1320,11 +1323,13 @@ fn save_snapshot_checked(
             // 读出来的字节直接写进目标文件，摘要就在这同一次读里算、读完后核对；
             // 对不上时返回错误，`write_fresh_file` 会把刚写的这份删掉。
             match engine
-                // 这是这次保存的最后一遍读：旧版明文登记在这里归一并接受。
-                .copy_cached_blob(blob, true, &mut |reader| {
-                    std::io::copy(reader, file).map(|_| ())
-                }) {
+                .copy_cached_blob(blob, &mut |reader| std::io::copy(reader, file).map(|_| ()))
+            {
                 Ok(rclaw_sync::AttachmentCopy::Copied) => Ok(()),
+                Ok(rclaw_sync::AttachmentCopy::CopiedLegacy) => {
+                    legacy.set(true);
+                    Ok(())
+                }
                 Ok(other) => {
                     outcome.set(Some(other));
                     Err(std::io::Error::other("这份快照核不了"))
@@ -1350,6 +1355,11 @@ fn save_snapshot_checked(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| "结果路径异常".to_string())?;
+    // 内容已经发布到工作区：这时才把旧版明文登记归一（提前换掉对象名会让失败重试
+    // 按旧名找不到登记）。
+    if legacy.get() {
+        engine.normalize_cached_blob(blob);
+    }
     Ok(SavedSnapshot {
         rel: format!("{dir_rel}/{file_name}"),
         verified: true,

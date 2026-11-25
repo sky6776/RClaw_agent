@@ -5257,18 +5257,22 @@ static PREVIEW_MEMORY: std::sync::Mutex<Vec<(String, &'static str, Vec<u8>)>> =
 /// 进程内预览缓存的总字节上限。
 const PREVIEW_MEMORY_BUDGET: usize = 16 * 1024 * 1024;
 
-/// 记一份核对过的预览（同一键先删再追加，超预算丢最旧的）。
+/// 记一份核对过的预览（同一键先删再追加；超预算的条目直接不记，先丢最旧的腾地方）。
 fn remember_memory_preview(key: &str, mime: &'static str, bytes: &[u8]) {
+    // 单条就超过预算的（很小的原图也可能上 MB）：记进去会把整个缓存挤空，不记。
+    if bytes.len() > PREVIEW_MEMORY_BUDGET {
+        return;
+    }
     let Ok(mut cache) = PREVIEW_MEMORY.lock() else {
         return;
     };
     cache.retain(|(known, _, _)| known != key);
-    cache.push((key.to_string(), mime, bytes.to_vec()));
     let mut total: usize = cache.iter().map(|(_, _, bytes)| bytes.len()).sum();
-    while total > PREVIEW_MEMORY_BUDGET && !cache.is_empty() {
+    while total + bytes.len() > PREVIEW_MEMORY_BUDGET && !cache.is_empty() {
         let (_, _, dropped) = cache.remove(0);
         total = total.saturating_sub(dropped.len());
     }
+    cache.push((key.to_string(), mime, bytes.to_vec()));
 }
 
 /// 取一份核对过的预览（命中挪到队尾）。
@@ -5487,10 +5491,16 @@ fn image_preview_bytes(
             verified: true,
         });
     }
-    let payload = encode_preview(bytes)?;
-    let (encoded, out_mime) = match payload {
-        // 原图已足够小：原样返回，也记进进程内缓存。
-        None => (bytes.to_vec(), mime),
+    let (encoded, out_mime) = match encode_preview(bytes)? {
+        // 原图已足够小：原样返回。MIME 取本次引用的扩展名（同一份内容引用成不同后缀
+        // 时不能借别的后缀的 MIME），也不进缓存——缓存键里没有后缀。
+        None => {
+            return Ok(MediaPayload {
+                mime: mime.into(),
+                base64: encode_base64(bytes),
+                verified: true,
+            })
+        }
         Some((encoded, out_mime)) => (encoded, out_mime),
     };
     remember_memory_preview(&key, out_mime, &encoded);

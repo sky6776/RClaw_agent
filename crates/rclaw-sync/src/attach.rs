@@ -259,7 +259,14 @@ fn check_local_row(ctx: &Ctx, keys: &Keys, row: BlobRow) -> Result<LocalObject> 
         return Ok(LocalObject::Mismatch);
     }
     // 旧版本按明文摘要登记的内联缓存：内容对得上，对象名按空间密钥重算并改登记。
-    let normalized = normalize_registration(ctx, &row.blob_id, &current, &row.rel_path, len)?;
+    let normalized = normalize_registration(
+        ctx,
+        &row.blob_id,
+        &current,
+        &row.rel_path,
+        len,
+        ctx.space.epoch(),
+    )?;
     Ok(LocalObject::Intact(normalized))
 }
 
@@ -271,8 +278,13 @@ pub(crate) fn normalize_registration(
     new: &str,
     rel_path: &str,
     size: u64,
+    epoch: u64,
 ) -> Result<BlobRow> {
     db::write(ctx.db(), |tx| {
+        // 读文件是在旧空间里做的：拿锁之后换代了就作废，别把旧对象名写进新空间。
+        if ctx.space.epoch() != epoch {
+            return Err(SyncError::other("同步空间刚换过，这次登记归一作废"));
+        }
         // 新对象名已经登记过（另一条消息先归一过，或同一份内容从别的设备取回过）：
         // 保留它的状态，落点换成本次核对过的这一份——两份内容相同。
         match db::blob_get(tx, new)? {

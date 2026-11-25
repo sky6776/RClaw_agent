@@ -103,6 +103,10 @@ pub enum AttachmentBytes {
 pub enum AttachmentCopy {
     /// 交出去的字节就是 `blob` 这个对象（摘要来自同一次读）。
     Copied,
+    /// 内容对得上，但登记是旧版本按明文摘要写的（无密钥时导入会话包留下的）：
+    /// 内容一样，调用方可以照常用；登记归一由 [`SyncEngine::normalize_cached_blob`]
+    /// 在整次操作成功之后做。
+    CopiedLegacy,
     /// 内容对不上（缓存副本被原地改写过）：调用方写出去的东西要作废。
     Rejected,
     /// 核不了（没有登记、不在本机、读不出密钥）：按老行为处理。
@@ -1229,14 +1233,11 @@ impl SyncEngine {
     /// 的字节就是核对过的那些，不给「核对完再按路径重新打开」留窗口。
     ///
     /// `Unverifiable` 表示核不了（没有登记、不在本机、读不出密钥）：调用方按老行为处理。
-    ///
-    /// `normalize`：这次读是「旧版明文摘要登记」时，顺手把登记归一成带密钥的对象名。
-    /// 一次操作里要读两遍的（保存快照先比较、再写入）只有**最后一遍**才归一——先归一
-    /// 会让第二遍按旧对象名查不到登记，退回不核对的复制。
+    /// 旧版明文摘要登记的内容对得上时返回 `CopiedLegacy`（内容可用，登记不改——归一由
+    /// 调用方在整次操作成功之后用 [`Self::normalize_cached_blob`] 做）。
     pub fn copy_cached_blob(
         &self,
         blob: &str,
-        normalize: bool,
         consume: &mut dyn FnMut(&mut dyn std::io::Read) -> std::io::Result<()>,
     ) -> std::io::Result<AttachmentCopy> {
         let ctx = &self.inner.ctx;
@@ -1285,21 +1286,59 @@ impl SyncEngine {
         let current = keys.blob_id(&digest);
         if current != blob {
             // 旧版本按明文摘要登记的内联缓存（无密钥时导入会话包留下的）：内容对得上
-            // 明文摘要就照常接受；归一失败只影响登记，读到的内容没变。
+            // 明文摘要就照常接受。这里**不改登记**——保存要读两遍、发布还可能重试，
+            // 提前换掉旧对象名会让后面的读按旧名找不到登记（退回不核对的复制）。
             if crate::ids::hex(&digest) != *blob {
                 return Ok(AttachmentCopy::Rejected);
             }
-            if normalize {
-                let _ = crate::attach::normalize_registration(
-                    ctx,
-                    blob,
-                    &current,
-                    &row.rel_path,
-                    total,
-                );
-            }
+            return Ok(AttachmentCopy::CopiedLegacy);
         }
         Ok(AttachmentCopy::Copied)
+    }
+
+    /// 旧版按明文摘要登记的本机副本：内容核对得上时把登记归一成带密钥的对象名
+    /// （只改登记与消息引用，不改文件）。调用方已经在同一次读里确认过内容就是这个
+    /// 对象；这里再读一遍只为拿摘要，失败就算了（登记归一只是补救）。
+    pub fn normalize_cached_blob(&self, blob: &str) {
+        let ctx = &self.inner.ctx;
+        let epoch = ctx.space.epoch();
+        let Some(keys) = Secrets::load(&ctx.paths)
+            .ok()
+            .and_then(|secrets| secrets.keys().ok())
+        else {
+            return;
+        };
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .ok()
+            .flatten();
+        let Some(row) = row else {
+            return;
+        };
+        if row.state == db::BLOB_REMOTE {
+            return;
+        }
+        let Ok(path) = ctx.env.checked_path(&row.rel_path) else {
+            return;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            return;
+        };
+        let cap = row.size.saturating_add(local::SIZE_SLACK).saturating_add(1);
+        let Ok((digest, read)) = crate::crypto::sha256_reader(&mut file.take(cap)) else {
+            return;
+        };
+        if read > row.size.saturating_add(local::SIZE_SLACK) {
+            return;
+        }
+        let keyed = keys.blob_id(&digest);
+        if keyed == blob || crate::ids::hex(&digest) != blob {
+            return;
+        }
+        if ctx.space.epoch() != epoch {
+            return;
+        }
+        let _ =
+            crate::attach::normalize_registration(ctx, blob, &keyed, &row.rel_path, read, epoch);
     }
 
     /// 读出本机缓存里 `blob` 副本的字节（与 [`Self::copy_cached_blob`] 同一次读核对）。
@@ -1318,7 +1357,7 @@ impl SyncEngine {
         // 文件又被换大了的时候，不能把内存读爆）。
         let mut bytes: Vec<u8> = Vec::new();
         let mut too_large = false;
-        let outcome = match self.copy_cached_blob(blob, true, &mut |reader| {
+        let outcome = match self.copy_cached_blob(blob, &mut |reader| {
             let mut buffer = vec![0u8; 64 * 1024];
             loop {
                 let n = reader.read(&mut buffer)?;
@@ -1339,6 +1378,11 @@ impl SyncEngine {
         };
         match outcome {
             AttachmentCopy::Copied => AttachmentBytes::Bytes(bytes),
+            AttachmentCopy::CopiedLegacy => {
+                // 内容已经核对过：顺手把旧登记归一（失败不影响这次读）。
+                self.normalize_cached_blob(blob);
+                AttachmentBytes::Bytes(bytes)
+            }
             AttachmentCopy::Rejected => AttachmentBytes::Rejected,
             AttachmentCopy::Unverifiable => AttachmentBytes::Unverifiable,
         }
