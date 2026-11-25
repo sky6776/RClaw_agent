@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::join_all;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -172,23 +173,38 @@ impl McpManager {
         self.resolved.enabled_server_names()
     }
 
+    /// 启动期握手并发上限：远端 server 的 initialize + tools/list 是启动期最贵的一段，
+    /// 串行会让就绪时间随配置项线性叠加；全量放开又会在配置很多时集中占用连接与
+    /// 读线程（stdio 还会集中起进程）。分波并发，波内保持配置顺序。
+    /// 16 覆盖当前的 9 个远端配置，一波内全并发。
+    const MAX_CONCURRENT_HANDSHAKES: usize = 16;
+
     async fn start_auto_start_servers(&self) {
-        for server_name in self.enabled_server_names() {
-            let Some(server_cfg) = self.resolved.servers.get(&server_name) else {
-                continue;
-            };
-            if !server_cfg.auto_start {
-                continue;
-            }
-            if let Err(e) = self.client_for(&server_name).await {
-                // 启动期错误可能内嵌 reqwest 错误（Display 含完整 URL，query 里可带 token），
-                // 与 provider.rs 的执行期日志同样先脱敏。
-                warn!(
-                    server = %server_name,
-                    error = %rclaw_store::redact_sensitive_text(&e.to_string()),
-                    "自动启动 MCP 服务器失败"
-                );
-            }
+        let servers: Vec<String> = self
+            .enabled_server_names()
+            .into_iter()
+            .filter(|name| {
+                self.resolved
+                    .servers
+                    .get(name)
+                    .map(|cfg| cfg.auto_start)
+                    .unwrap_or(false)
+            })
+            .collect();
+        for chunk in servers.chunks(Self::MAX_CONCURRENT_HANDSHAKES) {
+            join_all(chunk.iter().map(|server_name| async move {
+                if let Err(e) = self.client_for(server_name).await {
+                    // 启动期错误可能内嵌 reqwest 错误（Display 含完整 URL，query 里可带 token），
+                    // 与 provider.rs 的执行期日志同样先脱敏。在任务内立即落日志：不等到整批
+                    // 握手结束，启动转圈期间也看得到是哪台 server 挂了。
+                    warn!(
+                        server = %server_name,
+                        error = %rclaw_store::redact_sensitive_text(&e.to_string()),
+                        "自动启动 MCP 服务器失败"
+                    );
+                }
+            }))
+            .await;
         }
     }
 
@@ -305,30 +321,46 @@ impl McpManager {
         allowed_servers: &[String],
         allowed_tools: &[String],
     ) -> McpResult<()> {
-        for (server_name, server_cfg) in &self.resolved.servers {
-            if !should_register_at_boot(server_cfg, server_name, allowed_servers, allowed_tools) {
-                continue;
-            }
-            let client = match self.client_for(server_name).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        server = %server_name,
-                        error = %rclaw_store::redact_sensitive_text(&e.to_string()),
-                        "跳过不可用的 MCP 服务器"
-                    );
-                    continue;
+        // 握手（initialize + 首次 tools/list）是启动期最贵的一段：按波并发连上并取回
+        // 各 server 的工具清单，再串行写 `&mut` 注册表。清单也在并发任务里取——收到
+        // tools/list_changed（可随首轮响应到达）时 list_tools 会再请求一次，放在注册
+        // 循环里就退化成逐台串行等待。
+        let eligible: Vec<&String> = self
+            .resolved
+            .servers
+            .iter()
+            .filter(|(server_name, server_cfg)| {
+                should_register_at_boot(server_cfg, server_name, allowed_servers, allowed_tools)
+            })
+            .map(|(server_name, _)| server_name)
+            .collect();
+        for chunk in eligible.chunks(Self::MAX_CONCURRENT_HANDSHAKES) {
+            let connected = join_all(chunk.iter().map(|server_name| async move {
+                match self.client_for(server_name).await {
+                    Ok(client) => (server_name.as_str(), Ok(client.list_tools().await)),
+                    Err(e) => {
+                        warn!(
+                            server = %server_name,
+                            error = %rclaw_store::redact_sensitive_text(&e.to_string()),
+                            "跳过不可用的 MCP 服务器"
+                        );
+                        (server_name.as_str(), Err(()))
+                    }
                 }
-            };
-            for tool in client.list_tools().await {
-                if mcp_tool_allowed(allowed_servers, allowed_tools, server_name, &tool.name) {
-                    // wrapper 持有 manager 句柄（而非 client），execute 时再按需 client_for，
-                    // 从而在 server 退出后能自动重建连接。
-                    registry.register(Box::new(McpToolWrapper::new(
-                        server_name,
-                        tool,
-                        Arc::clone(self),
-                    )));
+            }))
+            .await;
+            for (server_name, tools) in connected {
+                let Ok(tools) = tools else { continue };
+                for tool in tools {
+                    if mcp_tool_allowed(allowed_servers, allowed_tools, server_name, &tool.name) {
+                        // wrapper 持有 manager 句柄（而非 client），execute 时再按需 client_for，
+                        // 从而在 server 退出后能自动重建连接。
+                        registry.register(Box::new(McpToolWrapper::new(
+                            server_name,
+                            tool,
+                            Arc::clone(self),
+                        )));
+                    }
                 }
             }
         }
@@ -592,5 +624,455 @@ mod http_integration_tests {
             .unwrap();
         assert!(!result.is_error);
         assert_eq!(result.content, serde_json::json!("hit"));
+    }
+
+    /// 测试用最小 MCP HTTP 服务（手写 TCP，不用 wiremock）。
+    ///
+    /// wiremock 的响应是同步 `Respond`，做不到「等其它 server 的请求也到达再应答」，
+    /// 而到达间隔阈值又会被调度抖动干扰。这里用 `tokio::sync::Barrier` 做栅栏：
+    /// initialize（以及第二轮 tools/list）必须三台同时在途才会被应答——串行实现
+    /// 永远凑不齐栅栏，由外层 `tokio::time::timeout` 判失败。这是因果证明，不靠计时门槛。
+    struct BarrierMcpServer {
+        url: String,
+    }
+
+    /// 多台 mock 共享的栅栏与请求记录。
+    struct MockShared {
+        init_barrier: tokio::sync::Barrier,
+        /// 首轮 tools/list 的栅栏：握手阶段的清单拉取也必须并发（否则「先并发连上、
+        /// 再逐台串行拉首轮清单」这种半吊子实现也能骗过纯 initialize 断言）。
+        first_list_barrier: tokio::sync::Barrier,
+        refresh_barrier: tokio::sync::Barrier,
+        /// initialize 到达顺序（按 label）。
+        init_arrivals: std::sync::Mutex<Vec<String>>,
+        /// 每台 server 的 tools/list 次数（首轮返回带 list_changed 的 SSE，其后等刷新栅栏）。
+        tool_list_calls: std::sync::Mutex<HashMap<String, usize>>,
+        /// mock 侧首个「请求不合法」记录（server: 原因）：让超时报错能区分「并发没做」
+        /// 和「请求本身有问题」，不把格式错误伪装成并发失败。
+        first_error: std::sync::Mutex<Option<String>>,
+    }
+
+    impl MockShared {
+        fn new(count: usize) -> Arc<Self> {
+            Arc::new(Self {
+                init_barrier: tokio::sync::Barrier::new(count),
+                first_list_barrier: tokio::sync::Barrier::new(count),
+                refresh_barrier: tokio::sync::Barrier::new(count),
+                init_arrivals: std::sync::Mutex::new(Vec::new()),
+                tool_list_calls: std::sync::Mutex::new(HashMap::new()),
+                first_error: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn record_error(&self, label: &str, reason: &str) {
+            let mut slot = self.first_error.lock().expect("错误记录锁未被毒化");
+            if slot.is_none() {
+                *slot = Some(format!("{label}: {reason}"));
+            }
+        }
+
+        /// 成功路径的守门：mock 侧一旦记录过非法请求就立刻失败（否则该错误可能被
+        /// 「跳过失败服务器」语义吞掉，测试反而通过）。
+        fn assert_no_error(&self) {
+            let error = self
+                .first_error
+                .lock()
+                .expect("错误记录锁未被毒化")
+                .clone();
+            assert!(error.is_none(), "mock 收到了非法请求：{error:?}");
+        }
+
+        /// 超时/失败时的取证：各阶段到达计数 + mock 侧首个解析错误。
+        fn diagnostics(&self) -> String {
+            format!(
+                "已记录 initialize: {:?}；tools/list 次数: {:?}；mock 首个请求错误: {:?}",
+                self.init_arrivals(),
+                self.tool_list_calls
+                    .lock()
+                    .expect("tools/list 计数锁未被毒化")
+                    .clone(),
+                self.first_error
+                    .lock()
+                    .expect("错误记录锁未被毒化")
+                    .clone(),
+            )
+        }
+
+        fn init_arrivals(&self) -> Vec<String> {
+            self.init_arrivals
+                .lock()
+                .expect("到达记录锁未被毒化")
+                .clone()
+        }
+
+        fn tool_list_calls(&self, label: &str) -> usize {
+            self.tool_list_calls
+                .lock()
+                .expect("tools/list 计数锁未被毒化")
+                .get(label)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl BarrierMcpServer {
+        async fn start(label: &str, tool: &str, extra: &str, shared: Arc<MockShared>) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("mock server 端口绑定失败");
+            let addr = listener.local_addr().expect("mock server 本地地址");
+            let label = label.to_string();
+            let tool = tool.to_string();
+            let extra = extra.to_string();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let shared = Arc::clone(&shared);
+                    let label = label.clone();
+                    let tool = tool.clone();
+                    let extra = extra.clone();
+                    tokio::spawn(async move {
+                        if let Some(body) = read_http_body(&mut sock).await {
+                            respond_mcp(&mut sock, &body, &label, &tool, &extra, &shared).await;
+                        }
+                    });
+                }
+            });
+            Self {
+                url: format!("http://{addr}/mcp"),
+            }
+        }
+    }
+
+    /// 读一次 HTTP 请求体（按 Content-Length）。头部缺失/非法/超限即放弃，不把格式
+    /// 异常掩盖成「空请求」——否则它会一路演变成栅栏超时，掩盖真正的失败点。
+    async fn read_http_body(sock: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        const MAX_BODY: usize = 1 << 20;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                let len = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()?;
+                if len > MAX_BODY {
+                    return None;
+                }
+                let end = pos.checked_add(4)?.checked_add(len)?;
+                if buf.len() >= end {
+                    return Some(String::from_utf8_lossy(&buf[pos + 4..end]).into_owned());
+                }
+            }
+            if buf.len() > MAX_BODY + 4096 {
+                return None;
+            }
+            let read = sock.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// mock 收到的一帧 JSON-RPC 请求的分类。
+    enum MockRequest {
+        /// 带数字 id 的调用：必须应答同 id。
+        Call { method: String, id: u64 },
+        /// 不带 id 的通知。
+        Notification { method: String },
+        /// 不合法的请求（JSON 语法、id 类型、缺 method 等）：回 400 并留证。
+        Invalid(&'static str),
+    }
+
+    /// 解析并校验请求：区分「id 缺失（通知）」与「id 类型非法（400）」，不把后者
+    /// 当成 id=0 混进栅栏。
+    fn parse_request(body: &str) -> MockRequest {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return MockRequest::Invalid("JSON 语法错误");
+        };
+        if value.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+            return MockRequest::Invalid("jsonrpc 不是 \"2.0\"");
+        }
+        // 空 method 等同于没有 method：不能当「未知方法」放过去。
+        let method = value
+            .get("method")
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.is_empty());
+        let id = value.get("id");
+        match (method, id) {
+            (Some(method), Some(id)) => match id.as_u64() {
+                Some(id) => MockRequest::Call {
+                    method: method.to_string(),
+                    id,
+                },
+                None => MockRequest::Invalid("id 不是数字"),
+            },
+            (Some(method), None) => MockRequest::Notification {
+                method: method.to_string(),
+            },
+            (None, _) => MockRequest::Invalid("缺少 method 或 method 为空"),
+        }
+    }
+
+    /// 必须带 id 的方法：以通知形式到达视为不合法，避免请求方永远等不到应答。
+    fn request_only(method: &str) -> bool {
+        matches!(method, "initialize" | "tools/list")
+    }
+
+    /// 按 method 应答一次请求；initialize、首轮 tools/list 与刷新轮 tools/list 各有一道
+    /// 栅栏，都必须 COUNT 台同时在途才放行。不合法的请求回 400 并留证，不进入栅栏。
+    async fn respond_mcp(
+        sock: &mut tokio::net::TcpStream,
+        body: &str,
+        label: &str,
+        tool: &str,
+        extra: &str,
+        shared: &MockShared,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let (status, content_type, payload) = match parse_request(body) {
+            MockRequest::Invalid(reason) => {
+                shared.record_error(label, reason);
+                (
+                    "400 Bad Request",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32600,"message":"invalid request"}}"#
+                        .to_string(),
+                )
+            }
+            // initialize / tools/list 必须以调用（带 id）到达：以通知形式到达说明请求方
+            // 发了错帧，立刻 400 而不是让它在栅栏上等到超时。
+            MockRequest::Notification { method } if request_only(&method) => {
+                shared.record_error(label, &format!("{method} 缺 id（以通知形式到达）"));
+                (
+                    "400 Bad Request",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32600,"message":"request has no id"}}"#
+                        .to_string(),
+                )
+            }
+            MockRequest::Notification { .. } => {
+                ("202 Accepted", "application/json", String::new())
+            }
+            MockRequest::Call { method, id } => match method.as_str() {
+                "initialize" => {
+                    shared
+                        .init_arrivals
+                        .lock()
+                        .expect("到达记录锁未被毒化")
+                        .push(label.to_string());
+                    shared.init_barrier.wait().await;
+                    (
+                        "200 OK",
+                        "application/json",
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-11-25","capabilities":{{}}}}}}"#
+                        ),
+                    )
+                }
+                "tools/list" => {
+                    let nth = {
+                        let mut calls = shared
+                            .tool_list_calls
+                            .lock()
+                            .expect("tools/list 计数锁未被毒化");
+                        let entry = calls.entry(label.to_string()).or_insert(0);
+                        *entry += 1;
+                        *entry
+                    };
+                    if nth == 1 {
+                        // 首轮：栅栏证明握手阶段各台的清单拉取也是并发的。
+                        shared.first_list_barrier.wait().await;
+                        // 响应 + tools/list_changed 通知（SSE 两条）。客户端会把清单
+                        // 标记为待刷新，下一次 list_tools 必然再发一次 tools/list。
+                        (
+                            "200 OK",
+                            "text/event-stream",
+                            format!(
+                                "event: message
+data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"{tool}\",\"description\":\"d\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}
+
+event: message
+data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}
+
+"
+                            ),
+                        )
+                    } else {
+                        // 刷新轮：同样要求 COUNT 台同时在途。若把 list_tools 挪回串行
+                        // 注册循环，这里凑不齐栅栏 → 外层超时失败。
+                        shared.refresh_barrier.wait().await;
+                        (
+                            "200 OK",
+                            "application/json",
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"{tool}","description":"d","inputSchema":{{"type":"object"}}}},{{"name":"{extra}","description":"d","inputSchema":{{"type":"object"}}}}]}}}}"#
+                            ),
+                        )
+                    }
+                }
+                // 其它调用（本测试用不到）：给空结果，避免请求方干等。
+                _ => (
+                    "200 OK",
+                    "application/json",
+                    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{}}}}"#),
+                ),
+            },
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nMcp-Session-Id: s\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.shutdown().await;
+    }
+
+    /// 建 COUNT 台互相独立的 mock server，返回 (解析后的配置, 共享记录)。
+    async fn build_mock_servers(count: usize) -> (McpResolved, Arc<MockShared>) {
+        let shared = MockShared::new(count);
+        let mut defs = HashMap::new();
+        for i in 0..count {
+            let server = BarrierMcpServer::start(
+                &format!("srv{i}"),
+                &format!("tool{i}"),
+                &format!("extra{i}"),
+                Arc::clone(&shared),
+            )
+            .await;
+            defs.insert(
+                format!("srv{i}"),
+                McpServerDef {
+                    url: Some(server.url),
+                    ..Default::default()
+                },
+            );
+        }
+        let resolved = crate::mcp::config::McpResolved::build(McpConfig {
+            servers: defs,
+            ..Default::default()
+        })
+        .unwrap();
+        (resolved, shared)
+    }
+
+    /// 栅栏等待上限：正常并发几百毫秒内就凑齐，串行实现必然用满这一段时间。
+    const GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// 启动期握手必须并发：initialize 与首轮 tools/list 的应答都要等三台同时在途才
+    /// 放行，串行（或「并发连接、串行拉清单」）都凑不齐栅栏、由超时判失败。这段串行
+    /// 握手曾是桌面版「正在启动 RClaw…」长时间转圈的主因（9 个远端 server 实测 ≈24s）。
+    #[tokio::test]
+    async fn auto_start_servers_handshake_in_parallel() {
+        const COUNT: usize = 3;
+        let (resolved, shared) = build_mock_servers(COUNT).await;
+
+        let loaded = tokio::time::timeout(GATE_TIMEOUT, McpManager::load(resolved)).await;
+        let manager = match loaded {
+            Ok(Ok(manager)) => Arc::new(manager),
+            Ok(Err(error)) => panic!("load() 失败: {error}（{}）", shared.diagnostics()),
+            Err(_) => panic!(
+                "握手未并发（栅栏没凑齐）或 mock 请求不合法：{}",
+                shared.diagnostics()
+            ),
+        };
+
+        // 成功路径先确认 mock 没收到过非法请求，再看计数。
+        shared.assert_no_error();
+        // load() 自己完成了全部握手（不是靠后续 client_for 补做的）。
+        let mut arrivals = shared.init_arrivals();
+        arrivals.sort();
+        assert_eq!(
+            arrivals,
+            (0..COUNT).map(|i| format!("srv{i}")).collect::<Vec<_>>(),
+            "load() 应完成全部 server 的 initialize"
+        );
+        // 首轮清单也在 load() 内、且是并发拉的（每台恰好一次，栅栏已证明同时发生）。
+        for i in 0..COUNT {
+            let label = format!("srv{i}");
+            assert_eq!(
+                shared.tool_list_calls(&label),
+                1,
+                "{label} 的首轮 tools/list 应在 load() 内完成且只发一次"
+            );
+        }
+        // 握手结果已写入 per-server 槽（不是「提前返回、留待下次补做」）。
+        {
+            let clients = manager.clients.lock().await;
+            for i in 0..COUNT {
+                let slot = clients.get(&format!("srv{i}")).expect("per-server 槽应已建立");
+                let guard = slot.try_lock().expect("空闲槽应可立即取锁");
+                assert!(guard.is_some(), "srv{i} 的 client 应已在 load() 内写入");
+            }
+        }
+        // 再取 client 不产生新的 initialize；复用若退化会卡在栅栏上，用独立超时兜住。
+        let reused = tokio::time::timeout(GATE_TIMEOUT, async {
+            for i in 0..COUNT {
+                if let Err(error) = manager.client_for(&format!("srv{i}")).await {
+                    return Err(error.to_string());
+                }
+            }
+            Ok(())
+        })
+        .await;
+        match reused {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("复用已有 client 失败: {error}（{}）", shared.diagnostics()),
+            Err(_) => panic!(
+                "复用已有 client 时重新握手（栅栏没凑齐）：{}",
+                shared.diagnostics()
+            ),
+        }
+        assert_eq!(shared.init_arrivals().len(), COUNT, "不应重复握手");
+    }
+
+    /// 注册入口：连接 + 首轮 tools/list 并发；首轮响应带 list_changed，注册必须基于
+    /// 刷新后的清单（第二轮 tools/list 也并发，串行会凑不齐刷新栅栏）。
+    #[tokio::test]
+    async fn extend_registry_uses_refreshed_tools_in_parallel() {
+        const COUNT: usize = 3;
+        let (resolved, shared) = build_mock_servers(COUNT).await;
+        let manager = Arc::new(McpManager::new(resolved));
+        let mut registry = ToolRegistry::new();
+
+        match tokio::time::timeout(GATE_TIMEOUT, manager.extend_registry(&mut registry)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("extend_registry 失败: {error}（{}）", shared.diagnostics()),
+            Err(_) => panic!(
+                "注册阶段未并发（栅栏没凑齐）或 mock 请求不合法：{}",
+                shared.diagnostics()
+            ),
+        }
+
+        shared.assert_no_error();
+        assert_eq!(
+            shared.init_arrivals().len(),
+            COUNT,
+            "每台 server 都应握手一次"
+        );
+        let names: Vec<String> = registry
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name.clone())
+            .collect();
+        for i in 0..COUNT {
+            let label = format!("srv{i}");
+            let exposed_tool = build_exposed_name(&label, &format!("tool{i}"));
+            let exposed_extra = build_exposed_name(&label, &format!("extra{i}"));
+            // 刷新轮跑过了（tools/list 两次：握手一次 + list_changed 后刷新一次）。
+            assert_eq!(
+                shared.tool_list_calls(&label),
+                2,
+                "{label} 应在 list_changed 后刷新一次工具清单"
+            );
+            // 注册用的是刷新后的清单：首轮工具与刷新后才出现的工具都在。
+            assert!(
+                names.contains(&exposed_tool) && names.contains(&exposed_extra),
+                "{label} 的工具未全部注册（实际 {names:?}）"
+            );
+        }
     }
 }
