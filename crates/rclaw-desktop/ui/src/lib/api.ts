@@ -666,6 +666,9 @@ export interface SkillConfigEntry {
 export interface MediaPayload {
   mime: string;
   base64: string;
+  /** 数据是不是「按对象核对过的字节」。核不了时按老行为读路径出图，这里是 false：
+   *  调用方不能把「读到了」当成「核对通过」（别撤掉「内容对不上」的标记）。 */
+  verified: boolean;
 }
 
 export interface UpdateInfo {
@@ -1640,9 +1643,10 @@ export const api = {
     invoke<MediaPayload>("sync_attachment_preview", { chatId, blob, path }),
 
   /** 点开同步会话里的一份附件：后端先按对象核对工作区里这个文件的内容，对不上就不
-   *  打开（返回错误），由界面改出「重新下载」。 */
+   *  打开（返回错误），由界面改出「重新下载」。返回值 = 打开的是不是核对过的副本
+   *  （核不了时按老行为打开原路径，为 false）。 */
   syncOpenAttachment: (chatId: string, blob: string, path: string) =>
-    invoke<void>("sync_open_attachment", { chatId, blob, path }),
+    invoke<boolean>("sync_open_attachment", { chatId, blob, path }),
 
   /** 把一份文件快照存进工作区，返回它在工作区里的相对路径（不覆盖已有的不同文件）。
    *  `path` 是消息里写的那个路径：同一份内容被几条消息引用时，存到点的那条的位置上。 */

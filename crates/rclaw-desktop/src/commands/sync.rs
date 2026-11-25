@@ -944,7 +944,7 @@ pub async fn sync_open_attachment(
     chat_id: String,
     blob: String,
     path: String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     check_chat_id(&chat_id)?;
     let engine = handle(&state)?;
     // 小文件：按对象读出核对过的字节、写成暂存副本，打开的就是核对过的那份内容
@@ -969,7 +969,8 @@ pub async fn sync_open_attachment(
                 Ok(super::stage_bytes_for_export(&home, &original, &bytes))
             })
             .await??;
-            super::open_media_path(&state.home, &rel)
+            super::open_media_path(&state.home, &rel)?;
+            Ok(true)
         }
         rclaw_sync::AttachmentBytes::TooLarge => {
             // 大文件读不进内存：边复制边核对，写成暂存副本再打开（与分享/点播同一套）。
@@ -995,14 +996,17 @@ pub async fn sync_open_attachment(
             .await?;
             match staged {
                 rclaw_sync::AttachmentStage::Staged(rel) => {
-                    super::open_media_path(&state.home, &rel)
+                    super::open_media_path(&state.home, &rel)?;
+                    Ok(true)
                 }
                 rclaw_sync::AttachmentStage::Rejected => Err(
                     "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）。点「重新下载」取回原来的内容。"
                         .into(),
                 ),
+                // 核不了：按老行为打开原路径（这次「打开成功」不代表核对通过）。
                 rclaw_sync::AttachmentStage::Unverifiable => {
-                    super::open_media_path(&state.home, &path)
+                    super::open_media_path(&state.home, &path)?;
+                    Ok(false)
                 }
             }
         }
@@ -1011,7 +1015,8 @@ pub async fn sync_open_attachment(
                 .into(),
         ),
         rclaw_sync::AttachmentBytes::Unverifiable => {
-            super::open_media_path(&state.home, &path)
+            super::open_media_path(&state.home, &path)?;
+            Ok(false)
         }
     }
 }

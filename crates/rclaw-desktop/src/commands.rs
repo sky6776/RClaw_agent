@@ -5230,6 +5230,9 @@ pub async fn group_cancel(
 pub struct MediaPayload {
     pub mime: String,
     pub base64: String,
+    /// 这份数据是不是「按对象核对过的字节」。核不了时按老行为读路径出图，这时是
+    /// `false`——界面不能把「读到了」当成「核对通过」（别撤掉「内容对不上」的标记）。
+    pub verified: bool,
 }
 
 const MEDIA_MAX_BYTES: u64 = 25 * 1024 * 1024;
@@ -5431,6 +5434,7 @@ fn image_preview_bytes(
         return Ok(MediaPayload {
             mime: mime.into(),
             base64: encode_base64(bytes),
+            verified: true,
         });
     }
     let key: String = {
@@ -5454,10 +5458,11 @@ fn image_preview_bytes(
             return Ok(MediaPayload {
                 mime: cache_mime.into(),
                 base64: encode_base64(&cached),
+                verified: true,
             });
         }
     }
-    image_preview_encode(home, bytes, &key, mime)
+    image_preview_encode(home, bytes, &key, mime, true)
 }
 
 /// 预览图的核心：`full` 是调用方已经校验过的图片文件，`extension` 是它的小写扩展名
@@ -5490,6 +5495,7 @@ fn image_preview_payload(
         return Ok(MediaPayload {
             mime: mime.into(),
             base64: encode_base64(&original),
+            verified: false,
         });
     }
 
@@ -5520,11 +5526,12 @@ fn image_preview_payload(
             return Ok(MediaPayload {
                 mime: cache_mime.into(),
                 base64: encode_base64(&cached),
+                verified: false,
             });
         }
     }
 
-    image_preview_encode(home, &original, &key, mime)
+    image_preview_encode(home, &original, &key, mime, false)
 }
 
 /// 解码 → 缩到上限 → 编码，并写缓存（键 `key`）。
@@ -5533,6 +5540,7 @@ fn image_preview_encode(
     original: &[u8],
     key: &str,
     mime: &str,
+    verified: bool,
 ) -> Result<MediaPayload, String> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MEDIA_DECODE_MAX_EDGE);
@@ -5548,6 +5556,7 @@ fn image_preview_encode(
         return Ok(MediaPayload {
             mime: mime.into(),
             base64: encode_base64(original),
+            verified,
         });
     }
     let thumb = img.thumbnail(MEDIA_PREVIEW_MAX_EDGE, MEDIA_PREVIEW_MAX_EDGE);
@@ -5579,6 +5588,7 @@ fn image_preview_encode(
             "image/jpeg".into()
         },
         base64: encode_base64(&encoded),
+        verified,
     })
 }
 
@@ -5613,6 +5623,7 @@ pub async fn media_base64(
                 return Ok(MediaPayload {
                     mime: mime.into(),
                     base64: encode_base64(&bytes),
+                    verified: true,
                 });
             }
             rclaw_sync::AttachmentBytes::TooLarge => {
@@ -5696,6 +5707,7 @@ fn media_base64_blocking(home: &std::path::Path, path: &str) -> Result<MediaPayl
     Ok(MediaPayload {
         mime: mime.into(),
         base64: encode_base64(&bytes),
+        verified: false,
     })
 }
 

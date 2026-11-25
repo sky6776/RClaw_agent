@@ -630,9 +630,11 @@ export function AttachmentCard({
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
     api
       .syncOpenAttachment(chatId, item.blob, path)
-      // 打开成功只说明**打开的这个落点**是对的：按它清覆盖（别把消息路径上的标记
-      // 也清了，那条可能仍然对不上）。
-      .then(() => clearAttachmentChanged({ path, blob: item.blob }))
+      // 打开的是核对过的副本才算这次读通过；按**打开的这个落点**清覆盖（别把消息
+      // 路径上的标记也清了，那条可能仍然对不上）。
+      .then((verified) => {
+        if (verified) clearAttachmentChanged({ path, blob: item.blob });
+      })
       .catch((e) => {
         onError(`打开文件失败: ${String(e)}`);
         // 核对没过（文件被改写/删掉）：这次保存的落点不能再「打开」，收回去让用户

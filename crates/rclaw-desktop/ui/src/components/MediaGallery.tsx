@@ -123,7 +123,9 @@ export default function MediaGallery({
         .mediaPreview(item.path, chatId, item.blob)
         .then((r) => {
           if (!alive) return;
-          if (item.blob) clearAttachmentChanged({ path: item.path, blob: item.blob });
+          if (r.verified && item.blob) {
+            clearAttachmentChanged({ path: item.path, blob: item.blob });
+          }
           setImgSrc(`data:${r.mime};base64,${r.base64}`);
         })
         .catch((e) => {

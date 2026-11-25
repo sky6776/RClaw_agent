@@ -396,8 +396,8 @@ export default function MediaPreviews({
         .mediaPreview(item.path, chatId, blob)
         .then((r) => {
           if (!mountedRef.current || chatRef.current !== chatId) return;
-          // 读成功（内容核对通过）：这条之前「对不上」的覆盖撤掉（修好之后能回到内联）。
-          if (blob) clearAttachmentChanged({ path: item.path, blob });
+          // 这次读的是核对过的字节才算通过（核不了时按老行为读路径出图，不清）。
+          if (r.verified && blob) clearAttachmentChanged({ path: item.path, blob });
           setUrls((prev) => ({ ...prev, [itemKey]: `data:${r.mime};base64,${r.base64}` }));
         })
         .catch((e) => {
@@ -476,6 +476,10 @@ export default function MediaPreviews({
       attachment && chatId
         ? api.syncOpenAttachment(chatId, attachment.blob, item.path)
         : api.openMedia(item.path);
+    void open.then((verified) => {
+      // 打开的是核对过的副本才算这次读通过（核不了时按老行为打开原路径）。
+      if (verified && attachment) clearAttachmentChanged(attachment);
+    });
     void open.catch((e) => {
       onError?.(`打开媒体失败: ${String(e)}`);
       if (attachment && isAttachmentChangedError(e)) {

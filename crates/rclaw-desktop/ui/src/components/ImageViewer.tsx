@@ -228,11 +228,11 @@ export default function ImageViewer({
       .mediaBase64(path, chatId, blob)
       .then((r) => {
         const dataUrl = `data:${r.mime};base64,${r.base64}`;
-        return dataUrlToBlob(dataUrl).then((b) => ({ b, dataUrl }));
+        return dataUrlToBlob(dataUrl).then((b) => ({ b, dataUrl, verified: r.verified }));
       })
-      .then(({ b, dataUrl }) => {
-        // 原图读成功（按对象核对过）：这条之前「对不上」的覆盖撤掉。
-        if (blob) clearAttachmentChanged({ path, blob });
+      .then(({ b, dataUrl, verified }) => {
+        // 原图读的是核对过的字节才算通过（核不了时按老行为读路径）。
+        if (verified && blob) clearAttachmentChanged({ path, blob });
         // Worker 不可用（如 CSP 拦 blob:）时拿 data URL 直挂原图：慢一点
         // （setAttribute 阻塞主线程）但「查看原图」不至于整个失败。
         const u = b ? URL.createObjectURL(b) : dataUrl;
