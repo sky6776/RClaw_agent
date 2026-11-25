@@ -58,10 +58,14 @@ export function mentionsPath(content: string, path: string): boolean {
     const okBefore =
       before === "" || before === "/" || before === "\\" || !word.test(before);
     // 句末的「.」后面是空白/汉字时算边界；后面还接着文件名成分（`pdf.bak`）就不算。
+    // 句点必须单独判，不能让它落进「标点都算边界」那一支。
+    const next = content[at + path.length + 1] ?? "";
     const okAfter =
-      after === "" ||
-      !/[A-Za-z0-9_\-/\\]/.test(after) ||
-      (after === "." && !/[A-Za-z0-9_]/.test(content[at + path.length + 1] ?? ""));
+      after === ""
+        ? true
+        : after === "."
+          ? !/[A-Za-z0-9_]/.test(next)
+          : !/[A-Za-z0-9_\-/\\]/.test(after);
     if (okBefore && okAfter) return true;
     from = at + 1;
   }

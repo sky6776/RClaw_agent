@@ -829,9 +829,9 @@ pub(crate) fn attachments(
             };
             // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
             // 里、密钥读不出来）时验不了：按登记说它在（老行为）。
-            // 不在核对预算里的（老消息）：只按存在性说它在。
+            // 内容核对（只在 `deep` 时做；没有密钥也验不了）。
             let verified = |path: &Path| -> bool {
-                !deep || keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
+                deep && keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
             };
             let (state, local_path, rel_path) = match &found.row {
                 Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
@@ -851,7 +851,8 @@ pub(crate) fn attachments(
                 // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上才算
                 // 本机有。
                 None if found.kind == "file" => match exact(&found.path) {
-                    Some(path) if verified(&path) => {
+                    // 不在核对窗口里的只能按存在性说（老消息，不渲染）。
+                    Some(path) if !deep || verified(&path) => {
                         ("local", Some(path), Some(found.path.clone()))
                     }
                     Some(_) => ("changed", None, None),
@@ -864,7 +865,11 @@ pub(crate) fn attachments(
             // 已经核对过的（`local`），或者那个路径上的文件核对下来就是这个对象。
             // 工具结果（artifact）在消息里只有一个文件名，按状态算。
             let path_present = if found.kind == "file" {
-                if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
+                if !deep {
+                    // 不在核对窗口里的：没核对过就不能说消息路径上是这份内容（按本机
+                    // 有处理会让界面内联显示/在画廊里打开一个同名的别的版本）。
+                    false
+                } else if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
                     true
                 } else if keys.is_none() {
                     // 没有密钥（不在同步空间里）就验不了别的位置上的同名文件是不是这
@@ -909,13 +914,26 @@ pub(crate) fn attachments(
         })
         .collect();
     if !restore.is_empty() {
-        if let Err(error) = db::write(ctx.db(), |tx| {
-            for (blob, rel_path, size) in &restore {
-                db::blob_register(tx, blob, rel_path, *size, BLOB_REMOTE)?;
+        // 换空间期间的清单不能把旧空间的登记写回来：写之前核对一次代。
+        let commit = ctx.space.begin();
+        if commit.valid() {
+            if let Err(error) = db::write(ctx.db(), |tx| {
+                if !commit.valid() {
+                    return Ok(());
+                }
+                for (blob, rel_path, size) in &restore {
+                    // 上传时发现「文件拿不出来了」留下的记录：留着它，文件放回原处、
+                    // 别的设备来要时才会重新上传（`attach::on_blob_want` 靠它）。补
+                    // 登记会挡住那条路。
+                    if db::state_get(tx, scope::BLOB_GONE, blob)?.is_some() {
+                        continue;
+                    }
+                    db::blob_register(tx, blob, rel_path, *size, BLOB_REMOTE)?;
+                }
+                Ok(())
+            }) {
+                tracing::debug!("补登记被回收的附件失败（清单照常）: {error}");
             }
-            Ok(())
-        }) {
-            tracing::debug!("补登记被回收的附件失败（清单照常）: {error}");
         }
     }
     Ok(list)

@@ -158,10 +158,13 @@ function apply(chatId: string, list: SyncAttachment[]) {
     let dropped = false;
     const next = { ...map };
     for (const key of Object.keys(next)) {
-      if (fileKeys.has(key) && !presentKeys.has(key)) {
-        delete next[key];
-        dropped = true;
-      }
+      if (!fileKeys.has(key) || presentKeys.has(key)) continue;
+      // 存到了另一个名字（原位置被别的文件占着，`xxx-快照.pdf`）：那个文件不是消息
+      // 路径，`path_present` 不描述它——保留「打开」，别让用户再存一份。
+      const original = key.slice(key.indexOf(":") + 1);
+      if (next[key] !== original) continue;
+      delete next[key];
+      dropped = true;
     }
     return dropped ? next : map;
   };

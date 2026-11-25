@@ -17,6 +17,7 @@ import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { mentionsPath, parseMediaItems } from "./MediaPreviews";
 import {
   awayAttachments,
+  messageFileRefs,
   refreshSyncAttachments,
   useChatAttachments,
   useChatAttachmentsReady,
@@ -1561,8 +1562,7 @@ export default function Chat({
       }
       // 清单里有、正文解析漏掉的图片/视频（已在本机）：也放进时间线，否则内联卡
       // 点不开（画廊里没有它，`openGallery` 会直接返回）。
-      for (const item of syncedAttachments) {
-        if (item.kind !== "file" || item.message_id !== e.msgId) continue;
+      for (const item of messageFileRefs(syncedAttachments, e.msgId)) {
         if (!item.path_present || seen.has(item.path)) continue;
         // 附件清单是从整行数据里抽的：工具参数、思考里提到的文件也在里面，只有正文
         // 里真的写到的才进时间线（与 MediaPreviews 的补卡同一口径）。
