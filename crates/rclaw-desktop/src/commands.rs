@@ -5245,8 +5245,10 @@ const MEDIA_PREVIEW_MAX_EDGE: u32 = 1440;
 /// 缓冲，Android 上会被 LMK 直接杀掉整个进程。前端对会话里每个图片标记都会自动请求预览。
 const MEDIA_DECODE_MAX_EDGE: u32 = 8192;
 const MEDIA_DECODE_MAX_ALLOC: u64 = 128 * 1024 * 1024;
-/// 预览缓存目录（相对 agent/；预览是派生物，进 media/cache 不污染用户文件）。
-const MEDIA_PREVIEW_CACHE_DIR: &str = "media/cache/preview";
+/// 预览缓存目录（相对数据根、**在 agent 工作区之外**）：缩略图是派生物，缓存命中会
+/// 直接标成 `verified`——放在助手工具能改写的目录里，一对被改写、彼此匹配的缓存文件
+/// 就能让界面把另一张图当成「核对过的」。
+const MEDIA_PREVIEW_CACHE_DIR: &str = "cache/preview";
 
 /// 生成（带磁盘缓存）媒体的屏幕级预览图：大图解码后按长边缩到上限再编码
 /// JPEG，避免前端解码 12MP 原图（真机实测 4032×3024 全图解码 + 光栅 2~3s，
@@ -5447,7 +5449,7 @@ fn image_preview_bytes(
             .collect()
     };
     // 内容寻址的缩略图缓存：同一份内容已经算过就直接用（重开会话、画廊来回滑不重解码）。
-    let cache_dir = home.join("agent").join(MEDIA_PREVIEW_CACHE_DIR);
+    let cache_dir = home.join(MEDIA_PREVIEW_CACHE_DIR);
     let cache_base = cache_dir.join(&key);
     if let Some((cached, cache_mime)) = read_preview_cache(&cache_base) {
         return Ok(MediaPayload {
@@ -5468,7 +5470,6 @@ fn image_preview_payload(
     cache_seed: &str,
     extension: &str,
 ) -> Result<MediaPayload, String> {
-    let root = home.join("agent");
     let meta = std::fs::metadata(full).map_err(|e| format!("读取媒体失败: {e}"))?;
     if meta.len() > MEDIA_MAX_BYTES {
         return Err(format!(
@@ -5511,7 +5512,7 @@ fn image_preview_payload(
             .map(|b| format!("{b:02x}"))
             .collect()
     };
-    let cache_dir = root.join(MEDIA_PREVIEW_CACHE_DIR);
+    let cache_dir = home.join(MEDIA_PREVIEW_CACHE_DIR);
     // 无 alpha → .jpg，带 alpha → .png（JPEG 无透明）：读缓存两种后缀都试，
     // 否则透明图永远不命中、每次打开都重新解码整张原图。
     let cache_base = cache_dir.join(&key);
@@ -5547,12 +5548,39 @@ fn read_preview_cache(cache_base: &std::path::Path) -> Option<(Vec<u8>, &'static
 
 /// 写预览缓存与它的内容摘要（摘要后写：读的一方要求两者对得上，先写摘要会让读到的
 /// 旧内容配上新摘要）。
+///
+/// 先写同目录的临时文件（不跟随链接、必须新建），写完再改名到正式名字：读的一方要么
+/// 看不到、要么看到完整的一份。
 fn write_preview_cache(path: &std::path::Path, bytes: &[u8]) {
-    let _ = std::fs::write(path, bytes);
+    fn publish(path: &std::path::Path, bytes: &[u8]) {
+        let tmp = path.with_extension(format!(
+            "{}.tmp-{}",
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("bin"),
+            rclaw_sync::ids::random_hex::<4>()
+        ));
+        let write = open_for_write_nofollow(&tmp, true).and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(bytes)
+        });
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::debug!("预览缓存写不上: {e}");
+            return;
+        }
+        // Windows 上 rename 不覆盖已有文件：先删一次（缓存被并发读到最多是重新编码）。
+        let _ = std::fs::remove_file(path);
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::debug!("预览缓存发布失败: {e}");
+        }
+    }
+    publish(path, bytes);
     let digest = rclaw_sync::crypto::sha256_hex(bytes);
     if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
         let sidecar = path.with_extension(format!("{extension}.sha"));
-        let _ = std::fs::write(sidecar, digest);
+        publish(&sidecar, digest.as_bytes());
     }
 }
 
@@ -5596,8 +5624,7 @@ fn image_preview_encode(
             .write_with_encoder(encoder)
             .map_err(|e| format!("编码预览失败: {e}"))?;
     }
-    let root = home.join("agent");
-    let cache_dir = root.join(MEDIA_PREVIEW_CACHE_DIR);
+    let cache_dir = home.join(MEDIA_PREVIEW_CACHE_DIR);
     let cache_path = cache_dir
         .join(key)
         .with_extension(if has_alpha { "png" } else { "jpg" });
@@ -6278,14 +6305,17 @@ fn cache_entry_activity(path: &std::path::Path, meta: &std::fs::Metadata) -> std
     newest
 }
 
-/// 一条暂存条目现在是不是「最近还在用」。
+/// 一条暂存条目现在是不是「最近还在用」（比扫描时刻新的也算）。
 fn cache_entry_fresh(now: std::time::SystemTime, path: &std::path::Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    now.duration_since(cache_entry_activity(path, &meta))
-        .map(|age| age.as_secs() <= 300)
-        .unwrap_or(false)
+    let activity = cache_entry_activity(path, &meta);
+    activity >= now
+        || now
+            .duration_since(activity)
+            .map(|age| age.as_secs() <= 300)
+            .unwrap_or(false)
 }
 
 fn prune_cache_dir(dir: &std::path::Path, keep: usize) {
@@ -6313,8 +6343,9 @@ fn prune_cache_dir(dir: &std::path::Path, keep: usize) {
         }
         let stale = age > 3600;
         if index >= keep || stale {
-            // 扫描和删除之间可能刚有 Range 请求刷新过：删之前再核一次活跃时间。
-            if path.is_file() && cache_entry_fresh(now, &path) {
+            // 扫描和删除之间可能刚有 Range 请求刷新过：删之前再核一次活跃时间
+            // （目录也要核：点播的副本在随机子目录里，活跃的是它里面的文件）。
+            if cache_entry_fresh(now, &path) {
                 continue;
             }
             let _ = if path.is_dir() {

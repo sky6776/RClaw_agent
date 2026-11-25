@@ -240,8 +240,9 @@ export default function ImageViewer({
         if (verified && blob) clearAttachmentChanged({ path, blob });
         // Worker 不可用（如 CSP 拦 blob:）时拿 data URL 直挂原图：慢一点
         // （setAttribute 阻塞主线程）但「查看原图」不至于整个失败。
-        const u = b ? URL.createObjectURL(b) : dataUrl;
-        // 按对象名索引的缓存只存核对过的字节：核不了时读到的可能是另一份内容。
+        // 只有核对过的字节才进（带回收的）共享缓存；核不了时直接用 data URL，不造
+        // 一个没人回收的 blob URL。
+        const u = verified && b ? URL.createObjectURL(b) : dataUrl;
         if (verified) cacheFullBlob(cacheKey, u);
         setFull({ url: u });
         setFullLoading(false);

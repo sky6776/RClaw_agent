@@ -248,6 +248,9 @@ pub enum SyncEvent {
         blob: String,
         error: Option<String>,
         placed: bool,
+        /// 这一次实际落到的相对路径（`placed` 为真时）。界面按它清「这个落点内容对不上」
+        /// 的标记——别的路径上没有它，标记不能跟着清。
+        landed: Option<String>,
     },
 }
 

@@ -368,14 +368,18 @@ fn entry_activity(path: &std::path::Path, meta: &std::fs::Metadata) -> std::time
     newest
 }
 
-/// 一条暂存条目现在是不是「最近还在用」（回收的宽限期）。
+/// 一条暂存条目现在是不是「最近还在用」（回收的宽限期）。比扫描时刻还新的
+/// （扫描之后刚被读过）也算。
 fn entry_fresh(now: std::time::SystemTime, path: &std::path::Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    now.duration_since(entry_activity(path, &meta))
-        .map(|age| age.as_secs() <= 300)
-        .unwrap_or(false)
+    let activity = entry_activity(path, &meta);
+    activity >= now
+        || now
+            .duration_since(activity)
+            .map(|age| age.as_secs() <= 300)
+            .unwrap_or(false)
 }
 
 fn prune_share_cache(dir: &std::path::Path, keep: usize) {
@@ -405,8 +409,9 @@ fn prune_share_cache(dir: &std::path::Path, keep: usize) {
         }
         let stale = age > 3600;
         if index >= keep || stale {
-            // 扫描和删除之间可能刚有 Range 请求刷新过：删之前再核一次活跃时间。
-            if is_file && entry_fresh(now, &path) {
+            // 扫描和删除之间可能刚有 Range 请求刷新过：删之前再核一次活跃时间
+            // （目录也要核：点播的副本在随机子目录里，活跃的是它里面的文件）。
+            if entry_fresh(now, &path) {
                 continue;
             }
             let _ = if is_file {
@@ -1224,9 +1229,14 @@ impl SyncEngine {
     /// 的字节就是核对过的那些，不给「核对完再按路径重新打开」留窗口。
     ///
     /// `Unverifiable` 表示核不了（没有登记、不在本机、读不出密钥）：调用方按老行为处理。
+    ///
+    /// `normalize`：这次读是「旧版明文摘要登记」时，顺手把登记归一成带密钥的对象名。
+    /// 一次操作里要读两遍的（保存快照先比较、再写入）只有**最后一遍**才归一——先归一
+    /// 会让第二遍按旧对象名查不到登记，退回不核对的复制。
     pub fn copy_cached_blob(
         &self,
         blob: &str,
+        normalize: bool,
         consume: &mut dyn FnMut(&mut dyn std::io::Read) -> std::io::Result<()>,
     ) -> std::io::Result<AttachmentCopy> {
         let ctx = &self.inner.ctx;
@@ -1275,12 +1285,19 @@ impl SyncEngine {
         let current = keys.blob_id(&digest);
         if current != blob {
             // 旧版本按明文摘要登记的内联缓存（无密钥时导入会话包留下的）：内容对得上
-            // 明文摘要就当场归一，这次照常接受；归一失败只影响登记，读到的内容没变。
+            // 明文摘要就照常接受；归一失败只影响登记，读到的内容没变。
             if crate::ids::hex(&digest) != *blob {
                 return Ok(AttachmentCopy::Rejected);
             }
-            let _ =
-                crate::attach::normalize_registration(ctx, blob, &current, &row.rel_path, total);
+            if normalize {
+                let _ = crate::attach::normalize_registration(
+                    ctx,
+                    blob,
+                    &current,
+                    &row.rel_path,
+                    total,
+                );
+            }
         }
         Ok(AttachmentCopy::Copied)
     }
@@ -1301,7 +1318,7 @@ impl SyncEngine {
         // 文件又被换大了的时候，不能把内存读爆）。
         let mut bytes: Vec<u8> = Vec::new();
         let mut too_large = false;
-        let outcome = match self.copy_cached_blob(blob, &mut |reader| {
+        let outcome = match self.copy_cached_blob(blob, true, &mut |reader| {
             let mut buffer = vec![0u8; 64 * 1024];
             loop {
                 let n = reader.read(&mut buffer)?;

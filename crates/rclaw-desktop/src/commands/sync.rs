@@ -1135,9 +1135,9 @@ fn same_content(target: &Path, source: &Path) -> bool {
     }
 }
 
-/// 缓存里的副本和登记的已经对不上了（被本机程序原地改写过）。
-const CHANGED_SNAPSHOT: &str =
-    "这份缓存副本的内容已经和登记的不一致（可能被本机的程序改写过）。请重新下载这个附件。";
+/// 缓存里的副本和登记的已经对不上了（被本机程序原地改写过）。开头这句与其它核对入口
+/// 的「内容对不上」文案一致，界面统一按它识别（`isAttachmentChangedError`）。
+const CHANGED_SNAPSHOT: &str = "这份缓存副本已经不是这条消息引用的那一份了（内容与登记的不一致，可能被本机的程序改写过）。请重新下载这个附件。";
 
 /// 快照要存到的工作区位置：返回（目录的规范路径、目录相对路径、文件名）。路径上的
 /// 目录逐级核对 / 新建，不跟随链接；越出工作区、路径不合规的都拒绝。
@@ -1250,18 +1250,11 @@ fn write_verified_file(
                 let _ = std::fs::remove_file(&tmp);
                 continue;
             }
-            // 文件系统不支持硬链接：退回「必须新建」的复制发布（这时是普通的复制窗口）。
-            Err(_) => {
-                let published = super::open_for_write_nofollow(&dest, true).and_then(|mut out| {
-                    let mut from = std::fs::File::open(&tmp)?;
-                    std::io::copy(&mut from, &mut out).map(|_| ())
-                });
+            // 文件系统不支持硬链接：**不**退回「按正式名先建再复制」——那会让并行的
+            // 读取看到未核对的半成品。宁可这次存不了，也不把核对过的说法变成假的。
+            Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
-                match published {
-                    Ok(()) => return Ok(dest),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => return Err(format!("存进工作区失败: {e}")),
-                }
+                return Err(format!("存进工作区失败: 这个文件系统不支持原子发布（{e}）"));
             }
         }
     }
@@ -1286,7 +1279,8 @@ fn save_snapshot_checked(
         // 目标位置已经有一份：同一次读里比较它和缓存副本、并核对缓存副本的摘要。
         let mut same = true;
         match engine
-            .copy_cached_blob(blob, &mut |reader| {
+            // 比较这一遍不归一：目标内容不同时下面还要按同一个对象名再读一遍。
+            .copy_cached_blob(blob, false, &mut |reader| {
                 compare_snapshot(reader, &target, &mut same)
             })
             .map_err(|e| format!("存进工作区失败: {e}"))?
@@ -1320,8 +1314,10 @@ fn save_snapshot_checked(
             // 读出来的字节直接写进目标文件，摘要就在这同一次读里算、读完后核对；
             // 对不上时返回错误，`write_fresh_file` 会把刚写的这份删掉。
             match engine
-                .copy_cached_blob(blob, &mut |reader| std::io::copy(reader, file).map(|_| ()))
-            {
+                // 这是这次保存的最后一遍读：旧版明文登记在这里归一并接受。
+                .copy_cached_blob(blob, true, &mut |reader| {
+                    std::io::copy(reader, file).map(|_| ())
+                }) {
                 Ok(rclaw_sync::AttachmentCopy::Copied) => Ok(()),
                 Ok(other) => {
                     outcome.set(Some(other));

@@ -118,18 +118,6 @@ export function clearAttachmentChanged(item: { path: string; blob: string }) {
   emit();
 }
 
-/** 重新下载 / 存进工作区成功之后：这个对象之前「对不上」的覆盖与卡片错误都撤掉。 */
-function clearChanged(blob: string) {
-  const cleared = [...changedKeys].filter((key) => key.startsWith(`${blob}:`));
-  if (cleared.length === 0) return;
-  for (const key of cleared) changedKeys.delete(key);
-  all = [...all];
-  let saveErrors = cards.saveErrors;
-  for (const key of cleared) saveErrors = without(saveErrors, key);
-  cards = { ...cards, saveErrors };
-  emit();
-}
-
 /** 让当前会话的清单重新取一遍（装载器在的时候才有）。 */
 let reload: (() => void) | null = null;
 const busyTimers: Record<string, number> = {};
@@ -199,8 +187,12 @@ function apply(chatId: string, list: SyncAttachment[]) {
     }
   });
   known = nextKnown;
-  // 下载下来之后又不见了的（被删了）会重新出现在 pending 里：不再算「已下载」。
-  const stillLanded = landed.filter((item) => !pendingKeys.has(fileKey(item)));
+  // 下载下来之后又不见了的（被删了）会重新出现在 pending 里：不再算「已下载」；
+  // 引用本身从清单里消失了的（消息被删/改）也一并丢掉，恢复就绪后不会又冒出来。
+  const currentKeys = new Set(usable.map((item) => fileKey(item)));
+  const stillLanded = landed.filter(
+    (item) => currentKeys.has(fileKey(item)) && !pendingKeys.has(fileKey(item)),
+  );
   // 存好的落点又对不上了（被改写/删除）：不能再给「打开 savedTo」，让用户重新存。
   // 只处理文件引用——工具结果全文的登记位置不是消息路径，不按它判断。
   const fileKeys = new Set(
@@ -245,11 +237,17 @@ function markStale(chatId: string) {
 }
 
 /** 一个附件的下载有了结果（或者请求本身没发出去）。 */
-function settle(blob: string, error: string | null, placed: boolean) {
+function settle(
+  blob: string,
+  error: string | null,
+  placed: boolean,
+  landed: string | null,
+) {
   if (error === null && placed) {
-    // 真的把对象落到了本机：「读出来对不上」的覆盖撤掉。`error` 为空但没落盘的
-    // （存上没有、记下「在等别的设备/取不回来」）不能清——内容还是没取回来。
-    clearChanged(blob);
+    // 只撤「这次实际落到的那个路径」上的覆盖：同一对象的其他路径上可能还是另一份
+    // 内容（取回到同步缓存时，消息路径并没有被修好）。`error` 为空但没落盘的
+    // （存上没有、记下「在等别的设备/取不回来」）什么都不能清。
+    if (landed) clearAttachmentChanged({ path: landed, blob });
   }
   const timer = busyTimers[blob];
   if (timer !== undefined) {
@@ -263,7 +261,7 @@ function settle(blob: string, error: string | null, placed: boolean) {
     // 重新下载成功：这个对象在各个落点上的旧失败（缓存副本被改写过之类）一并清掉，
     // 修好的卡不该还挂着上一条错误。
     let saveErrors = prev.saveErrors;
-    if (error === null) {
+    if (error === null && placed) {
       const prefix = `${blob}:`;
       const stale = Object.keys(saveErrors).filter((key) => key.startsWith(prefix));
       if (stale.length > 0) {
@@ -292,7 +290,7 @@ function download(chatId: string, blob: string) {
     setCards((prev) => (prev.busy[blob] ? { ...prev, busy: without(prev.busy, blob) } : prev));
     if (reload) reload();
   }, FETCH_SHOWN_MS);
-  api.syncFetchAttachment(chatId, blob).catch((e) => settle(blob, String(e), false));
+  api.syncFetchAttachment(chatId, blob).catch((e) => settle(blob, String(e), false, null));
 }
 
 /** 把同步缓存里的一份文件快照存进工作区（存到这条消息写的那个路径上）。
@@ -444,7 +442,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     void load();
     const un = api.onSync((event) => {
       if (event.kind === "attachment") {
-        settle(event.blob, event.error, event.placed);
+        settle(event.blob, event.error, event.placed, event.landed);
         schedule();
       } else if (event.kind === "status") {
         // 每一轮同步的状态变化：别名补落点、登记回收都可能在这时完成，借机重取一次

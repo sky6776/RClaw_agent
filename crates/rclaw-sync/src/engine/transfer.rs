@@ -104,12 +104,16 @@ async fn fetch_one(
     live: Arc<Live>,
     blob: String,
     attempt: Option<String>,
-) -> (String, Option<String>, Result<()>) {
+) -> (String, Option<String>, Option<String>, Result<()>) {
     let max_size = shared.attachment_max.load(Ordering::Relaxed);
-    let result = attach::download(&shared.ctx, live.transport(), &live.keys, &blob, max_size)
-        .await
-        .map(|_| ());
-    (blob, attempt, result)
+    let outcome =
+        attach::download(&shared.ctx, live.transport(), &live.keys, &blob, max_size).await;
+    // 实际落点（相对路径）：界面按它清「这个落点内容对不上」的标记，别的地方不能跟着清。
+    let landed = match &outcome {
+        Ok(path) => shared.ctx.env.rel_path(path),
+        Err(_) => None,
+    };
+    (blob, attempt, landed, outcome.map(|_| ()))
 }
 
 /// 这次取回的尝试标识（`blob-probe` 标记里的那段随机值）。没有标记（不是用户点的
@@ -191,9 +195,9 @@ pub(crate) async fn download_task(
                     }
                 }
             }
-            Some((blob, attempt, result)) = running.next(), if !running.is_empty() => {
+            Some((blob, attempt, landed, result)) = running.next(), if !running.is_empty() => {
                 let user = wanted.remove(&blob).unwrap_or(false);
-                finish(&shared, blob, user, attempt, result).await;
+                finish(&shared, blob, user, attempt, landed, result).await;
             }
         }
     }
@@ -209,7 +213,15 @@ async fn touch_probe(shared: &Arc<Shared>, blob: &str) {
             };
             let parts = marker.value.as_deref().and_then(attach::probe_parts);
             let (path, token) = match parts {
-                Some((path, token, _)) => (path.to_string(), token.to_string()),
+                // 老格式（没有标识）：补一个，这次取回的失败清理才认领得了它。
+                Some((path, token, _)) => (
+                    path.to_string(),
+                    if token.is_empty() {
+                        crate::ids::random_hex::<4>()
+                    } else {
+                        token.to_string()
+                    },
+                ),
                 None => (String::new(), String::new()),
             };
             db::state_put(
@@ -233,6 +245,7 @@ async fn finish(
     blob: String,
     user: bool,
     attempt: Option<String>,
+    landed: Option<String>,
     result: Result<()>,
 ) {
     // 这次是不是真的把对象落到了本机：`Ok` 是；「存上没有/内容坏了」记完账走的是下面
@@ -269,6 +282,18 @@ async fn finish(
                     // （取回成功会清标记并把行改成 FETCHED；并发登记进来的行状态也不同。）
                     // 只撤「这一次」的标记：一次旧的取回晚到的清理不能把新一次重试
                     // 的标记/登记删掉（尝试标识在取起时记下）。
+                    let marker_token = db::state_get(tx, crate::db::scope::BLOB_PROBE, &wanted)?
+                        .and_then(|row| row.value)
+                        .as_deref()
+                        .and_then(attach::probe_parts)
+                        .map(|(_, token, _)| token.to_string());
+                    // 标记已经换成另一次尝试的：那一次会自己做缺件记账，这次不再插一手。
+                    if marker_token
+                        .as_deref()
+                        .is_some_and(|token| Some(token) != attempt.as_deref())
+                    {
+                        return Ok(None);
+                    }
                     let probe = probe_matches(tx, &wanted, attempt.as_deref())?
                         && db::blob_get(tx, &wanted)?
                             .is_some_and(|row| row.state == crate::db::BLOB_REMOTE);
@@ -335,12 +360,14 @@ async fn finish(
             blob,
             error: None,
             placed,
+            landed,
         }),
         // 自动取的（小图、打开会话时预取的、隔一阵的重试）失败了不打扰用户，占位照旧。
         Some(error) if user => shared.emit(SyncEvent::Attachment {
             blob,
             error: Some(error),
             placed,
+            landed: None,
         }),
         Some(_) => {}
     }

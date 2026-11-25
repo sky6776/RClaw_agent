@@ -993,7 +993,15 @@ export interface SyncScanStart {
 export type SyncEvent =
   | { kind: "status" }
   | { kind: "sessions"; chats: Array<{ channel: string; chat_id: string }>; list: boolean }
-  | { kind: "attachment"; blob: string; error: string | null; placed: boolean }
+  | {
+      kind: "attachment";
+      blob: string;
+      error: string | null;
+      /** 这次真的把对象落到了本机（存储缺件/取不回来也是空 error，但没落盘）。 */
+      placed: boolean;
+      /** 实际落到的相对路径（`placed` 为真时）：界面只清这个路径的「内容对不上」标记。 */
+      landed: string | null;
+    }
   | { kind: "reload"; what: string };
 
 export const api = {

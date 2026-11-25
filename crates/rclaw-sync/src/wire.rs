@@ -65,6 +65,21 @@ impl Env {
         .expect("每一段都给出了名字")
     }
 
+    /// 本机路径 → 附件的相对路径（[`Env::resolve`] 的逆行）。不在 agent 根与同步目录
+    /// 之下的返回 `None`。
+    pub fn rel_path(&self, path: &Path) -> Option<String> {
+        if let Ok(rest) = path.strip_prefix(self.base()) {
+            return Some(rest.to_string_lossy().replace('\\', "/"));
+        }
+        if let Ok(rest) = path.strip_prefix(&self.sync_root) {
+            return Some(format!(
+                "sync/{}",
+                rest.to_string_lossy().replace('\\', "/")
+            ));
+        }
+        None
+    }
+
     /// 同 [`Env::resolve`]，但只在每一段都能原样拼上去时给出路径。读本机文件用：改写过
     /// 的名字指向的是另一个文件。
     pub fn resolve_exact(&self, rel_path: &str) -> Option<PathBuf> {

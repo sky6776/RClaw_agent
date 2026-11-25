@@ -416,7 +416,12 @@ async fn attachments_upload_after_the_backlog_choice_and_download_on_request() {
         lock(&b.events.0).iter().any(|event| {
             matches!(
                 event,
-                SyncEvent::Attachment { blob: got, error: None, placed: true } if *got == blob
+                SyncEvent::Attachment {
+                    blob: got,
+                    error: None,
+                    placed: true,
+                    ..
+                } if *got == blob
             )
         })
     })
