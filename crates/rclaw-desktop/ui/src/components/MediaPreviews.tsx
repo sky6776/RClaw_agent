@@ -223,7 +223,9 @@ export default function MediaPreviews({
   // 不再出一个点了只报「媒体文件不存在」的「点开」卡；清单里没有（本机文件、没开同步）
   // 的照旧按工作区路径出卡。
   const synced = useChatAttachments(chatId ?? null);
-  const ready = useChatAttachmentsReady(chatId ?? null);
+  const attachedReady = useChatAttachmentsReady(chatId ?? null);
+  // 没有 chatId（不在会话里用这个组件）就不查清单：按工作区路径出卡，与文档一致。
+  const ready = chatId === undefined ? true : attachedReady;
   // 只认这条消息自己登记的附件：同一个路径在不同消息里可能指向不同内容（文件改过），
   // 拿别的消息的对象来下载会把错的版本落到这条消息头上。消息还没落库（没有 msgId）
   // 时按工作区路径出卡，落库之后清单刷新再换成附件卡。

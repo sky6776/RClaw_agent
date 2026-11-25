@@ -1020,14 +1020,65 @@ impl SyncEngine {
 
     /// 工作区里 `rel_path` 上的文件是不是 `blob` 这个对象（点开前按需核对）。
     /// 没有登记、读不出密钥、路径不安全时返回 `None`：核不了，按老行为打开。
-    pub fn attachment_file_matches(&self, blob: &str, rel_path: &str) -> Option<bool> {
+    pub fn attachment_file_matches(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        blob: &str,
+        rel_path: &str,
+    ) -> Option<bool> {
         let ctx = &self.inner.ctx;
-        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob)).ok()??;
         let keys = Secrets::load(&ctx.paths)
             .ok()
             .and_then(|secrets| secrets.keys().ok())?;
         let path = ctx.env.checked_path(rel_path).ok()?;
-        Some(local::same_blob(&keys, &path, blob, row.size))
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .ok()
+            .flatten();
+        // 登记里有长度就用它；登记被回收的（上传失败留下的 `BLOB_GONE` 记录）用消息
+        // 引用里记的长度——否则这里返回 None，界面就把「核不了」当成「可以打开」。
+        let size = row.map(|row| row.size).or_else(|| {
+            local::referenced_attachment(ctx, channel, chat_id, blob).map(|(_, size, _)| size)
+        })?;
+        // 用户点开的这一下直接读一遍当前内容：不走摘要缓存那 60 秒的窗口。
+        Some(local::same_blob_now(&keys, &path, blob, size))
+    }
+
+    /// 点「重新下载」：登记被回收过的（很少见）先按消息里的引用补一条「等待取回」，
+    /// 再排队取回。补登记只在用户明确点了的时候做——清单查询是只读的，不在读路径上
+    /// 写库（换空间的那段窗口里旧对象名不该被写进新空间）。
+    pub fn fetch_attachment_at(&self, channel: &str, chat_id: &str, blob: &str) -> Result<()> {
+        let ctx = &self.inner.ctx;
+        let missing = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
+            .map(|row| row.is_none())
+            .unwrap_or(false);
+        if missing {
+            if let Some((path, size, artifact)) =
+                local::referenced_attachment(ctx, channel, chat_id, blob)
+            {
+                let rel_path = if artifact {
+                    format!("{}{}", crate::wire::artifact_rel_dir(channel, chat_id), path)
+                } else {
+                    crate::wire::landing_path(&path, blob)
+                };
+                // 上传失败留下的 `BLOB_GONE` 记录：留着它，文件放回原处后别的设备来要
+                // 时会重新上传；这里不补登记。
+                let commit = ctx.space.begin();
+                if commit.valid() {
+                    db::write(ctx.db(), |tx| {
+                        if !commit.valid() {
+                            return Ok(());
+                        }
+                        if db::state_get(tx, crate::db::scope::BLOB_GONE, blob)?.is_some() {
+                            return Ok(());
+                        }
+                        db::blob_register(tx, blob, &rel_path, size, crate::db::BLOB_REMOTE)?;
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        self.fetch_attachment(blob)
     }
 
     /// 用户点了一个还没下载的附件：排到下载队列的最前面。结果经

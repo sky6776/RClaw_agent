@@ -699,6 +699,9 @@ struct FoundRef {
     row: Option<BlobRow>,
     /// 登记是「还在别的设备上」的：`remote` / `asked` / `gone` / `lost`。
     remote: &'static str,
+    /// 本机登记被回收过、留下 `BLOB_GONE` 记录的：原来在这台设备上，现在拿不出来
+    /// （文件被删/改过；放回原处后别的设备来要时会重新上传）。
+    was_mine: bool,
     origin: Option<String>,
 }
 
@@ -714,10 +717,6 @@ pub(crate) fn attachments(
     if let Err(error) = crate::wire::backfill_artifact_refs(&ctx.env, channel, chat_id) {
         tracing::debug!("补附件索引失败（清单照常）: {error}");
     }
-    // 读引用之前先记下同步空间的代：读完之后文件核对可能很慢，这中间换了空间的话，
-    // 这次清单补登记不能把旧空间的对象写回去（`ctx.space.begin()` 此时已经是新代，
-    // 光靠它会漏掉这段窗口）。
-    let epoch_before = ctx.space.epoch();
     let found: Vec<FoundRef> = db::read(ctx.db(), |conn| {
         if !sync_db::sync_tables_exist(conn)? {
             return Ok(Vec::new());
@@ -740,13 +739,17 @@ pub(crate) fn attachments(
         let mut out = Vec::new();
         let now = now_ms();
         // 登记连同「还在别的设备上」的那几种情况一起查出来。
-        let lookup = |blob: &str| -> Result<(Option<BlobRow>, &'static str)> {
+        let lookup = |blob: &str| -> Result<(Option<BlobRow>, &'static str, bool)> {
             let row = db::blob_get(conn, blob)?;
             let remote = match &row {
                 Some(row) if row.state == BLOB_REMOTE => attach::remote_state(conn, blob, now)?,
                 _ => "remote",
             };
-            Ok((row, remote))
+            // 没有登记、却留着「原本在这台设备上、后来拿不出来」的记录：照实说，
+            // 别给一个必然失败的「重新下载」。
+            let was_mine = row.is_none()
+                && db::state_get(conn, scope::BLOB_GONE, blob)?.is_some();
+            Ok((row, remote, was_mine))
         };
         for (message_id, gid, refs) in rows {
             let Some(refs) = StoredRefs::parse(Some(&refs)) else {
@@ -765,12 +768,13 @@ pub(crate) fn attachments(
                 if blob_filter.is_some_and(|want| file.blob != want) {
                     continue;
                 }
-                let (row, remote) = lookup(&file.blob)?;
+                let (row, remote, was_mine) = lookup(&file.blob)?;
                 out.push(FoundRef {
                     message_id,
                     kind: "file",
                     row,
                     remote,
+                    was_mine,
                     path: file.path,
                     blob: file.blob,
                     size: file.size,
@@ -784,12 +788,13 @@ pub(crate) fn attachments(
                 if blob_filter.is_some_and(|want| blob != want) {
                     continue;
                 }
-                let (row, remote) = lookup(&blob)?;
+                let (row, remote, was_mine) = lookup(&blob)?;
                 out.push(FoundRef {
                     message_id,
                     kind: "artifact",
                     row,
                     remote,
+                    was_mine,
                     path: artifact.name,
                     blob,
                     size: artifact.size,
@@ -866,6 +871,8 @@ pub(crate) fn attachments(
                     Some(path) => ("local", Some(path), Some(row.rel_path.clone())),
                     None => ("missing", None, None),
                 },
+                // 登记被回收过、留下「原本在这台设备上」的记录：照实说取不回来。
+                None if found.was_mine => ("gone", None, None),
                 // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上才算
                 // 本机有。
                 None if found.kind == "file" => match exact(&found.path) {
@@ -914,48 +921,6 @@ pub(crate) fn attachments(
             }
         })
         .collect();
-    // 消息还引用着、本机又没有这份内容、列表里说「取不回来」的：把登记补成「等待取
-    // 回」——`attach::lookup` 没有登记时直接报错，界面上的「重新下载」按下去就只会
-    // 得到「没有这个附件的登记」。已经有登记的不受影响（`blob_register` 不覆盖）。
-    let restore: Vec<(String, String, u64)> = list
-        .iter()
-        .filter(|item| {
-            item.kind == "file"
-                && !item.path_present
-                && matches!(item.state, "missing" | "changed")
-        })
-        .map(|item| {
-            (
-                item.blob.clone(),
-                crate::wire::landing_path(&item.path, &item.blob),
-                item.size,
-            )
-        })
-        .collect();
-    if !restore.is_empty() {
-        // 换空间期间的清单不能把旧空间的登记写回来：读引用时记下的代、开始写时的代
-        // 与提交许可三处一致才写。
-        let commit = ctx.space.begin();
-        if commit.valid() && ctx.space.epoch() == epoch_before {
-            if let Err(error) = db::write(ctx.db(), |tx| {
-                if !commit.valid() {
-                    return Ok(());
-                }
-                for (blob, rel_path, size) in &restore {
-                    // 上传时发现「文件拿不出来了」留下的记录：留着它，文件放回原处、
-                    // 别的设备来要时才会重新上传（`attach::on_blob_want` 靠它）。补
-                    // 登记会挡住那条路。
-                    if db::state_get(tx, scope::BLOB_GONE, blob)?.is_some() {
-                        continue;
-                    }
-                    db::blob_register(tx, blob, rel_path, *size, BLOB_REMOTE)?;
-                }
-                Ok(())
-            }) {
-                tracing::debug!("补登记被回收的附件失败（清单照常）: {error}");
-            }
-        }
-    }
     Ok(list)
 }
 
@@ -1086,6 +1051,11 @@ fn verification_cost(ctx: &Ctx, found: &FoundRef) -> u64 {
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
+        // 长度与登记差太多：`same_blob` 一看长度就否，不用读，也不该占预算（否则一个
+        // 被换成超大文件的旧引用每轮都把预算吃光）。
+        if meta.len().abs_diff(found.size) > SIZE_SLACK {
+            continue;
+        }
         let Some(version) = version_of(&meta) else {
             cost = cost.saturating_add(meta.len());
             continue;
@@ -1098,6 +1068,26 @@ fn verification_cost(ctx: &Ctx, found: &FoundRef) -> u64 {
         }
     }
     cost
+}
+
+/// 点开前的一次明确核对：不用摘要缓存里「刚算过」的结论，直接读一遍当前内容。
+/// （时间戳被还原过的替换在缓存的 60 秒窗口里看不出来；这是用户点开的那一下，读一次
+/// 文件是值得的。）
+pub(crate) fn same_blob_now(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len().abs_diff(size) > SIZE_SLACK {
+        return false;
+    }
+    let limit = size.saturating_add(SIZE_SLACK);
+    match version_of(&meta) {
+        Some(version) => {
+            read_digest(path, &version, limit).is_some_and(|digest| keys.blob_id(&digest) == blob)
+        }
+        None => hash_file_digest(path, limit)
+            .is_some_and(|digest| keys.blob_id(&digest) == blob),
+    }
 }
 
 /// `path` 上的文件是不是 `blob` 这个对象。
@@ -1133,6 +1123,50 @@ pub(crate) fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool
     }
     read_digest(path, &version, limit)
         .is_some_and(|digest| keys.blob_id(&digest) == blob)
+}
+
+/// 一条消息引用里这个对象的路径与长度（`path` 是消息里写的那一串；artifact 是文件名）
+/// 和它是不是工具结果全文。登记被回收之后（上传失败留下的 `BLOB_GONE` 记录那种），
+/// 「点开前核对」和「重新下载」都拿它当依据。
+pub(crate) fn referenced_attachment(
+    ctx: &Ctx,
+    channel: &str,
+    chat_id: &str,
+    blob: &str,
+) -> Option<(String, u64, bool)> {
+    db::read(ctx.db(), |conn| {
+        if !sync_db::sync_tables_exist(conn)? {
+            return Ok(None);
+        }
+        let Some(session) = map::session_map_by_key(conn, channel, chat_id)? else {
+            return Ok(None);
+        };
+        let rows: Vec<String> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT refs FROM sync_msg WHERE session_id = ?1                  AND refs IS NOT NULL AND refs != '{}'",
+            )?;
+            let rows = stmt.query_map(params![session.session_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for column in rows {
+            let Some(refs) = StoredRefs::parse(Some(&column)) else {
+                continue;
+            };
+            if let Some(file) = refs.files.into_iter().find(|file| file.blob == blob) {
+                return Ok(Some((file.path, file.size, false)));
+            }
+            if let Some(artifact) = refs
+                .artifacts
+                .into_iter()
+                .find(|artifact| artifact.blob.as_deref() == Some(blob))
+            {
+                return Ok(Some((artifact.name, artifact.size, true)));
+            }
+        }
+        Ok(None)
+    })
+    .ok()
+    .flatten()
 }
 
 /// 一个会话最后 `tail` 条消息引用的、还在别的设备上的附件（打开会话、续聊之前补齐用）。

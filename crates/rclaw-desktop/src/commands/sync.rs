@@ -804,10 +804,17 @@ pub async fn sync_attachments(
 }
 
 /// 用户点了一个还没下载的附件：排到下载队列最前面。结果经 `sync` 事件
-/// （`kind = "attachment"`）通知。
+/// （`kind = "attachment"`）通知。登记被回收过的，先按消息里的引用补一条再取。
 #[tauri::command]
-pub async fn sync_fetch_attachment(state: State<'_, AppState>, blob: String) -> Result<(), String> {
-    handle(&state)?.fetch_attachment(&blob).map_err(fail)
+pub async fn sync_fetch_attachment(
+    state: State<'_, AppState>,
+    chat_id: String,
+    blob: String,
+) -> Result<(), String> {
+    check_chat_id(&chat_id)?;
+    handle(&state)?
+        .fetch_attachment_at(CHANNEL_DESKTOP, &chat_id, &blob)
+        .map_err(fail)
 }
 
 /// 在会话的附件清单里找到 `blob` 对应的那份文件快照，返回清单项与它在同步缓存里的真实
@@ -911,9 +918,9 @@ pub async fn sync_open_attachment(
 ) -> Result<(), String> {
     check_chat_id(&chat_id)?;
     let engine = handle(&state)?;
-    let (check_blob, check_path) = (blob, path.clone());
+    let (check_chat, check_blob, check_path) = (chat_id, blob, path.clone());
     let matches = run_blocking("核对附件", move || {
-        Ok(engine.attachment_file_matches(&check_blob, &check_path))
+        Ok(engine.attachment_file_matches(CHANNEL_DESKTOP, &check_chat, &check_blob, &check_path))
     })
     .await?;
     if matches == Some(false) {

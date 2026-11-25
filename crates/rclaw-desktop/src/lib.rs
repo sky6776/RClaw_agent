@@ -273,6 +273,7 @@ pub fn run() {
             commands::sync::sync_fetch_attachment,
             commands::sync::sync_attachment_preview,
             commands::sync::sync_attachment_save,
+            commands::sync::sync_open_attachment,
             commands::sync::session_export_bundle,
             commands::sync::session_import_bundle,
             commands::sync::sync_scan_qr_image,

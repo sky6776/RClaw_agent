@@ -26,6 +26,10 @@ import { formatBytes } from "../lib/syncUi";
  *  结果事件可能不来）；真的还在下的话，下完照样会刷新。 */
 const FETCH_SHOWN_MS = 3 * 60 * 1000;
 
+/** 附件清单一次没取到时的重试节奏：几秒内把临时故障熬过去；一直取不到就按「没有
+ *  清单」处理（清掉旧清单，别拿过时的判断冒充新清单）。 */
+const LOAD_RETRY_MS = [1000, 3000, 10_000, 30_000, 60_000];
+
 const IMAGE_RE = /\.(?:png|jpe?g|webp|gif)$/i;
 
 /** 这一条上要显示的附件。对象只在内容变了时才换。 */
@@ -217,7 +221,7 @@ function settle(blob: string, error: string | null) {
 }
 
 /** 下载一个还在别的设备上的附件。不等结果：结果经 sync 事件回来（见装载器）。 */
-function download(blob: string) {
+function download(chatId: string, blob: string) {
   if (cards.busy[blob]) return;
   setCards((prev) => ({
     ...prev,
@@ -230,7 +234,7 @@ function download(blob: string) {
     setCards((prev) => (prev.busy[blob] ? { ...prev, busy: without(prev.busy, blob) } : prev));
     if (reload) reload();
   }, FETCH_SHOWN_MS);
-  api.syncFetchAttachment(blob).catch((e) => settle(blob, String(e)));
+  api.syncFetchAttachment(chatId, blob).catch((e) => settle(blob, String(e)));
 }
 
 /** 把同步缓存里的一份文件快照存进工作区（存到这条消息写的那个路径上）。
@@ -296,21 +300,33 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     // 预算外的条目（`checked=false`）每轮会把上一轮核对过的让出来，几轮就能轮完；
     // 一直核不完的（很大的老消息）看几次就停。
     let uncheckedTries = 0;
+    // 取清单失败的重试节奏（毫秒）：一直取不到就不再假装就绪。
+    let loadFails = 0;
     const load = async () => {
       const mine = ++seq;
       let list: SyncAttachment[];
       try {
         list = await api.syncAttachments(chatId);
       } catch {
-        // agent 没启动、引擎不可用：当作没有清单，消息照旧按工作区路径显示（不能
-        // 一直停在「核对附件…」）。
-        if (alive && mine === seq && chat === chatId) {
-          loaded = chatId;
-          emit();
+        // 取不到清单：不能把旧清单（或者空清单）当成「核对好了」——那会让同步消息
+        // 回退到工作区路径，正好是这次要修的那类问题。退避重试几次；一直取不到才
+        // 按「没有清单」处理，并清掉旧清单（别拿过时的判断冒充新清单）。
+        if (!alive || mine !== seq || chat !== chatId) return;
+        if (loadFails < LOAD_RETRY_MS.length) {
+          const delay = LOAD_RETRY_MS[loadFails];
+          loadFails += 1;
+          window.clearTimeout(aliasTimer);
+          aliasTimer = window.setTimeout(() => void load(), delay);
+          return;
         }
+        all = EMPTY;
+        allSig = "";
+        loaded = chatId;
+        emit();
         return;
       }
       if (!alive || mine !== seq) return;
+      loadFails = 0;
       apply(chatId, list);
       const pendingAlias = list.filter(
         (item) => item.kind === "file" && item.state === "local" && !item.path_present,
@@ -514,7 +530,14 @@ export function AttachmentCard({
       .syncOpenAttachment(chatId, item.blob, path)
       .catch((e) => {
         onError(`打开文件失败: ${String(e)}`);
-        // 对不上时清单里的状态会变成「重新下载」：重取一次，卡片跟着换。
+        // 核对没过（文件被改写/删掉）：这次保存的落点不能再「打开」，收回去让用户
+        // 重新「存进工作区」；错误按落点记，只有这张卡显示。
+        const key = fileKey(item);
+        setCards((prev) => ({
+          ...prev,
+          saved: without(prev.saved, key),
+          saveErrors: { ...prev.saveErrors, [key]: String(e) },
+        }));
         reload?.();
       });
   };
@@ -581,7 +604,11 @@ export function AttachmentCard({
             <div className={`min-w-0 flex-1 ${CARD_ERROR}`}>{error}</div>
             {/* 快照核对不过（内容被本机改写过）或其他取用失败：重新下载走缺附件的
                 路径，由持有正确内容的设备核对摘要后重传。 */}
-            <button onClick={() => download(item.blob)} disabled={inactive} className={CARD_BTN}>
+            <button
+              onClick={() => download(chatId, item.blob)}
+              disabled={inactive}
+              className={CARD_BTN}
+            >
               重新下载
             </button>
           </div>
@@ -603,7 +630,7 @@ export function AttachmentCard({
           </span>
         </span>
         <button
-          onClick={() => download(item.blob)}
+          onClick={() => download(chatId, item.blob)}
           disabled={inactive || busy}
           className={CARD_BTN}
         >
@@ -667,6 +694,10 @@ function SnapshotImage({
   const [src, setSrc] = useState<string | null>(
     () => snapshotPreviews.get(cacheKey) ?? null,
   );
+  // 对象名或路径变了（换空间 rekey、旧版明文摘要归一）：换一份预览，别接着显示旧内容。
+  useEffect(() => {
+    setSrc(snapshotPreviews.get(cacheKey) ?? null);
+  }, [cacheKey]);
   const box = useRef<HTMLSpanElement | null>(null);
   useEffect(() => {
     if (src) return;
@@ -796,7 +827,7 @@ export function SyncChatBar({
             </button>
             {open && remote.length > 1 && (
               <button
-                onClick={() => idle.forEach((item) => download(item.blob))}
+                onClick={() => idle.forEach((item) => download(chatId, item.blob))}
                 disabled={idle.length === 0}
                 className={CARD_BTN}
               >

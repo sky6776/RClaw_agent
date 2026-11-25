@@ -1614,8 +1614,10 @@ export const api = {
   syncAttachments: (chatId: string) =>
     invoke<SyncAttachment[]>("sync_attachments", { chatId }),
 
-  /** 下载一个还在别的设备上的附件。不等结果：结果经 sync 事件（kind = attachment）通知。 */
-  syncFetchAttachment: (blob: string) => invoke<void>("sync_fetch_attachment", { blob }),
+  /** 下载一个还在别的设备上的附件。不等结果：结果经 sync 事件（kind = attachment）通知。
+   *  `chatId` 让后端在登记被回收过时按消息里的引用补一条再取。 */
+  syncFetchAttachment: (chatId: string, blob: string) =>
+    invoke<void>("sync_fetch_attachment", { chatId, blob }),
 
   /** 同步缓存里一张图片快照的预览。`path` 是这条消息里写的路径：同一份内容被引用成
    *  不同名字时，按它的扩展名决定能不能预览。 */
