@@ -974,10 +974,30 @@ impl SyncEngine {
     /// （同步缓存里的副本、同一对象的另一个路径），要核对内容摘要，所以这里取出空间
     /// 密钥。没配对、读不出密钥时按「验不了」处理（那种文件不算本机有）。
     pub fn attachments(&self, channel: &str, chat_id: &str) -> Result<Vec<AttachmentInfo>> {
+        self.attachments_matching(channel, chat_id, None)
+    }
+
+    /// 只要某个附件对象的登记（预览图、保存快照用）：不必核对这个会话里别的文件的
+    /// 摘要——会话里文件多的时候，预览/保存不该为此重读一堆不相干的文件。
+    pub fn attachments_of(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        blob: &str,
+    ) -> Result<Vec<AttachmentInfo>> {
+        self.attachments_matching(channel, chat_id, Some(blob))
+    }
+
+    fn attachments_matching(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        blob: Option<&str>,
+    ) -> Result<Vec<AttachmentInfo>> {
         let keys = Secrets::load(&self.inner.ctx.paths)
             .ok()
             .and_then(|secrets| secrets.keys().ok());
-        local::attachments(&self.inner.ctx, keys.as_ref(), channel, chat_id)
+        local::attachments(&self.inner.ctx, keys.as_ref(), channel, chat_id, blob)
     }
 
     /// 本机缓存的一份附件现在还是不是它登记的那个对象。打开缓存副本的入口用它拦下被

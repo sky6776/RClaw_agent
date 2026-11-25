@@ -420,6 +420,13 @@ async fn attachments_upload_after_the_backlog_choice_and_download_on_request() {
     assert_eq!(landed[0].state, "local");
     // 取回到原位置之后，界面按工作区路径出的卡就能直接打开了。
     assert!(landed[0].path_present);
+
+    // 就地把同名文件改成别的内容（长度不变）：内容已经不是登记的那份，不能再当本机有
+    // 打开（否则看到的是另一个文件）；界面给「重新下载」，取回时落到同步缓存。
+    std::fs::write(b.agent().join("uploads").join("a.txt"), b"HELLO").unwrap();
+    let tampered = b.engine.attachments("desktop", "c1").unwrap();
+    assert_eq!(tampered[0].state, "changed");
+    assert!(!tampered[0].path_present);
 }
 
 #[tokio::test]

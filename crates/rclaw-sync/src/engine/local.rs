@@ -665,6 +665,10 @@ pub struct AttachmentInfo {
     /// 去取过、同步空间里却没有这个文件的（§8.7）：`asked`：向别的设备要了，在等它们
     /// 传上来；`gone`：保存着它的设备说已经拿不出来了；`lost`：等了很久也没有设备传
     /// 上来。后两种本机不再自动去取，用户点「重试」时才再去看一次。
+    ///
+    /// `changed`：登记的那个落点上有个同名文件，内容已经不是这个对象了（被就地改写过）。
+    /// 不能把它当「本机有」打开——点「重新下载」会取回登记的那份（落到同步缓存，不覆盖
+    /// 现有文件）。
     pub state: &'static str,
     /// 本机上这个文件的绝对路径（有的话）。只给需要经引擎核对登记的后端入口用
     /// （预览、保存快照）；界面打开文件要走 [`Self::rel_path`]。
@@ -698,6 +702,7 @@ pub(crate) fn attachments(
     keys: Option<&Keys>,
     channel: &str,
     chat_id: &str,
+    blob_filter: Option<&str>,
 ) -> Result<Vec<AttachmentInfo>> {
     // 旧消息的附件索引可能只有一半（那时还没有 artifact 记录）：打开会话时把能准确
     // 重建的补上，否则清单里会缺掉那些工具结果。补不成不算错，清单照常给。
@@ -748,6 +753,9 @@ pub(crate) fn attachments(
                 _ => None,
             };
             for file in refs.files {
+                if blob_filter.is_some_and(|want| file.blob != want) {
+                    continue;
+                }
                 let (row, remote) = lookup(&file.blob)?;
                 out.push(FoundRef {
                     message_id,
@@ -764,6 +772,9 @@ pub(crate) fn attachments(
                 let Some(blob) = artifact.blob else {
                     continue;
                 };
+                if blob_filter.is_some_and(|want| blob != want) {
+                    continue;
+                }
                 let (row, remote) = lookup(&blob)?;
                 out.push(FoundRef {
                     message_id,
@@ -779,56 +790,57 @@ pub(crate) fn attachments(
         }
         Ok(out)
     })?;
-    // 文件在不在：库锁之外看。
+    // 文件在不在、还是不是登记的那份内容：库锁之外看。路径先过 `check_path`（工作区里
+    // 的链接不能把读取带到别处），内容核对按（路径、长度、mtime）记忆摘要。
     Ok(found
         .into_iter()
         .map(|found| {
             // 只认原样存在的文件：名字要改写才拼得上的路径（别的系统上的文件名），本机
-            // 工作区里不会有它。
-            let present = |rel_path: &str| {
-                let path = ctx.env.resolve_exact(rel_path)?;
-                path.is_file().then(|| path.to_string_lossy().into_owned())
+            // 工作区里不会有它；中间的目录是链接的也不算。
+            let present = |rel_path: &str| -> Option<std::path::PathBuf> {
+                let path = ctx.env.checked_path(rel_path).ok()?;
+                path.is_file().then_some(path)
+            };
+            // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
+            // 里、密钥读不出来）时验不了：按登记说它在（老行为）。
+            let verified = |path: &Path| -> bool {
+                keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
             };
             let (state, local_path, rel_path) = match &found.row {
                 Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
                 Some(row) => match present(&row.rel_path) {
+                    // 落点上的文件已经不是这个对象（被就地改写过）：不能当它还在，
+                    // 界面上给「重新下载」（`attach::lookup` 也按内容核对，取回时不会
+                    // 覆盖这份内容不同的文件）。
+                    Some(path) if found.kind == "file" && !verified(&path) => {
+                        ("changed", None, None)
+                    }
                     Some(path) if row.rel_path.starts_with(SYNC_DIR_PREFIX) => {
                         ("cached", Some(path), None)
                     }
                     Some(path) => ("local", Some(path), Some(row.rel_path.clone())),
                     None => ("missing", None, None),
                 },
-                // 没有登记（登记被回收了）：工作区里原来的位置上还有就算本机有。
+                // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上才算
+                // 本机有。
                 None if found.kind == "file" => match present(&found.path) {
-                    Some(path) => ("local", Some(path), Some(found.path.clone())),
+                    Some(path) if verified(&path) => {
+                        ("local", Some(path), Some(found.path.clone()))
+                    }
+                    Some(_) => ("changed", None, None),
                     None => ("missing", None, None),
                 },
                 None => ("missing", None, None),
             };
-            // 消息路径上这个文件是不是就是这条消息登记的那份内容：
-            // - 登记说这份内容就落在消息路径上（`state == local` 且 `rel_path` 就是它）：
-            //   取回时同名文件内容不同的会改落同步缓存（`attach::place`），所以落在这里
-            //   的就是登记的那一份，不必再整读一遍文件；
-            // - 别的落点（同步缓存、同一对象的另一个路径）上有这份内容、消息路径上另有
-            //   一个同名文件：核对长度与摘要，是同一个对象才算「本机真有」，否则打开的是
-            //   一个不相干的文件；
-            // - 登记已经回收：只能核对内容本身。
+            let local_path = local_path.map(|path| path.to_string_lossy().into_owned());
+            // 消息里写的那个路径上现在是不是真有这份内容：登记说它就是落点、内容上面
+            // 已经核对过的（`local`），或者那个路径上的文件核对下来就是这个对象。
             // 工具结果（artifact）在消息里只有一个文件名，按状态算。
             let path_present = if found.kind == "file" {
-                match present(&found.path) {
-                    None => false,
-                    Some(path) => {
-                        let same_size = std::fs::symlink_metadata(&path)
-                            .is_ok_and(|meta| meta.is_file() && meta.len() == found.size);
-                        let landed_here = found.row.is_some()
-                            && state == "local"
-                            && rel_path.as_deref() == Some(found.path.as_str());
-                        same_size
-                            && (landed_here
-                                || keys.is_some_and(|keys| {
-                                    same_blob(keys, Path::new(&path), &found.blob)
-                                }))
-                    }
+                if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
+                    true
+                } else {
+                    present(&found.path).is_some_and(|path| verified(&path))
                 }
             } else {
                 state == "local"
@@ -856,6 +868,9 @@ static DIGEST_CACHE: Mutex<Vec<(String, u64, i128, [u8; 32])>> = Mutex::new(Vec:
 const DIGEST_CACHE_MAX: usize = 128;
 
 /// 文件内容的 SHA-256（未加密钥；对象名是它在空间密钥下的摘要）。读不了不算。
+///
+/// 读不出修改时间的文件不记：那说明「判不了它有没有变」，宁可每次重算，不能把判不了
+/// 当成没变（记在一个固定的 0 上会让之后任一次改写都看不出来）。
 fn path_digest(path: &Path) -> Option<[u8; 32]> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.is_file() {
@@ -866,33 +881,38 @@ fn path_digest(path: &Path) -> Option<[u8; 32]> {
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|since| since.as_nanos() as i128)
-        .unwrap_or(0);
+        .map(|since| since.as_nanos() as i128);
     let key = path.to_string_lossy().into_owned();
-    if let Ok(cache) = DIGEST_CACHE.lock() {
-        if let Some((_, cached_size, cached_mtime, digest)) =
-            cache.iter().find(|(cached, ..)| *cached == key)
-        {
-            if *cached_size == size && *cached_mtime == mtime {
-                return Some(*digest);
+    if let Some(mtime) = mtime {
+        if let Ok(cache) = DIGEST_CACHE.lock() {
+            if let Some((_, cached_size, cached_mtime, digest)) =
+                cache.iter().find(|(cached, ..)| *cached == key)
+            {
+                if *cached_size == size && *cached_mtime == mtime {
+                    return Some(*digest);
+                }
             }
         }
     }
     let mut file = std::fs::File::open(path).ok()?;
     let (digest, _) = sha256_reader(&mut file).ok()?;
-    if let Ok(mut cache) = DIGEST_CACHE.lock() {
-        cache.retain(|(cached, ..)| *cached != key);
-        if cache.len() >= DIGEST_CACHE_MAX {
-            cache.remove(0);
+    if let Some(mtime) = mtime {
+        if let Ok(mut cache) = DIGEST_CACHE.lock() {
+            cache.retain(|(cached, ..)| *cached != key);
+            if cache.len() >= DIGEST_CACHE_MAX {
+                cache.remove(0);
+            }
+            cache.push((key, size, mtime, digest));
         }
-        cache.push((key, size, mtime, digest));
     }
     Some(digest)
 }
 
-/// `path` 上的文件是不是 `blob` 这个对象（调用方已经比对过长度，这里核对摘要）。
-fn same_blob(keys: &Keys, path: &Path, blob: &str) -> bool {
-    path_digest(path).is_some_and(|digest| keys.blob_id(&digest) == blob)
+/// `path` 上的文件是不是 `blob` 这个对象：先比长度，再核对内容摘要。
+fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.len() == size)
+        && path_digest(path).is_some_and(|digest| keys.blob_id(&digest) == blob)
 }
 
 /// 一个会话最后 `tail` 条消息引用的、还在别的设备上的附件（打开会话、续聊之前补齐用）。
@@ -1189,7 +1209,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let got = attachments(ctx, None, "desktop", "c1").unwrap();
+        let got = attachments(ctx, None, "desktop", "c1", None).unwrap();
         let states: Vec<&str> = got.iter().map(|item| item.state).collect();
         assert_eq!(states, ["local", "cached", "remote"]);
         // 消息路径上真有这份内容的只有第一个：cached 的那份在同步缓存里，消息写的
@@ -1209,11 +1229,11 @@ mod tests {
         assert!(tail_remote_blobs(ctx, "desktop", "c1", 20, 4, start)
             .unwrap()
             .is_empty());
-        assert!(attachments(ctx, None, "desktop", "nope").unwrap().is_empty());
+        assert!(attachments(ctx, None, "desktop", "nope", None).unwrap().is_empty());
 
         // 去取过、同步空间里没有的：照它现在的情况说（§8.7）。
         let (hour, day) = (3600 * 1000, 24 * 3600 * 1000);
-        let remote = || attachments(ctx, None, "desktop", "c1").unwrap()[2].state;
+        let remote = || attachments(ctx, None, "desktop", "c1", None).unwrap()[2].state;
         let tail = |at: i64| tail_remote_blobs(ctx, "desktop", "c1", 20, 5, at).unwrap();
         let me = device.settings.device.clone();
         let missing = |at: i64| {

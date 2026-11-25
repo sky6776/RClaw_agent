@@ -824,7 +824,7 @@ fn cached_snapshot(
     path: Option<&str>,
 ) -> Result<(AttachmentInfo, PathBuf), String> {
     let info = engine
-        .attachments(CHANNEL_DESKTOP, chat_id)
+        .attachments_of(CHANNEL_DESKTOP, chat_id, blob)
         .map_err(fail)?
         .into_iter()
         // 文件与工具结果全文（artifact）都可能有缓存副本：后者落到缓存时，工作区里的

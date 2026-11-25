@@ -11,6 +11,7 @@ import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import {
   AttachmentCard,
+  messageFileRefs,
   useChatAttachments,
   useChatAttachmentsReady,
 } from "./SyncAttachments";
@@ -183,11 +184,8 @@ export default function MediaPreviews({
   // 时按工作区路径出卡，落库之后清单刷新再换成附件卡。
   const mine = useMemo(() => {
     const map = new Map<string, SyncAttachment>();
-    if (!chatId || msgId === undefined) return map;
-    for (const item of synced) {
-      if (item.kind !== "file" || item.message_id !== msgId) continue;
-      map.set(item.path, item);
-    }
+    if (!chatId) return map;
+    for (const item of messageFileRefs(synced, msgId)) map.set(item.path, item);
     return map;
   }, [chatId, msgId, synced]);
   // 消息路径本机真有这个文件（包括同一对象的别名已经补到原位置）：照旧按工作区路径
@@ -211,7 +209,13 @@ export default function MediaPreviews({
     for (const path of mine.keys()) {
       if (seen.has(path)) continue;
       seen.add(path);
-      extra.push({ key: path, path, display: path.split("/").pop() || path, kind: "open" });
+      const image = /\.(?:png|jpe?g|webp|gif)$/i.test(path);
+      extra.push({
+        key: path,
+        path,
+        display: path.split("/").pop() || path,
+        kind: image ? "image" : "open",
+      });
     }
     return extra.length === 0 ? items : [...items, ...extra];
   }, [items, mine]);

@@ -39,16 +39,24 @@ interface BarView {
 
 const NONE: BarView = { pending: [], landed: [], sig: "" };
 
-/** 卡片上的临时状态，按附件对象（blob）记。 */
+/** 卡片上的临时状态。下载相关的按附件对象（blob）记；保存相关的按「对象:目标路径」
+ *  记——同一份内容可能被几条消息引用到不同路径，一个落点失败不该显示在另一个上。 */
 interface CardState {
   busy: Record<string, true>;
   saving: Record<string, true>;
   errors: Record<string, string>;
+  saveErrors: Record<string, string>;
   /** 存进工作区之后的相对路径。 */
   saved: Record<string, string>;
 }
 
-const noCardState = (): CardState => ({ busy: {}, saving: {}, errors: {}, saved: {} });
+const noCardState = (): CardState => ({
+  busy: {},
+  saving: {},
+  errors: {},
+  saveErrors: {},
+  saved: {},
+});
 
 /** 清单属于哪个会话；换会话时整份换掉。 */
 let chat: string | null = null;
@@ -182,7 +190,7 @@ function save(chatId: string, item: SyncAttachment) {
   setCards((prev) => ({
     ...prev,
     saving: { ...prev.saving, [key]: true },
-    errors: without(prev.errors, item.blob),
+    saveErrors: without(prev.saveErrors, key),
   }));
   api
     .syncAttachmentSave(chatId, item.blob, item.path)
@@ -195,7 +203,7 @@ function save(chatId: string, item: SyncAttachment) {
     })
     .catch((e) => {
       if (chat !== chatId) return;
-      setCards((prev) => ({ ...prev, errors: { ...prev.errors, [item.blob]: String(e) } }));
+      setCards((prev) => ({ ...prev, saveErrors: { ...prev.saveErrors, [key]: String(e) } }));
     })
     .finally(() => {
       setCards((prev) =>
@@ -292,6 +300,28 @@ export function useChatAttachmentsReady(chatId: string | null): boolean {
   );
 }
 
+/** 一条消息登记的文件附件（只认消息里写的路径；工具结果全文不在此列）。 */
+export function messageFileRefs(
+  list: SyncAttachment[],
+  msgId: number | undefined,
+): SyncAttachment[] {
+  if (msgId === undefined) return [];
+  return list.filter((item) => item.kind === "file" && item.message_id === msgId);
+}
+
+/** 一条消息登记的文件里，消息路径上并没有这份内容的（按路径索引）：界面出附件卡，
+ *  画廊也要跳过——按工作区路径取会拿到同名却不是这份内容的文件。 */
+export function awayAttachments(
+  list: SyncAttachment[],
+  msgId: number | undefined,
+): Map<string, SyncAttachment> {
+  const away = new Map<string, SyncAttachment>();
+  for (const item of messageFileRefs(list, msgId)) {
+    if (!item.path_present) away.set(item.path, item);
+  }
+  return away;
+}
+
 const CARD =
   "flex items-center gap-2 rounded-xl border border-[#2a2f3a] bg-[#0f131b] px-3 py-2 text-left";
 const CARD_ICON = "flex h-9 w-9 shrink-0 items-center justify-center rounded-full";
@@ -310,6 +340,13 @@ function awayText(state: string, where: string): { note: string; action: string 
       return {
         note: "同步空间里还没有这个文件。已经向其他设备要了，有设备传上来之后会自动取回",
         action: "再试一次",
+      };
+    // 这台设备上的同名文件被就地改写过，已经不是这条消息引用的那一份：重新下载会取回
+    // 登记的内容（落到同步缓存，不覆盖现有文件）。
+    case "changed":
+      return {
+        note: "这台设备上的同名文件已经不是这条消息引用的那一份",
+        action: "重新下载",
       };
     // 这两种不是定论（别的设备后来也许又有了它）：引擎在打开会话时隔一天再去看一次，
     // 所以说「现在」。
@@ -349,7 +386,7 @@ export function AttachmentCard({
   const shown = name ?? (item.path.split("/").pop() || item.path);
   const where = item.origin ? `「${item.origin}」` : "别的设备";
   const isImage = IMAGE_RE.test(item.path);
-  const error = state.errors[item.blob];
+  const error = state.errors[item.blob] ?? state.saveErrors[fileKey(item)];
   const open = (path: string) => {
     api.openMedia(path).catch((e) => onError(`打开文件失败: ${String(e)}`));
   };

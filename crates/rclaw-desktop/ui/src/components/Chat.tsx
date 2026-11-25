@@ -14,6 +14,7 @@ import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { parseMediaItems } from "./MediaPreviews";
+import { awayAttachments, useChatAttachments } from "./SyncAttachments";
 import WorkflowCard from "./WorkflowCard";
 import MediaGallery, { type GalleryItem, type GallerySeed } from "./MediaGallery";
 import ToolBatchRows from "./ToolCallRow";
@@ -651,6 +652,9 @@ export default function Chat({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // 上传附件（已写入工作区）与上传中标志；附件随消息发送后清空。
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  // 这个会话的附件清单（多端同步）：画廊与消息里的媒体卡用同一份，判断哪些路径在这台
+  // 设备上真有这份内容（同名的别的文件不算）。
+  const syncedAttachments = useChatAttachments(sessionKey);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   // 输入历史（当前会话已发送的用户消息，按发送序）：↑↓ 遍历回填到输入框。
@@ -1523,8 +1527,11 @@ export default function Chat({
     const seen = new Set<string>();
     for (const e of entries) {
       if (e.role !== "user" && e.role !== "assistant") continue;
+      // 不在这台设备上（或者本机同名文件已经不是这条消息引用那份）的不进时间线：
+      // 画廊按工作区路径取图，放进去会滑到一张同名、不同内容的图。
+      const away = awayAttachments(syncedAttachments, e.msgId);
       for (const it of parseMediaItems(e.content)) {
-        if (seen.has(it.path)) continue;
+        if (seen.has(it.path) || away.has(it.path)) continue;
         const isVideo = it.kind === "open" && /\.(?:mp4|webm|m4v|mov)$/i.test(it.path);
         if (it.kind !== "image" && !isVideo) continue;
         seen.add(it.path);
@@ -1532,6 +1539,19 @@ export default function Chat({
           path: it.path,
           display: it.display || it.path,
           kind: isVideo ? "video" : "image",
+        });
+      }
+      // 清单里有、正文解析漏掉的图片（已在本机）：也放进时间线，否则存回工作区之后
+      // 内联缩略图点不开（画廊里没有它，`openGallery` 会直接返回）。
+      for (const item of syncedAttachments) {
+        if (item.kind !== "file" || item.message_id !== e.msgId) continue;
+        if (!item.path_present || seen.has(item.path)) continue;
+        if (!/\.(?:png|jpe?g|webp|gif)$/i.test(item.path)) continue;
+        seen.add(item.path);
+        items.push({
+          path: item.path,
+          display: item.path.split("/").pop() || item.path,
+          kind: "image",
         });
       }
     }
