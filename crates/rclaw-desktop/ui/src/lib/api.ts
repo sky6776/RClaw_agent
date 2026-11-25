@@ -1614,9 +1614,10 @@ export const api = {
   /** 下载一个还在别的设备上的附件。不等结果：结果经 sync 事件（kind = attachment）通知。 */
   syncFetchAttachment: (blob: string) => invoke<void>("sync_fetch_attachment", { blob }),
 
-  /** 同步缓存里一张图片快照的预览。 */
-  syncAttachmentPreview: (chatId: string, blob: string) =>
-    invoke<MediaPayload>("sync_attachment_preview", { chatId, blob }),
+  /** 同步缓存里一张图片快照的预览。`path` 是这条消息里写的路径：同一份内容被引用成
+   *  不同名字时，按它的扩展名决定能不能预览。 */
+  syncAttachmentPreview: (chatId: string, blob: string, path: string) =>
+    invoke<MediaPayload>("sync_attachment_preview", { chatId, blob, path }),
 
   /** 把一份文件快照存进工作区，返回它在工作区里的相对路径（不覆盖已有的不同文件）。
    *  `path` 是消息里写的那个路径：同一份内容被几条消息引用时，存到点的那条的位置上。 */

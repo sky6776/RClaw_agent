@@ -1,5 +1,6 @@
 import React, {
   Fragment,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -1522,7 +1523,7 @@ export default function Chat({
   // 与应用内可播的视频按出现顺序去重入列，start 定位到点击的那条。只扫
   // 用户/助手消息——工具行、思考行不出媒体卡，塞进画廊会出现「滑到一张
   // 聊天里没见过的图」。
-  const openGallery = (start: string, seed?: GallerySeed | null) => {
+  const openGallery = useCallback((start: string, seed?: GallerySeed | null) => {
     const items: GalleryItem[] = [];
     const seen = new Set<string>();
     for (const e of entries) {
@@ -1541,23 +1542,24 @@ export default function Chat({
           kind: isVideo ? "video" : "image",
         });
       }
-      // 清单里有、正文解析漏掉的图片（已在本机）：也放进时间线，否则存回工作区之后
-      // 内联缩略图点不开（画廊里没有它，`openGallery` 会直接返回）。
+      // 清单里有、正文解析漏掉的图片/视频（已在本机）：也放进时间线，否则内联卡
+      // 点不开（画廊里没有它，`openGallery` 会直接返回）。
       for (const item of syncedAttachments) {
         if (item.kind !== "file" || item.message_id !== e.msgId) continue;
         if (!item.path_present || seen.has(item.path)) continue;
-        if (!/\.(?:png|jpe?g|webp|gif)$/i.test(item.path)) continue;
+        const video = /\.(?:mp4|webm|m4v|mov)$/i.test(item.path);
+        if (!video && !/\.(?:png|jpe?g|webp|gif)$/i.test(item.path)) continue;
         seen.add(item.path);
         items.push({
           path: item.path,
           display: item.path.split("/").pop() || item.path,
-          kind: "image",
+          kind: video ? "video" : "image",
         });
       }
     }
     if (!seen.has(start)) return;
     setGallery({ items, start, seed: seed ?? null });
-  };
+  }, [entries, syncedAttachments]);
 
   // 菜单媒体动作：保存 / 转发 / 系统打开 / 放大（放大按需拉 base64，媒体卡
   // 已加载的 data URL 不在 Chat 手里）。
@@ -2000,7 +2002,7 @@ export default function Chat({
     // 变化时必须重算否则一键开合不会重挂载。busy 参与运行段判定（最终回复
     // 是否分离）。sessionKey 是工具行懒加载详情的会话键。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId, thinkingGen, busy, sessionKey],
+    [entries, selectIds, isMobile, futureThinkingCollapsed, onError, onFork, textSelectId, thinkingGen, busy, sessionKey, openGallery],
   );
 
   // 运行段集合仅在提交阶段（useLayoutEffect）写入，渲染期只读上次提交的集合——

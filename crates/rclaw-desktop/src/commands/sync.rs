@@ -873,12 +873,18 @@ pub async fn sync_attachment_preview(
     state: State<'_, AppState>,
     chat_id: String,
     blob: String,
+    path: String,
 ) -> Result<MediaPayload, String> {
     check_chat_id(&chat_id)?;
+    if path.trim().is_empty() {
+        return Err("没有指定要预览的路径".into());
+    }
     let engine = handle(&state)?;
     let home = state.home.clone();
     run_blocking("生成预览", move || {
-        let (info, full) = cached_snapshot(&engine, &home, &chat_id, &blob, None)?;
+        // 按这道消息里的路径选那份快照：同一份内容被引用成不同的名字（`copy.bin`
+        // 与 `photo.png`）时，扩展名要取用户在看的这个，不能取清单里第一条。
+        let (info, full) = cached_snapshot(&engine, &home, &chat_id, &blob, Some(&path))?;
         let extension = info
             .path
             .rsplit('.')

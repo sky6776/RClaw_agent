@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rclaw_store::session::raw::SessionDeleteSync;
 use rclaw_store::sync_db::{self, INBOX_PENDING, INBOX_QUEUED, SEAL_LOCAL, SEAL_SEALED};
@@ -797,8 +797,18 @@ pub(crate) fn attachments(
         .map(|found| {
             // 只认原样存在的文件：名字要改写才拼得上的路径（别的系统上的文件名），本机
             // 工作区里不会有它；中间的目录是链接的也不算。
-            let present = |rel_path: &str| -> Option<std::path::PathBuf> {
+            //
+            // 落点（登记、同步缓存）按本机的改写规则解析（`checked_path`），写下的就是
+            // 那个名字；消息里写的路径必须原样存在（`resolve_exact`）——界面打开时用的
+            // 是消息里那一串，改写过名字的文件在界面上打不开（「存进工作区」会给出存好
+            // 的那个路径）。
+            let landing = |rel_path: &str| -> Option<std::path::PathBuf> {
                 let path = ctx.env.checked_path(rel_path).ok()?;
+                path.is_file().then_some(path)
+            };
+            let exact = |rel_path: &str| -> Option<std::path::PathBuf> {
+                let path = ctx.env.resolve_exact(rel_path)?;
+                ctx.env.check_path(rel_path, &path).ok()?;
                 path.is_file().then_some(path)
             };
             // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
@@ -808,7 +818,7 @@ pub(crate) fn attachments(
             };
             let (state, local_path, rel_path) = match &found.row {
                 Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
-                Some(row) => match present(&row.rel_path) {
+                Some(row) => match landing(&row.rel_path) {
                     // 落点上的文件已经不是这个对象（被就地改写过）：不能当它还在，
                     // 界面上给「重新下载」（`attach::lookup` 也按内容核对，取回时不会
                     // 覆盖这份内容不同的文件）。
@@ -823,7 +833,7 @@ pub(crate) fn attachments(
                 },
                 // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上才算
                 // 本机有。
-                None if found.kind == "file" => match present(&found.path) {
+                None if found.kind == "file" => match exact(&found.path) {
                     Some(path) if verified(&path) => {
                         ("local", Some(path), Some(found.path.clone()))
                     }
@@ -840,7 +850,7 @@ pub(crate) fn attachments(
                 if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
                     true
                 } else {
-                    present(&found.path).is_some_and(|path| verified(&path))
+                    exact(&found.path).is_some_and(|path| verified(&path))
                 }
             } else {
                 state == "local"
@@ -861,35 +871,57 @@ pub(crate) fn attachments(
         .collect())
 }
 
-/// 核对「消息路径上的文件就是登记的那个对象」时算过的摘要：按（路径、长度、
-/// mtime 纳秒）记住。打开会话、每次同步动静之后 [`attachments`] 都会被调用
-/// 一遍，同一个文件不重复整读；文件被改过（长度或 mtime 变了）就重算。
-static DIGEST_CACHE: Mutex<Vec<(String, u64, i128, [u8; 32])>> = Mutex::new(Vec::new());
-const DIGEST_CACHE_MAX: usize = 128;
+/// 核对「消息路径上的文件就是登记的那个对象」时算过的摘要：按（路径、长度、修改
+/// 时间、创建时间）记住。打开会话、每次同步动静之后 [`attachments`] 都会被调用
+/// 一遍，同一个文件不重复整读。
+///
+/// 容量按「一个会话里可能引用的文件数」留足（几千条），命中时挪到队尾（LRU）。按
+/// 128 条留的时候，一个引用过上百个文件的会话每轮都会把彼此挤掉、每次清单查询都把
+/// 这些文件重读一遍。
+struct DigestEntry {
+    path: String,
+    size: u64,
+    mtime: i128,
+    /// 创建时间（拿得到时比一比：Windows 上文件被整个替换过，创建时间会变）。
+    created: Option<i128>,
+    digest: [u8; 32],
+}
+
+static DIGEST_CACHE: Mutex<Vec<DigestEntry>> = Mutex::new(Vec::new());
+const DIGEST_CACHE_MAX: usize = 8192;
+
+fn timestamp(time: std::io::Result<SystemTime>) -> Option<i128> {
+    time.ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos() as i128)
+}
 
 /// 文件内容的 SHA-256（未加密钥；对象名是它在空间密钥下的摘要）。读不了不算。
 ///
-/// 读不出修改时间的文件不记：那说明「判不了它有没有变」，宁可每次重算，不能把判不了
-/// 当成没变（记在一个固定的 0 上会让之后任一次改写都看不出来）。
-fn path_digest(path: &Path) -> Option<[u8; 32]> {
+/// 读不出修改时间的文件不进缓存：那说明「判不了它有没有变」，宁可每次重算，不能把
+/// 判不了当成没变（记在一个固定的 0 上会让之后任一次改写都看不出来）。
+fn path_digest(path: &Path, use_cache: bool) -> Option<[u8; 32]> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.is_file() {
         return None;
     }
     let size = meta.len();
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|since| since.as_nanos() as i128);
+    let mtime = timestamp(meta.modified());
+    let created = timestamp(meta.created());
     let key = path.to_string_lossy().into_owned();
-    if let Some(mtime) = mtime {
-        if let Ok(cache) = DIGEST_CACHE.lock() {
-            if let Some((_, cached_size, cached_mtime, digest)) =
-                cache.iter().find(|(cached, ..)| *cached == key)
-            {
-                if *cached_size == size && *cached_mtime == mtime {
-                    return Some(*digest);
+    if use_cache {
+        if let Some(mtime) = mtime {
+            if let Ok(mut cache) = DIGEST_CACHE.lock() {
+                if let Some(at) = cache.iter().position(|entry| {
+                    entry.path == key
+                        && entry.size == size
+                        && entry.mtime == mtime
+                        && entry.created == created
+                }) {
+                    let entry = cache.remove(at);
+                    let digest = entry.digest;
+                    cache.push(entry);
+                    return Some(digest);
                 }
             }
         }
@@ -898,11 +930,17 @@ fn path_digest(path: &Path) -> Option<[u8; 32]> {
     let (digest, _) = sha256_reader(&mut file).ok()?;
     if let Some(mtime) = mtime {
         if let Ok(mut cache) = DIGEST_CACHE.lock() {
-            cache.retain(|(cached, ..)| *cached != key);
+            cache.retain(|entry| entry.path != key);
             if cache.len() >= DIGEST_CACHE_MAX {
                 cache.remove(0);
             }
-            cache.push((key, size, mtime, digest));
+            cache.push(DigestEntry {
+                path: key,
+                size,
+                mtime,
+                created,
+                digest,
+            });
         }
     }
     Some(digest)
@@ -910,9 +948,16 @@ fn path_digest(path: &Path) -> Option<[u8; 32]> {
 
 /// `path` 上的文件是不是 `blob` 这个对象：先比长度，再核对内容摘要。
 fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
-    std::fs::symlink_metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.len() == size)
-        && path_digest(path).is_some_and(|digest| keys.blob_id(&digest) == blob)
+    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() == size) {
+        return false;
+    }
+    if path_digest(path, true).is_some_and(|digest| keys.blob_id(&digest) == blob) {
+        return true;
+    }
+    // 缓存里的摘要对不上：可能文件真的变了，也可能是缓存过时（备份还原之类保留了
+    // 长度与时间戳的替换）。重算一次以区分——真是换了内容的花费只在变化后的第一次，
+    // 新摘要会记下来；是缓存过时的，这一次就把它纠正过来。
+    path_digest(path, false).is_some_and(|digest| keys.blob_id(&digest) == blob)
 }
 
 /// 一个会话最后 `tail` 条消息引用的、还在别的设备上的附件（打开会话、续聊之前补齐用）。

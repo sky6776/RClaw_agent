@@ -147,6 +147,15 @@ function apply(chatId: string, list: SyncAttachment[]) {
   emit();
 }
 
+/** 清单要重取了（这个会话刚合进来别的设备的消息）：在取到之前，消息里的工作区路径
+ *  不能当成「本机有」——新消息引用的可能正是别的设备上的文件，按路径打开会拿到一个
+ *  同名、不同内容的本地文件。 */
+function markStale(chatId: string) {
+  if (chat !== chatId || loaded !== chatId) return;
+  loaded = null;
+  emit();
+}
+
 /** 一个附件的下载有了结果（或者请求本身没发出去）。 */
 function settle(blob: string, error: string | null) {
   const timer = busyTimers[blob];
@@ -265,7 +274,9 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         event.kind === "sessions" &&
         event.chats.some((c) => c.channel === "desktop" && c.chat_id === chatId)
       ) {
-        // 别的设备的消息合进了这个会话：它们引用的文件多半不在本机。
+        // 别的设备的消息合进了这个会话：它们引用的文件多半不在本机。新消息可能已经
+        // 渲染出来了，而清单还要等一拍才重取——这一段里别让工作区路径当可用的入口。
+        markStale(chatId);
         schedule();
       }
     });
@@ -419,7 +430,9 @@ export function AttachmentCard({
     const saving = Boolean(state.saving[fileKey(item)]);
     return (
       <div>
-        {isImage && <SnapshotImage chatId={chatId} blob={item.blob} alt={shown} />}
+        {isImage && (
+          <SnapshotImage chatId={chatId} blob={item.blob} path={item.path} alt={shown} />
+        )}
         <div
           className={CARD}
           title="这是从别的设备取回的一份文件快照，放在同步缓存里（这台设备的工作区里可能另有同名文件，所以不往原位置写）。存进工作区之后，助手才能按路径读到它。"
@@ -518,7 +531,18 @@ function rememberSnapshot(blob: string, src: string) {
  *  卡片快进视口时才经 IPC 生成预览：`sync_attachment_preview` 每次都要重建这个会话
  *  的附件清单并核对摘要，而一个会话可能同时挂出几十张快照卡——都在挂载时请求的话，
  *  打开会话要白等一长串 IPC（`loading="lazy"` 只管字节，不管这次调用）。 */
-function SnapshotImage({ chatId, blob, alt }: { chatId: string; blob: string; alt: string }) {
+function SnapshotImage({
+  chatId,
+  blob,
+  path,
+  alt,
+}: {
+  chatId: string;
+  blob: string;
+  /** 这条消息里的路径（扩展名决定这份内容能不能出预览）。 */
+  path: string;
+  alt: string;
+}) {
   const [src, setSrc] = useState<string | null>(() => snapshotPreviews.get(blob) ?? null);
   const box = useRef<HTMLSpanElement | null>(null);
   useEffect(() => {
@@ -531,19 +555,22 @@ function SnapshotImage({ chatId, blob, alt }: { chatId: string; blob: string; al
         setSrc(known);
         return;
       }
-      let request = snapshotPending.get(blob);
+      // 在途请求按「对象 + 路径」记：同一份内容引用成不同的名字时，能不能预览取决于
+      // 各自那个名字的扩展名，不能把一次失败的结论借给另一张卡。
+      const pending = `${blob}:${path}`;
+      let request = snapshotPending.get(pending);
       if (!request) {
-        const started = api.syncAttachmentPreview(chatId, blob).then((r) => {
+        const started = api.syncAttachmentPreview(chatId, blob, path).then((r) => {
           const url = `data:${r.mime};base64,${r.base64}`;
           rememberSnapshot(blob, url);
           return url;
         });
         request = started;
-        snapshotPending.set(blob, started);
+        snapshotPending.set(pending, started);
         void started
           .catch(() => {})
           .then(() => {
-            if (snapshotPending.get(blob) === started) snapshotPending.delete(blob);
+            if (snapshotPending.get(pending) === started) snapshotPending.delete(pending);
           });
       }
       void request
@@ -572,7 +599,7 @@ function SnapshotImage({ chatId, blob, alt }: { chatId: string; blob: string; al
       alive = false;
       observer.disconnect();
     };
-  }, [chatId, blob, src]);
+  }, [chatId, blob, path, src]);
   // 没加载出来时不占位，只留一个 1px 的观察点（在卡片正上方，随卡片滚进视口）。
   if (!src) return <span ref={box} className="block h-1 w-full" aria-hidden="true" />;
   return (
