@@ -6169,9 +6169,17 @@ pub(crate) fn stage_bytes_for_export(
         return Err("暂存目录越出工作区".into());
     }
     let name = original.rsplit('/').next().unwrap_or("export.bin");
-    // 只接受一个普通的文件名段（不允许盘符、分隔符、备用数据流——否则 join 之后可能
-    // 写到暂存目录之外）。
-    if name.is_empty() || !rclaw_store::is_portable_file_name(name) {
+    // 本机合法、但别的系统上拼不得的名字（`NUL.pdf` 之类）按可移植规则改写（保留
+    // 扩展名），不拒绝已经核对过的文件；同时保证结果只是一个文件名段（没有盘符/分隔符/
+    // 备用数据流）。
+    let name = if name.is_empty() {
+        "export.bin".to_string()
+    } else if rclaw_store::is_portable_file_name(name) {
+        name.to_string()
+    } else {
+        rclaw_store::portable_file_name(name)
+    };
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains(':') {
         return Err("暂存文件名不合规，不能打开".into());
     }
     let staged = dir.join(name);

@@ -1016,6 +1016,25 @@ pub(crate) fn version_of(path: &Path, meta: &std::fs::Metadata) -> Option<FileVe
     })
 }
 
+/// 文件版本针：长度 + 修改时间 + 变更时间（拿得到的话）。流式入口用它钉住「核对过
+/// 的那一份」——同长度、时间戳被保留的替换也会让针变。
+pub(crate) fn file_version_pin(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let version = version_of(path, &meta)?;
+    Some(format!(
+        "{}-{}-{}",
+        version.size,
+        version.mtime,
+        version
+            .changed
+            .map(|changed| changed.to_string())
+            .unwrap_or_else(|| "x".to_string())
+    ))
+}
+
 /// 登记长度允许的误差：长度是别的设备报来的，下载本身宽出约一个分块（见
 /// `attach::download_max`）。超出这么多的文件不可能是这个对象，连读都不读。
 pub(crate) const SIZE_SLACK: u64 = 1024 * 1024;

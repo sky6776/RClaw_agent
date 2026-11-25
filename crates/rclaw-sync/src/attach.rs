@@ -1186,6 +1186,16 @@ fn settle(
 /// `blob.gone`。问的那台设备也许没看到上一次说的（它是后来加入的，那段日志已经回收），
 /// 不能让它干等。一条 `blob.want` 至多换来一条 `blob.gone`，`blob.want` 自己是限流的。
 pub fn on_blob_want(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
+    on_blob_want_at(conn, None, blob_id)
+}
+
+/// 同 [`on_blob_want`]，多一个工作区环境：能看本机文件时，「文件已经放回原处」的
+/// 附件即使还留着一条「等待取回」的登记（重试落空留下的），也恢复成可上传。
+pub fn on_blob_want_at(
+    conn: &rusqlite::Connection,
+    env: Option<&crate::wire::Env>,
+    blob_id: &str,
+) -> Result<()> {
     // 「重新下载」临时补的登记（带 `blob-probe` 标记）：刚点下去、下载可能还在跑，
     // 这时不能撤（`place` 落盘还要这条登记）；只有陈旧的（超过 10 分钟，不可能还有
     // 在途下载）才撤掉，让下面照常走 `BLOB_GONE` 的恢复路径。
@@ -1210,6 +1220,24 @@ pub fn on_blob_want(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
             // 在途：照常点名，但别动登记。
             mark_named(conn, blob_id)?;
             return Ok(());
+        }
+    }
+    // 本地文件已经放回原处：撤掉占着位置的「等待取回」登记，让下面照常按 `gone`
+    // 记录重新登记成待上传（重试落空留下的 REMOTE 行不再挡住恢复）。
+    if let Some(env) = env {
+        if let Some(note) = db::state_get(conn, scope::BLOB_GONE, blob_id)?
+            .and_then(|row| row.json::<GoneNote>())
+        {
+            let present = env
+                .resolve_exact(&note.path)
+                .is_some_and(|path| path.is_file());
+            if present {
+                if let Some(row) = db::blob_get(conn, blob_id)? {
+                    if row.state == BLOB_REMOTE {
+                        db::blob_delete(conn, blob_id)?;
+                    }
+                }
+            }
         }
     }
     let requeued = conn.execute(

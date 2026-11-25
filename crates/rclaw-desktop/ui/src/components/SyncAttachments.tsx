@@ -462,10 +462,12 @@ export function messageFileRefs(
  *  处理——读取前后端会再核一次；核对过且对不上的才出附件卡。 */
 export function readableAtPath(item: SyncAttachment): boolean {
   if (item.kind !== "file") return false;
-  // 核对过的看「消息路径上真有这份内容」（包括已存回原位置的快照：登记还指着
-  // 同步缓存，但原位置的内容核对得上）；没核对过的只有落点就在本机时才按能读处理
-  // （读取前后端还会再核一次）。
-  return item.checked ? item.path_present : item.state === "local";
+  // 核对过的看「消息路径上真有这份内容」（包括已存回原位置的快照）；没核对过的只在
+  // 落点就是消息路径时才按能读处理——`local` 只说明登记的落点存在，可能根本不是这条
+  // 消息写的那个路径。
+  return item.checked
+    ? item.path_present
+    : item.state === "local" && item.rel_path === item.path;
 }
 
 /** 一条消息登记的文件里，消息路径上并没有这份内容的（按路径索引）：界面出附件卡，

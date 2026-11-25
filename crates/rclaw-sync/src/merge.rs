@@ -1346,7 +1346,7 @@ impl Round<'_> {
             Op::BlobWant { blob } => {
                 db::write(self.ctx.db(), |tx| {
                     if ids::is_digest(&blob) {
-                        attach::on_blob_want(tx, &blob)?;
+                        attach::on_blob_want_at(tx, Some(&self.ctx.env), &blob)?;
                     }
                     settle(tx, row, None)
                 })?;

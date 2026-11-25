@@ -77,6 +77,11 @@ pub enum AttachmentStage {
     Unverifiable,
 }
 
+/// 文件版本针（长度-修改时间-变更时间）：流式入口钉「核对过的那一份」用。
+pub fn file_version_pin(path: &std::path::Path) -> Option<String> {
+    local::file_version_pin(path)
+}
+
 /// 一次「按对象核对要读/要导出的文件」的结果（§8.7）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachmentReadCheck {
@@ -1144,16 +1149,9 @@ impl SyncEngine {
         }) else {
             return AttachmentReadCheck::Unverifiable;
         };
-        let stamp = |path: &std::path::Path| -> Option<String> {
-            let meta = std::fs::metadata(path).ok()?;
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|since| since.as_nanos())
-                .unwrap_or(0);
-            Some(format!("{}-{}", meta.len(), mtime))
-        };
+        // 钉版本用与摘要缓存同一套元数据（长度 + mtime + 变更时间）：Windows 上同长度
+        // 覆盖常常不改 mtime，只有变更时间会变。
+        let stamp = |path: &std::path::Path| -> Option<String> { local::file_version_pin(path) };
         let before = stamp(&path);
         let matches = if fresh {
             local::same_blob_now(&keys, &path, blob, size)

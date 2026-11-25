@@ -99,16 +99,9 @@ pub fn stream_url(path: &str, pin: Option<&str>) -> Option<String> {
     ))
 }
 
-/// 文件版本针：长度 + 修改时间（纳秒）。取不到修改时间的只带长度。
+/// 文件版本针：与附件核对同一套（长度 + 修改时间 + 变更时间）。
 fn file_version(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|since| since.as_nanos())
-        .unwrap_or(0);
-    Some(format!("{}-{}", meta.len(), mtime))
+    rclaw_sync::file_version_pin(path)
 }
 
 /// 扩展名白名单（与 media_base64 的媒体扩展守卫同一防御纵深）：工作区里的
@@ -275,13 +268,7 @@ fn handle_conn(mut socket: std::net::TcpStream) {
     };
     // URL 上钉的版本和这个句柄不一致：这个流对应的内容已经不是当时核对过的那一个了。
     if let Some(expected) = &version {
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|since| since.as_nanos())
-            .unwrap_or(0);
-        if format!("{}-{}", meta.len(), mtime) != *expected {
+        if rclaw_sync::file_version_pin(&full).as_ref() != Some(expected) {
             let _ = write_all(
                 &mut socket,
                 b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n",

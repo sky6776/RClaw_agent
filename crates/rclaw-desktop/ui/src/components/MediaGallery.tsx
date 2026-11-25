@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useSwipeNav } from "../lib/swipeNav";
 import ImageViewer from "./ImageViewer";
@@ -68,6 +68,9 @@ export default function MediaGallery({
   const [index, setIndex] = useState(startIndex);
   const item = items[index];
   // 图片预览 data URL：null=取数中，""=失败。
+  // 本次画廊会话里已经看过的条目：种子里的流地址只在**第一次**进这条时用（点播刚
+  // 核对过）；划走再划回来时暂存副本可能已被回收，重新取一个核对过的新地址。
+  const visitedKeys = useRef<Set<string>>(new Set());
   const [imgSrc, setImgSrc] = useState<string | null>(null);
   // 视频本地流式 URL：null=取数中，""=失败。
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -78,8 +81,13 @@ export default function MediaGallery({
     if (!item) return;
     let alive = true;
     if (item.kind === "video") {
-      // 不复用种子里的流地址：暂存副本会被回收（8 份/1 小时），划回来时旧地址
-      // 可能已经 404。每次重新取一个核对过的新地址（后端按对象复制+核对）。
+      const first = !visitedKeys.current.has(item.key);
+      visitedKeys.current.add(item.key);
+      if (first && seed && seedMatches(seed, item) && seed.url) {
+        // 点播刚核对并复制过：首屏直接用这个地址，不再复制第二份。
+        setVideoUrl(seed.url);
+        return;
+      }
       api
         .mediaStreamUrl(item.path, chatId, item.blob, true)
         .then((u) => {

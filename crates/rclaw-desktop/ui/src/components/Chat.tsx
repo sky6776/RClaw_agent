@@ -1620,15 +1620,11 @@ export default function Chat({
       const refNames = new Set(
         refs.map((ref) => ref.path.split("/").pop() ?? ref.path),
       );
-      const isGuess = (path: string) => {
-        const rest = path.startsWith("media/") ? path.slice("media/".length) : null;
-        return rest !== null && !rest.includes("/");
-      };
       for (const it of parseMediaItems(e.content)) {
         const ref = byPath.get(it.path);
         if (
           !ref &&
-          isGuess(it.path) &&
+          it.inferred &&
           refNames.has(it.path.split("/").pop() ?? it.path)
         ) {
           continue;
