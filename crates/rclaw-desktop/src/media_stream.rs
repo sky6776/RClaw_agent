@@ -247,7 +247,18 @@ fn handle_conn(mut socket: std::net::TcpStream) {
     };
     // 先打开文件，长度与版本都取自「就要发送的这个句柄」：检查和发送不能是两个不同的
     // 文件（期间被原子替换的话，头发的是旧版本、身体是新的）。
-    let Ok(mut file) = std::fs::File::open(&full) else {
+    // 无版本针的流（点播用的暂存副本）带上写权限打开：下面要刷新 mtime，Windows 上
+    // SetFileTime 需要写属性权限（失败就退回只读打开，只是不能被回收保护）。
+    let opened = if version.is_none() {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&full)
+            .or_else(|_| std::fs::File::open(&full))
+    } else {
+        std::fs::File::open(&full)
+    };
+    let Ok(mut file) = opened else {
         let _ = write_all(
             &mut socket,
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
