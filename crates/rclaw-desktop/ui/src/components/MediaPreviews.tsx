@@ -70,9 +70,15 @@ export function mentionsPath(content: string, path: string): boolean {
  *  `output/media/x.png` 里的 `media/x.png` 是另一个路径的尾巴，不算——那会把它
  *  挂成一张不相干的卡。句读、空白、汉字都算边界。 */
 function boundaryBefore(content: string, at: number): boolean {
+  const startsToken = (index: number) =>
+    index === 0 || !/[A-Za-z0-9_.\-/\\]/.test(content[index - 1]);
   if (at === 0) return true;
   const before = content[at - 1];
   if (!/[A-Za-z0-9_.\-/\\]/.test(before)) return true;
+  // `./output/report.pdf`：点斜杠前缀也是 token 开头。
+  if ((before === "/" || before === "\\") && content[at - 2] === ".") {
+    return startsToken(at - 2);
+  }
   if (before !== "/" && before !== "\\") return false;
   // 紧跟在一个分隔符后面：前一段必须是工作区根 `agent`（媒体回执行里的绝对路径
   // 就是这种写法）。
@@ -382,6 +388,25 @@ export default function MediaPreviews({
     // max-w-full 约束（百分比相对本容器，会循环撑开），把消息列撑出屏幕。
     <div className="mt-1 flex max-w-full flex-col gap-2">
       {rendered.map(({ it, away: awayItem }) => {
+        if (!ready) {
+          // 清单还没核对好（刚合进新消息、正在重取）：这一步连已经加载过的图片/
+          // 视频也不再出可点的卡——这时按工作区路径看到、打开或存下的可能是同名的
+          // 另一个版本。清单到了再换回来。
+          return (
+            <div
+              key={it.key}
+              className="flex max-w-full items-center gap-2 self-start rounded-xl border border-[#2a2f3a] bg-[#0f131b] px-3 py-2 text-left opacity-60"
+            >
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#1a1f29] text-gray-400">
+                …
+              </span>
+              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-gray-400">
+                {it.display || it.path}
+              </span>
+              <span className="shrink-0 text-[10px] text-gray-500">核对附件…</span>
+            </div>
+          );
+        }
         if (awayItem && chatId) {
           return (
             // 多选模式下点卡片 = 选中这条消息（与图片/视频卡一致）：卡片上的按钮
@@ -474,25 +499,6 @@ export default function MediaPreviews({
               className="max-h-72 w-auto max-w-full cursor-pointer self-start rounded-xl border border-[#2a2f3a]"
               title={`${it.display || it.path}（点击播放；长按 / 右键更多操作）`}
             />
-          );
-        }
-        // 附件清单还没回来：这次要按工作区路径打开的可能正是别的设备上的文件（或者
-        // 同名、却不是这条消息引用的那一份）。先出不可点的占位，清单到了再换成正常
-        // 卡片——不把「核对中」当成「本机有」。
-        if (!ready && (it.kind === "open" || (urls[it.key] ?? "") === "")) {
-          return (
-            <div
-              key={it.key}
-              className="flex max-w-full items-center gap-2 self-start rounded-xl border border-[#2a2f3a] bg-[#0f131b] px-3 py-2 text-left opacity-60"
-            >
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#1a1f29] text-gray-400">
-                …
-              </span>
-              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-gray-400">
-                {it.display || it.path}
-              </span>
-              <span className="shrink-0 text-[10px] text-gray-500">核对附件…</span>
-            </div>
           );
         }
         return it.kind === "open" || (urls[it.key] ?? "") === "" ? (

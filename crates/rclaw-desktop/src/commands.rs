@@ -5769,13 +5769,19 @@ pub async fn browser_toggle_visible() -> Result<bool, String> {
 /// 桌面用系统默认程序打开（路径校验同 media_base64）。
 #[tauri::command]
 pub async fn open_media(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let full = resolve_media_file(&state.home, &path)?;
+    open_media_path(&state.home, &path)
+}
+
+/// `open_media` 的实现（路径校验 + 交系统 / 安卓打开）：同步附件卡点开前要先核对
+/// 内容，核对通过后走同一套打开逻辑。
+pub(crate) fn open_media_path(home: &std::path::Path, path: &str) -> Result<(), String> {
+    let full = resolve_media_file(home, path)?;
 
     #[cfg(target_os = "android")]
     {
         let _ = &full;
         // FileProvider 的 URI 需要调用方包名上下文，转交 Java 侧执行。
-        rclaw_android::open_media(&path).map_err(|e| format!("打开媒体失败: {e}"))
+        rclaw_android::open_media(path).map_err(|e| format!("打开媒体失败: {e}"))
     }
     #[cfg(not(target_os = "android"))]
     {

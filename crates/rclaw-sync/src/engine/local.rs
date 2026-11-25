@@ -684,6 +684,10 @@ pub struct AttachmentInfo {
     /// 多个落点里，本机可能只有其中一个：别名补到消息路径上之后这里就变成 true，
     /// 界面按工作区路径出卡（图片/视频照常内联），不必再让用户「存进工作区」。
     pub path_present: bool,
+    /// 这次清单里 `path_present` / `changed` 是不是核对出来的。false 表示这一条没轮到
+    /// 内容核对（大文件、老消息，见 [`VERIFY_BUDGET`]）：界面别把它当命中，点开之前
+    /// 另有一次按需核对（`sync_open_attachment`）。
+    pub checked: bool,
 }
 
 struct FoundRef {
@@ -801,12 +805,21 @@ pub(crate) fn attachments(
     const VERIFY_BUDGET: u64 = 128 * 1024 * 1024;
     let mut budget = VERIFY_BUDGET;
     let mut verify = vec![false; found.len()];
+    let mut verified_any = false;
     for (index, item) in found.iter().enumerate().rev() {
-        if item.kind != "file" || item.size > budget {
+        if item.kind != "file" {
             continue;
         }
-        budget -= item.size;
+        // 成本按「这一条要读多少」算：摘要缓存里已经有一份新鲜的就不要钱（同一次会话
+        // 里反复重取清单时，后面几轮会把预算让给还没核对过的文件）。
+        let cost = verification_cost(ctx, item);
+        // 最新的一条无论多大都要核对（单个大视频不能被预算永远挡在外面）。
+        if cost > budget && verified_any {
+            continue;
+        }
+        budget = budget.saturating_sub(cost);
         verify[index] = true;
+        verified_any = true;
     }
     // 文件在不在、还是不是登记的那份内容：库锁之外看。路径先过 `check_path`（工作区里
     // 的链接不能把读取带到别处），内容核对按（路径、长度、mtime）记忆摘要。
@@ -897,6 +910,7 @@ pub(crate) fn attachments(
                 rel_path,
                 origin: found.origin,
                 path_present,
+                checked: found.kind != "file" || deep,
             }
         })
         .collect();
@@ -1050,6 +1064,42 @@ fn read_digest(path: &Path, version: &FileVersion, limit: u64) -> Option<[u8; 32
     Some(digest)
 }
 
+/// 核对一条文件引用大概要读多少字节：落点和消息路径上存在的文件里，摘要缓存里没有
+/// 这一版的新鲜结论的，按长度累计。已经核对过（缓存新鲜）的成本是 0——同一次会话里
+/// 反复重取清单时，预算会一路让给还没核对过的文件。
+fn verification_cost(ctx: &Ctx, found: &FoundRef) -> u64 {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(row) = &found.row {
+        if let Ok(path) = ctx.env.checked_path(&row.rel_path) {
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    if let Some(path) = ctx.env.resolve_exact(&found.path) {
+        if path.is_file() && !paths.iter().any(|known| known == &path) {
+            paths.push(path);
+        }
+    }
+    let mut cost = 0u64;
+    for path in paths {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let Some(version) = version_of(&meta) else {
+            cost = cost.saturating_add(meta.len());
+            continue;
+        };
+        let key = path.to_string_lossy().into_owned();
+        let fresh = cached_digest(&key, &version)
+            .is_some_and(|(_, at)| at.elapsed() < DIGEST_TRUST);
+        if !fresh {
+            cost = cost.saturating_add(meta.len());
+        }
+    }
+    cost
+}
+
 /// `path` 上的文件是不是 `blob` 这个对象。
 ///
 /// 以内容摘要为准（长度是别的设备报来的，可能差一点；下载本身也只认摘要）。缓存里
@@ -1057,7 +1107,7 @@ fn read_digest(path: &Path, version: &FileVersion, limit: u64) -> Option<[u8; 32
 /// 同步动静之后会被反复查询，每次都整读一遍上百个文件不可接受；而时间戳被还原过的
 /// 替换只能靠过期后的重新整读发现，所以两个方向都设了期限——还原成正确内容之后，
 /// 卡上最多一分钟就会自己变回可用。
-fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
+pub(crate) fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };

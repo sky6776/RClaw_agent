@@ -899,6 +899,32 @@ pub async fn sync_attachment_preview(
     .await
 }
 
+/// 点开同步会话里的一份附件：先按对象核对工作区里这个文件的内容（只读这一个），
+/// 对不上（被就地改写过）就不打开——否则用户看到的是同名、内容不同的另一个版本。
+/// 没有登记、读不出密钥时核不了，按老行为打开。
+#[tauri::command]
+pub async fn sync_open_attachment(
+    state: State<'_, AppState>,
+    chat_id: String,
+    blob: String,
+    path: String,
+) -> Result<(), String> {
+    check_chat_id(&chat_id)?;
+    let engine = handle(&state)?;
+    let (check_blob, check_path) = (blob, path.clone());
+    let matches = run_blocking("核对附件", move || {
+        Ok(engine.attachment_file_matches(&check_blob, &check_path))
+    })
+    .await?;
+    if matches == Some(false) {
+        return Err(
+            "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）。             点「重新下载」取回原来的内容。"
+                .into(),
+        );
+    }
+    super::open_media_path(&state.home, &path)
+}
+
 /// 把一份文件快照存进工作区（§8.7）。返回它在工作区里的相对路径。
 #[tauri::command]
 pub async fn sync_attachment_save(

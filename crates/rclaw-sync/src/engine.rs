@@ -1018,6 +1018,18 @@ impl SyncEngine {
         )
     }
 
+    /// 工作区里 `rel_path` 上的文件是不是 `blob` 这个对象（点开前按需核对）。
+    /// 没有登记、读不出密钥、路径不安全时返回 `None`：核不了，按老行为打开。
+    pub fn attachment_file_matches(&self, blob: &str, rel_path: &str) -> Option<bool> {
+        let ctx = &self.inner.ctx;
+        let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob)).ok()??;
+        let keys = Secrets::load(&ctx.paths)
+            .ok()
+            .and_then(|secrets| secrets.keys().ok())?;
+        let path = ctx.env.checked_path(rel_path).ok()?;
+        Some(local::same_blob(&keys, &path, blob, row.size))
+    }
+
     /// 用户点了一个还没下载的附件：排到下载队列的最前面。结果经
     /// [`SyncEvent::Attachment`] 通知。
     pub fn fetch_attachment(&self, blob: &str) -> Result<()> {

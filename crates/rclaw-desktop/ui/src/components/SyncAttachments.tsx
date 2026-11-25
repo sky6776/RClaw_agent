@@ -293,6 +293,9 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     // 占着的，复制会一直不成功，看几次就停。
     let aliasTimer: number | undefined;
     const aliasTries = new Map<string, number>();
+    // 预算外的条目（`checked=false`）每轮会把上一轮核对过的让出来，几轮就能轮完；
+    // 一直核不完的（很大的老消息）看几次就停。
+    let uncheckedTries = 0;
     const load = async () => {
       const mine = ++seq;
       let list: SyncAttachment[];
@@ -319,6 +322,10 @@ export function useSyncAttachmentLoader(chatId: string | null) {
           aliasTries.set(item.blob, tries + 1);
           retry = true;
         }
+      }
+      if (list.some((item) => item.kind === "file" && !item.checked) && uncheckedTries < 6) {
+        uncheckedTries += 1;
+        retry = true;
       }
       if (retry) {
         window.clearTimeout(aliasTimer);
@@ -501,7 +508,15 @@ export function AttachmentCard({
   const isImage = IMAGE_RE.test(item.path);
   const error = state.errors[item.blob] ?? state.saveErrors[fileKey(item)];
   const open = (path: string) => {
-    api.openMedia(path).catch((e) => onError(`打开文件失败: ${String(e)}`));
+    // 点开前先让后端核对一下：工作区里这个路径上的文件可能已经被就地改写过，打开
+    // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
+    api
+      .syncOpenAttachment(chatId, item.blob, path)
+      .catch((e) => {
+        onError(`打开文件失败: ${String(e)}`);
+        // 对不上时清单里的状态会变成「重新下载」：重取一次，卡片跟着换。
+        reload?.();
+      });
   };
 
   if (item.state === "local") {

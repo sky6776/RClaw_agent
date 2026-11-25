@@ -894,6 +894,9 @@ export interface SyncAttachment {
   /** 消息里写的那个路径在本机工作区里是否真的原样存在（同一对象的别名补到原位置
    *  之后就是 true）。false 时界面按附件卡给取回入口。 */
   path_present: boolean;
+  /** path_present / changed 是不是内容核对出来的。false：这次清单没轮到它（大文件、
+   *  老消息），界面别当命中；点开前后端还有一次按需核对。 */
+  checked: boolean;
 }
 
 /** 回收站里的一个会话。 */
@@ -1618,6 +1621,11 @@ export const api = {
    *  不同名字时，按它的扩展名决定能不能预览。 */
   syncAttachmentPreview: (chatId: string, blob: string, path: string) =>
     invoke<MediaPayload>("sync_attachment_preview", { chatId, blob, path }),
+
+  /** 点开同步会话里的一份附件：后端先按对象核对工作区里这个文件的内容，对不上就不
+   *  打开（返回错误），由界面改出「重新下载」。 */
+  syncOpenAttachment: (chatId: string, blob: string, path: string) =>
+    invoke<void>("sync_open_attachment", { chatId, blob, path }),
 
   /** 把一份文件快照存进工作区，返回它在工作区里的相对路径（不覆盖已有的不同文件）。
    *  `path` 是消息里写的那个路径：同一份内容被几条消息引用时，存到点的那条的位置上。 */
