@@ -1359,9 +1359,14 @@ mod tests {
     fn status_counts_queues_and_lists_devices() {
         let device = Device::new();
         say(&device, "c1", "你好");
-        let mut config = SyncConfig::default();
-        config.enabled = true;
-        config.scopes.push("attachments".into());
+        // 默认范围之外再加附件（不是换掉默认范围）。
+        let mut scopes = SyncConfig::default().scopes;
+        scopes.push("attachments".into());
+        let config = SyncConfig {
+            enabled: true,
+            scopes,
+            ..Default::default()
+        };
         crate::publish::scan_sessions(&device.ctx, &device.settings, true).unwrap();
         db::write(device.ctx.db(), |tx| {
             db::blob_register(tx, "b1", "uploads/a.bin", 7, BLOB_HELD)?;

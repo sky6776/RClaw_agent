@@ -438,8 +438,10 @@ endpoint = \"https://s3.example.com\"
 
     #[test]
     fn oss_mode_cannot_be_combined_with_path_style() {
-        let mut config = SyncConfig::default();
-        config.transport = "s3".into();
+        let mut config = SyncConfig {
+            transport: "s3".into(),
+            ..Default::default()
+        };
         config.s3.endpoint = "https://s3.oss-cn-hangzhou.aliyuncs.com".into();
         config.s3.bucket = "rclaw-test".into();
         config.s3.oss_forbid_overwrite = true;
@@ -452,14 +454,20 @@ endpoint = \"https://s3.example.com\"
 
     #[test]
     fn validation_catches_typos() {
-        let mut config = SyncConfig::default();
-        config.transport = "ftp".into();
+        let config = SyncConfig {
+            transport: "ftp".into(),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
-        let mut config = SyncConfig::default();
-        config.scopes.push("everything".into());
+        let config = SyncConfig {
+            scopes: vec!["everything".into()],
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
-        let mut config = SyncConfig::default();
-        config.channels = vec!["Desktop".into()];
+        let config = SyncConfig {
+            channels: vec!["Desktop".into()],
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 

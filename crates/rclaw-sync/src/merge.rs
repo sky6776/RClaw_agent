@@ -248,8 +248,7 @@ pub(crate) fn thread_out_of_scope(conn: &Connection, s: &Settings, sid: &str) ->
     if !s.scopes.sessions {
         return Ok(true);
     }
-    Ok(map::open_info(conn, sid)?
-        .is_some_and(|open| !s.channels.iter().any(|channel| *channel == open.channel)))
+    Ok(map::open_info(conn, sid)?.is_some_and(|open| !s.channels.contains(&open.channel)))
 }
 
 /// 记下「这个线程因为通道不在名单里没有在本机落地」。有这种线程的设备手里的会话不全，
@@ -2663,7 +2662,7 @@ mod tests {
         b.merge();
         // 落到别的键上：不然它在 B 上成了「带着仅本机标记、却对应着 A 那个线程」的会话。
         let landed = format!("c1-{}", &a.settings.device[..4]);
-        assert_eq!(chats(&b), [landed.clone()]);
+        assert_eq!(chats(&b), std::slice::from_ref(&landed));
         assert_eq!(texts(&b, &landed), ["A 的会话"]);
         db::read(b.ctx.db(), |conn| {
             assert!(publish::eligible(conn, &b.settings, "desktop", &landed)?);

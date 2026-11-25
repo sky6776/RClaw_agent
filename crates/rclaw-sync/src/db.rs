@@ -886,16 +886,20 @@ mod tests {
         write(&db, |tx| {
             ensure_device(tx)?;
             assert_eq!(peer_state(tx, "0123456789abcdef")?, PeerState::default());
-            let mut peer = PeerState::default();
-            peer.fetched = 7;
-            peer.processed = 5;
+            let peer = PeerState {
+                fetched: 7,
+                processed: 5,
+                ..Default::default()
+            };
             put_peer_state(tx, "0123456789abcdef", &peer)?;
             assert_eq!(peer_state(tx, "0123456789abcdef")?, peer);
             assert_eq!(peers(tx)?.len(), 1);
 
             assert_eq!(log_state(tx)?, LogState::default());
-            let mut log = LogState::default();
-            log.seq = 3;
+            let log = LogState {
+                seq: 3,
+                ..Default::default()
+            };
             put_log_state(tx, &log)?;
             assert_eq!(log_state(tx)?.seq, 3);
             Ok(())

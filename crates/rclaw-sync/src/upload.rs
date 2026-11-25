@@ -114,7 +114,7 @@ pub fn self_check(
             SelfCheck::Regressed("存储上找不到本机写过的 head".into())
         };
     };
-    let known = instances.iter().any(|instance| *instance == head.instance)
+    let known = instances.contains(&head.instance)
         || (!log.head_instance.is_empty() && log.head_instance == head.instance);
     // 实例号不认识有两种来历：另有一份数据在写（要换身份），或者存储被回退到了本机很久以前
     // 写的 head——本机只记着最近的一批实例号，那时的已经不在了。后一种的 head 一定比本机

@@ -1048,7 +1048,7 @@ data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}
         );
         let names: Vec<String> = registry
             .schemas()
-            .into_iter()
+            .iter()
             .map(|schema| schema.name.clone())
             .collect();
         for i in 0..COUNT {

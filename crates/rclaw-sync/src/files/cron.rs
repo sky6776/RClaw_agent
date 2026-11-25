@@ -1588,11 +1588,10 @@ fn settle_claims(
             }
             Step::GiveUp(cause) => {
                 match &local {
-                    Some(local) => {
-                        if !withdraw(ctx, host, &key, &claim, local, cause, report) {
-                            continue;
-                        }
+                    Some(local) if !withdraw(ctx, host, &key, &claim, local, cause, report) => {
+                        continue;
                     }
+                    Some(_) => {}
                     // 从没加进过任务表：用户还在等，告诉他接不成了。
                     None if claim.local.is_none() && !claim.withdrawn => {
                         status::notice(

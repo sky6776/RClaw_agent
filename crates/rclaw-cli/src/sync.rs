@@ -85,6 +85,8 @@ impl SyncProfile {
 }
 
 impl SyncSeed {
+    // 宿主装配点的构造参数就是这么多（少一个都得拆成 builder），不拆。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: SyncConfig,
         data_root: PathBuf,

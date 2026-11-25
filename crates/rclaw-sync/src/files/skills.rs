@@ -1689,7 +1689,7 @@ pub(crate) fn detail(ctx: &Ctx, item: &PendingItem) -> Result<serde_json::Value>
         } else {
             "added"
         };
-        let local_text = before.and_then(|before| text_of(before));
+        let local_text = before.and_then(&text_of);
         files.push(serde_json::json!({
             "path": file.path,
             "status": status,
@@ -2183,7 +2183,7 @@ mod tests {
     #[test]
     fn a_synced_skill_is_marked_with_its_source_until_it_is_changed_here() {
         fn sources(device: &Device) -> Vec<(String, String)> {
-            db::read(device.ctx.db(), |conn| origins(conn)).unwrap()
+            db::read(device.ctx.db(), origins).unwrap()
         }
         fn label(on: &Device, of: &Device) -> String {
             db::read(on.ctx.db(), |conn| {
@@ -2631,7 +2631,7 @@ mod tests {
         b.merge();
         // 大文件还没取回：先不装，报出要取的对象。
         let report = sync_files(&b);
-        assert_eq!(report.want_blobs, [blob.clone()]);
+        assert_eq!(report.want_blobs, std::slice::from_ref(&blob));
         assert!(!at(&b, "notes").exists());
         crate::attach::download(&b.ctx, &transport, &keys, &blob, 1 << 20)
             .await

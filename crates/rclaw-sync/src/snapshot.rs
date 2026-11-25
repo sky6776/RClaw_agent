@@ -2041,7 +2041,7 @@ pub async fn bootstrap(
             .filter_map(|(device, peer)| peer.snap.clone().map(|snap| (device.clone(), snap)))
             .collect();
         candidates.extend(own.map(|snap| (s.device.clone(), snap)));
-        candidates.sort_by(|a, b| (b.1.ops, b.1.ts).cmp(&(a.1.ops, a.1.ts)));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse((candidate.1.ops, candidate.1.ts)));
         let mut applied = false;
         for (dev, snap) in candidates {
             let key = snap_key(&dev, &snap.name);
@@ -2259,13 +2259,15 @@ async fn sweep_due(
         bool,
         bool,
     );
-    // 退避表是进程内记忆（规模有限，重启后清零只会多核一次）。
-    let retry_until = memo.gc_retry.clone();
-    let (due, seeds, mut snap_rows): (
+    type Batch = (
         Vec<Due>,
         HashMap<String, Vec<String>>,
         HashMap<String, usize>,
-    ) = offload(ctx, move |ctx| {
+    );
+    type Evidence = (String, Option<(String, String)>, Option<PackGuard>);
+    // 退避表是进程内记忆（规模有限，重启后清零只会多核一次）。
+    let retry_until = memo.gc_retry.clone();
+    let (due, seeds, mut snap_rows): Batch = offload(ctx, move |ctx| {
         db::read(ctx.db(), |conn| {
             let rows = db::state_scan(conn, scope::GC, "")?;
             if rows.is_empty() {
@@ -2323,7 +2325,7 @@ async fn sweep_due(
                         && when
                             .snap
                             .is_none_or(|snap| log.head_snap.as_ref() == Some(&snap)))
-                    .then(|| (path, when.basis, when.pack, when.orphan, candidate))
+                    .then_some((path, when.basis, when.pack, when.orphan, candidate))
                 })
                 .collect();
             Ok((due, seeds, snap_rows))
@@ -2343,7 +2345,7 @@ async fn sweep_due(
     };
     // 这一轮核验哪一份依据/包：把到期行里的证据去重、按证据键排序，从游标之后的第一份
     // 接着选（没有游标或已经到末尾就回绕到第一份）。
-    let mut evidences: Vec<(String, Option<(String, String)>, Option<PackGuard>)> = Vec::new();
+    let mut evidences: Vec<Evidence> = Vec::new();
     {
         let mut seen: HashSet<String> = HashSet::new();
         for (path, basis, pack, _, _) in &due {
@@ -2459,11 +2461,10 @@ async fn sweep_due(
             target_had_rows = true;
         }
         match checked_basis {
-            Some(BasisCheck::Intact) => {
-                if deletable.len() < SWEEP_BATCH / 2 {
-                    deletable.push((path, Some(key), None));
-                }
+            Some(BasisCheck::Intact) if deletable.len() < SWEEP_BATCH / 2 => {
+                deletable.push((path, Some(key), None));
             }
+            Some(BasisCheck::Intact) => {}
             Some(check) => {
                 tracing::debug!(
                     "回收依据 {} 这轮核验不过（{check:?}），押着它的对象先不删",
@@ -2788,7 +2789,7 @@ async fn refresh_covers(
     for (dev, snap) in &refs {
         let key = snap_key(dev, &snap.name);
         // 覆盖算过没有：算过就用记下的；没算过要读清单。
-        let need_cover = known.get(&key).is_none();
+        let need_cover = !known.contains_key(&key);
         // 核验还没做完的也要清单（分片名单在清单里）：只读内存里有的，不额外占预算。
         let label = checked.get(&key);
         let need_verify =

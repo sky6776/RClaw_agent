@@ -361,7 +361,7 @@ fn prune_share_cache(dir: &std::path::Path, keep: usize) {
             Some((meta.modified().ok()?, entry.path(), meta.is_file()))
         })
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
     let now = std::time::SystemTime::now();
     for (index, (mtime, path, is_file)) in files.into_iter().enumerate() {
         let age = now

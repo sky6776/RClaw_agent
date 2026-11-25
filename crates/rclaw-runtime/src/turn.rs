@@ -1600,7 +1600,7 @@ impl TurnManager {
         let msg = match commands::dispatch(self, &msg).await {
             commands::DispatchOutcome::NotHandled => msg,
             commands::DispatchOutcome::Handled => return,
-            commands::DispatchOutcome::StartTurn(msg) => msg,
+            commands::DispatchOutcome::StartTurn(msg) => *msg,
         };
 
         let key = TurnKey::from_msg(&msg);
@@ -2856,9 +2856,9 @@ impl TurnManager {
         }
         // 本地清空成功之后才把记忆的删除登记为可发送；失败时不登记（重试时再走一遍）。
         // 登记时带上这次清理的操作标识：对不上（期间重新登记或撤销过）就不发布。
-        if all_scope && control.is_some() && matches!(&cleared, Ok(Ok(_))) {
-            if let Some((ids, op)) = memory_clear {
-                let sync = control.as_ref().unwrap().clone();
+        if all_scope && matches!(&cleared, Ok(Ok(_))) {
+            if let (Some(sync), Some((ids, op))) = (control.as_ref(), memory_clear) {
+                let sync = sync.clone();
                 let committed =
                     tokio::task::spawn_blocking(move || sync.commit_memory_clear(&ids, &op)).await;
                 match committed {

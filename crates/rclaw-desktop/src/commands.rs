@@ -4065,7 +4065,7 @@ mod tests {
         assert!(!dir.path().join("sync").exists());
         assert!(!session
             .db()
-            .with(|conn| rclaw_store::sync_db::sync_tables_exist(conn))
+            .with(rclaw_store::sync_db::sync_tables_exist)
             .unwrap());
     }
 
@@ -6245,7 +6245,7 @@ fn prune_cache_dir(dir: &std::path::Path, keep: usize) {
             Some((meta.modified().ok()?, entry.path()))
         })
         .collect();
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let now = std::time::SystemTime::now();
     for (index, (mtime, path)) in entries.into_iter().enumerate() {
         let age = now

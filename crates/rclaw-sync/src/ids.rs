@@ -17,7 +17,7 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn unhex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let digit = |b: u8| match b {
@@ -109,7 +109,7 @@ pub const CHAIN_ACCEPT_MAX: usize = 16384;
 
 /// 墓碑所带的链形状对不对：若干个 16 位小写十六进制连成一个串（空串也算，= 没带链）。
 pub fn is_chain(text: &str) -> bool {
-    text.len() % CHAIN_ITEM == 0
+    text.len().is_multiple_of(CHAIN_ITEM)
         && text.len() <= CHAIN_ACCEPT_MAX * CHAIN_ITEM
         && text
             .bytes()

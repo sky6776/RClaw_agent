@@ -162,6 +162,8 @@ impl ClearLock {
             .create(true)
             .read(true)
             .write(true)
+            // 锁文件不清空：截断会把别的进程刚写进去的内容抹掉。
+            .truncate(false)
             .open(path)?;
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(ClearLock { file })),
@@ -1592,9 +1594,11 @@ mod tests {
         .unwrap();
         assert!(!db::write(a.ctx.db(), |tx| settle_clearing(tx, "memory", &first)).unwrap());
         assert!(db::write(a.ctx.db(), |tx| settle_clearing(tx, "memory", &second)).unwrap());
-        assert!(db::read(a.ctx.db(), |conn| {
-            Ok(db::state_get(conn, SCOPE_CLEARING, "memory")?)
-        })
+        assert!(db::read(a.ctx.db(), |conn| db::state_get(
+            conn,
+            SCOPE_CLEARING,
+            "memory"
+        ))
         .unwrap()
         .is_none());
     }

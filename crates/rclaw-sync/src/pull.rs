@@ -342,7 +342,7 @@ async fn load_pack(
             (bytes, true)
         }
     };
-    let network = downloaded.then(|| object.len()).unwrap_or(0);
+    let network = if downloaded { object.len() } else { 0 };
     let (keys, device, digest) = (keys.clone(), device.to_string(), digest.to_string());
     let parsed = tokio::task::spawn_blocking(move || -> Result<Rollup> {
         let plain = codec::open_log_object(&keys, &path, &object, codec::ROLLUP_PLAIN_MAX)?;

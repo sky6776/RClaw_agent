@@ -162,7 +162,7 @@ fn storage_commit_read(paths: &SyncPaths) -> Result<StorageCommitFile> {
 fn storage_commit_write(paths: &SyncPaths, file: &StorageCommitFile) -> Result<()> {
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
-        &storage_commit_path(paths),
+        storage_commit_path(paths),
         &serde_json::to_vec_pretty(file)?,
     )?;
     Ok(())
@@ -216,7 +216,7 @@ pub(crate) fn storage_commit_advance_if_changed(
 fn storage_intent_store(paths: &SyncPaths, intent: &StorageIntent) -> Result<()> {
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
-        &storage_intent_path(paths),
+        storage_intent_path(paths),
         &serde_json::to_vec_pretty(intent)?,
     )?;
     Ok(())
@@ -225,7 +225,7 @@ fn storage_intent_store(paths: &SyncPaths, intent: &StorageIntent) -> Result<()>
 pub(crate) fn storage_intent_backup_save(paths: &SyncPaths, intent: &StorageIntent) -> Result<()> {
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
-        &storage_intent_backup_path(paths),
+        storage_intent_backup_path(paths),
         &serde_json::to_vec_pretty(intent)?,
     )?;
     Ok(())
@@ -469,6 +469,8 @@ impl StorageLock {
             .create(true)
             .read(true)
             .write(true)
+            // 锁文件不清空：截断会把别的进程刚写进去的内容抹掉。
+            .truncate(false)
             .open(Self::lock_path(paths))?;
         fs2::FileExt::lock_exclusive(&file)?;
         Ok(StorageLock { file })
@@ -481,6 +483,7 @@ impl StorageLock {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(Self::lock_path(paths))?;
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(StorageLock { file })),

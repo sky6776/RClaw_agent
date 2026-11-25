@@ -145,11 +145,12 @@ fn content_type(path: &Path) -> &'static str {
         .unwrap_or("application/octet-stream")
 }
 
+/// 解析出来的请求：(路径, Range, URL 上钉的版本针)。
+type ParsedRequest = (String, Option<(u64, u64)>, Option<String>);
+
 /// 解析请求首行与头（只需 Range 与路径 query），返回 (path, range)。
 /// token 不符 / 畸形请求返回 None（调用方回 403）。
-fn parse_request(
-    socket: &mut std::net::TcpStream,
-) -> Option<(String, Option<(u64, u64)>, Option<String>)> {
+fn parse_request(socket: &mut std::net::TcpStream) -> Option<ParsedRequest> {
     let mut buf = [0u8; 4096];
     let n = std::io::Read::read(socket, &mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf[..n]).to_string();

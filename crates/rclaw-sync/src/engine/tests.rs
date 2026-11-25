@@ -39,10 +39,12 @@ impl Rig {
 }
 
 fn config_for(storage: &Path, name: &str, enabled: bool) -> SyncConfig {
-    let mut config = SyncConfig::default();
-    config.enabled = enabled;
-    config.device_name = name.into();
-    config.transport = "file".into();
+    let mut config = SyncConfig {
+        enabled,
+        device_name: name.into(),
+        transport: "file".into(),
+        ..Default::default()
+    };
     config.file.dir = storage.to_string_lossy().into_owned();
     config
 }

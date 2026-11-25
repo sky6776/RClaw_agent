@@ -1340,11 +1340,13 @@ fn estimate_html_capacity(
             // 阻塞等待 writer，绝不能对它们执行。
             if let Ok(canonical) = resolve_export_image(&root_canon, &rel) {
                 if let Ok(meta) = std::fs::metadata(&canonical) {
-                    if meta.is_file() && meta.len() > 0 && meta.len() <= max_image_bytes {
-                        if file_magic_ok(&canonical) {
-                            counted += 1;
-                            image_bytes += meta.len();
-                        }
+                    if meta.is_file()
+                        && meta.len() > 0
+                        && meta.len() <= max_image_bytes
+                        && file_magic_ok(&canonical)
+                    {
+                        counted += 1;
+                        image_bytes += meta.len();
                     }
                 }
             }
@@ -1417,7 +1419,7 @@ fn render_html_with_budget(
     out.push_str("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">\n");
     out.push_str("<meta name=\"color-scheme\" content=\"light dark\">\n");
     out.push_str("<link rel=\"icon\" href=\"data:,\">\n");
-    let _ = write!(out, "<title>{}</title>\n", html_escape(title));
+    let _ = writeln!(out, "<title>{}</title>", html_escape(title));
     let _ = write!(out, "<style>{}</style>\n</head>\n<body>\n", HTML_CSS);
     let _ = write!(
         out,
@@ -1431,9 +1433,9 @@ fn render_html_with_budget(
     } else {
         format!(" · {} 轮", rounds.len())
     };
-    let _ = write!(
+    let _ = writeln!(
         out,
-        "<p class=\"doc-meta\">RClaw 会话导出 · {}{} · {} 条 · {HTML_STATS_TOKEN}</p></header>\n",
+        "<p class=\"doc-meta\">RClaw 会话导出 · {}{} · {} 条 · {HTML_STATS_TOKEN}</p></header>",
         html_escape(stamp),
         rounds_label,
         messages.len()

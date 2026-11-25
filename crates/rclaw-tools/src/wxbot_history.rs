@@ -1195,8 +1195,10 @@ fn find_case_insensitive_offset(text: &str, term_lower: &str) -> Option<usize> {
 /// 点——writer 在只读事务快照固定后提交，验证 total 与 returned 同快照一致）。
 /// 生产构建不编译，零开销。
 #[cfg(test)]
-static BETWEEN_QUERIES_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str) + Send>>> =
-    std::sync::Mutex::new(None);
+type QueryHook = Box<dyn Fn(&str) + Send>;
+
+#[cfg(test)]
+static BETWEEN_QUERIES_HOOK: std::sync::Mutex<Option<QueryHook>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 mod tests {

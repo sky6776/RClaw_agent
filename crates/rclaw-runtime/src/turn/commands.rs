@@ -86,7 +86,7 @@ pub(super) enum DispatchOutcome {
     Handled,
     /// 命令已产生状态副作用，但这条消息还要作为 turn 输入继续路由（`/goal <文本>`：
     /// 目标已落库，消息已展开为「立即开工」的模型输入）。
-    StartTurn(BusMessage),
+    StartTurn(Box<BusMessage>),
 }
 
 /// 在进入活动 turn 路由前处理所有即时命令。
@@ -190,8 +190,11 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> Di
                             objective_chars = objective.chars().count(),
                             "/goal 已写入，作为 turn 输入继续路由"
                         );
-                        return DispatchOutcome::StartTurn(msg.clone().expand_model_content(
-                            TurnManager::goal_command_expansion(&objective),
+                        return DispatchOutcome::StartTurn(Box::new(
+                            msg.clone()
+                                .expand_model_content(TurnManager::goal_command_expansion(
+                                    &objective,
+                                )),
                         ));
                     }
                 }

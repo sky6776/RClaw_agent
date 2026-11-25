@@ -367,7 +367,7 @@ fn pending_load(paths: &SyncPaths) -> Result<Option<PendingSpace>> {
 
 fn pending_save(paths: &SyncPaths, pending: &PendingSpace) -> Result<()> {
     paths.ensure_root()?;
-    rclaw_store::atomic_write_private(&pending_path(paths), &serde_json::to_vec_pretty(pending)?)?;
+    rclaw_store::atomic_write_private(pending_path(paths), &serde_json::to_vec_pretty(pending)?)?;
     Ok(())
 }
 
@@ -475,7 +475,7 @@ fn pending_close_save(paths: &SyncPaths, closes: &[PendingClose]) -> Result<()> 
     }
     paths.ensure_root()?;
     rclaw_store::atomic_write_private(
-        &pending_close_path(paths),
+        pending_close_path(paths),
         &serde_json::to_vec_pretty(closes)?,
     )?;
     // 旧文件从此不参与加载：尽力让它退场（新文件已写成功，这里失败不把整次保存算失败；
@@ -689,7 +689,6 @@ async fn pending_close_ensure_ids(paths: &SyncPaths) -> Result<Vec<PendingClose>
         }
         // 先按读入时的确认状态封顶，再把确认事实传播：传播会把同组全标成「已确认」，
         // 提前传播会让封顶的回退规则淘汰错人（可能丢掉唯一带有效凭据的快照）。
-        let mut closes = closes;
         changed |= cap_close_history(&mut closes);
         // 「已确认关闭」是**目标**的事实，不是某条记录私有的：同目标（同空间 + 同位置）
         // 里只要有一条确认过，保留下来的其余条目也带着这个事实去补写——否则有效密码
@@ -1036,11 +1035,11 @@ async fn finish_one_close(
     };
     let transport = Scoped::new(root, &space_id);
     // 先看一眼标记：验证过是关闭版就立刻记进记录（这一批后面超时/取消也不丢）。
-    if !close.closed_seen {
-        if remote::marker_closed_state(&transport, &keys, &space_id).await? == Some(true) {
-            pending_close_mark_seen(paths, &close.id, &close.storage, &space_id).await?;
-            close.closed_seen = true;
-        }
+    if !close.closed_seen
+        && remote::marker_closed_state(&transport, &keys, &space_id).await? == Some(true)
+    {
+        pending_close_mark_seen(paths, &close.id, &close.storage, &space_id).await?;
+        close.closed_seen = true;
     }
     // 补写过程中再读到「已验证关闭」时，先落盘（按 id，缺 id 按同目标）再动远端。
     let confirm =
@@ -1761,6 +1760,16 @@ mod tests {
     use crate::op::FileRef;
     use crate::wire::ArtifactRef;
 
+    /// 测试用的「本机文件后端」配置：只说落点目录，其余默认。
+    fn file_config(dir: impl Into<String>) -> SyncConfig {
+        let mut config = SyncConfig {
+            transport: "file".into(),
+            ..Default::default()
+        };
+        config.file.dir = dir.into();
+        config
+    }
+
     fn paired() -> Secrets {
         Secrets {
             space_id: new_space_id(),
@@ -1782,8 +1791,10 @@ mod tests {
         let full = PairingCode::parse(&pairing_code(&config, &secrets, true).unwrap()).unwrap();
 
         // 另一台设备：自己原来填的是别的后端，配对码里的存储设置覆盖它。
-        let mut theirs = SyncConfig::default();
-        theirs.transport = "file".into();
+        let theirs = SyncConfig {
+            transport: "file".into(),
+            ..Default::default()
+        };
         let mut their_secrets = Secrets::default();
         let joined = apply_pairing(&theirs, &mut their_secrets, &full);
         assert!(joined.enabled);
@@ -1804,9 +1815,7 @@ mod tests {
         assert!(their_secrets.webdav_password.is_empty());
 
         // `file` 后端的目录是本机路径，不进配对码。
-        let mut local = SyncConfig::default();
-        local.transport = "file".into();
-        local.file.dir = "/tmp/sync".into();
+        let local = file_config("/tmp/sync");
         let code = PairingCode::parse(&pairing_code(&local, &secrets, true).unwrap()).unwrap();
         assert!(code.storage.is_none());
         assert!(pairing_code(&config, &Secrets::default(), false).is_err());
@@ -1840,9 +1849,7 @@ mod tests {
     async fn a_close_left_over_by_a_failed_exit_is_completed_later() {
         let (_tmp, ctx) = crate::testing::ctx();
         let storage = tempfile::tempdir().unwrap();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = storage.path().to_string_lossy().into_owned();
+        let config = file_config(storage.path().to_string_lossy().into_owned());
         let secrets = paired();
         let keys = secrets.keys().unwrap();
         let root = root_transport(&config, &secrets).unwrap();
@@ -1909,7 +1916,7 @@ mod tests {
             previous: paired(),
             closed_seen: false,
         };
-        pending_close_save(&ctx.paths, &[other.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&other)).unwrap();
         let closes = pending_close_ensure_ids(&ctx.paths).await.unwrap();
         assert_eq!(closes.len(), 1);
         assert!(!closes[0].closed_seen);
@@ -1965,9 +1972,7 @@ mod tests {
     async fn a_target_cleanup_keeps_new_work_made_after_it_started() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let entry = || PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: crate::ids::random_hex::<8>(),
@@ -1976,7 +1981,7 @@ mod tests {
             closed_seen: true,
         };
         let older = entry();
-        pending_close_save(&ctx.paths, &[older.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&older)).unwrap();
         let in_flight_marks = pending_close_marks(&ctx.paths).await.unwrap();
         assert!(in_flight_marks.contains(close_mark(&older)));
         // 队列被并发成功清理清空，随后一次失败把同一身份的记录恢复回来（换了标记）。
@@ -2016,9 +2021,7 @@ mod tests {
     async fn a_legacy_record_without_a_mark_is_covered_by_the_marks() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let legacy = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: String::new(),
@@ -2026,7 +2029,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: true,
         };
-        pending_close_save(&ctx.paths, &[legacy.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&legacy)).unwrap();
         let marks = pending_close_marks(&ctx.paths).await.unwrap();
         assert!(marks.contains(&legacy.id));
         pending_close_finish_target(
@@ -2048,9 +2051,7 @@ mod tests {
     async fn a_legacy_queue_file_is_migrated_into_the_new_file() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let legacy = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: String::new(),
@@ -2102,9 +2103,7 @@ mod tests {
     async fn a_new_queue_record_is_invisible_to_old_engine_closures() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let close = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: String::new(),
@@ -2128,9 +2127,7 @@ mod tests {
     async fn a_late_legacy_write_is_ignored_after_the_first_migration() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let close = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: crate::ids::random_hex::<8>(),
@@ -2138,7 +2135,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: false,
         };
-        pending_close_save(&ctx.paths, &[close.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&close)).unwrap();
         // 迁移之后旧版闭包又把同一条（带它验证到的确认事实、换了标记）和一条独有
         // 记录写回旧文件。
         let mut late = close.clone();
@@ -2164,9 +2161,7 @@ mod tests {
     async fn a_new_restore_is_not_masked_by_a_stale_legacy_copy() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let close = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: crate::ids::random_hex::<8>(),
@@ -2174,7 +2169,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: true,
         };
-        pending_close_save(&ctx.paths, &[close.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&close)).unwrap();
         let marks = pending_close_marks(&ctx.paths).await.unwrap();
         // 旧文件里先有一份旧标记的副本，随后新版失败恢复把标记换掉（写进新文件）。
         let mut stale = close.clone();
@@ -2207,9 +2202,7 @@ mod tests {
     async fn a_legacy_file_left_after_the_migration_is_retired_without_changes() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let close = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: crate::ids::random_hex::<8>(),
@@ -2217,7 +2210,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: true,
         };
-        pending_close_save(&ctx.paths, &[close.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&close)).unwrap();
         // 旧版闭包在迁移之后又把旧凭据写回旧文件。
         std::fs::write(
             pending_close_legacy_path(&ctx.paths),
@@ -2239,9 +2232,7 @@ mod tests {
     async fn the_legacy_backup_is_retired_before_the_first_migration() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let close = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: crate::ids::random_hex::<8>(),
@@ -2252,7 +2243,7 @@ mod tests {
         // 只有旧文件（还没迁移），外加一份带旧凭据的备份。
         std::fs::write(
             pending_close_legacy_path(&ctx.paths),
-            serde_json::to_vec(&[close.clone()]).unwrap(),
+            serde_json::to_vec(std::slice::from_ref(&close)).unwrap(),
         )
         .unwrap();
         std::fs::write(
@@ -2289,9 +2280,7 @@ mod tests {
     async fn the_legacy_backup_file_is_retired_with_the_legacy_queue() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let close = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: crate::ids::random_hex::<8>(),
@@ -2299,7 +2288,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: true,
         };
-        pending_close_save(&ctx.paths, &[close.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&close)).unwrap();
         // 清空旧文件走备用替换时留下的备份（含旧凭据）。
         std::fs::write(
             legacy_close_backup_path(&ctx.paths),
@@ -2319,9 +2308,7 @@ mod tests {
     async fn a_legacy_path_that_cannot_be_retired_does_not_block_the_batch() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let close = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: crate::ids::random_hex::<8>(),
@@ -2340,9 +2327,7 @@ mod tests {
     async fn a_target_cleanup_keeps_records_restored_after_its_done() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let entry = || PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: crate::ids::random_hex::<8>(),
@@ -2376,9 +2361,7 @@ mod tests {
     async fn not_started_keeps_the_target_when_a_confirmed_record_exists() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let confirmed = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: String::new(),
@@ -2416,9 +2399,7 @@ mod tests {
     async fn a_failed_close_restores_its_record_after_a_concurrent_cleanup() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let entry = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: String::new(),
@@ -2426,7 +2407,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: true,
         };
-        pending_close_save(&ctx.paths, &[entry.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&entry)).unwrap();
         // 并发的成功清理把同目标全删了。
         pending_close_finish_target(&ctx.paths, &config, &secrets.space_id, false, None, None)
             .await
@@ -2611,9 +2592,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_entries_without_identity_get_distinct_ones() {
         let (_tmp, ctx) = crate::testing::ctx();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = "C:/sync-a".into();
+        let config = file_config("C:/sync-a");
         let first = paired();
         let second = paired();
         let entry = |space: &Secrets| PendingClose {
@@ -2657,12 +2636,7 @@ mod tests {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
         let other_space = paired();
-        let config_at = |dir: &str| {
-            let mut config = SyncConfig::default();
-            config.transport = "file".into();
-            config.file.dir = dir.into();
-            config
-        };
+        let config_at = |dir: &str| file_config(dir);
         let config = config_at("C:/sync-a");
         let old = PendingClose {
             id: crate::ids::random_hex::<8>(),
@@ -2671,7 +2645,7 @@ mod tests {
             previous: secrets.clone(),
             closed_seen: false,
         };
-        pending_close_save(&ctx.paths, &[old.clone()]).unwrap();
+        pending_close_save(&ctx.paths, std::slice::from_ref(&old)).unwrap();
         let fresh = PendingClose {
             id: crate::ids::random_hex::<8>(),
             mark: String::new(),
@@ -2751,12 +2725,7 @@ mod tests {
     async fn close_records_keep_each_storage_and_remember_a_confirmed_close() {
         let (_tmp, ctx) = crate::testing::ctx();
         let secrets = paired();
-        let config_at = |dir: &str| {
-            let mut config = SyncConfig::default();
-            config.transport = "file".into();
-            config.file.dir = dir.into();
-            config
-        };
+        let config_at = |dir: &str| file_config(dir);
         let first = config_at("C:/sync-a");
         let second = config_at("C:/sync-b");
         pending_close_add(
@@ -2811,9 +2780,7 @@ mod tests {
     async fn a_close_that_never_started_is_not_invented_by_the_leftover_record() {
         let (_tmp, ctx) = crate::testing::ctx();
         let storage = tempfile::tempdir().unwrap();
-        let mut config = SyncConfig::default();
-        config.transport = "file".into();
-        config.file.dir = storage.path().to_string_lossy().into_owned();
+        let config = file_config(storage.path().to_string_lossy().into_owned());
         let secrets = paired();
         let keys = secrets.keys().unwrap();
         let root = root_transport(&config, &secrets).unwrap();

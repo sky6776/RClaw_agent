@@ -8,8 +8,8 @@
 //!     secret 校验，入队即回 200——处理慢不算失败，wcx 的 10s 超时不会误重试）；
 //!   - 兜底（fallback）：常驻长轮询 `GET /api/messages/wait?cursor=<seq>`（cursor 式
 //!     读同一个收集器缓冲，没有逐条挂 listener 的间隙丢失）。
-//!   两路汇入同一条 ingest 队列，**单一任务顺序处理**：去重 → 账号核对 → 白名单 →
-//!   媒体落盘 → `inbound.send().await` → 提交账本（投递成功才提交，失败可重投）。
+//!     两路汇入同一条 ingest 队列，**单一任务顺序处理**：去重 → 账号核对 → 白名单 →
+//!     媒体落盘 → `inbound.send().await` → 提交账本（投递成功才提交，失败可重投）。
 //! - **发送**：REST `/api/messages/*`。文本按 UTF-8 安全分段；媒体先
 //!   `/api/media/upload` 到 WCX 侧拿到手机路径再发；语音链路为
 //!   mp3 → `utils/audio/mp3-to-silk`（WCX 本地路径）→ `utils/audio/duration` → 发送。
@@ -529,8 +529,7 @@ impl Wxbot {
                             || matches!(c, '"' | '\'' | '<' | '>' | '）' | '，' | '。' | '、')
                     })
                     .unwrap_or(tail.len());
-                let candidate = tail[..end]
-                    .trim_end_matches(|c: char| matches!(c, ')' | ']' | '}' | ',' | ';' | '.'));
+                let candidate = tail[..end].trim_end_matches([')', ']', '}', ',', ';', '.']);
                 if let Ok(url) = reqwest::Url::parse(candidate) {
                     if url.host_str().is_some_and(|h| h.eq_ignore_ascii_case(HOST)) {
                         return true;
@@ -646,18 +645,6 @@ impl Wxbot {
             .min(quarter);
             tokio::time::sleep(Duration::from_secs(delay.saturating_add(jitter))).await;
             delay = (delay * 2).min(60);
-        }
-    }
-
-    /// GET（带 Bearer），返回 `(status, body)`；非 JSON / 网络错误 → Err。
-    async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<(u16, Value), ()> {
-        let (status, body) = self.get_body(path, query).await?;
-        match serde_json::from_str::<Value>(&body) {
-            Ok(val) => Ok((status, val)),
-            Err(e) => {
-                tracing::warn!("wxbot 响应 JSON 解析失败 {}: {e}", self.api_url(path));
-                Err(())
-            }
         }
     }
 
@@ -859,14 +846,11 @@ impl Wxbot {
         // 时 account_ok 放行投递，但发送闸门在绑定前保持关闭；绑定只来自 self/info）。
         // 锁停立即置位的语义保留：被拒事件直接丢弃，游标照常推进（通道已锁停，
         // 该事件永远不会被投递）。
-        match self.state.lock() {
-            Ok(mut s) => {
-                if !s.account_ok(&ev.account) {
-                    return Ok(WaitOutcome::Got(seq));
-                }
+        // 毒锁：不做准入，交由 ingest 复核兜底。
+        if let Ok(mut s) = self.state.lock() {
+            if !s.account_ok(&ev.account) {
+                return Ok(WaitOutcome::Got(seq));
             }
-            // 毒锁：不做准入，交由 ingest 复核兜底。
-            Err(_) => {}
         }
         // 游标推进语义：入队成功才推进（入队失败重试同一条，游标不动）。
         enqueue_with_retry(queue, ev).await?;
@@ -1954,10 +1938,6 @@ fn token_bounds_with_limit(text: &str, end: usize, limit: usize) -> Option<(usiz
     Some((token_start, token_end))
 }
 
-fn token_bounds(text: &str, end: usize) -> Option<(usize, usize)> {
-    token_bounds_with_limit(text, end, PROTECT_SCAN)
-}
-
 /// Bounds of the `[0-9.]` run containing `end`, when it contains a decimal dot.
 fn numeric_run_bounds(text: &str, end: usize) -> Option<(usize, usize)> {
     let mut start = end;
@@ -2099,7 +2079,7 @@ impl SendPacer {
             // Instant 进程运行不足 60s 时 checked_sub 返回 None：此时窗口内所有
             // 记录都处于最近 60s，不能把 cutoff 退化成 now 而丢掉窗口上限。
             let cutoff = now.checked_sub(PACER_WINDOW);
-            let in_window = |t: &Instant| cutoff.map_or(true, |c| *t > c);
+            let in_window = |t: &Instant| cutoff.is_none_or(|c| *t > c);
             let active = self.window.iter().filter(|t| in_window(t)).count();
             if active >= self.window_max {
                 if let Some(oldest) = self.window.iter().find(|t| in_window(t)) {
@@ -2451,7 +2431,7 @@ fn inbound_media_params(
 /// 预检已知 Content-Length：超过上限快速拒绝（省带宽）；未知长度放行——由
 /// 流式计数兜底（本地 wcx 服务的文件响应恒带长度，异常流也会被中途上限拦住）。
 fn precheck_content_length(len: Option<u64>, max: u64) -> bool {
-    !len.is_some_and(|l| l > max)
+    len.is_none_or(|l| l <= max)
 }
 
 /// 流式累计写入是否超出上限（saturating 加法防溢出回绕）。

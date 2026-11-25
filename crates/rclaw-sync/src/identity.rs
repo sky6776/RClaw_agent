@@ -557,13 +557,11 @@ pub async fn rotate(
                     [],
                     |row| row.get(0),
                 )?;
-                let mut id = first - requeue.len() as i64;
-                for (hlc, op) in &requeue {
+                for (id, (hlc, op)) in (first - requeue.len() as i64..).zip(&requeue) {
                     tx.execute(
                         "INSERT INTO sync_outbox(id, session_id, hlc, op) VALUES (?1, NULL, ?2, ?3)",
                         params![id, hlc, op],
                     )?;
-                    id += 1;
                 }
 
                 // 4. 新身份的日志从头开始。旧身份名下的段、汇总包、快照留在存储上，别的
@@ -784,7 +782,12 @@ mod tests {
         let mut packed = head_with(&[&other]);
         packed.rollup = Some(pack.rollup_ref());
         assert_eq!(
-            fork_point(&log, &[c.clone()], &[pack.clone()], Some(&packed)),
+            fork_point(
+                &log,
+                std::slice::from_ref(&c),
+                std::slice::from_ref(&pack),
+                Some(&packed)
+            ),
             at(&b)
         );
         // 汇总包是另一个写者打的，但包尾是本机的段。
@@ -1008,8 +1011,8 @@ mod tests {
                 Some(rotated.identity.device.as_str())
             );
             let record = db::device_record(conn)?.unwrap();
-            assert_eq!(record.past, [old.clone()]);
-            assert_eq!(record.announce, [old.clone()]);
+            assert_eq!(record.past, std::slice::from_ref(&old));
+            assert_eq!(record.announce, std::slice::from_ref(&old));
             Ok(())
         })
         .unwrap();

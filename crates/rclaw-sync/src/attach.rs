@@ -530,7 +530,7 @@ pub async fn download(
     let found = {
         let blob_id = blob_id.to_string();
         let keys = keys.clone();
-        offload(ctx, move |ctx| lookup(&ctx, &keys, &blob_id)).await?
+        offload(ctx, move |ctx| lookup(ctx, &keys, &blob_id)).await?
     };
     let row = match found {
         // 本机就有也不用白拿一趟：同一个对象登记过的其他落点（占位）顺手补上。补别名会写
@@ -1505,7 +1505,7 @@ pub fn on_missing(
 /// 同一份内容的，那条引用可能比这句话先合入。所以照收场算的也不是定论——用户第一次用到
 /// 它时本机照样去存储上看一次、要一次（[`on_missing`]），之后隔一阵再看（[`worth_fetching`]）。
 pub fn on_blob_gone(conn: &rusqlite::Connection, blob_id: &str, now: i64) -> Result<()> {
-    if !db::blob_get(conn, blob_id)?.is_some_and(|row| row.state == BLOB_REMOTE) {
+    if db::blob_get(conn, blob_id)?.is_none_or(|row| row.state != BLOB_REMOTE) {
         return Ok(());
     }
     if let Some(mut want) = want_get(conn, blob_id)? {
@@ -1608,7 +1608,7 @@ pub(crate) struct Waiting {
 pub(crate) fn waiting(conn: &rusqlite::Connection) -> Result<Waiting> {
     let mut out = Waiting::default();
     for (blob, row) in db::state_scan(conn, scope::BLOB_WANT, "")? {
-        if !db::blob_get(conn, &blob)?.is_some_and(|row| row.state == BLOB_REMOTE) {
+        if db::blob_get(conn, &blob)?.is_none_or(|row| row.state != BLOB_REMOTE) {
             out.stale.push(blob);
             continue;
         }
@@ -1621,7 +1621,7 @@ pub(crate) fn waiting(conn: &rusqlite::Connection) -> Result<Waiting> {
 /// 见 [`Waiting::stale`]。在写事务里再看一眼登记：列出来之后它可能又变回「等着取回」了。
 pub(crate) fn forget_stale(conn: &rusqlite::Connection, blobs: &[String]) -> Result<()> {
     for blob in blobs {
-        if !db::blob_get(conn, blob)?.is_some_and(|row| row.state == BLOB_REMOTE) {
+        if db::blob_get(conn, blob)?.is_none_or(|row| row.state != BLOB_REMOTE) {
             forget(conn, blob)?;
         }
     }
@@ -1942,7 +1942,7 @@ mod tests {
         let batch = upload_pending(&a, &transport, &keys, 10).await.unwrap();
         assert_eq!((batch.taken, batch.done), (1, 1));
         assert_eq!(state(&fine), Some(BLOB_UPLOADED));
-        assert_eq!(queue(), [stuck.clone()]);
+        assert_eq!(queue(), std::slice::from_ref(&stuck));
         assert_eq!(failures().as_deref(), Some("2"));
         // 第三次还是不行：不再自动重试，留一条提示。
         let batch = upload_pending(&a, &transport, &keys, 10).await.unwrap();
@@ -2475,7 +2475,7 @@ mod tests {
         .unwrap();
         let listed = db::read(b.ctx.db(), waiting).unwrap();
         assert_eq!(listed.blobs, [(plain.clone(), false), (told.clone(), true)]);
-        assert_eq!(listed.stale, [arrived.clone()]);
+        assert_eq!(listed.stale, std::slice::from_ref(&arrived));
         db::write(b.ctx.db(), |tx| forget_stale(tx, &listed.stale)).unwrap();
         assert_eq!(
             db::read(b.ctx.db(), waiting).unwrap().stale,
