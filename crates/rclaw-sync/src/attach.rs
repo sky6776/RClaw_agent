@@ -265,7 +265,7 @@ fn check_local_row(ctx: &Ctx, keys: &Keys, row: BlobRow) -> Result<LocalObject> 
 
 /// 把旧版本按明文摘要登记的本机缓存归一成线上对象名：登记换成新的，消息的附件清单一起
 /// 改写。新对象名已经登记过（另一条消息先归一过）时保留它原来的落点。
-fn normalize_registration(
+pub(crate) fn normalize_registration(
     ctx: &Ctx,
     old: &str,
     new: &str,
@@ -1176,6 +1176,22 @@ pub fn on_blob_want(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
 
 /// 同 [`on_blob_want`]，多一个工作区环境：能看本机文件时，「文件已经放回原处」的
 /// 附件即使还留着一条「等待取回」的登记（重试落空留下的），也恢复成可上传。
+/// `blob-probe` 标记的值：「落点|尝试标识|开始毫秒」。尝试标识让清理只撤「这一次」
+/// 留下的登记——一次旧的取回晚到的清理不会把新一次重试的标记/登记删掉。
+pub(crate) fn probe_value(rel_path: &str, token: &str, started_ms: i64) -> String {
+    format!("{rel_path}|{token}|{started_ms}")
+}
+
+/// 解析 [`probe_value`]；老版本只有「落点|毫秒」，这时尝试标识是空串。
+pub(crate) fn probe_parts(value: &str) -> Option<(&str, &str, i64)> {
+    let (head, started) = value.rsplit_once('|')?;
+    let started = started.parse::<i64>().ok()?;
+    Some(match head.rsplit_once('|') {
+        Some((rel_path, token)) => (rel_path, token, started),
+        None => (head, "", started),
+    })
+}
+
 pub fn on_blob_want_at(
     conn: &rusqlite::Connection,
     env: Option<&crate::wire::Env>,
@@ -1189,8 +1205,8 @@ pub fn on_blob_want_at(
         let started = marker
             .value
             .as_deref()
-            .and_then(|value| value.rsplit_once('|'))
-            .and_then(|(_, ts)| ts.parse::<i64>().ok())
+            .and_then(probe_parts)
+            .map(|(_, _, started)| started)
             .unwrap_or(0);
         // 下载队列没有年龄上限、慢速下载也可能超过十分钟（下载任务被取起时会刷新
         // 时间戳）：两小时都没刷新过才算陈旧残留（比如应用在队列里重启了）。

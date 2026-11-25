@@ -99,12 +99,49 @@ pub(crate) async fn upload_task(shared: Arc<Shared>, live: Arc<Live>) {
     }
 }
 
-async fn fetch_one(shared: Arc<Shared>, live: Arc<Live>, blob: String) -> (String, Result<()>) {
+async fn fetch_one(
+    shared: Arc<Shared>,
+    live: Arc<Live>,
+    blob: String,
+    attempt: Option<String>,
+) -> (String, Option<String>, Result<()>) {
     let max_size = shared.attachment_max.load(Ordering::Relaxed);
     let result = attach::download(&shared.ctx, live.transport(), &live.keys, &blob, max_size)
         .await
         .map(|_| ());
-    (blob, result)
+    (blob, attempt, result)
+}
+
+/// 这次取回的尝试标识（`blob-probe` 标记里的那段随机值）。没有标记（不是用户点的
+/// 「重新下载」补的登记）时为 None：失败清理什么都不撤。
+async fn probe_token(shared: &Arc<Shared>, blob: &str) -> Option<String> {
+    let (ctx, wanted) = (shared.ctx.clone(), blob.to_string());
+    blocking(move || {
+        let marker = db::read(ctx.db(), |conn| {
+            db::state_get(conn, crate::db::scope::BLOB_PROBE, &wanted)
+        })?;
+        Ok(marker
+            .and_then(|row| row.value)
+            .as_deref()
+            .and_then(attach::probe_parts)
+            .map(|(_, token, _)| token.to_string())
+            .filter(|token| !token.is_empty()))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 库里的 `blob-probe` 标记是不是这一次尝试的（没有标记 / 不是这次 → false）。
+fn probe_matches(conn: &rusqlite::Connection, blob: &str, attempt: Option<&str>) -> Result<bool> {
+    let Some(attempt) = attempt else {
+        return Ok(false);
+    };
+    Ok(db::state_get(conn, crate::db::scope::BLOB_PROBE, blob)?
+        .and_then(|row| row.value)
+        .as_deref()
+        .and_then(attach::probe_parts)
+        .is_some_and(|(_, token, _)| token == attempt))
 }
 
 /// 下载任务：按请求取回附件，同时最多 [`DOWNLOADS`] 个，用户点名要的插到队首。
@@ -125,7 +162,8 @@ pub(crate) async fn download_task(
             // 重试的临时登记：被真正取起时刷新一下时间戳，长时间排队/慢速下载期间
             // 别的设备的 `blob.want` 不会把它当成「陈旧残留」撤掉。
             touch_probe(&shared, &blob).await;
-            running.push(fetch_one(shared.clone(), live.clone(), blob));
+            let attempt = probe_token(&shared, &blob).await;
+            running.push(fetch_one(shared.clone(), live.clone(), blob, attempt));
         }
         tokio::select! {
             request = requests.recv() => {
@@ -153,9 +191,9 @@ pub(crate) async fn download_task(
                     }
                 }
             }
-            Some((blob, result)) = running.next(), if !running.is_empty() => {
+            Some((blob, attempt, result)) = running.next(), if !running.is_empty() => {
                 let user = wanted.remove(&blob).unwrap_or(false);
-                finish(&shared, blob, user, result).await;
+                finish(&shared, blob, user, attempt, result).await;
             }
         }
     }
@@ -169,19 +207,18 @@ async fn touch_probe(shared: &Arc<Shared>, blob: &str) {
             let Some(marker) = db::state_get(tx, crate::db::scope::BLOB_PROBE, &wanted)? else {
                 return Ok(());
             };
-            let path = marker
-                .value
-                .as_deref()
-                .and_then(|value| value.rsplit_once('|'))
-                .map(|(path, _)| path.to_string())
-                .unwrap_or_default();
+            let parts = marker.value.as_deref().and_then(attach::probe_parts);
+            let (path, token) = match parts {
+                Some((path, token, _)) => (path.to_string(), token.to_string()),
+                None => (String::new(), String::new()),
+            };
             db::state_put(
                 tx,
                 crate::db::scope::BLOB_PROBE,
                 &wanted,
                 db::HLC_ZERO,
                 None,
-                Some(&format!("{}|{}", path, attach::now_ms())),
+                Some(&attach::probe_value(&path, &token, attach::now_ms())),
             )
         })
     })
@@ -191,7 +228,16 @@ async fn touch_probe(shared: &Arc<Shared>, blob: &str) {
 
 /// 一个下载有了结果：通知界面。存储上没有这个对象的，向别的设备要——要了很久没有、
 /// 或者持有它的设备说拿不出来了，就收场（[`attach::on_missing`]）。
-async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<()>) {
+async fn finish(
+    shared: &Arc<Shared>,
+    blob: String,
+    user: bool,
+    attempt: Option<String>,
+    result: Result<()>,
+) {
+    // 这次是不是真的把对象落到了本机：`Ok` 是；「存上没有/内容坏了」记完账走的是下面
+    // 的 `Ok(None)` 分支（不算落盘，界面不能据此撤「内容对不上」的标记）。
+    let placed = result.is_ok();
     let error = match result {
         Ok(()) => None,
         // 对象不在存储上，与对象在但内容对不上（长度相同却解不开/摘要不符）一样：这本机
@@ -221,7 +267,9 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
                     // 不是这次补的登记（别的消息正常登记进来的）走下面的常规路径。
                     // 标记还在、行也还是「等待取回」：这条登记确实是这次重试临时补的。
                     // （取回成功会清标记并把行改成 FETCHED；并发登记进来的行状态也不同。）
-                    let probe = db::state_get(tx, crate::db::scope::BLOB_PROBE, &wanted)?.is_some()
+                    // 只撤「这一次」的标记：一次旧的取回晚到的清理不能把新一次重试
+                    // 的标记/登记删掉（尝试标识在取起时记下）。
+                    let probe = probe_matches(tx, &wanted, attempt.as_deref())?
                         && db::blob_get(tx, &wanted)?
                             .is_some_and(|row| row.state == crate::db::BLOB_REMOTE);
                     // 只撤「这次重试临时补」的身份，**保留登记行**：`on_missing` 需要
@@ -272,15 +320,10 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
             tracing::debug!("取回附件 {blob} 失败: {error}");
             // 这次是「重新下载」临时补的登记、又没取成（连接断了/超时）：撤掉它，别
             // 挡住「文件放回原处后重新上传」的那条路。
-            let (ctx, wanted) = (shared.ctx.clone(), blob.clone());
+            let (ctx, wanted, attempt) = (shared.ctx.clone(), blob.clone(), attempt.clone());
             let cleanup = blocking(move || {
-                let probe = db::read(ctx.db(), |conn| {
-                    Ok(db::state_get(conn, crate::db::scope::BLOB_PROBE, &wanted)?.is_some())
-                })
-                .unwrap_or(false);
-                if probe {
-                    crate::engine::drop_remote_registration(&ctx, &wanted);
-                }
+                // 只撤这一次尝试的临时登记（旧任务晚到的清理不能删掉新一次重试的）。
+                crate::engine::drop_remote_registration(&ctx, &wanted, attempt.as_deref());
                 Ok(())
             });
             cleanup.await.ok();
@@ -288,11 +331,16 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
         }
     };
     match error {
-        None => shared.emit(SyncEvent::Attachment { blob, error: None }),
+        None => shared.emit(SyncEvent::Attachment {
+            blob,
+            error: None,
+            placed,
+        }),
         // 自动取的（小图、打开会话时预取的、隔一阵的重试）失败了不打扰用户，占位照旧。
         Some(error) if user => shared.emit(SyncEvent::Attachment {
             blob,
             error: Some(error),
+            placed,
         }),
         Some(_) => {}
     }

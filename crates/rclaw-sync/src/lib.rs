@@ -241,10 +241,14 @@ pub enum SyncEvent {
     /// 删除、改名、归档）。
     Sessions { chats: Vec<ChatKey>, list: bool },
     /// 一个附件的取回有了着落，界面该重新查一遍它的情况（`AttachmentInfo::state`）。
-    /// `error` 为空：已经取回到本机；或者存储上没有这个文件，本机记下了它现在的情况
-    /// （在等别的设备传上来、取不回来了）。不为空：用户点名要的那个这一次没取成（存储
-    /// 够不着之类），内容是给用户看的原因。
-    Attachment { blob: String, error: Option<String> },
+    /// `error` 为空：取回流程结束了；`placed` 说明这次是不是真的把对象落到了本机
+    /// （存上没有这个文件、记下「在等别的设备/取不回来」的也是空 error，但没落盘）。
+    /// 不为空：用户点名要的那个这一次没取成（存储够不着之类），内容是给用户看的原因。
+    Attachment {
+        blob: String,
+        error: Option<String>,
+        placed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]

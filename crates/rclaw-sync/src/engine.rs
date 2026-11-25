@@ -349,6 +349,35 @@ impl Shared {
 }
 
 /// 清理分享缓存目录：删掉一小时前的旧副本，最多留 `keep` 份（新的在前）。
+/// 暂存条目的最近活动时间：目录取「自己与直接子项的 mtime 最大值」——点播的流只刷新
+/// 文件本身的 mtime，父目录的 mtime 不会跟着变（每个请求一个随机子目录，按目录时间判断
+/// 会把正在播放的副本当成旧的删掉）。
+fn entry_activity(path: &std::path::Path, meta: &std::fs::Metadata) -> std::time::SystemTime {
+    let mut newest = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+    if meta.is_dir() {
+        if let Ok(children) = std::fs::read_dir(path) {
+            for child in children.flatten() {
+                if let Ok(child_meta) = child.metadata() {
+                    if let Ok(modified) = child_meta.modified() {
+                        newest = newest.max(modified);
+                    }
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// 一条暂存条目现在是不是「最近还在用」（回收的宽限期）。
+fn entry_fresh(now: std::time::SystemTime, path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    now.duration_since(entry_activity(path, &meta))
+        .map(|age| age.as_secs() <= 300)
+        .unwrap_or(false)
+}
+
 fn prune_share_cache(dir: &std::path::Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -358,7 +387,8 @@ fn prune_share_cache(dir: &std::path::Path, keep: usize) {
         .flatten()
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
-            Some((meta.modified().ok()?, entry.path(), meta.is_file()))
+            let is_file = meta.is_file();
+            Some((entry_activity(&entry.path(), &meta), entry.path(), is_file))
         })
         .collect();
     files.sort_by_key(|file| std::cmp::Reverse(file.0));
@@ -375,6 +405,10 @@ fn prune_share_cache(dir: &std::path::Path, keep: usize) {
         }
         let stale = age > 3600;
         if index >= keep || stale {
+            // 扫描和删除之间可能刚有 Range 请求刷新过：删之前再核一次活跃时间。
+            if is_file && entry_fresh(now, &path) {
+                continue;
+            }
             let _ = if is_file {
                 std::fs::remove_file(&path)
             } else {
@@ -385,7 +419,13 @@ fn prune_share_cache(dir: &std::path::Path, keep: usize) {
 }
 
 /// 撤掉一条为「重新下载」临时补的 `BLOB_REMOTE` 登记（只撤还是这个状态的）。
-pub(crate) fn drop_remote_registration(ctx: &crate::Ctx, blob: &str) {
+///
+/// `attempt` 是取回开始时记下的尝试标识：只撤**这一次**留下的标记与登记。一次旧的
+/// 取回晚到的清理（超时、连接断开）不能把新一次重试的登记删掉。
+pub(crate) fn drop_remote_registration(ctx: &crate::Ctx, blob: &str, attempt: Option<&str>) {
+    let Some(attempt) = attempt else {
+        return;
+    };
     let commit = ctx.space.begin();
     if !commit.valid() {
         return;
@@ -394,9 +434,13 @@ pub(crate) fn drop_remote_registration(ctx: &crate::Ctx, blob: &str) {
         if !commit.valid() {
             return Ok(());
         }
-        // 只撤「这次重试临时补的」那一条：标记还在、行还是等待取回。并发登记进来的
-        // 普通登记（没有标记，或已变成取回完成）不动。
-        let probe = db::state_get(tx, crate::db::scope::BLOB_PROBE, blob)?.is_some();
+        // 只撤「这次重试临时补的」那一条：标记还是这一次的、行还是等待取回。并发登记
+        // 进来的普通登记（没有标记，或已变成取回完成）不动。
+        let probe = db::state_get(tx, crate::db::scope::BLOB_PROBE, blob)?
+            .and_then(|row| row.value)
+            .as_deref()
+            .and_then(crate::attach::probe_parts)
+            .is_some_and(|(_, token, _)| token == attempt);
         if probe {
             if let Some(row) = db::blob_get(tx, blob)? {
                 if row.state == crate::db::BLOB_REMOTE {
@@ -1212,14 +1256,31 @@ impl SyncEngine {
         let cap = row.size.saturating_add(local::SIZE_SLACK).saturating_add(1);
         let mut reader = HashingReader::new(file.take(cap));
         consume(&mut reader)?;
+        // 消费方没读到 EOF 就返回的（提前停下）：摘要只覆盖了前缀，不能当成整份内容
+        // 核对过——补读一个字节，还有内容就按对不上处理。
+        let mut probe = [0u8; 1];
+        match reader.read(&mut probe) {
+            Ok(0) => {}
+            Ok(_) | Err(_) => return Ok(AttachmentCopy::Rejected),
+        }
         let total = reader.total;
         let digest: [u8; 32] = reader
             .finish()
             .as_ref()
             .try_into()
             .expect("SHA-256 是 32 字节");
-        if total.abs_diff(row.size) > local::SIZE_SLACK || keys.blob_id(&digest) != blob {
+        if total.abs_diff(row.size) > local::SIZE_SLACK {
             return Ok(AttachmentCopy::Rejected);
+        }
+        let current = keys.blob_id(&digest);
+        if current != blob {
+            // 旧版本按明文摘要登记的内联缓存（无密钥时导入会话包留下的）：内容对得上
+            // 明文摘要就当场归一，这次照常接受；归一失败只影响登记，读到的内容没变。
+            if crate::ids::hex(&digest) != *blob {
+                return Ok(AttachmentCopy::Rejected);
+            }
+            let _ =
+                crate::attach::normalize_registration(ctx, blob, &current, &row.rel_path, total);
         }
         Ok(AttachmentCopy::Copied)
     }
@@ -1236,11 +1297,27 @@ impl SyncEngine {
                 return AttachmentBytes::TooLarge;
             }
         }
+        // 登记长度只是「别的设备报来的」：实际读入同样按 `limit` 截住（登记比实际小、
+        // 文件又被换大了的时候，不能把内存读爆）。
         let mut bytes: Vec<u8> = Vec::new();
+        let mut too_large = false;
         let outcome = match self.copy_cached_blob(blob, &mut |reader| {
-            std::io::copy(reader, &mut bytes).map(|_| ())
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut buffer)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                if (bytes.len() as u64).saturating_add(n as u64) > limit {
+                    too_large = true;
+                    return Err(std::io::Error::other("超过读取上限"));
+                }
+                bytes.extend_from_slice(&buffer[..n]);
+            }
         }) {
             Ok(outcome) => outcome,
+            // 超上限被这里截断：按 TooLarge 报（不是「内容对不上」）。
+            Err(_) if too_large => return AttachmentBytes::TooLarge,
             Err(_) => return AttachmentBytes::Rejected,
         };
         match outcome {
@@ -1536,6 +1613,8 @@ impl SyncEngine {
             .map(|row| row.is_none())
             .unwrap_or(false);
         let mut registered = false;
+        // 这次「重新下载」的尝试标识：写进 `blob-probe` 标记，失败清理只撤这一次的。
+        let mut attempt: Option<String> = None;
         if missing {
             if let Some((path, size, artifact)) =
                 local::referenced_attachment(ctx, channel, chat_id, blob)
@@ -1556,24 +1635,30 @@ impl SyncEngine {
                 if commit.valid() && ctx.space.epoch() == epoch_before {
                     // 只有真的插入了这一行才算「这次补的登记」；标记里带开始时间，
                     // `on_blob_want` 据此区分「刚点的、还在下载」与「陈旧残留」。
-                    registered = db::write(ctx.db(), |tx| {
+                    attempt = db::write(ctx.db(), |tx| {
                         if !commit.valid() {
-                            return Ok(false);
+                            return Ok(None);
                         }
                         if db::blob_get(tx, blob)?.is_some() {
-                            return Ok(false);
+                            return Ok(None);
                         }
                         db::blob_register(tx, blob, &rel_path, size, crate::db::BLOB_REMOTE)?;
+                        let token = crate::ids::random_hex::<4>();
                         db::state_put(
                             tx,
                             crate::db::scope::BLOB_PROBE,
                             blob,
                             db::HLC_ZERO,
                             None,
-                            Some(&format!("{}|{}", rel_path, crate::attach::now_ms())),
+                            Some(&crate::attach::probe_value(
+                                &rel_path,
+                                &token,
+                                crate::attach::now_ms(),
+                            )),
                         )?;
-                        Ok(true)
+                        Ok(Some(token))
                     })?;
+                    registered = attempt.is_some();
                 }
             }
         }
@@ -1581,7 +1666,7 @@ impl SyncEngine {
         // 也撤掉——旧空间的登记不能留在新空间里）。
         if ctx.space.epoch() != epoch_before {
             if registered {
-                drop_remote_registration(ctx, blob);
+                drop_remote_registration(ctx, blob, attempt.as_deref());
             }
             return Err(SyncError::other("同步空间刚换过，请重试一次"));
         }
@@ -1589,7 +1674,7 @@ impl SyncEngine {
         if queued.is_err() && registered {
             // 没排上队（没连上同步空间、引擎在重连）：撤掉刚补的临时登记，别挡住
             // `BLOB_GONE` 记录「文件放回原处后重新上传」的那条路。
-            drop_remote_registration(ctx, blob);
+            drop_remote_registration(ctx, blob, attempt.as_deref());
         }
         queued
     }

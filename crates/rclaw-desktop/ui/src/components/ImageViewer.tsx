@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
-import { clearAttachmentChanged } from "./SyncAttachments";
+import {
+  clearAttachmentChanged,
+  isAttachmentChangedError,
+  markAttachmentChanged,
+  refreshSyncAttachments,
+} from "./SyncAttachments";
 import { useBackClose } from "../lib/backNav";
 
 /** 全屏图片查看器（WebView83 无手势库，touch 自算）：
@@ -236,14 +241,20 @@ export default function ImageViewer({
         // Worker 不可用（如 CSP 拦 blob:）时拿 data URL 直挂原图：慢一点
         // （setAttribute 阻塞主线程）但「查看原图」不至于整个失败。
         const u = b ? URL.createObjectURL(b) : dataUrl;
-        cacheFullBlob(cacheKey, u);
+        // 按对象名索引的缓存只存核对过的字节：核不了时读到的可能是另一份内容。
+        if (verified) cacheFullBlob(cacheKey, u);
         setFull({ url: u });
         setFullLoading(false);
       })
-      .catch(() => {
+      .catch((e) => {
         // 失败必须可见（按钮会弹回「查看原图」），不能静默装作加载完成。
         wantFullRef.current = false;
         setFullLoading(false);
+        // 内容对不上：消息里的卡也换成附件卡（带重新下载），别只留一句通用提示。
+        if (blob && isAttachmentChangedError(e)) {
+          markAttachmentChanged({ path, blob });
+          refreshSyncAttachments();
+        }
         onError?.("原图加载失败，请稍后重试");
       });
   };

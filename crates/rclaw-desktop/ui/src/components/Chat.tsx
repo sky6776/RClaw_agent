@@ -17,6 +17,8 @@ import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { mentionsPath, parseMediaItems } from "./MediaPreviews";
 import {
   clearAttachmentChanged,
+  isAttachmentChangedError,
+  markAttachmentChanged,
   messageFileRefs,
   readableAtPath,
   refreshSyncAttachments,
@@ -1733,7 +1735,13 @@ export default function Chat({
         // 打开的是核对过的副本：这条「读出来对不上」的标记可以撤掉。
         if (verified && ref) clearAttachmentChanged({ path, blob: ref.blob });
       })
-      .catch((e) => onError?.(`打开媒体失败: ${String(e)}`));
+      .catch((e) => {
+        if (ref && isAttachmentChangedError(e)) {
+          markAttachmentChanged({ path, blob: ref.blob });
+          refreshSyncAttachments();
+        }
+        onError?.(`打开媒体失败: ${String(e)}`);
+      });
   };
   const menuViewImage = (path: string, msgId?: number) => {
     const ref = messageFileRefs(syncedAttachments, msgId).find((item) => item.path === path);
@@ -1747,7 +1755,13 @@ export default function Chat({
           ref?.blob,
         );
       })
-      .catch((e) => onError?.(`读取图片失败: ${String(e)}`));
+      .catch((e) => {
+        if (ref && isAttachmentChangedError(e)) {
+          markAttachmentChanged({ path, blob: ref.blob });
+          refreshSyncAttachments();
+        }
+        onError?.(`读取图片失败: ${String(e)}`);
+      });
   };
 
   const selectedMessages = useMemo(

@@ -414,7 +414,10 @@ async fn attachments_upload_after_the_backlog_choice_and_download_on_request() {
     let blob = listed[0].blob.clone();
     wait_for("乙收到取回完成的事件", 10, || {
         lock(&b.events.0).iter().any(|event| {
-            matches!(event, SyncEvent::Attachment { blob: got, error: None } if *got == blob)
+            matches!(
+                event,
+                SyncEvent::Attachment { blob: got, error: None, placed: true } if *got == blob
+            )
         })
     })
     .await;

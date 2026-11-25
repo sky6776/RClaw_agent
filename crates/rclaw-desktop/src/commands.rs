@@ -5449,14 +5449,12 @@ fn image_preview_bytes(
     // 内容寻址的缩略图缓存：同一份内容已经算过就直接用（重开会话、画廊来回滑不重解码）。
     let cache_dir = home.join("agent").join(MEDIA_PREVIEW_CACHE_DIR);
     let cache_base = cache_dir.join(&key);
-    for (ext, cache_mime) in [("jpg", "image/jpeg"), ("png", "image/png")] {
-        if let Ok(cached) = std::fs::read(cache_base.with_extension(ext)) {
-            return Ok(MediaPayload {
-                mime: cache_mime.into(),
-                base64: encode_base64(&cached),
-                verified: true,
-            });
-        }
+    if let Some((cached, cache_mime)) = read_preview_cache(&cache_base) {
+        return Ok(MediaPayload {
+            mime: cache_mime.into(),
+            base64: encode_base64(&cached),
+            verified: true,
+        });
     }
     image_preview_encode(home, bytes, &key, mime, true)
 }
@@ -5517,17 +5515,45 @@ fn image_preview_payload(
     // 无 alpha → .jpg，带 alpha → .png（JPEG 无透明）：读缓存两种后缀都试，
     // 否则透明图永远不命中、每次打开都重新解码整张原图。
     let cache_base = cache_dir.join(&key);
-    for (ext, cache_mime) in [("jpg", "image/jpeg"), ("png", "image/png")] {
-        if let Ok(cached) = std::fs::read(cache_base.with_extension(ext)) {
-            return Ok(MediaPayload {
-                mime: cache_mime.into(),
-                base64: encode_base64(&cached),
-                verified: false,
-            });
-        }
+    if let Some((cached, cache_mime)) = read_preview_cache(&cache_base) {
+        return Ok(MediaPayload {
+            mime: cache_mime.into(),
+            base64: encode_base64(&cached),
+            verified: false,
+        });
     }
 
     image_preview_encode(home, &original, &key, mime, false)
+}
+
+/// 读预览缓存：缓存文件名旁边记着内容的 SHA-256（`.sha` 后缀），对得上才算数。缓存是
+/// 派生物，被本机程序改写过就不能再当成「这份内容」的预览——否则调用方标出去的
+/// `verified` 会是假的。
+fn read_preview_cache(cache_base: &std::path::Path) -> Option<(Vec<u8>, &'static str)> {
+    for (extension, mime) in [("jpg", "image/jpeg"), ("png", "image/png")] {
+        let path = cache_base.with_extension(extension);
+        let (Ok(bytes), Ok(sidecar)) = (
+            std::fs::read(&path),
+            std::fs::read_to_string(path.with_extension(format!("{extension}.sha"))),
+        ) else {
+            continue;
+        };
+        if rclaw_sync::crypto::sha256_hex(&bytes) == sidecar.trim() {
+            return Some((bytes, mime));
+        }
+    }
+    None
+}
+
+/// 写预览缓存与它的内容摘要（摘要后写：读的一方要求两者对得上，先写摘要会让读到的
+/// 旧内容配上新摘要）。
+fn write_preview_cache(path: &std::path::Path, bytes: &[u8]) {
+    let _ = std::fs::write(path, bytes);
+    let digest = rclaw_sync::crypto::sha256_hex(bytes);
+    if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
+        let sidecar = path.with_extension(format!("{extension}.sha"));
+        let _ = std::fs::write(sidecar, digest);
+    }
 }
 
 /// 解码 → 缩到上限 → 编码，并写缓存（键 `key`）。
@@ -5576,7 +5602,7 @@ fn image_preview_encode(
         .join(key)
         .with_extension(if has_alpha { "png" } else { "jpg" });
     let _ = std::fs::create_dir_all(&cache_dir);
-    let _ = std::fs::write(&cache_path, &encoded); // 缓存写失败只影响下次，不挡返回
+    write_preview_cache(&cache_path, &encoded); // 缓存写失败只影响下次，不挡返回
     Ok(MediaPayload {
         mime: if has_alpha {
             "image/png".into()
@@ -6234,6 +6260,34 @@ fn ensure_workspace_dir(
 }
 
 /// 清理缓存目录：删掉一小时前的，最多留 `keep` 个条目（新的在前）。
+/// 暂存条目的最近活动时间：目录取「自己与直接子项的 mtime 最大值」——点播的流只刷新
+/// 文件本身的 mtime，父目录的 mtime 不会跟着变。
+fn cache_entry_activity(path: &std::path::Path, meta: &std::fs::Metadata) -> std::time::SystemTime {
+    let mut newest = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+    if meta.is_dir() {
+        if let Ok(children) = std::fs::read_dir(path) {
+            for child in children.flatten() {
+                if let Ok(child_meta) = child.metadata() {
+                    if let Ok(modified) = child_meta.modified() {
+                        newest = newest.max(modified);
+                    }
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// 一条暂存条目现在是不是「最近还在用」。
+fn cache_entry_fresh(now: std::time::SystemTime, path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    now.duration_since(cache_entry_activity(path, &meta))
+        .map(|age| age.as_secs() <= 300)
+        .unwrap_or(false)
+}
+
 fn prune_cache_dir(dir: &std::path::Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -6242,7 +6296,7 @@ fn prune_cache_dir(dir: &std::path::Path, keep: usize) {
         .flatten()
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
-            Some((meta.modified().ok()?, entry.path()))
+            Some((cache_entry_activity(&entry.path(), &meta), entry.path()))
         })
         .collect();
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
@@ -6259,6 +6313,10 @@ fn prune_cache_dir(dir: &std::path::Path, keep: usize) {
         }
         let stale = age > 3600;
         if index >= keep || stale {
+            // 扫描和删除之间可能刚有 Range 请求刷新过：删之前再核一次活跃时间。
+            if path.is_file() && cache_entry_fresh(now, &path) {
+                continue;
+            }
             let _ = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
             } else {

@@ -993,7 +993,7 @@ export interface SyncScanStart {
 export type SyncEvent =
   | { kind: "status" }
   | { kind: "sessions"; chats: Array<{ channel: string; chat_id: string }>; list: boolean }
-  | { kind: "attachment"; blob: string; error: string | null }
+  | { kind: "attachment"; blob: string; error: string | null; placed: boolean }
   | { kind: "reload"; what: string };
 
 export const api = {

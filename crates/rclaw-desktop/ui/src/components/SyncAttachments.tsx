@@ -245,9 +245,10 @@ function markStale(chatId: string) {
 }
 
 /** 一个附件的下载有了结果（或者请求本身没发出去）。 */
-function settle(blob: string, error: string | null) {
-  if (error === null) {
-    // 重新下载成功：这个对象之前「读出来对不上」的覆盖撤掉。
+function settle(blob: string, error: string | null, placed: boolean) {
+  if (error === null && placed) {
+    // 真的把对象落到了本机：「读出来对不上」的覆盖撤掉。`error` 为空但没落盘的
+    // （存上没有、记下「在等别的设备/取不回来」）不能清——内容还是没取回来。
     clearChanged(blob);
   }
   const timer = busyTimers[blob];
@@ -291,7 +292,7 @@ function download(chatId: string, blob: string) {
     setCards((prev) => (prev.busy[blob] ? { ...prev, busy: without(prev.busy, blob) } : prev));
     if (reload) reload();
   }, FETCH_SHOWN_MS);
-  api.syncFetchAttachment(chatId, blob).catch((e) => settle(blob, String(e)));
+  api.syncFetchAttachment(chatId, blob).catch((e) => settle(blob, String(e), false));
 }
 
 /** 把同步缓存里的一份文件快照存进工作区（存到这条消息写的那个路径上）。
@@ -310,12 +311,14 @@ function save(chatId: string, item: SyncAttachment) {
     .syncAttachmentSave(chatId, item.blob, item.path)
     .then(({ rel, verified }) => {
       if (chat !== chatId) return;
-      // 只有「写下去的字节核对过」才撤「读出来对不上」的覆盖；核不了按老行为复制时
-      // 照样记下已存到，但不撤（那份副本可能仍不是这条消息引用的内容）。这种时候
-      // 卡片上「内容对不上」的说明要放回去（保存开始时按常规清过一次）。
-      if (verified) {
-        clearChanged(item.blob);
+      // 只有「写下去的字节核对过 **且** 落点就是这条消息的路径」才撤「读出来对不上」
+      // 的覆盖：目标被别的文件占着时存成了 `-快照`，消息路径上仍然不是这份内容，标记
+      // 要留着（其余路径同理，按落点清而不是按对象整体清）。
+      if (verified && rel === item.path) {
+        clearAttachmentChanged({ path: item.path, blob: item.blob });
       } else if (changedKeys.has(key)) {
+        // 没核对、或者没存到这条消息的路径上：卡片上的说明要放回去（保存开始时按常规
+        // 清过一次）。
         cards = { ...cards, saveErrors: { ...cards.saveErrors, [key]: CHANGED_CARD_NOTE } };
       }
       setCards((prev) => ({ ...prev, saved: { ...prev.saved, [key]: rel } }));
@@ -441,7 +444,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     void load();
     const un = api.onSync((event) => {
       if (event.kind === "attachment") {
-        settle(event.blob, event.error);
+        settle(event.blob, event.error, event.placed);
         schedule();
       } else if (event.kind === "status") {
         // 每一轮同步的状态变化：别名补落点、登记回收都可能在这时完成，借机重取一次
@@ -861,7 +864,9 @@ function SnapshotImage({
       if (!request) {
         const started = api.syncAttachmentPreview(chatId, blob, path).then((r) => {
           const url = `data:${r.mime};base64,${r.base64}`;
-          rememberSnapshot(cacheKey, url);
+          // 只有核对过的字节才进按对象名索引的跨打开缓存：核不了时读到的可能是
+          // 另一份内容，下次打开又原样复用就成了「永远显示错的那张」。
+          if (r.verified) rememberSnapshot(cacheKey, url);
           return url;
         });
         request = started;
@@ -876,7 +881,14 @@ function SnapshotImage({
         .then((url) => {
           if (alive) setSrc(url);
         })
-        .catch(() => {});
+        .catch((e) => {
+          if (!alive) return;
+          // 快照内容对不上：卡片换成「重新下载」，别只在预览处静默失败。
+          if (isAttachmentChangedError(e)) {
+            markAttachmentChanged({ path, blob });
+            refreshSyncAttachments();
+          }
+        });
     };
     const el = box.current;
     if (!el || typeof IntersectionObserver === "undefined") {
@@ -928,6 +940,7 @@ export function SyncChatBar({
 }) {
   const view = useSyncExternalStore(subscribe, () => (chat === chatId ? bar : NONE));
   const state = useSyncExternalStore(subscribe, () => cards);
+  const ready = useChatAttachmentsReady(chatId);
   const [open, setOpen] = useState(false);
   // 换会话时收起来。
   useEffect(() => {
@@ -935,7 +948,9 @@ export function SyncChatBar({
   }, [chatId]);
 
   const running = runningOn !== undefined && runningOn.length > 0;
-  const total = view.pending.length + view.landed.length;
+  // 清单没取到（或刚作废、正在重取）时 `bar` 还是上一轮的判断：不能拿它出下载/
+  // 「已下载 · 打开」这类操作，只留「正在别的设备上运行」的提示。
+  const total = ready ? view.pending.length + view.landed.length : 0;
   if (!running && total === 0) return null;
 
   const remote = view.pending.filter((item) => item.state === "remote");

@@ -1213,6 +1213,61 @@ fn save_snapshot(home: &Path, path: &str, cached: &Path) -> Result<String, Strin
     Ok(format!("{dir_rel}/{file_name}"))
 }
 
+/// 把核对过的内容发布到工作区：先写同目录下的临时文件，摘要核对通过后再以「不覆盖
+/// 已有文件」的方式原子发布（硬链接；文件系统不支持时退回「必须新建」的复制）。并行
+/// 的工作区读取不会看到半成品，也不会在摘要拒绝之前读走错误内容。
+fn write_verified_file(
+    dir: &Path,
+    candidate_name: impl Fn(u32) -> String,
+    write: impl Fn(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<PathBuf, String> {
+    for n in 1..=999u32 {
+        let dest = dir.join(candidate_name(n));
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            continue;
+        }
+        let tmp = dir.join(format!(
+            ".rclaw-save-{}.tmp",
+            rclaw_sync::ids::random_hex::<8>()
+        ));
+        let mut file = match super::open_for_write_nofollow(&tmp, true) {
+            Ok(file) => file,
+            Err(e) => return Err(format!("存进工作区失败: {e}")),
+        };
+        if let Err(e) = write(&mut file) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("存进工作区失败: {e}"));
+        }
+        drop(file);
+        match std::fs::hard_link(&tmp, &dest) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(dest);
+            }
+            // 名字刚被别人占了：换下一个候选。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&tmp);
+                continue;
+            }
+            // 文件系统不支持硬链接：退回「必须新建」的复制发布（这时是普通的复制窗口）。
+            Err(_) => {
+                let published = super::open_for_write_nofollow(&dest, true).and_then(|mut out| {
+                    let mut from = std::fs::File::open(&tmp)?;
+                    std::io::copy(&mut from, &mut out).map(|_| ())
+                });
+                let _ = std::fs::remove_file(&tmp);
+                match published {
+                    Ok(()) => return Ok(dest),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(format!("存进工作区失败: {e}")),
+                }
+            }
+        }
+    }
+    Err("存进工作区失败: 同名文件过多，请手动整理".to_string())
+}
+
 /// [`sync_attachment_save`] 的核心（核对版）：同 [`save_snapshot`]，但写出去的字节与
 /// 核对是**同一次读**——目标已经有一份一模一样的、或者写下去的内容摘要对不上，都在
 /// 同一次读里发现；对不上的那份写完就撤掉（`write_fresh_file` 失败即删）。
@@ -1258,9 +1313,8 @@ fn save_snapshot_checked(
     // 不会读文件，闭包必须报错让 `write_fresh_file` 把刚建的空文件删掉，再退回不核对的
     // 老路径重来一次——不能把一个 0 字节的「快照」留在工作区。
     let outcome = std::cell::Cell::new(None);
-    let dest = match super::write_fresh_file(
+    let dest = match write_verified_file(
         &dir,
-        "存进工作区失败",
         |n| snapshot_name(n, &name),
         |file| {
             // 读出来的字节直接写进目标文件，摘要就在这同一次读里算、读完后核对；
