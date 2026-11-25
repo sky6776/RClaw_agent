@@ -516,10 +516,11 @@ export function readableAtPath(item: SyncAttachment): boolean {
   // 核对过的看「消息路径上真有这份内容」（包括已存回原位置的快照）；没核对过的只在
   // 落点就是消息路径时才按能读处理——`local` 只说明登记的落点存在，可能根本不是这条
   // 消息写的那个路径。
-  if (item.checked) return item.path_present;
   // 读的时候已经发现对不上的（预算外/还没轮到核对的那条）：按对不上处理，出附件卡
-  // 给「重新下载」，不再内联一个每次点都失败的卡。
+  // 给「重新下载」，不再内联一个每次点都失败的卡。这一条优先于清单的 `checked`：
+  // 摘要有 60 秒的信任窗口，刚核对过又被改写的文件在清单里还是「核对过、在」。
   if (changedKeys.has(`${item.blob}:${item.path}`)) return false;
+  if (item.checked) return item.path_present;
   return item.state === "local" && item.rel_path === item.path;
 }
 

@@ -1195,7 +1195,9 @@ fn save_snapshot_checked(
 ) -> Result<String, String> {
     let (dir, dir_rel, name) = snapshot_dir(home, path)?;
     let target = dir.join(&name);
-    if std::fs::symlink_metadata(&target).is_ok() {
+    // 只把普通文件当「那里已经有一份」：链接（或别的什么挡在名字上）不算，往下照
+    // 「另存一份」走（与 [`save_snapshot`] 的老行为一致）。
+    if std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_file()) {
         // 目标位置已经有一份：同一次读里比较它和缓存副本、并核对缓存副本的摘要。
         let mut same = true;
         match engine
@@ -1248,9 +1250,19 @@ fn compare_snapshot(
     let (mut left, mut right) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
     loop {
         let n = read_full(reader, &mut left)?;
-        let m = match other.as_mut() {
-            Some(other) => read_full(other, &mut right)?,
-            None => 0,
+        let read_other = match other.as_mut() {
+            Some(other) => read_full(other, &mut right),
+            None => Ok(0),
+        };
+        let m = match read_other {
+            Ok(m) => m,
+            Err(_) => {
+                // 目标读不了（权限/被占用）：算不上「一样」，但也不用为此让整次保存
+                // 失败——按「另存一份」走。
+                *same = false;
+                other = None;
+                0
+            }
         };
         if n != m || left[..n] != right[..m] {
             *same = false;
