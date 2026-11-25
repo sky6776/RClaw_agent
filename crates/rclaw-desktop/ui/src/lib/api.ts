@@ -1257,8 +1257,15 @@ export const api = {
     invoke<MediaPayload>("media_preview", { path, chatId, blob }),
 
   /** 视频/音频的本地流式 URL（127.0.0.1 + 随机 token，支持 Range 边下边播）。 */
+  // `verified` = 地址上的字节是「这一次按对象核对过」的副本（点播暂存副本）；
+  // 海报/核不了时的原路径都是 false，调用方不能把它当成核对通过。
   mediaStreamUrl: (path: string, chatId?: string, blob?: string, fresh?: boolean) =>
-    invoke<string>("media_stream_url", { path, chatId, blob, fresh }),
+    invoke<{ url: string; verified: boolean }>("media_stream_url", {
+      path,
+      chatId,
+      blob,
+      fresh,
+    }),
 
   openMedia: (path: string) => invoke<void>("open_media", { path }),
 

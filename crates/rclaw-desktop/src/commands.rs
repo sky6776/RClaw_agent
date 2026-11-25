@@ -6503,6 +6503,15 @@ pub async fn app_versions() -> AppVersionsDto {
     }
 }
 
+/// 流式地址：`verified` 表示这个地址上的字节来自「这一次按对象核对过」的副本
+/// （点播的暂存副本）。海报的钉版本地址、以及核不了时退回的原路径都不是——界面
+/// 不能把「拿到地址」当成「核对通过」。
+#[derive(Serialize)]
+pub struct MediaStream {
+    pub url: String,
+    pub verified: bool,
+}
+
 /// 视频/音频的本地流式 URL：仅回环地址 + 随机 token 的 HTTP 服务（支持
 /// Range/206 分段），WebView `<video>` 据此边下边播并显示首帧——data URL
 /// 整包注入对视频不可行。路径守卫与 media_base64 相同。
@@ -6513,21 +6522,23 @@ pub async fn media_stream_url(
     chat_id: Option<String>,
     blob: Option<String>,
     fresh: Option<bool>,
-) -> Result<String, String> {
+) -> Result<MediaStream, String> {
     let playback = fresh.unwrap_or(true);
+    // 引擎句柄只取一次（两处判断之间引擎启停会让结论不一致）。
+    let engine = state.sync();
     // 点播时「核不了」（没有登记/密钥、登记在别的设备上）：按老行为不钉版本放行，
     // 与其他读取入口的「核不了按老行为」一致；画廊里不会因此永远放不出来。
     let mut playback_unverifiable = false;
     // 清单给了对象名、却没有能核对的环境（没有同步引擎/会话上下文）：同样按老行为
     // 放行（海报仍然拒绝未核对的帧）。
-    if playback && blob.is_some() && (chat_id.is_none() || state.sync().is_none()) {
+    if playback && blob.is_some() && (chat_id.is_none() || engine.is_none()) {
         playback_unverifiable = true;
     }
     // 点播：把核对过的内容复制成暂存副本，流从这份副本出——播放期间原路径被改写也
     // 影响不到已经在播的这一份（副本就是边复制边核对过的字节）。
     if playback {
         if let (Some(chat_id), Some(blob), Some(engine)) =
-            (chat_id.clone(), blob.clone(), state.sync())
+            (chat_id.clone(), blob.clone(), engine.clone())
         {
             let name = path.rsplit('/').next().unwrap_or("stream.bin");
             let dest = format!(
@@ -6550,8 +6561,12 @@ pub async fn media_stream_url(
             match staged {
                 rclaw_sync::AttachmentStage::Staged(rel) => {
                     let agent_root = state.home.join("agent");
-                    return crate::media_stream::stream_url_with_root(agent_root, &rel, None)
-                        .ok_or_else(|| "这个文件不能应用内播放".to_string());
+                    let url = crate::media_stream::stream_url_with_root(agent_root, &rel, None)
+                        .ok_or_else(|| "这个文件不能应用内播放".to_string())?;
+                    return Ok(MediaStream {
+                        url,
+                        verified: true,
+                    });
                 }
                 rclaw_sync::AttachmentStage::Rejected => {
                     return Err(
@@ -6573,7 +6588,11 @@ pub async fn media_stream_url(
     }
     let agent_root = state.home.join("agent");
     match crate::media_stream::stream_url_with_root(agent_root, &path, pin.as_deref()) {
-        Some(url) => Ok(url),
+        // 海报/核不了的原路径：地址能用，但不是「这一次核对过的字节」。
+        Some(url) => Ok(MediaStream {
+            url,
+            verified: false,
+        }),
         None => Err("媒体文件不存在或路径越出工作区".into()),
     }
 }

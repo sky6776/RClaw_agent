@@ -96,10 +96,13 @@ export default function MediaGallery({
       }
       api
         .mediaStreamUrl(item.path, chatId, item.blob, true)
-        .then((u) => {
+        .then((r) => {
           if (!alive) return;
-          if (item.blob) clearAttachmentChanged({ path: item.path, blob: item.blob });
-          setVideoUrl(u);
+          // 只有核对过的暂存副本才算这次读通过（核不了退回的原路径不算）。
+          if (r.verified && item.blob) {
+            clearAttachmentChanged({ path: item.path, blob: item.blob });
+          }
+          setVideoUrl(r.url);
         })
         .catch((e) => {
           if (!alive) return;

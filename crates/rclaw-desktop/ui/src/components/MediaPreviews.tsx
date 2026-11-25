@@ -354,10 +354,11 @@ export default function MediaPreviews({
       api
         // 海报帧用摘要缓存的结论核对（不整读整个视频）；点播时再直读核对一次。
         .mediaStreamUrl(item.path, chatId, blob, false)
-        .then((url) => {
+        .then((r) => {
           if (!mountedRef.current || chatRef.current !== chatId) return;
-          if (blob) clearAttachmentChanged({ path: item.path, blob });
-          setVideoUrls((prev) => ({ ...prev, [itemKey]: url }));
+          // 海报地址（钉版本 / 核不了时的原路径）不代表这一次核对通过：不清覆盖。
+          if (r.verified && blob) clearAttachmentChanged({ path: item.path, blob });
+          setVideoUrls((prev) => ({ ...prev, [itemKey]: r.url }));
         })
         .catch((e) => {
           if (!mountedRef.current || chatRef.current !== chatId) return;
@@ -625,11 +626,13 @@ export default function MediaPreviews({
                 const blob = mine.get(it.path)?.blob;
                 api
                   .mediaStreamUrl(it.path, chatId, blob, true)
-                  .then((url) => {
+                  .then((r) => {
                     if (!mountedRef.current || chatRef.current !== chatId) return;
-                    if (blob) clearAttachmentChanged({ path: it.path, blob });
+                    // 只有暂存副本（核对过的字节）才算这次读通过；核不了退回的
+                    // 原路径不算。
+                    if (r.verified && blob) clearAttachmentChanged({ path: it.path, blob });
                     onOpenVideo?.({
-                      url,
+                      url: r.url,
                       path: it.path,
                       display: it.display || it.path,
                       blob,
