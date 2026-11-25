@@ -710,6 +710,10 @@ pub(crate) fn attachments(
     if let Err(error) = crate::wire::backfill_artifact_refs(&ctx.env, channel, chat_id) {
         tracing::debug!("补附件索引失败（清单照常）: {error}");
     }
+    // 读引用之前先记下同步空间的代：读完之后文件核对可能很慢，这中间换了空间的话，
+    // 这次清单补登记不能把旧空间的对象写回去（`ctx.space.begin()` 此时已经是新代，
+    // 光靠它会漏掉这段窗口）。
+    let epoch_before = ctx.space.epoch();
     let found: Vec<FoundRef> = db::read(ctx.db(), |conn| {
         if !sync_db::sync_tables_exist(conn)? {
             return Ok(Vec::new());
@@ -829,17 +833,18 @@ pub(crate) fn attachments(
             };
             // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
             // 里、密钥读不出来）时验不了：按登记说它在（老行为）。
-            // 内容核对（只在 `deep` 时做；没有密钥也验不了）。
+            // 内容核对（没有密钥时验不了）。
             let verified = |path: &Path| -> bool {
-                deep && keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
+                keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
             };
             let (state, local_path, rel_path) = match &found.row {
                 Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
                 Some(row) => match landing(&row.rel_path) {
                     // 落点上的文件已经不是这个对象（被就地改写过）：不能当它还在，
                     // 界面上给「重新下载」（`attach::lookup` 也按内容核对，取回时不会
-                    // 覆盖这份内容不同的文件）。
-                    Some(path) if found.kind == "file" && !verified(&path) => {
+                    // 覆盖这份内容不同的文件）。只有这一条应用了核对才算——预算没轮到的
+                    // 只是「没核对过」，不是「内容对不上」。
+                    Some(path) if deep && found.kind == "file" && !verified(&path) => {
                         ("changed", None, None)
                     }
                     Some(path) if row.rel_path.starts_with(SYNC_DIR_PREFIX) => {
@@ -914,9 +919,10 @@ pub(crate) fn attachments(
         })
         .collect();
     if !restore.is_empty() {
-        // 换空间期间的清单不能把旧空间的登记写回来：写之前核对一次代。
+        // 换空间期间的清单不能把旧空间的登记写回来：读引用时记下的代、开始写时的代
+        // 与提交许可三处一致才写。
         let commit = ctx.space.begin();
-        if commit.valid() {
+        if commit.valid() && ctx.space.epoch() == epoch_before {
             if let Err(error) = db::write(ctx.db(), |tx| {
                 if !commit.valid() {
                     return Ok(());

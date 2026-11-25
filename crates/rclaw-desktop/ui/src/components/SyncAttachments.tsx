@@ -356,6 +356,13 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       alive = false;
       window.clearTimeout(timer);
       window.clearTimeout(aliasTimer);
+      // 离开对话页（或换会话）：清单可能在这段时间里过时（App 照样在合入消息）。
+      // 清单本身留着（同一个会话回来不闪），但标成「未核对」——回来时先按未就绪
+      // 处理，等新清单到了再放开工作区路径。
+      if (chat === chatId && loaded === chatId) {
+        loaded = null;
+        emit();
+      }
       if (reload === schedule) reload = null;
       void un.then((fn) => fn());
     };

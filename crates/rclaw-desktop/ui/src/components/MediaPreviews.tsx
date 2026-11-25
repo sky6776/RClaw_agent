@@ -45,20 +45,15 @@ function toWorkspacePath(p: string): string {
 }
 
 /** 正文里是否真的写出了这个路径：两侧要有边界（`report.pdf` 不能命中
- *  `report.pdf.bak`，也不能命中 `my_media/x.png` 的尾巴）。补卡与画廊的清单兜底
- *  共用这一把尺子。 */
+ *  `report.pdf.bak`，也不能命中 `output/media/x.png` 里的 `media/x.png` 尾巴）。
+ *  补卡与画廊的清单兜底共用这一把尺子。 */
 export function mentionsPath(content: string, path: string): boolean {
-  const word = /[A-Za-z0-9_.\-]/;
   let from = 0;
   for (;;) {
     const at = content.indexOf(path, from);
     if (at < 0) return false;
-    const before = at === 0 ? "" : content[at - 1];
     const after = content[at + path.length] ?? "";
-    const okBefore =
-      before === "" || before === "/" || before === "\\" || !word.test(before);
-    // 句末的「.」后面是空白/汉字时算边界；后面还接着文件名成分（`pdf.bak`）就不算。
-    // 句点必须单独判，不能让它落进「标点都算边界」那一支。
+    // 句点必须单独判：后面还接着文件名成分（`pdf.bak`）就不是这个路径。
     const next = content[at + path.length + 1] ?? "";
     const okAfter =
       after === ""
@@ -66,10 +61,27 @@ export function mentionsPath(content: string, path: string): boolean {
         : after === "."
           ? !/[A-Za-z0-9_]/.test(next)
           : !/[A-Za-z0-9_\-/\\]/.test(after);
-    if (okBefore && okAfter) return true;
+    if (okAfter && boundaryBefore(content, at)) return true;
     from = at + 1;
   }
 }
+
+/** 匹配位置左边的边界：token 开头，或者紧跟在**工作区根**（`agent/`）之后。
+ *  `output/media/x.png` 里的 `media/x.png` 是另一个路径的尾巴，不算——那会把它
+ *  挂成一张不相干的卡。句读、空白、汉字都算边界。 */
+function boundaryBefore(content: string, at: number): boolean {
+  if (at === 0) return true;
+  const before = content[at - 1];
+  if (!/[A-Za-z0-9_.\-/\\]/.test(before)) return true;
+  if (before !== "/" && before !== "\\") return false;
+  // 紧跟在一个分隔符后面：前一段必须是工作区根 `agent`（媒体回执行里的绝对路径
+  // 就是这种写法）。
+  const end = at - 1;
+  let start = end;
+  while (start > 0 && !/[/\\]/.test(content[start - 1])) start -= 1;
+  return content.slice(start, end).toLowerCase() === "agent";
+}
+
 
 /** 从消息正文解析媒体引用条目（媒体回执行 + 工作区路径 + 裸文件名兜底）。
  *  顺序即出现顺序，同路径去重。除本组件出卡外，Chat 的全屏媒体画廊也用
