@@ -298,19 +298,33 @@ function save(chatId: string, item: SyncAttachment) {
   }));
   api
     .syncAttachmentSave(chatId, item.blob, item.path)
-    .then(({ rel, verified }) => {
+    .then(({ rel, verified, blob: savedBlob }) => {
       if (chat !== chatId) return;
+      // 旧版明文登记保存成功后被归一：消息引用换成了新对象名，落点要记在刷新后用的
+      // 键上（否则刷新后卡片按新名找不到「已存到」，又显示「存进工作区」）。
+      const savedKey = `${savedBlob}:${item.path}`;
       // 只有「写下去的字节核对过 **且** 落点就是这条消息的路径」才撤「读出来对不上」
       // 的覆盖：目标被别的文件占着时存成了 `-快照`，消息路径上仍然不是这份内容，标记
       // 要留着（其余路径同理，按落点清而不是按对象整体清）。
       if (verified && rel === item.path) {
         clearAttachmentChanged({ path: item.path, blob: item.blob });
-      } else if (changedKeys.has(key)) {
+        if (savedBlob !== item.blob) {
+          clearAttachmentChanged({ path: item.path, blob: savedBlob });
+        }
+      } else if (changedKeys.has(key) || changedKeys.has(savedKey)) {
         // 没核对、或者没存到这条消息的路径上：卡片上的说明要放回去（保存开始时按常规
         // 清过一次）。
-        cards = { ...cards, saveErrors: { ...cards.saveErrors, [key]: CHANGED_CARD_NOTE } };
+        cards = {
+          ...cards,
+          saveErrors: { ...cards.saveErrors, [savedKey]: CHANGED_CARD_NOTE },
+        };
       }
-      setCards((prev) => ({ ...prev, saved: { ...prev.saved, [key]: rel } }));
+      setCards((prev) => {
+        const saved = { ...prev.saved, [savedKey]: rel };
+        // 归一之后旧对象名的键不再被卡片使用。
+        if (savedBlob !== item.blob) delete saved[key];
+        return { ...prev, saved };
+      });
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
       // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。
       reload?.();

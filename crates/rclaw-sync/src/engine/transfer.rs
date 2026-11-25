@@ -99,35 +99,48 @@ pub(crate) async fn upload_task(shared: Arc<Shared>, live: Arc<Live>) {
     }
 }
 
+/// 一次取回从取起到结算要带过去的现场。
+struct Attempt {
+    blob: String,
+    /// 临时登记的尝试标识（`blob-probe` 标记里的那段随机值）；不是用户点的
+    /// 「重新下载」时为 None（失败清理什么都不撤）。
+    token: Option<String>,
+    /// 取回开始时登记的状态与落点上有没有文件：结算时拿它们判断「期间是不是被别人
+    /// 处理过」（改过就丢弃这次晚到的结论）。
+    start_state: Option<i64>,
+    start_present: bool,
+}
+
 async fn fetch_one(
     shared: Arc<Shared>,
     live: Arc<Live>,
-    blob: String,
-    attempt: Option<String>,
-    start_state: Option<i64>,
-) -> (
-    String,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
-    Result<()>,
-) {
+    attempt: Attempt,
+) -> (Attempt, Option<String>, Result<()>) {
     let max_size = shared.attachment_max.load(Ordering::Relaxed);
-    let outcome =
-        attach::download(&shared.ctx, live.transport(), &live.keys, &blob, max_size).await;
+    let outcome = attach::download(
+        &shared.ctx,
+        live.transport(),
+        &live.keys,
+        &attempt.blob,
+        max_size,
+    )
+    .await;
     // 实际落点（相对路径）：界面按它清「这个落点内容对不上」的标记，别的地方不能跟着清。
     let landed = match &outcome {
         Ok(path) => shared.ctx.env.rel_path(path),
         Err(_) => None,
     };
-    (blob, attempt, start_state, landed, outcome.map(|_| ()))
+    (attempt, landed, outcome.map(|_| ()))
 }
 
 /// 这次取回开始时的现场：临时登记的尝试标识（没有标记时 None）与登记的状态。
 /// 结算时拿它们判断「登记是不是在取的过程中被别人改过」——改过就说明另一条路已经
 /// 有结论了，这次晚到的「没取到」要作废；没改过才照常处理（本机文件丢了的那种
 /// `UPLOADED`/`HELD` 登记也要能走到 `on_missing`）。
-async fn probe_token_and_state(shared: &Arc<Shared>, blob: &str) -> (Option<String>, Option<i64>) {
+async fn probe_token_and_state(
+    shared: &Arc<Shared>,
+    blob: &str,
+) -> (Option<String>, Option<i64>, bool) {
     let (ctx, wanted) = (shared.ctx.clone(), blob.to_string());
     let read = blocking(move || {
         db::read(ctx.db(), |conn| {
@@ -137,12 +150,20 @@ async fn probe_token_and_state(shared: &Arc<Shared>, blob: &str) -> (Option<Stri
                 .and_then(attach::probe_parts)
                 .map(|(_, token, _)| token.to_string())
                 .filter(|token| !token.is_empty());
-            let state = db::blob_get(conn, &wanted)?.map(|row| row.state);
-            Ok((token, state))
+            let row = db::blob_get(conn, &wanted)?;
+            let state = row.as_ref().map(|row| row.state);
+            // 落点上现在有没有文件：结算时拿它判断「文件是不是被别人放回来了」。
+            let present = row.is_some_and(|row| {
+                ctx.env
+                    .checked_path(&row.rel_path)
+                    .map(|path| path.is_file())
+                    .unwrap_or(false)
+            });
+            Ok((token, state, present))
         })
     })
     .await;
-    read.unwrap_or((None, None))
+    read.unwrap_or((None, None, false))
 }
 
 /// 库里的 `blob-probe` 标记是不是这一次尝试的（没有标记 / 不是这次 → false）。
@@ -175,13 +196,16 @@ pub(crate) async fn download_task(
             // 重试的临时登记：被真正取起时刷新一下时间戳，长时间排队/慢速下载期间
             // 别的设备的 `blob.want` 不会把它当成「陈旧残留」撤掉。
             touch_probe(&shared, &blob).await;
-            let (attempt, start_state) = probe_token_and_state(&shared, &blob).await;
+            let (token, start_state, start_present) = probe_token_and_state(&shared, &blob).await;
             running.push(fetch_one(
                 shared.clone(),
                 live.clone(),
-                blob,
-                attempt,
-                start_state,
+                Attempt {
+                    blob,
+                    token,
+                    start_state,
+                    start_present,
+                },
             ));
         }
         tokio::select! {
@@ -210,9 +234,9 @@ pub(crate) async fn download_task(
                     }
                 }
             }
-            Some((blob, attempt, start_state, landed, result)) = running.next(), if !running.is_empty() => {
-                let user = wanted.remove(&blob).unwrap_or(false);
-                finish(&shared, blob, user, attempt, start_state, landed, result).await;
+            Some((attempt, landed, result)) = running.next(), if !running.is_empty() => {
+                let user = wanted.remove(&attempt.blob).unwrap_or(false);
+                finish(&shared, attempt, user, landed, result).await;
             }
         }
     }
@@ -257,13 +281,19 @@ async fn touch_probe(shared: &Arc<Shared>, blob: &str) {
 /// 或者持有它的设备说拿不出来了，就收场（[`attach::on_missing`]）。
 async fn finish(
     shared: &Arc<Shared>,
-    blob: String,
+    attempt: Attempt,
     user: bool,
-    attempt: Option<String>,
-    start_state: Option<i64>,
     landed: Option<String>,
     result: Result<()>,
 ) {
+    let Attempt {
+        blob,
+        token,
+        start_state,
+        start_present,
+    } = attempt;
+    // 后面沿用 `attempt` 这个名字（尝试标识）。
+    let attempt = token;
     // 这次是不是真的把对象落到了本机：`Ok` 是；「存上没有/内容坏了」记完账走的是下面
     // 的 `Ok(None)` 分支（不算落盘，界面不能据此撤「内容对不上」的标记）。
     let placed = result.is_ok();
@@ -313,8 +343,16 @@ async fn finish(
                     // 取的过程中登记被别人改过（同一对象被另一条取回入口落了盘、标记也被
                     // 它清掉）：这次晚到的「没取到」作废，不能把刚取回的登记改回远端。
                     // 没改过的（本机文件丢了、登记还是 UPLOADED/HELD）照常走缺件记账。
-                    let state_now = db::blob_get(tx, &wanted)?.map(|row| row.state);
-                    if state_now != start_state {
+                    let row_now = db::blob_get(tx, &wanted)?;
+                    let state_now = row_now.as_ref().map(|row| row.state);
+                    // 落点上现在有没有文件：被别人放回来了也算「已经有结论」。
+                    let present_now = row_now.as_ref().is_some_and(|row| {
+                        ctx.env
+                            .checked_path(&row.rel_path)
+                            .map(|path| path.is_file())
+                            .unwrap_or(false)
+                    });
+                    if state_now != start_state || (!start_present && present_now) {
                         return Ok(None);
                     }
                     let probe = probe_matches(tx, &wanted, attempt.as_deref())?

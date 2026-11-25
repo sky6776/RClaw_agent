@@ -1030,6 +1030,9 @@ pub async fn sync_open_attachment(
 pub struct SavedSnapshot {
     pub rel: String,
     pub verified: bool,
+    /// 界面刷新后该用的对象名：旧版明文登记在保存成功后被归一成带密钥的对象名，
+    /// 前端要按这个名字记「已存到」的落点（消息引用也一起换成了它）。
+    pub blob: String,
 }
 
 /// 把一份文件快照存进工作区（§8.7）。返回它在工作区里的相对路径。
@@ -1213,63 +1216,9 @@ fn save_snapshot(home: &Path, path: &str, cached: &Path) -> Result<String, Strin
     Ok(format!("{dir_rel}/{file_name}"))
 }
 
-/// 把核对过的内容发布到工作区：先写同目录下的临时文件，摘要核对通过后再以「不覆盖
-/// 已有文件」的方式原子发布（硬链接）。并行的读取不会看到半成品，也不会在摘要拒绝之前
-/// 读走错误内容。
-///
-/// 核对与写临时文件**只做一次**：候选名被并发占走时换名字重试的只是硬链接这一步。
-/// （每换一个名字重读一遍的话，第二遍会在旧版明文登记已经归一之后按老对象名找不到
-/// 登记，退回不核对的复制。）
-fn write_verified_file(
-    dir: &Path,
-    candidate_name: impl Fn(u32) -> String,
-    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
-) -> Result<PathBuf, String> {
-    let tmp = dir.join(format!(
-        ".rclaw-save-{}.tmp",
-        rclaw_sync::ids::random_hex::<8>()
-    ));
-    let mut file = match super::open_for_write_nofollow(&tmp, true) {
-        Ok(file) => file,
-        Err(e) => return Err(format!("存进工作区失败: {e}")),
-    };
-    if let Err(e) = write(&mut file) {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("存进工作区失败: {e}"));
-    }
-    drop(file);
-    let mut last = None;
-    for n in 1..=999u32 {
-        let dest = dir.join(candidate_name(n));
-        if std::fs::symlink_metadata(&dest).is_ok() {
-            continue;
-        }
-        match std::fs::hard_link(&tmp, &dest) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Ok(dest);
-            }
-            // 名字刚被别人占了：换下一个候选（临时文件照用）。
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            // 文件系统不支持硬链接：**不**退回「按正式名先建再复制」——那会让并行的
-            // 读取看到未核对的半成品。宁可这次存不了，也不把核对过的说法变成假的。
-            Err(e) => {
-                last = Some(e);
-                break;
-            }
-        }
-    }
-    let _ = std::fs::remove_file(&tmp);
-    Err(match last {
-        Some(e) => format!("存进工作区失败: 这个文件系统不支持原子发布（{e}）"),
-        None => "存进工作区失败: 同名文件过多，请手动整理".to_string(),
-    })
-}
-
-/// [`sync_attachment_save`] 的核心（核对版）：同 [`save_snapshot`]，但写出去的字节与
-/// 核对是**同一次读**——目标已经有一份一模一样的、或者写下去的内容摘要对不上，都在
-/// 同一次读里发现；对不上的那份写完就撤掉（`write_fresh_file` 失败即删）。
+/// [`sync_attachment_save`] 的核心（核对版）：把核对过的内容**一次**读进同目录的暂存
+/// 文件，比较目标与发布都用这一份——写出去的字节和核对是同一次读，而且不会出现
+/// 「第二次读时旧版登记已被别人归一、按旧对象名查不到登记」。
 fn save_snapshot_checked(
     home: &Path,
     path: &str,
@@ -1279,126 +1228,109 @@ fn save_snapshot_checked(
 ) -> Result<SavedSnapshot, String> {
     let (dir, dir_rel, name) = snapshot_dir(home, path)?;
     let target = dir.join(&name);
-    // 只把普通文件当「那里已经有一份」：链接（或别的什么挡在名字上）不算，往下照
-    // 「另存一份」走（与 [`save_snapshot`] 的老行为一致）。
-    if std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_file()) {
-        // 目标位置已经有一份：同一次读里比较它和缓存副本、并核对缓存副本的摘要。
-        let mut same = true;
-        match engine
-            .copy_cached_blob(blob, &mut |reader| {
-                compare_snapshot(reader, &target, &mut same)
-            })
-            .map_err(|e| format!("存进工作区失败: {e}"))?
-        {
-            rclaw_sync::AttachmentCopy::Copied | rclaw_sync::AttachmentCopy::CopiedLegacy
-                if same =>
-            {
-                return Ok(SavedSnapshot {
-                    rel: format!("{dir_rel}/{name}"),
-                    verified: true,
-                })
-            }
-            // 内容不同不是错：往下照「另存一份」处理。
-            rclaw_sync::AttachmentCopy::Copied | rclaw_sync::AttachmentCopy::CopiedLegacy => {}
-            rclaw_sync::AttachmentCopy::Rejected => return Err(CHANGED_SNAPSHOT.into()),
-            // 核不了（没有登记/密钥）：按老行为只看内容一不一样。
-            rclaw_sync::AttachmentCopy::Unverifiable => {
-                return Ok(SavedSnapshot {
-                    rel: save_snapshot(home, path, cached)?,
-                    verified: false,
-                })
-            }
+
+    // 一次读：核对过的字节写进同目录的临时文件；比较与发布都复用这一份。
+    let legacy = std::cell::Cell::new(false);
+    let tmp = dir.join(format!(
+        ".rclaw-save-{}.tmp",
+        rclaw_sync::ids::random_hex::<8>()
+    ));
+    let mut file =
+        super::open_for_write_nofollow(&tmp, true).map_err(|e| format!("存进工作区失败: {e}"))?;
+    let staged = engine.copy_cached_blob(blob, &mut |reader| {
+        std::io::copy(reader, &mut file).map(|_| ())
+    });
+    drop(file);
+    match staged {
+        Ok(rclaw_sync::AttachmentCopy::Copied) => {}
+        Ok(rclaw_sync::AttachmentCopy::CopiedLegacy) => legacy.set(true),
+        // 核不了：删掉暂存，按老行为复制一份，但如实告诉界面这次没核对。
+        Ok(rclaw_sync::AttachmentCopy::Unverifiable) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(SavedSnapshot {
+                rel: save_snapshot(home, path, cached)?,
+                verified: false,
+                blob: blob.to_string(),
+            });
+        }
+        Ok(rclaw_sync::AttachmentCopy::Rejected) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CHANGED_SNAPSHOT.into());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("存进工作区失败: {e}"));
         }
     }
-    // 写入闭包里只接受「核对通过」：核不了（`Unverifiable`）时 `copy_cached_blob` 根本
-    // 不会读文件，闭包必须报错让 `write_fresh_file` 把刚建的空文件删掉，再退回不核对的
-    // 老路径重来一次——不能把一个 0 字节的「快照」留在工作区。
-    let outcome = std::cell::Cell::new(None);
-    // 这次读到的内容来自旧版明文摘要登记：保存发布成功之后再把登记归一。
-    let legacy = std::cell::Cell::new(false);
-    let dest = match write_verified_file(
-        &dir,
-        |n| snapshot_name(n, &name),
-        |file| {
-            // 读出来的字节直接写进目标文件，摘要就在这同一次读里算、读完后核对；
-            // 对不上时返回错误，`write_fresh_file` 会把刚写的这份删掉。
-            match engine
-                .copy_cached_blob(blob, &mut |reader| std::io::copy(reader, file).map(|_| ()))
-            {
-                Ok(rclaw_sync::AttachmentCopy::Copied) => Ok(()),
-                Ok(rclaw_sync::AttachmentCopy::CopiedLegacy) => {
-                    legacy.set(true);
-                    Ok(())
-                }
-                Ok(other) => {
-                    outcome.set(Some(other));
-                    Err(std::io::Error::other("这份快照核不了"))
-                }
-                Err(e) => Err(e),
-            }
-        },
-    ) {
-        Ok(dest) => dest,
-        Err(e) => {
-            return match outcome.get() {
-                // 核不了：按老行为复制一份，但如实告诉界面这次没核对。
-                Some(rclaw_sync::AttachmentCopy::Unverifiable) => Ok(SavedSnapshot {
-                    rel: save_snapshot(home, path, cached)?,
-                    verified: false,
-                }),
-                Some(rclaw_sync::AttachmentCopy::Rejected) => Err(CHANGED_SNAPSHOT.into()),
-                _ => Err(e),
-            };
-        }
-    };
+
+    // 目标位置已经有一份一模一样的（只把普通文件当「那里已经有一份」：链接或别的
+    // 什么挡在名字上不算，往下照「另存一份」走）。
+    if std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_file())
+        && same_content(&target, &tmp)
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(SavedSnapshot {
+            rel: format!("{dir_rel}/{name}"),
+            verified: true,
+            blob: normalized_blob(engine, blob, legacy.get()),
+        });
+    }
+
+    let dest = publish_staged(&tmp, &dir, |n| snapshot_name(n, &name))?;
     let file_name = dest
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| "结果路径异常".to_string())?;
-    // 内容已经发布到工作区：这时才把旧版明文登记归一（提前换掉对象名会让失败重试
-    // 按旧名找不到登记）。
-    if legacy.get() {
-        engine.normalize_cached_blob(blob);
-    }
     Ok(SavedSnapshot {
         rel: format!("{dir_rel}/{file_name}"),
         verified: true,
+        blob: normalized_blob(engine, blob, legacy.get()),
     })
 }
 
-/// 把 `reader`（核对过的缓存副本）与 `target` 逐块比较，读到来源结尾为止（摘要要覆盖
-/// 全部内容）；不一样、或者目标读不了，就把 `same` 置 false。
-fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> std::io::Result<()> {
-    let mut other = std::fs::File::open(target).ok();
-    if other.is_none() {
-        // 打不开（被占用/没有权限）：算不上「一样」，按「另存一份」走；来源照读到底，
-        // 摘要要覆盖全部内容。
-        *same = false;
+/// 旧版明文登记的内容已经落到工作区：这时才把登记归一，并返回界面刷新后该用的对象名
+/// （消息引用被改写成新对象名，前端要按新名记「已存到」的落点）。
+fn normalized_blob(engine: &SyncEngine, blob: &str, legacy: bool) -> String {
+    if !legacy {
+        return blob.to_string();
     }
-    let (mut left, mut right) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
-    loop {
-        let n = read_full(reader, &mut left)?;
-        let read_other = match other.as_mut() {
-            Some(other) => read_full(other, &mut right),
-            None => Ok(0),
-        };
-        let m = match read_other {
-            Ok(m) => m,
-            Err(_) => {
-                // 目标读不了（权限/被占用）：算不上「一样」，但也不用为此让整次保存
-                // 失败——按「另存一份」走。
-                *same = false;
-                other = None;
-                0
+    engine
+        .normalize_cached_blob(blob)
+        .unwrap_or_else(|| blob.to_string())
+}
+
+/// 把暂存文件发布成工作区里的新文件：候选名逐个试，`hard_link` 保证不覆盖已有文件、
+/// 也不会让并行的读取看到半成品（不支持硬链接的文件系统直接失败，**不**退回按正式名
+/// 复制——那会让读取看到未核对的半成品）。
+fn publish_staged(
+    tmp: &Path,
+    dir: &Path,
+    candidate_name: impl Fn(u32) -> String,
+) -> Result<PathBuf, String> {
+    let mut last = None;
+    for n in 1..=999u32 {
+        let dest = dir.join(candidate_name(n));
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            continue;
+        }
+        match std::fs::hard_link(tmp, &dest) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(tmp);
+                return Ok(dest);
             }
-        };
-        if n != m || left[..n] != right[..m] {
-            *same = false;
-        }
-        if n == 0 {
-            return Ok(());
+            // 名字刚被别人占了：换下一个候选（暂存文件照用）。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                last = Some(e);
+                break;
+            }
         }
     }
+    let _ = std::fs::remove_file(tmp);
+    Err(match last {
+        Some(e) => format!("存进工作区失败: 这个文件系统不支持原子发布（{e}）"),
+        None => "存进工作区失败: 同名文件过多，请手动整理".to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------

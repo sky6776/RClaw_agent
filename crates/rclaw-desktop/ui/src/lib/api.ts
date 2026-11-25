@@ -1660,7 +1660,7 @@ export const api = {
    *  核对过的」（核不了时按老行为复制，verified=false）。
    *  `path` 是消息里写的那个路径：同一份内容被几条消息引用时，存到点的那条的位置上。 */
   syncAttachmentSave: (chatId: string, blob: string, path: string) =>
-    invoke<{ rel: string; verified: boolean }>("sync_attachment_save", {
+    invoke<{ rel: string; verified: boolean; blob: string }>("sync_attachment_save", {
       chatId,
       blob,
       path,

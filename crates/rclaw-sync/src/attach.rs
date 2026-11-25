@@ -235,6 +235,9 @@ pub(crate) enum LocalObject {
 }
 
 fn check_local_row(ctx: &Ctx, keys: &Keys, row: BlobRow) -> Result<LocalObject> {
+    // 同步代在取登记、读文件**之前**取：读的过程中换了空间，这次读到的对象名是旧
+    // 密钥算的，归一必须作废（事务里还会再核一次）。
+    let epoch = ctx.space.epoch();
     // 路径不安全（经过链接、拼不出本机的名字）：按「验不了」处理，由别处照常兜底。
     let Ok(path) = ctx.env.checked_path(&row.rel_path) else {
         return Ok(LocalObject::Unknown);
@@ -259,14 +262,9 @@ fn check_local_row(ctx: &Ctx, keys: &Keys, row: BlobRow) -> Result<LocalObject> 
         return Ok(LocalObject::Mismatch);
     }
     // 旧版本按明文摘要登记的内联缓存：内容对得上，对象名按空间密钥重算并改登记。
-    let normalized = normalize_registration(
-        ctx,
-        &row.blob_id,
-        &current,
-        &row.rel_path,
-        len,
-        ctx.space.epoch(),
-    )?;
+    // 同步代在函数入口就取过（读文件之前），这里用那个。
+    let normalized =
+        normalize_registration(ctx, &row.blob_id, &current, &row.rel_path, len, epoch)?;
     Ok(LocalObject::Intact(normalized))
 }
 
@@ -284,6 +282,16 @@ pub(crate) fn normalize_registration(
         // 读文件是在旧空间里做的：拿锁之后换代了就作废，别把旧对象名写进新空间。
         if ctx.space.epoch() != epoch {
             return Err(SyncError::other("同步空间刚换过，这次登记归一作废"));
+        }
+        // 原登记得还是读文件时那一条：期间被别的操作换掉/改成「等待取回」的，
+        // 这次归一作废（别把已经有人处理过的登记再改一遍）。
+        let Some(existing) = db::blob_get(tx, old)? else {
+            return Err(SyncError::other(
+                "这条登记已经被别的操作换掉了，这次归一作废",
+            ));
+        };
+        if existing.rel_path != rel_path || existing.state == BLOB_REMOTE {
+            return Err(SyncError::other("这条登记已经被别的操作改过，这次归一作废"));
         }
         // 新对象名已经登记过（另一条消息先归一过，或同一份内容从别的设备取回过）：
         // 保留它的状态，落点换成本次核对过的这一份——两份内容相同。

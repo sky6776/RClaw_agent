@@ -1299,46 +1299,37 @@ impl SyncEngine {
     /// 旧版按明文摘要登记的本机副本：内容核对得上时把登记归一成带密钥的对象名
     /// （只改登记与消息引用，不改文件）。调用方已经在同一次读里确认过内容就是这个
     /// 对象；这里再读一遍只为拿摘要，失败就算了（登记归一只是补救）。
-    pub fn normalize_cached_blob(&self, blob: &str) {
+    ///
+    /// 归一成功时返回新对象名（调用方要按它记落点：消息引用也换成了它）。
+    pub fn normalize_cached_blob(&self, blob: &str) -> Option<String> {
         let ctx = &self.inner.ctx;
         let epoch = ctx.space.epoch();
-        let Some(keys) = Secrets::load(&ctx.paths)
+        let keys = Secrets::load(&ctx.paths)
             .ok()
-            .and_then(|secrets| secrets.keys().ok())
-        else {
-            return;
-        };
+            .and_then(|secrets| secrets.keys().ok())?;
         let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
             .ok()
-            .flatten();
-        let Some(row) = row else {
-            return;
-        };
+            .flatten()?;
         if row.state == db::BLOB_REMOTE {
-            return;
+            return None;
         }
-        let Ok(path) = ctx.env.checked_path(&row.rel_path) else {
-            return;
-        };
-        let Ok(file) = std::fs::File::open(&path) else {
-            return;
-        };
+        let path = ctx.env.checked_path(&row.rel_path).ok()?;
+        let file = std::fs::File::open(&path).ok()?;
         let cap = row.size.saturating_add(local::SIZE_SLACK).saturating_add(1);
-        let Ok((digest, read)) = crate::crypto::sha256_reader(&mut file.take(cap)) else {
-            return;
-        };
+        let (digest, read) = crate::crypto::sha256_reader(&mut file.take(cap)).ok()?;
         if read > row.size.saturating_add(local::SIZE_SLACK) {
-            return;
+            return None;
         }
         let keyed = keys.blob_id(&digest);
         if keyed == blob || crate::ids::hex(&digest) != blob {
-            return;
+            return None;
         }
         if ctx.space.epoch() != epoch {
-            return;
+            return None;
         }
-        let _ =
-            crate::attach::normalize_registration(ctx, blob, &keyed, &row.rel_path, read, epoch);
+        crate::attach::normalize_registration(ctx, blob, &keyed, &row.rel_path, read, epoch)
+            .ok()
+            .map(|_| keyed)
     }
 
     /// 读出本机缓存里 `blob` 副本的字节（与 [`Self::copy_cached_blob`] 同一次读核对）。
