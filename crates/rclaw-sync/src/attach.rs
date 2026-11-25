@@ -747,6 +747,16 @@ fn place(ctx: &Ctx, commit: &Commit, blob_id: &str, plain: &Path) -> Result<Path
             return Err(abandoned());
         }
         db::blob_set(tx, blob_id, &rel_path, BLOB_FETCHED)?;
+        // 落盘版本：每次成功落盘换一个新值——缺件结算据此判断「期间是不是已经有别的
+        // 取回路径落过盘」（状态都是 FETCHED 时也认得出）。
+        db::state_put(
+            tx,
+            scope::BLOB_LANDED,
+            blob_id,
+            db::HLC_ZERO,
+            None,
+            Some(&ids::random_hex::<8>()),
+        )?;
         // 取回成功：这条登记不再是「重新下载」的临时登记，撤掉标记（以后清单/回收都
         // 按常规登记对待）。
         tx.execute(

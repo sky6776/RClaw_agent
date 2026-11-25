@@ -105,10 +105,10 @@ struct Attempt {
     /// 临时登记的尝试标识（`blob-probe` 标记里的那段随机值）；不是用户点的
     /// 「重新下载」时为 None（失败清理什么都不撤）。
     token: Option<String>,
-    /// 取回开始时登记的状态与落点上有没有文件：结算时拿它们判断「期间是不是被别人
-    /// 处理过」（改过就丢弃这次晚到的结论）。
+    /// 取回开始时登记的状态与最近一次落盘的标识：结算时拿它们判断「期间是不是被
+    /// 别人处理过」（改过就丢弃这次晚到的结论）。
     start_state: Option<i64>,
-    start_present: bool,
+    start_landed: Option<String>,
 }
 
 async fn fetch_one(
@@ -133,14 +133,14 @@ async fn fetch_one(
     (attempt, landed, outcome.map(|_| ()))
 }
 
-/// 这次取回开始时的现场：临时登记的尝试标识（没有标记时 None）与登记的状态。
-/// 结算时拿它们判断「登记是不是在取的过程中被别人改过」——改过就说明另一条路已经
-/// 有结论了，这次晚到的「没取到」要作废；没改过才照常处理（本机文件丢了的那种
+/// 这次取回开始时的现场：临时登记的尝试标识（没有标记时 None）、登记的状态、最近
+/// 一次成功落盘的标识。结算时拿它们判断「期间是不是已经有别的取回路径有了结论」——
+/// 有变化就说明这次晚到的「没取到」要作废；没变才照常处理（本机文件丢了的那种
 /// `UPLOADED`/`HELD` 登记也要能走到 `on_missing`）。
 async fn probe_token_and_state(
     shared: &Arc<Shared>,
     blob: &str,
-) -> (Option<String>, Option<i64>, bool) {
+) -> (Option<String>, Option<i64>, Option<String>) {
     let (ctx, wanted) = (shared.ctx.clone(), blob.to_string());
     let read = blocking(move || {
         db::read(ctx.db(), |conn| {
@@ -150,20 +150,14 @@ async fn probe_token_and_state(
                 .and_then(attach::probe_parts)
                 .map(|(_, token, _)| token.to_string())
                 .filter(|token| !token.is_empty());
-            let row = db::blob_get(conn, &wanted)?;
-            let state = row.as_ref().map(|row| row.state);
-            // 落点上现在有没有文件：结算时拿它判断「文件是不是被别人放回来了」。
-            let present = row.is_some_and(|row| {
-                ctx.env
-                    .checked_path(&row.rel_path)
-                    .map(|path| path.is_file())
-                    .unwrap_or(false)
-            });
-            Ok((token, state, present))
+            let state = db::blob_get(conn, &wanted)?.map(|row| row.state);
+            let landed = db::state_get(conn, crate::db::scope::BLOB_LANDED, &wanted)?
+                .and_then(|row| row.value);
+            Ok((token, state, landed))
         })
     })
     .await;
-    read.unwrap_or((None, None, false))
+    read.unwrap_or((None, None, None))
 }
 
 /// 库里的 `blob-probe` 标记是不是这一次尝试的（没有标记 / 不是这次 → false）。
@@ -196,7 +190,7 @@ pub(crate) async fn download_task(
             // 重试的临时登记：被真正取起时刷新一下时间戳，长时间排队/慢速下载期间
             // 别的设备的 `blob.want` 不会把它当成「陈旧残留」撤掉。
             touch_probe(&shared, &blob).await;
-            let (token, start_state, start_present) = probe_token_and_state(&shared, &blob).await;
+            let (token, start_state, start_landed) = probe_token_and_state(&shared, &blob).await;
             running.push(fetch_one(
                 shared.clone(),
                 live.clone(),
@@ -204,7 +198,7 @@ pub(crate) async fn download_task(
                     blob,
                     token,
                     start_state,
-                    start_present,
+                    start_landed,
                 },
             ));
         }
@@ -290,7 +284,7 @@ async fn finish(
         blob,
         token,
         start_state,
-        start_present,
+        start_landed,
     } = attempt;
     // 后面沿用 `attempt` 这个名字（尝试标识）。
     let attempt = token;
@@ -340,19 +334,18 @@ async fn finish(
                     {
                         return Ok(None);
                     }
-                    // 取的过程中登记被别人改过（同一对象被另一条取回入口落了盘、标记也被
-                    // 它清掉）：这次晚到的「没取到」作废，不能把刚取回的登记改回远端。
-                    // 没改过的（本机文件丢了、登记还是 UPLOADED/HELD）照常走缺件记账。
-                    let row_now = db::blob_get(tx, &wanted)?;
-                    let state_now = row_now.as_ref().map(|row| row.state);
-                    // 落点上现在有没有文件：被别人放回来了也算「已经有结论」。
-                    let present_now = row_now.as_ref().is_some_and(|row| {
-                        ctx.env
-                            .checked_path(&row.rel_path)
-                            .map(|path| path.is_file())
-                            .unwrap_or(false)
-                    });
-                    if state_now != start_state || (!start_present && present_now) {
+                    // 期间已经有别的取回路径落了盘：这次晚到的「没取到」作废，不能把
+                    // 刚取回的登记改回远端。三样都要没变过（只看状态的话，
+                    // FETCHED→FETCHED 这种「又落了一次盘」看不出来）：
+                    // - 登记状态没变；- 落盘标识没变；- 这次尝试还认领着自己的标记
+                    //   （成功落盘会清标记，别的尝试会换标记）。
+                    let state_now = db::blob_get(tx, &wanted)?.map(|row| row.state);
+                    let landed_now = db::state_get(tx, crate::db::scope::BLOB_LANDED, &wanted)?
+                        .and_then(|row| row.value);
+                    if state_now != start_state || landed_now != start_landed {
+                        return Ok(None);
+                    }
+                    if attempt.is_some() && !probe_matches(tx, &wanted, attempt.as_deref())? {
                         return Ok(None);
                     }
                     let probe = probe_matches(tx, &wanted, attempt.as_deref())?

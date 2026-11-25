@@ -99,14 +99,14 @@ pub enum AttachmentBytes {
 }
 
 /// 「边核对边交给调用方」的结果：保存快照、读缓存副本用。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum AttachmentCopy {
     /// 交出去的字节就是 `blob` 这个对象（摘要来自同一次读）。
     Copied,
     /// 内容对得上，但登记是旧版本按明文摘要写的（无密钥时导入会话包留下的）：
-    /// 内容一样，调用方可以照常用；登记归一由 [`SyncEngine::normalize_cached_blob`]
-    /// 在整次操作成功之后做。
-    CopiedLegacy,
+    /// 内容一样，调用方可以照常用；`keyed` 是这次核对算出的带密钥对象名，调用方在
+    /// 整次操作成功之后用 [`SyncEngine::settle_legacy_blob`] 归一（或确认别人已归一）。
+    CopiedLegacy { keyed: String },
     /// 内容对不上（缓存副本被原地改写过）：调用方写出去的东西要作废。
     Rejected,
     /// 核不了（没有登记、不在本机、读不出密钥）：按老行为处理。
@@ -1291,7 +1291,7 @@ impl SyncEngine {
             if crate::ids::hex(&digest) != *blob {
                 return Ok(AttachmentCopy::Rejected);
             }
-            return Ok(AttachmentCopy::CopiedLegacy);
+            return Ok(AttachmentCopy::CopiedLegacy { keyed: current });
         }
         Ok(AttachmentCopy::Copied)
     }
@@ -1332,6 +1332,24 @@ impl SyncEngine {
             .map(|_| keyed)
     }
 
+    /// 旧版明文登记的内容已经核对过：把登记归一（如果还没被别的请求归一）并返回界面
+    /// 刷新后该用的对象名。`keyed` 是这次核对算出的带密钥对象名——另一个请求抢先
+    /// 归一过（旧登记没了）时，只要新登记还在、不是「等待取回」，就用它。
+    pub fn settle_legacy_blob(&self, blob: &str, keyed: &str) -> String {
+        if let Some(new) = self.normalize_cached_blob(blob) {
+            return new;
+        }
+        let exists = db::read(self.inner.ctx.db(), |conn| db::blob_get(conn, keyed))
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.state != db::BLOB_REMOTE);
+        if exists {
+            keyed.to_string()
+        } else {
+            blob.to_string()
+        }
+    }
+
     /// 读出本机缓存里 `blob` 副本的字节（与 [`Self::copy_cached_blob`] 同一次读核对）。
     pub fn read_cached_blob_bytes(&self, blob: &str, limit: u64) -> AttachmentBytes {
         // 先按登记长度挡掉读进内存会爆的大文件（预览只处理小图）。
@@ -1369,9 +1387,9 @@ impl SyncEngine {
         };
         match outcome {
             AttachmentCopy::Copied => AttachmentBytes::Bytes(bytes),
-            AttachmentCopy::CopiedLegacy => {
+            AttachmentCopy::CopiedLegacy { keyed } => {
                 // 内容已经核对过：顺手把旧登记归一（失败不影响这次读）。
-                self.normalize_cached_blob(blob);
+                self.settle_legacy_blob(blob, &keyed);
                 AttachmentBytes::Bytes(bytes)
             }
             AttachmentCopy::Rejected => AttachmentBytes::Rejected,
