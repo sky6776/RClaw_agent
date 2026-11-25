@@ -814,7 +814,7 @@ pub(crate) fn attachments(
             // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
             // 里、密钥读不出来）时验不了：按登记说它在（老行为）。
             let verified = |path: &Path| -> bool {
-                keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
+                keys.is_none_or(|keys| same_blob(keys, path, &found.blob))
             };
             let (state, local_path, rel_path) = match &found.row {
                 Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
@@ -849,6 +849,10 @@ pub(crate) fn attachments(
             let path_present = if found.kind == "file" {
                 if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
                     true
+                } else if keys.is_none() {
+                    // 没有密钥（不在同步空间里）就验不了别的位置上的同名文件是不是这
+                    // 一份内容：不认（界面继续按快照卡取用那份缓存副本）。
+                    false
                 } else {
                     exact(&found.path).is_some_and(|path| verified(&path))
                 }
@@ -871,24 +875,37 @@ pub(crate) fn attachments(
         .collect())
 }
 
-/// 核对「消息路径上的文件就是登记的那个对象」时算过的摘要：按（路径、长度、修改
-/// 时间、创建时间）记住。打开会话、每次同步动静之后 [`attachments`] 都会被调用
-/// 一遍，同一个文件不重复整读。
+/// 核对「某个路径上的文件就是登记的那个对象」时算过的摘要：按文件版本（路径、长度、
+/// 修改时间、创建时间、类 Unix 上的 ctime）记住。打开会话、每次同步动静之后
+/// [`attachments`] 都会被调用一遍，同一个版本不重复整读。
 ///
-/// 容量按「一个会话里可能引用的文件数」留足（几千条），命中时挪到队尾（LRU）。按
-/// 128 条留的时候，一个引用过上百个文件的会话每轮都会把彼此挤掉、每次清单查询都把
-/// 这些文件重读一遍。
+/// 容量按「一个会话里可能引用的文件数」留足，命中挪到队尾（LRU）：按 128 条留的时候，
+/// 一个引用过上百个文件的会话每轮都会把彼此挤掉、每次清单查询都把这些文件重读一遍。
 struct DigestEntry {
     path: String,
+    version: FileVersion,
+    digest: [u8; 32],
+    /// 读完的时刻：「就是它」这个结论放久了要重新确认。
+    at: Instant,
+}
+
+/// 文件版本：任何一项变了都重新整读。修改时间读不出来时判断不了它有没有变，不记。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileVersion {
     size: u64,
     mtime: i128,
-    /// 创建时间（拿得到时比一比：Windows 上文件被整个替换过，创建时间会变）。
     created: Option<i128>,
-    digest: [u8; 32],
+    /// 类 Unix 上的 ctime：用户态改不了，写入、改名、utime 都会让它变——备份还原
+    /// 保留 mtime 的那类替换靠它发现。（Windows 上没有对应的稳定接口，只能靠
+    /// [`DIGEST_TRUST`] 的重新确认。）
+    changed: Option<i128>,
 }
 
 static DIGEST_CACHE: Mutex<Vec<DigestEntry>> = Mutex::new(Vec::new());
 const DIGEST_CACHE_MAX: usize = 8192;
+/// 「内容就是它」的结论最多信这么久。时间戳被还原过的替换（还原工具会保留长度、
+/// mtime、创建时间）只能靠重新整读发现；元数据没变的版本每这么久重新确认一次。
+const DIGEST_TRUST: Duration = Duration::from_secs(60);
 
 fn timestamp(time: std::io::Result<SystemTime>) -> Option<i128> {
     time.ok()
@@ -896,68 +913,89 @@ fn timestamp(time: std::io::Result<SystemTime>) -> Option<i128> {
         .map(|since| since.as_nanos() as i128)
 }
 
-/// 文件内容的 SHA-256（未加密钥；对象名是它在空间密钥下的摘要）。读不了不算。
-///
-/// 读不出修改时间的文件不进缓存：那说明「判不了它有没有变」，宁可每次重算，不能把
-/// 判不了当成没变（记在一个固定的 0 上会让之后任一次改写都看不出来）。
-fn path_digest(path: &Path, use_cache: bool) -> Option<[u8; 32]> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let size = meta.len();
-    let mtime = timestamp(meta.modified());
-    let created = timestamp(meta.created());
-    let key = path.to_string_lossy().into_owned();
-    if use_cache {
-        if let Some(mtime) = mtime {
-            if let Ok(mut cache) = DIGEST_CACHE.lock() {
-                if let Some(at) = cache.iter().position(|entry| {
-                    entry.path == key
-                        && entry.size == size
-                        && entry.mtime == mtime
-                        && entry.created == created
-                }) {
-                    let entry = cache.remove(at);
-                    let digest = entry.digest;
-                    cache.push(entry);
-                    return Some(digest);
-                }
-            }
-        }
-    }
+/// 类 Unix 上的 ctime（秒 + 纳秒）：用户态改不了。
+#[cfg(unix)]
+fn changed_stamp(meta: &std::fs::Metadata) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128)
+}
+
+#[cfg(not(unix))]
+fn changed_stamp(_meta: &std::fs::Metadata) -> Option<i128> {
+    None
+}
+
+/// 这个文件的版本标识；修改时间读不出来（判不了有没有变）时返回 `None`。
+fn version_of(meta: &std::fs::Metadata) -> Option<FileVersion> {
+    Some(FileVersion {
+        size: meta.len(),
+        mtime: timestamp(meta.modified())?,
+        created: timestamp(meta.created()),
+        changed: changed_stamp(meta),
+    })
+}
+
+fn hash_file_digest(path: &Path) -> Option<[u8; 32]> {
     let mut file = std::fs::File::open(path).ok()?;
-    let (digest, _) = sha256_reader(&mut file).ok()?;
-    if let Some(mtime) = mtime {
-        if let Ok(mut cache) = DIGEST_CACHE.lock() {
-            cache.retain(|entry| entry.path != key);
-            if cache.len() >= DIGEST_CACHE_MAX {
-                cache.remove(0);
-            }
-            cache.push(DigestEntry {
-                path: key,
-                size,
-                mtime,
-                created,
-                digest,
-            });
+    sha256_reader(&mut file).ok().map(|(digest, _)| digest)
+}
+
+/// 这个版本的摘要与「读完的时刻」。缓存命中不算读（不刷新时刻）。
+fn cached_digest(path: &str, version: &FileVersion) -> Option<([u8; 32], Instant)> {
+    let mut cache = DIGEST_CACHE.lock().ok()?;
+    let at = cache.iter().position(|entry| {
+        entry.path == path && entry.version == *version
+    })?;
+    let entry = cache.remove(at);
+    let found = (entry.digest, entry.at);
+    cache.push(entry);
+    Some(found)
+}
+
+/// 整读一遍并记下这个版本的摘要（同一路径的旧版本被顶掉）。
+fn read_digest(path: &Path, version: &FileVersion) -> Option<[u8; 32]> {
+    let digest = hash_file_digest(path)?;
+    if let Ok(mut cache) = DIGEST_CACHE.lock() {
+        let key = path.to_string_lossy().into_owned();
+        cache.retain(|entry| entry.path != key);
+        if cache.len() >= DIGEST_CACHE_MAX {
+            cache.remove(0);
         }
+        cache.push(DigestEntry {
+            path: key,
+            version: *version,
+            digest,
+            at: Instant::now(),
+        });
     }
     Some(digest)
 }
 
-/// `path` 上的文件是不是 `blob` 这个对象：先比长度，再核对内容摘要。
-fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
-    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() == size) {
+/// `path` 上的文件是不是 `blob` 这个对象。
+///
+/// 以内容摘要为准（长度是别的设备报来的，可能差一点；下载本身也只认摘要）。缓存里
+/// 的结论（对得上或对不上都算）只在 [`DIGEST_TRUST`] 之内直接用：同一份清单在一次
+/// 同步动静之后会被反复查询，每次都整读一遍上百个文件不可接受；而时间戳被还原过的
+/// 替换只能靠过期后的重新整读发现，所以两个方向都设了期限——还原成正确内容之后，
+/// 卡上最多一分钟就会自己变回可用。
+fn same_blob(keys: &Keys, path: &Path, blob: &str) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
         return false;
     }
-    if path_digest(path, true).is_some_and(|digest| keys.blob_id(&digest) == blob) {
-        return true;
+    let Some(version) = version_of(&meta) else {
+        // 判不了有没有变：直接读一遍，不记结论。
+        return hash_file_digest(path).is_some_and(|digest| keys.blob_id(&digest) == blob);
+    };
+    let key = path.to_string_lossy().into_owned();
+    if let Some((digest, at)) = cached_digest(&key, &version) {
+        if at.elapsed() < DIGEST_TRUST {
+            return keys.blob_id(&digest) == blob;
+        }
     }
-    // 缓存里的摘要对不上：可能文件真的变了，也可能是缓存过时（备份还原之类保留了
-    // 长度与时间戳的替换）。重算一次以区分——真是换了内容的花费只在变化后的第一次，
-    // 新摘要会记下来；是缓存过时的，这一次就把它纠正过来。
-    path_digest(path, false).is_some_and(|digest| keys.blob_id(&digest) == blob)
+    read_digest(path, &version).is_some_and(|digest| keys.blob_id(&digest) == blob)
 }
 
 /// 一个会话最后 `tail` 条消息引用的、还在别的设备上的附件（打开会话、续聊之前补齐用）。

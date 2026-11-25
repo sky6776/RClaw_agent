@@ -108,6 +108,9 @@ function setCards(update: (prev: CardState) => CardState) {
 /** 换上一份新取的清单。 */
 function apply(chatId: string, list: SyncAttachment[]) {
   if (chat !== chatId) return;
+  // 就绪状态本身也是订阅者关心的：清单内容没变（比如新消息只是文本）时也要通知，
+  // 否则「核对附件…」的占位会一直停在那儿等下一次无关的重渲染。
+  const wasLoaded = loaded === chatId;
   loaded = chatId;
   const usable = list.filter((item) => item.kind === "file" || item.kind === "artifact");
   const nextAllSig = JSON.stringify(usable);
@@ -142,7 +145,7 @@ function apply(chatId: string, list: SyncAttachment[]) {
   // 下载下来之后又不见了的（被删了）会重新出现在 pending 里：不再算「已下载」。
   const stillLanded = landed.filter((item) => !pendingKeys.has(fileKey(item)));
   const sig = JSON.stringify([pending, stillLanded]);
-  if (sig === bar.sig && !changedAll) return;
+  if (sig === bar.sig && !changedAll && wasLoaded) return;
   bar = { pending, landed: stillLanded, sig };
   emit();
 }
@@ -274,8 +277,10 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         event.kind === "sessions" &&
         event.chats.some((c) => c.channel === "desktop" && c.chat_id === chatId)
       ) {
-        // 别的设备的消息合进了这个会话：它们引用的文件多半不在本机。新消息可能已经
-        // 渲染出来了，而清单还要等一拍才重取——这一段里别让工作区路径当可用的入口。
+        // 别的设备的消息合进了这个会话：它们引用的文件多半不在本机。已经开始的那次
+        // 查询读到的可能是旧清单（那条应答晚一拍回来会把旧清单又标成就绪），先作废
+        // 它；新消息可能已经渲染出来了，等重取到之前也别让工作区路径当可用的入口。
+        seq += 1;
         markStale(chatId);
         schedule();
       }

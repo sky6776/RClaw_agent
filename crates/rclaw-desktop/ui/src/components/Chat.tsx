@@ -15,7 +15,11 @@ import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { parseMediaItems } from "./MediaPreviews";
-import { awayAttachments, useChatAttachments } from "./SyncAttachments";
+import {
+  awayAttachments,
+  useChatAttachments,
+  useChatAttachmentsReady,
+} from "./SyncAttachments";
 import WorkflowCard from "./WorkflowCard";
 import MediaGallery, { type GalleryItem, type GallerySeed } from "./MediaGallery";
 import ToolBatchRows from "./ToolCallRow";
@@ -656,6 +660,7 @@ export default function Chat({
   // 这个会话的附件清单（多端同步）：画廊与消息里的媒体卡用同一份，判断哪些路径在这台
   // 设备上真有这份内容（同名的别的文件不算）。
   const syncedAttachments = useChatAttachments(sessionKey);
+  const syncedReady = useChatAttachmentsReady(sessionKey);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   // 输入历史（当前会话已发送的用户消息，按发送序）：↑↓ 遍历回填到输入框。
@@ -1524,6 +1529,9 @@ export default function Chat({
   // 用户/助手消息——工具行、思考行不出媒体卡，塞进画廊会出现「滑到一张
   // 聊天里没见过的图」。
   const openGallery = useCallback((start: string, seed?: GallerySeed | null) => {
+    // 清单还没核对好（刚合进新消息、正在重取）：这时按工作区路径拼时间线可能把同名
+    // 却不是这份内容的文件放进去，索性先不开——卡片自己会显示「核对附件…」。
+    if (!syncedReady) return;
     const items: GalleryItem[] = [];
     const seen = new Set<string>();
     for (const e of entries) {
@@ -1559,7 +1567,7 @@ export default function Chat({
     }
     if (!seen.has(start)) return;
     setGallery({ items, start, seed: seed ?? null });
-  }, [entries, syncedAttachments]);
+  }, [entries, syncedAttachments, syncedReady]);
 
   // 菜单媒体动作：保存 / 转发 / 系统打开 / 放大（放大按需拉 base64，媒体卡
   // 已加载的 data URL 不在 Chat 手里）。
