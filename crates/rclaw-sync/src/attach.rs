@@ -742,6 +742,12 @@ fn place(ctx: &Ctx, commit: &Commit, blob_id: &str, plain: &Path) -> Result<Path
             return Err(abandoned());
         }
         db::blob_set(tx, blob_id, &rel_path, BLOB_FETCHED)?;
+        // 取回成功：这条登记不再是「重新下载」的临时登记，撤掉标记（以后清单/回收都
+        // 按常规登记对待）。
+        tx.execute(
+            "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+            params![scope::BLOB_PROBE, blob_id],
+        )?;
         forget(tx, blob_id)
     });
     drop(permit);

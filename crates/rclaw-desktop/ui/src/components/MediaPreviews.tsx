@@ -421,7 +421,12 @@ export default function MediaPreviews({
     .map((it) => ({ it, away: away.get(it.path) }))
     .filter(
       ({ it, away }) =>
-        away !== undefined || it.kind === "open" || urls[keyFor(it)] !== undefined,
+        // 清单还没就绪（或取不到）时，图片也要留在列表里——否则首屏失败后图片消息
+        // 连「点此重试」都看不到。
+        !ready ||
+        away !== undefined ||
+        it.kind === "open" ||
+        urls[keyFor(it)] !== undefined,
     );
   if (rendered.length === 0) return null;
   return (

@@ -6042,6 +6042,7 @@ pub async fn save_media(
                 &chat,
                 &blob_id,
                 &source,
+                "media/cache/export",
                 &target,
             ))
         })
@@ -6119,14 +6120,15 @@ fn save_document(home: &std::path::Path, abs: &std::path::Path) -> Result<String
 }
 
 /// 把（核对过的）字节写进导出暂存目录的一个新子目录（文件名保持原样），返回绝对路径。
+/// 返回（绝对路径，工作区相对路径）。
 pub(crate) fn stage_bytes_for_export(
     home: &std::path::Path,
     original: &str,
     bytes: &[u8],
-) -> Result<std::path::PathBuf, String> {
+) -> Result<(std::path::PathBuf, String), String> {
     // 目录逐级建、每级都要求是普通目录（链接的祖先不写）；文件必须新建。
-    let dir = ensure_workspace_dir(home, "media/cache/export")?
-        .join(rclaw_sync::ids::random_hex::<6>());
+    let (dir, _) = ensure_workspace_dir(home, "media/cache/export")?;
+    let dir = dir.join(rclaw_sync::ids::random_hex::<6>());
     std::fs::create_dir(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let root = home
         .join("agent")
@@ -6149,15 +6151,22 @@ pub(crate) fn stage_bytes_for_export(
     file.write_all(bytes)
         .map_err(|e| format!("写入暂存文件失败: {e}"))?;
     drop(file);
-    prune_cache_dir(&ensure_workspace_dir(home, "media/cache/export")?, 8);
-    Ok(staged)
+    let (cache_root, _) = ensure_workspace_dir(home, "media/cache/export")?;
+    prune_cache_dir(&cache_root, 8);
+    // 相对路径按 canonicalize 之后的根算（Windows 上 canonicalize 会带 `\\?\` 前缀，
+    // 外面的 `strip_prefix` 比不过非 canonical 的 home/agent）。
+    let rel = staged
+        .strip_prefix(&root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .map_err(|_| "暂存路径异常".to_string())?;
+    Ok((staged, rel))
 }
 
 /// 在工作区里逐级建目录（每级都必须是普通目录，不跟随链接），返回 `agent/<rel>`。
 fn ensure_workspace_dir(
     home: &std::path::Path,
     rel: &str,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     let root = home.join("agent");
     let root_canon = root
         .canonicalize()
@@ -6180,7 +6189,7 @@ fn ensure_workspace_dir(
     if !dir.starts_with(&root_canon) {
         return Err("暂存目录越出工作区".into());
     }
-    Ok(dir)
+    Ok((dir, root_canon))
 }
 
 /// 清理缓存目录：删掉一小时前的，最多留 `keep` 个条目（新的在前）。
@@ -6242,6 +6251,7 @@ pub async fn share_media(
                     &chat_id,
                     &blob,
                     &source,
+                "media/cache/share",
                     &target,
                 ))
             })
@@ -6477,6 +6487,7 @@ pub async fn media_stream_url(
                     &chat_id,
                     &blob,
                     &source,
+                    "media/cache/stream",
                     &target,
                 ))
             })
@@ -6496,9 +6507,9 @@ pub async fn media_stream_url(
             }
         }
     }
-    // 海报帧（或核不了的）：按路径 + 版本针。核得上的钉住版本（海报按摘要缓存结论核，
-    // 不整读）；核不了的**不钉版本**。
-    let pin = check_media_read(&state, chat_id, blob, &path, !playback).await?;
+    // 海报帧（或核不了的）：按路径 + 版本针。海报按**摘要缓存**的结论核（不整读大
+    // 视频）；核不了的**不钉版本**。
+    let pin = check_media_read(&state, chat_id, blob, &path, false).await?;
     let agent_root = state.home.join("agent");
     match crate::media_stream::stream_url_with_root(agent_root, &path, pin.as_deref()) {
         Some(url) => Ok(url),

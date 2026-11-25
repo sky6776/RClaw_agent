@@ -1219,6 +1219,7 @@ impl SyncEngine {
         chat_id: &str,
         blob: &str,
         rel_path: &str,
+        cache_root_rel: &str,
         dest_rel: &str,
     ) -> AttachmentStage {
         let ctx = &self.inner.ctx;
@@ -1274,8 +1275,11 @@ impl SyncEngine {
             let _ = std::fs::remove_file(&dest);
             return AttachmentStage::Rejected;
         }
-        // 过期的旧副本（接收方早就读完了）：一小时前的清掉，最多留 8 份。
-        prune_share_cache(parent, 8);
+        // 过期的旧副本按**缓存根**回收（每个请求一个随机子目录，只看自己的目录永远
+        // 清不到别人）：一小时前的清掉，最多留 8 份；新写下的这份在 1 小时之内。
+        if let Ok(cache_root) = ctx.env.checked_path(cache_root_rel) {
+            prune_share_cache(&cache_root, 8);
+        }
         AttachmentStage::Staged(dest_rel.to_string())
     }
 
@@ -1344,6 +1348,10 @@ impl SyncEngine {
                 if commit.valid() && ctx.space.epoch() == epoch_before {
                     db::write(ctx.db(), |tx| {
                         if !commit.valid() {
+                            return Ok(());
+                        }
+                        // 别人（别的消息/别的任务）已经登记过这个对象：不改、不打标记。
+                        if db::blob_get(tx, blob)?.is_some() {
                             return Ok(());
                         }
                         db::blob_register(tx, blob, &rel_path, size, crate::db::BLOB_REMOTE)?;

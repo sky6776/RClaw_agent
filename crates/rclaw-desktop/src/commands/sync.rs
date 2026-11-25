@@ -942,15 +942,10 @@ pub async fn sync_open_attachment(
         rclaw_sync::AttachmentBytes::Bytes(bytes) => {
             let home = state.home.clone();
             let original = path.clone();
-            let staged = run_blocking("准备打开", move || {
+            let (_abs, rel) = run_blocking("准备打开", move || {
                 Ok(super::stage_bytes_for_export(&home, &original, &bytes))
             })
             .await??;
-            let root = state.home.join("agent");
-            let rel = staged
-                .strip_prefix(&root)
-                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-                .map_err(|_| "暂存路径异常".to_string())?;
             super::open_media_path(&state.home, &rel)
         }
         rclaw_sync::AttachmentBytes::TooLarge => {

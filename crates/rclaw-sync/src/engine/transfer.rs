@@ -188,12 +188,20 @@ async fn finish(shared: &Arc<Shared>, blob: String, user: bool, result: Result<(
                     // 这次是为「重新下载」临时补的登记、存储上又确实没有：撤掉它（保留
                     // `gone` 记录——文件放回原处之后别的设备来要时还能重新上传）。
                     // 不是这次补的登记（别的消息正常登记进来的）走下面的常规路径。
-                    if db::state_get(tx, crate::db::scope::BLOB_PROBE, &wanted)?.is_some() {
+                    // 标记还在、行也还是「等待取回」：这条登记确实是这次重试临时补的。
+                    // （取回成功会清标记并把行改成 FETCHED；并发登记进来的行状态也不同。）
+                    let probe = db::state_get(tx, crate::db::scope::BLOB_PROBE, &wanted)?
+                        .is_some()
+                        && db::blob_get(tx, &wanted)?
+                            .is_some_and(|row| row.state == crate::db::BLOB_REMOTE);
+                    if probe {
                         db::blob_delete(tx, &wanted)?;
-                        tx.execute(
-                            "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
-                            rusqlite::params![crate::db::scope::BLOB_PROBE, &wanted],
-                        )?;
+                    }
+                    tx.execute(
+                        "DELETE FROM sync_state WHERE scope = ?1 AND key = ?2",
+                        rusqlite::params![crate::db::scope::BLOB_PROBE, &wanted],
+                    )?;
+                    if probe {
                         return Ok(None);
                     }
                     let Some(device) = sync_db::device_id(tx)? else {
