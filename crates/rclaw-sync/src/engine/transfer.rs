@@ -294,6 +294,14 @@ async fn finish(
                     {
                         return Ok(None);
                     }
+                    // 去取的时候它还是「等待取回」：现在登记已经变成本机有了（同一对象
+                    // 被另一条取回入口落了盘、标记也被它清掉）的话，这次晚到的「没取到」
+                    // 作废——不能把刚取回的登记改回远端。
+                    if db::blob_get(tx, &wanted)?
+                        .is_some_and(|row| row.state != crate::db::BLOB_REMOTE)
+                    {
+                        return Ok(None);
+                    }
                     let probe = probe_matches(tx, &wanted, attempt.as_deref())?
                         && db::blob_get(tx, &wanted)?
                             .is_some_and(|row| row.state == crate::db::BLOB_REMOTE);

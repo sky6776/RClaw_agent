@@ -5245,10 +5245,41 @@ const MEDIA_PREVIEW_MAX_EDGE: u32 = 1440;
 /// 缓冲，Android 上会被 LMK 直接杀掉整个进程。前端对会话里每个图片标记都会自动请求预览。
 const MEDIA_DECODE_MAX_EDGE: u32 = 8192;
 const MEDIA_DECODE_MAX_ALLOC: u64 = 128 * 1024 * 1024;
-/// 预览缓存目录（相对数据根、**在 agent 工作区之外**）：缩略图是派生物，缓存命中会
-/// 直接标成 `verified`——放在助手工具能改写的目录里，一对被改写、彼此匹配的缓存文件
-/// 就能让界面把另一张图当成「核对过的」。
+/// 未核对预览的磁盘缓存目录（相对数据根）：只是画面复用，**不代表核对通过**。核对过的
+/// 预览不落盘（见 [`PREVIEW_MEMORY`]）——磁盘文件谁都能改，拿它当「核对过的字节」的
+/// 预览就是假的。
 const MEDIA_PREVIEW_CACHE_DIR: &str = "cache/preview";
+
+/// 核对过的预览的进程内缓存：键是内容地址，值是编码好的缩略图。由这次核对过的输入
+/// 生成，进程退出即失效（磁盘上的缓存文件可能被别的进程改写，不能承担 `verified`）。
+static PREVIEW_MEMORY: std::sync::Mutex<Vec<(String, &'static str, Vec<u8>)>> =
+    std::sync::Mutex::new(Vec::new());
+/// 进程内预览缓存的总字节上限。
+const PREVIEW_MEMORY_BUDGET: usize = 16 * 1024 * 1024;
+
+/// 记一份核对过的预览（同一键先删再追加，超预算丢最旧的）。
+fn remember_memory_preview(key: &str, mime: &'static str, bytes: &[u8]) {
+    let Ok(mut cache) = PREVIEW_MEMORY.lock() else {
+        return;
+    };
+    cache.retain(|(known, _, _)| known != key);
+    cache.push((key.to_string(), mime, bytes.to_vec()));
+    let mut total: usize = cache.iter().map(|(_, _, bytes)| bytes.len()).sum();
+    while total > PREVIEW_MEMORY_BUDGET && !cache.is_empty() {
+        let (_, _, dropped) = cache.remove(0);
+        total = total.saturating_sub(dropped.len());
+    }
+}
+
+/// 取一份核对过的预览（命中挪到队尾）。
+fn read_memory_preview(key: &str) -> Option<(Vec<u8>, &'static str)> {
+    let mut cache = PREVIEW_MEMORY.lock().ok()?;
+    let at = cache.iter().position(|(known, _, _)| known == key)?;
+    let entry = cache.remove(at);
+    let found = (entry.2.clone(), entry.1);
+    cache.push(entry);
+    Some(found)
+}
 
 /// 生成（带磁盘缓存）媒体的屏幕级预览图：大图解码后按长边缩到上限再编码
 /// JPEG，避免前端解码 12MP 原图（真机实测 4032×3024 全图解码 + 光栅 2~3s，
@@ -5394,7 +5425,7 @@ fn media_preview_blocking(
     }
     let cache_seed = seed.unwrap_or_else(|| path.to_string());
     if let Some(bytes) = verified {
-        return image_preview_bytes(home, &bytes, &cache_seed, &extension);
+        return image_preview_bytes(&bytes, &cache_seed, &extension);
     }
     let root = home.join("agent");
     let full = root
@@ -5413,7 +5444,6 @@ fn media_preview_blocking(
 /// 由「核对过的字节」出预览：字节已经和登记的对象对过，缓存键只按对象名（内容寻址），
 /// 不再掺路径的 mtime——路径上换成了同长度的另一个文件也影响不到这份内容。
 fn image_preview_bytes(
-    home: &std::path::Path,
     bytes: &[u8],
     cache_seed: &str,
     extension: &str,
@@ -5448,17 +5478,27 @@ fn image_preview_bytes(
             .map(|b| format!("{b:02x}"))
             .collect()
     };
-    // 内容寻址的缩略图缓存：同一份内容已经算过就直接用（重开会话、画廊来回滑不重解码）。
-    let cache_dir = home.join(MEDIA_PREVIEW_CACHE_DIR);
-    let cache_base = cache_dir.join(&key);
-    if let Some((cached, cache_mime)) = read_preview_cache(&cache_base) {
+    // 同一份内容已经算过就直接用（重开会话、画廊来回滑不重解码）。只认进程内缓存：
+    // 磁盘上的缩略图可能被别的进程改写，不能承担「核对过」的说法。
+    if let Some((cached, cache_mime)) = read_memory_preview(&key) {
         return Ok(MediaPayload {
             mime: cache_mime.into(),
             base64: encode_base64(&cached),
             verified: true,
         });
     }
-    image_preview_encode(home, bytes, &key, mime, true)
+    let payload = encode_preview(bytes)?;
+    let (encoded, out_mime) = match payload {
+        // 原图已足够小：原样返回，也记进进程内缓存。
+        None => (bytes.to_vec(), mime),
+        Some((encoded, out_mime)) => (encoded, out_mime),
+    };
+    remember_memory_preview(&key, out_mime, &encoded);
+    Ok(MediaPayload {
+        mime: out_mime.into(),
+        base64: encode_base64(&encoded),
+        verified: true,
+    })
 }
 
 /// 预览图的核心：`full` 是调用方已经校验过的图片文件，`extension` 是它的小写扩展名
@@ -5584,14 +5624,9 @@ fn write_preview_cache(path: &std::path::Path, bytes: &[u8]) {
     }
 }
 
-/// 解码 → 缩到上限 → 编码，并写缓存（键 `key`）。
-fn image_preview_encode(
-    home: &std::path::Path,
-    original: &[u8],
-    key: &str,
-    mime: &str,
-    verified: bool,
-) -> Result<MediaPayload, String> {
+/// 解码 → 缩到上限 → 编码。长边本就不超上限时返回 `None`（原图已足够小，原样返回，
+/// 不重编码损质量）；否则返回（编码后的字节, MIME）。
+fn encode_preview(original: &[u8]) -> Result<Option<(Vec<u8>, &'static str)>, String> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MEDIA_DECODE_MAX_EDGE);
     limits.max_image_height = Some(MEDIA_DECODE_MAX_EDGE);
@@ -5601,13 +5636,8 @@ fn image_preview_encode(
         .map_err(|e| format!("识别图片格式失败: {e}"))?;
     reader.limits(limits);
     let img = reader.decode().map_err(|e| format!("解码图片失败: {e}"))?;
-    // 长边本就不超上限：原图已足够小，原样返回（不重编码损质量）。
     if img.width() <= MEDIA_PREVIEW_MAX_EDGE && img.height() <= MEDIA_PREVIEW_MAX_EDGE {
-        return Ok(MediaPayload {
-            mime: mime.into(),
-            base64: encode_base64(original),
-            verified,
-        });
+        return Ok(None);
     }
     let thumb = img.thumbnail(MEDIA_PREVIEW_MAX_EDGE, MEDIA_PREVIEW_MAX_EDGE);
     // 带 alpha 的缩略图编码 PNG（JPEG 无透明，会衬黑底）；缓存后缀同步跟随。
@@ -5624,18 +5654,39 @@ fn image_preview_encode(
             .write_with_encoder(encoder)
             .map_err(|e| format!("编码预览失败: {e}"))?;
     }
+    Ok(Some((
+        encoded,
+        if has_alpha { "image/png" } else { "image/jpeg" },
+    )))
+}
+
+/// 未核对预览的磁盘缓存版：解码 → 缩到上限 → 编码并写缓存（键 `key`）。
+fn image_preview_encode(
+    home: &std::path::Path,
+    original: &[u8],
+    key: &str,
+    mime: &str,
+    verified: bool,
+) -> Result<MediaPayload, String> {
+    let Some((encoded, out_mime)) = encode_preview(original)? else {
+        return Ok(MediaPayload {
+            mime: mime.into(),
+            base64: encode_base64(original),
+            verified,
+        });
+    };
     let cache_dir = home.join(MEDIA_PREVIEW_CACHE_DIR);
     let cache_path = cache_dir
         .join(key)
-        .with_extension(if has_alpha { "png" } else { "jpg" });
+        .with_extension(if out_mime == "image/png" {
+            "png"
+        } else {
+            "jpg"
+        });
     let _ = std::fs::create_dir_all(&cache_dir);
     write_preview_cache(&cache_path, &encoded); // 缓存写失败只影响下次，不挡返回
     Ok(MediaPayload {
-        mime: if has_alpha {
-            "image/png".into()
-        } else {
-            "image/jpeg".into()
-        },
+        mime: out_mime.into(),
         base64: encode_base64(&encoded),
         verified,
     })

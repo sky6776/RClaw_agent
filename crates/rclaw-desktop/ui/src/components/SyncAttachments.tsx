@@ -258,21 +258,12 @@ function settle(
     const busy = without(prev.busy, blob);
     const errors =
       error === null ? without(prev.errors, blob) : { ...prev.errors, [blob]: error };
-    // 重新下载成功：这个对象在各个落点上的旧失败（缓存副本被改写过之类）一并清掉，
-    // 修好的卡不该还挂着上一条错误。
-    let saveErrors = prev.saveErrors;
-    if (error === null && placed) {
-      const prefix = `${blob}:`;
-      const stale = Object.keys(saveErrors).filter((key) => key.startsWith(prefix));
-      if (stale.length > 0) {
-        saveErrors = { ...saveErrors };
-        for (const key of stale) delete saveErrors[key];
-      }
-    }
-    if (busy === prev.busy && errors === prev.errors && saveErrors === prev.saveErrors) {
+    // 卡片上的「内容对不上／保存失败」是按落点记的：不在这里按整个对象清（成功落到的
+    // 那个落点由上面的 clearAttachmentChanged 连说明一起收掉；别的落点可能仍然不对）。
+    if (busy === prev.busy && errors === prev.errors) {
       return prev;
     }
-    return { ...prev, busy, errors, saveErrors };
+    return { ...prev, busy, errors };
   });
 }
 

@@ -231,9 +231,11 @@ export default function ImageViewer({
     setFullLoading(true);
     api
       .mediaBase64(path, chatId, blob)
-      .then((r) => {
+      .then(async (r) => {
         const dataUrl = `data:${r.mime};base64,${r.base64}`;
-        return dataUrlToBlob(dataUrl).then((b) => ({ b, dataUrl, verified: r.verified }));
+        // 核不了的（不进共享缓存、也不造 blob URL）直接用 data URL，不必先转 Blob。
+        const b = r.verified ? await dataUrlToBlob(dataUrl) : null;
+        return { b, dataUrl, verified: r.verified };
       })
       .then(({ b, dataUrl, verified }) => {
         // 原图读的是核对过的字节才算通过（核不了时按老行为读路径）。

@@ -922,7 +922,7 @@ pub async fn sync_attachment_preview(
         // 一遍缓存文件（两次之间被改写的话，预览就成了另一份内容）。
         match engine.read_cached_blob_bytes(&blob, super::MEDIA_MAX_BYTES) {
             rclaw_sync::AttachmentBytes::Bytes(bytes) => {
-                super::image_preview_bytes(&home, &bytes, &format!("sync-blob:{blob}"), &extension)
+                super::image_preview_bytes(&bytes, &format!("sync-blob:{blob}"), &extension)
             }
             rclaw_sync::AttachmentBytes::TooLarge => Err(format!(
                 "媒体超过大小上限（{} MB）",
@@ -1214,51 +1214,57 @@ fn save_snapshot(home: &Path, path: &str, cached: &Path) -> Result<String, Strin
 }
 
 /// 把核对过的内容发布到工作区：先写同目录下的临时文件，摘要核对通过后再以「不覆盖
-/// 已有文件」的方式原子发布（硬链接；文件系统不支持时退回「必须新建」的复制）。并行
-/// 的工作区读取不会看到半成品，也不会在摘要拒绝之前读走错误内容。
+/// 已有文件」的方式原子发布（硬链接）。并行的读取不会看到半成品，也不会在摘要拒绝之前
+/// 读走错误内容。
+///
+/// 核对与写临时文件**只做一次**：候选名被并发占走时换名字重试的只是硬链接这一步。
+/// （每换一个名字重读一遍的话，第二遍会在旧版明文登记已经归一之后按老对象名找不到
+/// 登记，退回不核对的复制。）
 fn write_verified_file(
     dir: &Path,
     candidate_name: impl Fn(u32) -> String,
-    write: impl Fn(&mut std::fs::File) -> std::io::Result<()>,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<PathBuf, String> {
+    let tmp = dir.join(format!(
+        ".rclaw-save-{}.tmp",
+        rclaw_sync::ids::random_hex::<8>()
+    ));
+    let mut file = match super::open_for_write_nofollow(&tmp, true) {
+        Ok(file) => file,
+        Err(e) => return Err(format!("存进工作区失败: {e}")),
+    };
+    if let Err(e) = write(&mut file) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("存进工作区失败: {e}"));
+    }
+    drop(file);
+    let mut last = None;
     for n in 1..=999u32 {
         let dest = dir.join(candidate_name(n));
         if std::fs::symlink_metadata(&dest).is_ok() {
             continue;
         }
-        let tmp = dir.join(format!(
-            ".rclaw-save-{}.tmp",
-            rclaw_sync::ids::random_hex::<8>()
-        ));
-        let mut file = match super::open_for_write_nofollow(&tmp, true) {
-            Ok(file) => file,
-            Err(e) => return Err(format!("存进工作区失败: {e}")),
-        };
-        if let Err(e) = write(&mut file) {
-            drop(file);
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("存进工作区失败: {e}"));
-        }
-        drop(file);
         match std::fs::hard_link(&tmp, &dest) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&tmp);
                 return Ok(dest);
             }
-            // 名字刚被别人占了：换下一个候选。
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = std::fs::remove_file(&tmp);
-                continue;
-            }
+            // 名字刚被别人占了：换下一个候选（临时文件照用）。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             // 文件系统不支持硬链接：**不**退回「按正式名先建再复制」——那会让并行的
             // 读取看到未核对的半成品。宁可这次存不了，也不把核对过的说法变成假的。
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(format!("存进工作区失败: 这个文件系统不支持原子发布（{e}）"));
+                last = Some(e);
+                break;
             }
         }
     }
-    Err("存进工作区失败: 同名文件过多，请手动整理".to_string())
+    let _ = std::fs::remove_file(&tmp);
+    Err(match last {
+        Some(e) => format!("存进工作区失败: 这个文件系统不支持原子发布（{e}）"),
+        None => "存进工作区失败: 同名文件过多，请手动整理".to_string(),
+    })
 }
 
 /// [`sync_attachment_save`] 的核心（核对版）：同 [`save_snapshot`]，但写出去的字节与
