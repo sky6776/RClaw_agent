@@ -122,6 +122,9 @@ pub(crate) async fn download_task(
             let Some(blob) = queue.pop_front() else {
                 break;
             };
+            // 重试的临时登记：被真正取起时刷新一下时间戳，长时间排队/慢速下载期间
+            // 别的设备的 `blob.want` 不会把它当成「陈旧残留」撤掉。
+            touch_probe(&shared, &blob).await;
             running.push(fetch_one(shared.clone(), live.clone(), blob));
         }
         tokio::select! {
@@ -156,6 +159,34 @@ pub(crate) async fn download_task(
             }
         }
     }
+}
+
+/// 「重新下载」临时补的登记：把它的开始时间刷成现在（只动带 `blob-probe` 标记的）。
+async fn touch_probe(shared: &Arc<Shared>, blob: &str) {
+    let (ctx, wanted) = (shared.ctx.clone(), blob.to_string());
+    let _ = blocking(move || {
+        db::write(ctx.db(), |tx| {
+            let Some(marker) = db::state_get(tx, crate::db::scope::BLOB_PROBE, &wanted)? else {
+                return Ok(());
+            };
+            let path = marker
+                .value
+                .as_deref()
+                .and_then(|value| value.rsplit_once('|'))
+                .map(|(path, _)| path.to_string())
+                .unwrap_or_default();
+            db::state_put(
+                tx,
+                crate::db::scope::BLOB_PROBE,
+                &wanted,
+                db::HLC_ZERO,
+                None,
+                Some(&format!("{}|{}", path, attach::now_ms())),
+            )
+        })
+    })
+    .await
+    .ok();
 }
 
 /// 一个下载有了结果：通知界面。存储上没有这个对象的，向别的设备要——要了很久没有、

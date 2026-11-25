@@ -973,18 +973,19 @@ fn timestamp(time: std::io::Result<SystemTime>) -> Option<i128> {
 ///   内的同长度快速覆盖，两者的 100ns 值经常一个字节都不变（Windows 对目录项时间戳
 ///   是懒更新的），摘要缓存会把新内容当成旧内容。
 #[cfg(unix)]
-fn changed_stamp(_path: &Path, meta: &std::fs::Metadata) -> Option<i128> {
+fn changed_stamp(file: Option<&std::fs::File>, meta: &std::fs::Metadata) -> Option<i128> {
+    let _ = file;
     use std::os::unix::fs::MetadataExt;
     Some(meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128)
 }
 
 #[cfg(windows)]
-fn changed_stamp(path: &Path, _meta: &std::fs::Metadata) -> Option<i128> {
+fn changed_stamp(file: Option<&std::fs::File>, _meta: &std::fs::Metadata) -> Option<i128> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
     };
-    let file = std::fs::File::open(path).ok()?;
+    let file = file?;
     let mut info = std::mem::MaybeUninit::<FILE_BASIC_INFO>::zeroed();
     let ok = unsafe {
         GetFileInformationByHandleEx(
@@ -1002,28 +1003,45 @@ fn changed_stamp(path: &Path, _meta: &std::fs::Metadata) -> Option<i128> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn changed_stamp(_path: &Path, _meta: &std::fs::Metadata) -> Option<i128> {
+fn changed_stamp(_file: Option<&std::fs::File>, _meta: &std::fs::Metadata) -> Option<i128> {
     None
 }
 
-/// 这个文件的版本标识；修改时间读不出来（判不了有没有变）时返回 `None`。
-pub(crate) fn version_of(path: &Path, meta: &std::fs::Metadata) -> Option<FileVersion> {
+fn version_with(file: Option<&std::fs::File>, meta: &std::fs::Metadata) -> Option<FileVersion> {
     Some(FileVersion {
         size: meta.len(),
         mtime: timestamp(meta.modified())?,
         created: timestamp(meta.created()),
-        changed: changed_stamp(path, meta),
+        changed: changed_stamp(file, meta),
     })
+}
+
+/// 这个文件的版本标识；修改时间读不出来（判不了有没有变）时返回 `None`。
+pub(crate) fn version_of(path: &Path, meta: &std::fs::Metadata) -> Option<FileVersion> {
+    let file = std::fs::File::open(path).ok();
+    version_with(file.as_ref(), meta)
+}
+
+/// 同一个文件的版本标识，但全部字段取自这个已经打开的句柄（流式发送时用：校验和
+/// 发送必须是同一个文件）。
+pub(crate) fn version_of_open(file: &std::fs::File) -> Option<FileVersion> {
+    let meta = file.metadata().ok()?;
+    version_with(Some(file), &meta)
 }
 
 /// 文件版本针：长度 + 修改时间 + 变更时间（拿得到的话）。流式入口用它钉住「核对过
 /// 的那一份」——同长度、时间戳被保留的替换也会让针变。
 pub(crate) fn file_version_pin(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let version = version_of(path, &meta)?;
+    let file = std::fs::File::open(path).ok()?;
+    pin_of_version(&version_of_open(&file)?)
+}
+
+/// 同一个文件的版本针，字段全部取自这个已打开的句柄。
+pub(crate) fn file_version_pin_of(file: &std::fs::File) -> Option<String> {
+    pin_of_version(&version_of_open(file)?)
+}
+
+fn pin_of_version(version: &FileVersion) -> Option<String> {
     Some(format!(
         "{}-{}-{}",
         version.size,

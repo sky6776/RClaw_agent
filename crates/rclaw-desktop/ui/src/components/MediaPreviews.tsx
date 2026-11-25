@@ -593,6 +593,9 @@ export default function MediaPreviews({
                   .catch((e) => {
                     if (!mountedRef.current) return;
                     onError?.(`打开视频失败: ${String(e)}`);
+                    // 核对没过（文件被改写）：重取清单，卡片会换成「重新下载」，
+                    // 不再留一张每次点都失败的帧卡。
+                    refreshSyncAttachments();
                   });
               }}
               className="max-h-72 w-auto max-w-full cursor-pointer self-start rounded-xl border border-[#2a2f3a]"

@@ -267,8 +267,9 @@ fn handle_conn(mut socket: std::net::TcpStream) {
         return;
     };
     // URL 上钉的版本和这个句柄不一致：这个流对应的内容已经不是当时核对过的那一个了。
+    // 版本字段全部取自即将发送的这个句柄，不重新按路径查（两次查之间可能被原子替换）。
     if let Some(expected) = &version {
-        if rclaw_sync::file_version_pin(&full).as_ref() != Some(expected) {
+        if rclaw_sync::file_version_pin_of(&file).as_ref() != Some(expected) {
             let _ = write_all(
                 &mut socket,
                 b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\n\r\n",

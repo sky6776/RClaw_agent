@@ -1186,7 +1186,7 @@ fn settle(
 /// `blob.gone`。问的那台设备也许没看到上一次说的（它是后来加入的，那段日志已经回收），
 /// 不能让它干等。一条 `blob.want` 至多换来一条 `blob.gone`，`blob.want` 自己是限流的。
 pub fn on_blob_want(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
-    on_blob_want_at(conn, None, blob_id)
+    on_blob_want_at(conn, None, None, blob_id)
 }
 
 /// 同 [`on_blob_want`]，多一个工作区环境：能看本机文件时，「文件已经放回原处」的
@@ -1194,6 +1194,7 @@ pub fn on_blob_want(conn: &rusqlite::Connection, blob_id: &str) -> Result<()> {
 pub fn on_blob_want_at(
     conn: &rusqlite::Connection,
     env: Option<&crate::wire::Env>,
+    keys: Option<&crate::crypto::Keys>,
     blob_id: &str,
 ) -> Result<()> {
     // 「重新下载」临时补的登记（带 `blob-probe` 标记）：刚点下去、下载可能还在跑，
@@ -1206,7 +1207,9 @@ pub fn on_blob_want_at(
             .and_then(|value| value.rsplit_once('|'))
             .and_then(|(_, ts)| ts.parse::<i64>().ok())
             .unwrap_or(0);
-        if now_ms().saturating_sub(started) > 10 * 60 * 1000 {
+        // 下载队列没有年龄上限、慢速下载也可能超过十分钟（下载任务被取起时会刷新
+        // 时间戳）：两小时都没刷新过才算陈旧残留（比如应用在队列里重启了）。
+        if now_ms().saturating_sub(started) > 2 * 3600 * 1000 {
             if let Some(row) = db::blob_get(conn, blob_id)? {
                 if row.state == BLOB_REMOTE {
                     db::blob_delete(conn, blob_id)?;
@@ -1228,10 +1231,14 @@ pub fn on_blob_want_at(
         if let Some(note) = db::state_get(conn, scope::BLOB_GONE, blob_id)?
             .and_then(|row| row.json::<GoneNote>())
         {
-            let present = env
-                .resolve_exact(&note.path)
-                .is_some_and(|path| path.is_file());
-            if present {
+            // 必须核对内容再算「放回原处」：原地那个文件可能已经被改写过，换成上传只会
+            // 让上传端拒掉、连自动重取也一起没了。
+            let restored = env.resolve_exact(&note.path).is_some_and(|path| {
+                keys.is_some_and(|keys| {
+                    crate::engine::file_is_blob(keys, &path, blob_id, note.size)
+                })
+            });
+            if restored {
                 if let Some(row) = db::blob_get(conn, blob_id)? {
                     if row.state == BLOB_REMOTE {
                         db::blob_delete(conn, blob_id)?;

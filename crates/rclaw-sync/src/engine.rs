@@ -78,8 +78,23 @@ pub enum AttachmentStage {
 }
 
 /// 文件版本针（长度-修改时间-变更时间）：流式入口钉「核对过的那一份」用。
+/// 工作区里 `path` 上的文件是不是这个对象（`on_blob_want` 判断「放回原处」用）。
+pub(crate) fn file_is_blob(
+    keys: &crate::crypto::Keys,
+    path: &std::path::Path,
+    blob: &str,
+    size: u64,
+) -> bool {
+    local::same_blob(keys, path, blob, size)
+}
+
 pub fn file_version_pin(path: &std::path::Path) -> Option<String> {
     local::file_version_pin(path)
+}
+
+/// 同一个文件的版本针，但全部字段取自这个已经打开的句柄（校验与发送同一个文件）。
+pub fn file_version_pin_of(file: &std::fs::File) -> Option<String> {
+    local::file_version_pin_of(file)
 }
 
 /// 一次「按对象核对要读/要导出的文件」的结果（§8.7）。
@@ -1263,14 +1278,10 @@ impl SyncEngine {
         if keys.blob_id(&digest) != blob {
             return AttachmentReadCheck::Mismatch;
         }
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|since| since.as_nanos())
-            .unwrap_or(0);
-        AttachmentReadCheck::Verified {
-            pin: format!("{}-{}", meta.len(), mtime),
+        // 与直读核对、流式服务用同一套版本针（长度-修改时间-变更时间）。
+        match local::file_version_pin(&path) {
+            Some(pin) => AttachmentReadCheck::Verified { pin },
+            None => AttachmentReadCheck::Unverifiable,
         }
     }
 

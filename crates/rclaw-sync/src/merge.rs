@@ -1346,7 +1346,17 @@ impl Round<'_> {
             Op::BlobWant { blob } => {
                 db::write(self.ctx.db(), |tx| {
                     if ids::is_digest(&blob) {
-                        attach::on_blob_want_at(tx, Some(&self.ctx.env), &blob)?;
+                        {
+                            let keys = crate::secrets::Secrets::load(&self.ctx.paths)
+                                .ok()
+                                .and_then(|secrets| secrets.keys().ok());
+                            attach::on_blob_want_at(
+                                tx,
+                                Some(&self.ctx.env),
+                                keys.as_ref(),
+                                &blob,
+                            )?
+                        }
                     }
                     settle(tx, row, None)
                 })?;

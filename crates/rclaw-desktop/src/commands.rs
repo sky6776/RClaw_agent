@@ -6549,8 +6549,14 @@ pub async fn media_stream_url(
         }
     }
     // 海报帧（或核不了的）：按路径 + 版本针。海报**只查摘要缓存**（缓存里没有就
-    // 不核、也不整读大视频）；核不了的**不钉版本**。
+    // 不核、也不整读大视频）。
+    let named = blob.is_some();
     let pin = check_media_read_cached(&state, chat_id, blob, &path).await?;
+    if named && pin.is_none() {
+        // 这条消息登记的附件还没核对完（缓存里没有结论）：先不出帧，界面保持通用的
+        // 视频卡（点开时走核对过的暂存副本）。否则同长度替换的新版本会在这里露脸。
+        return Err("这个视频还没有核对完，暂时不能应用内播放".into());
+    }
     let agent_root = state.home.join("agent");
     match crate::media_stream::stream_url_with_root(agent_root, &path, pin.as_deref()) {
         Some(url) => Ok(url),
