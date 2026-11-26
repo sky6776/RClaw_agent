@@ -2552,13 +2552,16 @@ export default function Chat({
     if (!el || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
       if (jumpTargetRef.current === null && !followLockRef.current) return;
-      clearJump();
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
       if (atBottom) {
+        // 被夹到新底部：等价用户回底，结束跳转并恢复跟随。
+        clearJump();
         el.scrollTo({ top: el.scrollHeight });
         stickToBottomRef.current = true;
         setShowJumpDown(false);
       }
+      // 没到底：跳转目标仍然可达，保留 pin/锁，让平滑滚动与对齐/2 秒兜底
+      // 自己收尾——提前解锁会让后续动画帧被当成「朝底」把跟随接回去。
       scheduleActiveRound();
     });
     observer.observe(el);
