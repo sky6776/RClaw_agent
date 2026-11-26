@@ -55,6 +55,9 @@ interface CardState {
   openErrors: Record<string, string>;
   /** 下载错误对应的发起序号（按对象）：卡片只显示自己最后一次操作之后的下载错误。 */
   errorSeq: Record<string, number>;
+  /** 合并下载里「这张卡加入时」的序号（按落点键）：只影响加入后没有再操作的卡片，
+   *  不会用别的卡更大的加入序号盖住这张卡更新的打开/保存错误。 */
+  downloadKeySeq: Record<string, number>;
   /** 每张卡最近一次操作的序号（按落点键）：放进订阅快照里，操作发起时触发重渲染
    *  （否则模块级序号变了、卡片不会重算要显示哪条错误）。 */
   cardOp: Record<string, number>;
@@ -80,7 +83,15 @@ function loadSaved(chatId: string): {
       saved?: Record<string, string>;
       verified?: Record<string, boolean>;
     };
-    return { saved: parsed.saved ?? {}, savedVerified: parsed.verified ?? {} };
+    // 只恢复明确标记为核对过的记录（旧格式/未核对的记录不能按路径直接打开）。
+    const saved: Record<string, string> = {};
+    const savedVerified: Record<string, boolean> = {};
+    for (const [key, rel] of Object.entries(parsed.saved ?? {})) {
+      if (parsed.verified?.[key] !== true) continue;
+      saved[key] = rel;
+      savedVerified[key] = true;
+    }
+    return { saved, savedVerified };
   } catch {
     return { saved: {}, savedVerified: {} };
   }
@@ -120,6 +131,7 @@ const noCardState = (): CardState => ({
   saveErrors: {},
   openErrors: {},
   errorSeq: {},
+  downloadKeySeq: {},
   cardOp: {},
   openErrorPath: {},
   savedVerified: {},
@@ -562,8 +574,8 @@ function settle(
   delete downloadKeys[blob];
   let seq = downloadAt[blob] ?? opSeq;
   if (joined) {
-    // 只算「加入后没再发起别的操作」的卡片：A 卡加入后又点了一次打开（失败），
-    // 这次下载的旧失败不能盖住它那条更新的错误。
+    // 每张参与卡只在自己的加入序号仍是它最后一次操作时才显示这次下载的失败；
+    // A 卡加入后又点了一次打开（失败），别的卡更大的加入序号也不能盖住它。
     for (const [key, joinedOp] of joined) {
       if ((cardOpSeq[key] ?? 0) === joinedOp) seq = Math.max(seq, joinedOp);
     }
@@ -627,6 +639,23 @@ function settle(
         error === null
           ? without(prev.errorSeq, blob)
           : { ...prev.errorSeq, [blob]: seq },
+      downloadKeySeq:
+        error === null
+          ? joined
+            ? Object.fromEntries(
+                Object.entries(prev.downloadKeySeq).filter(([key]) => !joined.has(key)),
+              )
+            : prev.downloadKeySeq
+          : joined
+            ? {
+                ...prev.downloadKeySeq,
+                ...Object.fromEntries(
+                  [...joined]
+                    .filter(([key, joinedOp]) => (cardOpSeq[key] ?? 0) === joinedOp)
+                    .map(([key, joinedOp]) => [key, joinedOp]),
+                ),
+              }
+            : prev.downloadKeySeq,
     };
   });
 }
@@ -1113,9 +1142,9 @@ export function AttachmentCard({
   const key = fileKey(item);
   // 下载错误按对象记；只有它发生在该卡最后一次操作之后才显示（之后点过保存/打开/
   // 重新下载的，旧的下载失败已经过时）。
+  const downloadSeq = state.downloadKeySeq[key] ?? state.errorSeq[item.blob];
   const downloadError =
-    state.errorSeq[item.blob] !== undefined &&
-    state.errorSeq[item.blob] >= (state.cardOp[key] ?? -1)
+    downloadSeq !== undefined && downloadSeq >= (state.cardOp[key] ?? -1)
       ? state.errors[item.blob]
       : undefined;
   const error = downloadError ?? state.saveErrors[key] ?? state.openErrors[key];

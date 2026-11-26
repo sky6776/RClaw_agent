@@ -1008,11 +1008,20 @@ export default function Chat({
       lastScrollTopRef.current = el.scrollTop;
       return; // 拖动中的位置混着流式拉底，不据它改判跟随
     }
-    // 显式跳转还在进行：离底 80px 内的「朝底」滚动不能把跟随接回去。
+    // 显式跳转还在进行：离底 80px 内的「朝底」滚动不能把跟随接回去；但用户把
+    // 滚动条直接拖到底（或内容无溢出）等价于显式回底，要恢复跟随。
     if (followLockRef.current) {
+      const noOverflow = el.scrollHeight - el.clientHeight <= 0;
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
+      if (noOverflow || atBottom) {
+        clearJump();
+        stickToBottomRef.current = true;
+        setShowJumpDown(false);
+      } else {
+        // 跳转把跟随关掉了：不管离底多近，都要留一个「回到底部」入口。
+        setShowJumpDown(!stickToBottomRef.current);
+      }
       lastScrollTopRef.current = el.scrollTop;
-      // 跳转把跟随关掉了：不管离底多近，都要留一个「回到底部」入口。
-      setShowJumpDown(!stickToBottomRef.current);
       return;
     }
     // 内容全部可见（无溢出，scrollTop 被钳在 0）等价于停在底部：必须恢复

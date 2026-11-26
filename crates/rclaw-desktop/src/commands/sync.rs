@@ -1429,8 +1429,24 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     // 只走原子无覆盖改名：失败就把真实错误交给调用方（AlreadyExists 换候选，
-    // 其它报错）——不降级成「可能覆盖目标」的普通 rename。
-    renameat2_noreplace(from, to)
+    // 其它报错）——不降级成「可能覆盖目标」的普通 rename。文件系统/内核明确
+    // 不支持时给稳定文案，界面据此不再提示重试/重下。
+    match renameat2_noreplace(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL)
+            ) =>
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("这个位置不支持原子发布文件（文件系统不支持无覆盖改名）: {e}"),
+            ))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Android：不调用 `renameat2`。bionic 直到 API 30 才导出该符号，而直接 syscall 又
