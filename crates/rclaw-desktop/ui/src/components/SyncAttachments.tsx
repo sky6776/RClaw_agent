@@ -52,6 +52,8 @@ interface CardState {
   saveErrors: Record<string, string>;
   /** 打开失败的文案（按落点）：与「存进工作区失败」分开，打开成功只清这一份。 */
   openErrors: Record<string, string>;
+  /** 下载错误对应的发起序号（按对象）：卡片只显示自己最后一次操作之后的下载错误。 */
+  errorSeq: Record<string, number>;
   /** 存进工作区之后的相对路径。 */
   saved: Record<string, string>;
 }
@@ -62,6 +64,7 @@ const noCardState = (): CardState => ({
   errors: {},
   saveErrors: {},
   openErrors: {},
+  errorSeq: {},
   saved: {},
 });
 
@@ -433,9 +436,8 @@ function settle(
   placed: boolean,
   landed: string | null,
 ) {
-  // 这个下载之后又发起了保存/打开：结果（尤其失败）不再写进卡片错误。
-  const stale =
-    downloadAt[blob] !== undefined && blobOpSeq[blob] !== downloadAt[blob];
+  // 这次下载的发起序号：卡片渲染时按「自己的最后一次操作」决定要不要显示它。
+  const seq = downloadAt[blob] ?? opSeq;
   if (error === null && placed) {
     // 只撤「这次实际落到的那个路径」上的覆盖：同一对象的其他路径上可能还是另一份
     // 内容（取回到同步缓存时，消息路径并没有被修好）。`error` 为空但没落盘的
@@ -450,20 +452,45 @@ function settle(
   setCards((prev) => {
     const busy = without(prev.busy, blob);
     const errors =
-      error === null || stale
-        ? without(prev.errors, blob)
-        : { ...prev.errors, [blob]: error };
+      error === null ? without(prev.errors, blob) : { ...prev.errors, [blob]: error };
+    // 下载成功：这个对象的副本刚取回来，之前「打开这个落点失败」的文案已经过时
+    // （按 blob:path 键找同一对象的落点）。保存失败（落点不支持发布等）不动。
+    let openErrors = prev.openErrors;
+    if (error === null && placed) {
+      const prefix = `${blob}:`;
+      const stale = Object.keys(openErrors).filter((key) => key.startsWith(prefix));
+      if (stale.length > 0) {
+        openErrors = { ...openErrors };
+        for (const key of stale) delete openErrors[key];
+      }
+    }
     // 卡片上的「内容对不上／保存失败」是按落点记的：不在这里按整个对象清（成功落到的
     // 那个落点由上面的 clearAttachmentChanged 连说明一起收掉；别的落点可能仍然不对）。
-    if (busy === prev.busy && errors === prev.errors) {
+    if (
+      busy === prev.busy &&
+      errors === prev.errors &&
+      openErrors === prev.openErrors &&
+      error === null &&
+      prev.errorSeq[blob] === undefined
+    ) {
       return prev;
     }
-    return { ...prev, busy, errors };
+    return {
+      ...prev,
+      busy,
+      errors,
+      openErrors,
+      errorSeq:
+        error === null
+          ? without(prev.errorSeq, blob)
+          : { ...prev.errorSeq, [blob]: seq },
+    };
   });
 }
 
-/** 下载一个还在别的设备上的附件。不等结果：结果经 sync 事件回来（见装载器）。 */
-function download(chatId: string, blob: string) {
+/** 下载一个还在别的设备上的附件。不等结果：结果经 sync 事件回来（见装载器）。
+ *  `key` 是卡片发起时给的落点键：下载也算这张卡的一次操作（旧打开/保存失败作废）。 */
+function download(chatId: string, blob: string, key?: string) {
   if (cards.busy[blob]) return;
   setCards((prev) => ({
     ...prev,
@@ -479,8 +506,17 @@ function download(chatId: string, blob: string) {
   // 下载也是一次操作：参与「最近一次操作」排序（稍后的保存/打开会让它的失败
   // 不再写进卡片错误）。
   opSeq += 1;
-  downloadAt[blob] = opSeq;
-  blobOpSeq[blob] = opSeq;
+  const op = opSeq;
+  downloadAt[blob] = op;
+  blobOpSeq[blob] = op;
+  if (key) {
+    cardOpSeq[key] = op;
+    setCards((prev) => ({
+      ...prev,
+      saveErrors: without(prev.saveErrors, key),
+      openErrors: without(prev.openErrors, key),
+    }));
+  }
   api.syncFetchAttachment(chatId, blob).catch((e) => settle(blob, String(e), false, null));
 }
 
@@ -866,10 +902,15 @@ export function AttachmentCard({
   const shown = name ?? (item.path.split("/").pop() || item.path);
   const where = item.origin ? `「${item.origin}」` : "别的设备";
   const isImage = IMAGE_RE.test(item.path);
-  const error =
-    state.errors[item.blob] ??
-    state.saveErrors[fileKey(item)] ??
-    state.openErrors[fileKey(item)];
+  const key = fileKey(item);
+  // 下载错误按对象记；只有它发生在该卡最后一次操作之后才显示（之后点过保存/打开/
+  // 重新下载的，旧的下载失败已经过时）。
+  const downloadError =
+    state.errorSeq[item.blob] !== undefined &&
+    state.errorSeq[item.blob] >= (cardOpSeq[key] ?? -1)
+      ? state.errors[item.blob]
+      : undefined;
+  const error = downloadError ?? state.saveErrors[key] ?? state.openErrors[key];
   // 落点不支持原子发布是文件系统能力问题，重新下载改变不了它。
   const publishUnsupported =
     typeof error === "string" &&
@@ -980,7 +1021,7 @@ export function AttachmentCard({
             <div className={`min-w-0 flex-1 ${CARD_ERROR}`}>{error}</div>
             {!publishUnsupported && (
               <button
-                onClick={() => download(chatId, item.blob)}
+                onClick={() => download(chatId, item.blob, key)}
                 disabled={inactive}
                 className={CARD_BTN}
               >
@@ -1067,7 +1108,7 @@ export function AttachmentCard({
           </button>
         )}
         <button
-          onClick={() => download(chatId, item.blob)}
+          onClick={() => download(chatId, item.blob, key)}
           disabled={inactive || busy}
           className={CARD_BTN}
         >

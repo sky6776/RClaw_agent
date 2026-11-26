@@ -864,17 +864,40 @@ pub(crate) fn attachments(
                     },
                 }
             };
-            let exact = |rel_path: &str| -> Option<std::path::PathBuf> {
-                let path = ctx.env.resolve_exact(rel_path)?;
-                ctx.env.check_path(rel_path, &path).ok()?;
-                path.is_file().then_some(path)
-            };
+
             // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
             // 里、密钥读不出来）时验不了：按登记说它在（老行为）。
             let verified = |path: &Path| -> BlobMatch {
                 match keys {
                     Some(keys) => same_blob_status(keys, path, &found.blob, found.size),
                     None => BlobMatch::Yes,
+                }
+            };
+            // 消息里写的那个路径自身的三态结论 + 路径（不能复用落点结论：落点可能
+            // 是同步缓存；消息路径上的文件读不了时也要按 Unknown 处理）。
+            let exact_status = |rel: &str| -> (BlobMatch, Option<std::path::PathBuf>) {
+                let Some(path) = ctx.env.resolve_exact(rel) else {
+                    return (BlobMatch::No, None);
+                };
+                match ctx.env.check_path_typed(rel, &path) {
+                    Err(crate::wire::LinkCheckError::Policy) => return (BlobMatch::No, None),
+                    Err(crate::wire::LinkCheckError::Io(_)) => {
+                        return (BlobMatch::Unknown, Some(path))
+                    }
+                    Ok(()) => {}
+                }
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_file() => (verified(&path), Some(path)),
+                    Ok(_) => (BlobMatch::No, None),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        (BlobMatch::No, None)
+                    }
+                    Err(_) => (BlobMatch::Unknown, Some(path)),
                 }
             };
             let (state, local_path, rel_path) = match &found.row {
@@ -896,33 +919,29 @@ pub(crate) fn attachments(
                     }
                     Landing::File(path) => ("local", Some(path), Some(row.rel_path.clone())),
                     Landing::Absent => ("missing", None, None),
-                    // 落点暂时读不了：登记状态照旧，但不给 local_path——预览/保存会
-                    // 拿到「暂时不可访问」的可重试错误，而不是「没下载/不在缓存」。
+                    // 落点暂时读不了：登记状态与落点都保留——卡片按登记的路径重试
+                    // （打开时会再核对一次），预览/保存拿不到 local_path 时给「暂时
+                    // 不可访问」的可重试错误，而不是「没下载/不在缓存」。
                     Landing::Unknown => {
                         let state = if row.rel_path.starts_with(SYNC_DIR_PREFIX) {
                             "cached"
                         } else {
                             "local"
                         };
-                        (state, None, None)
+                        (state, None, Some(row.rel_path.clone()))
                     }
                 },
                 // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上就算
                 // 本机有——文件被放回原处之后不该还按「取不回来」说。
-                None if found.kind == "file" => match exact(&found.path) {
-                    // 不在核对窗口里的只能按存在性说（老消息，不渲染）。
-                    Some(path) if !deep || matches!(verified(&path), BlobMatch::Yes) => {
-                        ("local", Some(path), Some(found.path.clone()))
-                    }
-                    // 这个路径读不了/核不了（暂时）：按本机有处理，但不算核对过，
-                    // `checked=false` 让界面别拿它撤保存记录。
-                    Some(path) if matches!(verified(&path), BlobMatch::Unknown) => {
-                        ("local", Some(path), Some(found.path.clone()))
-                    }
-                    Some(_) => ("changed", None, None),
+                None if found.kind == "file" => match exact_status(&found.path) {
+                    // 核对过、内容对不上：按「已改写」处理。
+                    (BlobMatch::No, Some(_)) if deep => ("changed", None, None),
+                    // 在（或暂时读不了/核不了）：按本机有处理；读不了的 `checked=false`
+                    // 让界面别拿它撤保存记录。
+                    (_, Some(path)) => ("local", Some(path), Some(found.path.clone())),
                     // 文件没了、又留着「原本在这台设备上」的记录：照实说取不回来。
-                    None if found.was_mine => ("gone", None, None),
-                    None => ("missing", None, None),
+                    (_, None) if found.was_mine => ("gone", None, None),
+                    (_, None) => ("missing", None, None),
                 },
                 // 工具结果全文：登记被回收过、留下记录的，照实说取不回来。
                 None if found.was_mine => ("gone", None, None),
@@ -935,31 +954,7 @@ pub(crate) fn attachments(
             } else {
                 None
             };
-            // 消息里写的那个路径自身的三态结论（不能复用落点结论：落点可能是同步
-            // 缓存，消息路径上的文件读不了时也要按 Unknown 处理）。
-            let exact_status = |rel: &str| -> BlobMatch {
-                let Some(path) = ctx.env.resolve_exact(rel) else {
-                    return BlobMatch::No;
-                };
-                match ctx.env.check_path_typed(rel, &path) {
-                    Err(crate::wire::LinkCheckError::Policy) => return BlobMatch::No,
-                    Err(crate::wire::LinkCheckError::Io(_)) => return BlobMatch::Unknown,
-                    Ok(()) => {}
-                }
-                match std::fs::symlink_metadata(&path) {
-                    Ok(meta) if meta.is_file() => verified(&path),
-                    Ok(_) => BlobMatch::No,
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) =>
-                    {
-                        BlobMatch::No
-                    }
-                    Err(_) => BlobMatch::Unknown,
-                }
-            };
+
             let message_status = if found.kind == "file" && deep {
                 Some(if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
                     outcome.unwrap_or(BlobMatch::Unknown)
@@ -984,7 +979,7 @@ pub(crate) fn attachments(
                         None => BlobMatch::No,
                     }
                 } else {
-                    exact_status(&found.path)
+                    exact_status(&found.path).0
                 })
             } else {
                 None
