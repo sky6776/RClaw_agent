@@ -80,8 +80,8 @@ export function RoundRail({
   );
   // 山峰高亮是鼠标悬停还是键盘焦点触发的：滚动只清鼠标那份，键盘高亮要留着。
   const focusSource = useRef<"hover" | "focus" | null>(null);
-  // 浮层上转发滚轮时没落下去的小数位移（scrollTop 只收整数）。
-  const wheelRest = useRef(0);
+  // 浮层上转发滚轮时没落下去的小数位移（scrollTop/scrollLeft 只收整数），两轴分开存。
+  const wheelRest = useRef({ x: 0, y: 0 });
   const activeIdx = rounds.findIndex((r) => r.id === activeId);
 
   // 窗口化：固定行高 10px，可视窗口上下各多渲染 6 条（zcode 同款 overscan）。
@@ -315,24 +315,34 @@ export function RoundRail({
           // 列表的 `space-y-3` 会给直接子节点加 12px 上外边距（fixed 元素也会被
           // 推下去）：`!mt-0` 抵掉，坐标才和按钮对得上。
           // 滚轮落在浮层上时显式滚正文（Chromium 不把 fixed 子树当成滚动链的一段）。
+          // 一个轴的位移落地：小数余量按轴分别攒（0.25px 的连续输入不会被取整吃掉，
+          // 两轴之间也不会互相借位）。
+          const applyAxis = (host: HTMLElement, axis: "x" | "y", delta: number) => {
+            if (delta === 0) return;
+            const pending = wheelRest.current[axis] + delta;
+            const whole = Math.trunc(pending);
+            wheelRest.current[axis] = pending - whole;
+            if (whole === 0) return;
+            if (axis === "x") host.scrollLeft += whole;
+            else host.scrollTop += whole;
+          };
           const wheel = (e: React.WheelEvent) => {
             if (e.ctrlKey) return; // Ctrl+滚轮是字号缩放，交给上层的原生监听
             const host = listRef?.current;
             if (!host) return;
-            // 三个单位分开换算：像素 / 行（约 16px）/ 页（一屏）；小数位移攒起来，
-            // 别让连续的 0.25px 事件被 scrollTop 的取整全吃掉。
-            const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? host.clientHeight : 1;
-            // Shift+滚轮 / 带 deltaX 的横向输入：转成横滚，别当成纵向（也不退出贴底）。
-            const horizontal = e.shiftKey || e.deltaX !== 0;
-            const raw = horizontal ? (e.deltaX !== 0 ? e.deltaX : e.deltaY) : e.deltaY;
-            const pending = wheelRest.current + raw * unit;
-            const whole = Math.trunc(pending);
-            wheelRest.current = pending - whole;
-            if (whole !== 0) {
-              if (horizontal) host.scrollLeft += whole;
-              else host.scrollTop += whole;
+            // 单位：像素 / 行（约 16px）/ 页（横向一屏宽、纵向一屏高）。
+            const scale = (value: number, page: number) =>
+              value * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? page : 1);
+            let dx = scale(e.deltaX, host.clientWidth);
+            let dy = scale(e.deltaY, host.clientHeight);
+            // Shift+滚轮是「横着滚」（浏览器约定）：纵向分量并到横轴，纵横不互相吞。
+            if (e.shiftKey) {
+              dx += dy;
+              dy = 0;
             }
-            if (!horizontal) onWheelScroll?.(e.deltaY);
+            applyAxis(host, "x", dx);
+            applyAxis(host, "y", dy);
+            if (dy < 0) onWheelScroll?.(dy);
           };
           const layer = (
             <>
