@@ -2366,6 +2366,7 @@ export default function Chat({
             rounds={rounds}
             activeId={activeRoundId}
             onJump={scrollToRound}
+            listRef={listRef}
           />
         )}
         {/* 消息流（移动端收窄页边距，把宽度还给消息正文）；rail 可见时左侧

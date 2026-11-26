@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useBackClose } from "../lib/backNav";
 
 /** 轮次快捷导航的一个条目（Chat 按用户消息推导，时间已格式化为展示文本）。 */
@@ -49,10 +50,13 @@ export function RoundRail({
   rounds,
   activeId,
   onJump,
+  listRef,
 }: {
   rounds: RoundNavItem[];
   activeId: number | null;
   onJump: (id: number) => void;
+  /** 消息列表的滚动容器：浮层 portal 到这里，滚轮落在浮层上也能滚正文。 */
+  listRef?: React.RefObject<HTMLDivElement | null>;
 }) {
   const [focusIdx, setFocusIdx] = useState<number | null>(null);
   // 键盘焦点所在的条目：窗口移动时保留它，避免按钮被卸载后焦点掉到 body。
@@ -65,7 +69,14 @@ export function RoundRail({
     y: number;
   } | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const navRef = useRef<HTMLElement | null>(null);
   const [view, setView] = useState({ top: 0, height: 0 });
+  // 当前提示挂在哪个按钮上、是鼠标还是键盘触发的：滚动时要区别对待。
+  const tipAnchor = useRef<{ el: HTMLElement; item: RoundNavItem; source: "hover" | "focus" } | null>(
+    null,
+  );
+  // 山峰高亮是鼠标悬停还是键盘焦点触发的：滚动只清鼠标那份，键盘高亮要留着。
+  const focusSource = useRef<"hover" | "focus" | null>(null);
   const activeIdx = rounds.findIndex((r) => r.id === activeId);
 
   // 窗口化：固定行高 10px，可视窗口上下各多渲染 6 条（zcode 同款 overscan）。
@@ -120,24 +131,43 @@ export function RoundRail({
   const clearTip = () => {
     window.clearTimeout(openTimer.current);
     window.clearTimeout(closeTimer.current);
+    tipAnchor.current = null;
     setTip(null);
   };
-  const hover = (i: number) => {
+  const keepTip = () => {
+    window.clearTimeout(openTimer.current);
+    window.clearTimeout(closeTimer.current);
+  };
+  // observer 只装一次（见下），通过 ref 拿到最新的清提示逻辑。
+  const clearTipRef = useRef(clearTip);
+  clearTipRef.current = clearTip;
+  const hover = (i: number, source: "hover" | "focus") => {
+    focusSource.current = source;
     setFocusIdx(i);
     window.clearTimeout(closeTimer.current);
   };
   const leave = () => {
+    focusSource.current = null;
     setFocusIdx(null);
+    tipAnchor.current = null;
     window.clearTimeout(openTimer.current);
     window.clearTimeout(closeTimer.current);
     closeTimer.current = window.setTimeout(() => setTip(null), 80);
   };
-  const showTip = (el: HTMLElement, item: RoundNavItem) => {
+  const showTip = (
+    el: HTMLElement,
+    item: RoundNavItem,
+    source: "hover" | "focus",
+    delayMs = 120,
+  ) => {
     window.clearTimeout(openTimer.current);
     window.clearTimeout(closeTimer.current);
+    tipAnchor.current = { el, item, source };
     // 换到另一行：旧的提示立刻收掉，别让第一行的预览滞留在屏幕上。
     setTip((prev) => (prev !== null && prev.id !== item.id ? null : prev));
     openTimer.current = window.setTimeout(() => {
+      // 锚点已经换了（移走/换了行）：这次结果作废。
+      if (tipAnchor.current?.el !== el) return;
       const rect = el.getBoundingClientRect();
       setTip({
         id: item.id,
@@ -147,8 +177,18 @@ export function RoundRail({
         x: Math.min(rect.right + 8, window.innerWidth - 16),
         y: rect.top + rect.height / 2,
       });
-    }, 120);
+    }, delayMs);
   };
+
+  // 轨道外层布局变化（窗口缩放、面板开关把整条轨道挪位）时收起提示：滚动盒自身
+  // 高度可以不变，只观察它抓不到这种位移。observer 只装一次，避免每次渲染重建。
+  useEffect(() => {
+    const el = navRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => clearTipRef.current());
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   // Esc 关闭（悬停出的提示没有焦点在按钮上也收得掉）。
   useEffect(() => {
@@ -166,15 +206,22 @@ export function RoundRail({
 
   if (rounds.length < 2) return null;
   return (
-    <nav aria-label="对话提问导航" className="absolute inset-y-0 left-3 z-20 w-6">
+    <nav ref={navRef} aria-label="对话提问导航" className="absolute inset-y-0 left-3 z-20 w-6">
       <div
         ref={scrollRef}
         onScroll={() => {
           const el = scrollRef.current;
           if (el) setView({ top: el.scrollTop, height: el.clientHeight });
-          setFocusIdx(null);
-          // 滚动时提示立刻收掉（计时器也清）：留着会停在已经移走的那一行上。
-          clearTip();
+          // 键盘焦点的高亮留着（Tab 到下一行会顺带滚动，别把刚亮起来的那行清掉）。
+          if (focusSource.current !== "focus") setFocusIdx(null);
+          // 滚动时提示不能停在已经移走的那一行上：鼠标提示直接收；键盘焦点行
+          // （Tab 到下一行时浏览器会顺带滚一下）按新坐标重开，别把刚排的提示清掉。
+          const anchor = tipAnchor.current;
+          if (anchor?.source === "focus" && document.activeElement === anchor.el) {
+            showTip(anchor.el, anchor.item, "focus", 0);
+          } else {
+            clearTip();
+          }
         }}
         onPointerLeave={leave}
         className="absolute top-1/2 max-h-[calc(100%-6rem)] w-6 -translate-y-1/2 overflow-x-hidden overflow-y-auto [scrollbar-width:none]"
@@ -206,18 +253,23 @@ export function RoundRail({
                 className="absolute left-0 top-0 h-2.5 w-6"
                 style={{ transform: `translateY(${i * ROW}px)` }}
               >
+                {/* 屏读描述：聚焦按钮时就有预览（不依赖浮层是否打开）。 */}
+                <span id={`rclaw-round-desc-${r.id}`} className="sr-only">
+                  {r.preview}
+                  {r.time ? `（${r.time}）` : ""}
+                </span>
                 <button
                   type="button"
                   onClick={() => onJump(r.id)}
                   onMouseEnter={(e) => {
-                    hover(i);
-                    showTip(e.currentTarget, r);
+                    hover(i, "hover");
+                    showTip(e.currentTarget, r, "hover");
                   }}
                   onMouseLeave={leave}
                   onFocus={(e) => {
-                    hover(i);
+                    hover(i, "focus");
                     setFocusedId(r.id);
-                    showTip(e.currentTarget, r);
+                    showTip(e.currentTarget, r, "focus");
                   }}
                   onBlur={() => {
                     setFocusedId(null);
@@ -225,7 +277,7 @@ export function RoundRail({
                   }}
                   aria-label={`跳转到第 ${i + 1} 条提问`}
                   aria-current={active ? "location" : undefined}
-                  aria-describedby={tip?.id === r.id ? "rclaw-round-tip" : undefined}
+                  aria-describedby={`rclaw-round-desc-${r.id}`}
                   className="flex h-2.5 w-6 items-center justify-start rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 focus-visible:ring-inset"
                 >
                   <span className="block" aria-hidden="true">
@@ -242,22 +294,34 @@ export function RoundRail({
           })}
         </div>
       </div>
-      {tip && (
-        <div
-          id="rclaw-round-tip"
-          role="tooltip"
-          onMouseEnter={() => {
-            window.clearTimeout(openTimer.current);
-            window.clearTimeout(closeTimer.current);
-          }}
-          onMouseLeave={leave}
-          className="fixed z-50 w-max max-w-[16rem] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 text-[11px] leading-relaxed text-gray-200 shadow-lg"
-          style={{ left: tip.x, top: tip.y }}
-        >
-          <div className="truncate">{tip.text}</div>
-          {tip.time && <div className="text-[10px] text-gray-500">{tip.time}</div>}
-        </div>
-      )}
+      {tip &&
+        (() => {
+          const layer = (
+            <>
+              {/* 按钮与浮层之间 8px 空隙的透明连接区：慢速移动也不会掉提示。 */}
+              <div
+                aria-hidden="true"
+                className="fixed z-40"
+                style={{ left: tip.x - 8, top: tip.y - 12, width: 8, height: 24 }}
+                onMouseEnter={keepTip}
+                onMouseLeave={leave}
+              />
+              <div
+                role="tooltip"
+                onMouseEnter={keepTip}
+                onMouseLeave={leave}
+                className="fixed z-50 w-max max-w-[16rem] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 text-[11px] leading-relaxed text-gray-200 shadow-lg"
+                style={{ left: tip.x, top: tip.y }}
+              >
+                <div className="truncate">{tip.text}</div>
+                {tip.time && <div className="text-[10px] text-gray-500">{tip.time}</div>}
+              </div>
+            </>
+          );
+          // 挂到消息列表里：滚轮落在浮层上也能滚正文（rail 自己是列表的兄弟节点）。
+          const host = listRef?.current;
+          return host ? createPortal(layer, host) : layer;
+        })()}
     </nav>
   );
 }
