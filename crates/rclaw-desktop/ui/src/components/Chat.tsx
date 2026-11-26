@@ -1200,15 +1200,20 @@ export default function Chat({
       armZombieObserver();
     }
   };
-  const handleListWheel = (e: React.WheelEvent) => {
-    // Ctrl+滚轮是缩放文字（见下面的原生监听）：那不是滚动，别把「跟到底部」关掉。
-    if (e.ctrlKey) return;
+  // 滚轮往上（不带 Ctrl）就退出贴底并露出「回到底部」——没有溢出时不判（短会话
+  // 全部可见，滚上去也没有可翻的内容）。正文与 rail 浮层上的滚轮共用这一份。
+  const noteWheelIntent = (deltaY: number) => {
     const el = listRef.current;
     if (!el || el.scrollHeight - el.clientHeight <= 0) return;
-    if (e.deltaY < 0) {
+    if (deltaY < 0) {
       stickToBottomRef.current = false;
       setShowJumpDown(true);
     }
+  };
+  const handleListWheel = (e: React.WheelEvent) => {
+    // Ctrl+滚轮是缩放文字（见下面的原生监听）：那不是滚动，别把「跟到底部」关掉。
+    if (e.ctrlKey) return;
+    noteWheelIntent(e.deltaY);
   };
   // 窗口尺寸变化会改变溢出状态：放大到内容全部可见时 scrollTop 被钳回 0、
   // 不再派发 scroll 事件；放大到仍溢出时位置也会被钳到新底部（scrollTop
@@ -2367,13 +2372,7 @@ export default function Chat({
             activeId={activeRoundId}
             onJump={scrollToRound}
             listRef={listRef}
-            onWheelScroll={(deltaY) => {
-              // 与 handleListWheel 同一套判定：向上滚退出贴底并露出「回到底部」。
-              if (deltaY < 0) {
-                stickToBottomRef.current = false;
-                setShowJumpDown(true);
-              }
-            }}
+            onWheelScroll={noteWheelIntent}
           />
         )}
         {/* 消息流（移动端收窄页边距，把宽度还给消息正文）；rail 可见时左侧

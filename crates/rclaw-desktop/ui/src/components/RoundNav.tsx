@@ -80,6 +80,8 @@ export function RoundRail({
   );
   // 山峰高亮是鼠标悬停还是键盘焦点触发的：滚动只清鼠标那份，键盘高亮要留着。
   const focusSource = useRef<"hover" | "focus" | null>(null);
+  // 浮层上转发滚轮时没落下去的小数位移（scrollTop 只收整数）。
+  const wheelRest = useRef(0);
   const activeIdx = rounds.findIndex((r) => r.id === activeId);
 
   // 窗口化：固定行高 10px，可视窗口上下各多渲染 6 条（zcode 同款 overscan）。
@@ -317,7 +319,13 @@ export function RoundRail({
             if (e.ctrlKey) return; // Ctrl+滚轮是字号缩放，交给上层的原生监听
             const host = listRef?.current;
             if (!host) return;
-            host.scrollTop += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+            // 三个单位分开换算：像素 / 行（约 16px）/ 页（一屏）；小数位移攒起来，
+            // 别让连续的 0.25px 事件被 scrollTop 的取整全吃掉。
+            const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? host.clientHeight : 1;
+            const pending = wheelRest.current + e.deltaY * unit;
+            const whole = Math.trunc(pending);
+            wheelRest.current = pending - whole;
+            if (whole !== 0) host.scrollTop += whole;
             onWheelScroll?.(e.deltaY);
           };
           const layer = (
