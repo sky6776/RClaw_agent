@@ -2556,11 +2556,12 @@ export default function Chat({
       if (jumpTargetRef.current === null && !followLockRef.current) return;
       const maxScroll = el.scrollHeight - el.clientHeight;
       const noOverflow = maxScroll <= 0;
-      // 只有高度变大把最大滚动位置压小、且位置确实落在新底部，才是「夹位」；
-      // 单纯的宽度变化/动画首帧（max 没变）不算。
+      // 只有「高度变大把上限压小、上一位置确实超过新上限、浏览器把它夹到
+      // 新上限」才是夹位；单纯宽度变化/动画首帧/只是靠近新底部都不算。
       const clamped =
         maxScroll < lastMaxScrollRef.current &&
-        el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
+        lastScrollTopRef.current > maxScroll &&
+        el.scrollTop === maxScroll;
       lastMaxScrollRef.current = maxScroll;
       if (noOverflow || clamped) {
         // 被夹到新底部：等价用户回底，结束跳转并恢复跟随。
