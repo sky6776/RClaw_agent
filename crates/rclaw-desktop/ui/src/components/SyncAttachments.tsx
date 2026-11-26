@@ -54,6 +54,11 @@ interface CardState {
   openErrors: Record<string, string>;
   /** 下载错误对应的发起序号（按对象）：卡片只显示自己最后一次操作之后的下载错误。 */
   errorSeq: Record<string, number>;
+  /** 每张卡最近一次操作的序号（按落点键）：放进订阅快照里，操作发起时触发重渲染
+   *  （否则模块级序号变了、卡片不会重算要显示哪条错误）。 */
+  cardOp: Record<string, number>;
+  /** 打开错误实际用的落点：下载成功只清对应落点的那条。 */
+  openErrorPath: Record<string, string>;
   /** 存进工作区之后的相对路径。 */
   saved: Record<string, string>;
 }
@@ -65,6 +70,8 @@ const noCardState = (): CardState => ({
   saveErrors: {},
   openErrors: {},
   errorSeq: {},
+  cardOp: {},
+  openErrorPath: {},
   saved: {},
 });
 
@@ -453,9 +460,20 @@ function settle(
     // 下载成功：只清「实际落到的那个路径」的打开失败（别的落点可能仍然读不了；
     // 存进工作区失败是另一回事）。没给出落点时什么都没恢复，不清。
     let openErrors = prev.openErrors;
+    let openErrorPath = prev.openErrorPath;
     if (error === null && placed && landed) {
-      const key = `${blob}:${landed}`;
-      if (openErrors[key] !== undefined) openErrors = without(openErrors, key);
+      const prefix = `${blob}:`;
+      const keys = Object.keys(openErrors).filter(
+        (key) => key.startsWith(prefix) && openErrorPath[key] === landed,
+      );
+      if (keys.length > 0) {
+        openErrors = { ...openErrors };
+        openErrorPath = { ...openErrorPath };
+        for (const key of keys) {
+          delete openErrors[key];
+          delete openErrorPath[key];
+        }
+      }
     }
     // 卡片上的「内容对不上／保存失败」是按落点记的：不在这里按整个对象清（成功落到的
     // 那个落点由上面的 clearAttachmentChanged 连说明一起收掉；别的落点可能仍然不对）。
@@ -473,6 +491,7 @@ function settle(
       busy,
       errors,
       openErrors,
+      openErrorPath,
       errorSeq:
         error === null
           ? without(prev.errorSeq, blob)
@@ -509,6 +528,8 @@ function download(chatId: string, blob: string, key?: string) {
       ...prev,
       saveErrors: without(prev.saveErrors, key),
       openErrors: without(prev.openErrors, key),
+      openErrorPath: without(prev.openErrorPath, key),
+      cardOp: { ...prev.cardOp, [key]: op },
     }));
   }
   api.syncFetchAttachment(chatId, blob).catch((e) => {
@@ -532,6 +553,8 @@ function save(chatId: string, item: SyncAttachment) {
     saving: { ...prev.saving, [key]: true },
     saveErrors: without(prev.saveErrors, key),
     openErrors: without(prev.openErrors, key),
+    openErrorPath: without(prev.openErrorPath, key),
+    cardOp: { ...prev.cardOp, [key]: op },
   }));
   api
     .syncAttachmentSave(chatId, item.blob, item.path)
@@ -904,7 +927,7 @@ export function AttachmentCard({
   // 重新下载的，旧的下载失败已经过时）。
   const downloadError =
     state.errorSeq[item.blob] !== undefined &&
-    state.errorSeq[item.blob] >= (cardOpSeq[key] ?? -1)
+    state.errorSeq[item.blob] >= (state.cardOp[key] ?? -1)
       ? state.errors[item.blob]
       : undefined;
   const error = downloadError ?? state.saveErrors[key] ?? state.openErrors[key];
@@ -921,9 +944,11 @@ export function AttachmentCard({
     setCards((prev) => {
       // 只收掉这个落点上一次「存进工作区失败」：下载错误是按对象记的，别的落点
       // 可能还要看它（由各卡片按自己的操作序号决定显示）。
-      const saveErrors = without(prev.saveErrors, key);
-      if (saveErrors === prev.saveErrors) return prev;
-      return { ...prev, saveErrors };
+      return {
+        ...prev,
+        saveErrors: without(prev.saveErrors, key),
+        cardOp: { ...prev.cardOp, [key]: op },
+      };
     });
     // 点开前先让后端核对一下：工作区里这个路径上的文件可能已经被就地改写过，打开
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
@@ -935,20 +960,23 @@ export function AttachmentCard({
       // 打开的是核对过的副本才算这次读通过；按**打开的这个落点**清覆盖（别把消息
       // 路径上的标记也清了，那条可能仍然对不上）。
       .then((verified) => {
-        if (!verified) return;
         // 先核对会话/版本/落点，全部对得上才清状态：迟到的成功回调不能清掉别的
         // 会话或后来重新保存的那份记录。
         if (chat !== chatId) return;
         if ((savedKeyGen[key] ?? 0) !== genAt) return;
         if (cards.saved[key] !== undefined && cards.saved[key] !== path) return;
         if (cardOpSeq[key] !== op) return;
-        clearAttachmentChanged({ path, blob: item.blob });
-        // 上一次打开失败（严格核对暂时不可用、拉起程序失败）的文案要收掉；存进
-        // 工作区失败是另一回事，不动它。
+        // `verified=false` 是「按老行为打开、没核对」：文件确实打开了，上一次打开
+        // 失败同样已经过去；只是不能清「内容对不上」的标记。
+        if (verified) clearAttachmentChanged({ path, blob: item.blob });
         setCards((prev) =>
           prev.openErrors[key] === undefined
             ? prev
-            : { ...prev, openErrors: without(prev.openErrors, key) },
+            : {
+                ...prev,
+                openErrors: without(prev.openErrors, key),
+                openErrorPath: without(prev.openErrorPath, key),
+              },
         );
       })
       .catch((e) => {
@@ -968,6 +996,7 @@ export function AttachmentCard({
           ...prev,
           saved: gone && prev.saved[key] === path ? without(prev.saved, key) : prev.saved,
           openErrors: { ...prev.openErrors, [key]: String(e) },
+          openErrorPath: { ...prev.openErrorPath, [key]: path },
         }));
         if (gone) reload?.();
       });
@@ -1366,7 +1395,9 @@ export function SyncChatBar({
             </button>
             {open && remote.length > 1 && (
               <button
-                onClick={() => idle.forEach((item) => download(chatId, item.blob))}
+                onClick={() =>
+                  idle.forEach((item) => download(chatId, item.blob, fileKey(item)))
+                }
                 disabled={idle.length === 0}
                 className={CARD_BTN}
               >
