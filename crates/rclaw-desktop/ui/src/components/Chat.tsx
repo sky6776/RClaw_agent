@@ -992,6 +992,10 @@ export default function Chat({
   const handleListScroll = () => {
     const el = listRef.current;
     if (!el) return;
+    // 最大滚动位置变小 = 视口变高把位置夹到了新底部（不是用户向下滚）。
+    const maxScroll = el.scrollHeight - el.clientHeight;
+    const clamped = maxScroll < lastMaxScrollRef.current;
+    lastMaxScrollRef.current = maxScroll;
     // 轮次导航的当前轮跟随滚动刷新（rAF 节流，见下方 computeActiveRound）。
     scheduleActiveRound();
     // 批量开合思考块的布局滚动抑制窗：钳位/结算复位产生的滚动事件（位置等于
@@ -1011,12 +1015,14 @@ export default function Chat({
     // 显式跳转还在进行：离底 80px 内的「朝底」滚动不能把跟随接回去；但用户把
     // 滚动条直接拖到底（或内容无溢出）等价于显式回底，要恢复跟随。
     if (followLockRef.current) {
-      const noOverflow = el.scrollHeight - el.clientHeight <= 0;
+      const noOverflow = maxScroll <= 0;
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
-      // 只有「向下滚到底」才算用户回底：从底部起跳的第一帧也「在底部」，但
-      // 位置没往上走（或还没离开），不能把跟随接回去。
-      // 无溢出等价回底（与方向无关）；有溢出时要「向下滚到底」才算用户回底。
-      if (noOverflow || (atBottom && el.scrollTop > lastScrollTopRef.current)) {
+      // 无溢出、布置变高夹到新底部（clamped）、或向下滚到底都算用户回底；
+      // 从底部起跳的第一帧位置不增大、也没被夹位，不恢复。
+      if (
+        noOverflow ||
+        (atBottom && (el.scrollTop > lastScrollTopRef.current || clamped))
+      ) {
         clearJump();
         stickToBottomRef.current = true;
         setShowJumpDown(false);
@@ -2398,6 +2404,9 @@ export default function Chat({
   // 显式跳转期间锁住「贴底跟随」：目标离底不到 80px 时，滚动处理器会把一路向下的
   // 平滑滚动当成「朝底」把跟随接回去，流式追加随即把视图拉走、跳转失效。
   const followLockRef = useRef(false);
+  // 上一次观察到的最大滚动位置：布局变化（顶部提示条收起、窗口变高）会把
+  // scrollTop 夹到新的更小的底部，这不是用户向下滚，但同样是「已经在底部」。
+  const lastMaxScrollRef = useRef(0);
   const jumpAtRef = useRef(0);
   const jumpTimerRef = useRef<number | undefined>(undefined);
   /** 结束一次显式跳转（pin / 对齐标志 / 跟随锁 / 兜底计时器一起清）：所有「跳转
