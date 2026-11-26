@@ -2367,6 +2367,13 @@ export default function Chat({
             activeId={activeRoundId}
             onJump={scrollToRound}
             listRef={listRef}
+            onWheelScroll={(deltaY) => {
+              // 与 handleListWheel 同一套判定：向上滚退出贴底并露出「回到底部」。
+              if (deltaY < 0) {
+                stickToBottomRef.current = false;
+                setShowJumpDown(true);
+              }
+            }}
           />
         )}
         {/* 消息流（移动端收窄页边距，把宽度还给消息正文）；rail 可见时左侧

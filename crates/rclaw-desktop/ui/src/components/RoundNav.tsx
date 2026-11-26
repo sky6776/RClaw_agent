@@ -51,12 +51,15 @@ export function RoundRail({
   activeId,
   onJump,
   listRef,
+  onWheelScroll,
 }: {
   rounds: RoundNavItem[];
   activeId: number | null;
   onJump: (id: number) => void;
   /** 消息列表的滚动容器：浮层 portal 到这里，滚轮落在浮层上也能滚正文。 */
   listRef?: React.RefObject<HTMLDivElement | null>;
+  /** 浮层上的滚轮转给正文后回调（Chat 用它复用「向上滚退出贴底」的判定）。 */
+  onWheelScroll?: (deltaY: number) => void;
 }) {
   const [focusIdx, setFocusIdx] = useState<number | null>(null);
   // 键盘焦点所在的条目：窗口移动时保留它，避免按钮被卸载后焦点掉到 body。
@@ -190,15 +193,22 @@ export function RoundRail({
     return () => observer.disconnect();
   }, []);
 
+  // 拖宽/收放侧栏会平移整条轨道（nav 尺寸不变、只是横向挪）：观察正文容器的
+  // 尺寸（宽度变了说明轨道被挪位），同样收起提示。
+  useEffect(() => {
+    const host = listRef?.current;
+    if (!host || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => clearTipRef.current());
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, [listRef]);
+
   // Esc 关闭（悬停出的提示没有焦点在按钮上也收得掉）。
   useEffect(() => {
     if (tip === null) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        window.clearTimeout(openTimer.current);
-        window.clearTimeout(closeTimer.current);
-        setTip(null);
-      }
+      // 走 clearTip：锚点也清掉，后续的自动滚动不会再把刚关掉的提示打开。
+      if (e.key === "Escape") clearTip();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -217,11 +227,15 @@ export function RoundRail({
           // 滚动时提示不能停在已经移走的那一行上：鼠标提示直接收；键盘焦点行
           // （Tab 到下一行时浏览器会顺带滚一下）按新坐标重开，别把刚排的提示清掉。
           const anchor = tipAnchor.current;
+          let reopen = false;
           if (anchor?.source === "focus" && document.activeElement === anchor.el) {
-            showTip(anchor.el, anchor.item, "focus", 0);
-          } else {
-            clearTip();
+            // 焦点行还得在轨道视口里：滚出可视窗口的焦点行不该有提示。
+            const rail = scrollRef.current?.getBoundingClientRect();
+            const row = anchor.el.getBoundingClientRect();
+            reopen = !!rail && row.bottom > rail.top && row.top < rail.bottom;
           }
+          if (reopen && anchor) showTip(anchor.el, anchor.item, "focus", 0);
+          else clearTip();
         }}
         onPointerLeave={leave}
         className="absolute top-1/2 max-h-[calc(100%-6rem)] w-6 -translate-y-1/2 overflow-x-hidden overflow-y-auto [scrollbar-width:none]"
@@ -296,21 +310,33 @@ export function RoundRail({
       </div>
       {tip &&
         (() => {
+          // 列表的 `space-y-3` 会给直接子节点加 12px 上外边距（fixed 元素也会被
+          // 推下去）：`!mt-0` 抵掉，坐标才和按钮对得上。
+          // 滚轮落在浮层上时显式滚正文（Chromium 不把 fixed 子树当成滚动链的一段）。
+          const wheel = (e: React.WheelEvent) => {
+            if (e.ctrlKey) return; // Ctrl+滚轮是字号缩放，交给上层的原生监听
+            const host = listRef?.current;
+            if (!host) return;
+            host.scrollTop += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+            onWheelScroll?.(e.deltaY);
+          };
           const layer = (
             <>
               {/* 按钮与浮层之间 8px 空隙的透明连接区：慢速移动也不会掉提示。 */}
               <div
                 aria-hidden="true"
-                className="fixed z-40"
+                className="!mt-0 fixed z-40"
                 style={{ left: tip.x - 8, top: tip.y - 12, width: 8, height: 24 }}
                 onMouseEnter={keepTip}
                 onMouseLeave={leave}
+                onWheel={wheel}
               />
               <div
                 role="tooltip"
                 onMouseEnter={keepTip}
                 onMouseLeave={leave}
-                className="fixed z-50 w-max max-w-[16rem] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 text-[11px] leading-relaxed text-gray-200 shadow-lg"
+                onWheel={wheel}
+                className="!mt-0 fixed z-50 w-max max-w-[16rem] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 text-[11px] leading-relaxed text-gray-200 shadow-lg"
                 style={{ left: tip.x, top: tip.y }}
               >
                 <div className="truncate">{tip.text}</div>
