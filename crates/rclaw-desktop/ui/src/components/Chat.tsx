@@ -22,6 +22,7 @@ import {
   messageFileRefs,
   readableAtPath,
   refreshSyncAttachments,
+  setLoadedAttachmentMessages,
   useChatAttachments,
   useChatAttachmentsReady,
 } from "./SyncAttachments";
@@ -2275,6 +2276,14 @@ export default function Chat({
     flush();
     return list;
   }, [entries]);
+  // 正文里现在有哪些消息行：附件清单覆盖整个会话，已保存的旧附件不在正文里时
+  // 只能靠顶栏保留打开入口（80 行首屏截断）。
+  useEffect(() => {
+    setLoadedAttachmentMessages(
+      sessionKey,
+      entries.map((e) => e.msgId).filter((id): id is number => typeof id === "number"),
+    );
+  }, [entries, sessionKey]);
   const widePointer = useWidePointer();
   // 选择模式 / 文字选择期间隐藏导航（选择手势与导航互抢）。
   const navEnabled = rounds.length >= 2 && selectIds === null && textSelectId === null;
@@ -2340,6 +2349,26 @@ export default function Chat({
       return;
     }
     const containerTop = el.getBoundingClientRect().top;
+    const viewBottom = containerTop + el.clientHeight;
+    // 滞回：当前轮的内容（到下一轮提问为止）还占着视口一半以上就保持。在长回复里
+    // 往上滑时，不能刚把这一轮的提问滑出视口顶就跳到上一条——尤其上一条只有几行
+    // 时，上半屏仍全是这一轮的正文，切过去会很突兀。等这一轮只剩半屏以下（上半屏
+    // 已经是上一条的内容），再按视口顶重算。
+    if (activeRoundId !== null) {
+      const idx = rounds.findIndex((r) => r.id === activeRoundId);
+      if (idx >= 0) {
+        const row = el.querySelector<HTMLElement>(`[data-entry-id="${rounds[idx].id}"]`);
+        if (row) {
+          const nextRow = rounds[idx + 1]
+            ? el.querySelector<HTMLElement>(`[data-entry-id="${rounds[idx + 1].id}"]`)
+            : null;
+          const startTop = row.getBoundingClientRect().top;
+          const endTop = nextRow ? nextRow.getBoundingClientRect().top : Number.POSITIVE_INFINITY;
+          const visible = Math.min(endTop, viewBottom) - Math.max(startTop, containerTop);
+          if (visible >= el.clientHeight / 2) return;
+        }
+      }
+    }
     let current: number | null = null;
     for (const r of rounds) {
       const row = el.querySelector<HTMLElement>(`[data-entry-id="${r.id}"]`);

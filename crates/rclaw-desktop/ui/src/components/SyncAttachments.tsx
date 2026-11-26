@@ -120,6 +120,87 @@ export function clearAttachmentChanged(item: { path: string; blob: string }) {
 
 /** 让当前会话的清单重新取一遍（装载器在的时候才有）。 */
 let reload: (() => void) | null = null;
+/** 当前会话正文里已经加载的消息行 id（Chat 回报）。附件清单覆盖整个会话，正文首屏
+ *  只加载最近 80 行：已保存的旧附件若不在正文里，顶栏那条就是它唯一的打开入口。 */
+let loadedMsgIds = new Set<number>();
+let loadedMsgSig = "";
+let loadedMsgChat: string | null = null;
+
+export function setLoadedAttachmentMessages(chatId: string, ids: number[]) {
+  // 装载器还没切到这个会话（Chat 的 effect 先于 App 的装载器 effect 跑）：等下一次。
+  if (chat !== chatId) return;
+  const sig = ids.join(",");
+  if (loadedMsgChat === chatId && sig === loadedMsgSig) return;
+  loadedMsgChat = chatId;
+  loadedMsgSig = sig;
+  loadedMsgIds = new Set(ids);
+  // 「已保存」的顶栏条目去留取决于消息卡在不在正文里：集合变了重取一次清单。
+  reload?.();
+}
+
+/** 另存落点的存在性：清单只描述消息路径，`-快照` 这种另存名字要靠目录列举确认。
+ *  按目录缓存几秒，避免每次清单刷新都为同一批保存记录打一轮 IPC。 */
+const savedDirCache = new Map<string, { at: number; names: Set<string> | null }>();
+const SAVED_PROBE_MS = 5_000;
+const savedDirOf = (rel: string) => {
+  const cut = rel.lastIndexOf("/");
+  return cut < 0 ? "" : rel.slice(0, cut);
+};
+
+async function probeSavedPaths(paths: string[]): Promise<Set<string>> {
+  const byDir = new Map<string, string[]>();
+  for (const rel of paths) {
+    const dir = savedDirOf(rel);
+    const bucket = byDir.get(dir);
+    if (bucket) bucket.push(rel);
+    else byDir.set(dir, [rel]);
+  }
+  const present = new Set<string>();
+  for (const [dir, rels] of byDir) {
+    let entry = savedDirCache.get(dir);
+    if (!entry || Date.now() - entry.at > SAVED_PROBE_MS) {
+      let names: Set<string> | null = null;
+      try {
+        names = new Set((await api.workspaceList(dir)).map((item) => item.name));
+      } catch {
+        // 列不出来（目录没了、命令失败）：按「不知道」处理，下面当它在，别误删记录。
+        names = null;
+      }
+      entry = { at: Date.now(), names };
+      savedDirCache.set(dir, entry);
+    }
+    for (const rel of rels) {
+      const name = rel.slice(rel.lastIndexOf("/") + 1);
+      if (entry.names === null || entry.names.has(name)) present.add(rel);
+    }
+  }
+  return present;
+}
+
+/** 另存的文件被删掉了：撤掉那条保存记录（卡片退回「存进工作区」，顶栏重新计入缺失）。 */
+async function pruneSavedGone(chatId: string) {
+  if (chat !== chatId) return;
+  const alt = Object.entries(cards.saved).filter(
+    ([key, rel]) => rel !== key.slice(key.indexOf(":") + 1),
+  );
+  if (alt.length === 0) return;
+  const present = await probeSavedPaths(alt.map(([, rel]) => rel));
+  if (chat !== chatId) return;
+  const gone = alt.filter(([, rel]) => !present.has(rel)).map(([key]) => key);
+  if (gone.length === 0) return;
+  setCards((prev) => {
+    const keys = gone.filter((key) => key in prev.saved);
+    if (keys.length === 0) return prev;
+    const saved = { ...prev.saved };
+    const saveErrors = { ...prev.saveErrors };
+    for (const key of keys) {
+      delete saved[key];
+      delete saveErrors[key];
+    }
+    return { ...prev, saved, saveErrors };
+  });
+}
+
 const busyTimers: Record<string, number> = {};
 const listeners = new Set<() => void>();
 
@@ -171,7 +252,9 @@ function apply(chatId: string, list: SyncAttachment[]) {
   usable.forEach((item) => {
     // 工具结果全文（artifact）也列出来：它落到同步缓存时，消息里原有的路径句柄指向的
     // 可能是工作区里的另一个同名文件，用户得能从这儿打开同步来的那份准确内容。
-    const id = `${item.message_id}:${item.blob}`;
+    // 键带路径：同一条消息可能把同一份内容引用成两个路径（a.pdf、b.pdf），
+    // 只按 blob 记会让后一个的可用性盖到前一个上。
+    const id = `${item.message_id}:${item.blob}:${item.path}`;
     const before = known[id];
     const key = fileKey(item);
     // 文件的消息路径上已经是登记的那份内容（`path_present`）：它就在这台设备上，
@@ -205,6 +288,7 @@ function apply(chatId: string, list: SyncAttachment[]) {
   known = nextKnown;
   // 存好的落点又对不上了（被改写/删除）：不能再给「打开 savedTo」，让用户重新存。
   // 只处理文件引用——工具结果全文的登记位置不是消息路径，不按它判断。
+  const liveKeys = new Set(usable.map((item) => fileKey(item)));
   const fileKeys = new Set(
     usable.filter((item) => item.kind === "file").map((item) => fileKey(item)),
   );
@@ -213,18 +297,27 @@ function apply(chatId: string, list: SyncAttachment[]) {
       .filter((item) => item.kind === "file" && item.path_present)
       .map((item) => fileKey(item)),
   );
-  // 这一轮没轮到核对的（`checked=false`，`path_present` 只是不知道）：不能拿它
-  // 撤掉刚保存成功的记录，否则界面又退回「存进工作区」。
-  const uncheckedKeys = new Set(
-    usable.filter((item) => item.kind === "file" && !item.checked).map((item) => fileKey(item)),
+  // 同一个（对象, 路径）可能被多条消息引用、这一轮只核对了其中几条：只要有一条
+  // 核对过、确认消息路径上没有它，就按「不在」处理；全都没轮到核对时才当「不知道」。
+  const checkedAbsent = new Set(
+    usable
+      .filter((item) => item.kind === "file" && item.checked && !item.path_present)
+      .map((item) => fileKey(item)),
   );
   const prune = (map: Record<string, string>) => {
     let dropped = false;
     const next = { ...map };
     for (const key of Object.keys(next)) {
-      if (!fileKeys.has(key) || presentKeys.has(key) || uncheckedKeys.has(key)) continue;
-      // 存到了另一个名字（原位置被别的文件占着，`xxx-快照.pdf`）：那个文件不是消息
-      // 路径，`path_present` 不描述它——保留「打开」，别让用户再存一份。
+      // 引用已经从清单里消失了（消息被删/改）：保存记录没有意义了。工具结果
+      // （artifact）也算引用，别把它的保存记录当成「已消失」。
+      if (!liveKeys.has(key)) {
+        delete next[key];
+        dropped = true;
+        continue;
+      }
+      if (presentKeys.has(key) || !checkedAbsent.has(key)) continue;
+      // 存到了另一个名字（原位置被别的文件占着，`xxx-快照.pdf`）：那个文件不是
+      // 消息路径，`path_present` 不描述它——它的存在由目录探活负责。
       const original = key.slice(key.indexOf(":") + 1);
       if (next[key] !== original) continue;
       delete next[key];
@@ -244,9 +337,9 @@ function apply(chatId: string, list: SyncAttachment[]) {
     (item) =>
       currentKeys.has(fileKey(item)) &&
       !pendingKeys.has(fileKey(item)) &&
-      // 存到这条消息原路径上的（已核对、消息里的卡能直接打开）不再列；存到
-      // `-快照` 名字的留着——它的打开入口只有这里。
-      saved[fileKey(item)] !== item.path,
+      // 已保存的：消息卡（带「已存到 … / 打开」）在正文里就交给正文；不在
+      // 正文里（首屏只加载最近 80 行）的留着——顶栏是它唯一的打开入口。
+      !(saved[fileKey(item)] !== undefined && loadedMsgIds.has(item.message_id)),
   );
   if (cardsChanged) cards = { ...cards, saved, saveErrors };
   const sig = JSON.stringify([pending, stillLanded]);
@@ -353,6 +446,9 @@ function save(chatId: string, item: SyncAttachment) {
         if (savedBlob !== item.blob) delete saved[key];
         return { ...prev, saved };
       });
+      // 目录探活缓存里可能还没有这个刚写下的名字：作废它，否则紧接着的清单刷新
+      // 会把刚保存的记录当成已被删掉。
+      savedDirCache.delete(savedDirOf(rel));
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
       // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。
       reload?.();
@@ -387,6 +483,10 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       known = {};
       cards = noCardState();
       changedKeys.clear();
+      loadedMsgIds = new Set();
+      loadedMsgSig = "";
+      loadedMsgChat = null;
+      savedDirCache.clear();
       emit();
     }
     let alive = true;
@@ -436,6 +536,9 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       if (!alive || mine !== seq) return;
       loadFails = 0;
       failed = null;
+      // 另存的文件可能已经被删：清单不描述这些路径，先探一遍目录再归类。
+      await pruneSavedGone(chatId);
+      if (!alive || mine !== seq || chat !== chatId) return;
       apply(chatId, list);
       const pendingAlias = list.filter(
         (item) => item.kind === "file" && item.state === "local" && !item.path_present,
@@ -719,7 +822,7 @@ export function AttachmentCard({
           {/* 打开只按工作区相对路径：`open_media` 不收绝对路径（安卓与 Windows 都会拒）。
               工具结果（artifact）的登记落点就在这个会话的 artifact 目录下。 */}
           <button
-            onClick={() => open(item.rel_path ?? item.path)}
+            onClick={() => open(savedTo ?? item.rel_path ?? item.path)}
             disabled={inactive}
             className={CARD_BTN}
           >
@@ -982,10 +1085,12 @@ export function SyncChatBar({
     setDismissed(null);
   }, [chatId]);
   // 清单从关闭时的样子变成别的样子（存回去又删掉之类）再变回来：旧的关闭记录
-  // 作废，该提示就提示；签名一直没变的重复重取则保持关闭。
+  // 作废，该提示就提示；签名一直没变的重复重取则保持关闭。清单取不到时 `bar`
+  // 会被清成空签名（不代表内容变了），那种过渡不算。
   useEffect(() => {
+    if (!ready) return;
     setDismissed((prev) => (prev !== null && prev !== view.sig ? null : prev));
-  }, [view.sig]);
+  }, [view.sig, ready]);
 
   const running = runningOn !== undefined && runningOn.length > 0;
   // 清单没取到（或刚作废、正在重取）时 `bar` 还是上一轮的判断：不能拿它出下载/
