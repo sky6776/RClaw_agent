@@ -1015,7 +1015,8 @@ export default function Chat({
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
       // 只有「向下滚到底」才算用户回底：从底部起跳的第一帧也「在底部」，但
       // 位置没往上走（或还没离开），不能把跟随接回去。
-      if ((noOverflow || atBottom) && el.scrollTop > lastScrollTopRef.current) {
+      // 无溢出等价回底（与方向无关）；有溢出时要「向下滚到底」才算用户回底。
+      if (noOverflow || (atBottom && el.scrollTop > lastScrollTopRef.current)) {
         clearJump();
         stickToBottomRef.current = true;
         setShowJumpDown(false);
@@ -2365,7 +2366,8 @@ export default function Chat({
     const top =
       el.scrollTop + row.getBoundingClientRect().top - el.getBoundingClientRect().top;
     const max = Math.max(0, el.scrollHeight - el.clientHeight);
-    if (top >= max - 1) {
+    // 与滚动处理器共用同一个「触底」判定（距底 ≤4px 都按到底处理）。
+    if (top >= max - 4) {
       // 目标落点会被底部夹住：落点就是底部，按「到底」处理——清掉上一次跳转的
       // pin（否则它会一直压着末轮规则），恢复跟随并收起「回到底部」按钮，高亮
       // 交给末轮规则。
