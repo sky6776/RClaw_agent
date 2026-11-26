@@ -66,13 +66,7 @@ export function RoundRail({
   const [focusIdx, setFocusIdx] = useState<number | null>(null);
   // 键盘焦点所在的条目：窗口移动时保留它，避免按钮被卸载后焦点掉到 body。
   const [focusedId, setFocusedId] = useState<number | null>(null);
-  const [tip, setTip] = useState<{
-    id: number;
-    user: string;
-    assistant: string;
-    x: number;
-    y: number;
-  } | null>(null);
+  const [tip, setTip] = useState<{ id: number; x: number; y: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const navRef = useRef<HTMLElement | null>(null);
   const [view, setView] = useState({ top: 0, height: 0 });
@@ -179,8 +173,6 @@ export function RoundRail({
       const rect = el.getBoundingClientRect();
       setTip({
         id: item.id,
-        user: item.preview,
-        assistant: item.assistantPreview ?? "",
         // 右侧浮层（320px 宽，zcode 同款）；贴近右缘时整块收回视口内。
         x: Math.max(8, Math.min(rect.right + 8, window.innerWidth - 328)),
         y: rect.top + rect.height / 2,
@@ -230,6 +222,8 @@ export function RoundRail({
   }, [tip]);
 
   if (rounds.length < 2) return null;
+  // 预览从当前 rounds 取，不冻结在打开浮层那一刻：流式回复是边生成边追加的。
+  const tipItem = tip === null ? null : (rounds.find((r) => r.id === tip.id) ?? null);
   return (
     <nav ref={navRef} aria-label="对话提问导航" className="absolute inset-y-0 left-3 z-20 w-6">
       <div
@@ -286,6 +280,7 @@ export function RoundRail({
                 <span id={`rclaw-round-desc-${r.id}`} className="sr-only">
                   {r.preview}
                   {r.time ? `（${r.time}）` : ""}
+                  {r.assistantPreview ? `。回复：${r.assistantPreview}` : ""}
                 </span>
                 <button
                   type="button"
@@ -378,13 +373,13 @@ export function RoundRail({
               >
                 <div className="space-y-2">
                   <p className="line-clamp-2 whitespace-pre-line text-sm font-medium leading-5">
-                    {tip.user}
+                    {tipItem?.preview ?? ""}
                   </p>
-                  {tip.assistant && (
+                  {tipItem?.assistantPreview ? (
                     <p className="line-clamp-3 whitespace-pre-line text-sm leading-5 text-gray-400">
-                      {tip.assistant}
+                      {tipItem.assistantPreview}
                     </p>
-                  )}
+                  ) : null}
                 </div>
               </div>
             </>

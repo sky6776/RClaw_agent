@@ -173,16 +173,28 @@ function apply(chatId: string, list: SyncAttachment[]) {
     // 可能是工作区里的另一个同名文件，用户得能从这儿打开同步来的那份准确内容。
     const id = `${item.message_id}:${item.blob}`;
     const before = known[id];
-    nextKnown[id] = item.state;
     const key = fileKey(item);
     // 文件的消息路径上已经是登记的那份内容（`path_present`）：它就在这台设备上，
     // 即便登记落点仍在同步缓存（「存进工作区」只写文件、不改登记，状态还是
     // `cached`）。工具结果（artifact）没有消息路径，仍按登记状态算。
     const here = item.state === "local" || (item.kind === "file" && item.path_present);
+    // 记「可用性」而不是原始状态：cached + path_present 的条目上一轮就已经可用，
+    // 相同的清单重取时不能当成「刚下载下来」。
+    nextKnown[id] = here ? "local" : item.state;
     if (here) {
       // 上一份清单里它还不在原位置上：是刚下载下来的。
       const fresh = before !== undefined && before !== "local";
       if (fresh && !landed.some((other) => fileKey(other) === key)) landed.push(item);
+      return;
+    }
+    // 已经存过、但存到了另一个名字（原路径被别的文件占着，`xxx-快照.pdf`）：消息
+    // 路径上没有它，可用户手上已经有能打开的落点——不再按「不在这台设备上」计，
+    // 留在这里保住「打开」入口（正文只加载最近 80 行，旧消息里的卡不一定在）。
+    // 存到原路径、这一轮又核对出文件没了的不算（prune 随后也会撤掉那条记录）。
+    const savedTo = cards.saved[key];
+    const savedExactGone = savedTo === item.path && item.checked && !item.path_present;
+    if (savedTo !== undefined && !savedExactGone) {
+      if (!landed.some((other) => fileKey(other) === key)) landed.push(item);
       return;
     }
     if (!pendingKeys.has(key)) {
@@ -201,11 +213,16 @@ function apply(chatId: string, list: SyncAttachment[]) {
       .filter((item) => item.kind === "file" && item.path_present)
       .map((item) => fileKey(item)),
   );
+  // 这一轮没轮到核对的（`checked=false`，`path_present` 只是不知道）：不能拿它
+  // 撤掉刚保存成功的记录，否则界面又退回「存进工作区」。
+  const uncheckedKeys = new Set(
+    usable.filter((item) => item.kind === "file" && !item.checked).map((item) => fileKey(item)),
+  );
   const prune = (map: Record<string, string>) => {
     let dropped = false;
     const next = { ...map };
     for (const key of Object.keys(next)) {
-      if (!fileKeys.has(key) || presentKeys.has(key)) continue;
+      if (!fileKeys.has(key) || presentKeys.has(key) || uncheckedKeys.has(key)) continue;
       // 存到了另一个名字（原位置被别的文件占着，`xxx-快照.pdf`）：那个文件不是消息
       // 路径，`path_present` 不描述它——保留「打开」，别让用户再存一份。
       const original = key.slice(key.indexOf(":") + 1);
@@ -227,7 +244,9 @@ function apply(chatId: string, list: SyncAttachment[]) {
     (item) =>
       currentKeys.has(fileKey(item)) &&
       !pendingKeys.has(fileKey(item)) &&
-      !saved[fileKey(item)],
+      // 存到这条消息原路径上的（已核对、消息里的卡能直接打开）不再列；存到
+      // `-快照` 名字的留着——它的打开入口只有这里。
+      saved[fileKey(item)] !== item.path,
   );
   if (cardsChanged) cards = { ...cards, saved, saveErrors };
   const sig = JSON.stringify([pending, stillLanded]);
@@ -962,6 +981,11 @@ export function SyncChatBar({
     setOpen(false);
     setDismissed(null);
   }, [chatId]);
+  // 清单从关闭时的样子变成别的样子（存回去又删掉之类）再变回来：旧的关闭记录
+  // 作废，该提示就提示；签名一直没变的重复重取则保持关闭。
+  useEffect(() => {
+    setDismissed((prev) => (prev !== null && prev !== view.sig ? null : prev));
+  }, [view.sig]);
 
   const running = runningOn !== undefined && runningOn.length > 0;
   // 清单没取到（或刚作废、正在重取）时 `bar` 还是上一轮的判断：不能拿它出下载/

@@ -2383,6 +2383,19 @@ export default function Chat({
     },
     [],
   );
+  // 尺寸变化不一定伴随 scroll：窗口变矮、顶部提示条展开/收起把列表压短之后，
+  // 已经离开底部但高亮还停在末轮；正文变高（图片加载、流式追加）也会改变
+  // 视口顶对应的轮次。观察列表与正文列，按同一路 rAF 补算。
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const column = el.querySelector("[data-chat-column]");
+    const observer = new ResizeObserver(() => scheduleActiveRound());
+    observer.observe(el);
+    if (column) observer.observe(column);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="chat-bg flex h-full flex-col">
@@ -2417,7 +2430,7 @@ export default function Chat({
         >
         {/* 正文列（zcode 同款 max-w-6xl 居中）：宽窗里两侧留白，轨道与正文之间
             不会只剩一条缝；窄窗/手机上列宽等于可用宽度，行为不变。 */}
-        <div className="mx-auto w-full max-w-6xl space-y-3 max-md:space-y-2.5">
+        <div data-chat-column className="mx-auto w-full max-w-6xl space-y-3 max-md:space-y-2.5">
         {entries.length === 0 && (
           <div className="mt-24 text-center text-sm text-gray-600 max-md:mt-36 max-md:px-6">
             <p className="text-base text-gray-400">向 RClaw 发出第一条消息</p>
