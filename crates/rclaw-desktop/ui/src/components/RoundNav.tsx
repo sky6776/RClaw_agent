@@ -173,9 +173,10 @@ export function RoundRail({
       const rect = el.getBoundingClientRect();
       setTip({
         id: item.id,
-        // 右侧浮层（320px 宽，zcode 同款）；贴近右缘时整块收回视口内。
+        // 右侧浮层（320px 宽，zcode 同款）；贴近右/上下缘时整块收回视口内
+        // （高度按常见两段预览估 120px，留半高余量）。
         x: Math.max(8, Math.min(rect.right + 8, window.innerWidth - 328)),
-        y: rect.top + rect.height / 2,
+        y: Math.min(Math.max(rect.top + rect.height / 2, 68), window.innerHeight - 68),
       });
     }, delayMs);
   };
@@ -259,9 +260,9 @@ export function RoundRail({
             const r = rounds[i];
             if (!r) return null;
             const active = i === activeIdx;
-            // 山峰视觉（zcode 同款数值）：hover/focus 2 倍（内部 2.6，渲染截到
-            // 2），±1/±2 衰减到 1.7/1.25；当前轮不放大，只提亮（opacity 0.9）——
-            // 常亮的条保持 12px 宽，不会把轨道与正文之间的空隙吃掉。
+            // 山峰视觉（zcode 同款数值）：hover/focus 2 倍（zcode 内部值 2.6 由
+            // 渲染时的上限 2 截住，我们直接用 2），±1/±2 衰减到 1.7/1.25；当前轮
+            // 不放大，只提亮（opacity 0.9）——常亮的条保持 12px 宽。
             const dist =
               focusIdx === null ? Number.POSITIVE_INFINITY : Math.min(3, Math.abs(i - focusIdx));
             const scale = dist === 0 ? 2 : dist === 1 ? 1.7 : dist === 2 ? 1.25 : 1;

@@ -1008,6 +1008,12 @@ export default function Chat({
       lastScrollTopRef.current = el.scrollTop;
       return; // 拖动中的位置混着流式拉底，不据它改判跟随
     }
+    // 显式跳转还在进行：离底 80px 内的「朝底」滚动不能把跟随接回去。
+    if (followLockRef.current) {
+      lastScrollTopRef.current = el.scrollTop;
+      setShowJumpDown(el.scrollHeight - el.scrollTop - el.clientHeight >= 80);
+      return;
+    }
     // 内容全部可见（无溢出，scrollTop 被钳在 0）等价于停在底部：必须恢复
     // 跟随——否则放大窗口甩下的脱离态会卡死（严格增大条件不再满足，wheel
     // 又因无溢出提前返回，后续再溢出也不会跟随）。
@@ -1049,6 +1055,7 @@ export default function Chat({
   // （防两套长按计时器叠加），bubble 阶段列表收不到起始事件，从卡片上开始的
   // 拖动会漏判；capture 从祖先往下先于目标元素执行，不受其影响。
   const handleListTouchStart = (e: React.TouchEvent) => {
+    followLockRef.current = false;
     const st = touchStateRef.current;
     const first = e.changedTouches[0];
     const el = listRef.current;
@@ -1204,6 +1211,7 @@ export default function Chat({
   // 滚轮往上（不带 Ctrl）就退出贴底并露出「回到底部」——没有溢出时不判（短会话
   // 全部可见，滚上去也没有可翻的内容）。正文与 rail 浮层上的滚轮共用这一份。
   const noteWheelIntent = (deltaY: number) => {
+    followLockRef.current = false;
     const el = listRef.current;
     if (!el || el.scrollHeight - el.clientHeight <= 0) return;
     if (deltaY < 0) {
@@ -1244,6 +1252,7 @@ export default function Chat({
 
   // 回到底部并恢复跟随（发送消息 / 点击悬浮钮时调用）。
   const scrollListToBottom = (smooth = false) => {
+    followLockRef.current = false;
     stickToBottomRef.current = true;
     setShowJumpDown(false);
     // 用户显式回底：zombie 的滚动抑制随即解除（抑制是为「未知手指还在列表
@@ -2314,6 +2323,7 @@ export default function Chat({
   const beginJump = (id: number) => {
     jumpTargetRef.current = id;
     jumpAlignedRef.current = false;
+    followLockRef.current = true;
     jumpAtRef.current = Date.now();
     setActiveRoundId(id);
     window.clearTimeout(jumpTimerRef.current);
@@ -2334,6 +2344,7 @@ export default function Chat({
       // 滚动处理器当成「脱离跟随」，按钮闪回），高亮交给到底规则。
       jumpTargetRef.current = null;
       jumpAlignedRef.current = false;
+      followLockRef.current = false;
       window.clearTimeout(jumpTimerRef.current);
       setActiveRoundId(id);
       scrollListToBottom(false);
@@ -2351,6 +2362,7 @@ export default function Chat({
       // 交给末轮规则。
       jumpTargetRef.current = null;
       jumpAlignedRef.current = false;
+      followLockRef.current = false;
       window.clearTimeout(jumpTimerRef.current);
       // 直接定位、不做平滑动画：动画中间的每一帧都离底很远，桌面滚动处理器会
       // 把它们当成「脱离跟随」，回到底部按钮闪回、跟随也被甩掉。
@@ -2372,6 +2384,9 @@ export default function Chat({
   // 「点上一轮、上一轮很短」时把高亮留给下面那一长轮）。对齐后用户再滚走就解除。
   const jumpTargetRef = useRef<number | null>(null);
   const jumpAlignedRef = useRef(false);
+  // 显式跳转期间锁住「贴底跟随」：目标离底不到 80px 时，滚动处理器会把一路向下的
+  // 平滑滚动当成「朝底」把跟随接回去，流式追加随即把视图拉走、跳转失效。
+  const followLockRef = useRef(false);
   const jumpAtRef = useRef(0);
   const jumpTimerRef = useRef<number | undefined>(undefined);
   const activeRoundRafRef = useRef<number | null>(null);
@@ -2403,6 +2418,7 @@ export default function Chat({
           !aligned && !jumpAlignedRef.current && Date.now() - jumpAtRef.current > 2_000;
         if (stale || (jumpAlignedRef.current && !aligned)) {
           jumpTargetRef.current = null;
+          followLockRef.current = false;
         } else {
           setActiveRoundId((v) => (v === target ? v : target));
           return;

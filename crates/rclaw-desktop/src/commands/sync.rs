@@ -1401,7 +1401,8 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
 /// - Linux/Android：`renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败
 ///   （内核 ≥3.15；Android 的内核都满足）。
 /// - 文件系统不认 `RENAME_NOREPLACE`：明确报错，不退回「先建名再复制」（复制期间
-///   正式名字可写，并发写入会被覆盖或反过来，发布结果无法保证）。
+///   正式名字可写，并发写入会被覆盖或反过来，发布结果无法保证）。两个原语都是
+///   「目标存在即失败」，不存在覆盖窗口。
 #[cfg(windows)]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -1448,7 +1449,14 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
         // 文件系统不认 RENAME_NOREPLACE：没有「原子 + 不覆盖」的发布原语，明确
         // 报错（不退回「先建名再复制」——复制期间正式名字可写，并发写入会被我们
         // 覆盖或反过来，发布结果无法保证）。
-        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::ENOTSUP) => Err(std::io::Error::new(
+        Some(libc::ENOSYS)
+        | Some(libc::EINVAL)
+        | Some(libc::ENOTSUP)
+        // 被 SELinux/挂载策略拒绝、跨设备：对这个落点也是「没有可用的原子无覆盖
+        // 改名」，重试不会变好，按 Unsupported 报（界面不再给重试/保存入口）。
+        | Some(libc::EPERM)
+        | Some(libc::EACCES)
+        | Some(libc::EXDEV) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "这个位置不支持原子发布文件（文件系统不支持无覆盖改名）",
         )),
@@ -2199,6 +2207,25 @@ mod tests {
         ] {
             assert!(workspace_rel_for(bad).is_err(), "{bad}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publish_noreplace_refuses_to_overwrite_and_moves_when_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("staged.bin");
+        let to = dir.path().join("target.bin");
+        std::fs::write(&from, b"verified").unwrap();
+        std::fs::write(&to, b"existing").unwrap();
+        let err = publish_noreplace(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&to).unwrap(), b"existing");
+        assert_eq!(std::fs::read(&from).unwrap(), b"verified");
+        // 目标空着：原子移动过去。
+        std::fs::remove_file(&to).unwrap();
+        publish_noreplace(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"verified");
+        assert!(!from.exists());
     }
 
     #[test]

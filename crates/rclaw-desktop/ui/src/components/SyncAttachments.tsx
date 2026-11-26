@@ -59,6 +59,8 @@ interface CardState {
   cardOp: Record<string, number>;
   /** 打开错误实际用的落点：下载成功只清对应落点的那条。 */
   openErrorPath: Record<string, string>;
+  /** 保存落点是不是核对过的（`verified=false` 的老行为保存不能严格核对打开）。 */
+  savedVerified: Record<string, boolean>;
   /** 存进工作区之后的相对路径。 */
   saved: Record<string, string>;
 }
@@ -72,6 +74,7 @@ const noCardState = (): CardState => ({
   errorSeq: {},
   cardOp: {},
   openErrorPath: {},
+  savedVerified: {},
   saved: {},
 });
 
@@ -161,7 +164,7 @@ export function setLoadedAttachmentMessages(chatId: string, ids: number[]) {
 }
 
 /** 另存落点的存在性：清单只描述消息路径，`-快照` 这种另存名字要靠目录列举确认。
- *  按目录缓存几秒，避免每次清单刷新都为同一批保存记录打一轮 IPC。 */
+ *  每次刷新都重新列目录（不缓存），避免每次清单刷新都为同一批保存记录打一轮 IPC。 */
 /** 保存记录的版本：每次写入保存落点递增。探活/打开回来时凭它确认期间没有重新
  *  保存，否则会拿旧结果把刚写下的记录删掉。 */
 const savedKeyGen: Record<string, number> = {};
@@ -428,6 +431,15 @@ function apply(chatId: string, list: SyncAttachment[]) {
       ),
   );
   if (cardsChanged) cards = { ...cards, saved, saveErrors };
+  // 已保存、正文里没有卡（旧消息/工具行）的条目要留在顶栏当打开入口——应用重启
+  // 后 `landed` 是空的，光靠「刚下载」的条目会把它们漏掉。
+  for (const item of usable) {
+    const key = fileKey(item);
+    if (saved[key] === undefined || pendingKeys.has(key)) continue;
+    if (item.kind === "file" && loadedMsgIds.has(item.message_id)) continue;
+    if (stillLanded.some((other) => fileKey(other) === key)) continue;
+    stillLanded.push(item);
+  }
   const sig = JSON.stringify([pending, stillLanded]);
   if (sig === bar.sig && !changedAll && !cardsChanged && wasLoaded) return;
   bar = { pending, landed: stillLanded, sig };
@@ -450,7 +462,10 @@ function settle(
   placed: boolean,
   landed: string | null,
   request?: string | null,
+  forChat?: string,
 ) {
+  // 事件按会话订阅；开关会话的缝里迟到一个旧会话的事件，不能写进新会话的卡片。
+  if (forChat !== undefined && chat !== forChat) return;
   // 完成事件带请求标识的：必须是当前这次请求；没带的（自动取回/别的设备触发）不能
   // 结算用户点名、还没回来的那次。
   const expected = downloadRequest[blob];
@@ -468,6 +483,7 @@ function settle(
   if (joined) {
     for (const key of joined) seq = Math.max(seq, cardOpSeq[key] ?? 0);
   }
+  delete downloadAt[blob];
   if (error === null && placed) {
     // 只撤「这次实际落到的那个路径」上的覆盖：同一对象的其他路径上可能还是另一份
     // 内容（取回到同步缓存时，消息路径并没有被修好）。`error` 为空但没落盘的
@@ -567,6 +583,8 @@ function download(chatId: string, blob: string, key?: string) {
   window.clearTimeout(busyTimers[blob]);
   busyTimers[blob] = window.setTimeout(() => {
     delete busyTimers[blob];
+    // 旧会话的计时器不能在切会话后清掉新会话同对象的下载状态。
+    if (chat !== chatId || chatGen !== gen) return;
     setCards((prev) => (prev.busy[blob] ? { ...prev, busy: without(prev.busy, blob) } : prev));
     // 这次请求算放弃：标识/序号退役，别让后续的自动完成事件被永久挡住。
     delete downloadRequest[blob];
@@ -582,7 +600,7 @@ function download(chatId: string, blob: string, key?: string) {
     // 会话切走、或这次请求已经被后来的下载顶掉了：迟到的失败不能结算到新请求上。
     if (chat !== chatId || chatGen !== gen) return;
     if (downloadAt[blob] !== op) return;
-    settle(blob, String(e), false, null, request);
+    settle(blob, String(e), false, null, request, chatId);
   });
 }
 
@@ -629,13 +647,19 @@ function save(chatId: string, item: SyncAttachment) {
       }
       setCards((prev) => {
         const saved = { ...prev.saved, [savedKey]: rel };
+        const savedVerified = { ...prev.savedVerified, [savedKey]: verified };
         // 归一之后旧对象名的键不再被卡片使用。
-        if (savedBlob !== item.blob) delete saved[key];
+        if (savedBlob !== item.blob) {
+          delete saved[key];
+          delete savedVerified[key];
+        }
         // 重新保存成功：早于这次保存的打开失败文案一并收掉（保存期间新发生的
         // 打开失败要留着）。
+        delete openErrorOp[savedKey];
         return {
           ...prev,
           saved,
+          savedVerified,
           openErrors:
             (openErrorOp[savedKey] ?? -1) < op
               ? without(prev.openErrors, savedKey)
@@ -699,6 +723,10 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       }
       // 模块级操作序号也清掉：旧会话迟到的回调不能再通过序号校验写进新卡片。
       chatGen += 1;
+      for (const blob of Object.keys(busyTimers)) {
+        window.clearTimeout(busyTimers[blob]);
+        delete busyTimers[blob];
+      }
       for (const key of Object.keys(cardOpSeq)) delete cardOpSeq[key];
       for (const blob of Object.keys(downloadAt)) delete downloadAt[blob];
       for (const blob of Object.keys(downloadRequest)) delete downloadRequest[blob];
@@ -802,7 +830,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     void load();
     const un = api.onSync((event) => {
       if (event.kind === "attachment") {
-        settle(event.blob, event.error, event.placed, event.landed, event.request);
+        settle(event.blob, event.error, event.placed, event.landed, event.request, chatId);
         schedule();
       } else if (event.kind === "status") {
         // 每一轮同步的状态变化：别名补落点、登记回收都可能在这时完成，借机重取一次
@@ -1024,7 +1052,11 @@ export function AttachmentCard({
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
     // 打开的是「已存到另一个名字」的副本时严格核对：核不了（同步密钥/登记不可用）
     // 就不要按老行为直接把路径交给系统——那条路径没有别的证据能证明是这份内容。
-    const strict = state.saved[key] !== undefined && state.saved[key] === path;
+    // 保存时就没核对过（老行为，`verified=false`）的落点没有这份证据，按老行为打开。
+    const strict =
+      state.saved[key] !== undefined &&
+      state.saved[key] === path &&
+      state.savedVerified[key] !== false;
     api
       .syncOpenAttachment(chatId, item.blob, path, strict)
       // 打开的是核对过的副本才算这次读通过；按**打开的这个落点**清覆盖（别把消息
@@ -1093,7 +1125,7 @@ export function AttachmentCard({
               {savedTo ? ` · 已存到 ${savedTo}` : ""}
             </span>
           </span>
-          {elsewhere && !savedTo && (
+          {elsewhere && !savedTo && !publishUnsupported && (
             <button
               onClick={() => save(chatId, item)}
               disabled={inactive || saving}
@@ -1156,6 +1188,8 @@ export function AttachmentCard({
             <button onClick={() => open(savedTo)} disabled={inactive} className={CARD_BTN}>
               打开
             </button>
+          ) : publishUnsupported ? (
+            <span className="shrink-0 text-[10px] text-gray-500">这个位置不能保存</span>
           ) : (
             <button
               onClick={() => save(chatId, item)}
