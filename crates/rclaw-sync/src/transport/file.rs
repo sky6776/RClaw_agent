@@ -48,8 +48,9 @@ impl FileTransport {
             }
             let mut path = root.clone();
             path.extend(key.split('/').filter(|part| !part.is_empty()));
-            crate::wire::check_no_links(&root, &path)
-                .map_err(|error| io_error("检查路径", &path, error))?;
+            crate::wire::check_no_links(&root, &path).map_err(|error| {
+                TransportError::Other(format!("检查路径 {} 失败: {error}", path.display()))
+            })?;
             action(path)
         })
         .await

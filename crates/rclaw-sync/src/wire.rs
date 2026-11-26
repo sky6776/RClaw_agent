@@ -93,14 +93,34 @@ impl Env {
         Ok(path)
     }
 
+    /// 同 [`Env::checked_path`]，但保留失败类型（策略拒绝 vs 元数据 I/O）。
+    pub(crate) fn checked_path_typed(
+        &self,
+        rel_path: &str,
+    ) -> std::result::Result<PathBuf, LinkCheckError> {
+        let path = self.resolve(rel_path);
+        self.check_path_typed(rel_path, &path)?;
+        Ok(path)
+    }
+
     pub(crate) fn check_path(&self, rel_path: &str, path: &Path) -> Result<()> {
+        self.check_path_typed(rel_path, path)
+            .map_err(|error| SyncError::other(format!("无法安全访问附件 {rel_path}：{error}")))
+    }
+
+    /// 同 [`Env::check_path`]，但保留失败类型：调用方要区分「路径策略拒绝」与
+    /// 「读元数据时的 I/O 失败」（后者只是暂时核不了）。
+    pub(crate) fn check_path_typed(
+        &self,
+        rel_path: &str,
+        path: &Path,
+    ) -> std::result::Result<(), LinkCheckError> {
         let root = if rel_path.starts_with(SYNC_DIR_PREFIX) {
             self.sync_root.parent().unwrap_or(&self.sync_root)
         } else {
             self.base()
         };
         check_no_links(root, path)
-            .map_err(|error| SyncError::other(format!("无法安全访问附件 {rel_path}：{error}")))
     }
 
     fn resolve_parts(
@@ -119,12 +139,33 @@ impl Env {
     }
 }
 
+/// 路径检查的失败：策略拒绝（链接/特殊文件）与读元数据失败（权限/IO）分开。
+#[derive(Debug)]
+pub(crate) enum LinkCheckError {
+    /// 路径经过链接或特殊文件：落点不可信，按「内容不可用」处理。
+    Policy,
+    /// 读元数据失败（权限、I/O）：只是暂时核不了。
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for LinkCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkCheckError::Policy => f.write_str("路径经过链接或特殊文件"),
+            LinkCheckError::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 /// 根由本机设置；根以下每一级必须是普通目录或文件。Windows reparse point 也按链接处理。
-pub(crate) fn check_no_links(root: &Path, path: &Path) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
+pub(crate) fn check_no_links(
+    root: &Path,
+    path: &Path,
+) -> std::result::Result<(), LinkCheckError> {
+    use std::io::ErrorKind;
     let relative = path
         .strip_prefix(root)
-        .map_err(|_| ErrorKind::InvalidInput)?;
+        .map_err(|_| LinkCheckError::Policy)?;
     let mut current = root.to_path_buf();
     for component in relative.components() {
         current.push(component);
@@ -135,13 +176,10 @@ pub(crate) fn check_no_links(root: &Path, path: &Path) -> std::io::Result<()> {
             {
                 return Ok(())
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(LinkCheckError::Io(error)),
         };
         if is_link(&meta) || !(meta.is_dir() || meta.is_file()) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "路径经过链接或特殊文件",
-            ));
+            return Err(LinkCheckError::Policy);
         }
     }
     Ok(())

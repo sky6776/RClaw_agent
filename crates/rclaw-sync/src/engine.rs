@@ -1480,14 +1480,12 @@ impl SyncEngine {
         else {
             return AttachmentBytes::Unverifiable;
         };
-        let path = match ctx.env.checked_path(rel_path) {
+        let path = match ctx.env.checked_path_typed(rel_path) {
             Ok(path) => path,
             // 链接/特殊文件是路径策略拒绝：落点不可信，收掉「已保存」。
-            Err(e) if e.to_string().contains("路径经过链接或特殊文件") => {
-                return AttachmentBytes::Rejected
-            }
+            Err(crate::wire::LinkCheckError::Policy) => return AttachmentBytes::Rejected,
             // 元数据/权限 I/O 失败：暂时核不了，别当内容被改写。
-            Err(_) => return AttachmentBytes::Failed,
+            Err(crate::wire::LinkCheckError::Io(_)) => return AttachmentBytes::Failed,
         };
         let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
             .ok()
@@ -1609,22 +1607,21 @@ impl SyncEngine {
         }) else {
             return AttachmentStage::Unverifiable;
         };
-        let source = match ctx.env.checked_path(rel_path) {
+        let source = match ctx.env.checked_path_typed(rel_path) {
             Ok(source) => source,
             // 链接/特殊文件：路径策略拒绝。
-            Err(e) if e.to_string().contains("路径经过链接或特殊文件") => {
-                return AttachmentStage::Rejected
-            }
+            Err(crate::wire::LinkCheckError::Policy) => return AttachmentStage::Rejected,
             // 元数据/权限 I/O 失败：暂时读不了。
-            Err(_) => return AttachmentStage::Failed,
+            Err(crate::wire::LinkCheckError::Io(_)) => return AttachmentStage::Failed,
         };
         let dest = ctx.env.resolve(dest_rel);
         let Some(parent) = dest.parent() else {
             return AttachmentStage::Rejected;
         };
-        // 目录也不许是链接（不然明文副本会写到别处）。
-        if ctx.env.check_path(dest_rel, &dest).is_err() {
-            return AttachmentStage::Rejected;
+        // 目录也不许是链接（不然明文副本会写到别处）。暂存目录的问题（权限/IO）
+        // 不是源文件的问题：按暂时失败处理，别让前端撤掉有效的保存记录。
+        if ctx.env.check_path_typed(dest_rel, &dest).is_err() {
+            return AttachmentStage::Failed;
         }
         if std::fs::create_dir_all(parent).is_err() {
             return AttachmentStage::Failed;

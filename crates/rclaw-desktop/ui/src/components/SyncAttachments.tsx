@@ -471,6 +471,7 @@ function save(chatId: string, item: SyncAttachment) {
     ...prev,
     saving: { ...prev.saving, [key]: true },
     saveErrors: without(prev.saveErrors, key),
+    openErrors: without(prev.openErrors, key),
   }));
   api
     .syncAttachmentSave(chatId, item.blob, item.path)
@@ -840,9 +841,20 @@ export function AttachmentCard({
     state.errors[item.blob] ??
     state.saveErrors[fileKey(item)] ??
     state.openErrors[fileKey(item)];
+  // 落点不支持原子发布是文件系统能力问题，重新下载改变不了它。
+  const publishUnsupported =
+    typeof error === "string" &&
+    (error.includes("不支持原子发布") || error.includes("不支持无覆盖改名"));
   const open = (path: string) => {
     const key = fileKey(item);
     const genAt = savedKeyGen[key] ?? 0;
+    // 用户刚点了打开：这张卡上一次「存进工作区失败」的文案先收掉，失败时显示
+    // 这次打开的原因（最近一次操作的错误）。
+    setCards((prev) =>
+      prev.saveErrors[key] === undefined
+        ? prev
+        : { ...prev, saveErrors: without(prev.saveErrors, key) },
+    );
     // 点开前先让后端核对一下：工作区里这个路径上的文件可能已经被就地改写过，打开
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
     // 打开的是「已存到另一个名字」的副本时严格核对：核不了（同步密钥/登记不可用）
@@ -931,13 +943,15 @@ export function AttachmentCard({
         {error && (
           <div className="mt-1 flex items-start justify-between gap-2">
             <div className={`min-w-0 flex-1 ${CARD_ERROR}`}>{error}</div>
-            <button
-              onClick={() => download(chatId, item.blob)}
-              disabled={inactive}
-              className={CARD_BTN}
-            >
-              重新下载
-            </button>
+            {!publishUnsupported && (
+              <button
+                onClick={() => download(chatId, item.blob)}
+                disabled={inactive}
+                className={CARD_BTN}
+              >
+                重新下载
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -1079,13 +1093,14 @@ function SnapshotImage({
   const [src, setSrc] = useState<string | null>(
     () => snapshotPreviews.get(cacheKey) ?? null,
   );
-  // 预览暂时取不到（权限/IO）：给一个重试入口。内容对不上的走「重新下载」，不在这里。
-  const [failed, setFailed] = useState(false);
+  // 预览失败：权限/IO 给重试入口；超过大小上限是定论，只说明限制。内容对不上的
+  // 走「重新下载」，不在这里。
+  const [failKind, setFailKind] = useState<"retry" | "limit" | null>(null);
   const [attempt, setAttempt] = useState(0);
   // 对象名或路径变了（换空间 rekey、旧版明文摘要归一）：换一份预览，别接着显示旧内容。
   useEffect(() => {
     setSrc(snapshotPreviews.get(cacheKey) ?? null);
-    setFailed(false);
+    setFailKind(null);
   }, [cacheKey]);
   const box = useRef<HTMLSpanElement | null>(null);
   useEffect(() => {
@@ -1130,8 +1145,9 @@ function SnapshotImage({
             refreshSyncAttachments();
             return;
           }
-          // 权限/IO 之类的临时失败：给个重试，别让卡片永远没有预览。
-          setFailed(true);
+          // 权限/IO 之类的临时失败：给个重试，别让卡片永远没有预览；超过上限
+          // 是定论，重试没有意义。
+          setFailKind(String(e).includes("超过大小上限") ? "limit" : "retry");
         });
     };
     const el = box.current;
@@ -1155,11 +1171,14 @@ function SnapshotImage({
       observer.disconnect();
     };
   }, [chatId, blob, path, cacheKey, src, attempt]);
-  if (!src && failed) {
+  if (!src && failKind === "limit") {
+    return <span className="mb-1 block text-[11px] text-gray-500">图片超过预览大小上限</span>;
+  }
+  if (!src && failKind === "retry") {
     return (
       <button
         onClick={() => {
-          setFailed(false);
+          setFailKind(null);
           setAttempt((n) => n + 1);
         }}
         className="mb-1 rounded-md border border-[#2a2f3a] px-2 py-1 text-[11px] text-gray-400 transition hover:text-gray-200"
