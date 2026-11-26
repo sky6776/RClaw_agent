@@ -2316,6 +2316,14 @@ export default function Chat({
     jumpAlignedRef.current = false;
     jumpAtRef.current = Date.now();
     setActiveRoundId(id);
+    window.clearTimeout(jumpTimerRef.current);
+    // 底部被夹住（目标行到不了视口顶）时页面会静止、没有重算：到点自己解除。
+    jumpTimerRef.current = window.setTimeout(() => {
+      if (jumpTargetRef.current === id && !jumpAlignedRef.current) {
+        jumpTargetRef.current = null;
+        scheduleActiveRound();
+      }
+    }, 2_000);
   };
   const scrollToRound = (id: number) => {
     const el = listRef.current;
@@ -2349,6 +2357,7 @@ export default function Chat({
   const jumpTargetRef = useRef<number | null>(null);
   const jumpAlignedRef = useRef(false);
   const jumpAtRef = useRef(0);
+  const jumpTimerRef = useRef<number | undefined>(undefined);
   const activeRoundRafRef = useRef<number | null>(null);
   // 最新实现经 ref 供 rAF 回调读取（见 scheduleActiveRound）；layout effect 写入
   // 而非渲染期——并发渲染丢弃的渲染不得更新 ref。
@@ -2441,6 +2450,7 @@ export default function Chat({
   useLayoutEffect(() => {
     jumpTargetRef.current = null;
     jumpAlignedRef.current = false;
+    window.clearTimeout(jumpTimerRef.current);
   }, [sessionKey]);
   const roundsSignature = `${rounds.length}:${rounds[0]?.id ?? ""}:${rounds[rounds.length - 1]?.id ?? ""}`;
   useLayoutEffect(() => {
@@ -2453,6 +2463,7 @@ export default function Chat({
       if (activeRoundRafRef.current !== null) {
         cancelAnimationFrame(activeRoundRafRef.current);
       }
+      window.clearTimeout(jumpTimerRef.current);
     },
     [],
   );

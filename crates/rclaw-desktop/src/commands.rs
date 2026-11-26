@@ -7016,9 +7016,12 @@ fn resolve_workspace_dir(root: &std::path::Path, rel: &str) -> Result<std::path:
     } else {
         base.join(rel)
     };
-    let canonical = target
-        .canonicalize()
-        .map_err(|e| format!("目录不存在: {e}"))?;
+    let canonical = target.canonicalize().map_err(|e| match e.kind() {
+        // 只有「确实不存在」才说目录没了：权限/IO 错误照实说访问不了，调用方
+        // （附件另存落点的探活）据此决定是删记录还是先留着。
+        std::io::ErrorKind::NotFound => format!("目录不存在: {e}"),
+        _ => format!("目录无法访问: {e}"),
+    })?;
     if !canonical.starts_with(&base) {
         return Err("目录越出工作区".into());
     }

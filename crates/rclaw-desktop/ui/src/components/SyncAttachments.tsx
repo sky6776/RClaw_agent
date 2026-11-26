@@ -146,78 +146,87 @@ export function setLoadedAttachmentMessages(chatId: string, ids: number[]) {
 
 /** 另存落点的存在性：清单只描述消息路径，`-快照` 这种另存名字要靠目录列举确认。
  *  按目录缓存几秒，避免每次清单刷新都为同一批保存记录打一轮 IPC。 */
-const savedDirCache = new Map<string, { at: number; names: Set<string> | null }>();
-const SAVED_PROBE_MS = 5_000;
-/** 保存记录的版本：每次写入保存落点递增。探活回来时凭它确认期间没有重新保存，
- *  否则会拿旧目录结果把刚写下的记录删掉。 */
-let savedGen = 0;
+/** 保存记录的版本：每次写入保存落点递增。探活/打开回来时凭它确认期间没有重新
+ *  保存，否则会拿旧结果把刚写下的记录删掉。 */
 const savedKeyGen: Record<string, number> = {};
 const savedDirOf = (rel: string) => {
   const cut = rel.lastIndexOf("/");
   return cut < 0 ? "" : rel.slice(0, cut);
 };
 
-async function probeSavedPaths(paths: string[]): Promise<Set<string>> {
-  const gen = savedGen;
-  const byDir = new Map<string, string[]>();
-  for (const rel of paths) {
-    const dir = savedDirOf(rel);
+type SavedProbe = { key: string; rel: string; size?: number; gen: number };
+
+/** 另存落点的存在性：清单只描述消息路径，`-快照` 这种另存名字要靠目录列举确认。
+ *  只返回结果、不写缓存——探活是异步的，缓存会把旧目录状态带进更新的一轮。
+ *  同名但大小对不上的按「不是当初存下的那份」处理（内容核对留给打开时）。 */
+async function probeSavedPaths(
+  paths: Array<{ rel: string; size?: number }>,
+): Promise<Set<string>> {
+  const byDir = new Map<string, Array<{ rel: string; size?: number }>>();
+  for (const item of paths) {
+    const dir = savedDirOf(item.rel);
     const bucket = byDir.get(dir);
-    if (bucket) bucket.push(rel);
-    else byDir.set(dir, [rel]);
+    if (bucket) bucket.push(item);
+    else byDir.set(dir, [item]);
   }
   const present = new Set<string>();
   for (const [dir, rels] of byDir) {
-    let entry = savedDirCache.get(dir);
-    if (!entry || Date.now() - entry.at > SAVED_PROBE_MS) {
-      let names: Set<string> | null = null;
-      try {
-        names = new Set(
-          (await api.workspaceList(dir))
-            .filter((item) => !item.is_dir)
-            .map((item) => item.name),
-        );
-      } catch (e) {
-        // 目录明确不存在 / 被同名文件顶掉：这个目录下的另存文件一定不在了。
-        // 其他错误（工作区暂不可用、越界）按「不知道」处理，别误删记录。
-        const text = String(e);
-        names =
-          text.startsWith("目录不存在") || text.startsWith("不是目录") ? new Set() : null;
-      }
-      entry = { at: Date.now(), names };
-      // 探活期间有保存写进这个目录：这份列举可能漏掉它，不缓存（结果本身只用来
-      // 判断老记录，新记录由按文件的版本号保护）。
-      if (savedGen === gen) savedDirCache.set(dir, entry);
+    let entries: Map<string, number> | null = null;
+    try {
+      entries = new Map(
+        (await api.workspaceList(dir))
+          .filter((item) => !item.is_dir)
+          .map((item) => [item.name, item.size]),
+      );
+    } catch (e) {
+      // 目录明确不存在 / 被同名文件顶掉：这个目录下的另存文件一定不在了。
+      // 其他错误（权限、工作区暂不可用、越界）按「不知道」处理，别误删记录。
+      const text = String(e);
+      entries =
+        text.startsWith("目录不存在") || text.startsWith("不是目录") ? new Map() : null;
     }
-    for (const rel of rels) {
+    for (const { rel, size } of rels) {
+      if (entries === null) {
+        // 核不了：当它在，别把还能用的记录删掉。
+        present.add(rel);
+        continue;
+      }
       const name = rel.slice(rel.lastIndexOf("/") + 1);
-      if (entry.names === null || entry.names.has(name)) present.add(rel);
+      if (!entries.has(name)) continue;
+      if (size !== undefined && entries.get(name) !== size) continue;
+      present.add(rel);
     }
   }
   return present;
 }
 
-/** 另存的文件被删掉了：撤掉那条保存记录（卡片退回「存进工作区」，顶栏重新计入缺失）。 */
-async function pruneSavedGone(chatId: string) {
-  if (chat !== chatId) return;
-  const alt = Object.entries(cards.saved).filter(
-    ([key, rel]) => rel !== key.slice(key.indexOf(":") + 1),
-  );
-  if (alt.length === 0) return;
-  const genAt = new Map(alt.map(([key]) => [key, savedKeyGen[key] ?? 0]));
-  const present = await probeSavedPaths(alt.map(([, rel]) => rel));
-  if (chat !== chatId) return;
-  const gone = alt
-    .filter(
-      ([key, rel]) =>
-        !present.has(rel) &&
-        (savedKeyGen[key] ?? 0) === genAt.get(key) &&
-        cards.saved[key] === rel,
-    )
-    .map(([key]) => key);
+/** 找出现在已经不该算「已保存」的另存记录（只返回候选，调用方在核对时序后再删）。 */
+async function probeSavedGone(chatId: string): Promise<SavedProbe[]> {
+  if (chat !== chatId) return [];
+  const alt: SavedProbe[] = [];
+  for (const [key, rel] of Object.entries(cards.saved)) {
+    if (rel === key.slice(key.indexOf(":") + 1)) continue; // 存回原路径的看清单
+    const blob = key.slice(0, key.indexOf(":"));
+    alt.push({
+      key,
+      rel,
+      size: all.find((item) => item.blob === blob)?.size,
+      gen: savedKeyGen[key] ?? 0,
+    });
+  }
+  if (alt.length === 0) return [];
+  const present = await probeSavedPaths(alt.map(({ rel, size }) => ({ rel, size })));
+  if (chat !== chatId) return [];
+  return alt.filter(({ rel }) => !present.has(rel));
+}
+
+/** 撤掉探活确认没了的保存记录（版本/落点在这期间变过的不动）。 */
+function dropSavedGone(gone: SavedProbe[]) {
   if (gone.length === 0) return;
   setCards((prev) => {
-    const keys = gone.filter((key) => key in prev.saved);
+    const keys = gone
+      .filter(({ key, rel, gen }) => prev.saved[key] === rel && (savedKeyGen[key] ?? 0) === gen)
+      .map(({ key }) => key);
     if (keys.length === 0) return prev;
     const saved = { ...prev.saved };
     const saveErrors = { ...prev.saveErrors };
@@ -479,11 +488,7 @@ function save(chatId: string, item: SyncAttachment) {
         if (savedBlob !== item.blob) delete saved[key];
         return { ...prev, saved };
       });
-      // 目录探活缓存里可能还没有这个刚写下的名字：作废它，否则紧接着的清单刷新
-      // 会把刚保存的记录当成已被删掉。
-      savedDirCache.delete(savedDirOf(rel));
-      savedGen += 1;
-      savedKeyGen[savedKey] = savedGen;
+      savedKeyGen[savedKey] = (savedKeyGen[savedKey] ?? 0) + 1;
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
       // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。
       reload?.();
@@ -529,7 +534,6 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         loadedMsgSig = "";
         loadedMsgChat = null;
       }
-      savedDirCache.clear();
       emit();
     }
     let alive = true;
@@ -580,8 +584,10 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       loadFails = 0;
       failed = null;
       // 另存的文件可能已经被删：清单不描述这些路径，先探一遍目录再归类。
-      await pruneSavedGone(chatId);
+      // 探活只返回候选——这期间可能已经有更新的一轮装载，顺序核对过再落。
+      const staleSaved = await probeSavedGone(chatId);
       if (!alive || mine !== seq || chat !== chatId) return;
+      dropSavedGone(staleSaved);
       apply(chatId, list);
       const pendingAlias = list.filter(
         (item) => item.kind === "file" && item.state === "local" && !item.path_present,
@@ -811,6 +817,8 @@ export function AttachmentCard({
   const isImage = IMAGE_RE.test(item.path);
   const error = state.errors[item.blob] ?? state.saveErrors[fileKey(item)];
   const open = (path: string) => {
+    const key = fileKey(item);
+    const genAt = savedKeyGen[key] ?? 0;
     // 点开前先让后端核对一下：工作区里这个路径上的文件可能已经被就地改写过，打开
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
     api
@@ -823,11 +831,14 @@ export function AttachmentCard({
       .catch((e) => {
         onError(`打开文件失败: ${String(e)}`);
         // 核对没过（文件被改写/删掉）：这次保存的落点不能再「打开」，收回去让用户
-        // 重新「存进工作区」；错误按落点记，只有这张卡显示。
-        const key = fileKey(item);
+        // 重新「存进工作区」；错误按落点记，只有这张卡显示。这期间重新保存过、
+        // 或保存记录已经换了落点的，不能拿这次失败把新记录清掉。
         setCards((prev) => ({
           ...prev,
-          saved: without(prev.saved, key),
+          saved:
+            prev.saved[key] === path && (savedKeyGen[key] ?? 0) === genAt
+              ? without(prev.saved, key)
+              : prev.saved,
           saveErrors: { ...prev.saveErrors, [key]: String(e) },
         }));
         reload?.();
@@ -944,6 +955,7 @@ export function AttachmentCard({
 
   const busy = Boolean(state.busy[item.blob]);
   const away = awayText(item.state, where);
+  const savedTo = state.saved[fileKey(item)];
   return (
     <div>
       <div className={CARD}>
@@ -954,6 +966,11 @@ export function AttachmentCard({
             {formatBytes(item.size)} · {away.note}
           </span>
         </span>
+        {savedTo && (
+          <button onClick={() => open(savedTo)} disabled={inactive} className={CARD_BTN}>
+            打开
+          </button>
+        )}
         <button
           onClick={() => download(chatId, item.blob)}
           disabled={inactive || busy}
