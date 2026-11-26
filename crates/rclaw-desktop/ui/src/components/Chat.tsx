@@ -2350,6 +2350,13 @@ export default function Chat({
   // （跳到最新还显示「回到底部」是反直觉的）；其余轮次脱离跟随。zcode 同款坐
   // 标公式；prefers-reduced-motion 时全部 instant。
   const beginJump = (id: number) => {
+    // 以当前布局为基线：布局变化可能没有滚动事件（上限变了但位置没动），
+    // 旧上限会在跳转首帧被误判成「夹位」。
+    const el = listRef.current;
+    if (el) {
+      lastScrollTopRef.current = el.scrollTop;
+      lastMaxScrollRef.current = el.scrollHeight - el.clientHeight;
+    }
     jumpTargetRef.current = id;
     jumpAlignedRef.current = false;
     followLockRef.current = true;
