@@ -2363,7 +2363,7 @@ export default function Chat({
           <RoundRail rounds={rounds} activeId={activeRoundId} onJump={scrollToRound} />
         )}
         {/* 消息流（移动端收窄页边距，把宽度还给消息正文）；rail 可见时左侧
-            让位 56px（rail 宽 40px + 边距），不压住正文。 */}
+            让位 36px（rail 占 12–36px，正好不压正文）。 */}
         <div
           ref={listRef}
           onScroll={handleListScroll}
@@ -2374,7 +2374,7 @@ export default function Chat({
           onWheel={handleListWheel}
           style={{ ["--chat-font-scale" as string]: String(fontScale / 100) }}
           className={`chat-msg-list flex-1 space-y-3 overflow-y-auto py-4 max-md:space-y-2.5 max-md:px-3 max-md:py-3 ${
-            railVisible ? "pl-14 pr-6" : "px-6"
+            railVisible ? "pl-9 pr-6" : "px-6"
           }`}
         >
         {entries.length === 0 && (

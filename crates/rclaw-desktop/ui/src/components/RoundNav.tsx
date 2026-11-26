@@ -35,10 +35,15 @@ export function useWidePointer(): boolean {
   return wide;
 }
 
-/** 桌面轮次 rail（zcode ConversationTurnNavigator 同形态的极简版）：列表左缘
- *  一列小横条，一根对应一条用户提问；hover/focus 附近按距离衰减放大（山峰），
- *  当前轮（视口顶最近的上方向锚点）前景色常亮；点击平滑滚动到该轮。命中区
- *  16×32px（视觉条只有 2px 高，点的是透明按钮）；预览走原生 title tooltip。 */
+/** 桌面轮次 rail（对齐 zcode 的 conversation turn navigator 规格）：会话面板左缘
+ *  12px 处一条 24px 宽的窄轨，一根 2×12px 横条对应一条用户提问；hover/focus 附近
+ *  按距离衰减放大（山峰，最大 2 倍），当前轮常亮；点击平滑滚动到该轮。
+ *
+ *  - 条目 10px 高、命中区 24×10px（视觉条只有 2px 高，点的是透明按钮）；
+ *  - 轮次多时只渲染可视窗口 ± 6 条（固定 10px 行高，自己窗口化，不引虚拟列表依赖）；
+ *  - 预览是右侧浮层 tooltip（120ms 打开 / 80ms 关闭），按视口坐标定位、不进滚动容器
+ *    （滚动容器 `overflow-x-hidden` 会把浮层裁掉）；
+ *  - 轮次 < 2 不渲染（Chat 的 navEnabled 也按同样条件收，rail/fab 一起消失）。 */
 export function RoundRail({
   rounds,
   activeId,
@@ -49,45 +54,152 @@ export function RoundRail({
   onJump: (id: number) => void;
 }) {
   const [focusIdx, setFocusIdx] = useState<number | null>(null);
+  const [tip, setTip] = useState<{ text: string; time: string | null; x: number; y: number } | null>(
+    null,
+  );
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const [view, setView] = useState({ top: 0, height: 0 });
   const activeIdx = rounds.findIndex((r) => r.id === activeId);
+
+  // 窗口化：固定行高 10px，可视窗口上下各多渲染 6 条（zcode 同款 overscan）。
+  const ROW = 10;
+  const OVERSCAN = 6;
+  const total = rounds.length * ROW;
+  const from = Math.max(0, Math.floor(view.top / ROW) - OVERSCAN);
+  const to = Math.min(rounds.length, Math.ceil((view.top + view.height) / ROW) + OVERSCAN);
+
+  // 量可视窗口：首次挂载与尺寸变化（窗口缩放、面板收起）时更新。
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const sync = () => setView({ top: el.scrollTop, height: el.clientHeight });
+    sync();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(sync);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  // 当前轮滚进可视窗口（zcode 同样 align: auto：只保证可见，不居中）。
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || activeIdx < 0 || view.height === 0) return;
+    const top = activeIdx * ROW;
+    if (top < el.scrollTop) el.scrollTop = top;
+    else if (top + ROW > el.scrollTop + el.clientHeight) {
+      el.scrollTop = top + ROW - el.clientHeight;
+    }
+  }, [activeIdx, view.height]);
+
+  // tooltip 计时器：120ms 打开、80ms 关闭；卸载时清掉。
+  const openTimer = useRef<number | undefined>(undefined);
+  const closeTimer = useRef<number | undefined>(undefined);
+  useEffect(
+    () => () => {
+      window.clearTimeout(openTimer.current);
+      window.clearTimeout(closeTimer.current);
+    },
+    [],
+  );
+  const hover = (i: number) => {
+    setFocusIdx(i);
+    window.clearTimeout(closeTimer.current);
+  };
+  const leave = () => {
+    setFocusIdx(null);
+    window.clearTimeout(openTimer.current);
+    window.clearTimeout(closeTimer.current);
+    closeTimer.current = window.setTimeout(() => setTip(null), 80);
+  };
+  const showTip = (el: HTMLElement, item: RoundNavItem) => {
+    window.clearTimeout(openTimer.current);
+    window.clearTimeout(closeTimer.current);
+    openTimer.current = window.setTimeout(() => {
+      const rect = el.getBoundingClientRect();
+      setTip({
+        text: item.preview,
+        time: item.time,
+        // 右侧浮层；贴近右缘时回收一点，别出视口。
+        x: Math.min(rect.right + 8, window.innerWidth - 16),
+        y: rect.top + rect.height / 2,
+      });
+    }, 120);
+  };
+
+  if (rounds.length < 2) return null;
   return (
-    <nav
-      aria-label="对话提问导航"
-      className="absolute inset-y-0 left-0 z-20 flex w-10 items-center"
-    >
-      <div className="flex max-h-[calc(100%-2rem)] w-full flex-col items-center gap-0.5 overflow-y-auto py-2 [scrollbar-width:none]">
-        {rounds.map((r, i) => {
-          const active = i === activeIdx;
-          // 山峰视觉：hover/focus 项 2.6 倍，±1/±2 项按距离衰减；无指针悬停时
-          // 仅当前轮适度放大（1.6）常亮。
-          const dist = focusIdx === null ? Number.POSITIVE_INFINITY : Math.abs(i - focusIdx);
-          const scale =
-            dist === 0 ? 2.6 : dist === 1 ? 1.7 : dist === 2 ? 1.25 : focusIdx === null && active ? 1.6 : 1;
-          const opacity =
-            dist === 0 ? 1 : dist === 1 ? 0.86 : dist === 2 ? 0.72 : active ? 1 : 0.55;
-          return (
-            <button
-              key={r.id}
-              onClick={() => onJump(r.id)}
-              onMouseEnter={() => setFocusIdx(i)}
-              onMouseLeave={() => setFocusIdx(null)}
-              onFocus={() => setFocusIdx(i)}
-              onBlur={() => setFocusIdx(null)}
-              title={r.preview}
-              aria-label={`跳转到第 ${i + 1} 条提问`}
-              aria-current={active ? "location" : undefined}
-              className="flex h-4 w-8 shrink-0 items-center justify-center"
-            >
-              <span
-                className={`h-0.5 w-4 origin-left rounded-full transition-[transform,opacity] duration-150 ${
-                  active ? "bg-indigo-400" : "bg-gray-500"
-                }`}
-                style={{ transform: `scaleX(${scale})`, opacity }}
-              />
-            </button>
-          );
-        })}
+    <nav aria-label="对话提问导航" className="absolute inset-y-0 left-3 z-20 w-6">
+      <div
+        ref={scrollRef}
+        onScroll={() => {
+          const el = scrollRef.current;
+          if (el) setView({ top: el.scrollTop, height: el.clientHeight });
+          setFocusIdx(null);
+          leave();
+        }}
+        onPointerLeave={leave}
+        className="absolute top-1/2 max-h-[calc(100%-6rem)] w-6 -translate-y-1/2 overflow-x-hidden overflow-y-auto py-1 [scrollbar-width:none]"
+      >
+        <div className="relative w-6" style={{ height: total }}>
+          {rounds.slice(from, to).map((r, offset) => {
+            const i = from + offset;
+            const active = i === activeIdx;
+            // 山峰视觉：hover/focus 项 2 倍，按距离衰减到 ±3 之外；无指针悬停时
+            // 仅当前轮适度放大（1.6）常亮。缩放上限 2（视觉条最长 24px = 轨道宽）。
+            const dist =
+              focusIdx === null ? Number.POSITIVE_INFINITY : Math.min(3, Math.abs(i - focusIdx));
+            const scale =
+              dist === 0 ? 2 : dist === 1 ? 1.6 : dist === 2 ? 1.25 : focusIdx === null && active ? 1.6 : 1;
+            const opacity =
+              dist === 0 ? 1 : dist === 1 ? 0.86 : dist === 2 ? 0.72 : active ? 1 : 0.55;
+            return (
+              <div
+                key={r.id}
+                className="absolute left-0 top-0 h-2.5 w-6"
+                style={{ transform: `translateY(${i * ROW}px)` }}
+              >
+                <button
+                  type="button"
+                  onClick={() => onJump(r.id)}
+                  onMouseEnter={(e) => {
+                    hover(i);
+                    showTip(e.currentTarget, r);
+                  }}
+                  onMouseLeave={leave}
+                  onFocus={(e) => {
+                    hover(i);
+                    showTip(e.currentTarget, r);
+                  }}
+                  onBlur={leave}
+                  aria-label={`跳转到第 ${i + 1} 条提问`}
+                  aria-current={active ? "location" : undefined}
+                  aria-posinset={i + 1}
+                  aria-setsize={rounds.length}
+                  className="flex h-2.5 w-6 items-center justify-start rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50"
+                >
+                  <span className="rclaw-turn-navigator-enter block" aria-hidden="true">
+                    <span
+                      className={`block h-0.5 w-3 origin-left rounded-full transition-[height,opacity,transform,background-color] duration-150 ease-out motion-reduce:transition-none ${
+                        active ? "bg-indigo-400" : "bg-gray-500"
+                      }`}
+                      style={{ transform: `scaleX(${scale})`, opacity }}
+                    />
+                  </span>
+                </button>
+              </div>
+            );
+          })}
+        </div>
       </div>
+      {tip && (
+        <div
+          className="pointer-events-none fixed z-50 w-max max-w-[16rem] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 text-[11px] leading-relaxed text-gray-200 shadow-lg"
+          style={{ left: tip.x, top: tip.y }}
+        >
+          <div className="truncate">{tip.text}</div>
+          {tip.time && <div className="text-[10px] text-gray-500">{tip.time}</div>}
+        </div>
+      )}
     </nav>
   );
 }

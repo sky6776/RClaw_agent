@@ -576,3 +576,20 @@ html.theme-light #root {
     line-height: 1.7;
   }
 }
+
+/* ---- 轮次 rail 条目进场：从 -6px 滑入（与 zcode 同款 0.18s ease-out） ---- */
+@keyframes rclaw-turn-navigator-enter {
+  from {
+    opacity: 0;
+    transform: translate(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0);
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .rclaw-turn-navigator-enter {
+    animation: 0.18s ease-out rclaw-turn-navigator-enter;
+  }
+}
