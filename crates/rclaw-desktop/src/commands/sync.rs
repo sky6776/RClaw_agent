@@ -1491,7 +1491,7 @@ fn renameat2_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// - rename 失败时只删「仍然是我们创建的那个空文件」（比对 dev/ino/size），不按
 ///   路径盲删。
 /// - 进程崩溃会留下一个 0 字节文件（后续保存会当成已有文件、转存 `-快照`）。
-#[cfg(not(windows))]
+#[cfg(target_os = "android")]
 fn publish_by_placeholder(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let placeholder = std::fs::OpenOptions::new()

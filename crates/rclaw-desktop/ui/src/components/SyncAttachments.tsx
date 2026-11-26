@@ -107,7 +107,9 @@ function persistSaved(
     const keep: Record<string, string> = {};
     const verified: Record<string, boolean> = {};
     for (const [key, rel] of Object.entries(saved)) {
-      if (savedVerified[key] === false) continue;
+      // 只写明确核对过的：`undefined` 不能当 true（打开失败会先删标记、后删路径，
+      // 中间那次状态更新不能把未核对的落点写成「已核对」）。
+      if (savedVerified[key] !== true) continue;
       keep[key] = rel;
       verified[key] = true;
     }
@@ -572,14 +574,9 @@ function settle(
   // 合并进来的卡片操作序号更大（它们加入得晚），失败才算它们的最近操作。
   const joined = downloadKeys[blob];
   delete downloadKeys[blob];
-  let seq = downloadAt[blob] ?? opSeq;
-  if (joined) {
-    // 每张参与卡只在自己的加入序号仍是它最后一次操作时才显示这次下载的失败；
-    // A 卡加入后又点了一次打开（失败），别的卡更大的加入序号也不能盖住它。
-    for (const [key, joinedOp] of joined) {
-      if ((cardOpSeq[key] ?? 0) === joinedOp) seq = Math.max(seq, joinedOp);
-    }
-  }
+  // 共享序号固定为这次下载的发起序号；参与卡各自的加入序号单独记在
+  // `downloadKeySeq`（不抬高共享值，否则会盖住别的卡更新的操作）。
+  const seq = downloadAt[blob] ?? opSeq;
   delete downloadAt[blob];
   if (error === null && placed) {
     // 只撤「这次实际落到的那个路径」上的覆盖：同一对象的其他路径上可能还是另一份
@@ -649,11 +646,9 @@ function settle(
           : joined
             ? {
                 ...prev.downloadKeySeq,
-                ...Object.fromEntries(
-                  [...joined]
-                    .filter(([key, joinedOp]) => (cardOpSeq[key] ?? 0) === joinedOp)
-                    .map(([key, joinedOp]) => [key, joinedOp]),
-                ),
+                // 所有参与卡都写自己的加入序号：加入后又发起了新操作的卡，
+                // 比较时自然不显示这次旧失败（也不会回退到共享序号）。
+                ...Object.fromEntries([...joined]),
               }
             : prev.downloadKeySeq,
     };
@@ -1215,19 +1210,19 @@ export function AttachmentCard({
         // 只有「落点上的文件已经不是这份内容了」（含被删掉）才收回「打开」；内容
         // 核对通过之后临时副本/拉起系统程序失败不算文件没了，记录要留着。
         const gone = isAttachmentChangedError(e);
-        if (gone) {
-          delete savedKeyGen[key];
-          setCards((prev) => ({
+        if (gone) delete savedKeyGen[key];
+        // 路径与核对标记在同一次更新里删：分两次写会让持久化先看到「路径还在、
+        // 标记没了」的中间态。
+        setCards((prev) => {
+          const dropSaved = gone && prev.saved[key] === path;
+          return {
             ...prev,
-            savedVerified: without(prev.savedVerified, key),
-          }));
-        }
-        setCards((prev) => ({
-          ...prev,
-          saved: gone && prev.saved[key] === path ? without(prev.saved, key) : prev.saved,
-          openErrors: { ...prev.openErrors, [key]: String(e) },
-          openErrorPath: { ...prev.openErrorPath, [key]: path },
-        }));
+            saved: dropSaved ? without(prev.saved, key) : prev.saved,
+            savedVerified: gone ? without(prev.savedVerified, key) : prev.savedVerified,
+            openErrors: { ...prev.openErrors, [key]: String(e) },
+            openErrorPath: { ...prev.openErrorPath, [key]: path },
+          };
+        });
         openErrorOp[key] = op;
         if (gone) reload?.();
       });
