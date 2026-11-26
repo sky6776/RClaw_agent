@@ -36,10 +36,20 @@ pub fn write_config(home: &Path, p: &WizardParams) -> Result<PathBuf, String> {
     }
     validate(p)?;
     let toml_text = render_template(p);
+    // 落盘前按启动同一条路径校验：生成的 TOML 必须能解析，且最终主 provider 能
+    // 构造（base_url 真实 URL、鉴权头合法）。校验失败时配置文件保持不存在。
+    let cfg = rclaw_cli::config::Config::from_toml(&toml_text)
+        .map_err(|error| format!("生成的配置未通过校验: {error:#}"))?;
+    cfg.build_provider_config()
+        .map_err(|error| format!("生成的 provider 未通过校验: {error:#}"))?;
     std::fs::create_dir_all(home).map_err(|e| format!("创建数据目录失败: {e}"))?;
     let path = crate::home::config_path(home);
-    // 原子写：半截 rclaw.toml 会让 has_config 为真而解析失败，用户既进不了向导也启动不了。
-    rclaw_store::atomic_write(&path, toml_text.as_bytes())
+    // 与导入/模型写回共享同一把跨进程配置锁：锁覆盖原子创建及其兜底回滚，
+    // 避免回滚删除另一实例刚发布的配置。
+    let _lock = rclaw_store::ConfigFileLock::acquire(&path)
+        .map_err(|e| format!("获取配置写锁失败: {e}"))?;
+    // 原子「仅当不存在时创建」：检查与创建不是两步；目标已存在则拒绝覆盖。
+    rclaw_store::atomic_create_private(&path, toml_text.as_bytes())
         .map_err(|e| format!("写入配置失败: {e}"))?;
     Ok(path)
 }
@@ -67,6 +77,7 @@ fn validate(p: &WizardParams) -> Result<(), String> {
         ("API key", &p.api_key),
         ("模型名", &p.model),
         ("provider 标识", &p.provider),
+        ("API 端点", &p.base_url),
     ] {
         if value
             .chars()
@@ -137,6 +148,37 @@ mod tests {
             context_length: 131_072,
             auto_evolve: true,
         }
+    }
+
+    /// 向导的 DeepSeek 预设：写盘 → 读回 → 构造 provider，必须与文档口径一致。
+    #[test]
+    fn deepseek_preset_builds_provider_with_documented_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params();
+        p.provider = "deepseek".into();
+        p.base_url = "https://api.deepseek.com/v1".into();
+        p.model = "deepseek-flash".into();
+        p.context_length = 1_048_576;
+        write_config(dir.path(), &p).unwrap();
+
+        let cfg = Config::load_from_dir(dir.path()).unwrap();
+        let provider = cfg.build_provider_config_for("deepseek").unwrap();
+        assert_eq!(provider.default_model, "deepseek-flash");
+        assert_eq!(provider.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(provider.flavor, rclaw_llm::ProviderFlavor::DeepSeek);
+        assert_eq!(provider.media_wire, rclaw_llm::MediaWire::DeepSeek);
+        assert!(provider.supports_multimodal());
+        assert_eq!(provider.max_tokens, cfg.llm.max_tokens);
+    }
+
+    #[test]
+    fn invalid_endpoint_is_rejected_before_any_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = params();
+        // 前缀合法但没有 host：向导检查能过，启动期解析会失败。
+        p.base_url = "https://".into();
+        assert!(write_config(dir.path(), &p).is_err());
+        assert!(!crate::home::config_path(dir.path()).exists());
     }
 
     #[test]

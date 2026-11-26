@@ -360,7 +360,8 @@ impl FinishReason {
             "tool_calls" => FinishReason::ToolCalls,
             "length" => FinishReason::Length,
             "content_filter" => FinishReason::ContentFilter,
-            other => FinishReason::Other(other.to_string()),
+            // 未知结束原因不保留上游原文（它可能回显凭据/提示词）；固定标记。
+            _ => FinishReason::Other("unknown".to_string()),
         }
     }
 }

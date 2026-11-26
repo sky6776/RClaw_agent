@@ -18,6 +18,9 @@ use tokio::sync::mpsc;
 pub struct RunningAgent {
     /// inbound 总线发送端（对话消息 / 斜杠命令都从这里进 agent loop）。
     pub inbound_tx: mpsc::Sender<BusMessage>,
+    /// 斜杠命令注册表：`/llmodel`、搜索开关与思考强度选择器共用同一把配置
+    /// mutation 锁（跨窗口/跨会话的读改写不会被互相覆盖）。
+    pub slash: Arc<rclaw_runtime::SlashRegistry>,
     /// cron 任务表（定时任务面板直接读它，不经模型）。
     pub cron: Arc<CronController>,
     /// 会话存储（多会话列表 / 历史 / 归档直接读它）。
@@ -184,13 +187,26 @@ impl AppState {
             })
     }
 
-    /// (provider 名, 模型名)。
+    /// (provider 名, 模型名)。读 live 配置而不是启动快照：`/llmodel` 跨 provider
+    /// 切换后，状态条与思考强度选择器必须立即看到新身份。
     pub fn provider_summary(&self) -> Option<(String, Option<String>)> {
         self.agent
             .read()
             .expect("AppState.agent 锁未被毒化")
             .as_ref()
-            .map(|a| (a.provider_name.clone(), a.model.clone()))
+            .map(|agent| match agent.slash.live_provider_summary() {
+                Some((provider, model)) => (provider, Some(model)),
+                None => (agent.provider_name.clone(), agent.model.clone()),
+            })
+    }
+
+    /// 共享的斜杠命令/配置事务句柄（思考强度选择器与 `/llmodel` 共用锁）。
+    pub fn slash(&self) -> Option<Arc<rclaw_runtime::SlashRegistry>> {
+        self.agent
+            .read()
+            .expect("AppState.agent 锁未被毒化")
+            .as_ref()
+            .map(|agent| agent.slash.clone())
     }
 
     /// Bot Mode：bot 注册表 + 交接路由 + provider 名列表。

@@ -18,6 +18,7 @@ pub mod heartbeat;
 pub mod options;
 pub mod session_handoff;
 pub mod slash;
+pub mod thinking;
 pub mod turn;
 
 pub use agent_loop::{AgentLoop, ForkHandle, SessionLifecycle};
@@ -41,6 +42,7 @@ pub use cron::CronService;
 pub use heartbeat::Heartbeat;
 pub use options::AgentOptions;
 pub use slash::{CommandOutcome, SlashRegistry};
+pub use thinking::{LlmState, ModelOption, ModelState, ThinkingOption, ThinkingState};
 pub use turn::tool_events::{
     brief_input, ToolBatchBegun, ToolBatchFinished, ToolCallBegun, ToolCallFinished,
 };

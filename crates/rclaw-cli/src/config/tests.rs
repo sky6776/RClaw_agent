@@ -782,3 +782,244 @@ fn sync_section_rejects_unknown_fields_and_bad_values() {
         "{shown}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DeepSeek / GLM：推理参数、媒体方言、per-provider max_tokens、搜索子表
+// ---------------------------------------------------------------------------
+
+fn build_provider(text: &str, name: &str) -> Result<rclaw_llm::ProviderConfig, String> {
+    let cfg = Config::parse_str(text).map_err(|error| format!("{error:#}"))?;
+    cfg.build_provider_config_for(name)
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[test]
+fn toml_diagnostics_redact_quoted_field_values() {
+    let redacted = crate::config::redact_toml_diagnostic(
+        "invalid type: string \"sk-secret\", expected a sequence",
+    );
+    assert!(!redacted.contains("sk-secret"), "{redacted}");
+    assert!(redacted.contains("\"…\""), "{redacted}");
+    // 漏写引号的数字凭据：Serde 用反引号包住原值。
+    let numeric = crate::config::redact_toml_diagnostic(
+        "invalid type: integer `123456789`, expected a string",
+    );
+    assert!(!numeric.contains("123456789"), "{numeric}");
+    assert!(numeric.contains("`…`"), "{numeric}");
+    // 字段名/类型名仍可读。
+    let named = crate::config::redact_toml_diagnostic("missing field `api_key`");
+    assert!(named.contains("api_key"), "{named}");
+}
+
+#[test]
+fn omitted_main_provider_uses_default_and_must_exist() {
+    // 缺省 [llm].provider = "deepseek"；只有 zhipu 条目时启动会找不到目标。
+    let text = r#"[llm]
+[[llm.providers]]
+name = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-5.4"
+api_key = "sk-test"
+"#;
+    let error = match Config::parse_str(text) {
+        Ok(_) => panic!("缺省主 provider 不存在时必须拒绝"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(message.contains("deepseek"), "{message}");
+
+    // 显式空白与缺省同义。
+    let blank = text.replace(
+        "[llm]",
+        "[llm]
+provider = \"  \"",
+    );
+    assert!(Config::parse_str(&blank).is_err());
+
+    // 补上 deepseek 条目后通过，且有效名归一为 deepseek。
+    let ok = format!(
+        "{text}
+[[llm.providers]]
+name = \"deepseek\"
+base_url = \"https://api.deepseek.com/v1\"
+model = \"deepseek-flash\"
+api_key = \"sk-test\"
+"
+    );
+    let cfg = Config::parse_str(&ok).unwrap();
+    assert_eq!(cfg.effective_provider_name(), "deepseek");
+
+    // 空 provider 列表 + 显式非默认主引用：启动只会注入 deepseek，必须拒绝。
+    let empty_other = "[llm]
+provider = \"zhipu\"
+";
+    assert!(Config::parse_str(empty_other).is_err());
+    // 只有默认引用/无引用时合法（供「仅含同步设置」的配置使用）。
+    assert!(Config::parse_str(
+        "[llm]
+provider = \"deepseek\"
+"
+    )
+    .is_ok());
+    assert!(Config::parse_str(
+        "[sync]
+enabled = false
+"
+    )
+    .is_ok());
+}
+
+#[test]
+fn profile_override_wins_before_final_validation() {
+    // 旧条目本身合法（glm-5.3 + none），但切换目标是 glm-5.3-flash：覆盖必须在
+    // 校验之前发生，否则旧档位会按新模型的支持范围误拒/误判。
+    let cfg = Config::parse_str(
+        r#"[llm]
+provider = "zhipu"
+
+[[llm.providers]]
+name = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-5.3"
+api_key = "sk-test"
+reasoning_effort = "none"
+"#,
+    )
+    .unwrap();
+    let built = cfg
+        .build_provider_config_for_profile(
+            "zhipu",
+            &crate::config::ProviderProfileParams {
+                model: "glm-5.3-flash",
+                media_wire: "openai",
+                thinking: "enabled",
+                reasoning_effort: "max",
+                reasoning_field: "reasoning_content",
+                max_tokens_key: "max_tokens",
+                max_tokens: 128_000,
+            },
+        )
+        .unwrap();
+    assert_eq!(built.default_model, "glm-5.3-flash");
+    assert_eq!(built.reasoning.thinking, Some(true));
+    assert_eq!(built.reasoning.effort.as_deref(), Some("max"));
+    assert_eq!(built.media_wire, rclaw_llm::MediaWire::OpenAiCompat);
+}
+
+#[test]
+fn deepseek_provider_parses_reasoning_and_media_fields() {
+    let cfg = build_provider(
+        r#"[llm]
+provider = "deepseek"
+
+[[llm.providers]]
+name = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-flash"
+api_key = "sk-test"
+context_length = 1048576
+max_tokens = 128000
+thinking = "disabled"
+media_wire = "deepseek"
+"#,
+        "deepseek",
+    )
+    .unwrap();
+    assert_eq!(cfg.max_tokens, 128_000);
+    assert_eq!(cfg.flavor, rclaw_llm::ProviderFlavor::DeepSeek);
+    assert_eq!(cfg.media_wire, rclaw_llm::MediaWire::DeepSeek);
+    assert_eq!(cfg.reasoning.thinking, Some(false));
+    assert!(cfg.reasoning.effort.is_none());
+}
+
+#[test]
+fn provider_rejects_unsupported_reasoning_values() {
+    // DeepSeek 只认 none/low/high/max；minimal 不是官方值。
+    let error = build_provider(
+        r#"[llm]
+provider = "deepseek"
+
+[[llm.providers]]
+name = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-flash"
+api_key = "sk-test"
+reasoning_effort = "minimal"
+"#,
+        "deepseek",
+    )
+    .unwrap_err();
+    assert!(error.contains("reasoning_effort"), "{error}");
+
+    // glm-5.3-flash 强制思考，禁止 disabled。
+    let error = build_provider(
+        r#"[llm]
+provider = "zhipu"
+
+[[llm.providers]]
+name = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-5.3-flash"
+api_key = "sk-test"
+thinking = "disabled"
+"#,
+        "zhipu",
+    )
+    .unwrap_err();
+    assert!(error.contains("强制开启思考"), "{error}");
+
+    // 关闭思考与 effort 互斥。
+    let error = build_provider(
+        r#"[llm]
+provider = "deepseek"
+
+[[llm.providers]]
+name = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-flash"
+api_key = "sk-test"
+thinking = "disabled"
+reasoning_effort = "low"
+"#,
+        "deepseek",
+    )
+    .unwrap_err();
+    assert!(error.contains("不能同时设置"), "{error}");
+}
+
+#[test]
+fn provider_rejects_credentials_in_base_url() {
+    let error = build_provider(
+        r#"[llm]
+provider = "custom"
+
+[[llm.providers]]
+name = "custom"
+base_url = "https://user:pass@example.com/v1"
+model = "x"
+api_key = "sk-test"
+"#,
+        "custom",
+    )
+    .unwrap_err();
+    assert!(error.contains("用户名或密码"), "{error}");
+}
+
+#[test]
+fn web_search_deepseek_section_parses() {
+    let cfg = Config::parse_str(
+        r#"[web_search]
+enabled = true
+order = ["deepseek"]
+
+[web_search.deepseek]
+api_key = "sk-test"
+need_content = true
+"#,
+    )
+    .unwrap();
+    let runtime = cfg.web_search_runtime_config().unwrap().unwrap();
+    let deepseek = runtime.deepseek.expect("deepseek 子表应被构建");
+    assert!(deepseek.need_content);
+    assert_eq!(runtime.order, vec![rclaw_tools::BackendId::DeepSeek]);
+}

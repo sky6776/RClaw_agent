@@ -193,6 +193,8 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     let opts_for_state = core.opts.clone();
     let channels_for_state = channel_info.clone();
     let web_search_for_state = core.web_search_control.clone();
+    // 斜杠命令注册表克隆给状态层（思考强度选择器与 /llmodel 共用同一把锁）。
+    let slash_for_state = core.slash.clone();
     let agent = AgentLoop::new(
         core.provider.clone(),
         core.review_provider.clone(),
@@ -249,6 +251,7 @@ async fn start_agent_inner(app: &tauri::AppHandle, home: PathBuf) -> Result<(), 
     let llm_providers: Vec<String> = cfg.llm.providers.iter().map(|p| p.name.clone()).collect();
     let running = RunningAgent {
         inbound_tx,
+        slash: slash_for_state,
         cron: core.cron,
         session: session_for_state,
         session_lifecycle,
@@ -823,6 +826,7 @@ async fn start_agent_inner(app: &tauri::AppHandle, _home: PathBuf) -> Result<(),
 fn clone_running_agent(running: &RunningAgent) -> RunningAgent {
     RunningAgent {
         inbound_tx: running.inbound_tx.clone(),
+        slash: running.slash.clone(),
         cron: running.cron.clone(),
         session: running.session.clone(),
         session_lifecycle: running.session_lifecycle.clone(),
@@ -1029,6 +1033,8 @@ pub(crate) async fn assemble_apk_agent(
     let opts_for_state = core.opts.clone();
     let channels_for_state = channel_info.clone();
     let web_search_for_state = core.web_search_control.clone();
+    // 斜杠命令注册表克隆给状态层（思考强度选择器与 /llmodel 共用同一把锁）。
+    let slash_for_state = core.slash.clone();
     let agent = AgentLoop::new(
         core.provider.clone(),
         core.review_provider.clone(),
@@ -1124,6 +1130,7 @@ pub(crate) async fn assemble_apk_agent(
     Ok((
         RunningAgent {
             inbound_tx,
+            slash: slash_for_state,
             cron: core.cron,
             session: session_for_state,
             session_lifecycle,

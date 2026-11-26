@@ -319,6 +319,7 @@ fn append_shared_body(
         let backends = [
             (BackendId::Zhipu, "智谱", "zhipu_search"),
             (BackendId::Tavily, "Tavily 多 Key", "tavily_search"),
+            (BackendId::DeepSeek, "DeepSeek", "deepseek_search"),
             (
                 BackendId::DoubaoCustom,
                 "豆包 Custom",
@@ -588,6 +589,7 @@ pub(crate) fn search_tool_backend(tool: &str) -> Option<BackendId> {
     match tool {
         "tavily_search" | "tavily_extract" => Some(BackendId::Tavily),
         "zhipu_search" => Some(BackendId::Zhipu),
+        "deepseek_search" => Some(BackendId::DeepSeek),
         "doubao_custom_search" => Some(BackendId::DoubaoCustom),
         "doubao_global_search" => Some(BackendId::DoubaoGlobal),
         _ => None,

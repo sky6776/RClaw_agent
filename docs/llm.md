@@ -2,7 +2,7 @@
 
 [← 返回 README](../README.md)
 
-RClaw 通过 OpenAI 兼容协议接入 LLM。本文说明 Provider 抽象、`[llm]` 配置字段、流式与工具调用的解析规则、重试策略、`/llmodel` 热切换，以及 bot / 子代理 / 后台评审各自使用不同 provider 的方式。实现位于 `crates/rclaw-llm`，配置解析位于 `crates/rclaw-cli/src/config.rs`。
+RClaw 通过 OpenAI 兼容协议接入 LLM。本文说明 Provider 抽象、`[llm]` 配置字段、流式与工具调用的解析规则、重试策略、会话页的模型 / 思考强度选择器，以及 bot / 子代理 / 后台评审各自使用不同 provider 的方式。实现位于 `crates/rclaw-llm`，配置解析位于 `crates/rclaw-cli/src/config.rs`。
 
 ## Provider 两层抽象
 
@@ -36,12 +36,17 @@ Provider 名不设白名单：任何 OpenAI 兼容端点（DeepSeek、Kimi、Ope
 | `max_tokens_key` | `max_tokens` | 或 `max_completion_tokens` |
 | `supports_tool_choice` | `true` | 是否发送 `tool_choice` |
 | `context_length` | `0` | 上下文窗口；`0` 按 128000 推导压缩预算（见 [长程会话](context-management.md)） |
+| `max_tokens` | 无 | per-provider 输出上限；缺省沿用 `[llm] max_tokens` |
+| `thinking` | 无 | `enabled` / `disabled` / `auto`；缺省=服务端默认。glm-5.3-flash 禁止 `disabled` |
+| `reasoning_effort` | 无 | DeepSeek：`none/low/high/max`；glm-5.3-flash / glm-5.4：`low/high/max` |
+| `media_wire` | 自动 | 媒体 part 方言：`openai`（image/video/file URL）或 `deepseek`（image + file_data）；缺省按 base_url host 判定 |
+| `flavor` | 自动 | 能力族：`zhipu` / `deepseek` / `generic`；缺省只按官方域名判定，代理端点必须显式写 |
 
-未被主 provider、`review_provider`、bot 或子代理引用的条目不会在启动期全部预检。`[llm]` 与 `[[llm.providers]]` 都拒绝未知字段，键名拼错直接启动失败；`base_url` 必须是绝对 http(s) URL。
+未被主 provider、`review_provider`、bot 或子代理引用的条目不会在启动期全部预检。`[llm]` 与 `[[llm.providers]]` 都拒绝未知字段，键名拼错直接启动失败；`base_url` 必须是绝对 http(s) URL，且不允许携带用户名/密码/query/fragment。
 
-主配置没有通用的 `temperature` / `top_p` / thinking 开关；仅对智谱 `glm-5.3-flash` 硬编码注入 `temperature=1`、`top_p=0.95`、`reasoning_effort=max`、`thinking={enabled, clear_thinking=false}`。
+显式 `thinking` / `reasoning_effort` 优先；未显式配置时，只有智谱 `glm-5.3-flash` 仍按官方推荐注入 `temperature=1`、`top_p=0.95`、`reasoning_effort=max`、`thinking={enabled, clear_thinking=false}`。`clear_thinking` 与 `tool_stream` 只发给智谱端点。
 
-**多模态白名单**：图片等媒体块只在模型为 `glm-5.3-flash` 或 `glm-5v-turbo` 时随请求发送，其他模型会静默剥离媒体 URL（只剩文字描述）。流式请求固定带 `stream_options.include_usage`，智谱 + 工具调用时附 `tool_stream=true`；返回的真实 usage 写入 `usage_anchor` 表，用于校准上下文压缩的估算。
+**多模态白名单**：图片等媒体块只在模型为 `glm-5.3-flash`、`glm-5.4`、`glm-5v-turbo`、`deepseek-flash`（含旧别名 `deepseek-v4-flash*`）时随请求发送；`deepseek-v4-pro` 是纯文本模型。DeepSeek 的 File 只支持 `file_data`（本地 data URI，≤20 MiB），远程文件 URL 与视频会降级成文本提示。流式请求固定带 `stream_options.include_usage`；返回的真实 usage 写入 `usage_anchor` 表，用于校准上下文压缩的估算。
 
 ## 流式解析与工具调用校验
 
@@ -56,11 +61,19 @@ Provider 名不设白名单：任何 OpenAI 兼容端点（DeepSeek、Kimi、Ope
 - 运行时默认最多重试 10 次（共 11 次），退避 1、2、4、8、16、30… 秒，单次封顶 30 秒；每次迭代的重试总预算为 `max(600 秒, 2 × request_timeout)`。取消可中断请求与退避。
 - 上下文超限（非可重试错误）另有一次 reactive 压缩后原地重试，不消耗普通重试次数，见 [长程会话](context-management.md)。
 
-## `/llmodel` 热切换
+## 模型与思考强度（会话页选择器）
 
-- `/llmodel` 不带参数显示当前模型；`/llmodel <模型名>` 切换。**只接受内置清单**中的名字：`glm-5.3`、`glm-5.3-flash`（旧名 `glm-5.2`、`glm-5v-turbo` 分别映射到二者），其他模型名一律回「未知模型」拒绝；切换后 `context_length` 写为 1,000,000，`base_url` 固定改为智谱 coding 端点。非智谱模型请直接改 `rclaw.toml` 重启。
-- 只切换当前选中 provider 的 `model` / `base_url`，保留 Key、鉴权与方言；构建成功后原子替换，进行中的调用继续用旧 Provider，下一次调用生效。
-- 同步把 `model` / `base_url` / `context_length` 写回 `rclaw.toml` 对应条目；写盘失败时运行时已切换、重启会回退。压缩预算不会热重算，需重启；若 `[llm].model` 存在，重启后仍以它为准。
+模型切换与思考强度都收在会话输入框底部、发送按钮左侧的「🧠 模型」控件里（它左边是环形上下文使用率按钮）。旧 `/llmodel` 命令已移除，只保留一条引导文案。
+
+- **可选模型**（固定三项）：
+  - `glm-5.3-flash`：智谱，1M 上下文 / 128K 输出，原生多模态，强制思考（低/高/最高）；
+  - `glm-5.4`：智谱旗舰，1M / 128K，多模态，思考低/高/最高（仅 Coding Plan 端点）；
+  - `deepseek-flash`：DeepSeek-V4.1-Flash-1017，1M / 384K，支持图像，思考可「关闭」或低/高/最高。
+- **整组切换**：选模型不是只改 `model`，还会同步 provider / `base_url` / `context_length` / `max_tokens` / `thinking` / `reasoning_effort` / `media_wire` / `reasoning_field` / `max_tokens_key`，并一次写回 `rclaw.toml`。这次覆盖以 profile 为准（包括条目里显式写的 `media_wire`），但 `flavor` 保持条目自身的显式值/域名判定：热切换与重启后行为一致。
+- **安全边界**：跨 provider 切换只在目标条目端点与官方端点同源时复用该条目的 key；代理端点不会被强行改写到官方端点（会明确报错）。`[llm].model` 全局覆盖存在时拒绝切换（该键会盖掉条目 model）。
+- **生效时机**：先写盘、后发布 live；主链在每个用户 turn 开始时冻结 provider 快照，进行中的 turn（含工具续轮与重试）继续用旧配置，**下一个用户轮**才用新模型。`context_length` 派生的压缩预算下次启动才重算。
+- **思考强度**：同一控件里按当前模型给出档位；DeepSeek 才有「关闭」。切换只改当前 provider 条目的 `thinking` / `reasoning_effort`，不碰其它参数。
+- **作用域**：设置作用于当前主 provider，同一模型的所有会话共享；显式绑定 provider 的 bot / 子代理 / 评审各用自己的实例，未显式绑定的 bot 继承主 provider 并跟随变化。bot/群编排会话不显示该控件。
 
 ## 多 provider 场景
 

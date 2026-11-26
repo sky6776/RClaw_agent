@@ -239,6 +239,40 @@ pub(super) async fn dispatch(manager: &Arc<TurnManager>, msg: &BusMessage) -> Di
     let Some(registry) = &manager.slash else {
         return DispatchOutcome::NotHandled;
     };
+    // `/search`、`/searchfallback` 会改全局搜索配置并写 rclaw.toml（模型切换走 UI 选择器）。
+    // 无参查询（以及 `/search status`）保持开放；有副作用的形式只认本机/授权会话，
+    // 否则一个普通远程消息就能换掉整机主模型或计费搜索源。
+    let trimmed = msg.content.trim();
+    // 只有真正的斜杠命令才走配置权限判定；普通聊天（哪怕以 "search" 开头）
+    // 不能被误判成写命令。
+    if !trimmed.starts_with('/') {
+        return DispatchOutcome::NotHandled;
+    }
+    let mut parts = trimmed.trim_start_matches('/').split_whitespace();
+    let command_name = parts.next().unwrap_or("").to_ascii_lowercase();
+    let first_arg = parts.next().unwrap_or("").to_ascii_lowercase();
+    let requires_privilege = match command_name.as_str() {
+        "searchfallback" => !first_arg.is_empty(),
+        "search" => !first_arg.is_empty() && first_arg != "status",
+        _ => false,
+    };
+    if requires_privilege && !is_privileged(msg) {
+        tracing::warn!(
+            "拒绝非特权会话 {}:{} 的配置命令 {}",
+            msg.channel,
+            msg.chat_id,
+            trimmed
+        );
+        manager
+            .send_command_reply(
+                &msg.channel,
+                &msg.chat_id,
+                "权限不足：该命令会修改全局模型或搜索配置，只能在本机（cli / desktop）或已授权的管理员会话中执行。"
+                    .to_string(),
+            )
+            .await;
+        return DispatchOutcome::Handled;
+    }
     let CommandOutcome::Handled(response) = registry.try_handle(&msg.content) else {
         return DispatchOutcome::NotHandled;
     };

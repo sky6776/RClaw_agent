@@ -138,6 +138,7 @@ impl WebSearch {
         let request = SearchRequest {
             query: query.to_string(),
             max_results,
+            need_content: read_top > 0,
         };
         let desired_hits = read_top.max(1).min(max_results);
         let mut hits = Vec::new();
@@ -284,6 +285,15 @@ impl WebSearch {
             }
         }
 
+        // need_content=true 的提供方会在搜索响应里直接带回正文；只让 read_top 条正文
+        // 进入渲染，避免 read_top=0 时仍输出正文、挤占输出预算（用户显式要求的
+        // 阅读范围必须被尊重）。
+        for (index, hit) in hits.iter_mut().enumerate() {
+            if index >= read_top {
+                hit.content = None;
+            }
+        }
+
         tracing::info!(
             result_count = hits.len(),
             summary_count = summaries.len(),
@@ -419,7 +429,7 @@ impl Tool for WebSearch {
     }
 
     fn description(&self) -> &str {
-        "Search and read the public web through an ordered, health-aware provider pool. Supports Zhipu, Tavily multi-key, Doubao Custom, and Doubao Global with automatic fallback."
+        "Search and read the public web through an ordered, health-aware provider pool. Supports DeepSeek Search, Zhipu, Tavily multi-key, Doubao Custom, and Doubao Global with automatic fallback."
     }
 
     fn input_schema(&self) -> Value {
@@ -728,6 +738,36 @@ mod tests {
             "关闭 fallback 后不应绕过主源调用次级 reader"
         );
         assert!(result.content.contains("没有已启用且健康的网页读取方式"));
+    }
+
+    /// DeepSeek 远端 400/422 归 Permanent：只影响该来源，不能中止整条 fallback 链。
+    #[tokio::test]
+    async fn permanent_error_falls_back_to_next_provider() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let deepseek = Arc::new(FakeSearch {
+            id: BackendId::DeepSeek,
+            result: Mutex::new(Err(BackendError::permanent("remote 400"))),
+            calls: calls.clone(),
+        });
+        let tavily = Arc::new(FakeSearch {
+            id: BackendId::Tavily,
+            result: Mutex::new(Ok(success(BackendId::Tavily, "fallback ok"))),
+            calls: calls.clone(),
+        });
+        let tool = make_tool(
+            vec![BackendId::DeepSeek, BackendId::Tavily],
+            vec![(BackendId::DeepSeek, true), (BackendId::Tavily, true)],
+            vec![deepseek, tavily],
+            vec![],
+        );
+
+        let result = tool.execute(json!({"search_query": "rust"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("fallback ok"), "{}", result.content);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![BackendId::DeepSeek, BackendId::Tavily]
+        );
     }
 
     #[tokio::test]

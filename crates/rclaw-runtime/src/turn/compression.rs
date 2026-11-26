@@ -339,6 +339,7 @@ pub(super) fn summary_llm_failure_is_fatal(err: &LlmError) -> bool {
         LlmError::BadStatus { status, .. } => *status == 401 || *status == 403,
         LlmError::MissingApiKey => true,
         LlmError::Http(e) => e.is_connect(),
+        LlmError::Transport { kind, .. } => *kind == "connect",
         _ => false,
     }
 }
@@ -348,7 +349,8 @@ pub(super) fn summary_llm_failure_is_fatal(err: &LlmError) -> bool {
 /// 某些兼容服务用 400/其他状态码（而非 401/403）回鉴权文本；仅按状态码会漏判，导致一次
 /// 坏 key 仍走 fallback 改写 session。这里补充文本兜底，匹配常见鉴权错误子串。
 pub(super) fn body_indicates_auth_failure(body: &str) -> bool {
-    let b = body.to_ascii_lowercase();
+    // 结构化错误码可能写成 invalid_api_key：归一成空格后再做文本匹配。
+    let b = body.to_ascii_lowercase().replace('_', " ");
     b.contains("invalid api key")
         || b.contains("invalid x-api-key")
         || b.contains("unauthorized")
@@ -575,7 +577,11 @@ pub(super) fn summarize_tool_result(
                 format!("[web_search] query='{q}' ({content_chars} chars result)")
             }
         }
-        "zhipu_search" | "tavily_search" | "doubao_custom_search" | "doubao_global_search" => {
+        "zhipu_search"
+        | "tavily_search"
+        | "deepseek_search"
+        | "doubao_custom_search"
+        | "doubao_global_search" => {
             let q = arg_str("query");
             format!("[{tool_name}] query='{q}' ({content_chars} chars result)")
         }

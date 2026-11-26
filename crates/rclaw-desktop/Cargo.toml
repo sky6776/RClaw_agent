@@ -98,6 +98,7 @@ zip = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # 预览缓存键（路径 + mtime + 大小）；版本对齐 rclaw-android 已有条目。
 sha2 = { workspace = true }
+# 旧目录迁移：完整写临时文件后无覆盖原子发布（不要求硬链接）。
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"

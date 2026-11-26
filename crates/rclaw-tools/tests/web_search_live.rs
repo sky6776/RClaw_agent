@@ -3,8 +3,9 @@
 //! 默认忽略，只有人工显式提供环境变量时才运行；密钥不会写入源码或测试输出。
 
 use rclaw_tools::{
-    DoubaoBackend, DoubaoSearchConfig, DoubaoVariant, SearchBackend, SearchRequest, TavilyClient,
-    TavilySearchConfig, ZhipuBackend, ZhipuSearchConfig,
+    DeepSeekBackend, DeepSeekSearchConfig, DoubaoBackend, DoubaoSearchConfig, DoubaoVariant,
+    ReaderBackend, SearchBackend, SearchRequest, TavilyClient, TavilySearchConfig, ZhipuBackend,
+    ZhipuSearchConfig,
 };
 
 fn required_env(name: &str) -> String {
@@ -15,6 +16,7 @@ fn request() -> SearchRequest {
     SearchRequest {
         query: "北京今日天气".into(),
         max_results: 3,
+        need_content: false,
     }
 }
 
@@ -89,4 +91,40 @@ async fn configured_search_providers_smoke() {
         }
         Err(error) => panic!("zhipu smoke failed unexpectedly: {:?}", error.kind),
     }
+}
+
+#[tokio::test]
+#[ignore = "需要真实 DeepSeek Key，会产生搜索/抓取用量计费"]
+async fn deepseek_search_and_fetch_smoke() {
+    let backend = DeepSeekBackend::new(DeepSeekSearchConfig {
+        api_key: required_env("RCLAW_TEST_DEEPSEEK_KEY"),
+        base_url: String::new(),
+        timeout_secs: 30,
+        max_results: 5,
+        // 一次搜索直接带正文，顺带验证 need_content 路径。
+        need_content: true,
+    })
+    .unwrap();
+    let request = SearchRequest {
+        query: "DeepSeek V4.1 Flash API".into(),
+        max_results: 3,
+        need_content: true,
+    };
+    let response = backend.search(&request).await.unwrap();
+    assert!(response.is_usable());
+    assert!(!response.hits.is_empty());
+    eprintln!("deepseek search: ok ({} hits)", response.hits.len());
+
+    // 取真实结果 URL 走 fetch；若命中内容已带正文，仍验证一次独立抓取。
+    let url = response
+        .hits
+        .iter()
+        .find_map(|hit| hit.url.clone())
+        .expect("search hits should carry a url");
+    let read = backend.read(&url).await.unwrap();
+    assert!(!read.content.trim().is_empty());
+    eprintln!(
+        "deepseek fetch: ok ({} bytes)",
+        read.content.chars().count()
+    );
 }

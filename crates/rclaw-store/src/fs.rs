@@ -246,6 +246,96 @@ pub fn atomic_write_private(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     atomic_write_mode(path.as_ref(), data, true)
 }
 
+/// 配置文件的跨进程写锁（与 `toml_file::CrossProcessLock` 使用同一个
+/// `<path>.lock`，因此向导/导入/模型切换共享同一临界区）。持锁期间不做
+/// 无覆盖改名也不做回滚删除，避免回滚误删另一写者刚发布的文件。
+pub struct ConfigFileLock {
+    file: std::fs::File,
+}
+
+impl ConfigFileLock {
+    pub fn acquire(path: &Path) -> Result<Self> {
+        let mut os = path.as_os_str().to_os_string();
+        os.push(".lock");
+        let lock_path = PathBuf::from(os);
+        ensure_parent_dir(&lock_path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        for _ in 0..250 {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { file }),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => return Err(crate::StoreError::Io(error)),
+            }
+        }
+        Err(crate::StoreError::Other(
+            "等待配置文件跨进程写锁超时".to_string(),
+        ))
+    }
+}
+
+impl Drop for ConfigFileLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+/// 原子「仅当目标不存在时创建」：先写同目录临时文件，再以平台的无覆盖原子改名发布。
+///
+/// `tempfile::NamedTempFile::persist_noclobber` 在 Linux/Android 用
+/// `renameat2(RENAME_NOREPLACE)`、Windows 用不带 `MOVEFILE_REPLACE_EXISTING` 的
+/// `MoveFileExW`。若它失败，先**单独重试硬链接**（tempfile 对部分 errno 不会
+/// 自动回退）；两者都不可用时返回原错误，绝不先公开正式路径再写数据。
+pub fn atomic_create_private(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
+    let path = path.as_ref();
+    ensure_parent_dir(path)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".rclaw-new-")
+        .tempfile_in(parent)?;
+    tmp.write_all(data)?;
+    tmp.as_file().sync_all()?;
+    let persist_error = match tmp.persist_noclobber(path) {
+        Ok(_file) => {
+            sync_parent_dir(path);
+            return Ok(());
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(crate::StoreError::Other(format!(
+                "目标文件已存在，拒绝覆盖: {}",
+                path.display()
+            )));
+        }
+        Err(error) => error,
+    };
+    // 无覆盖改名失败后独立验证硬链接能力：vfat 等卷上硬链接可能仍可用。
+    let temp_path = persist_error.file.path().to_path_buf();
+    match std::fs::hard_link(&temp_path, path) {
+        Ok(()) => {
+            drop(persist_error.file); // 删除临时目录项
+            sync_parent_dir(path);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
+            crate::StoreError::Other(format!("目标文件已存在，拒绝覆盖: {}", path.display())),
+        ),
+        Err(_) => {
+            // 改名与硬链接都无法完成原子发布：不再退化为先公开正式路径再写数据，
+            // 原样返回最初的发布错误（可能是权限、共享、属性或文件系统不支持）。
+            Err(crate::StoreError::Io(persist_error.error))
+        }
+    }
+}
+
 fn atomic_write_mode(path: &Path, data: &[u8], private: bool) -> Result<()> {
     ensure_parent_dir(path)?;
 
@@ -736,6 +826,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert_eq!(clear_dir_contents(&missing).unwrap(), 0);
+    }
+
+    #[test]
+    fn atomic_create_private_refuses_to_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rclaw.toml");
+        atomic_create_private(&path, b"first").unwrap();
+        let error = atomic_create_private(&path, b"second").unwrap_err();
+        assert!(error.to_string().contains("已存在"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
     }
 
     /// clear_dir_contents：根路径是普通文件（非目录）→ 拒绝，不报 IO 假成功。

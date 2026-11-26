@@ -15,14 +15,16 @@ pub enum BackendId {
     DoubaoCustom,
     Tavily,
     Zhipu,
+    DeepSeek,
     DoubaoGlobal,
 }
 
 impl BackendId {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::DoubaoCustom,
         Self::Tavily,
         Self::Zhipu,
+        Self::DeepSeek,
         Self::DoubaoGlobal,
     ];
 
@@ -31,6 +33,7 @@ impl BackendId {
             Self::DoubaoCustom => "doubao-custom",
             Self::Tavily => "tavily",
             Self::Zhipu => "zhipu",
+            Self::DeepSeek => "deepseek",
             Self::DoubaoGlobal => "doubao-global",
         }
     }
@@ -40,6 +43,7 @@ impl BackendId {
             Self::DoubaoCustom => "豆包 Custom",
             Self::Tavily => "Tavily",
             Self::Zhipu => "智谱",
+            Self::DeepSeek => "DeepSeek",
             Self::DoubaoGlobal => "豆包 Global",
         }
     }
@@ -49,6 +53,7 @@ impl BackendId {
             "doubao-custom" => Some(Self::DoubaoCustom),
             "tavily" => Some(Self::Tavily),
             "zhipu" => Some(Self::Zhipu),
+            "deepseek" => Some(Self::DeepSeek),
             "doubao-global" => Some(Self::DoubaoGlobal),
             _ => None,
         }
@@ -188,6 +193,9 @@ pub(super) async fn read_response_capped(
 pub struct SearchRequest {
     pub query: String,
     pub max_results: usize,
+    /// 调用方是否需要正文（聚合按 read_top>0；直连工具为 true）。
+    /// 后端可据此避免在 read_top=0 时仍向上游索取正文。
+    pub need_content: bool,
 }
 
 #[derive(Clone, Debug)]

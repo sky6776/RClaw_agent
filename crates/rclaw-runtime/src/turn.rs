@@ -2567,7 +2567,7 @@ impl TurnManager {
     /// 1. **「历史估算」不含系统提示 / 工具 schema**：它只用于判断旧会话本身体量。
     ///    自动压缩按「请求压力估算」触发，后者包含历史、system prompt 与工具 schema。
     /// 2. **窗口取启动时的 `context_length`**：与运行期压缩系统实际使用的窗口一致（二者都来自
-    ///    `AgentOptions::context_length`，启动期固定）。`/llmodel` 中途切模型的 `context_length`
+    ///    `AgentOptions::context_length`，启动期固定）。模型选择器中途切模型的 `context_length`
     ///    只持久化到 rclaw.toml、下次启动才重派生，故 /context 显示的窗口在当前会话内不会随
     ///    `/llmodel` 变动——这与压缩预算「启动期固定」的行为对齐，并不自相矛盾。
     fn handle_context(&self, channel: &str, chat_id: &str) -> String {
@@ -3445,10 +3445,15 @@ impl TurnManager {
             .as_ref()
             .map(|p| p.memory.clone())
             .unwrap_or_else(|| self.memory.clone());
-        let turn_provider = persona
+        let base_provider = persona
             .as_ref()
             .and_then(|p| p.provider.clone())
             .unwrap_or_else(|| self.provider.clone());
+        // 固定本次 turn 的 provider 快照：模型选择器在 turn 中途切换时，本 turn 的能力判断、
+        // 输出预算、工具链与重试继续用同一份配置；下一 turn 才用新模型。
+        let turn_provider = base_provider
+            .snapshot()
+            .unwrap_or_else(|| base_provider.clone());
 
         // 静态 schema 只读；共享循环状态（含动态 Manifest 工具集）由 TurnState 拥有。
         // 工具面口径见 `request_tool_schemas`（桌面版禁能开关从下一 turn 生效）。

@@ -4658,6 +4658,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "walkdir",
  "windows-sys 0.59.0",
 ]
@@ -4667,6 +4668,7 @@ name = "rclaw-store"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "fs2",
  "lunar-lite",
  "percent-encoding",
  "rand 0.8.6",

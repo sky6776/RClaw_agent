@@ -9,7 +9,10 @@ use secrecy::Secret;
 use serde::Deserialize;
 
 use rclaw_channels::{NapCatConfig, WeixinConfig, WxbotConfig};
-use rclaw_llm::{AuthScheme, Dialect, MaxTokensKey, ProtocolKind, ProviderConfig, ReasoningField};
+use rclaw_llm::{
+    AuthScheme, Dialect, MaxTokensKey, MediaWire, ProtocolKind, ProviderConfig, ProviderFlavor,
+    ReasoningConfig, ReasoningField,
+};
 pub use rclaw_runtime::options::WorkflowActivation;
 
 // ---------------------------------------------------------------------------
@@ -317,8 +320,10 @@ impl Default for LlmSection {
         }
     }
 }
+/// 未显式配置 `[llm].provider` 时的有效主 provider。
+pub const DEFAULT_PROVIDER_NAME: &str = "deepseek";
 fn default_provider() -> String {
-    "deepseek".into()
+    DEFAULT_PROVIDER_NAME.to_string()
 }
 fn default_true() -> bool {
     true
@@ -341,7 +346,7 @@ fn default_max_tool_calls() -> usize {
     256
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 // P3：拒绝未知字段——例如把 supports_tool_choice 误写成 supports_tool_choices 会被
 // 静默忽略并回退默认 true，导致「关闭 tool_choice」的配置失效（这正是上一轮修复的能力）。
 // 启用后拼错字段会在启动期直接报错。
@@ -375,7 +380,73 @@ pub struct ProviderEntry {
     /// `[[llm.providers]]` 里按模型实际窗口填写（如 DeepSeek 128K = 131072）可得最准确的预算。
     #[serde(default)]
     pub context_length: usize,
+    /// 该 provider 的单轮最大输出 token；缺省沿用 `[llm] max_tokens`。
+    ///
+    /// 不同模型输出上限不同（GLM-5.3-Flash 131072 / DeepSeek 393216），per-provider
+    /// 覆盖让模型选择器切换模型时能同步换掉输出预算，而不影响其它 provider。
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// 思考模式：`enabled` / `disabled`；缺省 = 服务端默认。
+    ///
+    /// 并非所有模型都允许关闭（glm-5.3-flash 官方强制开启），启动期按能力族校验。
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// 思考强度。各家值域不同：
+    /// - DeepSeek：none / low / high / max
+    /// - glm-5.3-flash：max / high / low
+    /// - glm-5.4：low / high / max
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// 媒体 content part 的 wire 方言：`openai` / `deepseek`；缺省按 base_url 自动判定。
+    ///
+    /// 代理域名（非 api.deepseek.com）时显式写 `deepseek`，避免媒体 part 用错方言。
+    #[serde(default)]
+    pub media_wire: Option<String>,
+    /// 能力族覆盖：`zhipu` / `deepseek` / `generic`。
+    ///
+    /// 缺省只按官方域名判定；自定义代理端点必须显式写这里，才能获得对应的
+    /// 媒体方言/工具链推理校验/结束原因分类。
+    #[serde(default)]
+    pub flavor: Option<String>,
 }
+
+/// 安全 Debug：API key 只显示是否设置，避免 `Config` 被日志/`{:?}` 打印时泄露明文。
+impl std::fmt::Debug for ProviderEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderEntry")
+            .field("name", &self.name)
+            .field("base_url", &safe_debug_url(&self.base_url))
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("auth", &self.auth)
+            .field("reasoning_field", &self.reasoning_field)
+            .field("max_tokens_key", &self.max_tokens_key)
+            .field("supports_tool_choice", &self.supports_tool_choice)
+            .field("context_length", &self.context_length)
+            .field("max_tokens", &self.max_tokens)
+            .field("thinking", &self.thinking)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("media_wire", &self.media_wire)
+            .field("flavor", &self.flavor)
+            .finish()
+    }
+}
+
+/// Debug 输出的端点标签：去掉凭据/query/fragment；非法 URL 只给占位。
+fn safe_debug_url(value: &str) -> String {
+    match url::Url::parse(value.trim()) {
+        Ok(mut parsed) if matches!(parsed.scheme(), "http" | "https") => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        _ => "<invalid-url>".to_string(),
+    }
+}
+
 fn default_auth() -> String {
     "bearer".into()
 }
@@ -393,7 +464,7 @@ fn default_max_tokens_key() -> String {
 pub struct WebSearchSection {
     #[serde(default = "default_false")]
     pub enabled: bool,
-    /// 有序搜索链。空数组时按 doubao-custom → tavily → zhipu → doubao-global
+    /// 有序搜索链。空数组时按 doubao-custom → tavily → deepseek → zhipu → doubao-global
     /// 过滤出已配置的 provider。
     #[serde(default)]
     pub order: Vec<String>,
@@ -414,6 +485,8 @@ pub struct WebSearchSection {
     #[serde(default)]
     pub tavily: Option<TavilySearchSection>,
     #[serde(default)]
+    pub deepseek: Option<DeepSeekSearchSection>,
+    #[serde(default)]
     pub doubao_custom: Option<DoubaoSearchSection>,
     #[serde(default)]
     pub doubao_global: Option<DoubaoSearchSection>,
@@ -433,6 +506,7 @@ impl std::fmt::Debug for WebSearchSection {
             .field("circuit_cooldown_secs", &self.circuit_cooldown_secs)
             .field("zhipu_configured", &self.zhipu.is_some())
             .field("tavily_configured", &self.tavily.is_some())
+            .field("deepseek_configured", &self.deepseek.is_some())
             .field("doubao_custom_configured", &self.doubao_custom.is_some())
             .field("doubao_global_configured", &self.doubao_global.is_some())
             .finish()
@@ -452,6 +526,7 @@ impl Default for WebSearchSection {
             circuit_cooldown_secs: default_web_search_circuit_cooldown(),
             zhipu: None,
             tavily: None,
+            deepseek: None,
             doubao_custom: None,
             doubao_global: None,
         }
@@ -500,6 +575,52 @@ fn default_zhipu_startup_timeout() -> u64 {
     10
 }
 fn default_zhipu_call_timeout() -> u64 {
+    10
+}
+
+/// DeepSeek 搜索（客户端直连 `/v1/tools/search` + `/v1/tools/fetch`）。
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepSeekSearchSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_deepseek_search_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_deepseek_search_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_deepseek_search_max_results")]
+    pub max_results: usize,
+    /// 搜索时是否直接返回正文。
+    ///
+    /// 默认 true：一次搜索就带回正文（省一次 fetch 请求）；聚合路径只把 `read_top`
+    /// 条正文送进渲染，`read_top=0` 时正文会被丢弃。置 false 则退回「搜索只拿摘要、
+    /// 需要时再 fetch」。
+    #[serde(default = "default_true")]
+    pub need_content: bool,
+}
+
+impl Default for DeepSeekSearchSection {
+    fn default() -> Self {
+        DeepSeekSearchSection {
+            enabled: true,
+            api_key: String::new(),
+            base_url: default_deepseek_search_base_url(),
+            timeout_secs: default_deepseek_search_timeout(),
+            max_results: default_deepseek_search_max_results(),
+            need_content: true,
+        }
+    }
+}
+
+fn default_deepseek_search_base_url() -> String {
+    "https://api.deepseek.com".into()
+}
+fn default_deepseek_search_timeout() -> u64 {
+    20
+}
+fn default_deepseek_search_max_results() -> usize {
     10
 }
 
@@ -581,6 +702,7 @@ pub struct WebSearchRuntimeConfig {
     pub circuit_cooldown_secs: u64,
     pub zhipu: Option<rclaw_tools::ZhipuSearchConfig>,
     pub tavily: Option<rclaw_tools::TavilySearchConfig>,
+    pub deepseek: Option<rclaw_tools::DeepSeekSearchConfig>,
     pub doubao_custom: Option<rclaw_tools::DoubaoSearchConfig>,
     pub doubao_global: Option<rclaw_tools::DoubaoSearchConfig>,
 }
@@ -1056,6 +1178,114 @@ fn parse_config_text(text: &str) -> std::result::Result<Config, toml::de::Error>
     toml::from_str(&stripped)
 }
 
+/// provider 名称（trim 后）必须唯一：模型切换读路径按 trim 名匹配，写路径也按
+/// trim 名定位；重名会让“校验 A、写回 B”发生。加载、面板保存、导入共用这一条。
+fn validate_provider_names_unique(cfg: &Config) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for provider in &cfg.llm.providers {
+        let name = provider.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("[[llm.providers]] 存在 name 为空的条目");
+        }
+        if !seen.insert(name.to_string()) {
+            anyhow::bail!("[[llm.providers]] provider 名称重复（trim 后）：{name}");
+        }
+    }
+    Ok(())
+}
+
+/// 把诊断文本里的双引号字面量整体替换为 `"…"`。
+///
+/// Serde 的「invalid type: string \"sk-...\", expected ...」会把字段原值带进错误；
+/// 字段名/枚举值是单引号或反引号，不受影响。TOML 源码片段另由调用方剔除。
+pub fn redact_toml_diagnostic(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '"' {
+            out.push(ch);
+            continue;
+        }
+        out.push('"');
+        out.push('…');
+        out.push('"');
+        let mut escaped = false;
+        for next in chars.by_ref() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match next {
+                '\\' => escaped = true,
+                '"' => break,
+                _ => {}
+            }
+        }
+    }
+    redact_backtick_numbers(&out)
+}
+
+/// 反引号里若是纯数字（无引号凭据漏写引号时 Serde 的原值形态），替换为 `…`；
+/// 字段名/类型名（`api_key` / `string`）保持可读。
+fn redact_backtick_numbers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '`' {
+            out.push(ch);
+            continue;
+        }
+        let mut inner = String::new();
+        let mut closed = false;
+        for next in chars.by_ref() {
+            if next == '`' {
+                closed = true;
+                break;
+            }
+            inner.push(next);
+        }
+        let numeric = !inner.is_empty()
+            && inner
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'));
+        if closed && numeric {
+            out.push_str("`…`");
+        } else {
+            out.push('`');
+            out.push_str(&inner);
+            if closed {
+                out.push('`');
+            }
+        }
+    }
+    out
+}
+
+/// TOML 解析错误的可展示摘要：保留位置与错误消息，去掉含源码行的片段（可能带 key）。
+fn toml_error_summary(error: &toml::de::Error) -> String {
+    let mut parts = Vec::new();
+    for line in error.to_string().lines() {
+        let trimmed = line.trim();
+        // 源码片段行形如 `  |` / `2 | key = "..."` / `  | ^^^`。
+        if trimmed.starts_with('|') {
+            continue;
+        }
+        if let Some((before, _)) = trimmed.split_once('|') {
+            if before.trim().parse::<usize>().is_ok() {
+                continue;
+            }
+        }
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    if parts.is_empty() {
+        "语法错误".to_string()
+    } else {
+        redact_toml_diagnostic(&parts.join("; "))
+    }
+}
+
 fn normalize_windows_path_basic_strings(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -1194,6 +1424,17 @@ fn is_value_terminator_after_quote(s: &str, quote_end: usize) -> bool {
         || rest.starts_with('}')
 }
 
+/// 模型选择器 profile 对 provider 条目的整组覆盖（值来自受控白名单常量）。
+pub struct ProviderProfileParams<'a> {
+    pub model: &'a str,
+    pub media_wire: &'a str,
+    pub thinking: &'a str,
+    pub reasoning_effort: &'a str,
+    pub reasoning_field: &'a str,
+    pub max_tokens_key: &'a str,
+    pub max_tokens: u32,
+}
+
 impl Config {
     fn validate_skill_curator(&self) -> Result<()> {
         if self.agent.skill_archive_after_days < self.agent.skill_stale_after_days {
@@ -1222,7 +1463,10 @@ impl Config {
     /// 解析一段 TOML 文本为配置（桌面配置面板保存前的校验用；不做缺省 provider
     /// 注入与文件 IO，只做与加载一致的语法/结构校验）。
     pub fn parse_str(text: &str) -> Result<Self> {
-        let cfg = parse_config_text(text).context("配置解析失败")?;
+        let cfg = parse_config_text(text)
+            .map_err(|error| anyhow::anyhow!("配置解析失败: {}", toml_error_summary(&error)))?;
+        validate_provider_names_unique(&cfg)?;
+        cfg.validate_effective_provider()?;
         cfg.validate_sync().context("配置解析失败")?;
         Ok(cfg)
     }
@@ -1234,34 +1478,74 @@ impl Config {
     /// [`Self::load`] 一致：返回编译期默认（含默认 DeepSeek provider 占位）。
     pub fn load_from_dir(dir: &std::path::Path) -> Result<Self> {
         let path = dir.join("rclaw.toml");
-        let cfg = if let Ok(text) = std::fs::read_to_string(&path) {
-            // 与 parse_config_text 同序：先归一化 Windows 路径字面量（`\U` 等
-            // 反斜杠序列会让 toml_edit 解析失败，导致遗留节剥不掉、带病解析），
-            // 再物理删除遗留节并写回原文件（toml_edit 保真，注释与格式不动）；
-            // 写回失败仅告警——本次仍按剥离结果加载，下次启动再试。
+        let mut text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::finish_load(Config::default());
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!("读取 {} 失败: {error}", path.display()));
+            }
+        };
+        // 遗留节清理是「读取 → 剥离 → CAS 写回」：CAS 冲突说明文件在读取后
+        // 被另一进程改过，必须重新读取再用最终快照构建运行态，不能拿旧配置启动。
+        for _ in 0..3 {
+            // 与 parse_config_text 同序：先归一化 Windows 路径字面量（反斜杠转义
+            // 会让 toml_edit 解析失败，导致遗留节剥不掉、带病解析），再物理删除
+            // 遗留节并写回原文件（toml_edit 保真，注释与格式不动）。
             let normalized = normalize_windows_path_basic_strings(&text);
             let (stripped, removed) = strip_removed_legacy_sections(&normalized);
             if !removed.is_empty() {
-                // 原子写：截断窗口内被杀会让整份 rclaw.toml（含 API key）归零，
-                // 下次启动按 Config::default() 加载。Android 路径（lib.rs）已同样处理。
-                match rclaw_store::atomic_write(&path, stripped.as_bytes()) {
+                // 原子写 + CAS：截断窗口内被杀会让整份 rclaw.toml（含 API key）归零。
+                match rclaw_store::RclawToml::new(&path)
+                    .write_text_expecting(&stripped, Some(&text))
+                {
                     Ok(()) => tracing::info!(
                         keys = %removed.join(", "),
                         path = %path.display(),
                         "已从 rclaw.toml 物理移除已退役配置节"
                     ),
-                    Err(error) => tracing::warn!(
-                        keys = %removed.join(", "),
-                        %error,
-                        "rclaw.toml 遗留节写回失败（本次按剥离结果加载）"
-                    ),
+                    Err(error) if rclaw_store::toml_file::is_cas_conflict(&error) => {
+                        tracing::warn!(
+                            keys = %removed.join(", "),
+                            %error,
+                            "rclaw.toml 在启动读取期间被修改，重新读取后重试"
+                        );
+                        text = std::fs::read_to_string(&path).map_err(|error| {
+                            anyhow::anyhow!("重新读取 {} 失败: {error}", path.display())
+                        })?;
+                        continue;
+                    }
+                    Err(error) => {
+                        // 写失败不等于快照仍有效：文件读不出或已被改写时中止，
+                        // 不能用旧文本完成启动。
+                        match std::fs::read_to_string(&path) {
+                            Ok(current) if current == text => tracing::warn!(
+                                keys = %removed.join(", "),
+                                %error,
+                                "rclaw.toml 遗留节写回失败（内容未变，按剥离结果加载）"
+                            ),
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "rclaw.toml 在启动读取期间变得不可读或已被修改，本次启动中止"
+                                ));
+                            }
+                        }
+                    }
                 }
             }
-            toml::from_str(&stripped).with_context(|| format!("解析 {} 失败", path.display()))?
-        } else {
-            Config::default()
-        };
-        Self::finish_load(cfg)
+            let cfg = toml::from_str(&stripped).map_err(|error| {
+                anyhow::anyhow!(
+                    "解析 {} 失败: {}",
+                    path.display(),
+                    toml_error_summary(&error)
+                )
+            })?;
+            return Self::finish_load(cfg);
+        }
+        Err(anyhow::anyhow!(
+            "rclaw.toml 在启动读取期间被反复修改，遗留节清理无法取得稳定快照，本次启动中止"
+        ))
     }
 
     /// 解析一段完整的 `rclaw.toml` 文本为配置，不触碰文件系统。
@@ -1270,7 +1554,9 @@ impl Config {
     /// 供 Android APK 等嵌入宿主使用：宿主自行决定配置文本从哪里来（app 私有
     /// 目录 / 向导写入），但接受的键与校验规则与 CLI / 桌面版完全一致。
     pub fn from_toml(text: &str) -> Result<Self> {
-        let cfg = parse_config_text(text).context("解析 rclaw.toml 失败")?;
+        let cfg = parse_config_text(text).map_err(|error| {
+            anyhow::anyhow!("解析 rclaw.toml 失败: {}", toml_error_summary(&error))
+        })?;
         Self::finish_load(cfg)
     }
 
@@ -1289,13 +1575,91 @@ impl Config {
                 max_tokens_key: "max_tokens".into(),
                 supports_tool_choice: true,
                 context_length: 0,
+                max_tokens: None,
+                thinking: None,
+                reasoning_effort: None,
+                media_wire: None,
+                flavor: None,
             });
         }
+
+        validate_provider_names_unique(&cfg)?;
+        let effective = cfg.effective_provider_name().trim().to_string();
+        cfg.llm.provider = effective;
+        cfg.llm.review_provider = cfg.effective_review_provider().map(str::to_string);
+        cfg.validate_effective_provider()?;
 
         cfg.validate_skill_curator()?;
         cfg.validate_sync()?;
 
         Ok(cfg)
+    }
+
+    /// 有效主 provider 名：显式值 trim 后非空则用之，否则回落到默认 DeepSeek。
+    ///
+    /// 启动反序列化对缺失键给默认值，但显式空白（`provider = ""`）不会走 serde
+    /// default；统一在这里归一，保证启动、导入校验与热切换判定的是同一件事。
+    pub fn effective_provider_name(&self) -> &str {
+        let trimmed = self.llm.provider.trim();
+        if trimmed.is_empty() {
+            DEFAULT_PROVIDER_NAME
+        } else {
+            trimmed
+        }
+    }
+
+    /// 有效评审 provider：空白/缺失视为未配置。
+    pub fn effective_review_provider(&self) -> Option<&str> {
+        self.llm
+            .review_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// 有效主 provider 必须存在（providers 为空时启动会注入默认 DeepSeek，放行）。
+    pub fn validate_effective_provider(&self) -> Result<()> {
+        let main = self.effective_provider_name();
+        let review = self.effective_review_provider();
+        if self.llm.providers.is_empty() {
+            // 空列表启动时只会注入默认 DeepSeek；引用别的名字必然启动失败。
+            if main != DEFAULT_PROVIDER_NAME {
+                anyhow::bail!(
+                    "[[llm.providers]] 为空时只能使用默认主 provider \"{DEFAULT_PROVIDER_NAME}\"（启动会注入），当前为 \"{main}\""
+                );
+            }
+            if let Some(review) = review {
+                if review != DEFAULT_PROVIDER_NAME {
+                    anyhow::bail!(
+                        "[[llm.providers]] 为空时 review_provider 只能是 \"{DEFAULT_PROVIDER_NAME}\" 或留空，当前为 \"{review}\""
+                    );
+                }
+            }
+            return Ok(());
+        }
+        if !self
+            .llm
+            .providers
+            .iter()
+            .any(|provider| provider.name.trim() == main)
+        {
+            anyhow::bail!(
+                "[llm].provider = \"{main}\"（含缺省值）不在 [[llm.providers]] 的 name 列表里，启动会失败"
+            );
+        }
+        if let Some(review) = review {
+            if !self
+                .llm
+                .providers
+                .iter()
+                .any(|provider| provider.name.trim() == review)
+            {
+                anyhow::bail!(
+                    "review_provider = \"{review}\"（trim 后）不在 [[llm.providers]] 的 name 列表里，启动会失败"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// 当前选中 provider 的上下文窗口大小（token）。0 = 该 provider 未声明 `context_length`。
@@ -1306,23 +1670,42 @@ impl Config {
         self.llm
             .providers
             .iter()
-            .find(|p| p.name == self.llm.provider)
+            .find(|p| p.name.trim() == self.effective_provider_name())
             .map(|p| p.context_length)
             .unwrap_or(0)
     }
 
     /// 由选中的 provider 条目 + env key 构造 `ProviderConfig`。
     pub fn build_provider_config(&self) -> Result<ProviderConfig> {
-        self.build_provider_config_for(&self.llm.provider)
+        self.build_provider_config_for(self.effective_provider_name())
     }
 
     /// 按名字构造 provider 配置（评审辅助 provider 复用同一校验路径）。
     pub fn build_provider_config_for(&self, provider_name: &str) -> Result<ProviderConfig> {
+        self.build_provider_config_inner(provider_name, None)
+    }
+
+    /// 带 profile 覆盖的构造：先把模型选择器要写的整组参数覆盖到条目上，再做
+    /// 校验/构造。保存前就能验证**最终**配置（旧条目的模型/档位检查不会阻断
+    /// 本会被整组替换的切换）。
+    pub fn build_provider_config_for_profile(
+        &self,
+        provider_name: &str,
+        params: &ProviderProfileParams<'_>,
+    ) -> Result<ProviderConfig> {
+        self.build_provider_config_inner(provider_name, Some(params))
+    }
+
+    fn build_provider_config_inner(
+        &self,
+        provider_name: &str,
+        over: Option<&ProviderProfileParams<'_>>,
+    ) -> Result<ProviderConfig> {
         let entry = self
             .llm
             .providers
             .iter()
-            .find(|p| p.name == provider_name)
+            .find(|p| p.name.trim() == provider_name.trim())
             .with_context(|| format!("未找到 provider '{provider_name}'"))?;
 
         // P2：统一用 trim 后的规范化字符串做【校验 / api_key / ProviderConfig】。
@@ -1333,15 +1716,27 @@ impl Config {
         // name 构造报错信息，并把 trim 后的值写进 ProviderConfig。
         let name = entry.name.trim().to_string();
         let base_url = entry.base_url.trim().to_string();
-        let default_model = self
+        // 空白全局 model 视同未设置（与持久层的 llm_global_model_override 口径一致）；
+        // 否则 CLI 会把 `model = "  "` 当成有效值并拒绝启动，而写回层却当作缺省。
+        let global_model = self
             .llm
             .model
             .as_deref()
-            // entry.model.as_deref() 是廉价的 &str 借用（无副作用），用 eager 的 .or 即可，
-            // 无需 .or_else 闭包（否则 clippy unnecessary_lazy_evaluations 告警）。
-            .or(entry.model.as_deref())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "deepseek-v4-pro".to_string());
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        let default_model = match over {
+            Some(params) => params.model.trim().to_string(),
+            None => global_model
+                .or_else(|| {
+                    entry
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|model| !model.is_empty())
+                })
+                .map(str::to_string)
+                .unwrap_or_else(|| "deepseek-v4-pro".to_string()),
+        };
 
         // name 非空校验必须在构造 api_key 报错之前：否则空 name 会误报「缺少 api_key」，
         // 掩盖真正的「name 配置为空」问题。
@@ -1376,37 +1771,47 @@ impl Config {
                     header: header.to_string(),
                 }
             }
-            other => {
+            _ => {
                 anyhow::bail!(
-                    "provider '{}' auth 值 '{}' 不识别（支持 bearer 或 apikey:<Header-Name>）",
+                    "provider '{}' auth 值不识别（支持 bearer 或 apikey:<Header-Name>）",
                     entry.name,
-                    other,
                 );
             }
         };
 
-        let reasoning_field = match entry.reasoning_field.as_str() {
-            "reasoning_content" | "" => ReasoningField::ReasoningContent,
-            "reasoning" => ReasoningField::Reasoning,
-            "none" => ReasoningField::None,
-            other => {
-                anyhow::bail!(
-                    "provider '{}' reasoning_field 值 '{}' 不识别（支持 reasoning_content / reasoning / none）",
-                    entry.name,
-                    other,
-                );
-            }
+        let reasoning_field = match over.map(|params| params.reasoning_field.trim()) {
+            Some("reasoning_content") => ReasoningField::ReasoningContent,
+            Some("reasoning") => ReasoningField::Reasoning,
+            Some("none") => ReasoningField::None,
+            Some(other) => anyhow::bail!("profile reasoning_field 值 '{}' 不识别", other),
+            None => match entry.reasoning_field.as_str() {
+                "reasoning_content" | "" => ReasoningField::ReasoningContent,
+                "reasoning" => ReasoningField::Reasoning,
+                "none" => ReasoningField::None,
+                other => {
+                    anyhow::bail!(
+                        "provider '{}' reasoning_field 值 '{}' 不识别（支持 reasoning_content / reasoning / none）",
+                        entry.name,
+                        other,
+                    );
+                }
+            },
         };
-        let max_tokens_key = match entry.max_tokens_key.as_str() {
-            "max_tokens" | "" => MaxTokensKey::MaxTokens,
-            "max_completion_tokens" => MaxTokensKey::MaxCompletionTokens,
-            other => {
-                anyhow::bail!(
-                    "provider '{}' max_tokens_key 值 '{}' 不识别（支持 max_tokens / max_completion_tokens）",
-                    entry.name,
-                    other,
-                );
-            }
+        let max_tokens_key = match over.map(|params| params.max_tokens_key.trim()) {
+            Some("max_tokens") => MaxTokensKey::MaxTokens,
+            Some("max_completion_tokens") => MaxTokensKey::MaxCompletionTokens,
+            Some(other) => anyhow::bail!("profile max_tokens_key 值 '{}' 不识别", other),
+            None => match entry.max_tokens_key.as_str() {
+                "max_tokens" | "" => MaxTokensKey::MaxTokens,
+                "max_completion_tokens" => MaxTokensKey::MaxCompletionTokens,
+                other => {
+                    anyhow::bail!(
+                        "provider '{}' max_tokens_key 值 '{}' 不识别（支持 max_tokens / max_completion_tokens）",
+                        entry.name,
+                        other,
+                    );
+                }
+            },
         };
 
         // P2：启动期标量校验（修复「Provider 标量配置缺少启动期校验」），全部使用上方 trim
@@ -1439,20 +1844,33 @@ impl Config {
         // 表现为难以排查的连接失败 / 404。用 url crate 做真实解析（而非仅前缀判断），
         // 可捕获诸如非法字符、缺 host 等问题。
         match url::Url::parse(&base_url) {
-            Ok(u) if matches!(u.scheme(), "http" | "https") => {}
+            Ok(u) if matches!(u.scheme(), "http" | "https") => {
+                // 凭据/query/fragment 一律拒绝：base_url 会进入日志与错误文案，
+                // 也可能让请求把凭据带到非预期来源。
+                if !u.username().is_empty() || u.password().is_some() {
+                    anyhow::bail!(
+                        "provider '{}' 配置非法：base_url 不允许包含用户名或密码",
+                        name
+                    );
+                }
+                if u.query().is_some() || u.fragment().is_some() {
+                    anyhow::bail!(
+                        "provider '{}' 配置非法：base_url 不允许包含 query 或 fragment",
+                        name
+                    );
+                }
+            }
             Ok(u) => {
                 anyhow::bail!(
-                    "provider '{}' 配置非法：base_url 协议必须为 http/https（实际为 '{}'): {}",
+                    "provider '{}' 配置非法：base_url 协议必须为 http/https（实际为 '{}'）",
                     name,
-                    u.scheme(),
-                    base_url
+                    u.scheme()
                 );
             }
             Err(e) => {
                 anyhow::bail!(
-                    "provider '{}' 配置非法：base_url 无法解析为 URL: {e}: {}",
-                    name,
-                    base_url
+                    "provider '{}' 配置非法：base_url 无法解析为 URL（{e}）",
+                    name
                 );
             }
         }
@@ -1461,6 +1879,139 @@ impl Config {
                 "provider '{}' 配置非法：model 为空（请在 [llm] model 或该 provider 的 model 设置有效模型名）",
                 name
             );
+        }
+
+        // 能力族与媒体方言：默认只按官方域名判定；代理端点可用 flavor/media_wire 显式覆盖。
+        let flavor = match entry.flavor.as_deref().map(str::trim) {
+            None | Some("") => ProviderFlavor::detect(&base_url),
+            Some(value) => ProviderFlavor::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider '{}' flavor 值 '{}' 不识别（支持 zhipu / deepseek / generic）",
+                    name,
+                    value
+                )
+            })?,
+        };
+        let media_wire = match over {
+            Some(params) => match params.media_wire.trim() {
+                "openai" => MediaWire::OpenAiCompat,
+                "deepseek" => MediaWire::DeepSeek,
+                other => {
+                    anyhow::bail!("profile media_wire 值 '{}' 不识别", other);
+                }
+            },
+            None => match entry.media_wire.as_deref().map(str::trim) {
+                None | Some("") => flavor.media_wire(),
+                Some("openai") => MediaWire::OpenAiCompat,
+                Some("deepseek") => MediaWire::DeepSeek,
+                Some(other) => {
+                    anyhow::bail!(
+                        "provider '{}' media_wire 值 '{}' 不识别（支持 openai / deepseek）",
+                        name,
+                        other
+                    );
+                }
+            },
+        };
+
+        // per-provider 输出上限：0 会让每轮输出立即可截断，必须在启动期拒绝。
+        let max_tokens = match over {
+            Some(params) => params.max_tokens,
+            None => match entry.max_tokens {
+                Some(0) => anyhow::bail!(
+                    "provider '{}' 配置非法：[[llm.providers]].max_tokens 必须大于 0",
+                    name
+                ),
+                Some(value) => value,
+                None => self.llm.max_tokens,
+            },
+        };
+        if max_tokens == 0 {
+            anyhow::bail!("provider '{}' 配置非法：max_tokens 必须大于 0", name);
+        }
+
+        // 思考模式/强度：缺省 = 服务端默认（保持既有行为）；显式值按能力族 + 模型校验。
+        let thinking = match over {
+            Some(params) => match params.thinking.trim() {
+                "enabled" => Some(true),
+                "disabled" => {
+                    if flavor == ProviderFlavor::Zhipu
+                        && default_model.eq_ignore_ascii_case("glm-5.3-flash")
+                    {
+                        anyhow::bail!(
+                            "provider '{}' 配置非法：glm-5.3-flash 官方强制开启思考，不能关闭",
+                            name
+                        );
+                    }
+                    Some(false)
+                }
+                other => {
+                    anyhow::bail!("profile thinking 值 '{}' 不识别", other);
+                }
+            },
+            None => match entry.thinking.as_deref().map(str::trim) {
+                None | Some("") | Some("auto") => None,
+                Some("enabled") => Some(true),
+                Some("disabled") => {
+                    if flavor == ProviderFlavor::Zhipu
+                        && default_model.eq_ignore_ascii_case("glm-5.3-flash")
+                    {
+                        anyhow::bail!(
+                            "provider '{}' 配置非法：glm-5.3-flash 官方强制开启思考，不能设置 thinking=\"disabled\"",
+                            name
+                        );
+                    }
+                    Some(false)
+                }
+                Some(other) => {
+                    anyhow::bail!(
+                        "provider '{}' thinking 值 '{}' 不识别（支持 auto / enabled / disabled）",
+                        name,
+                        other
+                    );
+                }
+            },
+        };
+        let reasoning_effort = match over {
+            Some(params) => Some(params.reasoning_effort.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty()),
+            None => entry
+                .reasoning_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_ascii_lowercase()),
+        };
+        // 关闭思考与档位互斥：`thinking` 会覆盖 `reasoning_effort`，两者同时配置时
+        // 语义含糊（用户以为关了、服务端仍按 effort 思考），启动期直接拒绝。
+        if thinking == Some(false) && reasoning_effort.is_some() {
+            anyhow::bail!(
+                "provider '{}' 配置非法：thinking=\"disabled\" 时不能同时设置 reasoning_effort",
+                name
+            );
+        }
+        if let Some(effort) = reasoning_effort.as_deref() {
+            let allowed = match flavor {
+                // DeepSeek 官方只确认 none/low/high/max 四项；minimal/medium/xhigh
+                // 会被映射或拒绝，不能作为配置值透传。
+                ProviderFlavor::DeepSeek => matches!(effort, "none" | "low" | "high" | "max"),
+                ProviderFlavor::Zhipu
+                    if default_model.eq_ignore_ascii_case("glm-5.3-flash")
+                        || default_model.eq_ignore_ascii_case("glm-5.4") =>
+                {
+                    matches!(effort, "low" | "high" | "max")
+                }
+                // 其它兼容端点：不代替远端做值域判断，透传。
+                _ => true,
+            };
+            if !allowed {
+                anyhow::bail!(
+                    "provider '{}' reasoning_effort 值 '{}' 超出模型 '{}' 的支持范围",
+                    name,
+                    effort,
+                    default_model
+                );
+            }
         }
 
         Ok(ProviderConfig {
@@ -1477,8 +2028,16 @@ impl Config {
                 // 让「不支持 tool_choice 的兼容服务」能在 rclaw.toml 里关掉（修复 P2）。
                 supports_tool_choice: entry.supports_tool_choice,
                 max_tokens_key,
+                // 仅 DeepSeek 方言把资源类结束原因归为可重试。
+                classify_upstream_busy: flavor == ProviderFlavor::DeepSeek,
             },
-            max_tokens: self.llm.max_tokens,
+            flavor,
+            media_wire,
+            reasoning: ReasoningConfig {
+                thinking,
+                effort: reasoning_effort,
+            },
+            max_tokens,
             request_timeout_secs: self.llm.request_timeout_secs,
             max_tool_calls: self.llm.max_tool_calls,
         })
@@ -1635,6 +2194,22 @@ impl Config {
                 .map_err(anyhow::Error::msg)
             })
             .transpose()?;
+        let deepseek = self
+            .web_search
+            .deepseek
+            .as_ref()
+            .map(|section| {
+                rclaw_tools::DeepSeekSearchConfig {
+                    api_key: section.api_key.clone(),
+                    base_url: section.base_url.clone(),
+                    timeout_secs: section.timeout_secs,
+                    max_results: section.max_results,
+                    need_content: section.need_content,
+                }
+                .normalized()
+                .map_err(anyhow::Error::msg)
+            })
+            .transpose()?;
         let doubao_custom = self
             .web_search
             .doubao_custom
@@ -1682,6 +2257,7 @@ impl Config {
                 doubao_custom.is_some(),
             ),
             (rclaw_tools::BackendId::Tavily, tavily.is_some()),
+            (rclaw_tools::BackendId::DeepSeek, deepseek.is_some()),
             (rclaw_tools::BackendId::Zhipu, zhipu.is_some()),
             (
                 rclaw_tools::BackendId::DoubaoGlobal,
@@ -1716,6 +2292,10 @@ impl Config {
                 .as_ref()
                 .map(|section| (rclaw_tools::BackendId::Tavily, section.enabled)),
             self.web_search
+                .deepseek
+                .as_ref()
+                .map(|section| (rclaw_tools::BackendId::DeepSeek, section.enabled)),
+            self.web_search
                 .zhipu
                 .as_ref()
                 .map(|section| (rclaw_tools::BackendId::Zhipu, section.enabled)),
@@ -1747,6 +2327,7 @@ impl Config {
             circuit_cooldown_secs: self.web_search.circuit_cooldown_secs,
             zhipu,
             tavily,
+            deepseek,
             doubao_custom,
             doubao_global,
         }))

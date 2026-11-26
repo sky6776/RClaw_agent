@@ -544,8 +544,14 @@ impl AgentToolRuntime {
     }
 
     /// 主 provider 名（execution_config.allowed_models 的默认项）。
+    ///
+    /// 优先取 live 身份：模型选择器跨 provider 切换后，工作流的允许清单要立即跟着变，
+    /// 不能停在启动时的 `Provider::name()`。
     pub(crate) fn provider_name(&self) -> String {
-        self.provider.name().to_string()
+        self.provider
+            .current_identity()
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| self.provider.name().to_string())
     }
 
     /// 后台 driver 的发起方上下文：权限 + 会话键（来自 execution_config 的持久化快照）。

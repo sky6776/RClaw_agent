@@ -1,7 +1,7 @@
 //! Tauri command 层：前端与核心之间的唯一通道。
 //!
 //! 命令面刻意保持最小——对话消息（含斜杠命令）统一走 inbound 总线，
-//! 配置类操作（/llmodel 等）复用既有 slash 管道，不另开配置命令。
+//! 配置类操作（/search 等）复用既有 slash 管道；模型/思考强度走独立的 chat_* 命令。
 //! 多会话以 chat_id 区分（同一 desktop 通道，TurnManager 按 (channel, chat_id)
 //! 各自维护活动 turn）；归档 = `state.sqlite` 里的 `archived_at` 标记（消息不动）。
 
@@ -437,6 +437,96 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<StatusDto, String>
             .expect("AppState.start_error 锁未被毒化")
             .clone(),
     })
+}
+
+/// 会话页「模型 + 思考强度」当前状态。agent 未启动时返回 unsupported（前端隐藏控件）。
+#[tauri::command]
+pub async fn chat_llm_state(state: State<'_, AppState>) -> Result<rclaw_runtime::LlmState, String> {
+    match state.slash() {
+        Some(slash) => Ok(slash.llm_state()),
+        None => Ok(rclaw_runtime::LlmState {
+            revision: 0,
+            model: rclaw_runtime::ModelState {
+                supported: false,
+                provider: String::new(),
+                model: String::new(),
+                models: Vec::new(),
+            },
+            thinking: rclaw_runtime::ThinkingState::unsupported(String::new(), String::new()),
+        }),
+    }
+}
+
+/// 切换当前模型（输入框底部模型选择器）。
+///
+/// `expected_provider` / `expected_model` 由前端在打开菜单时带回：若期间模型已被
+/// 另一窗口/会话切走，本次请求直接拒绝，避免把旧模型的档位写进新模型。
+#[tauri::command]
+pub async fn chat_set_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model: String,
+    expected_provider: Option<String>,
+    expected_model: Option<String>,
+    expected_revision: Option<u64>,
+) -> Result<rclaw_runtime::LlmState, String> {
+    let slash = state
+        .slash()
+        .ok_or_else(|| "agent 尚未启动，无法切换模型".to_string())?;
+    if expected_provider.as_deref().unwrap_or("").trim().is_empty()
+        || expected_model.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return Err("缺少预期模型身份（expected provider/model），请刷新后重试".into());
+    }
+    let Some(expected_revision) = expected_revision else {
+        return Err("缺少预期状态版本（expected revision），请刷新后重试".into());
+    };
+    let next = run_blocking("切换模型", move || {
+        slash.set_model_at(
+            &model,
+            expected_provider.as_deref(),
+            expected_model.as_deref(),
+            Some(expected_revision),
+        )
+    })
+    .await?;
+    // 广播给所有窗口：其它窗口的底部选择器立即跟随，不靠 5s 轮询。
+    let _ = app.emit("llm_state_changed", &next);
+    Ok(next)
+}
+
+/// 切换当前模型的思考强度。
+#[tauri::command]
+pub async fn chat_set_thinking(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    value: String,
+    expected_provider: Option<String>,
+    expected_model: Option<String>,
+    expected_revision: Option<u64>,
+) -> Result<rclaw_runtime::LlmState, String> {
+    let slash = state
+        .slash()
+        .ok_or_else(|| "agent 尚未启动，无法修改思考强度".to_string())?;
+    if expected_provider.as_deref().unwrap_or("").trim().is_empty()
+        || expected_model.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return Err("缺少预期模型身份（expected provider/model），请刷新后重试".into());
+    }
+    let Some(expected_revision) = expected_revision else {
+        return Err("缺少预期状态版本（expected revision），请刷新后重试".into());
+    };
+    let next = run_blocking("切换思考强度", move || {
+        slash.set_thinking_at(
+            &value,
+            expected_provider.as_deref(),
+            expected_model.as_deref(),
+            Some(expected_revision),
+        )
+    })
+    .await?;
+    let _ = app.emit("llm_state_changed", &next);
+    Ok(next)
 }
 
 /// 复制用户数据目录路径到系统剪贴板（状态条单击；复制原始反斜杠路径）。
@@ -2508,6 +2598,75 @@ pub struct UsageDto {
     pub rss_bytes: u64,
 }
 
+/// 上下文估算槽位：用一把 Mutex 同时保护忙状态、开始时间、代次与真实在途任务数，
+/// 检查/接管/释放在同一临界区完成，避免多个原子量分开更新产生的交错。
+struct UsageEstimateSlot {
+    busy: bool,
+    /// 单调时钟起点：墙钟回拨不会推迟接管。
+    started: Option<std::time::Instant>,
+    generation: u64,
+    /// 真实阻塞任务数（含被接管但尚未结束的旧任务），硬上限 2。
+    active_tasks: u32,
+}
+
+static USAGE_ESTIMATE_SLOT: std::sync::Mutex<UsageEstimateSlot> =
+    std::sync::Mutex::new(UsageEstimateSlot {
+        busy: false,
+        started: None,
+        generation: 0,
+        active_tasks: 0,
+    });
+
+struct UsageEstimateGuard {
+    generation: u64,
+}
+
+impl UsageEstimateGuard {
+    fn acquire() -> Result<Self, String> {
+        let mut slot = match USAGE_ESTIMATE_SLOT.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !slot.busy {
+            slot.busy = true;
+            slot.started = Some(std::time::Instant::now());
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.active_tasks = slot.active_tasks.saturating_add(1);
+            return Ok(Self {
+                generation: slot.generation,
+            });
+        }
+        // 旧任务永久挂起（>30s）时允许接管一次；但真实任务硬上限 2，避免每轮
+        // 接管都堆积一个阻塞任务。旧任务结束时按代次判断，不会清掉新槽。
+        let hung_too_long = slot
+            .started
+            .map(|started| started.elapsed() > std::time::Duration::from_secs(30))
+            .unwrap_or(false);
+        if hung_too_long && slot.active_tasks < 2 {
+            slot.started = Some(std::time::Instant::now());
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.active_tasks = slot.active_tasks.saturating_add(1);
+            return Ok(Self {
+                generation: slot.generation,
+            });
+        }
+        Err("上下文估算仍在进行，请稍后重试".to_string())
+    }
+}
+
+impl Drop for UsageEstimateGuard {
+    fn drop(&mut self) {
+        let mut slot = match USAGE_ESTIMATE_SLOT.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if slot.generation == self.generation {
+            slot.busy = false;
+        }
+        slot.active_tasks = slot.active_tasks.saturating_sub(1);
+    }
+}
+
 #[tauri::command]
 pub async fn usage_snapshot(
     state: State<'_, AppState>,
@@ -2521,7 +2680,11 @@ pub async fn usage_snapshot(
     let tools = state.tools().ok_or("agent 尚未启动")?;
     let (memory, opts, channels, web_search) = state.usage_inputs().ok_or("agent 尚未启动")?;
     // 估算会扫技能目录 / 读记忆文件（与 insights 同策略放阻塞线程，不卡 UI 桥）。
-    let usage = tauri::async_runtime::spawn_blocking(move || {
+    // 有界等待：超时先返回可识别错误，前端保留旧快照并稍后重试；守卫随真实任务
+    // 结束才释放，保证同时最多一个在途估算。
+    let guard = UsageEstimateGuard::acquire()?;
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
         rclaw_runtime::estimate_context_usage(
             &session,
             &memory,
@@ -2533,9 +2696,11 @@ pub async fn usage_snapshot(
             CHANNEL_DESKTOP,
             &chat_id,
         )
-    })
-    .await
-    .map_err(|e| format!("上下文估算任务失败: {e}"))??;
+    });
+    let usage = tokio::time::timeout(std::time::Duration::from_secs(20), task)
+        .await
+        .map_err(|_| "上下文估算超时，稍后重试".to_string())?
+        .map_err(|e| format!("上下文估算任务失败: {e}"))??;
     Ok(UsageDto {
         history_used: usage.history_used,
         request_used: usage.request_used,
@@ -2838,7 +3003,7 @@ pub fn config_state_for(home: &std::path::Path) -> Result<ConfigStateDto, String
     let mut doc = rclaw_store::config_doc::parse_example(rclaw_store::config_doc::EXAMPLE);
     let user: toml_edit::DocumentMut = raw
         .parse()
-        .map_err(|e| format!("rclaw.toml 解析失败: {e}"))?;
+        .map_err(|e| format!("rclaw.toml 解析失败: {}", toml_error_summary(&e)))?;
     for section in &mut doc.sections {
         for item in &mut section.items {
             item.current = rclaw_store::config_doc::resolve_current_display(&user, &item.path);
@@ -2890,13 +3055,45 @@ pub fn config_save_edits(home: &std::path::Path, edits: &[ConfigEdit]) -> Result
     for e in edits {
         parsed.push((e.path.clone(), parse_edit_value(&e.kind, &e.value)?));
     }
-    let preview = toml_file.apply_edits_preview(&parsed)?;
+    let (baseline, preview) = toml_file.apply_edits_preview_with_baseline(&parsed)?;
     // `{e:#}`：anyhow 链式展示——`parse_str` 外层只有「配置解析失败」，真正说明问题的
     // 是里层 toml 错误（如枚举键 `unknown variant …, expected …`），面板要能把它显示出来。
-    rclaw_cli::config::Config::parse_str(&preview)
+    let cfg = rclaw_cli::config::Config::parse_str(&preview)
         .map_err(|e| format!("保存被校验拒绝（未写入文件）: {e:#}"))?;
     validate_provider_names(&preview, parsed.iter().map(|(p, _)| p.as_str()))?;
-    toml_file.write_text(&preview)
+    // 与 provider 相关的面板改动也必须能真正启动（非法自定义鉴权头等），
+    // 否则会保存成功、重启才失败。
+    if parsed
+        .iter()
+        .any(|(path, _)| path == "llm" || path.starts_with("llm."))
+    {
+        validate_providers_startable(&cfg, "保存被校验拒绝（未写入文件）")?;
+    }
+    toml_file.write_text_expecting(&preview, Some(&baseline))
+}
+
+/// TOML 解析错误摘要：保留位置与消息，去掉含源码行的片段（可能带 key）。
+fn toml_error_summary(error: &toml_edit::TomlError) -> String {
+    let mut parts = Vec::new();
+    for line in error.to_string().lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('|') {
+            continue;
+        }
+        if let Some((before, _)) = trimmed.split_once('|') {
+            if before.trim().parse::<usize>().is_ok() {
+                continue;
+            }
+        }
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    if parts.is_empty() {
+        "语法错误".to_string()
+    } else {
+        rclaw_cli::config::redact_toml_diagnostic(&parts.join("; "))
+    }
 }
 
 /// `llm.provider` / `llm.review_provider` 指向不存在的 `[[llm.providers]]` 名会让
@@ -2915,7 +3112,9 @@ fn validate_provider_names<'a>(
     {
         return Ok(());
     }
-    let doc: toml_edit::DocumentMut = preview.parse().map_err(|e| format!("预览解析失败: {e}"))?;
+    let doc: toml_edit::DocumentMut = preview
+        .parse()
+        .map_err(|e| format!("预览解析失败: {}", toml_error_summary(&e)))?;
     let names: Vec<&str> = doc
         .get("llm")
         .and_then(|llm| llm.get("providers"))
@@ -2927,19 +3126,30 @@ fn validate_provider_names<'a>(
         })
         .unwrap_or_default();
     let llm_table = doc.get("llm").and_then(|llm| llm.as_table());
-    for (path, key, allow_empty) in [
-        ("llm.provider", "provider", false),
-        ("llm.review_provider", "review_provider", true),
-    ] {
-        let Some(value) = llm_table.and_then(|t| t.get(key)).and_then(|i| i.as_str()) else {
-            continue;
-        };
-        if (allow_empty && value.is_empty()) || names.contains(&value) {
-            continue;
-        }
+    // 主 provider 缺失/空白时启动语义是默认 DeepSeek：引用检查必须按同一有效值，
+    // 否则「省略主引用」的配置会绕过目标存在性检查。
+    let main = llm_table
+        .and_then(|t| t.get("provider"))
+        .and_then(|i| i.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(rclaw_cli::config::DEFAULT_PROVIDER_NAME);
+    if !names.is_empty() && !names.iter().any(|name| name.trim() == main) {
         return Err(format!(
-            "保存被拒绝（未写入文件）：{path} = \"{value}\" 不在 [[llm.providers]] 的 name 列表（{names:?}）里，保存后 agent 将无法启动"
+            "保存被拒绝（未写入文件）：llm.provider 有效值为 \"{main}\"，不在 [[llm.providers]] 的 name 列表（{names:?}）里，保存后 agent 将无法启动"
         ));
+    }
+    if let Some(value) = llm_table
+        .and_then(|t| t.get("review_provider"))
+        .and_then(|i| i.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !names.iter().any(|name| name.trim() == value) {
+            return Err(format!(
+                "保存被拒绝（未写入文件）：llm.review_provider = \"{value}\" 不在 [[llm.providers]] 的 name 列表（{names:?}）里，保存后 agent 将无法启动"
+            ));
+        }
     }
     Ok(())
 }
@@ -3008,6 +3218,28 @@ pub async fn config_save(state: State<'_, AppState>, edits: Vec<ConfigEdit>) -> 
     Ok(())
 }
 
+/// 与启动同路径的最终预检：主 provider 与独立评审 provider 都要能本地构造
+/// （URL、鉴权头名/值、模型/档位、api_key）。不发请求。
+fn validate_providers_startable(
+    cfg: &rclaw_cli::config::Config,
+    context: &str,
+) -> Result<(), String> {
+    let main = cfg
+        .build_provider_config()
+        .map_err(|error| format!("{context}（主 provider 无法启动）: {error:#}"))?;
+    rclaw_llm::build_provider(main)
+        .map_err(|error| format!("{context}（主 provider 无法构造，检查鉴权头/端点）: {error}"))?;
+    if let Some(review) = cfg.effective_review_provider() {
+        let review = cfg
+            .build_provider_config_for(review)
+            .map_err(|error| format!("{context}（review_provider 无法启动）: {error:#}"))?;
+        rclaw_llm::build_provider(review).map_err(|error| {
+            format!("{context}（review_provider 无法构造，检查鉴权头/端点）: {error}")
+        })?;
+    }
+    Ok(())
+}
+
 /// 导入整份 rclaw.toml（GUI「从文件导入」）：解析 + Config 校验 + provider 引用
 /// 一致性检查 → 原子替换。校验不过不落盘，现有配置保持不动。
 pub fn config_import_raw_for(home: &std::path::Path, content: &str) -> Result<(), String> {
@@ -3016,9 +3248,12 @@ pub fn config_import_raw_for(home: &std::path::Path, content: &str) -> Result<()
     }
     content
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("rclaw.toml 解析失败: {e}"))?;
-    rclaw_cli::config::Config::parse_str(content)
+        .map_err(|e| format!("rclaw.toml 解析失败: {}", toml_error_summary(&e)))?;
+    let parsed = rclaw_cli::config::Config::from_toml(content)
         .map_err(|e| format!("导入被校验拒绝（未写入文件）: {e:#}"))?;
+    // 与启动同一路径：主 provider 和评审 provider 都必须能真正构造出来
+    // （端点、鉴权头、模型/档位、api_key），避免导入成功、重启失败。
+    validate_providers_startable(&parsed, "导入被校验拒绝（未写入文件）")?;
     validate_provider_names(content, ["llm.provider", "llm.review_provider"].into_iter())?;
     rclaw_store::RclawToml::new(home.join("rclaw.toml")).write_text(content)
 }

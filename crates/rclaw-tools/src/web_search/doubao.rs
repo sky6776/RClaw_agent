@@ -112,7 +112,15 @@ impl DoubaoBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|error| BackendError::transient(format!("请求失败: {error}")))?;
+            .map_err(|error| {
+                BackendError::transient(if error.is_timeout() {
+                    "豆包搜索请求超时"
+                } else if error.is_connect() {
+                    "豆包搜索连接失败"
+                } else {
+                    "豆包搜索请求失败"
+                })
+            })?;
         let status = response.status();
         let bytes = match read_response_capped(response, MAX_RESPONSE_BYTES).await {
             Ok(bytes) => bytes,
@@ -121,8 +129,8 @@ impl DoubaoBackend {
                     "响应超过 {MAX_RESPONSE_BYTES} 字节"
                 )))
             }
-            Err(Some(error)) => {
-                return Err(BackendError::transient(format!("读取响应失败: {error}")))
+            Err(Some(_)) => {
+                return Err(BackendError::transient("豆包搜索响应读取失败（网络中断）"))
             }
         };
         if !status.is_success() {
@@ -402,6 +410,7 @@ mod tests {
         let body = backend.custom_body(&SearchRequest {
             query: "test".into(),
             max_results: 10,
+            need_content: false,
         });
         assert!(body.get("NeedContent").is_none());
         assert_eq!(body["Filter"]["NeedContent"], false);

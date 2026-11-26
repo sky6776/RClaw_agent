@@ -1834,6 +1834,8 @@ ${event.payload.command}
   // 任务概览不内嵌抽屉（具体任务状态展示不下），改为侧边栏同级入口 +
   // 专门详情页（TaskOverviewPanel）。
   const [mobileUsage, setMobileUsage] = useState<UsageSnapshot | null>(null);
+  // 轮询单飞：下一次估算在上一次返回后才安排；序号再挡一次乱序/旧响应。
+  const usageSeq = useRef(0);
   // 会话输入草稿（App 持有：Chat 随页面切换卸载重挂载时未发送内容不丢，
   // 分享/采集预填也直接写入这里）。
   const [chatDraft, setChatDraft] = useState("");
@@ -1845,23 +1847,31 @@ ${event.payload.command}
   }, [shareDraft]);
   const [shareChooserOpen, setShareChooserOpen] = useState(false);
   useEffect(() => {
-    if (!isMobile || agentState !== "ready") return;
+    // 对话页的环形上下文按钮需要实时快照；移动端抽屉的状态区也复用它。
+    // 其它页面（桌面）不轮询，避免每 5s 扫一次技能目录/记忆文件。
+    if (agentState !== "ready" || (!isMobile && page !== "chat")) return;
     let stopped = false;
+    let usageTimer: number | undefined;
+    // 切会话先清掉上一会话的百分比，避免环形按钮最多 5s 显示错数据。
+    setMobileUsage(null);
     const tickUsage = async () => {
+      const seq = ++usageSeq.current;
       try {
         const snapshot = await api.usageSnapshot(activeId);
-        if (!stopped) setMobileUsage(snapshot);
+        if (!stopped && seq === usageSeq.current) setMobileUsage(snapshot);
       } catch {
         // agent 未启动等瞬时错误：保留上次快照。
+      } finally {
+        // 单飞：上一次估算结束才排下一次；估算超过 5s 时不会堆叠在途请求。
+        if (!stopped) usageTimer = window.setTimeout(tickUsage, 5000);
       }
     };
     void tickUsage();
-    const usageTimer = setInterval(tickUsage, 5000);
     return () => {
       stopped = true;
-      clearInterval(usageTimer);
+      if (usageTimer !== undefined) window.clearTimeout(usageTimer);
     };
-  }, [isMobile, agentState, activeId]);
+  }, [agentState, activeId, isMobile, page]);
 
   // 系统分享消费：其他应用分享进来的文件已由 Java 侧落盘 uploads/。
   // 轮询消费（应用运行中分享经 onNewIntent 也会写入）；消费后弹目标选择：
@@ -2708,6 +2718,7 @@ ${event.payload.command}
                   onCapture={isMobile ? handleCaptureAction : undefined}
                   onForwardToChat={forwardToChat}
                   sessionKey={activeId}
+                  usage={mobileUsage}
                   fontScale={chatFont}
                   onFontScale={applyChatFont}
                   onFork={handleFork}
@@ -3656,8 +3667,8 @@ function About({ home }: { home: string }) {
               <code className="text-indigo-300">/context</code> — 查看上下文窗口占用与压缩预算
             </li>
             <li>
-              <code className="text-indigo-300">/llmodel</code> — 查看 / 切换模型（持久化到
-              rclaw.toml）
+              <code className="text-indigo-300">输入框底部「🧠 模型」</code> — 随时切换模型与思考强度
+              （写入 rclaw.toml；DeepSeek 可关闭思考）
             </li>
             <li>
               <code className="text-indigo-300">/search</code> — 搜索通道启停（已配置

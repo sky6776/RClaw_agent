@@ -91,7 +91,7 @@ auth = "bearer"
 | 配置段 | 字段 | 用途 | 何时需要 |
 |---|---|---|---|
 | `[[llm.providers]]` | `api_key` | LLM 主推理 | **必填**，缺 Key 启动期报错 |
-| `[web_search.doubao_custom]` / `[web_search.tavily]` / `[web_search.zhipu]` / `[web_search.doubao_global]` | `api_key` / `api_keys` | 联网搜索池各来源（Tavily 支持多 Key 自动轮换） | 启用 `[web_search]` 后按启用的来源填 |
+| `[web_search.doubao_custom]` / `[web_search.tavily]` / `[web_search.deepseek]` / `[web_search.zhipu]` / `[web_search.doubao_global]` | `api_key` / `api_keys` | 联网搜索池各来源（Tavily 支持多 Key 自动轮换；DeepSeek 直连 Search/Fetch） | 启用 `[web_search]` 后按启用的来源填 |
 | `[weixin]` | `token` | 微信 iLink Bot 凭据（可用 `rclaw-weixin-login` 扫码获取） | 启用微信通道时必填 |
 | `[napcat]` | `access_token` | QQ 通道鉴权（与 NapCat 配置一致；留空 = 不鉴权） | 可选 |
 | `[wxbot]` | `api_token`、`webhook_secret` | 个人微信 WCX 的 API 令牌与 Webhook 密钥（任一留空则通道不启动） | 启用 wxbot 时必填 |

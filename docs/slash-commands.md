@@ -2,14 +2,13 @@
 
 [← 返回 README](../README.md)
 
-会话内以 `/` 开头的已知命令由路由层直接处理、不进入 LLM（`/workflow` 与 `/goal <文本>` 例外：展开为提示词后进入 LLM；未知的 `/xxx` 原样交给模型）。所有通道与图形界面输入框通用，但影响全局的命令——`/clear`、`/log`、`/rewind`、`/export all`、`/skills` 的 `pin|unpin|adopt|restore|curate`——只对 CLI / 桌面会话或已提升为 `Unrestricted` 的会话开放，外部通道普通用户收到「权限不足」；`/clear`、`/rewind <id>`、`/fork <id>`、`/skills` 变更子命令在有 turn 或后台 review 运行时直接拒绝。`/help` 列出全部。实现位于 `crates/rclaw-runtime/src/slash.rs`、`turn.rs` 与 `turn/commands.rs`。
+会话内以 `/` 开头的已知命令由路由层直接处理、不进入 LLM（`/workflow` 与 `/goal <文本>` 例外：展开为提示词后进入 LLM；未知的 `/xxx` 原样交给模型）。所有通道与图形界面输入框通用，但影响全局的命令——`/clear`、`/log`、`/rewind`、`/export all`、`/skills` 的 `pin|unpin|adopt|restore|curate`、以及会写配置的 `/search` / `/searchfallback`——只对 CLI / 桌面会话或已提升为 `Unrestricted` 的会话开放，外部通道普通用户收到「权限不足」；`/clear`、`/rewind <id>`、`/fork <id>`、`/skills` 变更子命令在有 turn 或后台 review 运行时直接拒绝。`/help` 列出全部。模型与思考强度切换不再走斜杠命令，见 [模型接入](llm.md#模型与思考强度会话页选择器)。实现位于 `crates/rclaw-runtime/src/slash.rs`、`turn.rs` 与 `turn/commands.rs`。
 
 | 命令 | 说明 | 详细文档 |
 |---|---|---|
-| `/help` | 显示帮助与已知模型 | — |
-| `/llmodel [模型名]` | 查看 / 热切换 LLM 模型，同步写回 `rclaw.toml`；只接受内置清单 `glm-5.3`、`glm-5.3-flash`（旧名 `glm-5.2`、`glm-5v-turbo`），其他名字被拒绝 | [模型接入](llm.md#llmodel-热切换) |
+| `/help` | 显示帮助 | — |
 | `/search [来源]` | 显示搜索池状态，或把指定来源移到首位 | [内置工具](tools.md#联网搜索) |
-| `/search dis\|en <来源>` | 禁用 / 启用 `zhipu`、`tavily`、`doubao-custom`、`doubao-global`（启用会清除额度 / 鉴权阻塞） | 同上 |
+| `/search dis\|en <来源>` | 禁用 / 启用 `zhipu`、`tavily`、`deepseek`、`doubao-custom`、`doubao-global`（启用会清除额度 / 鉴权阻塞） | 同上 |
 | `/searchfallback [on\|off]` | 开关搜索 fallback（关闭后只用主来源，失败不回退）；无参查看状态，也接受 `true/false`、`开/关` | 同上 |
 | `/skills [子命令]` | 列出全部可发现技能入口、所属包与功能（默认 `list`）；子命令 `help` / `status [name]` / `pin <name>` / `unpin <name>` / `adopt <name>` / `restore <name>` / `curate` | [技能系统](skills.md#查看与管理) |
 | `/tools` | 列出当前工具面及说明 | [内置工具](tools.md) |

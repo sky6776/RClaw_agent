@@ -114,6 +114,9 @@ pub fn run() {
         .manage(AppState::new(home.clone()))
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
+            commands::chat_llm_state,
+            commands::chat_set_model,
+            commands::chat_set_thinking,
             commands::update_check,
             commands::update_download_install,
             commands::open_url,

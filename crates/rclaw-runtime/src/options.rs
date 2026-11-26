@@ -98,7 +98,7 @@ pub struct AgentOptions {
     /// [`AgentOptions::compression_summary_context_ceiling`]）的派生输入——`rclaw-cli`
     /// 装配时由 `Config::selected_context_length()` 写入。
     /// 同时供 `/context` 斜杠命令显示「上下文窗口 / 已用 / 剩余 / 使用率」。运行期只读、
-    /// 启动期固定（`/llmodel` 切换模型仅持久化到 rclaw.toml，下次启动才重派生，与本字段口径一致）。
+    /// 启动期固定（模型选择器切换模型仅持久化到 rclaw.toml，下次启动才重派生，与本字段口径一致）。
     pub context_length: usize,
     /// 是否启用会话语义压缩（把旧历史摘要化，而不是只做硬裁剪）。
     pub session_compression_enabled: bool,

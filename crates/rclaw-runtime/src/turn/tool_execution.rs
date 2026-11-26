@@ -1006,6 +1006,7 @@ pub(crate) fn is_candidate_patch_tool_allowed(name: &str) -> bool {
             | "web_search"
             | "zhipu_search"
             | "tavily_search"
+            | "deepseek_search"
             | "doubao_custom_search"
             | "doubao_global_search"
             | "tavily_extract"

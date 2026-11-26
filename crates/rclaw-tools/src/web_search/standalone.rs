@@ -54,6 +54,7 @@ impl Tool for ProviderSearchTool {
         match self.id() {
             BackendId::Zhipu => "zhipu_search",
             BackendId::Tavily => "tavily_search",
+            BackendId::DeepSeek => "deepseek_search",
             BackendId::DoubaoCustom => "doubao_custom_search",
             BackendId::DoubaoGlobal => "doubao_global_search",
         }
@@ -69,6 +70,7 @@ impl Tool for ProviderSearchTool {
             BackendId::Tavily => {
                 "Search the public web directly through Tavily with API-key rotation."
             }
+            BackendId::DeepSeek => "Search the public web directly through DeepSeek Search API.",
             BackendId::DoubaoCustom => {
                 "Search the public web directly through Doubao Custom Search."
             }
@@ -142,6 +144,7 @@ impl Tool for ProviderSearchTool {
             "独立搜索工具开始调用"
         );
         let request = SearchRequest {
+            need_content: true,
             query: query.to_string(),
             max_results,
         };
@@ -257,6 +260,7 @@ mod tests {
                 "doubao_custom_search",
                 "tavily_search",
                 "zhipu_search",
+                "deepseek_search",
                 "doubao_global_search",
             ]
         );

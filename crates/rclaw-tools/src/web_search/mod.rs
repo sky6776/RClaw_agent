@@ -4,6 +4,7 @@
 //! The router only understands normalized search/read capabilities and errors.
 
 mod control;
+mod deepseek;
 mod doubao;
 mod render;
 mod router;
@@ -13,6 +14,7 @@ mod types;
 mod zhipu;
 
 pub use control::{BackendStatus, HealthStatus, WebSearchControl};
+pub use deepseek::{DeepSeekBackend, DeepSeekSearchConfig};
 pub use doubao::{DoubaoBackend, DoubaoSearchConfig, DoubaoVariant};
 pub use router::{WebSearch, WebSearchConfig};
 pub use standalone::ProviderSearchTool;

@@ -138,16 +138,20 @@ impl TavilyClient {
             .json(body)
             .send()
             .await
-            .map_err(|error| BackendError::transient(format!("Tavily 请求失败: {error}")))?;
+            .map_err(|error| {
+                BackendError::transient(if error.is_timeout() {
+                    "Tavily 请求超时"
+                } else if error.is_connect() {
+                    "Tavily 连接失败"
+                } else {
+                    "Tavily 请求失败"
+                })
+            })?;
         let status = response.status();
         let bytes = match read_response_capped(response, MAX_RESPONSE_BYTES).await {
             Ok(bytes) => bytes,
             Err(None) => return Err(BackendError::permanent("Tavily 响应过大")),
-            Err(Some(error)) => {
-                return Err(BackendError::transient(format!(
-                    "Tavily 响应读取失败: {error}"
-                )))
-            }
+            Err(Some(_)) => return Err(BackendError::transient("Tavily 响应读取失败（网络中断）")),
         };
         let text = String::from_utf8_lossy(&bytes);
         if !status.is_success() {
@@ -506,6 +510,7 @@ mod tests {
             .search(&SearchRequest {
                 query: "q".into(),
                 max_results: 5,
+                need_content: false,
             })
             .await
             .unwrap();

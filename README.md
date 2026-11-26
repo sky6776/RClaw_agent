@@ -14,7 +14,7 @@
 
 - **多平台一体**：同一套核心以四种形态交付——全平台 CLI 二进制 `rclaw`、Windows 桌面 GUI（Tauri）、Android 原生 APK（arm64-v8a，内置 Python 运行时 / 语音识别 / 知识库）、Termux 手机直跑 CLI。桌面与安卓共用同一个 React 前端，GitHub Release 自动产出三种安装包。→ [平台与构建](docs/platforms.md)
 - **多通道并发**：控制台、桌面 / 安卓虚拟通道、QQ（NapCat OneBot 11）、微信 iLink Bot、个人微信（wxbot）可同时在线；每个通道 / 聊天独立会话、独立并发控制，各自声明「能否收发媒体 / 有无工作状态 / 是否许可中间输出 / 是否接收逐片思考流」四项能力。→ [外部通道](docs/channels.md)
-- **模型接入**：OpenAI 兼容协议即可接入任意服务（示例默认智谱 GLM，也可 DeepSeek 等）；SSE 流式解析、思考字段适配、工具调用严格校验、指数退避重试；`/llmodel` 热切换模型并写回配置；bot、子代理、后台评审可各自固定不同 provider。→ [模型接入与配置](docs/llm.md)
+- **模型接入**：OpenAI 兼容协议即可接入任意服务（示例默认智谱 GLM，也可 DeepSeek 等）；SSE 流式解析、思考字段适配、工具调用严格校验、指数退避重试；会话页底部「🧠 模型」选择器热切换模型与思考强度并写回配置；bot、子代理、后台评审可各自固定不同 provider。→ [模型接入与配置](docs/llm.md)
 - **图形界面**：对话 / 会话 / 智能体 / 工具 / 技能 / 工作区 / Agent / 任务概览 / 自进化 / 定时任务 / 配置 / 关于 十余个面板；消息分叉、排队插话、计划步骤卡片、工具调用明细与 diff、媒体画廊与照片编辑、`rclaw.toml` 可视化编辑与校验、应用内更新；安卓端另有前台服务保活、拍照 / 录音 / whisper 转写、内置浏览器。→ [图形界面](docs/gui.md)
 
 ### Agent 内核
@@ -35,7 +35,7 @@
 
 ### 运维与安全
 
-- **斜杠命令**：`/llmodel` `/search` `/skills` `/tools` `/context` `/compact` `/rewind` `/fork` `/goal` `/export` `/log` `/clear` `/cancel` 等，由路由层直接处理、不进入 LLM（`/workflow` 与 `/goal <文本>` 例外：展开为提示词交给模型，`/goal <文本>` 设定后立即开始执行）；影响全局的命令仅限本机或已授权会话。→ [斜杠命令](docs/slash-commands.md)
+- **斜杠命令**：`/search` `/skills` `/tools` `/context` `/compact` `/rewind` `/fork` `/goal` `/export` `/log` `/clear` `/cancel` 等，由路由层直接处理、不进入 LLM（`/workflow` 与 `/goal <文本>` 例外：展开为提示词交给模型，`/goal <文本>` 设定后立即开始执行）；影响全局的命令仅限本机或已授权会话。→ [斜杠命令](docs/slash-commands.md)
 - **数据与持久化**：一切运行数据集中在 `agent/`（会话 / 回滚点 / journal 在 `state.sqlite`，记忆、技能、日志、导出、媒体各有目录，定时任务在 `cron.json`）；`/clear` 的精确语义与备份建议。→ [数据目录与持久化](docs/storage.md)
 - **安全设计**：文件工具 fail-safe 沙箱与路径规则、通道身份 → 权限单向链、工具结果 / 摘要 / 记忆写入的密钥脱敏、记忆与技能写入的注入 / 隐形字符防护、密钥只落本地文件。→ [安全设计](docs/security.md)
 - **架构**：11 个 crate 的 workspace，`rclaw-core` 为无环依赖的根，`rclaw-cli` 产出主二进制 `rclaw`（另有桌面 exe 与 `rclaw-weixin-login` 两个 bin），`rclaw-desktop` 三态 crate（桌面 GUI / Termux 桩 / APK 宿主）。→ [架构与 Workspace 布局](docs/architecture.md)
@@ -92,7 +92,7 @@ auth = "bearer"
 | [平台与构建](docs/platforms.md) | CLI / Windows 桌面 / Android APK（签名、应用内更新、安装）/ Termux、CI 发布、构建脚本、profile 与 feature |
 | [图形界面](docs/gui.md) | 桌面与安卓共用前端的全部面板、桌面宿主（托盘 / 向导 / 导出）、安卓宿主（保活 / Python / whisper / 浏览器） |
 | [外部通道](docs/channels.md) | 控制台、NapCat QQ、微信 iLink、个人微信 wxbot、能力矩阵、媒体与语音、会话隔离与可靠性 |
-| [模型接入与配置](docs/llm.md) | Provider 两层抽象、`[llm]` 字段、流式与工具调用解析、重试、`/llmodel`、多 provider |
+| [模型接入与配置](docs/llm.md) | Provider 两层抽象、`[llm]` 字段、流式与工具调用解析、重试、模型/思考强度选择器、多 provider |
 | [ReAct 内核](docs/react-core.md) | turn 流程、系统提示、工具批次、熔断、完成 / 媒体闸门、插话队列、流式输出、后台唤醒、运行时选项 |
 | [长程会话与上下文管理](docs/context-management.md) | 三层压缩、工具结果落盘、`/rewind`、`/fork`、`/goal`、`/export`、跨会话检索与交接、会话存储模型 |
 | [内置工具](docs/tools.md) | 全部内置工具的参数、限制与沙箱规则，搜索池与浏览器 |

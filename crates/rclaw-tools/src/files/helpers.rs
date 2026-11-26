@@ -757,10 +757,29 @@ pub(super) fn attach_remote_media(url: &str) -> ToolResult {
     let Some((kind, mime)) = media else {
         return ToolResult::err("无法从 url 扩展名判断媒体类型");
     };
+    // 工具结果正文会进入会话历史/模型请求；签名 URL 的 query 不能跟着回显。
+    // 媒体块本身仍保留原始 URL（真正取图需要签名）。
     ToolResult::ok_with_attachments(
-        format!("OK: 已附加远程媒体 {url}，推断类型 {mime}。"),
+        format!(
+            "OK: 已附加远程媒体 {}，推断类型 {mime}。",
+            display_url_label(url)
+        ),
         vec![ContentBlock::media_url(kind, url.to_string())],
     )
+}
+
+/// 可展示的 URL：去掉 query / fragment / 凭据，只留 scheme://host/path。
+fn display_url_label(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => "<invalid-url>".to_string(),
+    }
 }
 
 /// 从 JSON 入参取可选的非负整数字段（offset 等）。
@@ -1028,5 +1047,19 @@ pub(super) fn read_window_note(w: &ReadWindow) -> String {
             start + 1,
             end
         )
+    }
+}
+
+#[cfg(test)]
+mod display_url_tests {
+    use super::display_url_label;
+
+    #[test]
+    fn display_url_strips_signature_query() {
+        assert_eq!(
+            display_url_label("https://example.com/a.pdf?sig=secret#page=2"),
+            "https://example.com/a.pdf"
+        );
+        assert_eq!(display_url_label("not a url"), "<invalid-url>");
     }
 }

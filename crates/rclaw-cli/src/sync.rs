@@ -873,16 +873,21 @@ pub fn save_sync_config(config_path: &Path, before: &SyncConfig, after: &SyncCon
     if edits.is_empty() {
         return Ok(());
     }
-    if !config_path.exists() {
-        rclaw_store::atomic_write(config_path, b"")
-            .with_context(|| format!("新建 {} 失败", config_path.display()))?;
-    }
     let file = RclawToml::new(config_path);
-    let preview = file
-        .apply_edits_preview(&edits)
+    // 文件不存在时以空文档为基线生成完整预览；首次创建由 write_text_expecting
+    // 在写锁内用「仅当不存在」的原子发布完成，不留下空配置文件中间态。
+    let (baseline, preview) = file
+        .apply_edits_preview_creating(&edits)
         .map_err(anyhow::Error::msg)?;
     Config::parse_str(&preview).context("改动没有通过配置校验，rclaw.toml 没有动")?;
-    file.write_text(&preview).map_err(anyhow::Error::msg)
+    match baseline {
+        Some(baseline) => file
+            .write_text_expecting(&preview, Some(&baseline))
+            .map_err(anyhow::Error::msg),
+        None => file
+            .write_text_creating(&preview)
+            .map_err(anyhow::Error::msg),
+    }
 }
 
 // ---------------------------------------------------------------------------

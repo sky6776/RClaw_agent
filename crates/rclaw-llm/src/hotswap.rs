@@ -93,6 +93,45 @@ impl SwappableProvider {
             state.config.base_url.clone(),
         ))
     }
+
+    /// 当前 live 配置的克隆（含 name / model / base_url / reasoning / media_wire）。
+    ///
+    /// 供思考强度选择器与 `/llmodel` 在"整组参数切换"时读取现状：跨 provider 切换后
+    /// `config.name` 已是目标条目名，持久化不会写错段。
+    pub fn current_config(&self) -> Result<ProviderConfig> {
+        Ok(self.state.read().map_err(|_| lock_err())?.config.clone())
+    }
+
+    /// 整体替换 provider 配置（含 api_key / auth / dialect / flavor / media_wire /
+    /// reasoning / max_tokens），用于跨 provider 或整组参数切换。
+    ///
+    /// 与 [`Self::switch_model`] 相同：先构造新 provider，成功后才在写锁内原子替换；
+    /// 构造失败时配置与 provider 都保持原样。
+    pub fn switch_provider(&self, cfg: ProviderConfig) -> Result<()> {
+        let provider: Arc<dyn Provider> = Arc::from(build_provider(cfg.clone())?);
+        self.switch_provider_built(cfg, provider);
+        Ok(())
+    }
+
+    /// 用**预先构建好**的 provider 原子替换配置。
+    ///
+    /// 供「先保存 TOML、再发布 live」的事务使用：构造已在保存前完成，这一步只剩
+    /// 写锁替换。锁中毒（持锁线程 panic）时也继续替换：state 是两个字段的整体赋值，
+    /// 不存在半更新；这样「磁盘已改、发布失败」的窗口被彻底关掉。
+    pub fn switch_provider_built(&self, cfg: ProviderConfig, inner: Arc<dyn Provider>) {
+        let mut state = match self.state.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.config = cfg;
+        state.inner = inner;
+        // 在写守卫内清除本次观察到的中毒：读端被阻塞到替换完成，不会看到
+        // 「已替换但读端仍报不可用」的间隙；持写锁期间也不可能有别的线程
+        // 制造新的中毒，因此不会误清后续的真实中毒。
+        if self.state.is_poisoned() {
+            self.state.clear_poison();
+        }
+    }
 }
 
 fn normalize_model(model: String) -> Result<String> {
@@ -142,6 +181,20 @@ impl Provider for SwappableProvider {
             .unwrap_or(false)
     }
 
+    fn current_identity(&self) -> Option<(String, String)> {
+        self.state.read().ok().map(|state| {
+            (
+                state.config.name.clone(),
+                state.config.default_model.clone(),
+            )
+        })
+    }
+
+    fn snapshot(&self) -> Option<Arc<dyn Provider>> {
+        let config = self.state.read().ok()?.config.clone();
+        build_provider(config).ok().map(Arc::from)
+    }
+
     async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome> {
         // 克隆出底层 Arc 后立即释放读锁：不持锁跨 await，正在进行的对话不受切换影响。
         let provider = self.state.read().map_err(|_| lock_err())?.inner.clone();
@@ -169,7 +222,10 @@ impl Provider for SwappableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AuthScheme, Dialect, MaxTokensKey, ProtocolKind, ReasoningField};
+    use crate::{
+        AuthScheme, Dialect, MaxTokensKey, MediaWire, ProtocolKind, ProviderFlavor,
+        ReasoningConfig, ReasoningField,
+    };
     use secrecy::SecretString;
 
     #[test]
@@ -217,7 +273,11 @@ mod tests {
                 reasoning_field: ReasoningField::ReasoningContent,
                 supports_tool_choice: true,
                 max_tokens_key: MaxTokensKey::MaxTokens,
+                classify_upstream_busy: false,
             },
+            flavor: ProviderFlavor::Zhipu,
+            media_wire: MediaWire::OpenAiCompat,
+            reasoning: ReasoningConfig::default(),
             max_tokens: 4096,
             request_timeout_secs: 300,
             max_tool_calls: 128,

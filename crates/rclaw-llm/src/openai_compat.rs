@@ -15,10 +15,13 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use rclaw_core::{
-    ChatOutcome, ChatRequest, ContentBlock, FinishReason, Message, Role, TokenUsage, ToolCall,
+    ChatOutcome, ChatRequest, ContentBlock, FinishReason, MediaKind, Message, Role, TokenUsage,
+    ToolCall,
 };
 
-use crate::config::{AuthScheme, Dialect, MaxTokensKey, ProviderConfig, ReasoningField};
+use crate::config::{
+    AuthScheme, Dialect, MaxTokensKey, MediaWire, ProviderConfig, ProviderFlavor, ReasoningField,
+};
 use crate::error::{LlmError, Result};
 use crate::protocol::{ChatProtocol, StreamDelta, StreamParser};
 
@@ -75,11 +78,25 @@ impl ChatProtocol for OpenAiCompat {
         // 旧实现忽略 `req.max_tokens` 而总用 `cfg.max_tokens`，使该字段形同虚设、误导 API。
         body[mt_key] = json!(req.max_tokens);
 
+        // DeepSeek 官方规则：请求携带 tools 且**思考开启**时，历史 assistant 的
+        // reasoning_content 必须完整回传，否则远端 400。关闭思考（或 effort=none）
+        // 时本就没有 reasoning，工具续轮必须放行。旧会话（别的 provider /
+        // reasoning_field=reasoning / 关闭思考时期）可能没有该字段；在本地 fail loud，
+        // 提示新建会话，而不是把一个必然 400 的请求发出去。
+        let deepseek_thinking_active = cfg.reasoning.thinking != Some(false)
+            && cfg.reasoning.effort.as_deref() != Some("none");
+        if cfg.flavor == ProviderFlavor::DeepSeek
+            && deepseek_thinking_active
+            && !req.tools.is_empty()
+        {
+            ensure_deepseek_tool_reasoning(&req.messages, &cfg.dialect)?;
+        }
         body["messages"] = Value::Array(convert_messages(
             req.system.as_deref(),
             &req.messages,
             &cfg.dialect,
             cfg.supports_multimodal(),
+            cfg.media_wire,
         )?);
 
         if !req.tools.is_empty() {
@@ -104,7 +121,7 @@ impl ChatProtocol for OpenAiCompat {
         }
 
         // glm-5.3-flash 官方推荐参数（采样 + 思考），流式/非流式都生效。
-        apply_zhipu_flash_recommended_params(cfg, &mut body);
+        apply_reasoning_params(cfg, &mut body);
         Ok(body)
     }
 
@@ -137,15 +154,9 @@ impl ChatProtocol for OpenAiCompat {
         let root: Value = serde_json::from_slice(body)?;
         let choices = root.get("choices").and_then(|c| c.as_array());
         let choice0 = choices.and_then(|a| a.first());
-        let message = choice0
-            .and_then(|c| c.get("message"))
-            .ok_or_else(|| LlmError::BadResponse("missing choices[0].message".into()))?;
 
-        // 1) finish_reason 校验：必须【显式】给出 `stop` 或 `tool_calls`，缺省或异常都拒绝整轮。
-        //
-        // **修复 P2**：旧实现把 `stop` 默认为 `FinishReason::Stop`，当 `finish_reason`
-        // 【缺失】时直接接受响应并按 Stop 持久化——这会把截断/不完整的 provider 响应
-        // 当成正常答案写进会话。现在要求必须看到明确的 `stop`/`tool_calls`，缺失即拒绝。
+        // 1) finish_reason 必须先于 message 校验：上游繁忙/中止的终帧可能不带 message，
+        //    若先要求 message 会被误判成协议错误，永远走不到可重试分类。
         let mut tool_use = false;
         let mut seen_finish = false;
         let mut stop = FinishReason::Stop;
@@ -155,6 +166,13 @@ impl ChatProtocol for OpenAiCompat {
             .filter(|s| !s.is_empty())
         {
             seen_finish = true;
+            // DeepSeek 等供应商在服务端资源不足/主动中止时返回这两个结束原因：
+            // 请求本身没问题，归为可重试的上游繁忙，而不是协议错误（整轮失败且不重试）。
+            if upstream_busy_finish_reason(fr, dialect) {
+                return Err(LlmError::UpstreamBusy(
+                    "上游结束原因表示资源暂不可用（可重试）".to_string(),
+                ));
+            }
             match FinishReason::from_openai(fr) {
                 FinishReason::ToolCalls => {
                     tool_use = true;
@@ -175,6 +193,10 @@ impl ChatProtocol for OpenAiCompat {
                     .into(),
             ));
         }
+
+        let message = choice0
+            .and_then(|c| c.get("message"))
+            .ok_or_else(|| LlmError::BadResponse("missing choices[0].message".into()))?;
 
         // 2) 正文 / 推理内容。
         let text = message
@@ -227,18 +249,29 @@ impl ChatProtocol for OpenAiCompat {
     }
 }
 
+/// 是否为「上游繁忙/主动中止」类的结束原因。
+///
+/// 仅当方言开启 `classify_upstream_busy`（DeepSeek）时生效：其它 OpenAI 兼容后端若
+/// 复用同名结束原因，语义可能不同，不能被重新分类。DeepSeek 在服务端资源不足或主动
+/// 中止请求时返回 `insufficient_system_resource` / `aborted`；请求本身没有协议问题，
+/// 原样重试可能成功，因此归入 `LlmError::UpstreamBusy`（Retryable）。
+fn upstream_busy_finish_reason(fr: &str, dialect: &Dialect) -> bool {
+    dialect.classify_upstream_busy && matches!(fr, "insufficient_system_resource" | "aborted")
+}
+
 /// 是否为智谱官方 provider：常规配置以 provider 名 `zhipu` 标识；同时识别官方域名，
 /// 兼容用户自定义 provider 名。智谱专用请求字段（`tool_stream`、glm-5.3-flash 推荐
 /// 参数等）只发给官方端点，避免透传未知参数给其它 OpenAI 兼容 provider。
 fn is_zhipu_provider(cfg: &ProviderConfig) -> bool {
-    cfg.name.trim().eq_ignore_ascii_case("zhipu")
-        || reqwest::Url::parse(&cfg.base_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .is_some_and(|host| {
-                host.eq_ignore_ascii_case("bigmodel.cn")
-                    || host.to_ascii_lowercase().ends_with(".bigmodel.cn")
-            })
+    // 只认官方域名：provider 名可以被任意代理复用，按名字放行会把 `tool_stream` /
+    // `clear_thinking` 等智谱专有字段发给别的服务（包括被命名为 zhipu 的 DeepSeek 端点）。
+    reqwest::Url::parse(&cfg.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("bigmodel.cn")
+                || host.to_ascii_lowercase().ends_with(".bigmodel.cn")
+        })
 }
 
 /// 判断当前智谱 provider / 模型是否支持工具调用参数流式输出。
@@ -265,27 +298,50 @@ fn supports_zhipu_tool_stream(cfg: &ProviderConfig) -> bool {
         || model.starts_with("glm-4.6-")
 }
 
-/// 按官方「推荐设置」为 glm-5.3-flash 注入采样与思考参数（仅智谱 provider）：
+/// 注入思考参数。
 ///
-/// - `temperature: 1`、`top_p: 0.95`、`reasoning_effort: max`（官方推荐设置）；
-/// - `thinking.type: enabled`（flash 不支持关闭思考）+ `clear_thinking: false`（官方推荐，
-///   保留历史轮次 reasoning_content；RClaw 方言暴露 reasoning_field 时本就会回传历史思考，
-///   显式关闭服务端清除才能让回传的思考真正参与上下文）。
+/// 优先级（高 → 低）：
+/// 1. `[[llm.providers]]` 显式配置的 `thinking` / `reasoning_effort`；
+/// 2. glm-5.3-flash 的官方推荐默认（`temperature:1`、`top_p:0.95`、
+///    `reasoning_effort:max`、`thinking:{type:enabled, clear_thinking:false}`）；
+/// 3. 不发送 —— 由服务端默认决定。
 ///
-/// 未知字段不透传：非智谱 provider 或其它模型一律不加，保持 glm-5.3 等既有模型行为不变。
-fn apply_zhipu_flash_recommended_params(cfg: &ProviderConfig, body: &mut Value) {
-    if !is_zhipu_provider(cfg)
-        || !cfg
+/// `clear_thinking` 是智谱专有字段：只有 `ProviderFlavor::Zhipu` 才注入，避免发给
+/// DeepSeek 等其它 OpenAI 兼容端点。
+fn apply_reasoning_params(cfg: &ProviderConfig, body: &mut Value) {
+    // 1) 显式配置优先。
+    if let Some(enabled) = cfg.reasoning.thinking {
+        if enabled {
+            if is_zhipu_provider(cfg) {
+                body["thinking"] = json!({ "type": "enabled", "clear_thinking": false });
+            } else {
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+        } else {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+    }
+    if let Some(effort) = cfg.reasoning.effort.as_deref().filter(|s| !s.is_empty()) {
+        body["reasoning_effort"] = json!(effort);
+    }
+
+    // 2) glm-5.3-flash 官方推荐默认：只补齐【未显式配置】的字段。
+    if is_zhipu_provider(cfg)
+        && cfg
             .default_model
             .trim()
             .eq_ignore_ascii_case("glm-5.3-flash")
     {
-        return;
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        obj.entry("temperature").or_insert_with(|| json!(1));
+        obj.entry("top_p").or_insert_with(|| json!(0.95));
+        obj.entry("reasoning_effort")
+            .or_insert_with(|| json!("max"));
+        obj.entry("thinking")
+            .or_insert_with(|| json!({ "type": "enabled", "clear_thinking": false }));
     }
-    body["temperature"] = json!(1);
-    body["top_p"] = json!(0.95);
-    body["reasoning_effort"] = json!("max");
-    body["thinking"] = json!({ "type": "enabled", "clear_thinking": false });
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +360,7 @@ fn convert_messages(
     messages: &[Message],
     dialect: &Dialect,
     supports_multimodal: bool,
+    media_wire: MediaWire,
 ) -> Result<Vec<Value>> {
     let mut out = Vec::new();
 
@@ -348,7 +405,7 @@ fn convert_messages(
                     // 若静默跳过本 tool_use，其后续 tool_result 会变成孤儿 role=tool（无前序 tool_calls）→ 400。
                     if id.is_empty() || name.is_empty() {
                         return Err(LlmError::BadResponse(format!(
-                            "messages[{idx}] 的 tool_use id/name 为空，拒绝回放（否则后续 tool_result 会成孤儿致 400）: id={id:?} name={name:?}"
+                            "messages[{idx}] 的 tool_use id/name 为空，拒绝回放（否则后续 tool_result 会成孤儿致 400）"
                         )));
                     }
                     // input 必须是 JSON 对象：
@@ -358,7 +415,7 @@ fn convert_messages(
                     // 三者一律拒绝，要求在 session repair 阶段清洗（丢弃整条工具链）。
                     if !input.is_object() {
                         return Err(LlmError::BadResponse(format!(
-                            "messages[{idx}] 的 tool_use input 非 JSON 对象，拒绝回放（否则 arguments 非对象/为 null 致 400）: id={id} name={name} type={}",
+                            "messages[{idx}] 的 tool_use input 非 JSON 对象，拒绝回放（否则 arguments 非对象/为 null 致 400）: type={}",
                             if input.is_null() { "null" }
                             else if input.is_array() { "array" }
                             else if input.is_string() { "string" }
@@ -402,7 +459,7 @@ fn convert_messages(
                         }));
                     }
                 }
-                if let Some(content) = user_visible_content(m, supports_multimodal) {
+                if let Some(content) = user_visible_content(m, supports_multimodal, media_wire) {
                     out.push(json!({ "role": "user", "content": content }));
                 }
             }
@@ -453,15 +510,35 @@ fn join_text(m: &Message) -> String {
 /// User 消息里真正发给模型的可见内容。
 ///
 /// - 只有文本时保持旧行为：`content` 是字符串，兼容纯文本模型；
-/// - 当前模型支持多模态且含多模态资源时，转成 OpenAI/智谱兼容的 content array；
+/// - 当前模型支持多模态且含多模态资源时，转成对应 provider 方言的 content array；
 /// - 当前模型不支持多模态时，过滤 MediaUrl，只发送同条消息里的文本；
 /// - ToolResult 块另行转成 `role=tool`，这里跳过。
-fn user_visible_content(m: &Message, supports_multimodal: bool) -> Option<Value> {
-    let has_media = m
+///
+/// 方言差异（[`MediaWire`]）：智谱/OpenAI 用 `image_url`/`video_url`/`file_url`；
+/// DeepSeek 只认 `image_url` 与 `file(file_data)`，且没有 video part——不支持的
+/// 形态必须降级成文本提示，绝不能把未知 part 透传给远端（会 400 或静默丢弃）。
+fn user_visible_content(
+    m: &Message,
+    supports_multimodal: bool,
+    media_wire: MediaWire,
+) -> Option<Value> {
+    let media_count = m
         .content
         .iter()
-        .any(|b| matches!(b, ContentBlock::MediaUrl { .. }));
-    if !has_media || !supports_multimodal {
+        .filter(|block| matches!(block, ContentBlock::MediaUrl { .. }))
+        .count();
+    if media_count > 0 && !supports_multimodal {
+        // 纯文本模型：媒体块会被剥离，但必须给模型一个明确提示，避免它以为看到了附件。
+        let mut text = join_text(m);
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "[{media_count} attachment(s) omitted: current model is text-only]"
+        ));
+        return Some(Value::String(text));
+    }
+    if media_count == 0 {
         let text = join_text(m);
         return (!text.is_empty()).then_some(Value::String(text));
     }
@@ -472,17 +549,221 @@ fn user_visible_content(m: &Message, supports_multimodal: bool) -> Option<Value>
             ContentBlock::Text { text } if !text.is_empty() => {
                 blocks.push(json!({ "type": "text", "text": text }));
             }
-            ContentBlock::MediaUrl { kind, url } => {
-                let ty = kind.openai_block_type();
-                let mut block = json!({ "type": ty });
-                block[ty] = json!({ "url": url });
-                blocks.push(block);
-            }
+            ContentBlock::MediaUrl { kind, url } => match (media_wire, kind) {
+                (MediaWire::DeepSeek, MediaKind::File) => match parse_data_uri(url) {
+                    DataUriPayload::Valid(payload) => {
+                        blocks.push(json!({
+                            "type": "file",
+                            "file": { "file_data": payload }
+                        }));
+                    }
+                    DataUriPayload::TooLarge => {
+                        tracing::warn!("DeepSeek file_data 超过 20 MiB 原始字节上限，已降级");
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": "[file attachment omitted: payload exceeds 20 MiB]"
+                        }));
+                    }
+                    DataUriPayload::Invalid => {
+                        tracing::warn!("DeepSeek file_data 不是合法 base64 data URI，已降级");
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": "[file attachment omitted: invalid data URI]"
+                        }));
+                    }
+                    DataUriPayload::NotDataUri => {
+                        tracing::warn!(
+                            "DeepSeek 不支持远程 file URL，已降级为文本提示（需 file_id/file_data）"
+                        );
+                        let label = if url.starts_with("http://") || url.starts_with("https://") {
+                            safe_url_label(url)
+                        } else {
+                            "<unsupported-uri>".to_string()
+                        };
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": format!(
+                                "[file attachment url: {label} — DeepSeek 需要 file_id/file_data，未内联]"
+                            )
+                        }));
+                    }
+                },
+                (MediaWire::DeepSeek, MediaKind::Video) => {
+                    tracing::warn!("DeepSeek 不支持视频输入，已降级为文本提示");
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": "[video attachment omitted: provider does not accept video input]"
+                    }));
+                }
+                (_, kind) => {
+                    let ty = kind.openai_block_type();
+                    let mut block = json!({ "type": ty });
+                    block[ty] = json!({ "url": url });
+                    blocks.push(block);
+                }
+            },
             _ => {}
         }
     }
 
     (!blocks.is_empty()).then_some(Value::Array(blocks))
+}
+
+/// data URI 解析结果。
+enum DataUriPayload<'a> {
+    NotDataUri,
+    Valid(&'a str),
+    TooLarge,
+    Invalid,
+}
+
+/// DeepSeek `file_data` 的原始字节上限（20 MiB）。
+const MAX_DEEPSEEK_FILE_RAW_BYTES: usize = 20 * 1024 * 1024;
+
+/// 严格解析 `data:<mime>;base64,<payload>`。
+///
+/// - MIME 必须是 `type/subtype` 形式（各段非空、token 字符），metadata 只允许
+///   `;base64`（且必须在末尾）；
+/// - 载荷必须是标准 base64（长度 4 的倍数、字符集合法、padding ≤ 2 且只在末尾、
+///   最后一组未使用的填充位为 0）；
+/// - 解码后原始字节 ≤ 20 MiB。
+///
+/// 任何不满足的形态都不发送 `file_data`（远端会 400 或把垃圾当文件）。
+fn parse_data_uri(url: &str) -> DataUriPayload<'_> {
+    let Some(rest) = url.strip_prefix("data:") else {
+        return DataUriPayload::NotDataUri;
+    };
+    let Some((meta, payload)) = rest.split_once(',') else {
+        return DataUriPayload::Invalid;
+    };
+    let parts = meta.split(';').collect::<Vec<_>>();
+    let mime = parts.first().copied().unwrap_or("");
+    let mut mime_parts = mime.split('/');
+    let (Some(kind), Some(subtype), None) =
+        (mime_parts.next(), mime_parts.next(), mime_parts.next())
+    else {
+        return DataUriPayload::Invalid;
+    };
+    let token = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+    };
+    if !token(kind) || !token(subtype) {
+        return DataUriPayload::Invalid;
+    }
+    // 只接受 `mime;base64`（base64 必须是最后一段）；charset 等参数不解析也不透传。
+    if parts.len() != 2 || !parts[1].eq_ignore_ascii_case("base64") {
+        return DataUriPayload::Invalid;
+    }
+    if payload.is_empty() || payload.len() % 4 != 0 {
+        return DataUriPayload::Invalid;
+    }
+    let padding = payload
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'=')
+        .count();
+    if padding > 2 {
+        return DataUriPayload::Invalid;
+    }
+    let body = &payload[..payload.len() - padding];
+    if body
+        .bytes()
+        .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'))
+    {
+        return DataUriPayload::Invalid;
+    }
+    // 规范 base64：最后一组未使用的填充位必须为 0（否则严格解码器会拒绝）。
+    if padding > 0 {
+        let last = payload.as_bytes()[payload.len() - padding - 1];
+        let Some(value) = base64_value(last) else {
+            return DataUriPayload::Invalid;
+        };
+        let mask = if padding == 1 { 0b11 } else { 0b1111 };
+        if value & mask != 0 {
+            return DataUriPayload::Invalid;
+        }
+    }
+    let decoded = payload.len() / 4 * 3 - padding;
+    if decoded > MAX_DEEPSEEK_FILE_RAW_BYTES {
+        return DataUriPayload::TooLarge;
+    }
+    DataUriPayload::Valid(payload)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// 降级提示里的 URL 标签：去掉 query / fragment / 凭据，避免签名 URL 被写进日志或
+/// 会话正文。解析失败时只回一个固定占位。
+fn safe_url_label(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) if matches!(parsed.scheme(), "http" | "https") => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+            }
+            parsed.to_string()
+        }
+        Err(_) => "<invalid-url>".to_string(),
+        _ => "<unsupported-url>".to_string(),
+    }
+}
+
+/// DeepSeek 带 tools 时的历史 reasoning 校验。
+///
+/// 官方规则：请求里一旦带 tools，之前所有 assistant 轮的 `reasoning_content` 都必须
+/// 完整回传，否则 400。这里只校验**参与工具链**的 assistant 消息（含 ToolUse）——
+/// 它们缺失 reasoning 必然触发远端 400；对应的 tool_result 也会因配对而放大问题。
+/// 缺失时返回 `LlmError::Config`（NonRetryable，不重试），并给出可执行的恢复路径。
+fn ensure_deepseek_tool_reasoning(messages: &[Message], dialect: &Dialect) -> Result<()> {
+    // DeepSeek 只认 `reasoning_content`；`reasoning` 是别的厂商字段名，回传后不会被
+    // 当作 reasoning，等同缺失。
+    if dialect.reasoning_field != ReasoningField::ReasoningContent {
+        return Err(LlmError::Config(
+            "DeepSeek 开启思考且带工具时必须回传 reasoning_content；当前 provider 的 \
+             reasoning_field 不是 reasoning_content，请改为 reasoning_content（或关闭思考）"
+                .into(),
+        ));
+    }
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let has_tool_use = message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        if !has_tool_use {
+            continue;
+        }
+        let has_reasoning = message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Reasoning { reasoning_content } if !reasoning_content.trim().is_empty()
+            )
+        });
+        if !has_reasoning {
+            return Err(LlmError::Config(format!(
+                "DeepSeek 要求带工具调用的历史完整回传 reasoning_content；messages[{index}] \
+                 缺少该字段（通常来自其它 provider 的旧会话）。请新建会话，或先切回非 \
+                 DeepSeek 模型处理该会话。"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn join_reasoning(m: &Message) -> Option<String> {
@@ -552,7 +833,8 @@ fn parse_tool_calls(val: Option<&Value>, max_tool_calls: usize) -> Result<Vec<To
         // tool_call_id 的结果，下一轮回放给 OpenAI 兼容接口时配对会产生歧义甚至 400。
         if !seen_ids.insert(id) {
             return Err(LlmError::BadResponse(format!(
-                "同一响应内 tool_call id 重复: {id}"
+                "同一响应内 tool_call id 重复（tool_calls[{}]）",
+                out.len()
             )));
         }
         let input = match func.get("arguments") {
@@ -580,6 +862,8 @@ fn parse_tool_calls(val: Option<&Value>, max_tool_calls: usize) -> Result<Vec<To
 ///   非对象参数会导致下游 `cron_add` 的对象写入 panic 或把非法参数持久化进工具链历史）；
 ///   否则返回 [`LlmError::BadResponse`]，由上层【整轮拒绝】。
 ///
+/// 诊断文本只带字段位置、类型与长度，绝不回显 original 参数内容（上游可能回显凭据）。
+///
 /// 这样下游（agent loop、持久化）拿到的 `ToolCall.input` 一定是合法 JSON 对象，
 /// 杜绝「畸形 arguments 被静默当成 `{}` 执行、并把坏响应当成正常工具错误写进会话」。
 fn normalize_arguments(raw: &str) -> std::result::Result<String, LlmError> {
@@ -590,11 +874,14 @@ fn normalize_arguments(raw: &str) -> std::result::Result<String, LlmError> {
     // 要求解析结果为 Object：工具调用参数必须是键值对，数组/字符串/数字等非对象
     // 会导致下游（如 cron_add 的 input["channel"] = ... 对象写入）panic。
     let v: Value = serde_json::from_str(trimmed).map_err(|_| {
-        LlmError::BadResponse(format!("tool_call arguments 非合法 JSON: {trimmed}"))
+        LlmError::BadResponse(format!(
+            "tool_call arguments 非合法 JSON（{} 字节）",
+            raw.len()
+        ))
     })?;
     if !v.is_object() {
         return Err(LlmError::BadResponse(format!(
-            "tool_call arguments 非 JSON 对象（类型={}）: {trimmed}",
+            "tool_call arguments 非 JSON 对象（类型={}）",
             if v.is_array() {
                 "array"
             } else if v.is_string() {
@@ -683,17 +970,66 @@ impl OpenAiSseParser {
             let id = s.id.as_deref().expect("上方已校验 tool_call id");
             if !seen.insert(id) {
                 return Err(LlmError::BadResponse(format!(
-                    "流式 tool_call 跨槽位重复 id: {id}"
+                    "流式 tool_call 跨槽位重复 id（tool_call[{i}]）"
                 )));
             }
             normalize_arguments(&s.args).map_err(|_| {
                 LlmError::BadResponse(format!(
-                    "流结束但 tool_call[{i}] arguments 非合法 JSON: {}",
-                    s.args
+                    "流结束但 tool_call[{i}] arguments 非合法 JSON（{} 字节）",
+                    s.args.len()
                 ))
             })?;
         }
         Ok(())
+    }
+}
+
+/// 把流内 `error` 对象收敛为受控错误码（code/type）与分类标记，绝不透出 message。
+fn stream_error_summary(error: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(object) = error.as_object() {
+        // 先归一 code/type，再判断瞬时优先级：大小写/空白不影响结论，且任一字段
+        // 明确瞬时时，另一个字段（如 context_length_exceeded）不得覆盖它。
+        let mut transient: Option<(String, String)> = None;
+        for key in ["code", "type"] {
+            let Some(raw) = object.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            let normalized = raw.trim().to_ascii_lowercase();
+            if transient.is_none() && crate::error::error_code_is_transient(&normalized) {
+                transient = Some((key.to_string(), normalized));
+            }
+        }
+        if let Some((key, code)) = transient {
+            return format!("流内错误事件（瞬时错误，{key}={code}）");
+        }
+        for key in ["code", "type"] {
+            if let Some(code) = object
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(crate::error::safe_error_code)
+            {
+                for tag in crate::error::error_code_tags(&code) {
+                    if !parts.iter().any(|part| part.ends_with(tag)) {
+                        parts.push(tag.to_string());
+                    }
+                }
+                parts.push(format!("{key}={code}"));
+            }
+        }
+        // message 只用于内部提取鉴权/超限分类，原文不外泄。
+        if let Some(message) = object.get("message").and_then(Value::as_str) {
+            for tag in crate::error::upstream_error_tags(message) {
+                if !parts.iter().any(|part| part.ends_with(tag)) {
+                    parts.push(tag.to_string());
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        "流内错误事件（未提供可识别错误码，正文已省略）".to_string()
+    } else {
+        format!("流内错误事件（{}）", parts.join(", "))
     }
 }
 
@@ -715,19 +1051,14 @@ impl StreamParser for OpenAiSseParser {
             self.usage = Some(usage);
         }
 
+        // error 必须先于 choices 判断：部分端点把 error 与空 choices 数组放在同一帧，
+        // 先看 choices 会把鉴权/超限信号当空帧丢掉。
+        if let Some(error) = root.get("error").filter(|value| !value.is_null()) {
+            return Err(LlmError::StreamAborted(stream_error_summary(error)));
+        }
         let choices = match root.get("choices").and_then(|c| c.as_array()) {
-            // 无 choices：可能是 error 对象或心跳。
-            None => {
-                if root.get("error").is_some() {
-                    let msg = root["error"]
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown stream error");
-                    return Err(LlmError::StreamAborted(msg.to_string()));
-                }
-                // 心跳/空事件，安全跳过。
-                return Ok(delta);
-            }
+            // 无 choices：心跳/usage 空事件，安全跳过。
+            None => return Ok(delta),
             Some(c) => c,
         };
 
@@ -735,6 +1066,33 @@ impl StreamParser for OpenAiSseParser {
             Some(c) => c,
             None => return Ok(delta),
         };
+
+        // 结束原因必须先于 delta 处理：上游资源不足/中止的终帧可能同时带不完整的
+        // tool_call 分片，先解析 delta 会先返回 BadResponse，永远走不到可重试分类。
+        if let Some(fr) = choice0
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            match FinishReason::from_openai(fr) {
+                FinishReason::Stop => {
+                    self.stop = Some(FinishReason::Stop);
+                    delta.finished = Some(FinishReason::Stop);
+                }
+                FinishReason::ToolCalls => {
+                    // 这里只记录逻辑结束原因。索引连续性、字段完整性和 arguments JSON
+                    // 校验统一推迟到 `finish()`，确保所有已到达的 SSE 分片都先完成聚合。
+                    self.stop = Some(FinishReason::ToolCalls);
+                    delta.finished = Some(FinishReason::ToolCalls);
+                }
+                _ if upstream_busy_finish_reason(fr, &self.dialect) => {
+                    return Err(LlmError::UpstreamBusy(
+                        "上游结束原因表示资源暂不可用（可重试）".to_string(),
+                    ));
+                }
+                other => return Err(LlmError::BadResponse(format!("异常结束: {other:?}"))),
+            }
+        }
 
         if let Some(d) = choice0.get("delta") {
             // 文本增量：累积 + 回调。
@@ -799,7 +1157,7 @@ impl StreamParser for OpenAiSseParser {
                         match &slot.id {
                             Some(existing) if existing != id => {
                                 return Err(LlmError::BadResponse(format!(
-                                    "tool_call[{idx}] id 不一致：已收到 {existing}，新 chunk 声称 {id}"
+                                    "tool_call[{idx}] 的 id 在流中发生变化"
                                 )));
                             }
                             _ => slot.id = Some(id.to_string()),
@@ -814,7 +1172,7 @@ impl StreamParser for OpenAiSseParser {
                             match &slot.name {
                                 Some(existing) if existing != n => {
                                     return Err(LlmError::BadResponse(format!(
-                                        "tool_call[{idx}] name 不一致：已收到 {existing}，新 chunk 声称 {n}"
+                                        "tool_call[{idx}] 的 name 在流中发生变化"
                                     )));
                                 }
                                 _ => slot.name = Some(n.to_string()),
@@ -836,27 +1194,6 @@ impl StreamParser for OpenAiSseParser {
                         }
                     }
                 }
-            }
-        }
-
-        // 结束原因。
-        if let Some(fr) = choice0
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            match FinishReason::from_openai(fr) {
-                FinishReason::Stop => {
-                    self.stop = Some(FinishReason::Stop);
-                    delta.finished = Some(FinishReason::Stop);
-                }
-                FinishReason::ToolCalls => {
-                    // 这里只记录逻辑结束原因。索引连续性、字段完整性和 arguments JSON
-                    // 校验统一推迟到 `finish()`，确保所有已到达的 SSE 分片都先完成聚合。
-                    self.stop = Some(FinishReason::ToolCalls);
-                    delta.finished = Some(FinishReason::ToolCalls);
-                }
-                other => return Err(LlmError::BadResponse(format!("异常结束: {other:?}"))),
             }
         }
 

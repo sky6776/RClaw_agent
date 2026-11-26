@@ -24,9 +24,9 @@ use rclaw_store::fs::Layout;
 use rclaw_store::memory::MemoryStore;
 use rclaw_store::session::SessionStore;
 use rclaw_tools::{
-    CronController, DoubaoBackend, MemoryTool, ProviderSearchTool, ReaderBackend, SearchBackend,
-    SessionSearchTool, SkillListTool, SkillManageTool, SkillUsageStore, TavilyClient,
-    TavilyExtract, ToolRegistry, WebSearch, WebSearchControl, WxbotChatHistoryTool,
+    CronController, DeepSeekBackend, DoubaoBackend, MemoryTool, ProviderSearchTool, ReaderBackend,
+    SearchBackend, SessionSearchTool, SkillListTool, SkillManageTool, SkillUsageStore,
+    TavilyClient, TavilyExtract, ToolRegistry, WebSearch, WebSearchControl, WxbotChatHistoryTool,
     WxbotChatListTool, WxbotMessageSearchTool, ZhipuBackend,
 };
 
@@ -279,6 +279,15 @@ pub async fn assemble_core_with(
                 TavilyExtract::from_client(client, control.clone()).map_err(anyhow::Error::msg)?,
             ));
         }
+        if let Some(provider_cfg) = web_cfg.deepseek {
+            let backend = Arc::new(DeepSeekBackend::new(provider_cfg).map_err(anyhow::Error::msg)?);
+            tools.register(Box::new(
+                ProviderSearchTool::new(backend.clone(), control.clone(), standalone_max_results)
+                    .map_err(anyhow::Error::msg)?,
+            ));
+            search_backends.push(backend.clone());
+            reader_backends.push(backend);
+        }
         if let Some(provider_cfg) = web_cfg.zhipu {
             let backend = Arc::new(ZhipuBackend::new(provider_cfg).map_err(anyhow::Error::msg)?);
             tools.register(Box::new(
@@ -495,11 +504,43 @@ pub async fn assemble_core_with(
     let tools = Arc::new(tools);
     let _ = agent_tools_registry.set(tools.clone());
 
-    // 斜杠命令注册表：/llmodel 持久化到调用方指定的 rclaw.toml 路径。
+    // 斜杠命令注册表：搜索控制与模型/思考切换持久化到调用方指定的 rclaw.toml 路径。
     // 后面收尾没存完的同步设置还要写回同一个文件：留一份路径。
     let sync_config_path = slash_config_path.clone();
     let slash = Arc::new({
-        let reg = SlashRegistry::new(hot.clone(), slash_config_path, cfg.llm.provider.clone());
+        let reg = SlashRegistry::new(
+            hot.clone(),
+            slash_config_path,
+            cfg.effective_provider_name().to_string(),
+        )
+        // 跨 provider 切换用：解析调用方传入的**事务快照文本**（与写回同一份），
+        // 不做遗留节物理写回，选中目标条目并用它自己的 key 构造；构造失败时
+        // 调用方明确报错且不改运行时。
+        .with_provider_factory(Arc::new(
+            move |name: &str,
+                  text: &str,
+                  over: Option<&rclaw_runtime::slash::ProviderProfileOverride<'_>>| {
+                // 解析调用方传入的事务快照，不再独立读盘：校验、编辑、构造 live 用同一份文本。
+                let latest = Config::from_toml(text)
+                    .map_err(|error| rclaw_llm::redact_secrets(&format!("{error:#}")))?;
+                let built = match over {
+                    Some(over) => latest.build_provider_config_for_profile(
+                        name,
+                        &crate::config::ProviderProfileParams {
+                            model: over.model,
+                            media_wire: over.media_wire,
+                            thinking: over.thinking,
+                            reasoning_effort: over.reasoning_effort,
+                            reasoning_field: over.reasoning_field,
+                            max_tokens_key: over.max_tokens_key,
+                            max_tokens: over.max_tokens,
+                        },
+                    ),
+                    None => latest.build_provider_config_for(name),
+                };
+                built.map_err(|error| rclaw_llm::redact_secrets(&format!("{error:#}")))
+            },
+        ));
         match web_search_control.clone() {
             Some(control) => reg.with_web_search_control(control),
             None => reg,

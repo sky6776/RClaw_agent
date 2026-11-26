@@ -3275,6 +3275,7 @@ fn all_direct_search_tools_are_read_only_and_summarized_consistently() {
     for name in [
         "zhipu_search",
         "tavily_search",
+        "deepseek_search",
         "doubao_custom_search",
         "doubao_global_search",
     ] {
@@ -8063,7 +8064,10 @@ script = "scripts/analyze.py"
 // ---- 斜杠命令（非 /cancel）仍可绕过 LLM 与 session 历史 ----
 
 fn zhipu_fixture() -> rclaw_llm::ProviderConfig {
-    use rclaw_llm::{AuthScheme, Dialect, MaxTokensKey, ProtocolKind, ReasoningField};
+    use rclaw_llm::{
+        AuthScheme, Dialect, MaxTokensKey, MediaWire, ProtocolKind, ProviderFlavor,
+        ReasoningConfig, ReasoningField,
+    };
     rclaw_llm::ProviderConfig {
         name: "zhipu".into(),
         base_url: "https://open.bigmodel.cn/api/coding/paas/v4".into(),
@@ -8075,7 +8079,11 @@ fn zhipu_fixture() -> rclaw_llm::ProviderConfig {
             reasoning_field: ReasoningField::ReasoningContent,
             supports_tool_choice: true,
             max_tokens_key: MaxTokensKey::MaxTokens,
+            classify_upstream_busy: false,
         },
+        flavor: ProviderFlavor::Zhipu,
+        media_wire: MediaWire::OpenAiCompat,
+        reasoning: ReasoningConfig::default(),
         max_tokens: 4096,
         request_timeout_secs: 300,
         max_tool_calls: 128,
@@ -8122,16 +8130,12 @@ api_key = "secret"
         None,
     ));
 
-    mgr.route(BusMessage::new(
-        CHANNEL_CLI,
-        "console",
-        "/llmodel glm-5.3-flash",
-    ))
-    .await;
+    mgr.route(BusMessage::new(CHANNEL_CLI, "console", "/help"))
+        .await;
     wait_idle(&mgr).await;
 
     let resp = outbound_rx.recv().await.unwrap();
-    assert!(resp.content.contains("已切换模型"));
+    assert!(resp.content.contains("可用斜杠命令"));
     let history = session
         .load_history(CHANNEL_CLI, "console", 10, 1024 * 1024)
         .unwrap();
@@ -8336,15 +8340,11 @@ api_key = "secret"
         .await;
     wait_history_len(&session, CHANNEL_CLI, "console", 1).await;
 
-    mgr.route(BusMessage::new(
-        CHANNEL_CLI,
-        "console",
-        "/llmodel glm-5.3-flash",
-    ))
-    .await;
+    mgr.route(BusMessage::new(CHANNEL_CLI, "console", "/help"))
+        .await;
 
     let resp = outbound_rx.recv().await.unwrap();
-    assert!(resp.content.contains("已切换模型"));
+    assert!(resp.content.contains("可用斜杠命令"));
 
     let h = session
         .load_history(CHANNEL_CLI, "console", 10, 1024 * 1024)
@@ -8352,10 +8352,8 @@ api_key = "secret"
     assert_eq!(h.len(), 1);
     assert_eq!(h[0].content[0].as_text().unwrap(), "长任务");
     assert!(
-        !h.iter().any(|m| m
-            .content
-            .iter()
-            .any(|b| b.as_text() == Some("/llmodel glm-5.3-flash"))),
+        !h.iter()
+            .any(|m| m.content.iter().any(|b| b.as_text() == Some("/help"))),
         "已知斜杠命令不得作为普通 user 文本进入 session"
     );
 

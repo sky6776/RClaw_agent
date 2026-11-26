@@ -36,6 +36,7 @@ fs2 = "0.4"                      # 工作流 driver 单实例锁（跨进程）
 globset = "0.4"                  # files.glob（项目根相对、拒绝越界）
 walkdir = "2"                    # files.glob/grep 目录遍历
 regex = "1"                      # files.grep / 代码扫描
+url = "2"                        # 热切换同源判断（与配置校验同一套 URL 解析）
 serde_yaml = "0.9"               # 存档工作流元数据块（/* rclaw-workflow ... */）
 rand = { workspace = true }      # 工作流 run / 请求 / 临时名
 oxc_parser = "0.116.0"

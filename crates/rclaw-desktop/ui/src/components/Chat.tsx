@@ -9,7 +9,7 @@ import React, {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, type PermissionMode, type PlanStatus } from "../lib/api";
+import { api, type LlmState, type PermissionMode, type PlanStatus, type UsageSnapshot } from "../lib/api";
 import type { ToolCallView } from "../lib/toolCalls";
 import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
 import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
@@ -29,6 +29,8 @@ import {
 import WorkflowCard from "./WorkflowCard";
 import MediaGallery, { type GalleryItem, type GallerySeed } from "./MediaGallery";
 import ToolBatchRows from "./ToolCallRow";
+import ModelThinkingPicker from "./ModelThinkingPicker";
+import ContextUsageRing from "./ContextUsageRing";
 import { RoundNavButton, RoundNavSheet, RoundRail, useWidePointer, type RoundNavItem } from "./RoundNav";
 import { CheckIcon, CopyIcon, ForkIcon, GearIcon, PencilIcon, QuoteIcon, ShieldIcon } from "./icons";
 
@@ -99,6 +101,8 @@ interface Props {
   onQueueEnqueue: (text: string) => void;
   /** 从队列移除一条（删除 / 编辑回填 / 立即投递前）。 */
   onQueueRemove: (id: number) => void;
+  /** 当前会话上下文用量（App 每 5s 轮询 usage_snapshot）：底部环形按钮实时显示占比。 */
+  usage?: UsageSnapshot | null;
 }
 
 /** 排队消息条目（App 级状态，按会话分桶存放——Chat 随页面切换会卸载，组件内
@@ -642,7 +646,7 @@ function ThinkingBlock({
 }
 
 /** 对话页（展示组件）：消息与忙碌状态由 App 按会话持有，切页 / 切会话不丢失。
- *  斜杠命令（/llmodel /context …）直接在输入框输入。 */
+ *  斜杠命令（/search /context …）直接在输入框输入。 */
 export default function Chat({
   entries,
   busy,
@@ -664,6 +668,7 @@ export default function Chat({
   onQueueRemove,
   fontScale,
   onFontScale,
+  usage,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -827,6 +832,65 @@ export default function Chat({
   const [foldGen, setFoldGen] = useState(0);
   // 移动端无物理键盘：占位文案去掉 Enter/↑↓ 提示。
   const isMobile = useIsMobile();
+  // 会话页「模型 + 思考强度」：选项完全由后端按 live provider + 模型给出。切会话、
+  // 窗口重获焦点、打开菜单、turn 结束都刷新；提交带 expected provider/model，防止
+  // 菜单打开后模型被另一窗口切走仍把旧档位写进新模型。
+  const [llm, setLlm] = useState<LlmState | null>(null);
+  const llmSeq = useRef(0);
+  const llmRevision = useRef(0);
+  const applyLlm = useCallback((next: LlmState) => {
+    // 版本单调：晚到的 GET / 旧窗口的 SET 回执 / 乱序广播都不能倒退状态。
+    if (next.revision < llmRevision.current) return;
+    llmRevision.current = next.revision;
+    setLlm(next);
+  }, []);
+  const refreshLlm = useCallback(() => {
+    const seq = ++llmSeq.current;
+    api
+      .chatLlmState()
+      .then((next) => {
+        if (seq === llmSeq.current) applyLlm(next);
+      })
+      .catch(() => {
+        // 刷新失败保留最近一次有效快照：期间收到的广播/回执可能比这次 GET 新，
+        // 不能因为一次晚到的 IPC 失败把底栏选择器清空。
+      });
+  }, [applyLlm]);
+  useEffect(() => {
+    void refreshLlm();
+  }, [sessionKey, refreshLlm]);
+  // 多窗口：任一窗口切换模型/档位后广播权威状态，其它窗口立即跟随。
+  // 注册完成后再补读一次：首读发生在订阅生效前，期间另一窗口的提交会既错过
+  // 广播、又可能让首读结果落在提交之前（竞态窗口）。
+  useEffect(() => {
+    let active = true;
+    // 事件不推进请求序号：用 revision 排序，避免旧广播把补读拿到的高版本 GET
+    // 一并作废（序号只用于拒绝失效生命周期的 GET/失败）。
+    const pending = api.onLlmStateChanged((next) => {
+      applyLlm(next);
+    });
+    void pending.then((unlisten) => {
+      if (!active) {
+        unlisten();
+        return;
+      }
+      void refreshLlm();
+    });
+    return () => {
+      active = false;
+      void pending.then((unlisten) => unlisten());
+    };
+  }, [applyLlm, refreshLlm]);
+  useEffect(() => {
+    const onFocus = () => void refreshLlm();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshLlm]);
+  const wasBusyRef = useRef(busy);
+  useEffect(() => {
+    if (wasBusyRef.current && !busy) void refreshLlm();
+    wasBusyRef.current = busy;
+  }, [busy, refreshLlm]);
   useEffect(() => {
     api
       .permissionModeGet()
@@ -2332,6 +2396,45 @@ export default function Chat({
   const navEnabled = rounds.length >= 2 && selectIds === null && textSelectId === null;
   const railVisible = navEnabled && !isAndroidDevice() && widePointer;
   const fabVisible = navEnabled && !railVisible;
+  // 模型 + 思考强度选择器：bot/群编排会话用各自的固定 provider，不显示主 provider 的档位。
+  const modelPicker =
+    llm && !sessionKey.startsWith("bot-") && !sessionKey.startsWith("grp-") ? (
+      <ModelThinkingPicker
+        state={llm}
+        busy={busy}
+        onOpen={refreshLlm}
+        onModelSelect={async (model, expected) => {
+          try {
+            const next = await api.chatSetModel(
+              model,
+              expected.model.provider,
+              expected.model.model,
+              expected.revision,
+            );
+            // 回执按 revision 参与排序；若期间有更新的 GET/广播，它会覆盖本次，
+            // 反之本次也不会作废更高版本的 GET。
+            applyLlm(next);
+          } catch (error) {
+            onError?.(String(error));
+            refreshLlm();
+          }
+        }}
+        onThinkingSelect={async (value, expected) => {
+          try {
+            const next = await api.chatSetThinking(
+              value,
+              expected.model.provider,
+              expected.model.model,
+              expected.revision,
+            );
+            applyLlm(next);
+          } catch (error) {
+            onError?.(String(error));
+            refreshLlm();
+          }
+        }}
+      />
+    ) : null;
   // 轮次面板开合（安卓/窄窗形态）：触发钮在输入区工具条、面板在消息列表
   // wrapper，分居两个子树，状态只能放这里。fab 形态退场（切选择模式/切桌面
   // 宽屏/rounds<2）时必须复位，否则回到该形态时面板自动重开。
@@ -3221,6 +3324,11 @@ export default function Chat({
                 ⏳ 排队
               </button>
             )}
+            {/* 底栏右侧（紧挨发送按钮）：环形上下文用量 → 模型+思考强度。 */}
+            <div className="ml-auto flex items-center gap-1">
+              <ContextUsageRing usage={usage ?? null} />
+              {modelPicker}
+            </div>
             {/* 卡片内右下角圆形按钮（与工具钮同排）：空闲 = ↑ 发送；工作中 = ■ 停止 */}
             <button
               onClick={stopOrSend}
@@ -3229,7 +3337,7 @@ export default function Chat({
               }
               title={busy ? "停止当前任务" : "发送"}
               aria-label={busy ? "停止" : "发送"}
-              className={`ml-auto flex h-10 w-10 items-center justify-center rounded-full transition ${
+              className={`flex h-10 w-10 items-center justify-center rounded-full transition ${
                 busy
                   ? "bg-gray-200 text-gray-900 hover:bg-white"
                   : "bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-40"

@@ -14,7 +14,7 @@ agent 每轮可用的工具面由三部分组成：本文的内置工具、技�
 | 执行 | `shell` `shell_poll` |
 | 记忆与检索 | `memory` `session_search` `session_handoff` |
 | 微信消息（wxbot） | `wxbot_chat_list` `wxbot_chat_history` `wxbot_message_search` |
-| 联网 | `web_search`（及各来源独立工具 `doubao_custom_search` / `tavily_search` / `zhipu_search` / `doubao_global_search`）`tavily_extract` |
+| 联网 | `web_search`（及各来源独立工具 `doubao_custom_search` / `tavily_search` / `deepseek_search` / `zhipu_search` / `doubao_global_search`）`tavily_extract` |
 | 浏览器 | `browser_navigate` `browser_snapshot` `browser_extract` `browser_click` `browser_type` `browser_scroll` `browser_screenshot` `browser_media` `browser_close` |
 | 媒体 | `download_media`（安卓另有 `open_media`） |
 | 技能管理 | `skills_list` `skill_manage` |
@@ -83,7 +83,7 @@ wxbot 通道未收到过消息时返回 `db_missing`；旧版 schema 库返回 `
 ```toml
 [web_search]
 enabled = true
-order = ["doubao-custom", "tavily", "zhipu", "doubao-global"]
+order = ["doubao-custom", "tavily", "deepseek", "zhipu", "doubao-global"]
 fallback = true
 read_top = 3                  # 示例值；缺省 1，范围 0–5：最多补读前 N 条正文
 max_results = 10
@@ -92,13 +92,14 @@ circuit_failure_threshold = 3 # 1–20
 circuit_cooldown_secs = 60    # 1–3600
 
 [web_search.tavily]           # api_keys（多 Key 轮换）、timeout_secs 20、max_results 5、search_depth basic、include_answer
+[web_search.deepseek]         # api_key、base_url、timeout_secs 20、max_results 10、need_content true（false=搜索只拿摘要）
 [web_search.zhipu]            # api_key、startup_timeout_secs 10、call_timeout_secs 10、search_url、reader_url
 [web_search.doubao_custom]    # api_key、timeout_secs 8、max_results 50
 [web_search.doubao_global]    # api_key、timeout_secs 8、max_results 20、max_snippet_tokens 1000
 ```
 
-- `web_search(search_query | url, read_top, max_results)`：URL 优先（直接读正文）；查询最长 1024 字节；`read_top` 默认 1、范围 0–5；`max_results` 默认 10、范围 1–50；总预算 25 秒；只有 Tavily 与智谱补读正文。输出总限 48000 字符，单摘要 / 片段 / 正文分别 8000 / 1500 / 6000。
-- **路由与降级**：按 `order` 顺序尝试（过滤未配置项），`fallback = true` 时失败自动切换下一来源。瞬态错误路由层快速重试 1 次（间隔 150 ms）；连续 3 次瞬态 / 限流失败后冷却 60 秒。鉴权 / 额度错误永久阻塞该来源直到 `/search en <来源>`；豆包 Custom 限流或额度错误优先切到 Global。Tavily 在鉴权 / 额度 / 限流时轮换全部 Key，成功后固定健康 Key；智谱后端内部最多再重试 1 次（共 2 次尝试）、退避 200 ms、请求间隔至少 250 ms。
+- `web_search(search_query | url, read_top, max_results)`：URL 优先（直接读正文）；查询最长 1024 字节；`read_top` 默认 1、范围 0–5；`max_results` 默认 10、范围 1–50；总预算 25 秒；Tavily / 智谱 / DeepSeek 可补读正文。输出总限 48000 字符，单摘要 / 片段 / 正文分别 8000 / 1500 / 6000。
+- **路由与降级**：按 `order` 顺序尝试（过滤未配置项），`fallback = true` 时失败自动切换下一来源。瞬态错误路由层快速重试 1 次（间隔 150 ms）；连续 3 次瞬态 / 限流失败后冷却 60 秒。鉴权 / 额度错误永久阻塞该来源直到 `/search en <来源>`；豆包 Custom 限流或额度错误优先切到 Global。Tavily 在鉴权 / 额度 / 限流时轮换全部 Key，成功后固定健康 Key；智谱后端内部最多再重试 1 次（共 2 次尝试）、退避 200 ms、请求间隔至少 250 ms。DeepSeek 远端 400/422 归为来源级失败（不中止整条 fallback 链），408/5xx/超时归瞬态。DeepSeek 的 Search/Fetch 由服务端抓取；RClaw 侧只校验公网 http(s) URL、拒绝凭据/内网地址、禁止 API 客户端跟随重定向，服务端对最终 DNS 与目标页重定向的公网约束以 DeepSeek 契约为准。
 - 命令：`/search` 查看状态；`/search <来源>` 持久调整首选；`/search dis|en <来源>` 持久禁用 / 启用（启用会清除阻塞）；`/searchfallback [on|off]` 持久切换降级（无参查看状态）。
 
 ## 浏览器

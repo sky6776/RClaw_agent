@@ -104,31 +104,77 @@ fn migrate_legacy_dir(legacy: &Path, home: &Path) -> std::io::Result<()> {
     // home 若已被建出（至多为空目录）先移掉，rename 才能落位；
     // 移不掉（非空但无配置）或跨卷 rename 失败 → 复制合并兜底。
     if home.exists() && std::fs::remove_dir(home).is_err() {
-        return copy_dir(legacy, home);
+        return copy_dir(legacy, home, std::path::Path::new(""));
     }
     match std::fs::rename(legacy, home) {
         Ok(()) => Ok(()),
-        Err(_) => copy_dir(legacy, home),
+        Err(_) => copy_dir(legacy, home, std::path::Path::new("")),
     }
 }
 
 /// 递归复制目录（rename 跨卷失败时的迁移兜底）。
 #[cfg_attr(all(target_os = "android", feature = "apk-host"), allow(dead_code))]
-fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+fn copy_dir(src: &Path, dst: &Path, rel: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
+    let mut entries: Vec<(std::ffi::OsString, std::path::PathBuf, bool)> = Vec::new();
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        let target = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &target)?;
+        let name = entry.file_name();
+        let is_dir = entry.file_type()?.is_dir();
+        if !is_dir && is_internal_lock(rel, &name) {
+            continue;
+        }
+        entries.push((name, entry.path(), is_dir));
+    }
+    // 配置必须最后发布：它存在即代表「已迁移」，先发布会让中途失败的迁移被
+    // 下次启动整体跳过，留下缺失的数据文件。其它文件先补齐（重复迁移会跳过
+    // 已完整发布的同名文件），配置落位即完成。
+    entries.sort_by_key(|(name, _, _)| name == "rclaw.toml");
+    for (_, path, is_dir) in entries {
+        let target = dst.join(path.file_name().unwrap_or_default());
+        if is_dir {
+            copy_dir(
+                &path,
+                &target,
+                &rel.join(path.file_name().unwrap_or_default()),
+            )?;
         } else {
-            std::fs::copy(entry.path(), target)?;
+            copy_new(&path, &target)?;
         }
     }
     Ok(())
 }
 
-/// 是否已完成首运行配置。
+/// 只排除 rclaw 自己的运行时锁文件，且按相对旧数据根的真实路径判断：
+/// 用户工作区里同名的业务锁文件不受影响。
+fn is_internal_lock(rel: &Path, name: &std::ffi::OsStr) -> bool {
+    match (rel.as_os_str().is_empty(), name.to_str()) {
+        (true, Some("rclaw.toml.lock")) => true,
+        (false, Some("storage.lock" | "engine.lock")) => rel == Path::new("sync"),
+        _ => false,
+    }
+}
+
+/// 复制单个文件：先写同目录临时文件，再以无覆盖方式原子发布。
+///
+/// 目标已存在（另一实例/更早一次迁移已发布）时跳过，不覆盖；进程中断最多留下
+/// 一个临时文件，不会留下半份正式文件。
+fn copy_new(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut input = std::fs::File::open(src)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".rclaw-migrate-")
+        .tempfile_in(parent)?;
+    std::io::copy(&mut input, tmp.as_file_mut())?;
+    tmp.as_file().sync_all()?;
+    match tmp.persist_noclobber(dst) {
+        Ok(_file) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error),
+    }
+}
+
+/// 是否已完成首运行配置。/// 是否已完成首运行配置。
 pub fn has_config(home: &Path) -> bool {
     config_path(home).exists()
 }
@@ -204,6 +250,50 @@ mod tests {
         migrate_legacy_dir(&legacy, &home).unwrap();
         assert_eq!(std::fs::read_to_string(config_path(&home)).unwrap(), "new");
         assert!(legacy.exists(), "新 home 已有配置时不得动旧目录");
+    }
+
+    #[test]
+    fn legacy_copy_never_overwrites_files_created_concurrently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("rclaw.toml"), "old").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        // 模拟检查之后、复制之前另一进程写出的新配置/新文件。
+        std::fs::write(config_path(&home), "new").unwrap();
+
+        copy_dir(&legacy, &home, std::path::Path::new("")).unwrap();
+        assert_eq!(std::fs::read_to_string(config_path(&home)).unwrap(), "new");
+    }
+
+    #[test]
+    fn internal_locks_are_matched_by_relative_path_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(legacy.join("agent").join("project")).unwrap();
+        std::fs::create_dir_all(legacy.join("sync")).unwrap();
+        std::fs::write(legacy.join("rclaw.toml.lock"), "x").unwrap();
+        std::fs::write(
+            legacy.join("agent").join("project").join("engine.lock"),
+            "business",
+        )
+        .unwrap();
+        std::fs::write(legacy.join("sync").join("engine.lock"), "internal").unwrap();
+
+        copy_dir(&legacy, &home, std::path::Path::new("")).unwrap();
+        assert!(!home.join("rclaw.toml.lock").exists(), "根锁文件应跳过");
+        assert!(
+            !home.join("sync").join("engine.lock").exists(),
+            "sync 内部锁应跳过"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("agent").join("project").join("engine.lock"))
+                .unwrap(),
+            "business",
+            "用户工作区同名业务锁必须复制"
+        );
     }
 
     #[test]

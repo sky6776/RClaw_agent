@@ -18,10 +18,10 @@ pub mod provider;
 
 // 顶层 re-export。
 pub use config::{
-    model_supports_multimodal, AuthScheme, Dialect, MaxTokensKey, ProtocolKind, ProviderConfig,
-    ReasoningField,
+    model_supports_multimodal, AuthScheme, Dialect, MaxTokensKey, MediaWire, ProtocolKind,
+    ProviderConfig, ProviderFlavor, ReasoningConfig, ReasoningField,
 };
-pub use error::{LlmError, LlmErrorClass, Result};
+pub use error::{redact_secrets, LlmError, LlmErrorClass, Result};
 pub use hotswap::SwappableProvider;
 pub use openai_compat::OpenAiCompat;
 pub use protocol::{ChatProtocol, StreamDelta, StreamParser};

@@ -60,10 +60,11 @@ pub use skill_usage::{
 };
 pub use truncate::{head_tail_truncate, HeadTailBuffer, HeadTailOutput};
 pub use web_search::{
-    BackendError, BackendErrorKind, BackendId, BackendStatus, DoubaoBackend, DoubaoSearchConfig,
-    DoubaoVariant, HealthStatus, ProviderSearchTool, ReadResponse, ReaderBackend, SearchBackend,
-    SearchHit, SearchRequest, SearchResponse, TavilyClient, TavilyExtract, TavilySearchConfig,
-    WebSearch, WebSearchConfig, WebSearchControl, ZhipuBackend, ZhipuSearchConfig,
+    BackendError, BackendErrorKind, BackendId, BackendStatus, DeepSeekBackend,
+    DeepSeekSearchConfig, DoubaoBackend, DoubaoSearchConfig, DoubaoVariant, HealthStatus,
+    ProviderSearchTool, ReadResponse, ReaderBackend, SearchBackend, SearchHit, SearchRequest,
+    SearchResponse, TavilyClient, TavilyExtract, TavilySearchConfig, WebSearch, WebSearchConfig,
+    WebSearchControl, ZhipuBackend, ZhipuSearchConfig,
 };
 pub use wxbot_history::{WxbotChatHistoryTool, WxbotChatListTool, WxbotMessageSearchTool};
 

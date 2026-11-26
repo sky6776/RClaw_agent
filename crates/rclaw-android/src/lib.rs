@@ -706,27 +706,97 @@ fn heartbeat_is_fresh(now_ms: u64, last_ms: u64) -> bool {
 /// 本次仍按剥离结果加载，下次启动再试。deny_unknown_fields 会把遗留键当
 /// 「拼错的键」拒绝（实例：v2.8.0 删除 [web_browser]，v2.7.x 配置在其上
 /// 启动即「解析 rclaw.toml 失败」），所以解析前必须剥离。
-fn from_toml_purging_legacy(toml: &str, files_dir: &Path) -> Result<RClawConfig> {
-    let (stripped, removed) = rclaw_cli::config::strip_removed_legacy_sections(toml);
-    if !removed.is_empty() {
-        let path = files_dir.join("rclaw.toml");
-        // 原子写：rclaw.toml 是唯一真源（含 API key），启动期被杀进程若落在
-        // `fs::write` 的截断窗口内，整份配置归零。
-        match rclaw_store::atomic_write(&path, stripped.as_bytes()) {
-            Ok(()) => log_boot(&format!(
-                "已从 rclaw.toml 物理移除已退役配置节: {}",
-                removed.join(", ")
-            )),
-            Err(error) => log_boot(&format!(
-                "rclaw.toml 遗留节写回失败: {error}（本次按剥离结果加载）"
-            )),
+fn from_toml_purging_legacy(
+    toml: &str,
+    files_dir: &Path,
+    mut file_authoritative: bool,
+) -> Result<RClawConfig> {
+    let path = files_dir.join("rclaw.toml");
+    let mut text = toml.to_string();
+    // CAS 冲突说明文件在读取后被改过：重新读取并用最终快照构建运行态。
+    for _ in 0..3 {
+        let (stripped, removed) = rclaw_cli::config::strip_removed_legacy_sections(&text);
+        if !removed.is_empty() {
+            // 原子写 + CAS：rclaw.toml 是唯一真源（含 API key），截断窗口内被杀
+            // 会让整份配置归零；写回失败只落 boot 日志，本次仍按剥离结果加载。
+            match rclaw_store::RclawToml::new(&path).write_text_expecting(&stripped, Some(&text)) {
+                Ok(()) => log_boot(&format!(
+                    "已从 rclaw.toml 物理移除已退役配置节: {}",
+                    removed.join(", ")
+                )),
+                Err(error) if rclaw_store::toml_file::is_cas_conflict(&error) => {
+                    log_boot(&format!(
+                        "rclaw.toml 在启动读取期间被修改，重新读取后重试: {error}"
+                    ));
+                    text = match std::fs::read_to_string(&path) {
+                        Ok(text) if text.trim().is_empty() => {
+                            if file_authoritative {
+                                return Err(anyhow!("rclaw.toml 在启动读取期间被清空，装配中止"));
+                            }
+                            return RClawConfig::from_toml(&stripped);
+                        }
+                        Ok(text) => {
+                            // 重读到非空磁盘文件后，后续冲突必须按磁盘权威处理。
+                            file_authoritative = true;
+                            text
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            if file_authoritative {
+                                return Err(anyhow!("rclaw.toml 在启动读取期间被删除，装配中止"));
+                            }
+                            return RClawConfig::from_toml(&stripped);
+                        }
+                        Err(_) => {
+                            return Err(anyhow!("重新读取 rclaw.toml 失败，装配中止"));
+                        }
+                    };
+                    continue;
+                }
+                Err(error) => {
+                    if file_authoritative {
+                        // 写失败前先确认磁盘内容仍是我们读到的这份；若文件已变得
+                        // 不可读/被改写，继续用旧文本装配会与重启分叉。
+                        match std::fs::read_to_string(&path) {
+                            Ok(current) if current == text => log_boot(&format!(
+                                "rclaw.toml 遗留节写回失败: {error}（内容未变，按剥离结果加载）"
+                            )),
+                            _ => {
+                                return Err(anyhow!(
+                                    "rclaw.toml 在启动读取期间变得不可读或已被修改，装配中止"
+                                ));
+                            }
+                        }
+                    } else {
+                        log_boot(&format!(
+                            "rclaw.toml 遗留节写回失败: {error}（仅内嵌快照，按内存剥离结果加载）"
+                        ));
+                    }
+                }
+            }
         }
+        return RClawConfig::from_toml(&stripped);
     }
-    RClawConfig::from_toml(&stripped)
+    Err(anyhow!(
+        "rclaw.toml 在启动读取期间被反复修改，遗留节清理无法取得稳定快照"
+    ))
 }
 
 /// Resolve the effective app-private agent directory without requiring an LLM key.
 /// The APK file editor uses this before the runtime has necessarily started.
+/// 读取权威配置文件：缺失/空白 → None；其它 I/O 错误直接失败（不能悄悄回退旧快照）。
+fn read_config_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => Ok(None),
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow!(
+            "读取 {} 失败（{}），拒绝用旧快照继续",
+            path.display(),
+            error.kind()
+        )),
+    }
+}
+
 pub fn resolve_agent_root(config_json: &str) -> Result<PathBuf> {
     let launch: AndroidConfig = serde_json::from_str(config_json)
         .map_err(|error| anyhow!("解析 Android 配置 JSON 失败: {error}"))?;
@@ -737,12 +807,19 @@ pub fn resolve_agent_root(config_json: &str) -> Result<PathBuf> {
     if !is_android_absolute(&files_dir) {
         return Err(anyhow!("files_dir 必须是 Android 应用私有目录的绝对路径"));
     }
-    let toml = launch
-        .toml_config
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| anyhow!("APK 完整 TOML 配置不能为空"))?;
-    let config = from_toml_purging_legacy(toml, &files_dir)?;
+    let path = files_dir.join("rclaw.toml");
+    let file_text = read_config_file(&path)?;
+    let file_authoritative = file_text.is_some();
+    let toml = match file_text {
+        Some(text) => text,
+        None => launch
+            .toml_config
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| anyhow!("APK 完整 TOML 配置不能为空"))?
+            .to_string(),
+    };
+    let config = from_toml_purging_legacy(&toml, &files_dir, file_authoritative)?;
     Ok(resolve_private_path(
         &files_dir,
         &files_dir,
@@ -760,40 +837,40 @@ pub fn resolve_android_config(launch: AndroidConfig) -> Result<ResolvedAndroidCo
         return Err(anyhow!("files_dir 必须是 Android 应用私有目录的绝对路径"));
     }
 
-    // toml_config 缺省（GUI 早于服务装配的 nativeInit 最小上下文）时，按固定路径
-    // 回读 filesDir/rclaw.toml（v1.7 review #2：agent 读固定路径；损坏/缺失由
-    // from_toml 报错，绝不自动写默认值）。
-    let toml_from_file;
-    let toml = match launch
-        .toml_config
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
-    {
-        Some(text) => text,
-        None => {
-            let path = PathBuf::from(files_dir.as_os_str()).join("rclaw.toml");
-            toml_from_file = std::fs::read_to_string(&path).map_err(|error| {
+    // 文件是唯一真源：Java 在启动时读出的 toml_config 只是快照，读完之后文件
+    // 可能已被保存/向导更新（模型、端点、轮换的 key）。Rust 装配时优先读取当前
+    // 文件；只有文件不存在/为空时才回退到 Java 快照（兼容 GUI 早于服务装配的
+    // nativeInit 最小上下文）。
+    let path = PathBuf::from(files_dir.as_os_str()).join("rclaw.toml");
+    let file_text = read_config_file(&path)?;
+    let used_file = file_text.is_some();
+    let toml_from_file = file_text.unwrap_or_default();
+    let toml = if used_file {
+        toml_from_file.as_str()
+    } else {
+        launch
+            .toml_config
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
                 anyhow!(
-                    "rclaw.toml 未提供且无法读取 {}: {error}（首次使用请完成配置向导）",
+                    "rclaw.toml 不可读且未提供内嵌配置（{}）：首次使用请完成配置向导",
                     path.display()
                 )
-            })?;
-            toml_from_file.as_str()
-        }
+            })?
     };
-    let mut config = from_toml_purging_legacy(toml, &files_dir).map_err(|error| {
-        // 真机取证（vivo logcat 被裁剪）：把输入指纹与完整错误链落到 boot log。
-        let head: String = toml.chars().take(40).collect();
+    let mut config = from_toml_purging_legacy(toml, &files_dir, used_file).map_err(|error| {
+        // 真机取证（vivo logcat 被裁剪）：只落来源与长度；配置原文（含凭据）
+        // 绝不能进 boot log。
         let boot = format!(
-            "from_toml 失败: {error:#}\n  toml_config 来源: {}\n  长度: {} 字节\n  开头 40 字符: {head:?}\n",
-            if launch
-                .toml_config
-                .as_deref()
-                .is_some_and(|t| !t.trim().is_empty())
-            {
-                "Java toml_config"
+            "from_toml 失败: {error:#}
+  toml_config 来源: {}
+  长度: {} 字节
+",
+            if used_file {
+                "filesDir/rclaw.toml（Rust 现读）"
             } else {
-                "filesDir/rclaw.toml 文件回读"
+                "Java toml_config（文件缺失/为空）"
             },
             toml.len()
         );

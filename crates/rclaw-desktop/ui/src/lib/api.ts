@@ -46,6 +46,44 @@ export interface ChatMeta {
   archived: boolean;
 }
 
+/** 思考强度的一个选项（label 由后端给出：关闭/低/高/最高）。 */
+export interface ThinkingOption {
+  value: string;
+  label: string;
+}
+
+/** 当前模型的思考强度状态；supported=false 时不显示档位区。 */
+export interface ThinkingState {
+  supported: boolean;
+  provider: string;
+  model: string;
+  current: string | null;
+  options: ThinkingOption[];
+}
+
+/** 模型选择器里的一个模型（含该模型可用的思考档位）。 */
+export interface ModelOption {
+  model: string;
+  label: string;
+  provider: string;
+  efforts: ThinkingOption[];
+}
+
+/** 模型选择器状态。 */
+export interface ModelState {
+  supported: boolean;
+  provider: string;
+  model: string;
+  models: ModelOption[];
+}
+
+/** 模型 + 思考强度的完整状态（切换后一次更新）。 */
+export interface LlmState {
+  revision: number;
+  model: ModelState;
+  thinking: ThinkingState;
+}
+
 /** 关于页的模块版本信息（对应后端 app_versions 命令）。 */
 export interface AppVersions {
   /** 应用版本（与安卓 versionName 同源）。 */
@@ -1019,7 +1057,7 @@ export const api = {
       autoEvolve: input.autoEvolve,
     }),
 
-  /** 发送对话消息到指定会话；以 `/` 开头即斜杠命令（/llmodel、/context、/cancel…）。 */
+  /** 发送对话消息到指定会话；以 `/` 开头即斜杠命令（/search、/context、/cancel…）。 */
   send: (chatId: string, content: string) =>
     invoke<void>("send_message", { chatId, content }),
 
@@ -1032,6 +1070,37 @@ export const api = {
   openHomeDir: () => invoke<void>("open_home_dir"),
 
   chatList: () => invoke<ChatMeta[]>("chat_list"),
+
+  /** 会话页「模型 + 思考强度」：当前选择器状态。 */
+  chatLlmState: () => invoke<LlmState>("chat_llm_state"),
+
+  /** 切换模型；expected* 用于拒绝"菜单打开后模型已被切走"的过期提交。 */
+  chatSetModel: (
+    model: string,
+    expectedProvider?: string | null,
+    expectedModel?: string | null,
+    expectedRevision?: number | null,
+  ) =>
+    invoke<LlmState>("chat_set_model", {
+      model,
+      expectedProvider,
+      expectedModel,
+      expectedRevision,
+    }),
+
+  /** 切换思考强度；expected* 语义同 chatSetModel。 */
+  chatSetThinking: (
+    value: string,
+    expectedProvider?: string | null,
+    expectedModel?: string | null,
+    expectedRevision?: number | null,
+  ) =>
+    invoke<LlmState>("chat_set_thinking", {
+      value,
+      expectedProvider,
+      expectedModel,
+      expectedRevision,
+    }),
 
   /** 历史快照（尾部窗口条目 + 行级游标）：会话首开 / 重建视图用。 */
   chatHistory: (chatId: string) =>
@@ -1511,6 +1580,10 @@ export const api = {
   onToolCalls: (cb: (payload: ToolCallsEvent) => void): Promise<UnlistenFn> =>
     listen<ToolCallsEvent>("tool_calls", (event) => cb(event.payload)),
 
+  /** 模型/思考强度切换广播：所有窗口共用同一权威状态，不靠轮询。 */
+  onLlmStateChanged: (cb: (state: LlmState) => void): Promise<UnlistenFn> =>
+    listen<LlmState>("llm_state_changed", (event) => cb(event.payload)),
+
   onAgent: (cb: (payload: AgentEvent) => void): Promise<UnlistenFn> =>
     listen<AgentEvent>("agent", (event) => cb(event.payload)),
 
@@ -1754,8 +1827,9 @@ export const PROVIDER_PRESETS: Record<
   deepseek: {
     label: "DeepSeek",
     baseUrl: "https://api.deepseek.com/v1",
-    model: "deepseek-chat",
-    contextLength: 131072,
+    // 官方当前只认 deepseek-flash / deepseek-v4-pro；deepseek-chat 已下线。
+    model: "deepseek-flash",
+    contextLength: 1048576,
   },
   custom: {
     label: "自定义（OpenAI 兼容）",

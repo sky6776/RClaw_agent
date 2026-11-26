@@ -38,8 +38,9 @@ pub use bots::{
 pub use cron_store::{CronJob, CronKind};
 pub use db::Db;
 pub use fs::{
-    atomic_write, atomic_write_private, ensure_dir, ensure_file, ensure_parent_dir, init_layout,
-    is_portable_file_name, portable_file_name, Layout,
+    atomic_create_private, atomic_write, atomic_write_private, ensure_dir, ensure_file,
+    ensure_parent_dir, init_layout, is_portable_file_name, portable_file_name, ConfigFileLock,
+    Layout,
 };
 pub use journal::{
     JournalStore, JOURNAL_EXEC_LOG, JOURNAL_PLAN, JOURNAL_TEAM_STATE, JOURNAL_WORKFLOW,

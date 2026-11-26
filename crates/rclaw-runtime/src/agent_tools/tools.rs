@@ -628,7 +628,7 @@ impl Tool for ClaudeAgentTool {
         {
             if !self.runtime.has_model_provider(model) {
                 return ToolResult::err(format!(
-                    "unknown model '{model}': 未在 [[llm.providers]] 中配置同名 provider；可用名称见 /llmodel 或配置文件。"
+                    "unknown model '{model}': 未在 [[llm.providers]] 中配置同名 provider；可用名称见会话底部「模型」选择器或 rclaw.toml。"
                 ));
             }
         }

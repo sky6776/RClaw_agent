@@ -13,11 +13,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use secrecy::ExposeSecret;
 
 use rclaw_core::{ChatOutcome, ChatRequest};
 
 use crate::config::{ProtocolKind, ProviderConfig};
-use crate::error::{LlmError, Result};
+use crate::error::{redact_secrets, LlmError, Result};
 use crate::openai_compat::OpenAiCompat;
 use crate::protocol::ChatProtocol;
 
@@ -56,6 +57,23 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// 当前 live 身份 `(provider 名, 模型名)`。
+    ///
+    /// `name()` 在可热切换实现里是启动时的名字（trait 返回 `&str`，无法在锁内返回）；
+    /// 工作流的 allowed_models、状态条等需要"现在是谁"的地方应优先用本方法。
+    fn current_identity(&self) -> Option<(String, String)> {
+        None
+    }
+
+    /// 返回一份配置冻结的 provider 快照。
+    ///
+    /// 可热切换实现（[`crate::SwappableProvider`]）用它把一次 turn 的能力、输出预算、
+    /// 工具链与重试固定在同一份配置上：turn 中途 `/llmodel` 切换只影响下一 turn。
+    /// 不支持热切换的实现返回 `None`，调用方回退到自身。
+    fn snapshot(&self) -> Option<Arc<dyn Provider>> {
+        None
+    }
+
     /// 非流式：一次性返回完整结果。
     async fn chat(&self, req: ChatRequest) -> Result<ChatOutcome>;
 
@@ -90,6 +108,9 @@ pub struct ProtocolProvider<P: ChatProtocol> {
 
 impl<P: ChatProtocol> ProtocolProvider<P> {
     pub fn new(cfg: ProviderConfig, protocol: P) -> Result<Self> {
+        // 最终配置预检：模型/档位/端点/api_key 全部在构造期验证。调用方（保存、
+        // 热切换）因此可以「先构造成功再落盘」，不会出现首请求或重启才失败。
+        crate::config::validate_provider_config(&cfg)?;
         if cfg.request_timeout_secs == 0 {
             return Err(LlmError::Config(
                 "request_timeout_secs 必须大于 0".to_string(),
@@ -97,16 +118,26 @@ impl<P: ChatProtocol> ProtocolProvider<P> {
         }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.request_timeout_secs))
-            .build()?;
-        Ok(ProtocolProvider {
+            .build()
+            .map_err(|error| crate::error::transport_error(&error))?;
+        let provider = ProtocolProvider {
             cfg,
             protocol,
             client,
-        })
+        };
+        // 构造期就验证鉴权头（非法 key 字符/头名会在首个请求才炸）；保存前预检才能
+        // 保证「成功返回的切换 = 重启后也能构造」。
+        provider.build_headers()?;
+        Ok(provider)
     }
 
     fn build_headers(&self) -> Result<HeaderMap> {
-        build_header_map(&self.protocol.auth_headers(&self.cfg))
+        let mut map = build_header_map(&self.protocol.auth_headers(&self.cfg))?;
+        // 鉴权头可能使用任意自定义头名；统一标记 sensitive，避免日志/中间件回显。
+        for (_, value) in map.iter_mut() {
+            value.set_sensitive(true);
+        }
+        Ok(map)
     }
 }
 
@@ -145,22 +176,23 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
             .headers(self.build_headers()?)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|error| crate::error::transport_error(&error))?;
 
         let status = resp.status();
         if !status.is_success() {
             let text = read_error_body(resp).await;
+            // 上游正文可能回显提示词/工具数据/凭据：边界内只保留状态码与受控错误码。
             return Err(LlmError::BadStatus {
                 status: status.as_u16(),
-                body: truncate(&text, 500),
+                body: upstream_error_summary(status.as_u16(), &text),
             });
         }
         let bytes = read_body_capped(resp, MAX_RESPONSE_BYTES).await?;
-        let outcome = self.protocol.parse_full_response(
-            &bytes,
-            &self.cfg.dialect,
-            self.cfg.max_tool_calls,
-        )?;
+        let outcome = self
+            .protocol
+            .parse_full_response(&bytes, &self.cfg.dialect, self.cfg.max_tool_calls)
+            .map_err(|error| redact_llm_error(error, self.cfg.api_key.expose_secret()))?;
         log_final_output(&self.cfg, &call_id, "non-stream", &outcome);
         Ok(outcome)
     }
@@ -194,14 +226,16 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
             .headers(self.build_headers()?)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|error| crate::error::transport_error(&error))?;
 
         let status = resp.status();
         if !status.is_success() {
             let text = read_error_body(resp).await;
+            // 上游正文可能回显提示词/工具数据/凭据：边界内只保留状态码与受控错误码。
             return Err(LlmError::BadStatus {
                 status: status.as_u16(),
-                body: truncate(&text, 500),
+                body: upstream_error_summary(status.as_u16(), &text),
             });
         }
 
@@ -221,7 +255,7 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
         let mut saw_termination = false;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = chunk.map_err(|error| crate::error::transport_error(&error))?;
             buf.extend_from_slice(&chunk);
 
             // 处理所有完整行（内联，避免 dyn Fn 跨函数强转的生命周期问题）。
@@ -249,7 +283,9 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
                     saw_termination = true;
                     continue;
                 }
-                let delta = parser.feed(payload)?;
+                let delta = parser
+                    .feed(payload)
+                    .map_err(|error| redact_llm_error(error, self.cfg.api_key.expose_secret()))?;
                 if let Some(t) = &delta.text {
                     on_text(t);
                 }
@@ -277,7 +313,9 @@ impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
 
         // 最后一道状态校验：挡住「只有 [DONE] 却没有 finish_reason」这类不完整流——
         // 否则未校验的工具槽位会被补成空 id/name 或 {} 入参的 ToolCall。
-        parser.finish()?;
+        parser
+            .finish()
+            .map_err(|error| redact_llm_error(error, self.cfg.api_key.expose_secret()))?;
         let outcome = parser.into_outcome();
         log_final_output(&self.cfg, &call_id, "stream", &outcome);
         Ok(outcome)
@@ -297,7 +335,7 @@ async fn read_body_capped(resp: reqwest::Response, max: usize) -> Result<Vec<u8>
     let mut stream = resp.bytes_stream();
     let mut out: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|error| crate::error::transport_error(&error))?;
         if out.len().saturating_add(chunk.len()) > max {
             return Err(LlmError::BadResponse(format!(
                 "响应体超过 {max} 字节上限，已中止读取"
@@ -384,16 +422,44 @@ fn log_final_output(cfg: &ProviderConfig, call_id: &str, mode: &str, outcome: &C
 /// 解析失败的 header 跳过，于是 `auth = apikey:...` 配成非法 header 名、或 header 值含非法
 /// 字节时，请求会【无鉴权头】发出，只在远端返回 401 时才暴露，排查困难。现在改为返回
 /// [`Result`]，并在错误信息里指明【是哪个 header】非法，让配置/请求构造阶段就地失败。
+/// 流式错误里可能带上游正文/密钥回显：先替换本 provider 的实际 key，再做通用脱敏。
+fn redact_llm_error(error: LlmError, secret: &str) -> LlmError {
+    match error {
+        LlmError::StreamAborted(message) => {
+            LlmError::StreamAborted(redact_secrets(&message.replace(secret, "<redacted>")))
+        }
+        LlmError::BadStatus { status, body } => LlmError::BadStatus {
+            status,
+            body: redact_secrets(&body.replace(secret, "<redacted>")),
+        },
+        LlmError::BadResponse(message) => {
+            LlmError::BadResponse(redact_secrets(&message.replace(secret, "<redacted>")))
+        }
+        LlmError::Config(message) => {
+            LlmError::Config(redact_secrets(&message.replace(secret, "<redacted>")))
+        }
+        other => other,
+    }
+}
+
 fn build_header_map(headers: &[(String, String)]) -> Result<HeaderMap> {
     let mut map = HeaderMap::new();
     for (k, v) in headers {
-        let name = HeaderName::from_bytes(k.as_bytes())
-            .map_err(|_| LlmError::Config(format!("非法 header 名（无法解析）: {k:?}")))?;
-        let val = HeaderValue::from_str(v).map_err(|_| {
-            LlmError::Config(format!(
-                "header {k:?} 的值含非法字节（HeaderValue 仅允许可见 ASCII 与 tab）"
-            ))
+        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
+            LlmError::Config("非法 header 名（无法解析，只允许 HTTP token 字符）".to_string())
         })?;
+        let mut val = HeaderValue::from_str(v).map_err(|_| {
+            LlmError::Config(
+                "header 的值含非法字节（HeaderValue 仅允许可见 ASCII 与 tab）".to_string(),
+            )
+        })?;
+        // 鉴权头标记 sensitive：Debug/日志/中间件不会打印明文 value。
+        if name == reqwest::header::AUTHORIZATION
+            || k.to_ascii_lowercase().contains("key")
+            || k.to_ascii_lowercase().contains("auth")
+        {
+            val.set_sensitive(true);
+        }
         map.append(name, val);
     }
     Ok(map)
@@ -404,16 +470,56 @@ fn build_header_map(headers: &[(String, String)]) -> Result<HeaderMap> {
 /// 必须在 UTF-8 字符边界处截断：直接 `&s[..max]` 当 `max` 落在多字节字符（中文/emoji）
 /// 中间时会 panic。这里把 `max` 回退到最近的字符边界再切片。错误体常含非 ASCII 文本，
 /// 不做边界处理会在运行期 panic。
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
+/// 把上游错误正文收敛为「状态码之外的结构化错误码 + 有限分类标记」：正文
+/// （可能含提示词、工具数据、任意格式凭据）只在本函数内读取，绝不进入错误文案。
+fn upstream_error_summary(status: u16, text: &str) -> String {
+    // 可重试状态（408/425/429/5xx）优先按状态分类：正文里的鉴权/超限字样通常是
+    // 限流或网关附言，不能据此把瞬时失败判成配置错误；正文完全省略。
+    if matches!(status, 408 | 425 | 429) || (500..=599).contains(&status) {
+        return "（瞬时错误正文已省略）".to_string();
     }
-    // 回退到 <= max 的最近字符边界；max 为 0 时退化为空串前缀。
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    let mut parts: Vec<String> = Vec::new();
+    let mut decoded_message = String::new();
+    if let Ok(root) = serde_json::from_str::<serde_json::Value>(text) {
+        let error = &root["error"];
+        for key in ["code", "type"] {
+            let value = error
+                .get(key)
+                .and_then(|value| value.as_str())
+                .or_else(|| root.get(key).and_then(|value| value.as_str()));
+            if let Some(code) = value.and_then(crate::error::safe_error_code) {
+                for tag in crate::error::error_code_tags(&code) {
+                    if !parts.iter().any(|part| part.ends_with(tag)) {
+                        parts.push(tag.to_string());
+                    }
+                }
+                parts.push(format!("{key}={code}"));
+            }
+        }
+        // message 可能是 Unicode 转义的中文：解析后的值参与分类，但原文不外泄。
+        if let Some(message) = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .or_else(|| root.get("message").and_then(|value| value.as_str()))
+        {
+            decoded_message.push_str(message);
+        }
     }
-    format!("{}...", &s[..end])
+    let mut scan = text.to_string();
+    if !decoded_message.is_empty() {
+        scan.push(' ');
+        scan.push_str(&decoded_message);
+    }
+    for tag in crate::error::upstream_error_tags(&scan) {
+        if !parts.iter().any(|part| part.ends_with(tag)) {
+            parts.push(tag.to_string());
+        }
+    }
+    if parts.is_empty() {
+        "（未提供可识别错误码，正文已省略）".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 #[cfg(test)]
@@ -431,22 +537,53 @@ mod tests {
         );
     }
 
-    /// ASCII 短串不截断。
     #[test]
-    fn truncate_keeps_short_ascii() {
-        assert_eq!(truncate("hi", 10), "hi");
-    }
-
-    /// 非 ASCII 错误体：max 落在多字节字符中间时不得 panic，且结果是合法 UTF-8。
-    #[test]
-    fn truncate_on_char_boundary_no_panic() {
-        // 6 个中文共 18 字节；max=8 落在第 3 个字符（字节 6..9）中间。
-        // 回退到 <= 8 的最近边界 = 6，即前 2 个完整字符「错误」。
-        let s = "错误错误错误";
-        let out = truncate(s, 8);
-        assert!(out.ends_with("..."));
-        let prefix = out.trim_end_matches("...");
-        assert_eq!(prefix, "错误");
+    fn upstream_error_summary_drops_free_form_body() {
+        let summary = upstream_error_summary(
+            400,
+            r#"{"error":{"code":"invalid_api_key","type":"authentication_error","message":"sk-secret prompt text"}}"#,
+        );
+        assert!(summary.contains("code=invalid_api_key"));
+        assert!(summary.contains("type=authentication_error"));
+        assert!(!summary.contains("sk-secret"));
+        assert!(!summary.contains("prompt text"));
+        // 非 JSON 网关错误页：正文整体省略。
+        assert!(!upstream_error_summary(500, "<html>token=secret</html>").contains("secret"));
+        // 只有 message 的鉴权错误：保留分类标记，但不透出 message 原文。
+        let auth_only = upstream_error_summary(
+            400,
+            r#"{"error":{"message":"invalid api key sk-live-secret"}}"#,
+        );
+        assert!(auth_only.contains("authentication_error"), "{auth_only}");
+        assert!(!auth_only.contains("sk-live-secret"), "{auth_only}");
+        // 未知 code 不在白名单：不透出任意远端文本。
+        let unknown = upstream_error_summary(400, r#"{"error":{"code":"sk-very-secret"}}"#);
+        assert!(!unknown.contains("sk-very-secret"), "{unknown}");
+        // 瞬时状态只按状态分类：正文/白名单鉴权码都不得把 429 判成鉴权失败。
+        let transient = upstream_error_summary(
+            429,
+            r#"{"error":{"code":"invalid_api_key","message":"unauthorized"}}"#,
+        );
+        assert!(!transient.contains("authentication"), "{transient}");
+        assert!(!transient.contains("invalid_api_key"), "{transient}");
+        // 中文超限提示可能是 JSON Unicode 转义：解码后仍要产出分类标签。
+        let unicode = upstream_error_summary(
+            400,
+            r#"{"error":{"message":"\u4e0a\u4e0b\u6587\u957f\u5ea6\u8d85\u9650"}}"#,
+        );
+        assert!(unicode.contains("context_length_exceeded"), "{unicode}");
+        // 只有 permission_error 码、没有文本：按码映射到鉴权分类。
+        let permission = upstream_error_summary(400, r#"{"error":{"type":"permission_error"}}"#);
+        assert!(permission.contains("authentication_error"), "{permission}");
+        // 与下游分类器保持超集：request too large / API key is invalid 组合。
+        let too_large = upstream_error_summary(400, r#"{"error":{"message":"Request too large"}}"#);
+        assert!(too_large.contains("context_length_exceeded"), "{too_large}");
+        let key_invalid =
+            upstream_error_summary(400, r#"{"error":{"message":"API key is invalid"}}"#);
+        assert!(
+            key_invalid.contains("authentication_error"),
+            "{key_invalid}"
+        );
     }
 
     /// P3：合法 header 列表应正确构造 HeaderMap。

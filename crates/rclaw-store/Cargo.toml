@@ -21,6 +21,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fs2 = "0.4"
 rclaw-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,6 +34,6 @@ toml_edit = { workspace = true }
 toml = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }   # agent/state.sqlite：会话 / checkpoint / 锚点 / journal
+tempfile = "3"                     # 原子「仅当不存在时创建」（persist_noclobber）
 
 [dev-dependencies]
-tempfile = "3"

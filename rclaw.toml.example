@@ -137,16 +137,38 @@ api_key = "your-zhipu-api-key"
 auth = "bearer"
 reasoning_field = "reasoning_content"
 max_tokens_key = "max_tokens"
+# max_tokens = 128000                # per-provider 输出上限（缺省沿用 [llm] max_tokens）
+# thinking = "enabled"               # enabled / disabled / auto（glm-5.3-flash 禁止 disabled）
+# reasoning_effort = "max"           # glm-5.3-flash / glm-5.4：low / high / max
+# media_wire = "openai"              # 媒体 part 方言：openai / deepseek（缺省按 host 自动）
+# flavor = "zhipu"                   # 能力族覆盖：zhipu / deepseek / generic（代理端点必填）
+
+# DeepSeek（可选）：会话页「🧠 模型」选择器切到它后会整组写入本条目。
+# 注意：deepseek-flash = V4.1-Flash-1017（1M / 384K，支持图像）；deepseek-v4-pro 纯文本。
+# [[llm.providers]]
+# name = "deepseek"
+# base_url = "https://api.deepseek.com/v1"
+# model = "deepseek-flash"
+# context_length = 1048576
+# api_key = "your-deepseek-api-key"
+# reasoning_field = "reasoning_content"
+# max_tokens_key = "max_tokens"
+# max_tokens = 128000
+# thinking = "enabled"
+# reasoning_effort = "high"          # none / low / high / max
+# media_wire = "deepseek"
+# flavor = "deepseek"                # 官方域名会自动判定；代理端点必须显式写
 
 
 # ── web_search（可选）：多来源高可用搜索池 ────────────────────────────────────
-# 支持豆包 Custom、Tavily 多 Key、智谱 MCP、豆包 Global。请求按 order 顺序尝试；
-# 额度/鉴权错误会阻塞当前方式，连续临时故障会触发短时熔断，fallback=true 时自动切换。
+# 支持豆包 Custom、Tavily 多 Key、DeepSeek Search、智谱 MCP、豆包 Global。请求按
+# order 顺序尝试；额度/鉴权错误会阻塞当前方式，连续临时故障会触发短时熔断，
+# fallback=true 时自动切换。显式 order 必须覆盖所有已配置的子表（disabled 也要列）。
 # `/search` 查看状态，`/search <方式>` 调整首选方式，
 # `/search dis|en <方式>` 可在额度耗尽时禁用/恢复单个方式。
 [web_search]
 enabled = true
-order = ["doubao-custom", "tavily", "zhipu", "doubao-global"] # 默认豆包 Custom 为主
+order = ["doubao-custom", "tavily", "deepseek", "zhipu", "doubao-global"] # 默认豆包 Custom 为主
 fallback = true
 read_top = 3                  # 搜索后最多补读前 N 条正文；0=只返回搜索摘要，上限 5
 max_results = 10              # web_search 最终结果上限
@@ -171,6 +193,17 @@ timeout_secs = 20
 max_results = 5
 search_depth = "basic"        # basic / advanced / fast / ultra-fast
 include_answer = false        # true 时请求 Tavily 返回聚合答案；false 仅返回搜索结果
+
+# DeepSeek Search / Fetch（客户端直连 /v1/tools/search + /v1/tools/fetch）。
+# 与对话 API 共用同一把 key；按成功请求计费，失败/空结果/超时不计费。
+[web_search.deepseek]
+enabled = false
+api_key = "your-deepseek-api-key"
+# base_url = "https://api.deepseek.com"
+timeout_secs = 20
+max_results = 10
+# 默认 true：一次搜索即带正文（省一次 fetch）；聚合只把 read_top 条正文送进渲染。
+need_content = true
 
 # 智谱 webSearchPrime + webReader MCP，共用一个 BigModel API Key。
 [web_search.zhipu]

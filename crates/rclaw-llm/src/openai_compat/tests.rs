@@ -8,6 +8,20 @@ fn cfg() -> ProviderConfig {
 fn cfg_multimodal() -> ProviderConfig {
     let mut cfg = cfg();
     cfg.default_model = "glm-5.3-flash".into();
+    cfg.name = "zhipu".into();
+    cfg.base_url = "https://open.bigmodel.cn/api/coding/paas/v4".into();
+    cfg.flavor = ProviderFlavor::Zhipu;
+    cfg.media_wire = MediaWire::OpenAiCompat;
+    cfg
+}
+
+/// 智谱官方端点夹具：flavor/media_wire 必须与真实构造一致（不能只改 name/host）。
+fn zhipu_cfg() -> ProviderConfig {
+    let mut cfg = cfg();
+    cfg.name = "zhipu".into();
+    cfg.base_url = "https://open.bigmodel.cn/api/coding/paas/v4".into();
+    cfg.flavor = ProviderFlavor::Zhipu;
+    cfg.media_wire = MediaWire::OpenAiCompat;
     cfg
 }
 
@@ -63,9 +77,7 @@ fn request_with_tool() -> ChatRequest {
 
 #[test]
 fn zhipu_stream_request_enables_tool_stream() {
-    let mut zhipu = cfg();
-    zhipu.name = "zhipu".into();
-    zhipu.base_url = "https://open.bigmodel.cn/api/coding/paas/v4".into();
+    let mut zhipu = zhipu_cfg();
     zhipu.default_model = "glm-5.3".into();
 
     let body = OpenAiCompat::new()
@@ -78,9 +90,7 @@ fn zhipu_stream_request_enables_tool_stream() {
 /// glm-5.3-flash 按官方「推荐设置」注入采样与思考参数，流式/非流式都生效。
 #[test]
 fn zhipu_flash_request_injects_recommended_params() {
-    let mut zhipu_flash = cfg();
-    zhipu_flash.name = "zhipu".into();
-    zhipu_flash.base_url = "https://open.bigmodel.cn/api/coding/paas/v4".into();
+    let mut zhipu_flash = zhipu_cfg();
     zhipu_flash.default_model = "glm-5.3-flash".into();
 
     for stream in [false, true] {
@@ -99,28 +109,24 @@ fn zhipu_flash_request_injects_recommended_params() {
 /// 保持既有模型行为不变、未知字段不透传。
 #[test]
 fn flash_recommended_params_only_for_flash_on_zhipu() {
-    let mut zhipu53 = cfg();
-    zhipu53.name = "zhipu".into();
-    zhipu53.base_url = "https://open.bigmodel.cn/api/coding/paas/v4".into();
+    let mut zhipu53 = zhipu_cfg();
     zhipu53.default_model = "glm-5.3".into();
     let mut body = json!({});
-    apply_zhipu_flash_recommended_params(&zhipu53, &mut body);
+    apply_reasoning_params(&zhipu53, &mut body);
     assert!(body.get("temperature").is_none());
 
     // 非智谱 provider（deepseek 名 + deepseek 域名）即便模型名叫 glm-5.3-flash 也不注入。
     let mut non_zhipu_flash = cfg();
     non_zhipu_flash.default_model = "glm-5.3-flash".into();
     let mut body = json!({});
-    apply_zhipu_flash_recommended_params(&non_zhipu_flash, &mut body);
+    apply_reasoning_params(&non_zhipu_flash, &mut body);
     assert!(body.get("temperature").is_none());
 
     // 正对照：门开时确有注入（完整字段断言见 zhipu_flash_request_injects_recommended_params）。
-    let mut zhipu_flash = cfg();
-    zhipu_flash.name = "zhipu".into();
-    zhipu_flash.base_url = "https://open.bigmodel.cn/api/coding/paas/v4".into();
+    let mut zhipu_flash = zhipu_cfg();
     zhipu_flash.default_model = "glm-5.3-flash".into();
     let mut body = json!({});
-    apply_zhipu_flash_recommended_params(&zhipu_flash, &mut body);
+    apply_reasoning_params(&zhipu_flash, &mut body);
     assert_eq!(body["temperature"], 1);
 }
 
@@ -217,7 +223,10 @@ fn omits_user_media_for_non_multimodal_model() {
         .build_request_body(&cfg(), &req, false)
         .unwrap();
     let content = &body["messages"].as_array().unwrap()[0]["content"];
-    assert_eq!(content, "请分析图片");
+    let text = content.as_str().expect("纯文本模型应保持 content 字符串");
+    assert!(text.contains("请分析图片"), "{text}");
+    assert!(text.contains("attachment(s) omitted"), "{text}");
+    assert!(text.contains("text-only"), "{text}");
 }
 
 // -------------------------------------------------------------------------
@@ -315,6 +324,89 @@ fn rejects_abnormal_finish_in_full_response() {
     let body = br#"{"choices":[{"message":{"content":"x"},"finish_reason":"length"}]}"#;
     let r = OpenAiCompat::new().parse_full_response(body, &Dialect::deepseek(), 4);
     assert!(r.is_err());
+}
+
+/// DeepSeek 的 `insufficient_system_resource` / `aborted` 是上游繁忙，不是协议错误：
+/// 必须归为可重试，否则一次服务端抖动会让整轮直接失败且不重试。
+#[test]
+fn upstream_busy_finish_is_retryable_in_full_response() {
+    for fr in ["insufficient_system_resource", "aborted"] {
+        let body =
+            format!(r#"{{"choices":[{{"message":{{"content":"x"}},"finish_reason":"{fr}"}}]}}"#);
+        let err = OpenAiCompat::new()
+            .parse_full_response(body.as_bytes(), &Dialect::deepseek(), 4)
+            .expect_err("上游繁忙结束原因不应被当成正常响应");
+        assert!(matches!(err, LlmError::UpstreamBusy(_)), "got {err:?}");
+        assert!(err.is_retryable(), "{err:?}");
+    }
+}
+
+#[test]
+fn upstream_busy_finish_is_retryable_in_stream() {
+    for fr in ["insufficient_system_resource", "aborted"] {
+        let mut p = OpenAiCompat::new().make_stream_parser(Dialect::deepseek(), 4);
+        let err = p
+            .feed(&format!(
+                r#"{{"choices":[{{"delta":{{}},"finish_reason":"{fr}"}}]}}"#
+            ))
+            .expect_err("上游繁忙结束原因不应被当成正常流结束");
+        assert!(matches!(err, LlmError::UpstreamBusy(_)), "got {err:?}");
+        assert!(err.is_retryable(), "{err:?}");
+    }
+}
+
+#[test]
+fn null_error_field_does_not_abort_chunk() {
+    let mut p = OpenAiCompat::new().make_stream_parser(Dialect::deepseek(), 4);
+    let delta = p
+        .feed(r#"{"error":null,"choices":[{"delta":{"content":"hi"}}]}"#)
+        .expect("error:null 不是错误事件");
+    assert_eq!(delta.text.as_deref(), Some("hi"));
+}
+
+#[test]
+fn sse_transient_code_wins_over_context_wording() {
+    let mut p = OpenAiCompat::new().make_stream_parser(Dialect::deepseek(), 4);
+    let err = p
+        .feed(
+            r#"{"error":{"code":"rate_limit_exceeded","message":"request too large for this endpoint"}}"#,
+        )
+        .expect_err("限流错误不是心跳");
+    assert!(err.is_retryable(), "{err:?}");
+    let text = err.to_string();
+    assert!(text.contains("rate_limit_exceeded"), "{text}");
+    assert!(!text.contains("context_length_exceeded"), "{text}");
+}
+
+#[test]
+fn sse_transient_code_is_normalized_and_beats_conflicting_type() {
+    let mut p = OpenAiCompat::new().make_stream_parser(Dialect::deepseek(), 4);
+    let err = p
+        .feed(r#"{"error":{"code":" RATE_LIMIT_EXCEEDED ","type":"context_length_exceeded"}}"#)
+        .expect_err("限流错误不是心跳");
+    assert!(err.is_retryable(), "{err:?}");
+    let text = err.to_string();
+    assert!(text.contains("rate_limit_exceeded"), "{text}");
+    assert!(!text.contains("context_length_exceeded"), "{text}");
+}
+
+#[test]
+fn sse_content_policy_error_is_not_retryable() {
+    let mut p = OpenAiCompat::new().make_stream_parser(Dialect::deepseek(), 4);
+    let err = p
+        .feed(r#"{"error":{"message":"blocked by content policy"}}"#)
+        .expect_err("内容策略错误不是心跳");
+    assert!(!err.is_retryable(), "{err:?}");
+}
+
+#[test]
+fn error_with_empty_choices_is_not_treated_as_heartbeat() {
+    let mut p = OpenAiCompat::new().make_stream_parser(Dialect::deepseek(), 4);
+    let err = p
+        .feed(r#"{"choices":[],"error":{"message":"invalid api key","code":"invalid_api_key"}}"#)
+        .expect_err("error 必须先于空 choices 判断");
+    assert!(matches!(err, LlmError::StreamAborted(_)), "{err:?}");
+    assert!(!err.is_retryable(), "鉴权错误不应按瞬时失败重试: {err:?}");
 }
 
 /// 畸形 arguments 必须整轮拒绝，而非静默当成 {} 执行/持久化。
@@ -554,6 +646,7 @@ fn cfg_none_reasoning() -> ProviderConfig {
         reasoning_field: ReasoningField::None,
         supports_tool_choice: true,
         max_tokens_key: MaxTokensKey::MaxTokens,
+        classify_upstream_busy: false,
     };
     c
 }
@@ -727,4 +820,291 @@ fn usage_from_openai_rejects_empty_object() {
     let usage = TokenUsage::from_openai(&json!({"prompt_tokens": 5})).unwrap();
     // total 缺失时用 prompt+completion 兜底。
     assert_eq!(usage.total(), 5);
+}
+
+// ---------------------------------------------------------------------------
+// 媒体方言：DeepSeek 只认 image_url + file(file_data)，无 video
+// ---------------------------------------------------------------------------
+
+fn deepseek_flash_cfg() -> ProviderConfig {
+    let mut cfg = cfg();
+    cfg.default_model = "deepseek-flash".into();
+    cfg
+}
+
+fn media_message(kind: rclaw_core::MediaKind, url: &str) -> Message {
+    Message {
+        id: 0,
+        role: Role::User,
+        content: vec![
+            ContentBlock::text("see attachment"),
+            ContentBlock::media_url(kind, url),
+        ],
+        tool_call_id: None,
+        ts: 0,
+    }
+}
+
+fn body_content(body: &serde_json::Value) -> &serde_json::Value {
+    &body["messages"][0]["content"]
+}
+
+#[test]
+fn deepseek_image_uses_image_url() {
+    let req = ChatRequest::new(
+        None,
+        vec![media_message(
+            rclaw_core::MediaKind::Image,
+            "data:image/png;base64,abc",
+        )],
+    );
+    let body = OpenAiCompat::new()
+        .build_request_body(&deepseek_flash_cfg(), &req, false)
+        .unwrap();
+    let content = body_content(&body).as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,abc");
+}
+
+#[test]
+fn deepseek_data_uri_file_uses_file_data_without_prefix() {
+    let req = ChatRequest::new(
+        None,
+        vec![media_message(
+            rclaw_core::MediaKind::File,
+            "data:application/pdf;base64,QUJD",
+        )],
+    );
+    let body = OpenAiCompat::new()
+        .build_request_body(&deepseek_flash_cfg(), &req, false)
+        .unwrap();
+    let content = body_content(&body).as_array().unwrap();
+    assert_eq!(content[1]["type"], "file");
+    assert_eq!(content[1]["file"]["file_data"], "QUJD");
+    assert!(!content[1]["file"]["file_data"]
+        .as_str()
+        .unwrap()
+        .contains("data:"));
+}
+
+#[test]
+fn deepseek_remote_file_falls_back_to_text_without_query() {
+    let req = ChatRequest::new(
+        None,
+        vec![media_message(
+            rclaw_core::MediaKind::File,
+            "https://example.com/doc.pdf?sig=secret",
+        )],
+    );
+    let body = OpenAiCompat::new()
+        .build_request_body(&deepseek_flash_cfg(), &req, false)
+        .unwrap();
+    let content = body_content(&body).as_array().unwrap();
+    assert_eq!(content[1]["type"], "text");
+    let text = content[1]["text"].as_str().unwrap();
+    assert!(text.contains("https://example.com/doc.pdf"), "{text}");
+    assert!(!text.contains("sig=secret"), "{text}");
+}
+
+#[test]
+fn deepseek_video_falls_back_to_text() {
+    let req = ChatRequest::new(
+        None,
+        vec![media_message(
+            rclaw_core::MediaKind::Video,
+            "https://example.com/v.mp4",
+        )],
+    );
+    let body = OpenAiCompat::new()
+        .build_request_body(&deepseek_flash_cfg(), &req, false)
+        .unwrap();
+    let content = body_content(&body).as_array().unwrap();
+    assert_eq!(content[1]["type"], "text");
+    assert!(content[1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("does not accept video input"));
+}
+
+#[test]
+fn zhipu_file_and_video_keep_url_parts() {
+    for (kind, expected) in [
+        (rclaw_core::MediaKind::File, "file_url"),
+        (rclaw_core::MediaKind::Video, "video_url"),
+    ] {
+        let req = ChatRequest::new(None, vec![media_message(kind, "https://example.com/a")]);
+        let body = OpenAiCompat::new()
+            .build_request_body(&cfg_multimodal(), &req, false)
+            .unwrap();
+        let content = body_content(&body).as_array().unwrap();
+        assert_eq!(content[1]["type"], expected);
+        assert_eq!(content[1][expected]["url"], "https://example.com/a");
+    }
+}
+
+/// DeepSeek 带 tools 时，参与工具链的 assistant 消息必须有 reasoning_content；
+/// 缺失时本地 fail loud（Config），而不是把必然 400 的请求发出去。
+#[test]
+fn deepseek_tools_require_reasoning_on_tool_chains() {
+    let assistant_without_reasoning = Message {
+        id: 0,
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "call_1".into(),
+            name: "read".into(),
+            input: json!({"path":"a"}),
+        }],
+        tool_call_id: None,
+        ts: 0,
+    };
+    let tool_result = Message {
+        id: 0,
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: "ok".into(),
+            is_error: false,
+        }],
+        tool_call_id: None,
+        ts: 0,
+    };
+    let mut req = ChatRequest::new(None, vec![assistant_without_reasoning, tool_result.clone()]);
+    req.tools.push(ToolSchema {
+        name: "read".into(),
+        description: "read".into(),
+        input_schema: json!({"type":"object"}),
+    });
+    let error = OpenAiCompat::new()
+        .build_request_body(&deepseek_flash_cfg(), &req, false)
+        .expect_err("缺失 reasoning 的 DeepSeek 工具链必须本地拒绝");
+    assert!(matches!(error, LlmError::Config(_)), "{error:?}");
+
+    // 补上 reasoning 后放行。
+    let mut req_ok = req.clone();
+    req_ok.messages[0]
+        .content
+        .push(ContentBlock::reasoning("thinking"));
+    OpenAiCompat::new()
+        .build_request_body(&deepseek_flash_cfg(), &req_ok, false)
+        .expect("带 reasoning 的工具链应放行");
+
+    // 非 DeepSeek 方言没有这条限制。
+    OpenAiCompat::new()
+        .build_request_body(&cfg_multimodal(), &req, false)
+        .expect("非 DeepSeek 方言不应被该规则拦截");
+}
+
+/// UpstreamBusy 分类仅对 DeepSeek 方言生效；通用方言同名结束原因仍是协议错误。
+#[test]
+fn upstream_busy_finish_reason_is_deepseek_only() {
+    let body = br#"{"choices":[{"message":{"content":""},"finish_reason":"insufficient_system_resource"}]}"#;
+    let error = OpenAiCompat::new()
+        .parse_full_response(body, &Dialect::openai_compat(), 4)
+        .expect_err("通用方言不应重分类");
+    assert!(matches!(error, LlmError::BadResponse(_)), "{error:?}");
+}
+
+/// 关闭思考时，工具续轮没有 reasoning 是合法的——不能被 DeepSeek 的“必须回传”
+/// 校验误杀（否则关闭思考后第一次工具调用就断链）。
+#[test]
+fn deepseek_tools_allowed_when_thinking_disabled() {
+    let mut cfg = deepseek_flash_cfg();
+    cfg.reasoning = crate::config::ReasoningConfig {
+        thinking: Some(false),
+        effort: None,
+    };
+    let assistant_without_reasoning = Message {
+        id: 0,
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "call_1".into(),
+            name: "read".into(),
+            input: json!({"path":"a"}),
+        }],
+        tool_call_id: None,
+        ts: 0,
+    };
+    let mut req = ChatRequest::new(None, vec![assistant_without_reasoning]);
+    req.tools.push(ToolSchema {
+        name: "read".into(),
+        description: "read".into(),
+        input_schema: json!({"type":"object"}),
+    });
+    OpenAiCompat::new()
+        .build_request_body(&cfg, &req, false)
+        .expect("关闭思考时工具续轮不应要求 reasoning");
+}
+
+/// 资源类终帧即使同时带不完整 tool_call 分片，也必须先归类为可重试的上游繁忙，
+/// 不能被 delta 解析抢先判成协议错误。
+#[test]
+fn upstream_busy_finish_wins_over_bad_delta() {
+    let mut p = OpenAiCompat::new().make_stream_parser(Dialect::deepseek(), 4);
+    let err = p
+        .feed(
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"read"}}]},"finish_reason":"insufficient_system_resource"}]}"#,
+        )
+        .expect_err("资源类终帧应优先归类");
+    assert!(matches!(err, LlmError::UpstreamBusy(_)), "{err:?}");
+    assert!(err.is_retryable());
+}
+
+/// File 的 data URI 必须严格校验；非法 base64 不能被当成 file_data 发出去。
+#[test]
+fn deepseek_invalid_base64_file_is_omitted() {
+    for bad in [
+        "data:application/pdf;base64,!!!!",
+        "data:application/pdf;base64,QUJ", // 长度不是 4 的倍数
+        "data:no-mime;base64,QUJD",        // MIME 缺 /
+        "data:application/pdf,QUJD",       // 缺 ;base64
+    ] {
+        assert!(
+            matches!(parse_data_uri(bad), DataUriPayload::Invalid),
+            "{bad}"
+        );
+        let req = ChatRequest::new(None, vec![media_message(rclaw_core::MediaKind::File, bad)]);
+        let body = OpenAiCompat::new()
+            .build_request_body(&deepseek_flash_cfg(), &req, false)
+            .unwrap();
+        let content = body_content(&body).as_array().unwrap();
+        assert_eq!(content[1]["type"], "text", "{bad}");
+        assert!(
+            content[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("invalid data URI"),
+            "{bad}"
+        );
+    }
+}
+
+/// 纯文本模型收到附件时必须显式告诉模型“附件被省略”，不能让它在没有附件的情况下
+/// 继续回答。
+#[test]
+fn text_only_model_reports_attachment_omitted() {
+    let mut cfg = cfg(); // deepseek-v4-pro：纯文本
+    cfg.default_model = "deepseek-v4-pro".into();
+    let req = ChatRequest::new(
+        None,
+        vec![media_message(
+            rclaw_core::MediaKind::Image,
+            "https://example.com/a.png",
+        )],
+    );
+    let body = OpenAiCompat::new()
+        .build_request_body(&cfg, &req, false)
+        .unwrap();
+    let content = body["messages"][0]["content"].as_str().unwrap();
+    assert!(content.contains("attachment(s) omitted"), "{content}");
+    assert!(content.contains("text-only"), "{content}");
+}
+
+#[test]
+fn redact_secrets_removes_keys_and_bearer_tokens() {
+    let text = r#"bad key sk-abc123DEF456 and header "Authorization: Bearer tok_987xyz""#;
+    let redacted = crate::error::redact_secrets(text);
+    assert!(!redacted.contains("sk-abc123DEF456"), "{redacted}");
+    assert!(!redacted.contains("tok_987xyz"), "{redacted}");
+    assert!(redacted.contains("<redacted>"), "{redacted}");
 }

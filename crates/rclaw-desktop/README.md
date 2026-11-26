@@ -30,8 +30,9 @@ cargo build --release -p rclaw-desktop
 - **常驻**：点窗口关闭 = 隐藏到托盘；托盘菜单「退出」才结束进程；
 - **安全语义与 CLI 一致**：模型流式片段在完成闸门通过前不外发，界面只显示
   outbound 已有的状态消息；agent 存储沙箱保持默认（无 Unrestricted）；
-- **设置复用 slash 管道**：`/llmodel`、`/context`、`/cancel` 等直接在输入框输入，
-  不另开配置命令面。
+- **设置复用 slash 管道**：`/search`、`/context`、`/cancel` 等直接在输入框输入；
+  模型与思考强度走输入框底部的独立选择器（`chat_llm_state` / `chat_set_model` /
+  `chat_set_thinking`），不另开配置命令面。
 
 ## 模块
 
