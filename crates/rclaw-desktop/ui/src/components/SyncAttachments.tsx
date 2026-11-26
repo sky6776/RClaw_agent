@@ -120,6 +120,9 @@ export function clearAttachmentChanged(item: { path: string; blob: string }) {
 
 /** 让当前会话的清单重新取一遍（装载器在的时候才有）。 */
 let reload: (() => void) | null = null;
+/** 作废正在路上的清单查询并重取：保存成功后，旧清单会按保存前的 `path_present`
+ *  把刚写下的记录清掉。 */
+let invalidateLoad: (() => void) | null = null;
 /** 当前会话正文里已经加载的消息行 id（Chat 回报）。附件清单覆盖整个会话，正文首屏
  *  只加载最近 80 行：已保存的旧附件若不在正文里，顶栏那条就是它唯一的打开入口。 */
 let loadedMsgIds = new Set<number>();
@@ -156,20 +159,26 @@ const savedDirOf = (rel: string) => {
 
 type SavedProbe = { key: string; rel: string; size?: number; gen: number };
 
+/** 后端核对附件内容时允许的长度偏差（`local::SIZE_SLACK`）：登记长度是别的设备
+ *  报来的，实际落盘长度可能差一点；探活的长度快筛用同样的容差，别误删有效副本。 */
+const SIZE_SLACK = 1024 * 1024;
+
 /** 另存落点的存在性：清单只描述消息路径，`-快照` 这种另存名字要靠目录列举确认。
  *  只返回结果、不写缓存——探活是异步的，缓存会把旧目录状态带进更新的一轮。
- *  同名但大小对不上的按「不是当初存下的那份」处理（内容核对留给打开时）。 */
+ *  结果按输入下标一一对应（同一路径可能被两条记录复用，不能按路径归并）。
+ *  同名但长度超容差的按「不是当初存下的那份」处理（内容核对留给打开时）。 */
 async function probeSavedPaths(
   paths: Array<{ rel: string; size?: number }>,
-): Promise<Set<string>> {
-  const byDir = new Map<string, Array<{ rel: string; size?: number }>>();
-  for (const item of paths) {
+): Promise<boolean[]> {
+  const present = new Array<boolean>(paths.length).fill(false);
+  const byDir = new Map<string, Array<{ idx: number; rel: string; size?: number }>>();
+  paths.forEach((item, idx) => {
     const dir = savedDirOf(item.rel);
+    const entry = { idx, rel: item.rel, size: item.size };
     const bucket = byDir.get(dir);
-    if (bucket) bucket.push(item);
-    else byDir.set(dir, [item]);
-  }
-  const present = new Set<string>();
+    if (bucket) bucket.push(entry);
+    else byDir.set(dir, [entry]);
+  });
   for (const [dir, rels] of byDir) {
     let entries: Map<string, number> | null = null;
     try {
@@ -185,16 +194,17 @@ async function probeSavedPaths(
       entries =
         text.startsWith("目录不存在") || text.startsWith("不是目录") ? new Map() : null;
     }
-    for (const { rel, size } of rels) {
+    for (const { idx, rel, size } of rels) {
       if (entries === null) {
         // 核不了：当它在，别把还能用的记录删掉。
-        present.add(rel);
+        present[idx] = true;
         continue;
       }
       const name = rel.slice(rel.lastIndexOf("/") + 1);
-      if (!entries.has(name)) continue;
-      if (size !== undefined && entries.get(name) !== size) continue;
-      present.add(rel);
+      const onDisk = entries.get(name);
+      if (onDisk === undefined) continue;
+      if (size !== undefined && Math.abs(onDisk - size) > SIZE_SLACK) continue;
+      present[idx] = true;
     }
   }
   return present;
@@ -215,9 +225,9 @@ async function probeSavedGone(chatId: string): Promise<SavedProbe[]> {
     });
   }
   if (alt.length === 0) return [];
-  const present = await probeSavedPaths(alt.map(({ rel, size }) => ({ rel, size })));
+  const ok = await probeSavedPaths(alt.map(({ rel, size }) => ({ rel, size })));
   if (chat !== chatId) return [];
-  return alt.filter(({ rel }) => !present.has(rel));
+  return alt.filter((_, idx) => !ok[idx]);
 }
 
 /** 撤掉探活确认没了的保存记录（版本/落点在这期间变过的不动）。 */
@@ -489,8 +499,9 @@ function save(chatId: string, item: SyncAttachment) {
         return { ...prev, saved };
       });
       savedKeyGen[savedKey] = (savedKeyGen[savedKey] ?? 0) + 1;
-      // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
-      // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。
+      // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：先
+      // 作废在途的旧清单（否则它按保存前的结论把刚写的记录清掉），再立刻重取。
+      invalidateLoad?.();
       reload?.();
     })
     .catch((e) => {
@@ -623,6 +634,11 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       aliasTries.clear();
       schedule();
     };
+    const invalidate = () => {
+      seq += 1;
+      schedule();
+    };
+    invalidateLoad = invalidate;
     reload = retry;
     void load();
     const un = api.onSync((event) => {
@@ -657,6 +673,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         emit();
       }
       if (reload === retry) reload = null;
+      if (invalidateLoad === invalidate) invalidateLoad = null;
       void un.then((fn) => fn());
     };
   }, [chatId]);
@@ -829,6 +846,10 @@ export function AttachmentCard({
         if (verified) clearAttachmentChanged({ path, blob: item.blob });
       })
       .catch((e) => {
+        if (chat !== chatId) return;
+        // 这期间已经保存到别的落点：这次失败说的是旧落点，整次状态更新都不作数
+        // （包括错误文案与刷新），别挂到新卡片上。
+        if (cards.saved[key] !== undefined && cards.saved[key] !== path) return;
         onError(`打开文件失败: ${String(e)}`);
         // 核对没过（文件被改写/删掉）：这次保存的落点不能再「打开」，收回去让用户
         // 重新「存进工作区」；错误按落点记，只有这张卡显示。这期间重新保存过、

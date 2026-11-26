@@ -7020,6 +7020,7 @@ fn resolve_workspace_dir(root: &std::path::Path, rel: &str) -> Result<std::path:
         // 只有「确实不存在」才说目录没了：权限/IO 错误照实说访问不了，调用方
         // （附件另存落点的探活）据此决定是删记录还是先留着。
         std::io::ErrorKind::NotFound => format!("目录不存在: {e}"),
+        std::io::ErrorKind::NotADirectory => format!("不是目录: {e}"),
         _ => format!("目录无法访问: {e}"),
     })?;
     if !canonical.starts_with(&base) {

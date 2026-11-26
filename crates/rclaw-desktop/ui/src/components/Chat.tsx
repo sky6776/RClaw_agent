@@ -2379,7 +2379,9 @@ export default function Chat({
       if (!row) {
         jumpTargetRef.current = null;
       } else {
-        const aligned = Math.abs(row.getBoundingClientRect().top - containerTop) <= 8;
+        // 容差 2px：底部夹住时目标可能只差几像素，不能算「已对齐」（否则 pin
+        // 永远不解除、到底也切不回末轮）。
+        const aligned = Math.abs(row.getBoundingClientRect().top - containerTop) <= 2;
         if (aligned) jumpAlignedRef.current = true;
         const stale =
           !aligned && !jumpAlignedRef.current && Date.now() - jumpAtRef.current > 2_000;
