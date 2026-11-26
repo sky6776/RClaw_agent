@@ -92,8 +92,11 @@ pub enum AttachmentBytes {
     Bytes(Vec<u8>),
     /// 登记的明文长度超过调用方给的上限（预览/原图这类读进内存的入口）。
     TooLarge,
-    /// 内容对不上（被就地改写过）、路径不安全、读失败。
+    /// 内容对不上（被就地改写过）或文件/路径不安全。
     Rejected,
+    /// 读文件时的 I/O 失败（权限、共享冲突、磁盘错误）：不是内容对不上，调用方
+    /// 按「暂时读不了」处理，不能当成文件被改写。
+    Failed,
     /// 核不了（没有登记/引用、读不出密钥）：按老行为处理。
     Unverifiable,
 }
@@ -1396,7 +1399,8 @@ impl SyncEngine {
             Ok(outcome) => outcome,
             // 超上限被这里截断：按 TooLarge 报（不是「内容对不上」）。
             Err(_) if too_large => return AttachmentBytes::TooLarge,
-            Err(_) => return AttachmentBytes::Rejected,
+            // 读缓存副本时的 I/O 失败：暂时读不了，不是内容被改写。
+            Err(_) => return AttachmentBytes::Failed,
         };
         match outcome {
             AttachmentCopy::Copied => AttachmentBytes::Bytes(bytes),
@@ -1491,8 +1495,14 @@ impl SyncEngine {
         if size > limit {
             return AttachmentBytes::TooLarge;
         }
-        let Ok(file) = std::fs::File::open(&path) else {
-            return AttachmentBytes::Rejected;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            // 文件不在：落点失效（调用方可以收掉「已保存」）。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return AttachmentBytes::Rejected
+            }
+            // 权限/共享冲突/磁盘错误：暂时读不了，别当内容被改写。
+            Err(_) => return AttachmentBytes::Failed,
         };
         // 最多读「登记长度 + 允许的误差 + 1」：路径被换成超大文件时不会把内存读爆。
         let cap = size.saturating_add(local::SIZE_SLACK).saturating_add(1);
@@ -1606,8 +1616,14 @@ impl SyncEngine {
         if std::fs::create_dir_all(parent).is_err() {
             return AttachmentStage::Failed;
         }
-        let Ok(input) = std::fs::File::open(&source) else {
-            return AttachmentStage::Rejected;
+        let input = match std::fs::File::open(&source) {
+            Ok(input) => input,
+            // 源文件不在：落点失效。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return AttachmentStage::Rejected
+            }
+            // 权限/共享冲突：暂时读不了。
+            Err(_) => return AttachmentStage::Failed,
         };
         let mut output = match std::fs::OpenOptions::new()
             .write(true)

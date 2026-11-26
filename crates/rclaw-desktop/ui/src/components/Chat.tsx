@@ -2346,7 +2346,9 @@ export default function Chat({
       jumpTargetRef.current = null;
       jumpAlignedRef.current = false;
       window.clearTimeout(jumpTimerRef.current);
-      scrollListToBottom(!reduce);
+      // 直接定位、不做平滑动画：动画中间的每一帧都离底很远，桌面滚动处理器会
+      // 把它们当成「脱离跟随」，回到底部按钮闪回、跟随也被甩掉。
+      scrollListToBottom(false);
       scheduleActiveRound();
       return;
     }

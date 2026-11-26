@@ -380,10 +380,9 @@ function apply(chatId: string, list: SyncAttachment[]) {
   // 引用本身从清单里消失了的（消息被删/改）也一并丢掉，恢复就绪后不会又冒出来。
   // 已经「存进工作区」的也不再列：消息里那张卡（带已存到的落点）就是它的入口，
   // 留在顶栏只会让提示在保存成功后继续挂着。
-  const currentKeys = new Set(usable.map((item) => fileKey(item)));
   const stillLanded = landed.filter(
     (item) =>
-      currentKeys.has(fileKey(item)) &&
+      liveKeys.has(fileKey(item)) &&
       !pendingKeys.has(fileKey(item)) &&
       // 已保存的文件：消息卡（带「已存到 … / 打开」）在正文里就交给正文；不在
       // 正文里（首屏只加载最近 80 行）、或者根本没有正文卡（工具结果 artifact；
@@ -848,6 +847,7 @@ export function AttachmentCard({
       // 路径上的标记也清了，那条可能仍然对不上）。
       .then((verified) => {
         if (!verified) return;
+        if (chat !== chatId) return;
         clearAttachmentChanged({ path, blob: item.blob });
         // 上一次打开失败（严格核对暂时不可用、拉起程序失败）的文案要收掉：这次
         // 已经核对通过。期间换过记录的（版本/落点变了）不动，交给新记录自己。

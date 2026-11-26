@@ -5395,7 +5395,9 @@ pub async fn media_preview(
                 rclaw_sync::AttachmentBytes::Rejected => {
                     return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
-                rclaw_sync::AttachmentBytes::Unverifiable => None,
+                // 暂时读不了：退回下面按路径的老读法（能读就照常，读不了再报错）。
+                rclaw_sync::AttachmentBytes::Failed
+                | rclaw_sync::AttachmentBytes::Unverifiable => None,
             }
         }
         _ => None,
@@ -5738,7 +5740,9 @@ pub async fn media_base64(
             rclaw_sync::AttachmentBytes::Rejected => {
                 return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
             }
-            rclaw_sync::AttachmentBytes::Unverifiable => {}
+            // 暂时读不了：退回下面按路径的读取。
+            rclaw_sync::AttachmentBytes::Failed
+            | rclaw_sync::AttachmentBytes::Unverifiable => {}
         }
     }
     // 最大 25MB 的同步读 + 编码挪到阻塞线程池（与同文件其他命令一致），

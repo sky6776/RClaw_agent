@@ -929,8 +929,9 @@ pub async fn sync_attachment_preview(
                 super::MEDIA_MAX_BYTES / 1024 / 1024
             )),
             rclaw_sync::AttachmentBytes::Rejected => Err(CHANGED_SNAPSHOT.into()),
-            // 核不了（没有密钥）：按老行为按路径出预览。
-            rclaw_sync::AttachmentBytes::Unverifiable => {
+            // 核不了（没有密钥）/ 暂时读不了缓存副本：按老行为按路径出预览。
+            rclaw_sync::AttachmentBytes::Unverifiable
+            | rclaw_sync::AttachmentBytes::Failed => {
                 super::image_preview_payload(&home, &full, &format!("sync-blob:{blob}"), &extension)
             }
         }
@@ -1027,6 +1028,9 @@ pub async fn sync_open_attachment(
             "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）。点「重新下载」取回原来的内容。"
                 .into(),
         ),
+        rclaw_sync::AttachmentBytes::Failed => {
+            Err("打开失败: 读取文件出错（权限或 I/O），稍后再试".into())
+        }
         rclaw_sync::AttachmentBytes::Unverifiable => {
             if strict {
                 return Err(STRICT_UNVERIFIABLE.into());
@@ -1386,6 +1390,52 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
     }
 }
 
+/// 同目录内「目标存在即失败」的发布（`hard_link` 不可用的落点）：
+/// - Windows：`MoveFileExW` 不设 `MOVEFILE_REPLACE_EXISTING`——同卷原子改名，目标
+///   已存在即失败（exFAT/FAT 也支持）。
+/// - 其它平台：`create_new` 先把目标名建住（不覆盖已有文件、并发写入抢不到这个名字），
+///   再把核对过的暂存内容复制进去并 fsync。复制期间正式名字上可能被读到半成品——
+///   这是卷不支持硬链接时仅剩的选项（与 `rclaw-sync` 的 space 标记发布同一套退路）；
+///   失败会删掉刚建的半成品，恢复「不存在」。
+#[cfg(windows)]
+fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+    let wide = |path: &Path| -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (from, to) = (wide(from), wide(to));
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    let copied = (|| {
+        let mut source = std::fs::File::open(from)?;
+        std::io::copy(&mut source, &mut target)?;
+        target.sync_all()
+    })();
+    drop(target);
+    if copied.is_err() {
+        // 正式路径上只留了一个刚创建的空/半截文件：删掉，恢复「不存在」。
+        let _ = std::fs::remove_file(to);
+    }
+    copied
+}
+
 /// 把暂存文件发布成工作区里的新文件：候选名逐个试，`hard_link` 保证不覆盖已有文件、
 /// 也不会让并行的读取看到半成品。
 ///
@@ -1412,35 +1462,17 @@ fn publish_staged(
             }
             // 名字刚被别人占了：换下一个候选（暂存文件照用）。
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => {
-                // 这条落点不支持硬链接：先用 `create_new` 把候选名占住（并发保存
-                // 抢不到这个名字，也不会覆盖已有文件），再把写好的暂存文件 rename
-                // 上去。rename 覆盖的是我们自己刚建的空占位文件——读者只会看到
-                // 「空文件 → 完整文件」，不会看到写了一半的内容（空文件窗口只有
-                // 一次元数据操作那么长）。
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&dest)
-                {
-                    Ok(placeholder) => {
-                        drop(placeholder);
-                        match std::fs::rename(tmp, &dest) {
-                            Ok(()) => return Ok(dest),
-                            Err(e) => {
-                                let _ = std::fs::remove_file(&dest);
-                                last = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => {
-                        last = Some(e);
-                        break;
-                    }
+            Err(_) => match publish_noreplace(tmp, &dest) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(tmp);
+                    return Ok(dest);
                 }
-            }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    last = Some(e);
+                    break;
+                }
+            },
         }
     }
     let _ = std::fs::remove_file(tmp);
