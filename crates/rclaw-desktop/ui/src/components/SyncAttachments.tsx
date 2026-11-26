@@ -168,12 +168,17 @@ const savedKeyGen: Record<string, number> = {};
 /** 每张卡最近一次发起的操作（打开/保存）序号：异步回调回来时只有「最近一次
  *  操作」的失败才写进卡片——先发起、后返回的旧操作不能盖住新错误。 */
 let opSeq = 0;
+/** 会话代次：切出再切回同一会话时，旧回调的 operator/seq 校验会通过（chat 相同、
+ *  序号仍是模块级全局值），要多一道代次。 */
+let chatGen = 0;
 const cardOpSeq: Record<string, number> = {};
 /** 这个对象最近一次「下载」的发起序号：下载结果回来时凭它判断是不是当前这次请求。 */
 const downloadAt: Record<string, number> = {};
 /** 用户点下载时带过去的请求标识：完成事件带回来的标识对不上就丢弃（超时重发、
  *  迟到的旧事件不串账）。 */
 const downloadRequest: Record<string, string> = {};
+/** 正在进行的下载合并了哪些卡片（键）：失败时这些卡片都要能看到结果。 */
+const downloadKeys: Record<string, Set<string>> = {};
 /** 打开失败的序号：更早的下载成功不能把它清掉（只有早于这次下载的才算过去）。 */
 const openErrorOp: Record<string, number> = {};
 function beginOp(key: string): number {
@@ -456,7 +461,13 @@ function settle(
     return;
   }
   // 这次下载的发起序号：卡片渲染时按「自己的最后一次操作」决定要不要显示它。
-  const seq = downloadAt[blob] ?? opSeq;
+  // 合并进来的卡片操作序号更大（它们加入得晚），失败才算它们的最近操作。
+  const joined = downloadKeys[blob];
+  delete downloadKeys[blob];
+  let seq = downloadAt[blob] ?? opSeq;
+  if (joined) {
+    for (const key of joined) seq = Math.max(seq, cardOpSeq[key] ?? 0);
+  }
   if (error === null && placed) {
     // 只撤「这次实际落到的那个路径」上的覆盖：同一对象的其他路径上可能还是另一份
     // 内容（取回到同步缓存时，消息路径并没有被修好）。`error` 为空但没落盘的
@@ -526,6 +537,7 @@ function download(chatId: string, blob: string, key?: string) {
   // 已有请求在跑，也要更新自己的操作序号、清掉旧错误）。
   opSeq += 1;
   const op = opSeq;
+  const gen = chatGen;
   if (key) {
     cardOpSeq[key] = op;
     setCards((prev) => ({
@@ -535,9 +547,18 @@ function download(chatId: string, blob: string, key?: string) {
       openErrorPath: without(prev.openErrorPath, key),
       cardOp: { ...prev.cardOp, [key]: op },
     }));
+    delete openErrorOp[key];
   }
-  // 已经有同一个对象的请求在跑：合并，不再发一次。
-  if (cards.busy[blob]) return;
+  // 已经有同一个对象的请求在跑：合并，不再发一次（但要记下这张卡也参与了，
+  // 失败时它得看到结果）。
+  if (cards.busy[blob]) {
+    if (key) {
+      const joined = downloadKeys[blob] ?? new Set<string>();
+      joined.add(key);
+      downloadKeys[blob] = joined;
+    }
+    return;
+  }
   setCards((prev) => ({
     ...prev,
     busy: { ...prev.busy, [blob]: true },
@@ -547,14 +568,19 @@ function download(chatId: string, blob: string, key?: string) {
   busyTimers[blob] = window.setTimeout(() => {
     delete busyTimers[blob];
     setCards((prev) => (prev.busy[blob] ? { ...prev, busy: without(prev.busy, blob) } : prev));
+    // 这次请求算放弃：标识/序号退役，别让后续的自动完成事件被永久挡住。
+    delete downloadRequest[blob];
+    delete downloadAt[blob];
+    delete downloadKeys[blob];
     if (reload) reload();
   }, FETCH_SHOWN_MS);
   downloadAt[blob] = op;
   const request = `dl-${op}-${Date.now().toString(36)}`;
   downloadRequest[blob] = request;
+  downloadKeys[blob] = new Set(key ? [key] : []);
   api.syncFetchAttachment(chatId, blob, request).catch((e) => {
     // 会话切走、或这次请求已经被后来的下载顶掉了：迟到的失败不能结算到新请求上。
-    if (chat !== chatId) return;
+    if (chat !== chatId || chatGen !== gen) return;
     if (downloadAt[blob] !== op) return;
     settle(blob, String(e), false, null, request);
   });
@@ -568,6 +594,7 @@ function save(chatId: string, item: SyncAttachment) {
   const key = fileKey(item);
   if (cards.saving[key]) return;
   const op = beginOp(key);
+  const gen = chatGen;
   setCards((prev) => ({
     ...prev,
     saving: { ...prev.saving, [key]: true },
@@ -576,10 +603,11 @@ function save(chatId: string, item: SyncAttachment) {
     openErrorPath: without(prev.openErrorPath, key),
     cardOp: { ...prev.cardOp, [key]: op },
   }));
+  delete openErrorOp[key];
   api
     .syncAttachmentSave(chatId, item.blob, item.path)
     .then(({ rel, verified, blob: savedBlob }) => {
-      if (chat !== chatId) return;
+      if (chat !== chatId || chatGen !== gen) return;
       // 旧版明文登记保存成功后被归一：消息引用换成了新对象名，落点要记在刷新后用的
       // 键上（否则刷新后卡片按新名找不到「已存到」，又显示「存进工作区」）。
       const savedKey = `${savedBlob}:${item.path}`;
@@ -625,12 +653,14 @@ function save(chatId: string, item: SyncAttachment) {
       reload?.();
     })
     .catch((e) => {
-      if (chat !== chatId) return;
+      if (chat !== chatId || chatGen !== gen) return;
       // 之后又发起了别的操作（比如点打开）：这条保存失败不写进卡片。
       if (cardOpSeq[key] !== op) return;
       setCards((prev) => ({ ...prev, saveErrors: { ...prev.saveErrors, [key]: String(e) } }));
     })
     .finally(() => {
+      // 旧会话（切出再切回）的请求结束了：不能清掉同键新请求的「保存中」。
+      if (chat !== chatId || chatGen !== gen) return;
       setCards((prev) =>
         prev.saving[key] ? { ...prev, saving: without(prev.saving, key) } : prev,
       );
@@ -668,9 +698,11 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         loadedMsgChat = null;
       }
       // 模块级操作序号也清掉：旧会话迟到的回调不能再通过序号校验写进新卡片。
+      chatGen += 1;
       for (const key of Object.keys(cardOpSeq)) delete cardOpSeq[key];
       for (const blob of Object.keys(downloadAt)) delete downloadAt[blob];
       for (const blob of Object.keys(downloadRequest)) delete downloadRequest[blob];
+      for (const blob of Object.keys(downloadKeys)) delete downloadKeys[blob];
       for (const key of Object.keys(openErrorOp)) delete openErrorOp[key];
       emit();
     }
@@ -976,6 +1008,7 @@ export function AttachmentCard({
     const key = fileKey(item);
     const genAt = savedKeyGen[key] ?? 0;
     const op = beginOp(key);
+    const gen = chatGen;
     // 用户刚点了打开：这张卡上一次「存进工作区失败」的文案先收掉，失败时显示
     // 这次打开的原因（最近一次操作的错误）。
     setCards((prev) => {
@@ -999,7 +1032,7 @@ export function AttachmentCard({
       .then((verified) => {
         // 先核对会话/版本/落点，全部对得上才清状态：迟到的成功回调不能清掉别的
         // 会话或后来重新保存的那份记录。
-        if (chat !== chatId) return;
+        if (chat !== chatId || chatGen !== gen) return;
         if ((savedKeyGen[key] ?? 0) !== genAt) return;
         if (cards.saved[key] !== undefined && cards.saved[key] !== path) return;
         if (cardOpSeq[key] !== op) return;
@@ -1018,7 +1051,7 @@ export function AttachmentCard({
         );
       })
       .catch((e) => {
-        if (chat !== chatId) return;
+        if (chat !== chatId || chatGen !== gen) return;
         // 这期间又保存过（含存到同一路径的新版本）：这次失败说的是上一份记录，
         // 整次状态更新都不作数（包括错误文案与刷新），别挂到新卡片上。
         if ((savedKeyGen[key] ?? 0) !== genAt) return;

@@ -213,7 +213,11 @@ pub(crate) async fn download_task(
                 match wanted.get_mut(&request.blob) {
                     // 已经在排队或正在取。用户又点了它：往前挪；请求标识按最新那次算。
                     Some((user, current)) => {
-                        *current = request.request;
+                        // 后台/预取请求不带标识：不能把用户点名那次请求的标识抹掉
+                        // （完成事件要按它结算到界面）。
+                        if request.request.is_some() || current.is_none() {
+                            *current = request.request;
+                        }
                         if request.user && !*user {
                             *user = true;
                             if let Some(at) = queue.iter().position(|blob| *blob == request.blob) {
