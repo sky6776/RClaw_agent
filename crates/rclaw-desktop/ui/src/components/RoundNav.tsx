@@ -171,8 +171,9 @@ export function RoundRail({
     // 换到另一行：旧的提示立刻收掉，别让第一行的预览滞留在屏幕上。
     setTip((prev) => (prev !== null && prev.id !== item.id ? null : prev));
     openTimer.current = window.setTimeout(() => {
-      // 锚点已经换了（移走/换了行）：这次结果作废。
-      if (tipAnchor.current?.el !== el) return;
+      // 锚点已经换了（移走/换了行）、或者按钮已经不在 DOM 里（轮次被删）：
+      // 这次结果作废（否则会读到 (0,0) 的坐标）。
+      if (tipAnchor.current?.el !== el || !el.isConnected) return;
       const rect = el.getBoundingClientRect();
       setTip({
         id: item.id,
@@ -204,6 +205,16 @@ export function RoundRail({
     observer.observe(host);
     return () => observer.disconnect();
   }, [listRef]);
+
+  // 轮次被移除（发送失败、切会话清空等）时，已打开或等待打开的提示一并收掉：
+  // 那一行已经不在轨道上了。
+  useEffect(() => {
+    const known = new Set(rounds.map((r) => r.id));
+    if (tip !== null && !known.has(tip.id)) clearTip();
+    else if (tipAnchor.current !== null && !known.has(tipAnchor.current.item.id)) {
+      clearTip();
+    }
+  }, [rounds]);
 
   // Esc 关闭（悬停出的提示没有焦点在按钮上也收得掉）。
   useEffect(() => {
