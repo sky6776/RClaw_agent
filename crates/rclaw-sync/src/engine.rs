@@ -1449,10 +1449,12 @@ impl SyncEngine {
         else {
             return AttachmentReadCheck::Unverifiable;
         };
-        let path = match ctx.env.checked_path(rel_path) {
+        let path = match ctx.env.checked_path_typed(rel_path) {
             Ok(path) => path,
             // 路径不安全（链接/越界）：不能当「核不了就放行」。
-            Err(_) => return AttachmentReadCheck::Mismatch,
+            Err(crate::wire::LinkCheckError::Policy) => return AttachmentReadCheck::Mismatch,
+            // 元数据/权限 I/O：暂时核不了，按老行为放行，别报成「内容被改写」。
+            Err(crate::wire::LinkCheckError::Io(_)) => return AttachmentReadCheck::Unverifiable,
         };
         let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
             .ok()
@@ -1466,16 +1468,20 @@ impl SyncEngine {
         // 覆盖常常不改 mtime，只有变更时间会变。
         let stamp = |path: &std::path::Path| -> Option<String> { local::file_version_pin(path) };
         let before = stamp(&path);
-        let matches = if fresh {
-            local::same_blob_now(&keys, &path, blob, size)
+        let matched = if fresh {
+            local::same_blob_now_status(&keys, &path, blob, size)
         } else {
-            local::same_blob(&keys, &path, blob, size)
+            local::same_blob_status(&keys, &path, blob, size)
         };
+        if matched == local::BlobMatch::Unknown {
+            return AttachmentReadCheck::Unverifiable;
+        }
         let after = stamp(&path);
         match after {
-            Some(pin) if matches && before.as_ref() == Some(&pin) => {
+            Some(pin) if matched == local::BlobMatch::Yes && before.as_ref() == Some(&pin) => {
                 AttachmentReadCheck::Verified { pin }
             }
+            None if matched == local::BlobMatch::Yes => AttachmentReadCheck::Unverifiable,
             _ => AttachmentReadCheck::Mismatch,
         }
     }
@@ -1555,9 +1561,11 @@ impl SyncEngine {
         else {
             return AttachmentReadCheck::Unverifiable;
         };
-        let path = match ctx.env.checked_path(rel_path) {
+        let path = match ctx.env.checked_path_typed(rel_path) {
             Ok(path) => path,
-            Err(_) => return AttachmentReadCheck::Mismatch,
+            Err(crate::wire::LinkCheckError::Policy) => return AttachmentReadCheck::Mismatch,
+            // 元数据/权限 I/O：暂时核不了，按老行为放行。
+            Err(crate::wire::LinkCheckError::Io(_)) => return AttachmentReadCheck::Unverifiable,
         };
         let row = db::read(ctx.db(), |conn| db::blob_get(conn, blob))
             .ok()
@@ -1567,8 +1575,13 @@ impl SyncEngine {
         }) else {
             return AttachmentReadCheck::Unverifiable;
         };
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            return AttachmentReadCheck::Mismatch;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // 文件不在：按对不上/失效处理；其它 I/O：暂时核不了。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return AttachmentReadCheck::Mismatch
+            }
+            Err(_) => return AttachmentReadCheck::Unverifiable,
         };
         if meta.len().abs_diff(size) > local::SIZE_SLACK {
             return AttachmentReadCheck::Mismatch;

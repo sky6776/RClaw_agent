@@ -1252,7 +1252,7 @@ export default function Chat({
 
   // 回到底部并恢复跟随（发送消息 / 点击悬浮钮时调用）。
   const scrollListToBottom = (smooth = false) => {
-    followLockRef.current = false;
+    clearJump();
     stickToBottomRef.current = true;
     setShowJumpDown(false);
     // 用户显式回底：zombie 的滚动抑制随即解除（抑制是为「未知手指还在列表
@@ -2330,7 +2330,7 @@ export default function Chat({
     // 底部被夹住（目标行到不了视口顶）时页面会静止、没有重算：到点自己解除。
     jumpTimerRef.current = window.setTimeout(() => {
       if (jumpTargetRef.current === id && !jumpAlignedRef.current) {
-        jumpTargetRef.current = null;
+        clearJump();
         scheduleActiveRound();
       }
     }, 2_000);
@@ -2342,10 +2342,7 @@ export default function Chat({
     if (rounds[rounds.length - 1]?.id === id) {
       // 末轮 = 最新：清掉可能残留的跳转 pin，瞬时回底（平滑动画的中间帧会被
       // 滚动处理器当成「脱离跟随」，按钮闪回），高亮交给到底规则。
-      jumpTargetRef.current = null;
-      jumpAlignedRef.current = false;
-      followLockRef.current = false;
-      window.clearTimeout(jumpTimerRef.current);
+      clearJump();
       setActiveRoundId(id);
       scrollListToBottom(false);
       scheduleActiveRound();
@@ -2360,10 +2357,7 @@ export default function Chat({
       // 目标落点会被底部夹住：落点就是底部，按「到底」处理——清掉上一次跳转的
       // pin（否则它会一直压着末轮规则），恢复跟随并收起「回到底部」按钮，高亮
       // 交给末轮规则。
-      jumpTargetRef.current = null;
-      jumpAlignedRef.current = false;
-      followLockRef.current = false;
-      window.clearTimeout(jumpTimerRef.current);
+      clearJump();
       // 直接定位、不做平滑动画：动画中间的每一帧都离底很远，桌面滚动处理器会
       // 把它们当成「脱离跟随」，回到底部按钮闪回、跟随也被甩掉。
       scrollListToBottom(false);
@@ -2389,6 +2383,14 @@ export default function Chat({
   const followLockRef = useRef(false);
   const jumpAtRef = useRef(0);
   const jumpTimerRef = useRef<number | undefined>(undefined);
+  /** 结束一次显式跳转（pin / 对齐标志 / 跟随锁 / 兜底计时器一起清）：所有「跳转
+   *  不再有效」的路径都走这里，避免某个标志漏清把跟随锁死。 */
+  const clearJump = () => {
+    jumpTargetRef.current = null;
+    jumpAlignedRef.current = false;
+    followLockRef.current = false;
+    window.clearTimeout(jumpTimerRef.current);
+  };
   const activeRoundRafRef = useRef<number | null>(null);
   // 最新实现经 ref 供 rAF 回调读取（见 scheduleActiveRound）；layout effect 写入
   // 而非渲染期——并发渲染丢弃的渲染不得更新 ref。
@@ -2396,6 +2398,7 @@ export default function Chat({
   const computeActiveRound = () => {
     const el = listRef.current;
     if (!el || rounds.length === 0) {
+      clearJump();
       setActiveRoundId((v) => (v === null ? v : null));
       return;
     }
@@ -2408,7 +2411,7 @@ export default function Chat({
         ? el.querySelector<HTMLElement>(`[data-entry-id="${target}"]`)
         : null;
       if (!row) {
-        jumpTargetRef.current = null;
+        clearJump();
       } else {
         // 容差 2px：底部夹住时目标可能只差几像素，不能算「已对齐」（否则 pin
         // 永远不解除、到底也切不回末轮）。
@@ -2417,8 +2420,7 @@ export default function Chat({
         const stale =
           !aligned && !jumpAlignedRef.current && Date.now() - jumpAtRef.current > 2_000;
         if (stale || (jumpAlignedRef.current && !aligned)) {
-          jumpTargetRef.current = null;
-          followLockRef.current = false;
+          clearJump();
         } else {
           setActiveRoundId((v) => (v === target ? v : target));
           return;
@@ -2482,9 +2484,7 @@ export default function Chat({
   // 忙碌翻转。依赖收窄到轮次集合签名（长度+首尾 id）：流式每 chunk 变 entries
   // 不再逐 chunk 全量查 DOM（滚动路径的 rAF 兜住其余时机）。
   useLayoutEffect(() => {
-    jumpTargetRef.current = null;
-    jumpAlignedRef.current = false;
-    window.clearTimeout(jumpTimerRef.current);
+    clearJump();
   }, [sessionKey]);
   const roundsSignature = `${rounds.length}:${rounds[0]?.id ?? ""}:${rounds[rounds.length - 1]?.id ?? ""}`;
   useLayoutEffect(() => {

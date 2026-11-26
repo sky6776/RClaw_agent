@@ -1280,21 +1280,29 @@ enum Landing {
 /// （时间戳被还原过的替换在缓存的 60 秒窗口里看不出来；这是用户点开的那一下，读一次
 /// 文件是值得的。）
 pub(crate) fn same_blob_now(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
+    matches!(same_blob_now_status(keys, path, blob, size), BlobMatch::Yes)
+}
+
+/// [`same_blob_now`] 的三态版本：读不了/判不了是 `Unknown`，不是「内容对不上」。
+pub(crate) fn same_blob_now_status(keys: &Keys, path: &Path, blob: &str, size: u64) -> BlobMatch {
     let Some(mut file) = open_regular(path) else {
-        return false;
+        return BlobMatch::Unknown;
     };
     let Ok(meta) = file.metadata() else {
-        return false;
+        return BlobMatch::Unknown;
     };
     if meta.len().abs_diff(size) > SIZE_SLACK {
-        return false;
+        return BlobMatch::No;
     }
     let limit = size.saturating_add(SIZE_SLACK);
-    match version_with(Some(&file), &meta) {
-        Some(version) => read_digest(path, &mut file, &version, limit)
-            .is_some_and(|digest| keys.blob_id(&digest) == blob),
-        None => hash_file_digest_of(&mut file, limit)
-            .is_some_and(|digest| keys.blob_id(&digest) == blob),
+    let digest = match version_with(Some(&file), &meta) {
+        Some(version) => read_digest(path, &mut file, &version, limit),
+        None => hash_file_digest_of(&mut file, limit),
+    };
+    match digest {
+        Some(digest) if keys.blob_id(&digest) == blob => BlobMatch::Yes,
+        Some(_) => BlobMatch::No,
+        None => BlobMatch::Unknown,
     }
 }
 

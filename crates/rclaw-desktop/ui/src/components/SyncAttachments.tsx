@@ -65,6 +65,44 @@ interface CardState {
   saved: Record<string, string>;
 }
 
+/** 保存落点的持久化键（按会话）：应用重启/切回会话后，「已保存」的旧附件还要能
+ *  在顶栏找到打开入口。只存路径与是否核对过，不含文件内容。 */
+const SAVED_KEY_PREFIX = "rclaw_sync_saved:";
+function loadSaved(chatId: string): {
+  saved: Record<string, string>;
+  savedVerified: Record<string, boolean>;
+} {
+  try {
+    const raw = window.localStorage.getItem(SAVED_KEY_PREFIX + chatId);
+    if (!raw) return { saved: {}, savedVerified: {} };
+    const parsed = JSON.parse(raw) as {
+      saved?: Record<string, string>;
+      verified?: Record<string, boolean>;
+    };
+    return { saved: parsed.saved ?? {}, savedVerified: parsed.verified ?? {} };
+  } catch {
+    return { saved: {}, savedVerified: {} };
+  }
+}
+function persistSaved(
+  chatId: string,
+  saved: Record<string, string>,
+  savedVerified: Record<string, boolean>,
+) {
+  try {
+    if (Object.keys(saved).length === 0) {
+      window.localStorage.removeItem(SAVED_KEY_PREFIX + chatId);
+    } else {
+      window.localStorage.setItem(
+        SAVED_KEY_PREFIX + chatId,
+        JSON.stringify({ saved, verified: savedVerified }),
+      );
+    }
+  } catch {
+    // 存不了就只在内存里（不影响本次会话）。
+  }
+}
+
 const noCardState = (): CardState => ({
   busy: {},
   saving: {},
@@ -163,8 +201,6 @@ export function setLoadedAttachmentMessages(chatId: string, ids: number[]) {
   reload?.();
 }
 
-/** 另存落点的存在性：清单只描述消息路径，`-快照` 这种另存名字要靠目录列举确认。
- *  每次刷新都重新列目录（不缓存），避免每次清单刷新都为同一批保存记录打一轮 IPC。 */
 /** 保存记录的版本：每次写入保存落点递增。探活/打开回来时凭它确认期间没有重新
  *  保存，否则会拿旧结果把刚写下的记录删掉。 */
 const savedKeyGen: Record<string, number> = {};
@@ -181,7 +217,7 @@ const downloadAt: Record<string, number> = {};
  *  迟到的旧事件不串账）。 */
 const downloadRequest: Record<string, string> = {};
 /** 正在进行的下载合并了哪些卡片（键）：失败时这些卡片都要能看到结果。 */
-const downloadKeys: Record<string, Set<string>> = {};
+const downloadKeys: Record<string, Map<string, number>> = {};
 /** 打开失败的序号：更早的下载成功不能把它清掉（只有早于这次下载的才算过去）。 */
 const openErrorOp: Record<string, number> = {};
 function beginOp(key: string): number {
@@ -280,12 +316,15 @@ function dropSavedGone(gone: SavedProbe[]) {
       .map(({ key }) => key);
     if (keys.length === 0) return prev;
     const saved = { ...prev.saved };
+    const savedVerified = { ...prev.savedVerified };
     const saveErrors = { ...prev.saveErrors };
     for (const key of keys) {
       delete saved[key];
+      delete savedVerified[key];
       delete saveErrors[key];
+      delete savedKeyGen[key];
     }
-    return { ...prev, saved, saveErrors };
+    return { ...prev, saved, savedVerified, saveErrors };
   });
 }
 
@@ -315,7 +354,12 @@ function without<T>(map: Record<string, T>, key: string): Record<string, T> {
 function setCards(update: (prev: CardState) => CardState) {
   const next = update(cards);
   if (next === cards) return;
+  const savedChanged =
+    next.saved !== cards.saved || next.savedVerified !== cards.savedVerified;
   cards = next;
+  if (savedChanged && chat !== null) {
+    persistSaved(chat, next.saved, next.savedVerified);
+  }
   emit();
 }
 
@@ -430,7 +474,23 @@ function apply(chatId: string, list: SyncAttachment[]) {
         loadedMsgIds.has(item.message_id)
       ),
   );
-  if (cardsChanged) cards = { ...cards, saved, saveErrors };
+  if (cardsChanged) {
+    const dropped = Object.keys(cards.saved).filter((key) => !(key in saved));
+    if (dropped.length > 0) {
+      const savedVerified = { ...cards.savedVerified };
+      const openErrors = { ...cards.openErrors };
+      const openErrorPath = { ...cards.openErrorPath };
+      for (const key of dropped) {
+        delete savedVerified[key];
+        delete openErrors[key];
+        delete openErrorPath[key];
+        delete openErrorOp[key];
+        delete savedKeyGen[key];
+      }
+      cards = { ...cards, savedVerified, openErrors, openErrorPath };
+    }
+    cards = { ...cards, saved, saveErrors };
+  }
   // 已保存、正文里没有卡（旧消息/工具行）的条目要留在顶栏当打开入口——应用重启
   // 后 `landed` 是空的，光靠「刚下载」的条目会把它们漏掉。
   for (const item of usable) {
@@ -481,7 +541,7 @@ function settle(
   delete downloadKeys[blob];
   let seq = downloadAt[blob] ?? opSeq;
   if (joined) {
-    for (const key of joined) seq = Math.max(seq, cardOpSeq[key] ?? 0);
+    for (const joinedOp of joined.values()) seq = Math.max(seq, joinedOp);
   }
   delete downloadAt[blob];
   if (error === null && placed) {
@@ -569,8 +629,8 @@ function download(chatId: string, blob: string, key?: string) {
   // 失败时它得看到结果）。
   if (cards.busy[blob]) {
     if (key) {
-      const joined = downloadKeys[blob] ?? new Set<string>();
-      joined.add(key);
+      const joined = downloadKeys[blob] ?? new Map<string, number>();
+      joined.set(key, op);
       downloadKeys[blob] = joined;
     }
     return;
@@ -595,7 +655,7 @@ function download(chatId: string, blob: string, key?: string) {
   downloadAt[blob] = op;
   const request = `dl-${op}-${Date.now().toString(36)}`;
   downloadRequest[blob] = request;
-  downloadKeys[blob] = new Set(key ? [key] : []);
+  downloadKeys[blob] = new Map(key ? [[key, op]] : []);
   api.syncFetchAttachment(chatId, blob, request).catch((e) => {
     // 会话切走、或这次请求已经被后来的下载顶掉了：迟到的失败不能结算到新请求上。
     if (chat !== chatId || chatGen !== gen) return;
@@ -654,20 +714,16 @@ function save(chatId: string, item: SyncAttachment) {
           delete savedVerified[key];
         }
         // 重新保存成功：早于这次保存的打开失败文案一并收掉（保存期间新发生的
-        // 打开失败要留着）。
-        delete openErrorOp[savedKey];
+        // 打开失败要留着）。先取值再删序号。
+        const prior = openErrorOp[savedKey] ?? -1;
+        if (prior < op) delete openErrorOp[savedKey];
         return {
           ...prev,
           saved,
           savedVerified,
-          openErrors:
-            (openErrorOp[savedKey] ?? -1) < op
-              ? without(prev.openErrors, savedKey)
-              : prev.openErrors,
+          openErrors: prior < op ? without(prev.openErrors, savedKey) : prev.openErrors,
           openErrorPath:
-            (openErrorOp[savedKey] ?? -1) < op
-              ? without(prev.openErrorPath, savedKey)
-              : prev.openErrorPath,
+            prior < op ? without(prev.openErrorPath, savedKey) : prev.openErrorPath,
         };
       });
       savedKeyGen[savedKey] = (savedKeyGen[savedKey] ?? 0) + 1;
@@ -709,6 +765,9 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       failed = null;
       known = {};
       cards = noCardState();
+      // 上次会话里保存过的落点：恢复出来，旧附件的顶栏打开入口不会随重启丢掉。
+      const remembered = loadSaved(chatId);
+      cards = { ...cards, saved: remembered.saved, savedVerified: remembered.savedVerified };
       changedKeys.clear();
       // Chat 的上报可能先到（子组件 effect 先跑）：消费它，别丢。
       if (pendingLoaded?.chatId === chatId) {
@@ -830,6 +889,12 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     void load();
     const un = api.onSync((event) => {
       if (event.kind === "attachment") {
+        // 没有请求标识、也不是本会话发起的下载（自动取回/别的会话）：事件不带会话，
+        // 不能拿它改本会话卡片的 busy/错误；重取清单就够了。
+        if (event.request == null && downloadAt[event.blob] === undefined) {
+          schedule();
+          return;
+        }
         settle(event.blob, event.error, event.placed, event.landed, event.request, chatId);
         schedule();
       } else if (event.kind === "status") {
@@ -1483,7 +1548,7 @@ export function SyncChatBar({
                   ? `这个会话引用的文件里，有 ${view.pending.length} 个不在这台设备上`
                   : `已下载 ${view.landed.length} 个文件`}
                 {view.pending.length > 0 && view.landed.length > 0
-                  ? `，刚下载了 ${view.landed.length} 个`
+                  ? `，另有 ${view.landed.length} 个可直接打开`
                   : ""}
               </span>
               <span className="shrink-0 text-gray-500">{open ? "收起 ▴" : "查看 ▾"}</span>
@@ -1515,7 +1580,7 @@ export function SyncChatBar({
             <div className="mt-2 max-h-64 space-y-2 overflow-y-auto pb-1">
               {view.landed.length > 0 && (
                 <p className="text-[10px] leading-relaxed text-gray-500">
-                  刚下载的文件可以在这里直接打开；消息里的预览图在下次打开这个会话时显示。
+                  已下载/已保存的文件可以在这里直接打开；消息里的预览图在下次打开这个会话时显示。
                 </p>
               )}
               {view.pending.map((item) => (

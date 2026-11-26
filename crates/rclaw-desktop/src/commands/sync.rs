@@ -1400,9 +1400,9 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
 ///   已存在即失败（exFAT/FAT 也支持）。
 /// - Linux/Android：`renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败
 ///   （内核 ≥3.15；Android 的内核都满足）。
-/// - 文件系统不认 `RENAME_NOREPLACE`：明确报错，不退回「先建名再复制」（复制期间
-///   正式名字可写，并发写入会被覆盖或反过来，发布结果无法保证）。两个原语都是
-///   「目标存在即失败」，不存在覆盖窗口。
+/// - 文件系统不认 `RENAME_NOREPLACE` / Android 没有该符号：退回「create_new 占名 +
+///   同目录 rename」——不覆盖已有文件，正式名字上不会出现写了一半的内容；空占位被
+///   并发写入的窗口只有一次元数据操作那么长（没有更好原语时保证「能保存」的取舍）。
 #[cfg(windows)]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -1425,6 +1425,68 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    match renameat2_noreplace(from, to) {
+        Ok(()) => Ok(()),
+        // 目标已存在：让调用方换下一个候选。
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        // 不支持/被拒绝（老内核、FUSE、seccomp 拦下、跨设备……）：退回「create_new
+        // 占名 + 同目录 rename」。不覆盖已存在的文件（名字由我们建住），正式名字上
+        // 不会出现写了一半的内容；空占位被并发写入的窗口只有一次元数据操作那么长
+        // （没有更好的原语时的取舍，Android 8/9 的 seccomp 也不至于让保存彻底失败）。
+        Err(_) => publish_by_placeholder(from, to),
+    }
+}
+
+/// `renameat2(RENAME_NOREPLACE)`：原子、目标存在即失败。
+///
+/// Android 的 bionic 直到 API 30 才导出 `renameat2` 符号，直接 `syscall` 又可能
+/// 撞上 seccomp（SIGSYS）：运行时 `dlsym` 找符号，没有就走占名 + rename 的退路。
+#[cfg(target_os = "android")]
+fn renameat2_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    type RenameAt2 = unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_uint,
+    ) -> libc::c_int;
+    let sym = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            b"renameat2\0".as_ptr() as *const libc::c_char,
+        )
+    };
+    if sym.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "这个 Android 版本没有导出 renameat2",
+        ));
+    }
+    let rename: RenameAt2 = unsafe { std::mem::transmute(sym) };
+    let cstr = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径里有 NUL"))
+    };
+    let (from_c, to_c) = (cstr(from)?, cstr(to)?);
+    let rc = unsafe {
+        rename(
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_uint,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let cstr = |path: &Path| {
         std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -1442,35 +1504,34 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
         )
     };
     if rc == 0 {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        // 文件系统不认 RENAME_NOREPLACE：没有「原子 + 不覆盖」的发布原语，明确
-        // 报错（不退回「先建名再复制」——复制期间正式名字可写，并发写入会被我们
-        // 覆盖或反过来，发布结果无法保证）。
-        Some(libc::ENOSYS)
-        | Some(libc::EINVAL)
-        | Some(libc::ENOTSUP)
-        // 被 SELinux/挂载策略拒绝、跨设备：对这个落点也是「没有可用的原子无覆盖
-        // 改名」，重试不会变好，按 Unsupported 报（界面不再给重试/保存入口）。
-        | Some(libc::EPERM)
-        | Some(libc::EACCES)
-        | Some(libc::EXDEV) => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "这个位置不支持原子发布文件（文件系统不支持无覆盖改名）",
-        )),
-        _ => Err(err),
+}
+
+/// 没有原子无覆盖改名原语时的退路：`create_new` 占住目标名（不覆盖已有文件、并发
+/// 抢不到这个名字），再把写好的暂存文件 rename 上去（同目录、原子）。空占位被并发
+/// 写入的窗口只有一次元数据操作那么长。
+#[cfg(not(windows))]
+fn publish_by_placeholder(from: &Path, to: &Path) -> std::io::Result<()> {
+    let placeholder = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    drop(placeholder);
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(to);
+            Err(e)
+        }
     }
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    let _ = (from, to);
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "这个平台没有可用的无覆盖发布原语",
-    ))
+    publish_by_placeholder(from, to)
 }
 
 /// 把暂存文件发布成工作区里的新文件：候选名逐个试，`hard_link` 保证不覆盖已有文件、
