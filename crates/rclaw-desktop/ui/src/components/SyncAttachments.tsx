@@ -125,15 +125,21 @@ let reload: (() => void) | null = null;
 let loadedMsgIds = new Set<number>();
 let loadedMsgSig = "";
 let loadedMsgChat: string | null = null;
+/** 装载器还没切过去时先攒着的上报（切会话时 Chat 的 effect 先于装载器跑，丢了
+ *  的话正文里已有的消息会被当成没加载，保存过的附件一直留在顶栏）。 */
+let pendingLoaded: { chatId: string; ids: number[]; sig: string } | null = null;
 
 export function setLoadedAttachmentMessages(chatId: string, ids: number[]) {
-  // 装载器还没切到这个会话（Chat 的 effect 先于 App 的装载器 effect 跑）：等下一次。
-  if (chat !== chatId) return;
   const sig = ids.join(",");
+  if (chat !== chatId) {
+    pendingLoaded = { chatId, ids, sig };
+    return;
+  }
   if (loadedMsgChat === chatId && sig === loadedMsgSig) return;
   loadedMsgChat = chatId;
   loadedMsgSig = sig;
   loadedMsgIds = new Set(ids);
+  pendingLoaded = null;
   // 「已保存」的顶栏条目去留取决于消息卡在不在正文里：集合变了重取一次清单。
   reload?.();
 }
@@ -142,12 +148,17 @@ export function setLoadedAttachmentMessages(chatId: string, ids: number[]) {
  *  按目录缓存几秒，避免每次清单刷新都为同一批保存记录打一轮 IPC。 */
 const savedDirCache = new Map<string, { at: number; names: Set<string> | null }>();
 const SAVED_PROBE_MS = 5_000;
+/** 保存记录的版本：每次写入保存落点递增。探活回来时凭它确认期间没有重新保存，
+ *  否则会拿旧目录结果把刚写下的记录删掉。 */
+let savedGen = 0;
+const savedKeyGen: Record<string, number> = {};
 const savedDirOf = (rel: string) => {
   const cut = rel.lastIndexOf("/");
   return cut < 0 ? "" : rel.slice(0, cut);
 };
 
 async function probeSavedPaths(paths: string[]): Promise<Set<string>> {
+  const gen = savedGen;
   const byDir = new Map<string, string[]>();
   for (const rel of paths) {
     const dir = savedDirOf(rel);
@@ -161,13 +172,22 @@ async function probeSavedPaths(paths: string[]): Promise<Set<string>> {
     if (!entry || Date.now() - entry.at > SAVED_PROBE_MS) {
       let names: Set<string> | null = null;
       try {
-        names = new Set((await api.workspaceList(dir)).map((item) => item.name));
-      } catch {
-        // 列不出来（目录没了、命令失败）：按「不知道」处理，下面当它在，别误删记录。
-        names = null;
+        names = new Set(
+          (await api.workspaceList(dir))
+            .filter((item) => !item.is_dir)
+            .map((item) => item.name),
+        );
+      } catch (e) {
+        // 目录明确不存在 / 被同名文件顶掉：这个目录下的另存文件一定不在了。
+        // 其他错误（工作区暂不可用、越界）按「不知道」处理，别误删记录。
+        const text = String(e);
+        names =
+          text.startsWith("目录不存在") || text.startsWith("不是目录") ? new Set() : null;
       }
       entry = { at: Date.now(), names };
-      savedDirCache.set(dir, entry);
+      // 探活期间有保存写进这个目录：这份列举可能漏掉它，不缓存（结果本身只用来
+      // 判断老记录，新记录由按文件的版本号保护）。
+      if (savedGen === gen) savedDirCache.set(dir, entry);
     }
     for (const rel of rels) {
       const name = rel.slice(rel.lastIndexOf("/") + 1);
@@ -184,9 +204,17 @@ async function pruneSavedGone(chatId: string) {
     ([key, rel]) => rel !== key.slice(key.indexOf(":") + 1),
   );
   if (alt.length === 0) return;
+  const genAt = new Map(alt.map(([key]) => [key, savedKeyGen[key] ?? 0]));
   const present = await probeSavedPaths(alt.map(([, rel]) => rel));
   if (chat !== chatId) return;
-  const gone = alt.filter(([, rel]) => !present.has(rel)).map(([key]) => key);
+  const gone = alt
+    .filter(
+      ([key, rel]) =>
+        !present.has(rel) &&
+        (savedKeyGen[key] ?? 0) === genAt.get(key) &&
+        cards.saved[key] === rel,
+    )
+    .map(([key]) => key);
   if (gone.length === 0) return;
   setCards((prev) => {
     const keys = gone.filter((key) => key in prev.saved);
@@ -337,9 +365,14 @@ function apply(chatId: string, list: SyncAttachment[]) {
     (item) =>
       currentKeys.has(fileKey(item)) &&
       !pendingKeys.has(fileKey(item)) &&
-      // 已保存的：消息卡（带「已存到 … / 打开」）在正文里就交给正文；不在
-      // 正文里（首屏只加载最近 80 行）的留着——顶栏是它唯一的打开入口。
-      !(saved[fileKey(item)] !== undefined && loadedMsgIds.has(item.message_id)),
+      // 已保存的文件：消息卡（带「已存到 … / 打开」）在正文里就交给正文；不在
+      // 正文里（首屏只加载最近 80 行）、或者根本没有正文卡（工具结果 artifact；
+      // 只在工具调用参数里出现的引用）的，留着——顶栏是唯一的打开入口。
+      !(
+        item.kind === "file" &&
+        saved[fileKey(item)] !== undefined &&
+        loadedMsgIds.has(item.message_id)
+      ),
   );
   if (cardsChanged) cards = { ...cards, saved, saveErrors };
   const sig = JSON.stringify([pending, stillLanded]);
@@ -449,6 +482,8 @@ function save(chatId: string, item: SyncAttachment) {
       // 目录探活缓存里可能还没有这个刚写下的名字：作废它，否则紧接着的清单刷新
       // 会把刚保存的记录当成已被删掉。
       savedDirCache.delete(savedDirOf(rel));
+      savedGen += 1;
+      savedKeyGen[savedKey] = savedGen;
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：让
       // 消息里的卡立刻换回正常的图片/视频卡，不用等下一次同步动静。
       reload?.();
@@ -483,9 +518,17 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       known = {};
       cards = noCardState();
       changedKeys.clear();
-      loadedMsgIds = new Set();
-      loadedMsgSig = "";
-      loadedMsgChat = null;
+      // Chat 的上报可能先到（子组件 effect 先跑）：消费它，别丢。
+      if (pendingLoaded?.chatId === chatId) {
+        loadedMsgIds = new Set(pendingLoaded.ids);
+        loadedMsgSig = pendingLoaded.sig;
+        loadedMsgChat = chatId;
+        pendingLoaded = null;
+      } else {
+        loadedMsgIds = new Set();
+        loadedMsgSig = "";
+        loadedMsgChat = null;
+      }
       savedDirCache.clear();
       emit();
     }

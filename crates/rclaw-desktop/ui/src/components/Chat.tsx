@@ -2279,9 +2279,14 @@ export default function Chat({
   // 正文里现在有哪些消息行：附件清单覆盖整个会话，已保存的旧附件不在正文里时
   // 只能靠顶栏保留打开入口（80 行首屏截断）。
   useEffect(() => {
+    // 只报 user/assistant：工具/思考行（status）不渲染附件卡，正文里的卡只出现
+    // 在这两类行上。
     setLoadedAttachmentMessages(
       sessionKey,
-      entries.map((e) => e.msgId).filter((id): id is number => typeof id === "number"),
+      entries
+        .filter((e) => e.role === "user" || e.role === "assistant")
+        .map((e) => e.msgId)
+        .filter((id): id is number => typeof id === "number"),
     );
   }, [entries, sessionKey]);
   const widePointer = useWidePointer();
@@ -2306,16 +2311,24 @@ export default function Chat({
   // 跳转到第 N 轮：锚点行顶对齐列表视口顶。最后一轮 = 最新对话，恢复跟随拉底
   // （跳到最新还显示「回到底部」是反直觉的）；其余轮次脱离跟随。zcode 同款坐
   // 标公式；prefers-reduced-motion 时全部 instant。
+  const beginJump = (id: number) => {
+    jumpTargetRef.current = id;
+    jumpAlignedRef.current = false;
+    jumpAtRef.current = Date.now();
+    setActiveRoundId(id);
+  };
   const scrollToRound = (id: number) => {
     const el = listRef.current;
     if (!el) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     if (rounds[rounds.length - 1]?.id === id) {
+      beginJump(id);
       scrollListToBottom(!reduce);
       return;
     }
     const row = el.querySelector<HTMLElement>(`[data-entry-id="${id}"]`);
     if (!row) return;
+    beginJump(id);
     stickToBottomRef.current = false;
     setShowJumpDown(true);
     el.scrollTo({
@@ -2331,6 +2344,11 @@ export default function Chat({
   // 停在第一条消息内部）才取第一条——底部不管多长的回复都不回退第一条。rAF
   // 节流：scroll 每 tick 至多一次，DOM 查询量 = 轮次数（≤80）。
   const [activeRoundId, setActiveRoundId] = useState<number | null>(null);
+  // 显式跳转的目标：滚动动画期间与对齐之后都保持目标轮高亮（半屏滞回会在
+  // 「点上一轮、上一轮很短」时把高亮留给下面那一长轮）。对齐后用户再滚走就解除。
+  const jumpTargetRef = useRef<number | null>(null);
+  const jumpAlignedRef = useRef(false);
+  const jumpAtRef = useRef(0);
   const activeRoundRafRef = useRef<number | null>(null);
   // 最新实现经 ref 供 rAF 回调读取（见 scheduleActiveRound）；layout effect 写入
   // 而非渲染期——并发渲染丢弃的渲染不得更新 ref。
@@ -2341,6 +2359,29 @@ export default function Chat({
       setActiveRoundId((v) => (v === null ? v : null));
       return;
     }
+    const containerTop = el.getBoundingClientRect().top;
+    // 显式跳转：目标轮在平滑滚动期间/对齐之后保持高亮；对齐后被用户滚走，或者
+    // 跳转两秒还没对齐（底部被夹住）就解除，交回常规判定。
+    if (jumpTargetRef.current !== null) {
+      const target = jumpTargetRef.current;
+      const row = rounds.some((r) => r.id === target)
+        ? el.querySelector<HTMLElement>(`[data-entry-id="${target}"]`)
+        : null;
+      if (!row) {
+        jumpTargetRef.current = null;
+      } else {
+        const aligned = Math.abs(row.getBoundingClientRect().top - containerTop) <= 8;
+        if (aligned) jumpAlignedRef.current = true;
+        const stale =
+          !aligned && !jumpAlignedRef.current && Date.now() - jumpAtRef.current > 2_000;
+        if (stale || (jumpAlignedRef.current && !aligned)) {
+          jumpTargetRef.current = null;
+        } else {
+          setActiveRoundId((v) => (v === target ? v : target));
+          return;
+        }
+      }
+    }
     // 已经在最底部：当前轮就是最后一轮（最后一轮可能很短，轮次行的顶还在
     // 视口顶之上；按「视口顶以上最近一轮」会错误地停在倒数第二个）。
     if (el.scrollHeight - el.scrollTop - el.clientHeight <= 4) {
@@ -2348,7 +2389,6 @@ export default function Chat({
       setActiveRoundId((v) => (v === last ? v : last));
       return;
     }
-    const containerTop = el.getBoundingClientRect().top;
     const viewBottom = containerTop + el.clientHeight;
     // 滞回：当前轮的内容（到下一轮提问为止）还占着视口一半以上就保持。在长回复里
     // 往上滑时，不能刚把这一轮的提问滑出视口顶就跳到上一条——尤其上一条只有几行
@@ -2398,6 +2438,10 @@ export default function Chat({
   // 补算时机：滚动之外没有 scroll 事件的场景——切会话/首屏/发送/轮次集合变化/
   // 忙碌翻转。依赖收窄到轮次集合签名（长度+首尾 id）：流式每 chunk 变 entries
   // 不再逐 chunk 全量查 DOM（滚动路径的 rAF 兜住其余时机）。
+  useLayoutEffect(() => {
+    jumpTargetRef.current = null;
+    jumpAlignedRef.current = false;
+  }, [sessionKey]);
   const roundsSignature = `${rounds.length}:${rounds[0]?.id ?? ""}:${rounds[rounds.length - 1]?.id ?? ""}`;
   useLayoutEffect(() => {
     computeActiveRound();
