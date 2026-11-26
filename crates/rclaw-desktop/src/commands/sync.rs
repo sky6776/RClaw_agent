@@ -1009,6 +1009,9 @@ pub async fn sync_open_attachment(
                     "这份文件已经不是这条消息引用的那一份了（可能被就地改写过）。点「重新下载」取回原来的内容。"
                         .into(),
                 ),
+                rclaw_sync::AttachmentStage::Failed => Err(
+                    "打开失败: 暂存文件写不出来（磁盘空间或权限不足）".into(),
+                ),
                 // 核不了：按老行为打开原路径（这次「打开成功」不代表核对通过）。
                 // 另存副本入口要求核对，核不了就不要打开。
                 rclaw_sync::AttachmentStage::Unverifiable => {
@@ -1409,15 +1412,35 @@ fn publish_staged(
             }
             // 名字刚被别人占了：换下一个候选（暂存文件照用）。
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => match std::fs::rename(tmp, &dest) {
-                Ok(()) => return Ok(dest),
-                // Windows 上 rename 不覆盖已有文件：名字被占了，换下一个。
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    last = Some(e);
-                    break;
+            Err(_) => {
+                // 这条落点不支持硬链接：先用 `create_new` 把候选名占住（并发保存
+                // 抢不到这个名字，也不会覆盖已有文件），再把写好的暂存文件 rename
+                // 上去。rename 覆盖的是我们自己刚建的空占位文件——读者只会看到
+                // 「空文件 → 完整文件」，不会看到写了一半的内容（空文件窗口只有
+                // 一次元数据操作那么长）。
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&dest)
+                {
+                    Ok(placeholder) => {
+                        drop(placeholder);
+                        match std::fs::rename(tmp, &dest) {
+                            Ok(()) => return Ok(dest),
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&dest);
+                                last = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        last = Some(e);
+                        break;
+                    }
                 }
-            },
+            }
         }
     }
     let _ = std::fs::remove_file(tmp);

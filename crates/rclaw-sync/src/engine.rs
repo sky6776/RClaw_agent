@@ -118,8 +118,11 @@ pub enum AttachmentCopy {
 pub enum AttachmentStage {
     /// 副本已写好，字节核对过。
     Staged(String),
-    /// 对不上/太大/写失败：调用方不能退回原路径。
+    /// 内容对不上 / 路径不安全：调用方不能退回原路径。
     Rejected,
+    /// 暂存 I/O 失败（建目录、写盘、磁盘满、权限）：不是内容问题，调用方按
+    /// 「暂时打不开/写不出」处理，不能当成「内容被改写了」。
+    Failed,
     /// 核不了（没有登记/引用、读不出密钥）：按老行为。
     Unverifiable,
 }
@@ -1601,7 +1604,7 @@ impl SyncEngine {
             return AttachmentStage::Rejected;
         }
         if std::fs::create_dir_all(parent).is_err() {
-            return AttachmentStage::Rejected;
+            return AttachmentStage::Failed;
         }
         let Ok(input) = std::fs::File::open(&source) else {
             return AttachmentStage::Rejected;
@@ -1612,18 +1615,21 @@ impl SyncEngine {
             .open(&dest)
         {
             Ok(file) => file,
-            Err(_) => return AttachmentStage::Rejected,
+            Err(_) => return AttachmentStage::Failed,
         };
         let cap = size.saturating_add(local::SIZE_SLACK).saturating_add(1);
         let mut reader = input.take(cap);
         let result = crate::crypto::copy_hash(&mut reader, &mut output);
         drop(output);
-        let ok = matches!(
-            result,
-            Ok((digest, read)) if read <= size.saturating_add(local::SIZE_SLACK)
-                && keys.blob_id(&digest) == blob
-        );
-        if !ok {
+        let (digest, read) = match result {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                // 写到一半失败（磁盘满/权限）：不是内容对不上。
+                let _ = std::fs::remove_file(&dest);
+                return AttachmentStage::Failed;
+            }
+        };
+        if read > size.saturating_add(local::SIZE_SLACK) || keys.blob_id(&digest) != blob {
             let _ = std::fs::remove_file(&dest);
             return AttachmentStage::Rejected;
         }

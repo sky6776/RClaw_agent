@@ -9,7 +9,7 @@ import { useBackClose } from "../lib/backNav";
 interface Entry {
   name: string;
   is_dir: boolean;
-  size: number;
+  size: number | null;
   modified_ms: number;
   /** 主配置虚拟条目（rclaw.toml，实体在 home 根，保存走配置校验）。 */
   is_config?: boolean;
@@ -527,7 +527,7 @@ export default function FilePanel({ onError }: { onError?: (m: string) => void }
               </span>
               {!entry.is_dir && (
                 <span className="shrink-0 font-mono text-[10px] text-gray-600">
-                  {formatSize(entry.size)}
+                  {entry.size === null ? "—" : formatSize(entry.size)}
                 </span>
               )}
             </button>

@@ -180,7 +180,7 @@ async function probeSavedPaths(
     else byDir.set(dir, [entry]);
   });
   for (const [dir, rels] of byDir) {
-    let entries: Map<string, number> | null = null;
+    let entries: Map<string, number | null> | null = null;
     try {
       entries = new Map(
         (await api.workspaceList(dir))
@@ -203,9 +203,11 @@ async function probeSavedPaths(
       const name = rel.slice(rel.lastIndexOf("/") + 1);
       const onDisk = entries.get(name);
       if (onDisk === undefined) continue;
-      // 目录接口在单个文件读不到元数据时会报 0（不是真的 0 字节）：这种不参与
-      // 长度比较，别把有效副本当成被换掉。
-      if (size !== undefined && onDisk !== 0 && Math.abs(onDisk - size) > SIZE_SLACK) continue;
+      // 读不到元数据（null）不参与长度比较；真实的 0 字节要照常比（被截断成 0 的
+      // 副本不能一直算「还在」）。
+      if (size !== undefined && onDisk !== null && Math.abs(onDisk - size) > SIZE_SLACK) {
+        continue;
+      }
       present[idx] = true;
     }
   }
@@ -338,9 +340,6 @@ function apply(chatId: string, list: SyncAttachment[]) {
   // 存好的落点又对不上了（被改写/删除）：不能再给「打开 savedTo」，让用户重新存。
   // 只处理文件引用——工具结果全文的登记位置不是消息路径，不按它判断。
   const liveKeys = new Set(usable.map((item) => fileKey(item)));
-  const fileKeys = new Set(
-    usable.filter((item) => item.kind === "file").map((item) => fileKey(item)),
-  );
   const presentKeys = new Set(
     usable
       .filter((item) => item.kind === "file" && item.path_present)
@@ -848,7 +847,17 @@ export function AttachmentCard({
       // 打开的是核对过的副本才算这次读通过；按**打开的这个落点**清覆盖（别把消息
       // 路径上的标记也清了，那条可能仍然对不上）。
       .then((verified) => {
-        if (verified) clearAttachmentChanged({ path, blob: item.blob });
+        if (!verified) return;
+        clearAttachmentChanged({ path, blob: item.blob });
+        // 上一次打开失败（严格核对暂时不可用、拉起程序失败）的文案要收掉：这次
+        // 已经核对通过。期间换过记录的（版本/落点变了）不动，交给新记录自己。
+        if ((savedKeyGen[key] ?? 0) !== genAt) return;
+        if (cards.saved[key] !== undefined && cards.saved[key] !== path) return;
+        setCards((prev) =>
+          prev.saveErrors[key] === undefined
+            ? prev
+            : { ...prev, saveErrors: without(prev.saveErrors, key) },
+        );
       })
       .catch((e) => {
         if (chat !== chatId) return;

@@ -6212,6 +6212,9 @@ pub async fn save_media(
             rclaw_sync::AttachmentStage::Rejected => {
                 return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
             }
+            rclaw_sync::AttachmentStage::Failed => {
+                return Err("保存失败: 暂存文件写不出来（磁盘空间或权限不足）".into())
+            }
             rclaw_sync::AttachmentStage::Unverifiable => {}
         }
     }
@@ -6460,6 +6463,9 @@ pub async fn share_media(
                 // 是另一个版本。
                 rclaw_sync::AttachmentStage::Rejected => {
                     return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
+                }
+                rclaw_sync::AttachmentStage::Failed => {
+                    return Err("转发失败: 暂存文件写不出来（磁盘空间或权限不足）".into())
                 }
                 // 核不了（没有登记/读不出密钥）：按老行为转发原路径。
                 rclaw_sync::AttachmentStage::Unverifiable => {}
@@ -6719,6 +6725,9 @@ pub async fn media_stream_url(
                 rclaw_sync::AttachmentStage::Rejected => {
                     return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
+                rclaw_sync::AttachmentStage::Failed => {
+                    return Err("应用内播放失败: 暂存文件写不出来（磁盘空间或权限不足）".into())
+                }
                 rclaw_sync::AttachmentStage::Unverifiable => playback_unverifiable = true,
             }
         }
@@ -6753,8 +6762,9 @@ pub async fn media_stream_url(
 pub struct WorkspaceEntryDto {
     pub name: String,
     pub is_dir: bool,
-    /// 字节数（目录为 0）。
-    pub size: u64,
+    /// 字节数；读不到元数据时为 `None`（不能拿 0 冒充「未知」，附件另存探活要靠
+    /// 真实长度判断落点有没有被换掉）。
+    pub size: Option<u64>,
     /// 最后修改（unix 毫秒）。
     pub modified_ms: u64,
     /// 主配置虚拟条目（rclaw.toml，实体在 home 根）：前端用于图标/操作门控。
@@ -6791,9 +6801,9 @@ fn config_entry_dto(home: &std::path::Path) -> WorkspaceEntryDto {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            (m.len(), modified)
+            (Some(m.len()), modified)
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((None, 0));
     WorkspaceEntryDto {
         name: CONFIG_NAME.to_string(),
         is_dir: false,
@@ -7055,7 +7065,7 @@ pub async fn workspace_list(
             out.push(WorkspaceEntryDto {
                 name,
                 is_dir: entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                size: meta.as_ref().map(|m| m.len()),
                 modified_ms,
                 is_config: false,
             });

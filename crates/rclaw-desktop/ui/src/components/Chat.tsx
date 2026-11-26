@@ -2339,15 +2339,20 @@ export default function Chat({
     const top =
       el.scrollTop + row.getBoundingClientRect().top - el.getBoundingClientRect().top;
     const max = Math.max(0, el.scrollHeight - el.clientHeight);
-    stickToBottomRef.current = false;
-    setShowJumpDown(true);
     if (top >= max - 1) {
-      // 目标落点会被底部夹住：滚过去也就是底部，按「到底 = 末轮」高亮（钉目标
-      // 的话它永远等不到对齐，会一直压着末轮规则）。
-      el.scrollTo({ top: max, behavior: reduce ? "auto" : "smooth" });
+      // 目标落点会被底部夹住：落点就是底部，按「到底」处理——清掉上一次跳转的
+      // pin（否则它会一直压着末轮规则），恢复跟随并收起「回到底部」按钮，高亮
+      // 交给末轮规则。
+      jumpTargetRef.current = null;
+      jumpAlignedRef.current = false;
+      window.clearTimeout(jumpTimerRef.current);
+      scrollListToBottom(!reduce);
+      scheduleActiveRound();
       return;
     }
     beginJump(id);
+    stickToBottomRef.current = false;
+    setShowJumpDown(true);
     el.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
   };
 

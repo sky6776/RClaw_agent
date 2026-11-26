@@ -1328,7 +1328,8 @@ export const api = {
       Array<{
         name: string;
         is_dir: boolean;
-        size: number;
+        /** 读不到元数据时为 null（未知，不能当 0 字节）。 */
+        size: number | null;
         modified_ms: number;
         is_config?: boolean;
       }>
