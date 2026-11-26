@@ -997,6 +997,8 @@ export type SyncEvent =
       kind: "attachment";
       blob: string;
       error: string | null;
+      /** 本地下载请求的标识（用户点下载时带过去）：只结算对应的那次请求。 */
+      request?: string | null;
       /** 这次真的把对象落到了本机（存储缺件/取不回来也是空 error，但没落盘）。 */
       placed: boolean;
       /** 实际落到的相对路径（`placed` 为真时）：界面只清这个路径的「内容对不上」标记。 */
@@ -1643,8 +1645,8 @@ export const api = {
 
   /** 下载一个还在别的设备上的附件。不等结果：结果经 sync 事件（kind = attachment）通知。
    *  `chatId` 让后端在登记被回收过时按消息里的引用补一条再取。 */
-  syncFetchAttachment: (chatId: string, blob: string) =>
-    invoke<void>("sync_fetch_attachment", { chatId, blob }),
+  syncFetchAttachment: (chatId: string, blob: string, request: string) =>
+    invoke<void>("sync_fetch_attachment", { chatId, blob, request }),
 
   /** 同步缓存里一张图片快照的预览。`path` 是这条消息里写的路径：同一份内容被引用成
    *  不同名字时，按它的扩展名决定能不能预览。 */

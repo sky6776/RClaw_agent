@@ -51,6 +51,8 @@ pub(crate) struct FetchReq {
     pub blob: String,
     /// 用户点名要的（或者续聊要用）：排到队首，取不到要告诉界面。
     pub user: bool,
+    /// 本地请求标识：完成事件原样带回，界面据此判断是不是当前这次请求。
+    pub request: Option<String>,
 }
 
 /// 上传任务：每次被叫醒（一轮同步结束、用户选了存量附件的范围、恢复同步）就把排着队的
@@ -180,7 +182,8 @@ pub(crate) async fn download_task(
 ) {
     let mut queue: VecDeque<String> = VecDeque::new();
     // 排着队的和正在取的：是不是用户点名要的。
-    let mut wanted: HashMap<String, bool> = HashMap::new();
+    // blob ->（是不是用户点名要的，最新一次本地请求标识）
+    let mut wanted: HashMap<String, (bool, Option<String>)> = HashMap::new();
     let mut running = FuturesUnordered::new();
     loop {
         while running.len() < DOWNLOADS {
@@ -208,8 +211,9 @@ pub(crate) async fn download_task(
                     break;
                 };
                 match wanted.get_mut(&request.blob) {
-                    // 已经在排队或正在取。用户又点了它：往前挪。
-                    Some(user) => {
+                    // 已经在排队或正在取。用户又点了它：往前挪；请求标识按最新那次算。
+                    Some((user, current)) => {
+                        *current = request.request;
                         if request.user && !*user {
                             *user = true;
                             if let Some(at) = queue.iter().position(|blob| *blob == request.blob) {
@@ -219,7 +223,10 @@ pub(crate) async fn download_task(
                         }
                     }
                     None => {
-                        wanted.insert(request.blob.clone(), request.user);
+                        wanted.insert(
+                            request.blob.clone(),
+                            (request.user, request.request),
+                        );
                         if request.user {
                             queue.push_front(request.blob);
                         } else {
@@ -229,8 +236,8 @@ pub(crate) async fn download_task(
                 }
             }
             Some((attempt, landed, result)) = running.next(), if !running.is_empty() => {
-                let user = wanted.remove(&attempt.blob).unwrap_or(false);
-                finish(&shared, attempt, user, landed, result).await;
+                let (user, request) = wanted.remove(&attempt.blob).unwrap_or((false, None));
+                finish(&shared, attempt, user, request, landed, result).await;
             }
         }
     }
@@ -277,6 +284,7 @@ async fn finish(
     shared: &Arc<Shared>,
     attempt: Attempt,
     user: bool,
+    request: Option<String>,
     landed: Option<String>,
     result: Result<()>,
 ) {
@@ -414,6 +422,7 @@ async fn finish(
         None => shared.emit(SyncEvent::Attachment {
             blob,
             error: None,
+            request,
             placed,
             landed,
         }),
@@ -421,6 +430,7 @@ async fn finish(
         Some(error) if user => shared.emit(SyncEvent::Attachment {
             blob,
             error: Some(error),
+            request,
             placed,
             landed: None,
         }),

@@ -1642,7 +1642,7 @@ impl Worker {
         match tail {
             Ok(blobs) => {
                 for blob in blobs {
-                    self.shared.request_fetch(blob, user);
+                    self.shared.request_fetch(blob, user, None);
                 }
             }
             Err(error) => tracing::debug!("查找会话引用的附件失败: {error}"),

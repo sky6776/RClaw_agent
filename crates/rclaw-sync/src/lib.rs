@@ -247,6 +247,9 @@ pub enum SyncEvent {
     Attachment {
         blob: String,
         error: Option<String>,
+        /// 本地请求的标识（用户点下载时带过来）：界面据此只结算对应的那次请求
+        /// （超时后重发、旧完成事件迟到时不串账）。自动取回的事件不带。
+        request: Option<String>,
         placed: bool,
         /// 这一次实际落到的相对路径（`placed` 为真时）。界面按它清「这个落点内容对不上」
         /// 的标记——别的路径上没有它，标记不能跟着清。

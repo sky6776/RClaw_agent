@@ -171,6 +171,11 @@ let opSeq = 0;
 const cardOpSeq: Record<string, number> = {};
 /** 这个对象最近一次「下载」的发起序号：下载结果回来时凭它判断是不是当前这次请求。 */
 const downloadAt: Record<string, number> = {};
+/** 用户点下载时带过去的请求标识：完成事件带回来的标识对不上就丢弃（超时重发、
+ *  迟到的旧事件不串账）。 */
+const downloadRequest: Record<string, string> = {};
+/** 打开失败的序号：更早的下载成功不能把它清掉（只有早于这次下载的才算过去）。 */
+const openErrorOp: Record<string, number> = {};
 function beginOp(key: string): number {
   opSeq += 1;
   cardOpSeq[key] = opSeq;
@@ -439,7 +444,17 @@ function settle(
   error: string | null,
   placed: boolean,
   landed: string | null,
+  request?: string | null,
 ) {
+  // 完成事件带请求标识的：必须是当前这次请求；没带的（自动取回/别的设备触发）不能
+  // 结算用户点名、还没回来的那次。
+  const expected = downloadRequest[blob];
+  if (request !== undefined && request !== null) {
+    if (expected !== request) return;
+    delete downloadRequest[blob];
+  } else if (expected !== undefined) {
+    return;
+  }
   // 这次下载的发起序号：卡片渲染时按「自己的最后一次操作」决定要不要显示它。
   const seq = downloadAt[blob] ?? opSeq;
   if (error === null && placed) {
@@ -464,7 +479,10 @@ function settle(
     if (error === null && placed && landed) {
       const prefix = `${blob}:`;
       const keys = Object.keys(openErrors).filter(
-        (key) => key.startsWith(prefix) && openErrorPath[key] === landed,
+        (key) =>
+          key.startsWith(prefix) &&
+          openErrorPath[key] === landed &&
+          (openErrorOp[key] ?? -1) < seq,
       );
       if (keys.length > 0) {
         openErrors = { ...openErrors };
@@ -472,6 +490,7 @@ function settle(
         for (const key of keys) {
           delete openErrors[key];
           delete openErrorPath[key];
+          delete openErrorOp[key];
         }
       }
     }
@@ -503,6 +522,21 @@ function settle(
 /** 下载一个还在别的设备上的附件。不等结果：结果经 sync 事件回来（见装载器）。
  *  `key` 是卡片发起时给的落点键：下载也算这张卡的一次操作（旧打开/保存失败作废）。 */
 function download(chatId: string, blob: string, key?: string) {
+  // 下载也是一次操作：先把这张卡登记进排序（批量下载里同一对象的第二张卡即使
+  // 已有请求在跑，也要更新自己的操作序号、清掉旧错误）。
+  opSeq += 1;
+  const op = opSeq;
+  if (key) {
+    cardOpSeq[key] = op;
+    setCards((prev) => ({
+      ...prev,
+      saveErrors: without(prev.saveErrors, key),
+      openErrors: without(prev.openErrors, key),
+      openErrorPath: without(prev.openErrorPath, key),
+      cardOp: { ...prev.cardOp, [key]: op },
+    }));
+  }
+  // 已经有同一个对象的请求在跑：合并，不再发一次。
   if (cards.busy[blob]) return;
   setCards((prev) => ({
     ...prev,
@@ -515,28 +549,14 @@ function download(chatId: string, blob: string, key?: string) {
     setCards((prev) => (prev.busy[blob] ? { ...prev, busy: without(prev.busy, blob) } : prev));
     if (reload) reload();
   }, FETCH_SHOWN_MS);
-  // 下载也是一次操作：参与「最近一次操作」排序（稍后的保存/打开会让它的失败
-  // 不再写进卡片错误）。
-  opSeq += 1;
-  const op = opSeq;
   downloadAt[blob] = op;
-  if (key) {
-    // 这张卡的下载也算一次操作：该落点的旧打开/保存失败作废（结果回来时还会写
-    // 这次的错误）。
-    cardOpSeq[key] = op;
-    setCards((prev) => ({
-      ...prev,
-      saveErrors: without(prev.saveErrors, key),
-      openErrors: without(prev.openErrors, key),
-      openErrorPath: without(prev.openErrorPath, key),
-      cardOp: { ...prev.cardOp, [key]: op },
-    }));
-  }
-  api.syncFetchAttachment(chatId, blob).catch((e) => {
+  const request = `dl-${op}-${Date.now().toString(36)}`;
+  downloadRequest[blob] = request;
+  api.syncFetchAttachment(chatId, blob, request).catch((e) => {
     // 会话切走、或这次请求已经被后来的下载顶掉了：迟到的失败不能结算到新请求上。
     if (chat !== chatId) return;
     if (downloadAt[blob] !== op) return;
-    settle(blob, String(e), false, null);
+    settle(blob, String(e), false, null, request);
   });
 }
 
@@ -583,8 +603,20 @@ function save(chatId: string, item: SyncAttachment) {
         const saved = { ...prev.saved, [savedKey]: rel };
         // 归一之后旧对象名的键不再被卡片使用。
         if (savedBlob !== item.blob) delete saved[key];
-        // 重新保存成功：上一次打开失败的文案也一并收掉。
-        return { ...prev, saved, openErrors: without(prev.openErrors, savedKey) };
+        // 重新保存成功：早于这次保存的打开失败文案一并收掉（保存期间新发生的
+        // 打开失败要留着）。
+        return {
+          ...prev,
+          saved,
+          openErrors:
+            (openErrorOp[savedKey] ?? -1) < op
+              ? without(prev.openErrors, savedKey)
+              : prev.openErrors,
+          openErrorPath:
+            (openErrorOp[savedKey] ?? -1) < op
+              ? without(prev.openErrorPath, savedKey)
+              : prev.openErrorPath,
+        };
       });
       savedKeyGen[savedKey] = (savedKeyGen[savedKey] ?? 0) + 1;
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：先
@@ -635,6 +667,11 @@ export function useSyncAttachmentLoader(chatId: string | null) {
         loadedMsgSig = "";
         loadedMsgChat = null;
       }
+      // 模块级操作序号也清掉：旧会话迟到的回调不能再通过序号校验写进新卡片。
+      for (const key of Object.keys(cardOpSeq)) delete cardOpSeq[key];
+      for (const blob of Object.keys(downloadAt)) delete downloadAt[blob];
+      for (const blob of Object.keys(downloadRequest)) delete downloadRequest[blob];
+      for (const key of Object.keys(openErrorOp)) delete openErrorOp[key];
       emit();
     }
     let alive = true;
@@ -733,7 +770,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
     void load();
     const un = api.onSync((event) => {
       if (event.kind === "attachment") {
-        settle(event.blob, event.error, event.placed, event.landed);
+        settle(event.blob, event.error, event.placed, event.landed, event.request);
         schedule();
       } else if (event.kind === "status") {
         // 每一轮同步的状态变化：别名补落点、登记回收都可能在这时完成，借机重取一次
@@ -969,6 +1006,7 @@ export function AttachmentCard({
         // `verified=false` 是「按老行为打开、没核对」：文件确实打开了，上一次打开
         // 失败同样已经过去；只是不能清「内容对不上」的标记。
         if (verified) clearAttachmentChanged({ path, blob: item.blob });
+        delete openErrorOp[key];
         setCards((prev) =>
           prev.openErrors[key] === undefined
             ? prev
@@ -998,6 +1036,7 @@ export function AttachmentCard({
           openErrors: { ...prev.openErrors, [key]: String(e) },
           openErrorPath: { ...prev.openErrorPath, [key]: path },
         }));
+        openErrorOp[key] = op;
         if (gone) reload?.();
       });
   };

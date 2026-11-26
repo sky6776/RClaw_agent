@@ -1101,7 +1101,7 @@ impl Session {
                 break;
             }
             if self.auto_fetched.insert(blob.clone()) {
-                shared.request_fetch(blob, false);
+                shared.request_fetch(blob, false, None);
                 queued += 1;
             }
         }
@@ -1128,7 +1128,7 @@ impl Session {
                     if tried < WANTS_PER_ROUND && last.elapsed() >= WANT_BACKOFF[step] {
                         tried += 1;
                         self.want_tries.insert(blob.clone(), (tries + 1, now));
-                        shared.request_fetch(blob, false);
+                        shared.request_fetch(blob, false, None);
                     }
                 }
             }

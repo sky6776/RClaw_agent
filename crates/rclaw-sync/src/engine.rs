@@ -351,10 +351,21 @@ impl Shared {
     }
 
     /// 排一个取回附件的请求。没有连上同步空间时返回 `false`。
-    pub(crate) fn request_fetch(&self, blob: String, user: bool) -> bool {
-        lock(&self.fetch)
-            .as_ref()
-            .is_some_and(|sender| sender.send(FetchReq { blob, user }).is_ok())
+    pub(crate) fn request_fetch(
+        &self,
+        blob: String,
+        user: bool,
+        request: Option<String>,
+    ) -> bool {
+        lock(&self.fetch).as_ref().is_some_and(|sender| {
+            sender
+                .send(FetchReq {
+                    blob,
+                    user,
+                    request,
+                })
+                .is_ok()
+        })
     }
 }
 
@@ -1727,7 +1738,13 @@ impl SyncEngine {
     /// 点「重新下载」：登记被回收过的（很少见）先按消息里的引用补一条「等待取回」，
     /// 再排队取回。补登记只在用户明确点了的时候做——清单查询是只读的，不在读路径上
     /// 写库（换空间的那段窗口里旧对象名不该被写进新空间）。
-    pub fn fetch_attachment_at(&self, channel: &str, chat_id: &str, blob: &str) -> Result<()> {
+    pub fn fetch_attachment_at(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        blob: &str,
+        request: Option<String>,
+    ) -> Result<()> {
         let ctx = &self.inner.ctx;
         // 读引用之前记下同步空间的代：读完之后补登记要核对的是**同一代**（换空间之后
         // 旧引用里的对象名不该被写进新空间）。
@@ -1793,7 +1810,7 @@ impl SyncEngine {
             }
             return Err(SyncError::other("同步空间刚换过，请重试一次"));
         }
-        let queued = self.fetch_attachment(blob);
+        let queued = self.fetch_attachment(blob, request);
         if queued.is_err() && registered {
             // 没排上队（没连上同步空间、引擎在重连）：撤掉刚补的临时登记，别挡住
             // `BLOB_GONE` 记录「文件放回原处后重新上传」的那条路。
@@ -1804,9 +1821,9 @@ impl SyncEngine {
 
     /// 用户点了一个还没下载的附件：排到下载队列的最前面。结果经
     /// [`SyncEvent::Attachment`] 通知。
-    pub fn fetch_attachment(&self, blob: &str) -> Result<()> {
+    pub fn fetch_attachment(&self, blob: &str, request: Option<String>) -> Result<()> {
         match self.live(true) {
-            Some((_, shared)) if shared.request_fetch(blob.to_string(), true) => Ok(()),
+            Some((_, shared)) if shared.request_fetch(blob.to_string(), true, request) => Ok(()),
             _ => Err(SyncError::other("还没有连上同步空间，取不了这个附件")),
         }
     }

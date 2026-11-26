@@ -810,6 +810,7 @@ pub async fn sync_fetch_attachment(
     state: State<'_, AppState>,
     chat_id: String,
     blob: String,
+    request: Option<String>,
 ) -> Result<(), String> {
     check_chat_id(&chat_id)?;
     let engine = handle(&state)?;
@@ -817,7 +818,7 @@ pub async fn sync_fetch_attachment(
     // 下载」时别把 Tauri 的命令线程堵住。
     run_blocking("下载附件", move || {
         engine
-            .fetch_attachment_at(CHANNEL_DESKTOP, &chat_id, &blob)
+            .fetch_attachment_at(CHANNEL_DESKTOP, &chat_id, &blob, request)
             .map_err(fail)
     })
     .await

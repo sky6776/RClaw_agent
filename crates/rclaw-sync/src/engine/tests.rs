@@ -402,7 +402,7 @@ async fn attachments_upload_after_the_backlog_choice_and_download_on_request() {
     assert!(!listed[0].path_present);
     assert!(!b.agent().join("uploads").join("a.txt").exists());
 
-    b.engine.fetch_attachment(&listed[0].blob).unwrap();
+    b.engine.fetch_attachment(&listed[0].blob, None).unwrap();
     wait_for("乙取回附件", 20, || {
         b.agent().join("uploads").join("a.txt").is_file()
     })
