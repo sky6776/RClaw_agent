@@ -2544,6 +2544,27 @@ export default function Chat({
     return () => observer.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // 列表视口尺寸变化会让正在进行/刚完成的跳转对齐失效（窗口 resize、顶部提示条
+  // 展开/收起）：结束跳转；如果夹到新底部就恢复跟随、收起按钮。只观察列表本身
+  // （正文列随流式长高不触发，不能每 chunk 把跳转清掉）。
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (jumpTargetRef.current === null && !followLockRef.current) return;
+      clearJump();
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
+      if (atBottom) {
+        el.scrollTo({ top: el.scrollHeight });
+        stickToBottomRef.current = true;
+        setShowJumpDown(false);
+      }
+      scheduleActiveRound();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="chat-bg flex h-full flex-col">
