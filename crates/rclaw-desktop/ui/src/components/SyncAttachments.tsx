@@ -162,14 +162,11 @@ const savedKeyGen: Record<string, number> = {};
  *  操作」的失败才写进卡片——先发起、后返回的旧操作不能盖住新错误。 */
 let opSeq = 0;
 const cardOpSeq: Record<string, number> = {};
-const blobOpSeq: Record<string, number> = {};
-/** 这个对象最近一次「下载」的序号：下载结果回来时若之后又发起了保存/打开，就不再
- *  拿它写卡片错误（最近一次操作的错误优先）。 */
+/** 这个对象最近一次「下载」的发起序号：下载结果回来时凭它判断是不是当前这次请求。 */
 const downloadAt: Record<string, number> = {};
-function beginOp(key: string, blob?: string): number {
+function beginOp(key: string): number {
   opSeq += 1;
   cardOpSeq[key] = opSeq;
-  if (blob !== undefined) blobOpSeq[blob] = opSeq;
   return opSeq;
 }
 const savedDirOf = (rel: string) => {
@@ -453,16 +450,12 @@ function settle(
     const busy = without(prev.busy, blob);
     const errors =
       error === null ? without(prev.errors, blob) : { ...prev.errors, [blob]: error };
-    // 下载成功：这个对象的副本刚取回来，之前「打开这个落点失败」的文案已经过时
-    // （按 blob:path 键找同一对象的落点）。保存失败（落点不支持发布等）不动。
+    // 下载成功：只清「实际落到的那个路径」的打开失败（别的落点可能仍然读不了；
+    // 存进工作区失败是另一回事）。没给出落点时什么都没恢复，不清。
     let openErrors = prev.openErrors;
-    if (error === null && placed) {
-      const prefix = `${blob}:`;
-      const stale = Object.keys(openErrors).filter((key) => key.startsWith(prefix));
-      if (stale.length > 0) {
-        openErrors = { ...openErrors };
-        for (const key of stale) delete openErrors[key];
-      }
+    if (error === null && placed && landed) {
+      const key = `${blob}:${landed}`;
+      if (openErrors[key] !== undefined) openErrors = without(openErrors, key);
     }
     // 卡片上的「内容对不上／保存失败」是按落点记的：不在这里按整个对象清（成功落到的
     // 那个落点由上面的 clearAttachmentChanged 连说明一起收掉；别的落点可能仍然不对）。
@@ -508,8 +501,9 @@ function download(chatId: string, blob: string, key?: string) {
   opSeq += 1;
   const op = opSeq;
   downloadAt[blob] = op;
-  blobOpSeq[blob] = op;
   if (key) {
+    // 这张卡的下载也算一次操作：该落点的旧打开/保存失败作废（结果回来时还会写
+    // 这次的错误）。
     cardOpSeq[key] = op;
     setCards((prev) => ({
       ...prev,
@@ -517,7 +511,12 @@ function download(chatId: string, blob: string, key?: string) {
       openErrors: without(prev.openErrors, key),
     }));
   }
-  api.syncFetchAttachment(chatId, blob).catch((e) => settle(blob, String(e), false, null));
+  api.syncFetchAttachment(chatId, blob).catch((e) => {
+    // 会话切走、或这次请求已经被后来的下载顶掉了：迟到的失败不能结算到新请求上。
+    if (chat !== chatId) return;
+    if (downloadAt[blob] !== op) return;
+    settle(blob, String(e), false, null);
+  });
 }
 
 /** 把同步缓存里的一份文件快照存进工作区（存到这条消息写的那个路径上）。
@@ -527,14 +526,12 @@ function download(chatId: string, blob: string, key?: string) {
 function save(chatId: string, item: SyncAttachment) {
   const key = fileKey(item);
   if (cards.saving[key]) return;
-  const op = beginOp(key, item.blob);
+  const op = beginOp(key);
   setCards((prev) => ({
     ...prev,
     saving: { ...prev.saving, [key]: true },
     saveErrors: without(prev.saveErrors, key),
     openErrors: without(prev.openErrors, key),
-    // 旧的下载错误也收掉：最近一次操作（这次保存）的错误才算。
-    errors: without(prev.errors, item.blob),
   }));
   api
     .syncAttachmentSave(chatId, item.blob, item.path)
@@ -918,15 +915,15 @@ export function AttachmentCard({
   const open = (path: string) => {
     const key = fileKey(item);
     const genAt = savedKeyGen[key] ?? 0;
-    const op = beginOp(key, item.blob);
+    const op = beginOp(key);
     // 用户刚点了打开：这张卡上一次「存进工作区失败」的文案先收掉，失败时显示
     // 这次打开的原因（最近一次操作的错误）。
     setCards((prev) => {
-      // 也收掉旧的下载错误（`errors` 按 blob）：失败时显示这次打开的原因。
-      const errors = without(prev.errors, item.blob);
+      // 只收掉这个落点上一次「存进工作区失败」：下载错误是按对象记的，别的落点
+      // 可能还要看它（由各卡片按自己的操作序号决定显示）。
       const saveErrors = without(prev.saveErrors, key);
-      if (errors === prev.errors && saveErrors === prev.saveErrors) return prev;
-      return { ...prev, errors, saveErrors };
+      if (saveErrors === prev.saveErrors) return prev;
+      return { ...prev, saveErrors };
     });
     // 点开前先让后端核对一下：工作区里这个路径上的文件可能已经被就地改写过，打开
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
@@ -1076,7 +1073,7 @@ export function AttachmentCard({
                 系统能力问题，重下解决不了。 */}
             {!publishUnsupported && (
               <button
-                onClick={() => download(chatId, item.blob)}
+                onClick={() => download(chatId, item.blob, key)}
                 disabled={inactive}
                 className={CARD_BTN}
               >

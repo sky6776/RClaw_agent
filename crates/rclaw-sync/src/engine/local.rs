@@ -875,7 +875,7 @@ pub(crate) fn attachments(
             };
             // 消息里写的那个路径自身的三态结论 + 路径（不能复用落点结论：落点可能
             // 是同步缓存；消息路径上的文件读不了时也要按 Unknown 处理）。
-            let exact_status = |rel: &str| -> (BlobMatch, Option<std::path::PathBuf>) {
+            let exact_status = |rel: &str, deep: bool| -> (BlobMatch, Option<std::path::PathBuf>) {
                 let Some(path) = ctx.env.resolve_exact(rel) else {
                     return (BlobMatch::No, None);
                 };
@@ -887,7 +887,11 @@ pub(crate) fn attachments(
                     Ok(()) => {}
                 }
                 match std::fs::symlink_metadata(&path) {
-                    Ok(meta) if meta.is_file() => (verified(&path), Some(path)),
+                    // 预算外（!deep）只探测存在性：不整读旧附件。
+                    Ok(meta) if meta.is_file() => {
+                        let match_state = if deep { verified(&path) } else { BlobMatch::Unknown };
+                        (match_state, Some(path))
+                    }
                     Ok(_) => (BlobMatch::No, None),
                     Err(e)
                         if matches!(
@@ -933,7 +937,7 @@ pub(crate) fn attachments(
                 },
                 // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上就算
                 // 本机有——文件被放回原处之后不该还按「取不回来」说。
-                None if found.kind == "file" => match exact_status(&found.path) {
+                None if found.kind == "file" => match exact_status(&found.path, deep) {
                     // 核对过、内容对不上：按「已改写」处理。
                     (BlobMatch::No, Some(_)) if deep => ("changed", None, None),
                     // 在（或暂时读不了/核不了）：按本机有处理；读不了的 `checked=false`
@@ -979,7 +983,7 @@ pub(crate) fn attachments(
                         None => BlobMatch::No,
                     }
                 } else {
-                    exact_status(&found.path).0
+                    exact_status(&found.path, true).0
                 })
             } else {
                 None
