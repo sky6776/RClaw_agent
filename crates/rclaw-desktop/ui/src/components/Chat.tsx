@@ -2244,19 +2244,37 @@ export default function Chat({
   // ── 轮次快捷导航（桌面 rail / 移动 chip+底部 sheet，组件在 RoundNav.tsx）──
   // 轮次 = 用户消息（发送失败的不算：没落库、带错误提示，导航意义小）。后端
   // 只保留最近 ~80 条目：编号按「已加载序号」，不是全会话轮次（面板有说明）。
-  const rounds = useMemo<RoundNavItem[]>(
-    () =>
-      entries
-        .filter((e) => e.role === "user" && !e.sendFailed)
-        .map((e) => ({
-          id: e.id,
-          preview:
-            stripMediaMarkers(e.content).split("\n")[0]?.trim().slice(0, 80) ||
-            "（媒体消息）",
-          time: e.ts && e.ts > 0 ? formatEntryTime(new Date(e.ts)) : null,
-        })),
-    [entries],
-  );
+  const rounds = useMemo<RoundNavItem[]>(() => {
+    // 每轮 = 一条用户消息 + 它后面第一条助手正文的开头（rail 浮层第二段预览，
+    // zcode 同款）。一次正向扫完：每轮最多处理一条助手消息的 2000 字，流式更新
+    // 下不会把整篇回复反复过一遍。
+    const list: RoundNavItem[] = [];
+    let user: (typeof entries)[number] | null = null;
+    let assistant = "";
+    const flush = () => {
+      if (!user) return;
+      list.push({
+        id: user.id,
+        preview:
+          stripMediaMarkers(user.content).split("\n")[0]?.trim().slice(0, 80) ||
+          "（媒体消息）",
+        assistantPreview: assistant,
+        time: user.ts && user.ts > 0 ? formatEntryTime(new Date(user.ts)) : null,
+      });
+    };
+    for (const e of entries) {
+      if (e.role === "user") {
+        flush();
+        user = e.sendFailed ? null : e;
+        assistant = "";
+      } else if (user && assistant === "" && e.role === "assistant" && !e.sendFailed) {
+        const text = stripMediaMarkers((e.content ?? "").slice(0, 2000)).trim();
+        if (text) assistant = text.slice(0, 600);
+      }
+    }
+    flush();
+    return list;
+  }, [entries]);
   const widePointer = useWidePointer();
   // 选择模式 / 文字选择期间隐藏导航（选择手势与导航互抢）。
   const navEnabled = rounds.length >= 2 && selectIds === null && textSelectId === null;
@@ -2312,6 +2330,13 @@ export default function Chat({
     const el = listRef.current;
     if (!el || rounds.length === 0) {
       setActiveRoundId((v) => (v === null ? v : null));
+      return;
+    }
+    // 已经在最底部：当前轮就是最后一轮（最后一轮可能很短，轮次行的顶还在
+    // 视口顶之上；按「视口顶以上最近一轮」会错误地停在倒数第二个）。
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= 4) {
+      const last = rounds[rounds.length - 1].id;
+      setActiveRoundId((v) => (v === last ? v : last));
       return;
     }
     const containerTop = el.getBoundingClientRect().top;
@@ -2376,7 +2401,7 @@ export default function Chat({
           />
         )}
         {/* 消息流（移动端收窄页边距，把宽度还给消息正文）；rail 可见时左侧
-            让位 36px（rail 占 12–36px，正好不压正文）。 */}
+            让位 48px（rail 占 12–36px，再留 12px 空隙，正文不贴着轨道）。 */}
         <div
           ref={listRef}
           onScroll={handleListScroll}
@@ -2386,10 +2411,13 @@ export default function Chat({
           onTouchCancelCapture={handleListTouchFinish}
           onWheel={handleListWheel}
           style={{ ["--chat-font-scale" as string]: String(fontScale / 100) }}
-          className={`chat-msg-list flex-1 space-y-3 overflow-y-auto py-4 max-md:space-y-2.5 max-md:px-3 max-md:py-3 ${
-            railVisible ? "pl-9 pr-6" : "px-6"
+          className={`chat-msg-list flex-1 overflow-y-auto py-4 max-md:px-3 max-md:py-3 ${
+            railVisible ? "pl-12 pr-6" : "px-6"
           }`}
         >
+        {/* 正文列（zcode 同款 max-w-6xl 居中）：宽窗里两侧留白，轨道与正文之间
+            不会只剩一条缝；窄窗/手机上列宽等于可用宽度，行为不变。 */}
+        <div className="mx-auto w-full max-w-6xl space-y-3 max-md:space-y-2.5">
         {entries.length === 0 && (
           <div className="mt-24 text-center text-sm text-gray-600 max-md:mt-36 max-md:px-6">
             <p className="text-base text-gray-400">向 RClaw 发出第一条消息</p>
@@ -2469,6 +2497,7 @@ export default function Chat({
             </button>
           </div>
         )}
+        </div>
         </div>
         {/* 移动端 / 窄窗：轮次导航底部面板（入口在输入区工具条；rail 是桌面
             宽屏形态，两者互斥）。 */}

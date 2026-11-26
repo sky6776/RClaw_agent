@@ -8,6 +8,8 @@ export interface RoundNavItem {
   id: number;
   /** 用户消息首行预览（剥媒体标记，截断）。 */
   preview: string;
+  /** 这一轮助手回复的开头（浮层第二段预览；没有就空着不显示）。 */
+  assistantPreview?: string;
   /** 展示用时间文本（无时间戳的极旧条目为 null）。 */
   time: string | null;
 }
@@ -66,8 +68,8 @@ export function RoundRail({
   const [focusedId, setFocusedId] = useState<number | null>(null);
   const [tip, setTip] = useState<{
     id: number;
-    text: string;
-    time: string | null;
+    user: string;
+    assistant: string;
     x: number;
     y: number;
   } | null>(null);
@@ -177,10 +179,10 @@ export function RoundRail({
       const rect = el.getBoundingClientRect();
       setTip({
         id: item.id,
-        text: item.preview,
-        time: item.time,
-        // 右侧浮层；贴近右缘时回收一点，别出视口。
-        x: Math.min(rect.right + 8, window.innerWidth - 16),
+        user: item.preview,
+        assistant: item.assistantPreview ?? "",
+        // 右侧浮层（320px 宽，zcode 同款）；贴近右缘时整块收回视口内。
+        x: Math.max(8, Math.min(rect.right + 8, window.innerWidth - 328)),
         y: rect.top + rect.height / 2,
       });
     }, delayMs);
@@ -263,14 +265,14 @@ export function RoundRail({
             const r = rounds[i];
             if (!r) return null;
             const active = i === activeIdx;
-            // 山峰视觉：hover/focus 项 2 倍，按距离衰减到 ±3 之外；无指针悬停时
-            // 仅当前轮适度放大（1.6）常亮。缩放上限 2（视觉条最长 24px = 轨道宽）。
+            // 山峰视觉（zcode 同款数值）：hover/focus 2 倍（内部 2.6，渲染截到
+            // 2），±1/±2 衰减到 1.7/1.25；当前轮不放大，只提亮（opacity 0.9）——
+            // 常亮的条保持 12px 宽，不会把轨道与正文之间的空隙吃掉。
             const dist =
               focusIdx === null ? Number.POSITIVE_INFINITY : Math.min(3, Math.abs(i - focusIdx));
-            const scale =
-              dist === 0 ? 2 : dist === 1 ? 1.6 : dist === 2 ? 1.25 : focusIdx === null && active ? 1.6 : 1;
+            const scale = dist === 0 ? 2 : dist === 1 ? 1.7 : dist === 2 ? 1.25 : 1;
             const opacity =
-              dist === 0 ? 1 : dist === 1 ? 0.86 : dist === 2 ? 0.72 : active ? 1 : 0.55;
+              dist === 0 ? 1 : dist === 1 ? 0.86 : dist === 2 ? 0.72 : active ? 0.9 : 0.58;
             return (
               <div
                 key={r.id}
@@ -323,8 +325,8 @@ export function RoundRail({
       </div>
       {tip &&
         (() => {
-          // 列表的 `space-y-3` 会给直接子节点加 12px 上外边距（fixed 元素也会被
-          // 推下去）：`!mt-0` 抵掉，坐标才和按钮对得上。
+          // 连接区/浮层是 fixed 定位，portal 进消息列表后仍保留 `!mt-0`（抵掉
+          // 列表容器可能的纵向间距，坐标才和按钮对得上）。
           // 滚轮落在浮层上时显式滚正文（Chromium 不把 fixed 子树当成滚动链的一段）。
           // 一个轴的位移落地：小数余量按轴分别攒（0.25px 的连续输入不会被取整吃掉，
           // 两轴之间也不会互相借位）。
@@ -371,11 +373,19 @@ export function RoundRail({
                 onMouseEnter={keepTip}
                 onMouseLeave={leave}
                 onWheel={wheel}
-                className="!mt-0 fixed z-50 w-max max-w-[16rem] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 text-[11px] leading-relaxed text-gray-200 shadow-lg"
+                className="!mt-0 fixed z-50 w-80 max-w-[calc(100vw-2rem)] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] p-3 text-sm leading-5 text-gray-200 shadow-lg"
                 style={{ left: tip.x, top: tip.y }}
               >
-                <div className="truncate">{tip.text}</div>
-                {tip.time && <div className="text-[10px] text-gray-500">{tip.time}</div>}
+                <div className="space-y-2">
+                  <p className="line-clamp-2 whitespace-pre-line text-sm font-medium leading-5">
+                    {tip.user}
+                  </p>
+                  {tip.assistant && (
+                    <p className="line-clamp-3 whitespace-pre-line text-sm leading-5 text-gray-400">
+                      {tip.assistant}
+                    </p>
+                  )}
+                </div>
               </div>
             </>
           );

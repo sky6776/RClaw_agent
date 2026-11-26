@@ -175,7 +175,11 @@ function apply(chatId: string, list: SyncAttachment[]) {
     const before = known[id];
     nextKnown[id] = item.state;
     const key = fileKey(item);
-    if (item.state === "local") {
+    // 文件的消息路径上已经是登记的那份内容（`path_present`）：它就在这台设备上，
+    // 即便登记落点仍在同步缓存（「存进工作区」只写文件、不改登记，状态还是
+    // `cached`）。工具结果（artifact）没有消息路径，仍按登记状态算。
+    const here = item.state === "local" || (item.kind === "file" && item.path_present);
+    if (here) {
       // 上一份清单里它还不在原位置上：是刚下载下来的。
       const fresh = before !== undefined && before !== "local";
       if (fresh && !landed.some((other) => fileKey(other) === key)) landed.push(item);
@@ -187,12 +191,6 @@ function apply(chatId: string, list: SyncAttachment[]) {
     }
   });
   known = nextKnown;
-  // 下载下来之后又不见了的（被删了）会重新出现在 pending 里：不再算「已下载」；
-  // 引用本身从清单里消失了的（消息被删/改）也一并丢掉，恢复就绪后不会又冒出来。
-  const currentKeys = new Set(usable.map((item) => fileKey(item)));
-  const stillLanded = landed.filter(
-    (item) => currentKeys.has(fileKey(item)) && !pendingKeys.has(fileKey(item)),
-  );
   // 存好的落点又对不上了（被改写/删除）：不能再给「打开 savedTo」，让用户重新存。
   // 只处理文件引用——工具结果全文的登记位置不是消息路径，不按它判断。
   const fileKeys = new Set(
@@ -220,6 +218,17 @@ function apply(chatId: string, list: SyncAttachment[]) {
   const saved = prune(cards.saved);
   const saveErrors = prune(cards.saveErrors);
   const cardsChanged = saved !== cards.saved || saveErrors !== cards.saveErrors;
+  // 下载下来之后又不见了的（被删了）会重新出现在 pending 里：不再算「已下载」；
+  // 引用本身从清单里消失了的（消息被删/改）也一并丢掉，恢复就绪后不会又冒出来。
+  // 已经「存进工作区」的也不再列：消息里那张卡（带已存到的落点）就是它的入口，
+  // 留在顶栏只会让提示在保存成功后继续挂着。
+  const currentKeys = new Set(usable.map((item) => fileKey(item)));
+  const stillLanded = landed.filter(
+    (item) =>
+      currentKeys.has(fileKey(item)) &&
+      !pendingKeys.has(fileKey(item)) &&
+      !saved[fileKey(item)],
+  );
   if (cardsChanged) cards = { ...cards, saved, saveErrors };
   const sig = JSON.stringify([pending, stillLanded]);
   if (sig === bar.sig && !changedAll && !cardsChanged && wasLoaded) return;
@@ -945,16 +954,22 @@ export function SyncChatBar({
   const state = useSyncExternalStore(subscribe, () => cards);
   const ready = useChatAttachmentsReady(chatId);
   const [open, setOpen] = useState(false);
+  // 用户手动关掉的提示按「当前清单签名」记：清单内容变了（新的缺附件 / 刚下载完）
+  // 会重新出现；换会话复位。
+  const [dismissed, setDismissed] = useState<string | null>(null);
   // 换会话时收起来。
   useEffect(() => {
     setOpen(false);
+    setDismissed(null);
   }, [chatId]);
 
   const running = runningOn !== undefined && runningOn.length > 0;
   // 清单没取到（或刚作废、正在重取）时 `bar` 还是上一轮的判断：不能拿它出下载/
   // 「已下载 · 打开」这类操作，只留「正在别的设备上运行」的提示。
   const total = ready ? view.pending.length + view.landed.length : 0;
-  if (!running && total === 0) return null;
+  // 「收起」只折叠列表；要整条消失用右上角的 ✕（清单签名变了会再出现）。
+  const showBar = total > 0 && dismissed !== view.sig;
+  if (!running && !showBar) return null;
 
   const remote = view.pending.filter((item) => item.state === "remote");
   const idle = remote.filter((item) => !state.busy[item.blob]);
@@ -963,14 +978,14 @@ export function SyncChatBar({
       {running && (
         <div
           className={`rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs leading-relaxed text-amber-300${
-            total > 0 ? " mb-2" : ""
+            showBar ? " mb-2" : ""
           }`}
         >
           这个会话正在「{runningOn.join("」「")}」上运行。
           现在在这里接着发消息的话，两边各写各的，同步之后会分成两个分支。
         </div>
       )}
-      {total > 0 && (
+      {showBar && (
         <>
           <div className="flex items-center gap-2">
             <button
@@ -987,6 +1002,17 @@ export function SyncChatBar({
                   : ""}
               </span>
               <span className="shrink-0 text-gray-500">{open ? "收起 ▴" : "查看 ▾"}</span>
+            </button>
+            <button
+              onClick={() => {
+                setDismissed(view.sig);
+                setOpen(false);
+              }}
+              title="关闭"
+              aria-label="关闭附件提示"
+              className="shrink-0 rounded px-1 py-0.5 text-xs text-gray-500 transition hover:text-gray-200"
+            >
+              ✕
             </button>
             {open && remote.length > 1 && (
               <button
