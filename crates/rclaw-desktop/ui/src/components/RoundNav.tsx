@@ -40,9 +40,10 @@ export function useWidePointer(): boolean {
  *  按距离衰减放大（山峰，最大 2 倍），当前轮常亮；点击平滑滚动到该轮。
  *
  *  - 条目 10px 高、命中区 24×10px（视觉条只有 2px 高，点的是透明按钮）；
- *  - 轮次多时只渲染可视窗口 ± 6 条（固定 10px 行高，自己窗口化，不引虚拟列表依赖）；
- *  - 预览是右侧浮层 tooltip（120ms 打开 / 80ms 关闭），按视口坐标定位、不进滚动容器
- *    （滚动容器 `overflow-x-hidden` 会把浮层裁掉）；
+ *  - 轮次多时只渲染可视窗口 ± 6 条（固定 10px 行高，自己窗口化）；键盘焦点所在的
+ *    那一行即使滚出窗口也保留挂载，别把焦点弄丢；
+ *  - 预览是右侧浮层 tooltip（120ms 打开 / 80ms 关闭，可悬停、Esc 关闭），按视口坐标
+ *    定位（滚动容器 `overflow-x-hidden` 会把内部浮层裁掉）；
  *  - 轮次 < 2 不渲染（Chat 的 navEnabled 也按同样条件收，rail/fab 一起消失）。 */
 export function RoundRail({
   rounds,
@@ -54,9 +55,15 @@ export function RoundRail({
   onJump: (id: number) => void;
 }) {
   const [focusIdx, setFocusIdx] = useState<number | null>(null);
-  const [tip, setTip] = useState<{ text: string; time: string | null; x: number; y: number } | null>(
-    null,
-  );
+  // 键盘焦点所在的条目：窗口移动时保留它，避免按钮被卸载后焦点掉到 body。
+  const [focusedId, setFocusedId] = useState<number | null>(null);
+  const [tip, setTip] = useState<{
+    id: number;
+    text: string;
+    time: string | null;
+    x: number;
+    y: number;
+  } | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [view, setView] = useState({ top: 0, height: 0 });
   const activeIdx = rounds.findIndex((r) => r.id === activeId);
@@ -67,6 +74,14 @@ export function RoundRail({
   const total = rounds.length * ROW;
   const from = Math.max(0, Math.floor(view.top / ROW) - OVERSCAN);
   const to = Math.min(rounds.length, Math.ceil((view.top + view.height) / ROW) + OVERSCAN);
+  const focusedIdx = focusedId === null ? -1 : rounds.findIndex((r) => r.id === focusedId);
+  // 窗口外的焦点行也渲染（绝对定位，不影响布局）。
+  const indices: number[] = [];
+  for (let i = from; i < to; i++) indices.push(i);
+  if (focusedIdx >= 0 && (focusedIdx < from || focusedIdx >= to)) {
+    indices.push(focusedIdx);
+    indices.sort((a, b) => a - b);
+  }
 
   // 量可视窗口：首次挂载与尺寸变化（窗口缩放、面板收起）时更新。
   useEffect(() => {
@@ -80,7 +95,8 @@ export function RoundRail({
     return () => observer.disconnect();
   }, []);
 
-  // 当前轮滚进可视窗口（zcode 同样 align: auto：只保证可见，不居中）。
+  // 当前轮滚进可视窗口（zcode 同样 align: auto：只保证可见，不居中）。行顶就是
+  // `index*10`（容器没有纵向内边距），与窗口化用同一个坐标原点。
   useEffect(() => {
     const el = scrollRef.current;
     if (!el || activeIdx < 0 || view.height === 0) return;
@@ -101,6 +117,11 @@ export function RoundRail({
     },
     [],
   );
+  const clearTip = () => {
+    window.clearTimeout(openTimer.current);
+    window.clearTimeout(closeTimer.current);
+    setTip(null);
+  };
   const hover = (i: number) => {
     setFocusIdx(i);
     window.clearTimeout(closeTimer.current);
@@ -114,9 +135,12 @@ export function RoundRail({
   const showTip = (el: HTMLElement, item: RoundNavItem) => {
     window.clearTimeout(openTimer.current);
     window.clearTimeout(closeTimer.current);
+    // 换到另一行：旧的提示立刻收掉，别让第一行的预览滞留在屏幕上。
+    setTip((prev) => (prev !== null && prev.id !== item.id ? null : prev));
     openTimer.current = window.setTimeout(() => {
       const rect = el.getBoundingClientRect();
       setTip({
+        id: item.id,
         text: item.preview,
         time: item.time,
         // 右侧浮层；贴近右缘时回收一点，别出视口。
@@ -125,6 +149,20 @@ export function RoundRail({
       });
     }, 120);
   };
+
+  // Esc 关闭（悬停出的提示没有焦点在按钮上也收得掉）。
+  useEffect(() => {
+    if (tip === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        window.clearTimeout(openTimer.current);
+        window.clearTimeout(closeTimer.current);
+        setTip(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [tip]);
 
   if (rounds.length < 2) return null;
   return (
@@ -135,14 +173,21 @@ export function RoundRail({
           const el = scrollRef.current;
           if (el) setView({ top: el.scrollTop, height: el.clientHeight });
           setFocusIdx(null);
-          leave();
+          // 滚动时提示立刻收掉（计时器也清）：留着会停在已经移走的那一行上。
+          clearTip();
         }}
         onPointerLeave={leave}
-        className="absolute top-1/2 max-h-[calc(100%-6rem)] w-6 -translate-y-1/2 overflow-x-hidden overflow-y-auto py-1 [scrollbar-width:none]"
+        className="absolute top-1/2 max-h-[calc(100%-6rem)] w-6 -translate-y-1/2 overflow-x-hidden overflow-y-auto [scrollbar-width:none]"
       >
-        <div className="relative w-6" style={{ height: total }}>
-          {rounds.slice(from, to).map((r, offset) => {
-            const i = from + offset;
+        <div
+          role="list"
+          aria-label="对话提问列表"
+          className="rclaw-turn-navigator-enter relative w-6"
+          style={{ height: total }}
+        >
+          {indices.map((i) => {
+            const r = rounds[i];
+            if (!r) return null;
             const active = i === activeIdx;
             // 山峰视觉：hover/focus 项 2 倍，按距离衰减到 ±3 之外；无指针悬停时
             // 仅当前轮适度放大（1.6）常亮。缩放上限 2（视觉条最长 24px = 轨道宽）。
@@ -155,6 +200,9 @@ export function RoundRail({
             return (
               <div
                 key={r.id}
+                role="listitem"
+                aria-posinset={i + 1}
+                aria-setsize={rounds.length}
                 className="absolute left-0 top-0 h-2.5 w-6"
                 style={{ transform: `translateY(${i * ROW}px)` }}
               >
@@ -168,16 +216,19 @@ export function RoundRail({
                   onMouseLeave={leave}
                   onFocus={(e) => {
                     hover(i);
+                    setFocusedId(r.id);
                     showTip(e.currentTarget, r);
                   }}
-                  onBlur={leave}
+                  onBlur={() => {
+                    setFocusedId(null);
+                    leave();
+                  }}
                   aria-label={`跳转到第 ${i + 1} 条提问`}
                   aria-current={active ? "location" : undefined}
-                  aria-posinset={i + 1}
-                  aria-setsize={rounds.length}
-                  className="flex h-2.5 w-6 items-center justify-start rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50"
+                  aria-describedby={tip?.id === r.id ? "rclaw-round-tip" : undefined}
+                  className="flex h-2.5 w-6 items-center justify-start rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 focus-visible:ring-inset"
                 >
-                  <span className="rclaw-turn-navigator-enter block" aria-hidden="true">
+                  <span className="block" aria-hidden="true">
                     <span
                       className={`block h-0.5 w-3 origin-left rounded-full transition-[height,opacity,transform,background-color] duration-150 ease-out motion-reduce:transition-none ${
                         active ? "bg-indigo-400" : "bg-gray-500"
@@ -193,7 +244,14 @@ export function RoundRail({
       </div>
       {tip && (
         <div
-          className="pointer-events-none fixed z-50 w-max max-w-[16rem] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 text-[11px] leading-relaxed text-gray-200 shadow-lg"
+          id="rclaw-round-tip"
+          role="tooltip"
+          onMouseEnter={() => {
+            window.clearTimeout(openTimer.current);
+            window.clearTimeout(closeTimer.current);
+          }}
+          onMouseLeave={leave}
+          className="fixed z-50 w-max max-w-[16rem] -translate-y-1/2 rounded-md border border-[#2a2f3a] bg-[#0f131b] px-2 py-1 text-[11px] leading-relaxed text-gray-200 shadow-lg"
           style={{ left: tip.x, top: tip.y }}
         >
           <div className="truncate">{tip.text}</div>

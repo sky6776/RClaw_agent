@@ -2360,7 +2360,13 @@ export default function Chat({
           top-1/2 若挂在 chat-bg 上会居中到整个聊天列、压到输入区）。 */}
       <div className="relative flex min-h-0 flex-1 flex-col">
         {railVisible && (
-          <RoundRail rounds={rounds} activeId={activeRoundId} onJump={scrollToRound} />
+          // key=sessionKey：切换会话时整条 rail 重建（清掉 tooltip / 计时器 / 窗口状态）。
+          <RoundRail
+            key={sessionKey}
+            rounds={rounds}
+            activeId={activeRoundId}
+            onJump={scrollToRound}
+          />
         )}
         {/* 消息流（移动端收窄页边距，把宽度还给消息正文）；rail 可见时左侧
             让位 36px（rail 占 12–36px，正好不压正文）。 */}
