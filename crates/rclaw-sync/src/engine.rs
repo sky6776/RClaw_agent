@@ -1262,11 +1262,20 @@ impl SyncEngine {
         if row.state == db::BLOB_REMOTE {
             return Ok(AttachmentCopy::Unverifiable);
         }
-        let Ok(path) = ctx.env.checked_path(&row.rel_path) else {
-            return Ok(AttachmentCopy::Rejected);
+        let path = match ctx.env.checked_path_typed(&row.rel_path) {
+            Ok(path) => path,
+            Err(crate::wire::LinkCheckError::Policy) => return Ok(AttachmentCopy::Rejected),
+            // 元数据/权限 I/O：交给调用方按「暂时读不了」处理。
+            Err(crate::wire::LinkCheckError::Io(error)) => return Err(error),
         };
-        let Ok(file) = std::fs::File::open(&path) else {
-            return Ok(AttachmentCopy::Rejected);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            // 缓存副本不在：登记失效。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AttachmentCopy::Rejected)
+            }
+            // 权限/共享冲突：暂时读不了。
+            Err(e) => return Err(e),
         };
         // 最多读「登记长度 + 允许的误差 + 1」：缓存里的文件被换成超大文件时不会把
         // 调用方的内存/磁盘写爆。

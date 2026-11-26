@@ -5650,15 +5650,11 @@ fn encode_preview(original: &[u8]) -> Result<Option<(Vec<u8>, &'static str)>, St
         .with_guessed_format()
         .map_err(|e| format!("识别图片格式失败: {e}"))?;
     reader.limits(limits);
-    let img = reader.decode().map_err(|e| {
-        // 宽高超过解码上限（Limits::max_image_width/height）不是文件坏了：按
-        // 「超过预览尺寸上限」报，界面不给无意义的重试。
-        let text = e.to_string();
-        if text.to_ascii_lowercase().contains("limit") {
-            "图片超过预览尺寸上限".to_string()
-        } else {
-            format!("解码图片失败: {e}")
-        }
+    let img = reader.decode().map_err(|e| match e {
+        // 解码上限（宽高或内存预算）不是文件坏了：统一报「超过预览解码限制」，
+        // 界面不给无意义的重试。
+        image::ImageError::Limits(_) => "图片超过预览解码限制".to_string(),
+        other => format!("解码图片失败: {other}"),
     })?;
     if img.width() <= MEDIA_PREVIEW_MAX_EDGE && img.height() <= MEDIA_PREVIEW_MAX_EDGE {
         return Ok(None);

@@ -902,26 +902,56 @@ pub(crate) fn attachments(
                 None => ("missing", None, None),
             };
             // 这一轮的核对结论（`Yes`/`No`/`Unknown`）：落点文件读不了时是 Unknown，
-            // 不能当成「内容对不上」。
-            let outcome = local_path.as_deref().map(&verified);
+            // 不能当成「内容对不上」。只对预算内的条目算（`deep`）：预算外的不整读。
+            let outcome = if deep {
+                local_path.as_deref().map(&verified)
+            } else {
+                None
+            };
+            // 消息里写的那个路径自身的三态结论（不能复用落点结论：落点可能是同步
+            // 缓存，消息路径上的文件读不了时也要按 Unknown 处理）。
+            let exact_status = |rel: &str| -> BlobMatch {
+                let Some(path) = ctx.env.resolve_exact(rel) else {
+                    return BlobMatch::No;
+                };
+                match ctx.env.check_path_typed(rel, &path) {
+                    Err(crate::wire::LinkCheckError::Policy) => return BlobMatch::No,
+                    Err(crate::wire::LinkCheckError::Io(_)) => return BlobMatch::Unknown,
+                    Ok(()) => {}
+                }
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_file() => verified(&path),
+                    Ok(_) => BlobMatch::No,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        BlobMatch::No
+                    }
+                    Err(_) => BlobMatch::Unknown,
+                }
+            };
+            let message_status = if found.kind == "file" && deep {
+                Some(if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
+                    outcome.unwrap_or(BlobMatch::Unknown)
+                } else if keys.is_none() {
+                    // 没有密钥（不在同步空间里）就验不了别的位置上的同名文件是不是这
+                    // 一份内容：不认（界面继续按快照卡取用那份缓存副本）。
+                    BlobMatch::No
+                } else {
+                    exact_status(&found.path)
+                })
+            } else {
+                None
+            };
             let local_path = local_path.map(|path| path.to_string_lossy().into_owned());
             // 消息里写的那个路径上现在是不是真有这份内容：登记说它就是落点、内容上面
             // 已经核对过的（`local`），或者那个路径上的文件核对下来就是这个对象。
             // 工具结果（artifact）在消息里只有一个文件名，按状态算。
             let path_present = if found.kind == "file" {
-                if !deep {
-                    // 不在核对窗口里的：没核对过就不能说消息路径上是这份内容（按本机
-                    // 有处理会让界面内联显示/在画廊里打开一个同名的别的版本）。
-                    false
-                } else if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
-                    matches!(outcome, Some(BlobMatch::Yes))
-                } else if keys.is_none() {
-                    // 没有密钥（不在同步空间里）就验不了别的位置上的同名文件是不是这
-                    // 一份内容：不认（界面继续按快照卡取用那份缓存副本）。
-                    false
-                } else {
-                    exact(&found.path).is_some_and(|path| matches!(verified(&path), BlobMatch::Yes))
-                }
+                matches!(message_status, Some(BlobMatch::Yes))
             } else {
                 state == "local"
             };
@@ -939,7 +969,9 @@ pub(crate) fn attachments(
                 // 读不了/核不了不是「核对结论」：checked=false 让界面按「还没核对」
                 // 处理（别拿它撤有效的保存记录）。
                 checked: found.kind != "file"
-                    || (deep && !matches!(outcome, Some(BlobMatch::Unknown))),
+                    || (deep
+                        && !matches!(outcome, Some(BlobMatch::Unknown))
+                        && !matches!(message_status, Some(BlobMatch::Unknown))),
             }
         })
         .collect();

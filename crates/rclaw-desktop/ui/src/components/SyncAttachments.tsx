@@ -482,6 +482,8 @@ function save(chatId: string, item: SyncAttachment) {
     saving: { ...prev.saving, [key]: true },
     saveErrors: without(prev.saveErrors, key),
     openErrors: without(prev.openErrors, key),
+    // 旧的下载错误也收掉：最近一次操作（这次保存）的错误才算。
+    errors: without(prev.errors, item.blob),
   }));
   api
     .syncAttachmentSave(chatId, item.blob, item.path)
@@ -863,11 +865,13 @@ export function AttachmentCard({
     const op = beginOp(key);
     // 用户刚点了打开：这张卡上一次「存进工作区失败」的文案先收掉，失败时显示
     // 这次打开的原因（最近一次操作的错误）。
-    setCards((prev) =>
-      prev.saveErrors[key] === undefined
-        ? prev
-        : { ...prev, saveErrors: without(prev.saveErrors, key) },
-    );
+    setCards((prev) => {
+      // 也收掉旧的下载错误（`errors` 按 blob）：失败时显示这次打开的原因。
+      const errors = without(prev.errors, item.blob);
+      const saveErrors = without(prev.saveErrors, key);
+      if (errors === prev.errors && saveErrors === prev.saveErrors) return prev;
+      return { ...prev, errors, saveErrors };
+    });
     // 点开前先让后端核对一下：工作区里这个路径上的文件可能已经被就地改写过，打开
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
     // 打开的是「已存到另一个名字」的副本时严格核对：核不了（同步密钥/登记不可用）
@@ -1168,7 +1172,7 @@ function SnapshotImage({
           // 是定论，重试没有意义。
           const text = String(e);
           setFailKind(
-            text.includes("超过大小上限") || text.includes("超过预览尺寸上限") ? "limit" : "retry",
+            text.includes("超过大小上限") || text.includes("超过预览解码限制") ? "limit" : "retry",
           );
         });
     };
@@ -1194,7 +1198,7 @@ function SnapshotImage({
     };
   }, [chatId, blob, path, cacheKey, src, attempt]);
   if (!src && failKind === "limit") {
-    return <span className="mb-1 block text-[11px] text-gray-500">图片超过预览大小上限</span>;
+    return <span className="mb-1 block text-[11px] text-gray-500">图片过大，不生成预览</span>;
   }
   if (!src && failKind === "retry") {
     return (
