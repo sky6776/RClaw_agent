@@ -996,10 +996,13 @@ export default function Chat({
     // 视口变高把位置夹到了新底部（不是用户向下滚）。scrollTop 可能是小数，
     // 用半像素容差比较；只是靠近新底部/上限变小但位置没动的不算。
     const maxScroll = el.scrollHeight - el.clientHeight;
+    // scrollHeight/clientHeight 各自取整，真实底边与整数差最多差 1px：统一用
+    // 1px 容差判定「在新底部」。
+    const bottomGap = el.scrollHeight - el.scrollTop - el.clientHeight;
     const clamped =
       maxScroll < lastMaxScrollRef.current &&
-      lastScrollTopRef.current >= maxScroll - 0.5 &&
-      el.scrollTop >= maxScroll - 0.5;
+      lastScrollTopRef.current >= maxScroll - 1 &&
+      bottomGap <= 1;
     lastMaxScrollRef.current = maxScroll;
     // 轮次导航的当前轮跟随滚动刷新（rAF 节流，见下方 computeActiveRound）。
     scheduleActiveRound();
@@ -2559,11 +2562,12 @@ export default function Chat({
       const noOverflow = maxScroll <= 0;
       // 只有「高度变大把上限压小、上一位置已在新上限（或被它夹住）、当前落在
       // 新底部」才是夹位；单纯宽度变化/动画首帧/只是靠近新底部都不算。
-      // scrollTop 可能是小数，用半像素容差。
+      // scrollHeight/clientHeight 各自取整，真实底边与整数差最多差 1px。
+      const bottomGap = el.scrollHeight - el.scrollTop - el.clientHeight;
       const clamped =
         maxScroll < lastMaxScrollRef.current &&
-        lastScrollTopRef.current >= maxScroll - 0.5 &&
-        el.scrollTop >= maxScroll - 0.5;
+        lastScrollTopRef.current >= maxScroll - 1 &&
+        bottomGap <= 1;
       lastMaxScrollRef.current = maxScroll;
       if (noOverflow || clamped) {
         // 被夹到新底部：等价用户回底，结束跳转并恢复跟随。
