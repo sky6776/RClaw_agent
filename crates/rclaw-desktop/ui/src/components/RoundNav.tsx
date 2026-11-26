@@ -333,13 +333,13 @@ export function RoundRail({
             // 单位：像素 / 行（约 16px）/ 页（横向一屏宽、纵向一屏高）。
             const scale = (value: number, page: number) =>
               value * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? page : 1);
-            let dx = scale(e.deltaX, host.clientWidth);
-            let dy = scale(e.deltaY, host.clientHeight);
-            // Shift+滚轮是「横着滚」（浏览器约定）：纵向分量并到横轴，纵横不互相吞。
-            if (e.shiftKey) {
-              dx += dy;
-              dy = 0;
-            }
+            // Shift+滚轮（且没有自带横向分量）是「横着滚」（浏览器约定）：先在原始量上
+            // 置换方向，再按横向单位换算（翻页用页宽）。已经有 deltaX 的输入保留两轴。
+            const shiftToX = e.shiftKey && e.deltaX === 0;
+            const dx = shiftToX
+              ? scale(e.deltaY, host.clientWidth)
+              : scale(e.deltaX, host.clientWidth);
+            const dy = shiftToX ? 0 : scale(e.deltaY, host.clientHeight);
             applyAxis(host, "x", dx);
             applyAxis(host, "y", dy);
             if (dy < 0) onWheelScroll?.(dy);
