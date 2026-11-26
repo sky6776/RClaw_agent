@@ -1257,6 +1257,8 @@ export default function Chat({
     const onResize = () => {
       const el = listRef.current;
       if (!el || touchStateRef.current.active) return;
+      // 跳转进行中：跟随由跳转锁管理，真正的触底夹位交给列表视口 observer。
+      if (followLockRef.current || jumpTargetRef.current !== null) return;
       const noOverflow = el.scrollHeight - el.clientHeight <= 0;
       // 只认「位置被钳动过」（scrollTop 与最近一次滚动事件记录不同）：用户
       // 停在半空的自由位置不因缩放窗口而被拉底。无溢出例外——短列表贴顶时
@@ -2552,13 +2554,21 @@ export default function Chat({
     if (!el || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
       if (jumpTargetRef.current === null && !followLockRef.current) return;
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
-      if (atBottom) {
+      const maxScroll = el.scrollHeight - el.clientHeight;
+      const noOverflow = maxScroll <= 0;
+      // 只有高度变大把最大滚动位置压小、且位置确实落在新底部，才是「夹位」；
+      // 单纯的宽度变化/动画首帧（max 没变）不算。
+      const clamped =
+        maxScroll < lastMaxScrollRef.current &&
+        el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
+      lastMaxScrollRef.current = maxScroll;
+      if (noOverflow || clamped) {
         // 被夹到新底部：等价用户回底，结束跳转并恢复跟随。
         clearJump();
         el.scrollTo({ top: el.scrollHeight });
         stickToBottomRef.current = true;
         setShowJumpDown(false);
+        lastScrollTopRef.current = el.scrollTop;
       }
       // 没到底：跳转目标仍然可达，保留 pin/锁，让平滑滚动与对齐/2 秒兜底
       // 自己收尾——提前解锁会让后续动画帧被当成「朝底」把跟随接回去。
