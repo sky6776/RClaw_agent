@@ -1055,7 +1055,7 @@ export default function Chat({
   // （防两套长按计时器叠加），bubble 阶段列表收不到起始事件，从卡片上开始的
   // 拖动会漏判；capture 从祖先往下先于目标元素执行，不受其影响。
   const handleListTouchStart = (e: React.TouchEvent) => {
-    followLockRef.current = false;
+    clearJump();
     const st = touchStateRef.current;
     const first = e.changedTouches[0];
     const el = listRef.current;
@@ -1211,7 +1211,7 @@ export default function Chat({
   // 滚轮往上（不带 Ctrl）就退出贴底并露出「回到底部」——没有溢出时不判（短会话
   // 全部可见，滚上去也没有可翻的内容）。正文与 rail 浮层上的滚轮共用这一份。
   const noteWheelIntent = (deltaY: number) => {
-    followLockRef.current = false;
+    clearJump();
     const el = listRef.current;
     if (!el || el.scrollHeight - el.clientHeight <= 0) return;
     if (deltaY < 0) {
@@ -2368,6 +2368,9 @@ export default function Chat({
     stickToBottomRef.current = false;
     setShowJumpDown(true);
     el.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
+    // 目标本来就在视口顶（或 instant 且位置不变）时不会有 scroll 事件：主动补算
+    // 一次，让对齐/解除不依赖那 2 秒兜底。
+    scheduleActiveRound();
   };
 
   // 当前轮 = 视口顶以上最近的一条用户消息（zcode 同语义）；一条都不到线（视口

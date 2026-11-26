@@ -1400,9 +1400,10 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
 ///   已存在即失败（exFAT/FAT 也支持）。
 /// - Linux/Android：`renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败
 ///   （内核 ≥3.15；Android 的内核都满足）。
-/// - 文件系统不认 `RENAME_NOREPLACE` / Android 没有该符号：退回「create_new 占名 +
-///   同目录 rename」——不覆盖已有文件，正式名字上不会出现写了一半的内容；空占位被
-///   并发写入的窗口只有一次元数据操作那么长（没有更好原语时保证「能保存」的取舍）。
+/// - 文件系统不认 `RENAME_NOREPLACE` / Android（不调用 renameat2，避免 seccomp
+///   SIGSYS）：退回「create_new 占名 + 同目录 rename」。不覆盖已有文件；占位是
+///   0 字节可见的、写入会被检测后放弃、崩溃会留下空文件——没有更好原语时保证
+///   「能保存」的取舍，详见 [`publish_by_placeholder`]。
 #[cfg(windows)]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -1423,66 +1424,24 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     match renameat2_noreplace(from, to) {
         Ok(()) => Ok(()),
         // 目标已存在：让调用方换下一个候选。
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-        // 不支持/被拒绝（老内核、FUSE、seccomp 拦下、跨设备……）：退回「create_new
-        // 占名 + 同目录 rename」。不覆盖已存在的文件（名字由我们建住），正式名字上
-        // 不会出现写了一半的内容；空占位被并发写入的窗口只有一次元数据操作那么长
-        // （没有更好的原语时的取舍，Android 8/9 的 seccomp 也不至于让保存彻底失败）。
+        // 不支持/被拒绝（老内核、FUSE、容器策略、跨设备……）：退回占名 + rename。
         Err(_) => publish_by_placeholder(from, to),
     }
 }
 
-/// `renameat2(RENAME_NOREPLACE)`：原子、目标存在即失败。
-///
-/// Android 的 bionic 直到 API 30 才导出 `renameat2` 符号，直接 `syscall` 又可能
-/// 撞上 seccomp（SIGSYS）：运行时 `dlsym` 找符号，没有就走占名 + rename 的退路。
+/// Android：不调用 `renameat2`。bionic 直到 API 30 才导出该符号，而直接 syscall 又
+/// 可能被 seccomp 以 SIGSYS 打死（进程直接退出，连退路都走不到）；这里统一用
+/// 「占名 + rename」的退路——能保存，代价是有一个极短的空占位窗口（见
+/// [`publish_by_placeholder`]）。
 #[cfg(target_os = "android")]
-fn renameat2_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    type RenameAt2 = unsafe extern "C" fn(
-        libc::c_int,
-        *const libc::c_char,
-        libc::c_int,
-        *const libc::c_char,
-        libc::c_uint,
-    ) -> libc::c_int;
-    let sym = unsafe {
-        libc::dlsym(
-            libc::RTLD_DEFAULT,
-            b"renameat2\0".as_ptr() as *const libc::c_char,
-        )
-    };
-    if sym.is_null() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "这个 Android 版本没有导出 renameat2",
-        ));
-    }
-    let rename: RenameAt2 = unsafe { std::mem::transmute(sym) };
-    let cstr = |path: &Path| {
-        std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径里有 NUL"))
-    };
-    let (from_c, to_c) = (cstr(from)?, cstr(to)?);
-    let rc = unsafe {
-        rename(
-            libc::AT_FDCWD,
-            from_c.as_ptr(),
-            libc::AT_FDCWD,
-            to_c.as_ptr(),
-            libc::RENAME_NOREPLACE as libc::c_uint,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    publish_by_placeholder(from, to)
 }
 
 #[cfg(target_os = "linux")]
@@ -1511,19 +1470,41 @@ fn renameat2_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// 没有原子无覆盖改名原语时的退路：`create_new` 占住目标名（不覆盖已有文件、并发
-/// 抢不到这个名字），再把写好的暂存文件 rename 上去（同目录、原子）。空占位被并发
-/// 写入的窗口只有一次元数据操作那么长。
+/// 保存抢不到这个名字），再把写好的暂存文件 rename 上去（同目录、原子地替换我们
+/// 自己的空占位）。残余窗口与边界：
+/// - 占位存在期间，别有用心的进程可以往这个 0 字节文件里写；rename 前会核对它
+///   仍是空的，写过就放弃这次发布（不覆盖别人的写入）。
+/// - rename 失败时只删「仍然是我们创建的那个空文件」（比对 dev/ino/size），不按
+///   路径盲删。
+/// - 进程崩溃会留下一个 0 字节文件（后续保存会当成已有文件、转存 `-快照`）。
 #[cfg(not(windows))]
 fn publish_by_placeholder(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let placeholder = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(to)?;
+    let meta = placeholder.metadata()?;
+    let (dev, ino) = (meta.dev(), meta.ino());
     drop(placeholder);
+    // 占位被别的进程写过：不能把它覆盖掉。
+    match std::fs::symlink_metadata(to) {
+        Ok(meta) if meta.len() == 0 => {}
+        _ => {
+            return Err(std::io::Error::other(
+                "暂存占位文件被其他程序改动，已放弃这次发布",
+            ))
+        }
+    }
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_file(to);
+            // 只清理仍然是我们的空占位；换成别人的文件就不动。
+            if let Ok(meta) = std::fs::symlink_metadata(to) {
+                if meta.dev() == dev && meta.ino() == ino && meta.len() == 0 {
+                    let _ = std::fs::remove_file(to);
+                }
+            }
             Err(e)
         }
     }

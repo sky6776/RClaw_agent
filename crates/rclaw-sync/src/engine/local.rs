@@ -661,9 +661,10 @@ pub struct AttachmentInfo {
     pub path: String,
     pub blob: String,
     pub size: u64,
-    /// `local`：本机有，就在原来的位置；`cached`：从别的设备取回、放在同步缓存里的
-    /// 一份快照；`remote`：还在别的设备上，没有下载；`missing`：本机登记过，但文件已经
-    /// 不在了。
+    /// `local`：本机有，就在原来的位置（落点暂时读不了、`Landing::Unknown` 时也可能是
+    /// `local` 但 `local_path=None`）；`cached`：从别的设备取回、放在同步缓存里的一份
+    /// 快照；`remote`：还在别的设备上，没有下载；`missing`：本机登记过，但文件已经不
+    /// 在了。
     ///
     /// 去取过、同步空间里却没有这个文件的（§8.7）：`asked`：向别的设备要了，在等它们
     /// 传上来；`gone`：保存着它的设备说已经拿不出来了；`lost`：等了很久也没有设备传

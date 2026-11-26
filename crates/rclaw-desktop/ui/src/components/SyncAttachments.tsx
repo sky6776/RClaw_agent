@@ -36,7 +36,8 @@ const IMAGE_RE = /\.(?:png|jpe?g|webp|gif)$/i;
 interface BarView {
   /** 不在工作区原位置上的（按消息先后；同一个文件被几条消息引用也只列一次）。 */
   pending: SyncAttachment[];
-  /** 这个会话开着期间刚下载到工作区原位置上的。 */
+  /** 可打开的本地副本：这个会话开着期间刚下载到工作区原位置上的，以及从持久化
+   *  记录恢复出来的已保存落点（正文里没有卡的旧附件）。 */
   landed: SyncAttachment[];
   sig: string;
 }
@@ -318,13 +319,18 @@ function dropSavedGone(gone: SavedProbe[]) {
     const saved = { ...prev.saved };
     const savedVerified = { ...prev.savedVerified };
     const saveErrors = { ...prev.saveErrors };
+    const openErrors = { ...prev.openErrors };
+    const openErrorPath = { ...prev.openErrorPath };
     for (const key of keys) {
       delete saved[key];
       delete savedVerified[key];
       delete saveErrors[key];
       delete savedKeyGen[key];
+      delete openErrors[key];
+      delete openErrorPath[key];
+      delete openErrorOp[key];
     }
-    return { ...prev, saved, savedVerified, saveErrors };
+    return { ...prev, saved, savedVerified, saveErrors, openErrors, openErrorPath };
   });
 }
 
@@ -489,7 +495,13 @@ function apply(chatId: string, list: SyncAttachment[]) {
       }
       cards = { ...cards, savedVerified, openErrors, openErrorPath };
     }
-    cards = { ...cards, saved, saveErrors };
+    // 普通保存错误（文案不是落点）不归 prune 管：引用没了就一并清掉。
+    let keptSaveErrors = saveErrors;
+    for (const key of Object.keys(keptSaveErrors)) {
+      if (!liveKeys.has(key)) keptSaveErrors = without(keptSaveErrors, key);
+    }
+    cards = { ...cards, saved, saveErrors: keptSaveErrors };
+    if (chat !== null) persistSaved(chat, saved, cards.savedVerified);
   }
   // 已保存、正文里没有卡（旧消息/工具行）的条目要留在顶栏当打开入口——应用重启
   // 后 `landed` 是空的，光靠「刚下载」的条目会把它们漏掉。
@@ -791,6 +803,7 @@ export function useSyncAttachmentLoader(chatId: string | null) {
       for (const blob of Object.keys(downloadRequest)) delete downloadRequest[blob];
       for (const blob of Object.keys(downloadKeys)) delete downloadKeys[blob];
       for (const key of Object.keys(openErrorOp)) delete openErrorOp[key];
+      for (const key of Object.keys(savedKeyGen)) delete savedKeyGen[key];
       emit();
     }
     let alive = true;
@@ -1160,6 +1173,13 @@ export function AttachmentCard({
         // 只有「落点上的文件已经不是这份内容了」（含被删掉）才收回「打开」；内容
         // 核对通过之后临时副本/拉起系统程序失败不算文件没了，记录要留着。
         const gone = isAttachmentChangedError(e);
+        if (gone) {
+          delete savedKeyGen[key];
+          setCards((prev) => ({
+            ...prev,
+            savedVerified: without(prev.savedVerified, key),
+          }));
+        }
         setCards((prev) => ({
           ...prev,
           saved: gone && prev.saved[key] === path ? without(prev.saved, key) : prev.saved,
