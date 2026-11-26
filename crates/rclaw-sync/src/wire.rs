@@ -158,10 +158,7 @@ impl std::fmt::Display for LinkCheckError {
 }
 
 /// 根由本机设置；根以下每一级必须是普通目录或文件。Windows reparse point 也按链接处理。
-pub(crate) fn check_no_links(
-    root: &Path,
-    path: &Path,
-) -> std::result::Result<(), LinkCheckError> {
+pub(crate) fn check_no_links(root: &Path, path: &Path) -> std::result::Result<(), LinkCheckError> {
     use std::io::ErrorKind;
     let relative = path
         .strip_prefix(root)

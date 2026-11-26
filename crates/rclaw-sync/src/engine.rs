@@ -351,12 +351,7 @@ impl Shared {
     }
 
     /// 排一个取回附件的请求。没有连上同步空间时返回 `false`。
-    pub(crate) fn request_fetch(
-        &self,
-        blob: String,
-        user: bool,
-        request: Option<String>,
-    ) -> bool {
+    pub(crate) fn request_fetch(&self, blob: String, user: bool, request: Option<String>) -> bool {
         lock(&self.fetch).as_ref().is_some_and(|sender| {
             sender
                 .send(FetchReq {
@@ -1523,9 +1518,7 @@ impl SyncEngine {
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
             // 文件不在：落点失效（调用方可以收掉「已保存」）。
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return AttachmentBytes::Rejected
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AttachmentBytes::Rejected,
             // 权限/共享冲突/磁盘错误：暂时读不了，别当内容被改写。
             Err(_) => return AttachmentBytes::Failed,
         };
@@ -1651,9 +1644,7 @@ impl SyncEngine {
         let input = match std::fs::File::open(&source) {
             Ok(input) => input,
             // 源文件不在：落点失效。
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return AttachmentStage::Rejected
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AttachmentStage::Rejected,
             // 权限/共享冲突：暂时读不了。
             Err(_) => return AttachmentStage::Failed,
         };

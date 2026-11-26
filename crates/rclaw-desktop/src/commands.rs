@@ -6479,7 +6479,9 @@ pub async fn share_media(
                     return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
                 rclaw_sync::AttachmentStage::Failed => {
-                    return Err("转发失败: 暂存位置不可用（权限、I/O 或目录含链接/特殊文件）".into())
+                    return Err(
+                        "转发失败: 暂存位置不可用（权限、I/O 或目录含链接/特殊文件）".into(),
+                    )
                 }
                 // 核不了（没有登记/读不出密钥）：按老行为转发原路径。
                 rclaw_sync::AttachmentStage::Unverifiable => {}

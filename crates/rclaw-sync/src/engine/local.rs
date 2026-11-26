@@ -889,7 +889,11 @@ pub(crate) fn attachments(
                 match std::fs::symlink_metadata(&path) {
                     // 预算外（!deep）只探测存在性：不整读旧附件。
                     Ok(meta) if meta.is_file() => {
-                        let match_state = if deep { verified(&path) } else { BlobMatch::Unknown };
+                        let match_state = if deep {
+                            verified(&path)
+                        } else {
+                            BlobMatch::Unknown
+                        };
                         (match_state, Some(path))
                     }
                     Ok(_) => (BlobMatch::No, None),
@@ -960,31 +964,33 @@ pub(crate) fn attachments(
             };
 
             let message_status = if found.kind == "file" && deep {
-                Some(if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
-                    outcome.unwrap_or(BlobMatch::Unknown)
-                } else if keys.is_none() {
-                    // 没有密钥（不在同步空间里）验不了内容：文件不在是 No，文件在
-                    // 但核不了是 Unknown（不能当成「没了」）。
-                    match ctx.env.resolve_exact(&found.path) {
-                        Some(path) => match std::fs::symlink_metadata(&path) {
-                            Ok(meta) if meta.is_file() => BlobMatch::Unknown,
-                            Ok(_) => BlobMatch::No,
-                            Err(e)
-                                if matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::NotFound
-                                        | std::io::ErrorKind::NotADirectory
-                                ) =>
-                            {
-                                BlobMatch::No
-                            }
-                            Err(_) => BlobMatch::Unknown,
-                        },
-                        None => BlobMatch::No,
-                    }
-                } else {
-                    exact_status(&found.path, true).0
-                })
+                Some(
+                    if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
+                        outcome.unwrap_or(BlobMatch::Unknown)
+                    } else if keys.is_none() {
+                        // 没有密钥（不在同步空间里）验不了内容：文件不在是 No，文件在
+                        // 但核不了是 Unknown（不能当成「没了」）。
+                        match ctx.env.resolve_exact(&found.path) {
+                            Some(path) => match std::fs::symlink_metadata(&path) {
+                                Ok(meta) if meta.is_file() => BlobMatch::Unknown,
+                                Ok(_) => BlobMatch::No,
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::NotFound
+                                            | std::io::ErrorKind::NotADirectory
+                                    ) =>
+                                {
+                                    BlobMatch::No
+                                }
+                                Err(_) => BlobMatch::Unknown,
+                            },
+                            None => BlobMatch::No,
+                        }
+                    } else {
+                        exact_status(&found.path, true).0
+                    },
+                )
             } else {
                 None
             };
@@ -1300,10 +1306,7 @@ pub(crate) fn same_blob_now(keys: &Keys, path: &Path, blob: &str, size: u64) -> 
 /// 替换只能靠过期后的重新整读发现，所以两个方向都设了期限——还原成正确内容之后，
 /// 卡上最多一分钟就会自己变回可用。
 pub(crate) fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
-    matches!(
-        same_blob_status(keys, path, blob, size),
-        BlobMatch::Yes
-    )
+    matches!(same_blob_status(keys, path, blob, size), BlobMatch::Yes)
 }
 
 /// 一次内容核对的三态结论：`Unknown` 表示「这一下读不了/判不了」（权限、I/O、

@@ -1448,12 +1448,10 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
         // 文件系统不认 RENAME_NOREPLACE：没有「原子 + 不覆盖」的发布原语，明确
         // 报错（不退回「先建名再复制」——复制期间正式名字可写，并发写入会被我们
         // 覆盖或反过来，发布结果无法保证）。
-        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::ENOTSUP) => {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "这个位置不支持原子发布文件（文件系统不支持无覆盖改名）",
-            ))
-        }
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::ENOTSUP) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "这个位置不支持原子发布文件（文件系统不支持无覆盖改名）",
+        )),
         _ => Err(err),
     }
 }
