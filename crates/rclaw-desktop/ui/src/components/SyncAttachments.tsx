@@ -50,6 +50,8 @@ interface CardState {
   saving: Record<string, true>;
   errors: Record<string, string>;
   saveErrors: Record<string, string>;
+  /** 打开失败的文案（按落点）：与「存进工作区失败」分开，打开成功只清这一份。 */
+  openErrors: Record<string, string>;
   /** 存进工作区之后的相对路径。 */
   saved: Record<string, string>;
 }
@@ -59,6 +61,7 @@ const noCardState = (): CardState => ({
   saving: {},
   errors: {},
   saveErrors: {},
+  openErrors: {},
   saved: {},
 });
 
@@ -496,7 +499,8 @@ function save(chatId: string, item: SyncAttachment) {
         const saved = { ...prev.saved, [savedKey]: rel };
         // 归一之后旧对象名的键不再被卡片使用。
         if (savedBlob !== item.blob) delete saved[key];
-        return { ...prev, saved };
+        // 重新保存成功：上一次打开失败的文案也一并收掉。
+        return { ...prev, saved, openErrors: without(prev.openErrors, savedKey) };
       });
       savedKeyGen[savedKey] = (savedKeyGen[savedKey] ?? 0) + 1;
       // 存进工作区之后清单里的 `path_present` 会变（消息路径上真有这份内容了）：先
@@ -832,7 +836,10 @@ export function AttachmentCard({
   const shown = name ?? (item.path.split("/").pop() || item.path);
   const where = item.origin ? `「${item.origin}」` : "别的设备";
   const isImage = IMAGE_RE.test(item.path);
-  const error = state.errors[item.blob] ?? state.saveErrors[fileKey(item)];
+  const error =
+    state.errors[item.blob] ??
+    state.openErrors[fileKey(item)] ??
+    state.saveErrors[fileKey(item)];
   const open = (path: string) => {
     const key = fileKey(item);
     const genAt = savedKeyGen[key] ?? 0;
@@ -847,16 +854,18 @@ export function AttachmentCard({
       // 路径上的标记也清了，那条可能仍然对不上）。
       .then((verified) => {
         if (!verified) return;
+        // 先核对会话/版本/落点，全部对得上才清状态：迟到的成功回调不能清掉别的
+        // 会话或后来重新保存的那份记录。
         if (chat !== chatId) return;
-        clearAttachmentChanged({ path, blob: item.blob });
-        // 上一次打开失败（严格核对暂时不可用、拉起程序失败）的文案要收掉：这次
-        // 已经核对通过。期间换过记录的（版本/落点变了）不动，交给新记录自己。
         if ((savedKeyGen[key] ?? 0) !== genAt) return;
         if (cards.saved[key] !== undefined && cards.saved[key] !== path) return;
+        clearAttachmentChanged({ path, blob: item.blob });
+        // 上一次打开失败（严格核对暂时不可用、拉起程序失败）的文案要收掉；存进
+        // 工作区失败是另一回事，不动它。
         setCards((prev) =>
-          prev.saveErrors[key] === undefined
+          prev.openErrors[key] === undefined
             ? prev
-            : { ...prev, saveErrors: without(prev.saveErrors, key) },
+            : { ...prev, openErrors: without(prev.openErrors, key) },
         );
       })
       .catch((e) => {
@@ -873,7 +882,7 @@ export function AttachmentCard({
         setCards((prev) => ({
           ...prev,
           saved: gone && prev.saved[key] === path ? without(prev.saved, key) : prev.saved,
-          saveErrors: { ...prev.saveErrors, [key]: String(e) },
+          openErrors: { ...prev.openErrors, [key]: String(e) },
         }));
         if (gone) reload?.();
       });

@@ -2330,8 +2330,14 @@ export default function Chat({
     if (!el) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     if (rounds[rounds.length - 1]?.id === id) {
-      beginJump(id);
-      scrollListToBottom(!reduce);
+      // 末轮 = 最新：清掉可能残留的跳转 pin，瞬时回底（平滑动画的中间帧会被
+      // 滚动处理器当成「脱离跟随」，按钮闪回），高亮交给到底规则。
+      jumpTargetRef.current = null;
+      jumpAlignedRef.current = false;
+      window.clearTimeout(jumpTimerRef.current);
+      setActiveRoundId(id);
+      scrollListToBottom(false);
+      scheduleActiveRound();
       return;
     }
     const row = el.querySelector<HTMLElement>(`[data-entry-id="${id}"]`);

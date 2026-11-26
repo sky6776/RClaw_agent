@@ -1508,8 +1508,10 @@ impl SyncEngine {
         let cap = size.saturating_add(local::SIZE_SLACK).saturating_add(1);
         let mut reader = file.take(cap);
         let mut bytes: Vec<u8> = Vec::new();
-        let Ok((digest, read)) = crate::crypto::copy_hash(&mut reader, &mut bytes) else {
-            return AttachmentBytes::Rejected;
+        let (digest, read) = match crate::crypto::copy_hash(&mut reader, &mut bytes) {
+            Ok(outcome) => outcome,
+            // 读到一半失败（权限/共享冲突/磁盘错误）：不是内容对不上。
+            Err(_) => return AttachmentBytes::Failed,
         };
         if read > limit || read.abs_diff(size) > local::SIZE_SLACK || keys.blob_id(&digest) != blob
         {

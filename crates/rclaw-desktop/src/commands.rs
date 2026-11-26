@@ -4796,7 +4796,7 @@ mod tests {
         let dto = super::config_entry_dto(home);
         assert!(dto.is_config);
         assert_eq!(dto.name, "rclaw.toml");
-        assert_eq!(dto.size, body.len() as u64);
+        assert_eq!(dto.size, Some(body.len() as u64));
         // agent 根出现同名真实文件 → 虚拟停用（真实文件优先，避免同名并列）。
         std::fs::write(home.join("agent/rclaw.toml"), "x").unwrap();
         assert!(!super::config_virtual_active(&home.join("agent")));
@@ -5395,9 +5395,12 @@ pub async fn media_preview(
                 rclaw_sync::AttachmentBytes::Rejected => {
                     return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
-                // 暂时读不了：退回下面按路径的老读法（能读就照常，读不了再报错）。
-                rclaw_sync::AttachmentBytes::Failed
-                | rclaw_sync::AttachmentBytes::Unverifiable => None,
+                // 核对读取暂时失败：不退回按路径重读（重读时路径可能已经换成
+                // 另一份文件，显示出来的就不是这条消息引用的内容了）。
+                rclaw_sync::AttachmentBytes::Failed => {
+                    return Err("读取媒体失败（权限或 I/O），稍后再试".into())
+                }
+                rclaw_sync::AttachmentBytes::Unverifiable => None,
             }
         }
         _ => None,
@@ -5740,9 +5743,11 @@ pub async fn media_base64(
             rclaw_sync::AttachmentBytes::Rejected => {
                 return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
             }
-            // 暂时读不了：退回下面按路径的读取。
-            rclaw_sync::AttachmentBytes::Failed
-            | rclaw_sync::AttachmentBytes::Unverifiable => {}
+            // 核对读取暂时失败：不退回按路径重读（理由同上），报可重试错误。
+            rclaw_sync::AttachmentBytes::Failed => {
+                return Err("读取媒体失败（权限或 I/O），稍后再试".into())
+            }
+            rclaw_sync::AttachmentBytes::Unverifiable => {}
         }
     }
     // 最大 25MB 的同步读 + 编码挪到阻塞线程池（与同文件其他命令一致），
