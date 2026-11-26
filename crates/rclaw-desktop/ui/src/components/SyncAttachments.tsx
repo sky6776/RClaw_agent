@@ -91,12 +91,21 @@ function persistSaved(
   savedVerified: Record<string, boolean>,
 ) {
   try {
-    if (Object.keys(saved).length === 0) {
+    // 只持久化核对过的落点：`verified=false` 的副本本来就不核对内容，重启后还
+    // 按路径打开就可能在文件被同名替换时亮出另一份内容。
+    const keep: Record<string, string> = {};
+    const verified: Record<string, boolean> = {};
+    for (const [key, rel] of Object.entries(saved)) {
+      if (savedVerified[key] === false) continue;
+      keep[key] = rel;
+      verified[key] = true;
+    }
+    if (Object.keys(keep).length === 0) {
       window.localStorage.removeItem(SAVED_KEY_PREFIX + chatId);
     } else {
       window.localStorage.setItem(
         SAVED_KEY_PREFIX + chatId,
-        JSON.stringify({ saved, verified: savedVerified }),
+        JSON.stringify({ saved: keep, verified }),
       );
     }
   } catch {
@@ -553,7 +562,11 @@ function settle(
   delete downloadKeys[blob];
   let seq = downloadAt[blob] ?? opSeq;
   if (joined) {
-    for (const joinedOp of joined.values()) seq = Math.max(seq, joinedOp);
+    // 只算「加入后没再发起别的操作」的卡片：A 卡加入后又点了一次打开（失败），
+    // 这次下载的旧失败不能盖住它那条更新的错误。
+    for (const [key, joinedOp] of joined) {
+      if ((cardOpSeq[key] ?? 0) === joinedOp) seq = Math.max(seq, joinedOp);
+    }
   }
   delete downloadAt[blob];
   if (error === null && placed) {

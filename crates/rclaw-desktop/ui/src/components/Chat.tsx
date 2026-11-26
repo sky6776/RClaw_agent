@@ -1011,7 +1011,8 @@ export default function Chat({
     // 显式跳转还在进行：离底 80px 内的「朝底」滚动不能把跟随接回去。
     if (followLockRef.current) {
       lastScrollTopRef.current = el.scrollTop;
-      setShowJumpDown(el.scrollHeight - el.scrollTop - el.clientHeight >= 80);
+      // 跳转把跟随关掉了：不管离底多近，都要留一个「回到底部」入口。
+      setShowJumpDown(!stickToBottomRef.current);
       return;
     }
     // 内容全部可见（无溢出，scrollTop 被钳在 0）等价于停在底部：必须恢复

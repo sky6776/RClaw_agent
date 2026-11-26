@@ -1398,8 +1398,10 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
 /// 同目录内「目标存在即失败」的发布（`hard_link` 不可用的落点）：
 /// - Windows：`MoveFileExW` 不设 `MOVEFILE_REPLACE_EXISTING`——同卷原子改名，目标
 ///   已存在即失败（exFAT/FAT 也支持）。
-/// - Linux：`renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败（内核 ≥3.15）。
-/// - Android：不调用 `renameat2`（符号/ seccomp SIGSYS 风险），直接走占名退路。
+/// - Linux：只走 `renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败
+///   （内核 ≥3.15）；失败保留真实错误，不降级成普通 rename。
+/// - Android：不调用 `renameat2`（符号/ seccomp SIGSYS 风险），走占名退路（见下，
+///   残余窗口是有意取舍）。
 /// - 文件系统不认 `RENAME_NOREPLACE` / Android（不调用 renameat2，避免 seccomp
 ///   SIGSYS）：退回「create_new 占名 + 同目录 rename」。不覆盖已有文件；占位是
 ///   0 字节可见的、写入会被检测后放弃、崩溃会留下空文件——没有更好原语时保证
@@ -1426,13 +1428,9 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    match renameat2_noreplace(from, to) {
-        Ok(()) => Ok(()),
-        // 目标已存在：让调用方换下一个候选。
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-        // 不支持/被拒绝（老内核、FUSE、容器策略、跨设备……）：退回占名 + rename。
-        Err(_) => publish_by_placeholder(from, to),
-    }
+    // 只走原子无覆盖改名：失败就把真实错误交给调用方（AlreadyExists 换候选，
+    // 其它报错）——不降级成「可能覆盖目标」的普通 rename。
+    renameat2_noreplace(from, to)
 }
 
 /// Android：不调用 `renameat2`。bionic 直到 API 30 才导出该符号，而直接 syscall 又
@@ -1486,7 +1484,7 @@ fn publish_by_placeholder(from: &Path, to: &Path) -> std::io::Result<()> {
         .open(to)?;
     let meta = placeholder.metadata()?;
     let (dev, ino) = (meta.dev(), meta.ino());
-    drop(placeholder);
+    // 句柄保留到 rename/清理结束：inode 在句柄打开期间不会被复用，身份比较才可靠。
     // 只清理仍然是我们创建的那个空占位；换成别人的文件就不动。
     let cleanup_ours = || {
         if let Ok(meta) = std::fs::symlink_metadata(to) {
@@ -1517,7 +1515,12 @@ fn publish_by_placeholder(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    publish_by_placeholder(from, to)
+    // 没有验证过的落点原语：明确报错，不静默降级。
+    let _ = (from, to);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "这个平台没有可用的无覆盖发布原语",
+    ))
 }
 
 /// 把暂存文件发布成工作区里的新文件：候选名逐个试，`hard_link` 保证不覆盖已有文件、
