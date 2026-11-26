@@ -947,9 +947,12 @@ pub async fn sync_open_attachment(
     chat_id: String,
     blob: String,
     path: String,
+    // 另存副本入口：核不了（密钥/登记不可用）时不要退回「按路径直接打开」。
+    strict: Option<bool>,
 ) -> Result<bool, String> {
     check_chat_id(&chat_id)?;
     let engine = handle(&state)?;
+    let strict = strict.unwrap_or(false);
     // 小文件：按对象读出核对过的字节、写成暂存副本，打开的就是核对过的那份内容
     // （不再「核对路径 → 交系统打开路径」）。大文件（视频等）读进内存不现实：
     // 直读核对后打开原文件。
@@ -1007,7 +1010,11 @@ pub async fn sync_open_attachment(
                         .into(),
                 ),
                 // 核不了：按老行为打开原路径（这次「打开成功」不代表核对通过）。
+                // 另存副本入口要求核对，核不了就不要打开。
                 rclaw_sync::AttachmentStage::Unverifiable => {
+                    if strict {
+                        return Err(STRICT_UNVERIFIABLE.into());
+                    }
                     super::open_media_path(&state.home, &path)?;
                     Ok(false)
                 }
@@ -1018,6 +1025,9 @@ pub async fn sync_open_attachment(
                 .into(),
         ),
         rclaw_sync::AttachmentBytes::Unverifiable => {
+            if strict {
+                return Err(STRICT_UNVERIFIABLE.into());
+            }
             super::open_media_path(&state.home, &path)?;
             Ok(false)
         }
@@ -1141,6 +1151,8 @@ fn same_content(target: &Path, source: &Path) -> bool {
 /// 缓存里的副本和登记的已经对不上了（被本机程序原地改写过）。开头这句与其它核对入口
 /// 的「内容对不上」文案一致，界面统一按它识别（`isAttachmentChangedError`）。
 const CHANGED_SNAPSHOT: &str = "这份缓存副本已经不是这条消息引用的那一份了（内容与登记的不一致，可能被本机的程序改写过）。请重新下载这个附件。";
+/// 另存副本入口在核不了时的说明（不走「按老行为直接打开」）。
+const STRICT_UNVERIFIABLE: &str = "现在无法核对这份文件的内容（同步密钥或登记不可用），稍后再试";
 
 /// 快照要存到的工作区位置：返回（目录的规范路径、目录相对路径、文件名）。路径上的
 /// 目录逐级核对 / 新建，不跟随链接；越出工作区、路径不合规的都拒绝。

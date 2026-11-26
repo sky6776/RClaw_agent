@@ -1653,8 +1653,8 @@ export const api = {
   /** 点开同步会话里的一份附件：后端先按对象核对工作区里这个文件的内容，对不上就不
    *  打开（返回错误），由界面改出「重新下载」。返回值 = 打开的是不是核对过的副本
    *  （核不了时按老行为打开原路径，为 false）。 */
-  syncOpenAttachment: (chatId: string, blob: string, path: string) =>
-    invoke<boolean>("sync_open_attachment", { chatId, blob, path }),
+  syncOpenAttachment: (chatId: string, blob: string, path: string, strict = false) =>
+    invoke<boolean>("sync_open_attachment", { chatId, blob, path, strict }),
 
   /** 把一份文件快照存进工作区（不覆盖已有的不同文件），返回落点与「写入的字节是不是
    *  核对过的」（核不了时按老行为复制，verified=false）。

@@ -203,7 +203,9 @@ async function probeSavedPaths(
       const name = rel.slice(rel.lastIndexOf("/") + 1);
       const onDisk = entries.get(name);
       if (onDisk === undefined) continue;
-      if (size !== undefined && Math.abs(onDisk - size) > SIZE_SLACK) continue;
+      // 目录接口在单个文件读不到元数据时会报 0（不是真的 0 字节）：这种不参与
+      // 长度比较，别把有效副本当成被换掉。
+      if (size !== undefined && onDisk !== 0 && Math.abs(onDisk - size) > SIZE_SLACK) continue;
       present[idx] = true;
     }
   }
@@ -838,8 +840,11 @@ export function AttachmentCard({
     const genAt = savedKeyGen[key] ?? 0;
     // 点开前先让后端核对一下：工作区里这个路径上的文件可能已经被就地改写过，打开
     // 前的一次核对（只读这一个）是「不让用户看到另一个版本」的最后一道关。
+    // 打开的是「已存到另一个名字」的副本时严格核对：核不了（同步密钥/登记不可用）
+    // 就不要按老行为直接把路径交给系统——那条路径没有别的证据能证明是这份内容。
+    const strict = state.saved[key] !== undefined && state.saved[key] === path;
     api
-      .syncOpenAttachment(chatId, item.blob, path)
+      .syncOpenAttachment(chatId, item.blob, path, strict)
       // 打开的是核对过的副本才算这次读通过；按**打开的这个落点**清覆盖（别把消息
       // 路径上的标记也清了，那条可能仍然对不上）。
       .then((verified) => {
@@ -847,22 +852,21 @@ export function AttachmentCard({
       })
       .catch((e) => {
         if (chat !== chatId) return;
-        // 这期间已经保存到别的落点：这次失败说的是旧落点，整次状态更新都不作数
-        // （包括错误文案与刷新），别挂到新卡片上。
+        // 这期间又保存过（含存到同一路径的新版本）：这次失败说的是上一份记录，
+        // 整次状态更新都不作数（包括错误文案与刷新），别挂到新卡片上。
+        if ((savedKeyGen[key] ?? 0) !== genAt) return;
+        // 这期间已经保存到别的落点：同上，别挂到新卡片上。
         if (cards.saved[key] !== undefined && cards.saved[key] !== path) return;
         onError(`打开文件失败: ${String(e)}`);
-        // 核对没过（文件被改写/删掉）：这次保存的落点不能再「打开」，收回去让用户
-        // 重新「存进工作区」；错误按落点记，只有这张卡显示。这期间重新保存过、
-        // 或保存记录已经换了落点的，不能拿这次失败把新记录清掉。
+        // 只有「落点上的文件已经不是这份内容了」（含被删掉）才收回「打开」；内容
+        // 核对通过之后临时副本/拉起系统程序失败不算文件没了，记录要留着。
+        const gone = isAttachmentChangedError(e);
         setCards((prev) => ({
           ...prev,
-          saved:
-            prev.saved[key] === path && (savedKeyGen[key] ?? 0) === genAt
-              ? without(prev.saved, key)
-              : prev.saved,
+          saved: gone && prev.saved[key] === path ? without(prev.saved, key) : prev.saved,
           saveErrors: { ...prev.saveErrors, [key]: String(e) },
         }));
-        reload?.();
+        if (gone) reload?.();
       });
   };
 

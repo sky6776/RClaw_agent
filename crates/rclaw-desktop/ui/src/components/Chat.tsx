@@ -2336,16 +2336,19 @@ export default function Chat({
     }
     const row = el.querySelector<HTMLElement>(`[data-entry-id="${id}"]`);
     if (!row) return;
-    beginJump(id);
+    const top =
+      el.scrollTop + row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    const max = Math.max(0, el.scrollHeight - el.clientHeight);
     stickToBottomRef.current = false;
     setShowJumpDown(true);
-    el.scrollTo({
-      top:
-        el.scrollTop +
-        row.getBoundingClientRect().top -
-        el.getBoundingClientRect().top,
-      behavior: reduce ? "auto" : "smooth",
-    });
+    if (top >= max - 1) {
+      // 目标落点会被底部夹住：滚过去也就是底部，按「到底 = 末轮」高亮（钉目标
+      // 的话它永远等不到对齐，会一直压着末轮规则）。
+      el.scrollTo({ top: max, behavior: reduce ? "auto" : "smooth" });
+      return;
+    }
+    beginJump(id);
+    el.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
   };
 
   // 当前轮 = 视口顶以上最近的一条用户消息（zcode 同语义）；一条都不到线（视口
