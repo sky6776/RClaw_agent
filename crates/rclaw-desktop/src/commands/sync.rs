@@ -1399,10 +1399,8 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
 ///   已存在即失败（exFAT/FAT 也支持）。
 /// - Linux/Android：`renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败
 ///   （内核 ≥3.15；Android 的内核都满足）。
-/// - 文件系统不认 `RENAME_NOREPLACE` 时最后退回 `create_new` + 复制：目标名先被
-///   我们建住（不覆盖已有文件、并发写入抢不到这个名字），复制期间正式名字上可能
-///   被读到半成品——卷不支持原子无覆盖改名时仅剩的选项（与 `rclaw-sync` 的 space
-///   标记发布同一套退路）；失败会删掉刚建的半成品。
+/// - 文件系统不认 `RENAME_NOREPLACE`：明确报错，不退回「先建名再复制」（复制期间
+///   正式名字可写，并发写入会被覆盖或反过来，发布结果无法保证）。
 #[cfg(windows)]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -1446,44 +1444,26 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     }
     let err = std::io::Error::last_os_error();
     match err.raw_os_error() {
-        // 文件系统不认 RENAME_NOREPLACE：走复制退路。
-        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::ENOTSUP) => {}
-        _ => return Err(err),
+        // 文件系统不认 RENAME_NOREPLACE：没有「原子 + 不覆盖」的发布原语，明确
+        // 报错（不退回「先建名再复制」——复制期间正式名字可写，并发写入会被我们
+        // 覆盖或反过来，发布结果无法保证）。
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::ENOTSUP) => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "这个位置不支持原子发布文件（文件系统不支持无覆盖改名）",
+            ))
+        }
+        _ => Err(err),
     }
-    publish_by_copy(from, to)
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    publish_by_copy(from, to)
-}
-
-/// 没有原子无覆盖改名原语时的最后退路：`create_new` 占住目标名再复制（不覆盖
-/// 已有文件），失败删掉半成品。
-#[cfg(any(test, not(windows)))]
-fn publish_by_copy(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(to)?;
-    let copied = (|| {
-        let mut source = std::fs::File::open(from)?;
-        std::io::copy(&mut source, &mut target)?;
-        target.sync_all()
-    })();
-    drop(target);
-    if let Err(e) = copied {
-        // 正式路径上只留了一个刚创建的空/半截文件：删掉，恢复「不存在」。
-        let _ = std::fs::remove_file(to);
-        return Err(e);
-    }
-    // 复制期间可能有别的程序在写这个名字：核对写下去的确实还是暂存的那份内容，
-    // 别把「被别人改过」的文件报成发布成功。对不上时不删（可能是别人的写入），
-    // 报错让用户重试。
-    if !same_content(to, from) {
-        return Err(std::io::Error::other("发布期间目标文件被其他程序改动"));
-    }
-    Ok(())
+    let _ = (from, to);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "这个平台没有可用的无覆盖发布原语",
+    ))
 }
 
 /// 把暂存文件发布成工作区里的新文件：候选名逐个试，`hard_link` 保证不覆盖已有文件、
@@ -2220,19 +2200,6 @@ mod tests {
         ] {
             assert!(workspace_rel_for(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn publish_by_copy_never_overwrites_an_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let staged = dir.path().join("staged.bin");
-        let target = dir.path().join("target.bin");
-        std::fs::write(&staged, b"verified bytes").unwrap();
-        std::fs::write(&target, b"someone else's file").unwrap();
-        let err = publish_by_copy(&staged, &target).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&target).unwrap(), b"someone else's file");
-        assert_eq!(std::fs::read(&staged).unwrap(), b"verified bytes");
     }
 
     #[test]

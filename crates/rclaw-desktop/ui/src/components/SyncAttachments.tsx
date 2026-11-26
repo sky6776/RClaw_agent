@@ -838,8 +838,8 @@ export function AttachmentCard({
   const isImage = IMAGE_RE.test(item.path);
   const error =
     state.errors[item.blob] ??
-    state.openErrors[fileKey(item)] ??
-    state.saveErrors[fileKey(item)];
+    state.saveErrors[fileKey(item)] ??
+    state.openErrors[fileKey(item)];
   const open = (path: string) => {
     const key = fileKey(item);
     const genAt = savedKeyGen[key] ?? 0;
@@ -1079,9 +1079,13 @@ function SnapshotImage({
   const [src, setSrc] = useState<string | null>(
     () => snapshotPreviews.get(cacheKey) ?? null,
   );
+  // 预览暂时取不到（权限/IO）：给一个重试入口。内容对不上的走「重新下载」，不在这里。
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   // 对象名或路径变了（换空间 rekey、旧版明文摘要归一）：换一份预览，别接着显示旧内容。
   useEffect(() => {
     setSrc(snapshotPreviews.get(cacheKey) ?? null);
+    setFailed(false);
   }, [cacheKey]);
   const box = useRef<HTMLSpanElement | null>(null);
   useEffect(() => {
@@ -1124,7 +1128,10 @@ function SnapshotImage({
           if (isAttachmentChangedError(e)) {
             markAttachmentChanged({ path, blob });
             refreshSyncAttachments();
+            return;
           }
+          // 权限/IO 之类的临时失败：给个重试，别让卡片永远没有预览。
+          setFailed(true);
         });
     };
     const el = box.current;
@@ -1147,7 +1154,20 @@ function SnapshotImage({
       alive = false;
       observer.disconnect();
     };
-  }, [chatId, blob, path, cacheKey, src]);
+  }, [chatId, blob, path, cacheKey, src, attempt]);
+  if (!src && failed) {
+    return (
+      <button
+        onClick={() => {
+          setFailed(false);
+          setAttempt((n) => n + 1);
+        }}
+        className="mb-1 rounded-md border border-[#2a2f3a] px-2 py-1 text-[11px] text-gray-400 transition hover:text-gray-200"
+      >
+        预览加载失败，点此重试
+      </button>
+    );
+  }
   // 没加载出来时不占位，只留一个 1px 的观察点（在卡片正上方，随卡片滚进视口）。
   if (!src) return <span ref={box} className="block h-1 w-full" aria-hidden="true" />;
   return (
