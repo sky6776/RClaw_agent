@@ -1398,8 +1398,8 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
 /// 同目录内「目标存在即失败」的发布（`hard_link` 不可用的落点）：
 /// - Windows：`MoveFileExW` 不设 `MOVEFILE_REPLACE_EXISTING`——同卷原子改名，目标
 ///   已存在即失败（exFAT/FAT 也支持）。
-/// - Linux/Android：`renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败
-///   （内核 ≥3.15；Android 的内核都满足）。
+/// - Linux：`renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败（内核 ≥3.15）。
+/// - Android：不调用 `renameat2`（符号/ seccomp SIGSYS 风险），直接走占名退路。
 /// - 文件系统不认 `RENAME_NOREPLACE` / Android（不调用 renameat2，避免 seccomp
 ///   SIGSYS）：退回「create_new 占名 + 同目录 rename」。不覆盖已有文件；占位是
 ///   0 字节可见的、写入会被检测后放弃、崩溃会留下空文件——没有更好原语时保证
@@ -1487,24 +1487,29 @@ fn publish_by_placeholder(from: &Path, to: &Path) -> std::io::Result<()> {
     let meta = placeholder.metadata()?;
     let (dev, ino) = (meta.dev(), meta.ino());
     drop(placeholder);
-    // 占位被别的进程写过：不能把它覆盖掉。
+    // 只清理仍然是我们创建的那个空占位；换成别人的文件就不动。
+    let cleanup_ours = || {
+        if let Ok(meta) = std::fs::symlink_metadata(to) {
+            if meta.dev() == dev && meta.ino() == ino && meta.is_file() && meta.len() == 0 {
+                let _ = std::fs::remove_file(to);
+            }
+        }
+    };
+    // 占位被别的进程改写/替换：不能把它覆盖掉，也不能删别人的东西。
     match std::fs::symlink_metadata(to) {
-        Ok(meta) if meta.len() == 0 => {}
+        Ok(meta) if meta.dev() == dev && meta.ino() == ino && meta.is_file() && meta.len() == 0 => {
+        }
         _ => {
+            cleanup_ours();
             return Err(std::io::Error::other(
                 "暂存占位文件被其他程序改动，已放弃这次发布",
-            ))
+            ));
         }
     }
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
         Err(e) => {
-            // 只清理仍然是我们的空占位；换成别人的文件就不动。
-            if let Ok(meta) = std::fs::symlink_metadata(to) {
-                if meta.dev() == dev && meta.ino() == ino && meta.len() == 0 {
-                    let _ = std::fs::remove_file(to);
-                }
-            }
+            cleanup_ours();
             Err(e)
         }
     }
