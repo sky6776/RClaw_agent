@@ -1400,12 +1400,10 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
 ///   已存在即失败（exFAT/FAT 也支持）。
 /// - Linux：只走 `renameat2(RENAME_NOREPLACE)`——原子改名、目标已存在即失败
 ///   （内核 ≥3.15）；失败保留真实错误，不降级成普通 rename。
-/// - Android：不调用 `renameat2`（符号/ seccomp SIGSYS 风险），走占名退路（见下，
-///   残余窗口是有意取舍）。
-/// - 文件系统不认 `RENAME_NOREPLACE` / Android（不调用 renameat2，避免 seccomp
-///   SIGSYS）：退回「create_new 占名 + 同目录 rename」。不覆盖已有文件；占位是
-///   0 字节可见的、写入会被检测后放弃、崩溃会留下空文件——没有更好原语时保证
-///   「能保存」的取舍，详见 [`publish_by_placeholder`]。
+/// - Android：不调用 `renameat2`（符号/seccomp SIGSYS 风险），走占名退路
+///   （`publish_by_placeholder`：0 字节占位可见、写入会被检测后放弃、崩溃会留下
+///   空文件——没有更好原语时保证「能保存」的取舍）。
+/// - 其它平台：明确报 Unsupported，不静默降级。
 #[cfg(windows)]
 fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -1543,10 +1541,9 @@ fn publish_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// 也不会让并行的读取看到半成品。
 ///
 /// 有的落点不支持硬链接（安卓的 FUSE 共享存储会被 SELinux 拒绝、FAT/exFAT 也不支持，
-/// 报 `Permission denied` 或 `Unsupported`）：退到**同目录内的 `rename`**——同一文件
-/// 系统内改名是原子的，正式名字上仍然不会出现写了一半的内容，读取不会看到未核对
-/// 半成品。候选名刚确认过不存在，保存又按对象串行，rename 覆盖的窗口极小；不退回
-/// 「按正式名复制」（那会让读取看到半成品）。
+/// 报 `Permission denied` 或 `Unsupported`）：交给 [`publish_noreplace`] 按平台处理
+/// （Windows/Linux 原子无覆盖改名；Android 占名 + rename，见其文档；其它平台报
+/// Unsupported）。不退回「按正式名复制」（那会让读取看到未核对半成品）。
 fn publish_staged(
     tmp: &Path,
     dir: &Path,

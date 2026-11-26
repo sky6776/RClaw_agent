@@ -636,21 +636,18 @@ function settle(
         error === null
           ? without(prev.errorSeq, blob)
           : { ...prev.errorSeq, [blob]: seq },
-      downloadKeySeq:
-        error === null
-          ? joined
-            ? Object.fromEntries(
-                Object.entries(prev.downloadKeySeq).filter(([key]) => !joined.has(key)),
-              )
-            : prev.downloadKeySeq
-          : joined
-            ? {
-                ...prev.downloadKeySeq,
-                // 所有参与卡都写自己的加入序号：加入后又发起了新操作的卡，
-                // 比较时自然不显示这次旧失败（也不会回退到共享序号）。
-                ...Object.fromEntries([...joined]),
-              }
-            : prev.downloadKeySeq,
+      // 这个对象的旧参与序号全部丢弃（上一次下载的记录不能影响这一次），
+      // 失败时只保留本次参与卡加入时的序号。
+      downloadKeySeq: (() => {
+        const base = Object.fromEntries(
+          Object.entries(prev.downloadKeySeq).filter(
+            ([key]) => !key.startsWith(`${blob}:`),
+          ),
+        );
+        return error !== null && joined
+          ? { ...base, ...Object.fromEntries([...joined]) }
+          : base;
+      })(),
     };
   });
 }

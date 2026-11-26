@@ -1013,9 +1013,9 @@ export default function Chat({
     if (followLockRef.current) {
       const noOverflow = el.scrollHeight - el.clientHeight <= 0;
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 4;
-      // 跳转进行中（pin 还在）不按位置恢复：从底部起跳的第一帧也「在底部」，
-      // 那不是用户回底，而是动画还没离开。
-      if ((noOverflow || atBottom) && jumpTargetRef.current === null) {
+      // 只有「向下滚到底」才算用户回底：从底部起跳的第一帧也「在底部」，但
+      // 位置没往上走（或还没离开），不能把跟随接回去。
+      if ((noOverflow || atBottom) && el.scrollTop > lastScrollTopRef.current) {
         clearJump();
         stickToBottomRef.current = true;
         setShowJumpDown(false);
