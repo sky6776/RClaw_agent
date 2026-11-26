@@ -992,9 +992,13 @@ export default function Chat({
   const handleListScroll = () => {
     const el = listRef.current;
     if (!el) return;
-    // 最大滚动位置变小 = 视口变高把位置夹到了新底部（不是用户向下滚）。
+    // 最大滚动位置变小且上一位置确实超过新上限、当前落在新底部 = 视口变高把
+    // 位置夹到了新底部（不是用户向下滚）。只是上限变小、位置没被夹动的不算。
     const maxScroll = el.scrollHeight - el.clientHeight;
-    const clamped = maxScroll < lastMaxScrollRef.current;
+    const clamped =
+      maxScroll < lastMaxScrollRef.current &&
+      lastScrollTopRef.current > maxScroll &&
+      el.scrollTop === maxScroll;
     lastMaxScrollRef.current = maxScroll;
     // 轮次导航的当前轮跟随滚动刷新（rAF 节流，见下方 computeActiveRound）。
     scheduleActiveRound();
