@@ -843,9 +843,26 @@ pub(crate) fn attachments(
             // 那个名字；消息里写的路径必须原样存在（`resolve_exact`）——界面打开时用的
             // 是消息里那一串，改写过名字的文件在界面上打不开（「存进工作区」会给出存好
             // 的那个路径）。
-            let landing = |rel_path: &str| -> Option<std::path::PathBuf> {
-                let path = ctx.env.checked_path(rel_path).ok()?;
-                path.is_file().then_some(path)
+            // 落点的三种情况：文件在、确认不在、暂时读不了（权限/IO）——最后一种
+            // 不能当「不在」（会误撤保存记录、预览拿不到可重试错误）。
+            let landing = |rel_path: &str| -> Landing {
+                match ctx.env.checked_path_typed(rel_path) {
+                    Err(crate::wire::LinkCheckError::Policy) => Landing::Absent,
+                    Err(crate::wire::LinkCheckError::Io(_)) => Landing::Unknown,
+                    Ok(path) => match std::fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.is_file() => Landing::File(path),
+                        Ok(_) => Landing::Absent,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                            ) =>
+                        {
+                            Landing::Absent
+                        }
+                        Err(_) => Landing::Unknown,
+                    },
+                }
             };
             let exact = |rel_path: &str| -> Option<std::path::PathBuf> {
                 let path = ctx.env.resolve_exact(rel_path)?;
@@ -867,18 +884,28 @@ pub(crate) fn attachments(
                     // 界面上给「重新下载」（`attach::lookup` 也按内容核对，取回时不会
                     // 覆盖这份内容不同的文件）。只有这一条应用了核对才算——预算没轮到的
                     // 只是「没核对过」，不是「内容对不上」。
-                    Some(path)
+                    Landing::File(path)
                         if deep
                             && found.kind == "file"
                             && matches!(verified(&path), BlobMatch::No) =>
                     {
                         ("changed", None, None)
                     }
-                    Some(path) if row.rel_path.starts_with(SYNC_DIR_PREFIX) => {
+                    Landing::File(path) if row.rel_path.starts_with(SYNC_DIR_PREFIX) => {
                         ("cached", Some(path), None)
                     }
-                    Some(path) => ("local", Some(path), Some(row.rel_path.clone())),
-                    None => ("missing", None, None),
+                    Landing::File(path) => ("local", Some(path), Some(row.rel_path.clone())),
+                    Landing::Absent => ("missing", None, None),
+                    // 落点暂时读不了：登记状态照旧，但不给 local_path——预览/保存会
+                    // 拿到「暂时不可访问」的可重试错误，而不是「没下载/不在缓存」。
+                    Landing::Unknown => {
+                        let state = if row.rel_path.starts_with(SYNC_DIR_PREFIX) {
+                            "cached"
+                        } else {
+                            "local"
+                        };
+                        (state, None, None)
+                    }
                 },
                 // 没有登记（登记被回收了）：工作区里原来的位置上还有、内容也对得上就算
                 // 本机有——文件被放回原处之后不该还按「取不回来」说。
@@ -937,9 +964,25 @@ pub(crate) fn attachments(
                 Some(if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
                     outcome.unwrap_or(BlobMatch::Unknown)
                 } else if keys.is_none() {
-                    // 没有密钥（不在同步空间里）就验不了别的位置上的同名文件是不是这
-                    // 一份内容：不认（界面继续按快照卡取用那份缓存副本）。
-                    BlobMatch::No
+                    // 没有密钥（不在同步空间里）验不了内容：文件不在是 No，文件在
+                    // 但核不了是 Unknown（不能当成「没了」）。
+                    match ctx.env.resolve_exact(&found.path) {
+                        Some(path) => match std::fs::symlink_metadata(&path) {
+                            Ok(meta) if meta.is_file() => BlobMatch::Unknown,
+                            Ok(_) => BlobMatch::No,
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::NotADirectory
+                                ) =>
+                            {
+                                BlobMatch::No
+                            }
+                            Err(_) => BlobMatch::Unknown,
+                        },
+                        None => BlobMatch::No,
+                    }
                 } else {
                     exact_status(&found.path)
                 })
@@ -968,10 +1011,10 @@ pub(crate) fn attachments(
                 path_present,
                 // 读不了/核不了不是「核对结论」：checked=false 让界面按「还没核对」
                 // 处理（别拿它撤有效的保存记录）。
+                // 核对结论只看消息路径：同步缓存暂时读不了不影响「消息路径上有没有
+                // 这份内容」这个判断（缓存状态仍由 state 表达）。
                 checked: found.kind != "file"
-                    || (deep
-                        && !matches!(outcome, Some(BlobMatch::Unknown))
-                        && !matches!(message_status, Some(BlobMatch::Unknown))),
+                    || (deep && !matches!(message_status, Some(BlobMatch::Unknown))),
             }
         })
         .collect();
@@ -1216,6 +1259,16 @@ fn verification_cost(ctx: &Ctx, found: &FoundRef) -> u64 {
         }
     }
     cost
+}
+
+/// 登记落点的三种情况（见 `attachments()` 的 `landing`）。
+enum Landing {
+    /// 文件就在这个落点上。
+    File(std::path::PathBuf),
+    /// 确认不在（不存在、不是文件、路径策略拒绝）。
+    Absent,
+    /// 暂时读不了（权限/IO）：不能当成「不在」。
+    Unknown,
 }
 
 /// 点开前的一次明确核对：不用摘要缓存里「刚算过」的结论，直接读一遍当前内容。

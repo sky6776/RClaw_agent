@@ -873,7 +873,7 @@ fn cached_snapshot(
     let local = info
         .local_path
         .as_deref()
-        .ok_or_else(|| "这个附件在本机没有文件".to_string())?;
+        .ok_or_else(|| "附件暂时不可访问（权限或 I/O），稍后再试".to_string())?;
     let full = Path::new(local)
         .canonicalize()
         .map_err(|e| format!("附件文件不存在: {e}"))?;

@@ -159,9 +159,14 @@ const savedKeyGen: Record<string, number> = {};
  *  操作」的失败才写进卡片——先发起、后返回的旧操作不能盖住新错误。 */
 let opSeq = 0;
 const cardOpSeq: Record<string, number> = {};
-function beginOp(key: string): number {
+const blobOpSeq: Record<string, number> = {};
+/** 这个对象最近一次「下载」的序号：下载结果回来时若之后又发起了保存/打开，就不再
+ *  拿它写卡片错误（最近一次操作的错误优先）。 */
+const downloadAt: Record<string, number> = {};
+function beginOp(key: string, blob?: string): number {
   opSeq += 1;
   cardOpSeq[key] = opSeq;
+  if (blob !== undefined) blobOpSeq[blob] = opSeq;
   return opSeq;
 }
 const savedDirOf = (rel: string) => {
@@ -428,6 +433,9 @@ function settle(
   placed: boolean,
   landed: string | null,
 ) {
+  // 这个下载之后又发起了保存/打开：结果（尤其失败）不再写进卡片错误。
+  const stale =
+    downloadAt[blob] !== undefined && blobOpSeq[blob] !== downloadAt[blob];
   if (error === null && placed) {
     // 只撤「这次实际落到的那个路径」上的覆盖：同一对象的其他路径上可能还是另一份
     // 内容（取回到同步缓存时，消息路径并没有被修好）。`error` 为空但没落盘的
@@ -442,7 +450,9 @@ function settle(
   setCards((prev) => {
     const busy = without(prev.busy, blob);
     const errors =
-      error === null ? without(prev.errors, blob) : { ...prev.errors, [blob]: error };
+      error === null || stale
+        ? without(prev.errors, blob)
+        : { ...prev.errors, [blob]: error };
     // 卡片上的「内容对不上／保存失败」是按落点记的：不在这里按整个对象清（成功落到的
     // 那个落点由上面的 clearAttachmentChanged 连说明一起收掉；别的落点可能仍然不对）。
     if (busy === prev.busy && errors === prev.errors) {
@@ -466,6 +476,11 @@ function download(chatId: string, blob: string) {
     setCards((prev) => (prev.busy[blob] ? { ...prev, busy: without(prev.busy, blob) } : prev));
     if (reload) reload();
   }, FETCH_SHOWN_MS);
+  // 下载也是一次操作：参与「最近一次操作」排序（稍后的保存/打开会让它的失败
+  // 不再写进卡片错误）。
+  opSeq += 1;
+  downloadAt[blob] = opSeq;
+  blobOpSeq[blob] = opSeq;
   api.syncFetchAttachment(chatId, blob).catch((e) => settle(blob, String(e), false, null));
 }
 
@@ -476,7 +491,7 @@ function download(chatId: string, blob: string) {
 function save(chatId: string, item: SyncAttachment) {
   const key = fileKey(item);
   if (cards.saving[key]) return;
-  const op = beginOp(key);
+  const op = beginOp(key, item.blob);
   setCards((prev) => ({
     ...prev,
     saving: { ...prev.saving, [key]: true },
@@ -862,7 +877,7 @@ export function AttachmentCard({
   const open = (path: string) => {
     const key = fileKey(item);
     const genAt = savedKeyGen[key] ?? 0;
-    const op = beginOp(key);
+    const op = beginOp(key, item.blob);
     // 用户刚点了打开：这张卡上一次「存进工作区失败」的文案先收掉，失败时显示
     // 这次打开的原因（最近一次操作的错误）。
     setCards((prev) => {

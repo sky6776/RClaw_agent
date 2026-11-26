@@ -1287,7 +1287,9 @@ impl SyncEngine {
         let mut probe = [0u8; 1];
         match reader.read(&mut probe) {
             Ok(0) => {}
-            Ok(_) | Err(_) => return Ok(AttachmentCopy::Rejected),
+            Ok(_) => return Ok(AttachmentCopy::Rejected),
+            // 探测读失败（权限/共享冲突）：暂时读不了，交给调用方归 Failed。
+            Err(e) => return Err(e),
         }
         let total = reader.total;
         let digest: [u8; 32] = reader
