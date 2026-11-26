@@ -322,11 +322,17 @@ export function RoundRail({
             // 三个单位分开换算：像素 / 行（约 16px）/ 页（一屏）；小数位移攒起来，
             // 别让连续的 0.25px 事件被 scrollTop 的取整全吃掉。
             const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? host.clientHeight : 1;
-            const pending = wheelRest.current + e.deltaY * unit;
+            // Shift+滚轮 / 带 deltaX 的横向输入：转成横滚，别当成纵向（也不退出贴底）。
+            const horizontal = e.shiftKey || e.deltaX !== 0;
+            const raw = horizontal ? (e.deltaX !== 0 ? e.deltaX : e.deltaY) : e.deltaY;
+            const pending = wheelRest.current + raw * unit;
             const whole = Math.trunc(pending);
             wheelRest.current = pending - whole;
-            if (whole !== 0) host.scrollTop += whole;
-            onWheelScroll?.(e.deltaY);
+            if (whole !== 0) {
+              if (horizontal) host.scrollLeft += whole;
+              else host.scrollTop += whole;
+            }
+            if (!horizontal) onWheelScroll?.(e.deltaY);
           };
           const layer = (
             <>
