@@ -1384,8 +1384,13 @@ fn compare_snapshot(reader: &mut dyn Read, target: &Path, same: &mut bool) -> st
 }
 
 /// 把暂存文件发布成工作区里的新文件：候选名逐个试，`hard_link` 保证不覆盖已有文件、
-/// 也不会让并行的读取看到半成品（不支持硬链接的文件系统直接失败，**不**退回按正式名
-/// 复制——那会让读取看到未核对的半成品）。
+/// 也不会让并行的读取看到半成品。
+///
+/// 有的落点不支持硬链接（安卓的 FUSE 共享存储会被 SELinux 拒绝、FAT/exFAT 也不支持，
+/// 报 `Permission denied` 或 `Unsupported`）：退到**同目录内的 `rename`**——同一文件
+/// 系统内改名是原子的，正式名字上仍然不会出现写了一半的内容，读取不会看到未核对
+/// 半成品。候选名刚确认过不存在，保存又按对象串行，rename 覆盖的窗口极小；不退回
+/// 「按正式名复制」（那会让读取看到半成品）。
 fn publish_staged(
     tmp: &Path,
     dir: &Path,
@@ -1404,15 +1409,20 @@ fn publish_staged(
             }
             // 名字刚被别人占了：换下一个候选（暂存文件照用）。
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                last = Some(e);
-                break;
-            }
+            Err(_) => match std::fs::rename(tmp, &dest) {
+                Ok(()) => return Ok(dest),
+                // Windows 上 rename 不覆盖已有文件：名字被占了，换下一个。
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    last = Some(e);
+                    break;
+                }
+            },
         }
     }
     let _ = std::fs::remove_file(tmp);
     Err(match last {
-        Some(e) => format!("存进工作区失败: 这个文件系统不支持原子发布（{e}）"),
+        Some(e) => format!("存进工作区失败: 无法发布这份文件（{e}）"),
         None => "存进工作区失败: 同名文件过多，请手动整理".to_string(),
     })
 }
