@@ -854,9 +854,11 @@ pub(crate) fn attachments(
             };
             // 这个落点上的文件是不是就是这条消息登记的那份内容。没有密钥（不在同步空间
             // 里、密钥读不出来）时验不了：按登记说它在（老行为）。
-            // 内容核对（没有密钥时验不了）。
-            let verified = |path: &Path| -> bool {
-                keys.is_none_or(|keys| same_blob(keys, path, &found.blob, found.size))
+            let verified = |path: &Path| -> BlobMatch {
+                match keys {
+                    Some(keys) => same_blob_status(keys, path, &found.blob, found.size),
+                    None => BlobMatch::Yes,
+                }
             };
             let (state, local_path, rel_path) = match &found.row {
                 Some(row) if row.state == BLOB_REMOTE => (found.remote, None, None),
@@ -865,7 +867,11 @@ pub(crate) fn attachments(
                     // 界面上给「重新下载」（`attach::lookup` 也按内容核对，取回时不会
                     // 覆盖这份内容不同的文件）。只有这一条应用了核对才算——预算没轮到的
                     // 只是「没核对过」，不是「内容对不上」。
-                    Some(path) if deep && found.kind == "file" && !verified(&path) => {
+                    Some(path)
+                        if deep
+                            && found.kind == "file"
+                            && matches!(verified(&path), BlobMatch::No) =>
+                    {
                         ("changed", None, None)
                     }
                     Some(path) if row.rel_path.starts_with(SYNC_DIR_PREFIX) => {
@@ -878,7 +884,12 @@ pub(crate) fn attachments(
                 // 本机有——文件被放回原处之后不该还按「取不回来」说。
                 None if found.kind == "file" => match exact(&found.path) {
                     // 不在核对窗口里的只能按存在性说（老消息，不渲染）。
-                    Some(path) if !deep || verified(&path) => {
+                    Some(path) if !deep || matches!(verified(&path), BlobMatch::Yes) => {
+                        ("local", Some(path), Some(found.path.clone()))
+                    }
+                    // 这个路径读不了/核不了（暂时）：按本机有处理，但不算核对过，
+                    // `checked=false` 让界面别拿它撤保存记录。
+                    Some(path) if matches!(verified(&path), BlobMatch::Unknown) => {
                         ("local", Some(path), Some(found.path.clone()))
                     }
                     Some(_) => ("changed", None, None),
@@ -890,6 +901,9 @@ pub(crate) fn attachments(
                 None if found.was_mine => ("gone", None, None),
                 None => ("missing", None, None),
             };
+            // 这一轮的核对结论（`Yes`/`No`/`Unknown`）：落点文件读不了时是 Unknown，
+            // 不能当成「内容对不上」。
+            let outcome = local_path.as_deref().map(&verified);
             let local_path = local_path.map(|path| path.to_string_lossy().into_owned());
             // 消息里写的那个路径上现在是不是真有这份内容：登记说它就是落点、内容上面
             // 已经核对过的（`local`），或者那个路径上的文件核对下来就是这个对象。
@@ -900,13 +914,13 @@ pub(crate) fn attachments(
                     // 有处理会让界面内联显示/在画廊里打开一个同名的别的版本）。
                     false
                 } else if state == "local" && rel_path.as_deref() == Some(found.path.as_str()) {
-                    true
+                    matches!(outcome, Some(BlobMatch::Yes))
                 } else if keys.is_none() {
                     // 没有密钥（不在同步空间里）就验不了别的位置上的同名文件是不是这
                     // 一份内容：不认（界面继续按快照卡取用那份缓存副本）。
                     false
                 } else {
-                    exact(&found.path).is_some_and(|path| verified(&path))
+                    exact(&found.path).is_some_and(|path| matches!(verified(&path), BlobMatch::Yes))
                 }
             } else {
                 state == "local"
@@ -922,7 +936,10 @@ pub(crate) fn attachments(
                 rel_path,
                 origin: found.origin,
                 path_present,
-                checked: found.kind != "file" || deep,
+                // 读不了/核不了不是「核对结论」：checked=false 让界面按「还没核对」
+                // 处理（别拿它撤有效的保存记录）。
+                checked: found.kind != "file"
+                    || (deep && !matches!(outcome, Some(BlobMatch::Unknown))),
             }
         })
         .collect();
@@ -1199,33 +1216,59 @@ pub(crate) fn same_blob_now(keys: &Keys, path: &Path, blob: &str, size: u64) -> 
 /// 替换只能靠过期后的重新整读发现，所以两个方向都设了期限——还原成正确内容之后，
 /// 卡上最多一分钟就会自己变回可用。
 pub(crate) fn same_blob(keys: &Keys, path: &Path, blob: &str, size: u64) -> bool {
+    matches!(
+        same_blob_status(keys, path, blob, size),
+        BlobMatch::Yes
+    )
+}
+
+/// 一次内容核对的三态结论：`Unknown` 表示「这一下读不了/判不了」（权限、I/O、
+/// 判不了版本），不是「内容对不上」——调用方不能拿它当缺失。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobMatch {
+    Yes,
+    No,
+    Unknown,
+}
+
+pub(crate) fn same_blob_status(keys: &Keys, path: &Path, blob: &str, size: u64) -> BlobMatch {
     // 版本字段与摘要都取自同一个句柄：先 stat 路径、再按路径打开读取时，两次之间
     // 文件被原子替换会把「旧版本 + 新内容」配成一条缓存结论。
     let Some(mut file) = open_regular(path) else {
-        return false;
+        return BlobMatch::Unknown;
     };
     let Ok(meta) = file.metadata() else {
-        return false;
+        return BlobMatch::Unknown;
     };
     // 长度差太多的（路径上换成了一个更大的文件之类）不可能是这个对象：连读都不读，
     // 不能让一个超大文件拖住整份清单。
     if meta.len().abs_diff(size) > SIZE_SLACK {
-        return false;
+        return BlobMatch::No;
     }
     let limit = size.saturating_add(SIZE_SLACK);
     let Some(version) = version_with(Some(&file), &meta) else {
         // 判不了有没有变：直接读一遍，不记结论。
-        return hash_file_digest_of(&mut file, limit)
-            .is_some_and(|digest| keys.blob_id(&digest) == blob);
+        return match hash_file_digest_of(&mut file, limit) {
+            Some(digest) if keys.blob_id(&digest) == blob => BlobMatch::Yes,
+            Some(_) => BlobMatch::No,
+            None => BlobMatch::Unknown,
+        };
     };
     let key = path.to_string_lossy().into_owned();
     if let Some((digest, at)) = cached_digest(&key, &version) {
         if at.elapsed() < DIGEST_TRUST {
-            return keys.blob_id(&digest) == blob;
+            return if keys.blob_id(&digest) == blob {
+                BlobMatch::Yes
+            } else {
+                BlobMatch::No
+            };
         }
     }
-    read_digest(path, &mut file, &version, limit)
-        .is_some_and(|digest| keys.blob_id(&digest) == blob)
+    match read_digest(path, &mut file, &version, limit) {
+        Some(digest) if keys.blob_id(&digest) == blob => BlobMatch::Yes,
+        Some(_) => BlobMatch::No,
+        None => BlobMatch::Unknown,
+    }
 }
 
 /// 一条消息引用里这个对象的路径与长度（`path` 是消息里写的那一串；artifact 是文件名）

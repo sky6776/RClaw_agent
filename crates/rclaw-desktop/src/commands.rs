@@ -5650,7 +5650,16 @@ fn encode_preview(original: &[u8]) -> Result<Option<(Vec<u8>, &'static str)>, St
         .with_guessed_format()
         .map_err(|e| format!("识别图片格式失败: {e}"))?;
     reader.limits(limits);
-    let img = reader.decode().map_err(|e| format!("解码图片失败: {e}"))?;
+    let img = reader.decode().map_err(|e| {
+        // 宽高超过解码上限（Limits::max_image_width/height）不是文件坏了：按
+        // 「超过预览尺寸上限」报，界面不给无意义的重试。
+        let text = e.to_string();
+        if text.to_ascii_lowercase().contains("limit") {
+            "图片超过预览尺寸上限".to_string()
+        } else {
+            format!("解码图片失败: {e}")
+        }
+    })?;
     if img.width() <= MEDIA_PREVIEW_MAX_EDGE && img.height() <= MEDIA_PREVIEW_MAX_EDGE {
         return Ok(None);
     }
@@ -6222,7 +6231,7 @@ pub async fn save_media(
                 return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
             }
             rclaw_sync::AttachmentStage::Failed => {
-                return Err("保存失败: 暂存文件写不出来（磁盘空间或权限不足）".into())
+                return Err("保存失败: 暂存位置不可用（权限、I/O 或目录含链接/特殊文件）".into())
             }
             rclaw_sync::AttachmentStage::Unverifiable => {}
         }
@@ -6474,7 +6483,7 @@ pub async fn share_media(
                     return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
                 rclaw_sync::AttachmentStage::Failed => {
-                    return Err("转发失败: 暂存文件写不出来（磁盘空间或权限不足）".into())
+                    return Err("转发失败: 暂存位置不可用（权限、I/O 或目录含链接/特殊文件）".into())
                 }
                 // 核不了（没有登记/读不出密钥）：按老行为转发原路径。
                 rclaw_sync::AttachmentStage::Unverifiable => {}
@@ -6735,7 +6744,9 @@ pub async fn media_stream_url(
                     return Err("这份文件已经不是这条消息引用的那一份了（可能被就地改写过）".into())
                 }
                 rclaw_sync::AttachmentStage::Failed => {
-                    return Err("应用内播放失败: 暂存文件写不出来（磁盘空间或权限不足）".into())
+                    return Err(
+                        "应用内播放失败: 暂存位置不可用（权限、I/O 或目录含链接/特殊文件）".into(),
+                    )
                 }
                 rclaw_sync::AttachmentStage::Unverifiable => playback_unverifiable = true,
             }

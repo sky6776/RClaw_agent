@@ -1015,7 +1015,7 @@ pub async fn sync_open_attachment(
                         .into(),
                 ),
                 rclaw_sync::AttachmentStage::Failed => Err(
-                    "打开失败: 暂存文件写不出来（磁盘空间或权限不足）".into(),
+                    "打开失败: 暂存位置不可用（权限、I/O 或目录含链接/特殊文件）".into(),
                 ),
                 // 核不了：按老行为打开原路径（这次「打开成功」不代表核对通过）。
                 // 另存副本入口要求核对，核不了就不要打开。

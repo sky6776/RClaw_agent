@@ -155,6 +155,15 @@ export function setLoadedAttachmentMessages(chatId: string, ids: number[]) {
 /** 保存记录的版本：每次写入保存落点递增。探活/打开回来时凭它确认期间没有重新
  *  保存，否则会拿旧结果把刚写下的记录删掉。 */
 const savedKeyGen: Record<string, number> = {};
+/** 每张卡最近一次发起的操作（打开/保存）序号：异步回调回来时只有「最近一次
+ *  操作」的失败才写进卡片——先发起、后返回的旧操作不能盖住新错误。 */
+let opSeq = 0;
+const cardOpSeq: Record<string, number> = {};
+function beginOp(key: string): number {
+  opSeq += 1;
+  cardOpSeq[key] = opSeq;
+  return opSeq;
+}
 const savedDirOf = (rel: string) => {
   const cut = rel.lastIndexOf("/");
   return cut < 0 ? "" : rel.slice(0, cut);
@@ -467,6 +476,7 @@ function download(chatId: string, blob: string) {
 function save(chatId: string, item: SyncAttachment) {
   const key = fileKey(item);
   if (cards.saving[key]) return;
+  const op = beginOp(key);
   setCards((prev) => ({
     ...prev,
     saving: { ...prev.saving, [key]: true },
@@ -511,6 +521,8 @@ function save(chatId: string, item: SyncAttachment) {
     })
     .catch((e) => {
       if (chat !== chatId) return;
+      // 之后又发起了别的操作（比如点打开）：这条保存失败不写进卡片。
+      if (cardOpSeq[key] !== op) return;
       setCards((prev) => ({ ...prev, saveErrors: { ...prev.saveErrors, [key]: String(e) } }));
     })
     .finally(() => {
@@ -848,6 +860,7 @@ export function AttachmentCard({
   const open = (path: string) => {
     const key = fileKey(item);
     const genAt = savedKeyGen[key] ?? 0;
+    const op = beginOp(key);
     // 用户刚点了打开：这张卡上一次「存进工作区失败」的文案先收掉，失败时显示
     // 这次打开的原因（最近一次操作的错误）。
     setCards((prev) =>
@@ -871,6 +884,7 @@ export function AttachmentCard({
         if (chat !== chatId) return;
         if ((savedKeyGen[key] ?? 0) !== genAt) return;
         if (cards.saved[key] !== undefined && cards.saved[key] !== path) return;
+        if (cardOpSeq[key] !== op) return;
         clearAttachmentChanged({ path, blob: item.blob });
         // 上一次打开失败（严格核对暂时不可用、拉起程序失败）的文案要收掉；存进
         // 工作区失败是另一回事，不动它。
@@ -887,6 +901,8 @@ export function AttachmentCard({
         if ((savedKeyGen[key] ?? 0) !== genAt) return;
         // 这期间已经保存到别的落点：同上，别挂到新卡片上。
         if (cards.saved[key] !== undefined && cards.saved[key] !== path) return;
+        // 之后又发起了别的操作：这次失败是过期的，不写状态也不弹提示。
+        if (cardOpSeq[key] !== op) return;
         onError(`打开文件失败: ${String(e)}`);
         // 只有「落点上的文件已经不是这份内容了」（含被删掉）才收回「打开」；内容
         // 核对通过之后临时副本/拉起系统程序失败不算文件没了，记录要留着。
@@ -996,14 +1012,17 @@ export function AttachmentCard({
           <div className="mt-1 flex items-start justify-between gap-2">
             <div className={`min-w-0 flex-1 ${CARD_ERROR}`}>{error}</div>
             {/* 快照核对不过（内容被本机改写过）或其他取用失败：重新下载走缺附件的
-                路径，由持有正确内容的设备核对摘要后重传。 */}
-            <button
-              onClick={() => download(chatId, item.blob)}
-              disabled={inactive}
-              className={CARD_BTN}
-            >
-              重新下载
-            </button>
+                路径，由持有正确内容的设备核对摘要后重传。落点不支持原子发布是文件
+                系统能力问题，重下解决不了。 */}
+            {!publishUnsupported && (
+              <button
+                onClick={() => download(chatId, item.blob)}
+                disabled={inactive}
+                className={CARD_BTN}
+              >
+                重新下载
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -1147,7 +1166,10 @@ function SnapshotImage({
           }
           // 权限/IO 之类的临时失败：给个重试，别让卡片永远没有预览；超过上限
           // 是定论，重试没有意义。
-          setFailKind(String(e).includes("超过大小上限") ? "limit" : "retry");
+          const text = String(e);
+          setFailKind(
+            text.includes("超过大小上限") || text.includes("超过预览尺寸上限") ? "limit" : "retry",
+          );
         });
     };
     const el = box.current;
