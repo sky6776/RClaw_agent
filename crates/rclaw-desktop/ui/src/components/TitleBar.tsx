@@ -8,16 +8,18 @@ import {
 } from "react";
 import { api } from "../lib/api";
 import { PanelRightIcon } from "./icons";
-import { BellIcon } from "./NavIcons";
+import { BellIcon, GearIcon } from "./NavIcons";
 
 /** 标题栏右侧统一的图标按钮（主题切换 / 窗控三键）。 */
 function BarButton({
   title,
+  label,
   onClick,
   danger,
   children,
 }: {
   title: string;
+  label?: string;
   onClick: () => void;
   danger?: boolean;
   children: ReactNode;
@@ -25,6 +27,7 @@ function BarButton({
   return (
     <button
       title={title}
+      aria-label={label ?? title}
       onClick={onClick}
       className={`flex h-full w-11 items-center justify-center text-gray-400 transition hover:text-gray-200 ${
         danger ? "hover:bg-red-600 hover:text-white" : "hover:bg-[#1a1f29]"
@@ -56,12 +59,16 @@ export default function TitleBar({
   activityPulse,
   activityHint,
   onOpenActivity,
+  onOpenSettings,
+  syncPending,
   onToggleTaskPanel,
 }: {
   title: string;
   taskPanelOpen: boolean;
   activityCount: number;
   activityHint?: string;
+  onOpenSettings?: () => void;
+  syncPending?: number;
   activityPulse: boolean;
   onOpenActivity: () => void;
   onToggleTaskPanel: () => void;
@@ -142,6 +149,33 @@ export default function TitleBar({
             )}
           </span>
         </BarButton>
+        {onOpenSettings && (
+          <BarButton
+            title={
+              syncPending && syncPending > 0
+                ? `设置（Ctrl+,）；${syncPending} 件多端同步事项待处理`
+                : "设置（Ctrl+,）"
+            }
+            label={
+              syncPending && syncPending > 0
+                ? `设置，${syncPending} 件多端同步事项待处理`
+                : "设置"
+            }
+            onClick={onOpenSettings}
+          >
+            <span className="relative flex items-center">
+              <GearIcon />
+              {syncPending !== undefined && syncPending > 0 && (
+                <span
+                  aria-hidden="true"
+                  className="absolute -right-2 -top-1 min-w-3 rounded-full bg-amber-400 px-0.5 text-[9px] leading-3 text-black"
+                >
+                  {syncPending}
+                </span>
+              )}
+            </span>
+          </BarButton>
+        )}
         <BarButton title={taskPanelOpen ? "收起任务面板" : "展开任务面板"} onClick={onToggleTaskPanel}>
           <PanelRightIcon active={taskPanelOpen} />
         </BarButton>

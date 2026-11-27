@@ -3277,6 +3277,7 @@ ${event.payload.command}
             <TaskPanel
               agentReady
               activeChatId={activeId}
+              usage={mobileUsage}
               width={rightWidth}
               onOpenAgents={(id) => openActivity("agents", id)}
             />
@@ -3297,6 +3298,10 @@ ${event.payload.command}
           activityPulse={liveCounts.running > 0}
           activityHint={activityHint}
           onOpenActivity={() => openActivity("tasks")}
+          onOpenSettings={
+            status && !status.wizard_needed ? () => openSettings() : undefined
+          }
+          syncPending={syncPending}
           onToggleTaskPanel={toggleTaskPanel}
         />
       )}

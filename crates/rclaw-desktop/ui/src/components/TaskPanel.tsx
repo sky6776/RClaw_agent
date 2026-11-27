@@ -16,41 +16,23 @@ import ExecutionCard from "./ExecutionCard";
 export default function TaskPanel({
   agentReady,
   activeChatId,
+  usage,
   onOpenAgents,
   width,
 }: {
   agentReady: boolean;
   activeChatId: string;
+  /** App 统一的用量快照（左右两处共用，避免两次估算争用同一槽位）。 */
+  usage: UsageSnapshot | null;
   /** 打开 Agent 页；带 agentId 时直接进入该条执行的详情。 */
   onOpenAgents: (agentId?: string) => void;
   /** 面板宽度（px；App 侧拖拽手柄调整并持久化）。 */
   width: number;
 }) {
   const { executions, truncated } = useAgentExecutions(agentReady);
-  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
   const [clearing, setClearing] = useState(false);
   const counts = countByState(executions);
   const now = useNow(counts.active > 0);
-
-  // 上下文 / 内存轮询（估算要扫技能目录，频率放宽）。
-  useEffect(() => {
-    if (!agentReady) return;
-    let stopped = false;
-    const tick = async () => {
-      try {
-        const snapshot = await api.usageSnapshot(activeChatId);
-        if (!stopped) setUsage(snapshot);
-      } catch {
-        // agent 未启动等瞬时错误：保留上次快照。
-      }
-    };
-    void tick();
-    const timer = setInterval(tick, 5000);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [agentReady, activeChatId]);
 
   // 概览四格：succeeded / running+waiting+cancelling / queued / failed。
   const { total, done, running: active, queued, failed, finished: finishedCount } = counts;
@@ -181,7 +163,7 @@ export default function TaskPanel({
           </div>
           <div className="flex items-center justify-between text-gray-500">
             <span>内存占用</span>
-            <span className="font-mono">{rssMb > 0 ? `${rssMb.toFixed(1)} MB` : "—"}</span>
+            <span className="font-mono">{rssMb > 0 ? `${rssMb.toFixed(1)} MiB` : "—"}</span>
           </div>
         </div>
       </div>

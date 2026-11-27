@@ -378,18 +378,18 @@ export default function Sidebar({
           )}
         </button>
         <div className="flex-1" />
-        <button
-          onClick={onOpenSettings}
-          title="设置"
-          className="relative flex h-9 w-9 items-center justify-center rounded-lg text-gray-400 transition hover:bg-[#1a1f29] hover:text-gray-200"
-        >
-          <GearIcon />
-          {syncPending > 0 && (
-            <span className="absolute right-0.5 top-0.5 min-w-3 rounded-full bg-amber-500/90 px-0.5 text-[9px] leading-3 text-black">
-              {syncPending}
-            </span>
-          )}
-        </button>
+        <div className="w-full px-1 pb-1 text-center text-[10px] leading-4 text-gray-400">
+          <div title="上下文使用">
+            {usage && usage.context_length > 0
+              ? `${Math.round((usage.request_used / usage.context_length) * 100)}%`
+              : "—"}
+          </div>
+          <div title="内存占用">
+            {usage && usage.rss_bytes > 0
+              ? `${Math.round(usage.rss_bytes / (1024 * 1024))} MiB`
+              : "—"}
+          </div>
+        </div>
         <button
           onClick={onToggleCollapse}
           title="展开侧栏"
@@ -640,33 +640,47 @@ export default function Sidebar({
           </div>
         )}
       </div>
-      {compact && (
-        <div className="mx-3 mb-2 flex items-center justify-between rounded-xl border border-[#2a2f3a] bg-[#141821] px-3 py-2 text-[11px] text-gray-500">
-          <span className="flex items-center gap-1.5">
-            <span
-              className={`inline-block h-1.5 w-1.5 rounded-full ${
-                usage && usage.context_length > 0 && usage.request_used / usage.context_length > 0.8
-                  ? "bg-red-500"
-                  : "bg-indigo-500"
-              }`}
-            />
-            上下文
-            {usage && usage.context_length > 0
-              ? ` ${Math.round((usage.request_used / usage.context_length) * 100)}%`
-              : " —"}
-          </span>
-          {usage && (
-            <span className="tabular-nums">
-              {Math.round(usage.request_used / 1000)}K / {Math.round(usage.context_length / 1000)}K
+      {(
+        <div className="mx-3 mb-2 space-y-1 rounded-xl border border-[#2a2f3a] bg-[#141821] px-3 py-2 text-[11px] text-gray-400">
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
+              <span
+                className={`inline-block h-1.5 w-1.5 rounded-full ${
+                  usage && usage.context_length > 0 && usage.request_used / usage.context_length > 0.8
+                    ? "bg-red-500"
+                    : "bg-indigo-500"
+                }`}
+              />
+              上下文
+              {usage && usage.context_length > 0
+                ? ` ${Math.round((usage.request_used / usage.context_length) * 100)}%`
+                : " —"}
             </span>
-          )}
+            {usage && (
+              <span className="tabular-nums">
+                {Math.round(usage.request_used / 1000)}K / {Math.round(usage.context_length / 1000)}K
+              </span>
+            )}
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500/80" />
+              内存
+            </span>
+            <span className="tabular-nums">
+              {usage && usage.rss_bytes > 0
+                ? `${Math.round(usage.rss_bytes / (1024 * 1024))} MiB`
+                : " —"}
+            </span>
+          </div>
         </div>
       )}
-      {compact && homePath && (
-        <div className="mx-3 mb-2 truncate text-[10px] text-gray-600" title={homePath}>
+      {homePath && (
+        <div className="mx-3 mb-2 truncate text-[10px] text-gray-400" title={homePath}>
           {homePath}
         </div>
       )}
+      {compact && (
       <div className="border-t border-[#252b36] px-3 py-2">
         <button
           onClick={onOpenSettings}
@@ -686,6 +700,7 @@ export default function Sidebar({
           )}
         </button>
       </div>
+      )}
     </div>
   );
 }
