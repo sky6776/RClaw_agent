@@ -143,6 +143,21 @@ export default function ModelThinkingPicker({
     if (busy) setOpen(false);
   }, [busy]);
 
+  // 点击菜单/按钮之外的任何位置关闭（参考 ZCode）：菜单内部连点模型/档位不关闭，
+  // 方便连续调整；只有落到会话页面其它地方才收起。pointerdown 覆盖鼠标与触屏。
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const root = rootRef.current;
+      if (!root || !(event.target instanceof Node) || root.contains(event.target)) {
+        return;
+      }
+      setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [open]);
+
   if (!state.model.supported) return null;
 
   const currentModel =
@@ -162,8 +177,11 @@ export default function ModelThinkingPicker({
       <button
         type="button"
         onClick={() => {
-          if (!open) onOpen?.();
-          setOpen(!open);
+          // 打开后点按钮本身不再收起（与文档一致：外点 / 返回键 / busy 才关闭）。
+          if (!open) {
+            onOpen?.();
+            setOpen(true);
+          }
         }}
         disabled={busy || pending}
         title={`模型与思考强度：${fullModelLabel}${effortLabel ? ` · ${effortLabel}` : ""}`}
@@ -174,9 +192,6 @@ export default function ModelThinkingPicker({
           compact ? "max-w-[110px]" : "max-w-[260px]"
         }`}
       >
-        <span aria-hidden="true" className="text-[13px] leading-none">
-          🧠
-        </span>
         <span className="min-w-0 truncate">{displayModelLabel}</span>
         {effortLabel && (
           <span className="shrink-0 rounded bg-[#232937] px-1 py-0.5 text-[10px] leading-none text-gray-300">
@@ -259,14 +274,11 @@ export default function ModelThinkingPicker({
                     aria-checked={selected}
                     disabled={busy || pending}
                     onClick={async () => {
-                      if (selected) {
-                        setOpen(false);
-                        return;
-                      }
+                      if (selected) return;
                       setPending(true);
                       try {
+                        // 选择后菜单保持打开：用户可继续调档位，点页面其它地方关闭。
                         await onThinkingSelect(option.value, state);
-                        setOpen(false);
                       } finally {
                         setPending(false);
                       }

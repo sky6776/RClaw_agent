@@ -936,7 +936,7 @@ impl SlashRegistry {
                 && cfg.flavor == target_flavor
                 && same_origin(&cfg.base_url, profile.base_url)
         };
-        let target_provider = preferred
+        let mut target_provider = preferred
             .filter(|cfg| matches(cfg))
             .map(|cfg| cfg.name.clone())
             .or_else(|| {
@@ -947,12 +947,117 @@ impl SlashRegistry {
                 }
             })
             .unwrap_or_else(|| profile.provider.to_string());
-        let snapshot = std::fs::read_to_string(&self.config_path).map_err(|error| {
+        let mut snapshot = std::fs::read_to_string(&self.config_path).map_err(|error| {
             format!(
                 "读取 rclaw.toml 失败（{}）：{error}",
                 self.config_path.display()
             )
         })?;
+        // 旧的自定义条目名若已从配置里消失（用户改名但进程未重启），不要按旧名
+        // 复活一个空 key 条目：自动创建/复用只走 profile 的固定名。
+        if target_provider != profile.provider
+            && !rclaw_store::toml_file::provider_exists_in_text(&snapshot, &target_provider)
+                .map_err(|error| format!("检查 provider 配置失败：{error}"))?
+        {
+            target_provider = profile.provider.to_string();
+        }
+        // 选中的模型能力族在配置里没有对应 provider（典型：用户从未配过 DeepSeek）：
+        // 按 profile 自动补一个条目（端点/模型/能力参数齐全，api_key 留空），然后
+        // 提醒用户填 key。后续新增 provider 走同一条 profile 路径，无需再改这里。
+        let provider_known =
+            rclaw_store::toml_file::provider_exists_in_text(&snapshot, &target_provider)
+                .map_err(|error| format!("检查 provider 配置失败：{error}"))?;
+        if !provider_known {
+            let flavor = match profile_flavor(profile) {
+                ProviderFlavor::Zhipu => Some("zhipu"),
+                ProviderFlavor::DeepSeek => Some("deepseek"),
+                ProviderFlavor::Generic => None,
+            };
+            // CAS 冲突分支已经读到的最新文本直接作为后续 key 检查/构造的快照，
+            // 避免两次读取之间条目被删除时误报「还没有配置 api_key」。
+            let mut refreshed_snapshot: Option<String> = None;
+            let added = match rclaw_store::RclawToml::new(&self.config_path).ensure_provider_entry(
+                &rclaw_store::toml_file::NewProviderEntry {
+                    name: &target_provider,
+                    base_url: profile.base_url,
+                    model: profile.model,
+                    context_length: profile.context_length,
+                    max_tokens: profile.max_tokens,
+                    thinking: profile.thinking,
+                    reasoning_effort: profile.reasoning_effort,
+                    media_wire: profile.media_wire,
+                    reasoning_field: profile.reasoning_field,
+                    max_tokens_key: profile.max_tokens_key,
+                    flavor,
+                },
+            ) {
+                Ok(added) => added,
+                // 并发窗口：另一方先写入导致 CAS 冲突。按最新文件复查——同名条目
+                // 已出现就继续走正常流程；仍缺失则保留明确的冲突错误。
+                Err(error) if rclaw_store::toml_file::is_cas_conflict(&error) => {
+                    let latest =
+                        std::fs::read_to_string(&self.config_path).map_err(|read_error| {
+                            format!(
+                                "读取 rclaw.toml 失败（{}）：{read_error}",
+                                self.config_path.display()
+                            )
+                        })?;
+                    let exists =
+                        rclaw_store::toml_file::provider_exists_in_text(&latest, &target_provider)
+                            .map_err(|check_error| {
+                                format!("检查 provider 配置失败：{check_error}")
+                            })?;
+                    if !exists {
+                        return Err(format!(
+                            "自动添加 provider「{target_provider}」失败：{error}"
+                        ));
+                    }
+                    refreshed_snapshot = Some(latest);
+                    false
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "自动添加 provider「{target_provider}」失败：{error}"
+                    ))
+                }
+            };
+            if added {
+                return Err(format!(
+                    "已自动在 rclaw.toml 中添加 provider「{target_provider}」，\
+                     请在配置里填写它的 api_key 后重新选择该模型"
+                ));
+            }
+            // 同名条目刚被其它进程/其它窗口加上：以最新文本构造。
+            snapshot = match refreshed_snapshot {
+                Some(latest) => latest,
+                None => std::fs::read_to_string(&self.config_path).map_err(|error| {
+                    format!(
+                        "读取 rclaw.toml 失败（{}）：{error}",
+                        self.config_path.display()
+                    )
+                })?,
+            };
+            // helper 返回「同名已存在」与本次重读之间条目可能又被删除：在同一次
+            // 读取上区分「已删除」和「未填 key」，不要误报成 key 为空。
+            let exists_now =
+                rclaw_store::toml_file::provider_exists_in_text(&snapshot, &target_provider)
+                    .map_err(|error| format!("检查 provider 配置失败：{error}"))?;
+            if !exists_now {
+                return Err(format!(
+                    "provider「{target_provider}」在 rclaw.toml 中已不存在（配置可能刚被其它窗口修改），请重新选择该模型"
+                ));
+            }
+        }
+        // 条目存在但 key 为空（包括刚自动补的、或用户只填了端点）：继续提醒填 key，
+        // 而不是让构造期抛「缺少 api_key」的技术错误。
+        let key_present =
+            rclaw_store::toml_file::provider_has_api_key_in_text(&snapshot, &target_provider)
+                .map_err(|error| format!("检查 provider 配置失败：{error}"))?;
+        if !key_present {
+            return Err(format!(
+                "provider「{target_provider}」还没有配置 api_key，请在配置里填写后重新选择该模型"
+            ));
+        }
         let factory = self
             .provider_factory
             .as_ref()

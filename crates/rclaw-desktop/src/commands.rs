@@ -3091,10 +3091,10 @@ fn fill_effective_llm_model_default(
     else {
         return;
     };
-    let Some(model) = rclaw_store::config_doc::resolve_current_display(
-        user,
-        &format!("llm.providers.{provider}.model"),
-    ) else {
+    // provider 名作为独立值传入：名称里允许带点，拼进点分路径会读错条目。
+    let Some(model) =
+        rclaw_store::config_doc::resolve_provider_field_display(user, &provider, "model")
+    else {
         return;
     };
     for section in &mut doc.sections {
@@ -3122,7 +3122,7 @@ pub fn config_save_edits(home: &std::path::Path, edits: &[ConfigEdit]) -> Result
     // 是里层 toml 错误（如枚举键 `unknown variant …, expected …`），面板要能把它显示出来。
     let cfg = rclaw_cli::config::Config::parse_str(&preview)
         .map_err(|e| format!("保存被校验拒绝（未写入文件）: {e:#}"))?;
-    validate_provider_names(&preview, parsed.iter().map(|(p, _)| p.as_str()))?;
+    validate_provider_names(&cfg, parsed.iter().map(|(p, _)| p.as_str()))?;
     // 与 provider 相关的面板改动也必须能真正启动（非法自定义鉴权头等），
     // 否则会保存成功、重启才失败。
     if parsed
@@ -3163,7 +3163,7 @@ fn toml_error_summary(error: &toml_edit::TomlError) -> String {
 /// 同样可能断开引用）时，对预览文本做全量名字一致性校验（不追咎既有配置的历史
 /// 问题；`review_provider` 空串 = 未配置，放行）。
 fn validate_provider_names<'a>(
-    preview: &str,
+    cfg: &rclaw_cli::config::Config,
     edited_paths: impl Iterator<Item = &'a str>,
 ) -> Result<(), String> {
     let edited: std::collections::HashSet<&str> = edited_paths.collect();
@@ -3174,42 +3174,32 @@ fn validate_provider_names<'a>(
     {
         return Ok(());
     }
-    let doc: toml_edit::DocumentMut = preview
-        .parse()
-        .map_err(|e| format!("预览解析失败: {}", toml_error_summary(&e)))?;
-    let names: Vec<&str> = doc
-        .get("llm")
-        .and_then(|llm| llm.get("providers"))
-        .and_then(|p| p.as_array_of_tables())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let llm_table = doc.get("llm").and_then(|llm| llm.as_table());
-    // 主 provider 缺失/空白时启动语义是默认 DeepSeek：引用检查必须按同一有效值，
-    // 否则「省略主引用」的配置会绕过目标存在性检查。
-    let main = llm_table
-        .and_then(|t| t.get("provider"))
-        .and_then(|i| i.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(rclaw_cli::config::DEFAULT_PROVIDER_NAME);
-    if !names.is_empty() && !names.iter().any(|name| name.trim() == main) {
+    // 名称与有效引用直接取解析后的 Config：与启动校验同一套规则，也天然覆盖
+    // `providers = [{…}]` 内联数组/`llm = {…}` 内联表（模板扫描只能看到数组表）。
+    let names: Vec<&str> = cfg
+        .llm
+        .providers
+        .iter()
+        .map(|provider| provider.name.trim())
+        .collect();
+    // 空列表由启动收尾注入默认 DeepSeek；引用规则已由
+    // `Config::validate_effective_provider` 校验。这里再用空名单比对会把合法的
+    // 默认引用误报成「不存在」，交给后续的构造预检报真正原因（缺条目/缺凭据）。
+    if names.is_empty() {
+        return Ok(());
+    }
+    // `parse_str` 不会把显式空白的主 provider 归一（只做校验），必须与启动/构造
+    // 同一口径取有效值：空白 → 默认 DeepSeek。
+    let main = cfg.effective_provider_name();
+    if !names.contains(&main) {
         return Err(format!(
-            "保存被拒绝（未写入文件）：llm.provider 有效值为 \"{main}\"，不在 [[llm.providers]] 的 name 列表（{names:?}）里，保存后 agent 将无法启动"
+            "保存被拒绝（未写入文件）：llm.provider 有效值为 \"{main}\"，不在 llm.providers 的 name 列表（{names:?}）里，保存后 agent 将无法启动"
         ));
     }
-    if let Some(value) = llm_table
-        .and_then(|t| t.get("review_provider"))
-        .and_then(|i| i.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if !names.iter().any(|name| name.trim() == value) {
+    if let Some(value) = cfg.effective_review_provider() {
+        if !names.contains(&value) {
             return Err(format!(
-                "保存被拒绝（未写入文件）：llm.review_provider = \"{value}\" 不在 [[llm.providers]] 的 name 列表（{names:?}）里，保存后 agent 将无法启动"
+                "保存被拒绝（未写入文件）：llm.review_provider = \"{value}\" 不在 llm.providers 的 name 列表（{names:?}）里，保存后 agent 将无法启动"
             ));
         }
     }
@@ -3316,7 +3306,7 @@ pub fn config_import_raw_for(home: &std::path::Path, content: &str) -> Result<()
     // 与启动同一路径：主 provider 和评审 provider 都必须能真正构造出来
     // （端点、鉴权头、模型/档位、api_key），避免导入成功、重启失败。
     validate_providers_startable(&parsed, "导入被校验拒绝（未写入文件）")?;
-    validate_provider_names(content, ["llm.provider", "llm.review_provider"].into_iter())?;
+    validate_provider_names(&parsed, ["llm.provider", "llm.review_provider"].into_iter())?;
     rclaw_store::RclawToml::new(home.join("rclaw.toml")).write_text(content)
 }
 
@@ -5281,6 +5271,80 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
         assert!(text.contains("name = \"renamed\""));
         assert!(text.contains("provider = \"renamed\""));
+    }
+
+    /// 内联写法（`providers = [{…}]`）是合法配置：引用校验与导入都必须按
+    /// 解析后的 Config 取名字，不能因为模板扫描只认数组表而误拒。
+    fn inline_provider_config() -> &'static str {
+        "# 内联写法\n[agent]\nbase_dir = \"agent\"\n\n[llm]\nprovider = \"zhipu\"\nreview_provider = \"deepseek\"\nproviders = [\n  { name = \"zhipu\", base_url = \"https://open.bigmodel.cn/api/paas/v4\", model = \"glm-5.3\", api_key = \"sk-live\" },\n  { name = \"deepseek\", base_url = \"https://api.deepseek.com/v1\", model = \"deepseek-flash\", api_key = \"sk-ds\" },\n]\n"
+    }
+
+    #[test]
+    fn config_save_and_import_accept_inline_provider_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rclaw.toml"), inline_provider_config()).unwrap();
+        let edits = vec![
+            super::ConfigEdit {
+                path: "llm.review_provider".into(),
+                kind: "str".into(),
+                value: "zhipu".into(),
+            },
+            super::ConfigEdit {
+                path: "llm.providers.zhipu.api_key".into(),
+                kind: "str".into(),
+                value: "sk-updated".into(),
+            },
+        ];
+        super::config_save_edits(dir.path(), &edits).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
+        assert!(text.contains("providers = ["), "保持内联形态: {text}");
+        assert!(text.contains("api_key = \"sk-updated\""), "{text}");
+        assert!(text.contains("review_provider = \"zhipu\""), "{text}");
+
+        // 整份导入同样按 Config 校验引用。
+        let dir2 = tempfile::tempdir().unwrap();
+        super::config_import_raw_for(dir2.path(), inline_provider_config()).unwrap();
+        let imported = std::fs::read_to_string(dir2.path().join("rclaw.toml")).unwrap();
+        assert_eq!(imported, inline_provider_config());
+    }
+
+    #[test]
+    fn config_save_accepts_blank_main_provider_with_default_deepseek() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rclaw.toml"),
+            "[agent]\nbase_dir = \"agent\"\n\n[llm]\nprovider = \"   \"\n\n[[llm.providers]]\nname = \"deepseek\"\nbase_url = \"https://api.deepseek.com/v1\"\nmodel = \"deepseek-flash\"\napi_key = \"sk-ds\"\n",
+        )
+        .unwrap();
+        // 空白主 provider 按启动语义 = 默认 DeepSeek；只改评审引用必须能保存。
+        let edits = vec![super::ConfigEdit {
+            path: "llm.review_provider".into(),
+            kind: "str".into(),
+            value: "deepseek".into(),
+        }];
+        super::config_save_edits(dir.path(), &edits).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
+        assert!(text.contains("review_provider = \"deepseek\""), "{text}");
+    }
+
+    #[test]
+    fn config_save_empty_provider_list_reports_startup_error_not_name_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rclaw.toml"),
+            "[agent]\nbase_dir = \"agent\"\n\n[llm]\nprovider = \"deepseek\"\nreview_provider = \"deepseek\"\n",
+        )
+        .unwrap();
+        let edits = vec![super::ConfigEdit {
+            path: "llm.review_provider".into(),
+            kind: "str".into(),
+            value: "deepseek".into(),
+        }];
+        let err = super::config_save_edits(dir.path(), &edits).unwrap_err();
+        // 空名单的默认引用不是「名字不存在」，真正的失败原因是主 provider 无法构造
+        // （缺少条目/凭据）——与整份导入同一诊断。
+        assert!(!err.contains("name 列表"), "{err}");
+        assert!(err.contains("主 provider 无法启动"), "{err}");
     }
 }
 

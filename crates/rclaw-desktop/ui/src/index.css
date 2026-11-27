@@ -297,6 +297,11 @@ html.theme-light #root {
 .theme-light .bg-\[\#1a2030\] {
   background-color: #e4e8fb;
 }
+/* 思考强度徽标底与上下文环轨道（共用 #232937）：浅色主题下必须换浅灰，
+   否则深底 + 深字（gray-300 已反转为 #374151）几乎不可读。 */
+.theme-light .bg-\[\#232937\] {
+  background-color: #e5e7eb;
+}
 /* 全屏工作层（工作区文档编辑器 / 拍照编辑页）随主题：dark 保持原深底，
    浅色系换纸白——此前这两个字面量没有浅色覆盖，浅色主题下编辑器整页深底。 */
 .theme-light .bg-\[\#0f1117\],

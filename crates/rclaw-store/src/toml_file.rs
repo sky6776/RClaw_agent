@@ -134,6 +134,75 @@ impl RclawToml {
         self.save_expecting(&doc, Some(&baseline))
     }
 
+    /// 目标 provider 在配置里缺失时追加一个 `[[llm.providers]]` 条目（模型选择器
+    /// 自动补端点/能力参数，`api_key` 留空等用户填写）。
+    ///
+    /// 同时支持两种合法表达（serde 反序列化一视同仁）：数组表
+    /// `[[llm.providers]]` 与内联数组 `providers = [{ ... }]`；追加沿用原表达，
+    /// 不改写既有条目/凭据，也不动数组现有的注释装饰。
+    ///
+    /// 返回 `Ok(true)` = 本次真的写入了新条目；`Ok(false)` = 同名条目已存在（并发
+    /// 窗口里刚被别的写入者加上），未改文件。写入走 `save_expecting`（跨进程锁 +
+    /// CAS），与配置面板/导入/模型切换共享同一套「比较后原子写」协议。
+    pub fn ensure_provider_entry(&self, entry: &NewProviderEntry<'_>) -> Result<bool, String> {
+        let context_length = i64::try_from(entry.context_length)
+            .map_err(|_| "context_length 超出 TOML 整数范围".to_string())?;
+        let max_tokens = i64::from(entry.max_tokens);
+        let (baseline, mut doc) = self.load_with_text()?;
+        if provider_name_in_doc(&doc, entry.name) {
+            return Ok(false);
+        }
+        if doc.get("llm").is_none() {
+            doc.insert("llm", toml_edit::Item::Table(explicit_table()));
+        }
+        match doc.get_mut("llm") {
+            Some(toml_edit::Item::Table(llm)) => {
+                if !llm.contains_key("providers") {
+                    llm.insert(
+                        "providers",
+                        toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+                    );
+                }
+                match llm.get_mut("providers") {
+                    Some(toml_edit::Item::ArrayOfTables(providers)) => {
+                        providers.push(new_provider_table(entry, context_length, max_tokens));
+                    }
+                    Some(toml_edit::Item::Value(toml_edit::Value::Array(providers))) => {
+                        push_inline_provider(providers, entry, context_length, max_tokens)?;
+                    }
+                    Some(_) => {
+                        return Err(
+                            "llm.providers 不是数组表/内联数组，无法添加 provider".to_string()
+                        )
+                    }
+                    None => {
+                        return Err(
+                            "llm.providers 不是数组表/内联数组，无法添加 provider".to_string()
+                        )
+                    }
+                }
+            }
+            Some(toml_edit::Item::Value(value)) if value.as_inline_table().is_some() => {
+                let llm = value.as_inline_table_mut().expect("已确认是内联表");
+                if llm.get("providers").is_none() {
+                    llm.insert(
+                        "providers",
+                        toml_edit::Value::Array(toml_edit::Array::new()),
+                    );
+                }
+                match llm.get_mut("providers") {
+                    Some(toml_edit::Value::Array(providers)) => {
+                        push_inline_provider(providers, entry, context_length, max_tokens)?;
+                    }
+                    _ => return Err("llm.providers 不是内联数组，无法添加 provider".to_string()),
+                }
+            }
+            _ => return Err("[llm] 不是表/内联表，无法添加 provider".to_string()),
+        }
+        self.save_expecting(&doc, Some(&baseline))?;
+        Ok(true)
+    }
+
     /// 模型选择器的一次性整组参数写回。
     ///
     /// - 写入目标 provider 条目的 model / base_url / context_length / max_tokens /
@@ -499,6 +568,200 @@ pub struct ProviderParamUpdate<'a> {
     pub max_tokens_key: &'a str,
 }
 
+/// 模型选择器发现目标 provider 缺失时要新增的 `[[llm.providers]]` 条目。
+///
+/// `api_key` 不在这里给值：自动补的是端点/模型/能力参数，凭据必须由用户手填。
+pub struct NewProviderEntry<'a> {
+    pub name: &'a str,
+    pub base_url: &'a str,
+    pub model: &'a str,
+    pub context_length: usize,
+    pub max_tokens: u32,
+    pub thinking: &'a str,
+    pub reasoning_effort: &'a str,
+    pub media_wire: &'a str,
+    pub reasoning_field: &'a str,
+    pub max_tokens_key: &'a str,
+    /// 能力族（`zhipu` / `deepseek`）；`None` 表示按 base_url 自动判定。
+    pub flavor: Option<&'a str>,
+}
+
+/// 文本里是否已定义同名 provider 条目（不做任何写入）。
+pub fn provider_exists_in_text(text: &str, provider_name: &str) -> Result<bool, String> {
+    let doc = parse_doc(text)?;
+    Ok(provider_name_in_doc(&doc, provider_name))
+}
+
+/// 同名条目是否已有非空 `api_key`（只返回布尔值，不把凭据带出配置层）。
+///
+/// 条目缺失也算 `false`：调用方应先补条目，再提示用户填 key。
+pub fn provider_has_api_key_in_text(text: &str, provider_name: &str) -> Result<bool, String> {
+    let doc = parse_doc(text)?;
+    Ok(provider_api_key_present_in_doc(&doc, provider_name))
+}
+
+fn parse_doc(text: &str) -> Result<toml_edit::DocumentMut, String> {
+    text.parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("rclaw.toml 解析失败: {}", toml_parse_summary(&error)))
+}
+
+/// `llm.providers` 的两种合法表达（与 `Config` 反序列化的 `Vec<ProviderEntry>`
+/// 一致）：数组表 `[[llm.providers]]` 或内联数组 `providers = [{ ... }]`。
+enum ProvidersRef<'a> {
+    Tables(&'a toml_edit::ArrayOfTables),
+    Inline(&'a toml_edit::Array),
+}
+
+fn providers_ref(doc: &toml_edit::DocumentMut) -> Option<ProvidersRef<'_>> {
+    let providers = match doc.get("llm")? {
+        toml_edit::Item::Table(llm) => llm.get("providers")?,
+        toml_edit::Item::Value(llm) => {
+            // 内联表 `llm = { providers = [...] }`：值只能是内联数组。
+            return match llm.as_inline_table()?.get("providers")? {
+                toml_edit::Value::Array(array) => Some(ProvidersRef::Inline(array)),
+                _ => None,
+            };
+        }
+        _ => return None,
+    };
+    match providers {
+        toml_edit::Item::ArrayOfTables(tables) => Some(ProvidersRef::Tables(tables)),
+        toml_edit::Item::Value(toml_edit::Value::Array(array)) => Some(ProvidersRef::Inline(array)),
+        _ => None,
+    }
+}
+
+fn name_matches(value: Option<&str>, provider_name: &str) -> bool {
+    value
+        .map(|name| name.trim() == provider_name.trim())
+        .unwrap_or(false)
+}
+
+fn provider_name_in_doc(doc: &toml_edit::DocumentMut, provider_name: &str) -> bool {
+    match providers_ref(doc) {
+        Some(ProvidersRef::Tables(tables)) => tables.iter().any(|table| {
+            name_matches(
+                table.get("name").and_then(|name| name.as_str()),
+                provider_name,
+            )
+        }),
+        Some(ProvidersRef::Inline(array)) => array.iter().any(|value| {
+            value
+                .as_inline_table()
+                .map(|table| {
+                    name_matches(
+                        table.get("name").and_then(|name| name.as_str()),
+                        provider_name,
+                    )
+                })
+                .unwrap_or(false)
+        }),
+        None => false,
+    }
+}
+
+fn provider_api_key_present_in_doc(doc: &toml_edit::DocumentMut, provider_name: &str) -> bool {
+    match providers_ref(doc) {
+        Some(ProvidersRef::Tables(tables)) => tables
+            .iter()
+            .find(|table| {
+                name_matches(
+                    table.get("name").and_then(|name| name.as_str()),
+                    provider_name,
+                )
+            })
+            .and_then(|table| table.get("api_key"))
+            .and_then(|value| value.as_str())
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false),
+        Some(ProvidersRef::Inline(array)) => array
+            .iter()
+            .filter_map(|value| value.as_inline_table())
+            .find(|table| {
+                name_matches(
+                    table.get("name").and_then(|name| name.as_str()),
+                    provider_name,
+                )
+            })
+            .and_then(|table| table.get("api_key"))
+            .and_then(|value| value.as_str())
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// 新增条目要写入的字段（数组表与内联表共用，避免两处字段漂移）。
+fn provider_field_values(
+    entry: &NewProviderEntry<'_>,
+    context_length: i64,
+    max_tokens: i64,
+) -> Vec<(&'static str, toml_edit::Value)> {
+    let mut fields = vec![
+        ("name", toml_edit::Value::from(entry.name)),
+        ("base_url", toml_edit::Value::from(entry.base_url)),
+        ("model", toml_edit::Value::from(entry.model)),
+        // 空 api_key 让构造期明确报「缺少 api_key」，而不是用别人的凭据发请求。
+        ("api_key", toml_edit::Value::from("")),
+        ("context_length", toml_edit::Value::from(context_length)),
+        ("max_tokens", toml_edit::Value::from(max_tokens)),
+        ("thinking", toml_edit::Value::from(entry.thinking)),
+        (
+            "reasoning_effort",
+            toml_edit::Value::from(entry.reasoning_effort),
+        ),
+        ("media_wire", toml_edit::Value::from(entry.media_wire)),
+        (
+            "reasoning_field",
+            toml_edit::Value::from(entry.reasoning_field),
+        ),
+        (
+            "max_tokens_key",
+            toml_edit::Value::from(entry.max_tokens_key),
+        ),
+    ];
+    if let Some(flavor) = entry.flavor {
+        fields.push(("flavor", toml_edit::Value::from(flavor)));
+    }
+    fields
+}
+
+fn new_provider_table(
+    entry: &NewProviderEntry<'_>,
+    context_length: i64,
+    max_tokens: i64,
+) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    for (key, value) in provider_field_values(entry, context_length, max_tokens) {
+        table.insert(key, toml_edit::Item::Value(value));
+    }
+    // 固定文案：条目名来自配置，可能含换行/控制字符，不拼进原始装饰。
+    table
+        .decor_mut()
+        .set_prefix("# 由模型选择器自动添加：请先填写 api_key，再重新选择该模型\n");
+    table
+}
+
+fn push_inline_provider(
+    providers: &mut toml_edit::Array,
+    entry: &NewProviderEntry<'_>,
+    context_length: i64,
+    max_tokens: i64,
+) -> Result<(), String> {
+    if providers
+        .iter()
+        .any(|value| value.as_inline_table().is_none())
+    {
+        return Err("llm.providers 内联数组包含非内联表值，无法添加 provider".to_string());
+    }
+    let mut table = toml_edit::InlineTable::new();
+    for (key, value) in provider_field_values(entry, context_length, max_tokens) {
+        table.insert(key, value);
+    }
+    providers.push(toml_edit::Value::InlineTable(table));
+    Ok(())
+}
+
 /// 读取 `[llm] model` 全局覆盖（trim 后非空才算存在）。
 fn llm_global_model_override(doc: &toml_edit::DocumentMut) -> Option<String> {
     doc.get("llm")
@@ -544,8 +807,10 @@ pub enum EditValue {
 }
 
 /// 应用一条点路径赋值（如 `web_search.tavily.timeout_secs`、`llm.providers.zhipu.model`）。
-/// 路径末段是键名；下钻中遇到数组表时，下一段按条目的 `name` 字段匹配；
-/// 缺失的中间表会创建（显式表头，注释与既有键序保真）。
+/// 路径末段是键名；下钻同时支持常规表/数组表与内联表/内联数组（`llm = { ... }`、
+/// `providers = [{ ... }]` 都是合法且可加载的写法，设置页必须能填其中的 key）；
+/// 数组段下一段按条目的 `name` 字段匹配；缺失的中间表会创建（显式表头，注释与
+/// 既有键序保真）。
 fn apply_dotted(
     doc: &mut toml_edit::DocumentMut,
     path: &str,
@@ -555,46 +820,119 @@ fn apply_dotted(
     let Some(key) = segments.pop() else {
         return Err(format!("配置路径为空: {path}"));
     };
-    if segments.is_empty() || key.is_empty() {
+    // 与读路径一致：空段（`a..b`）不是合法寻址，不能把它当成某个空名条目。
+    if segments.is_empty() || key.is_empty() || segments.iter().any(|seg| seg.is_empty()) {
         return Err(format!("配置路径至少要包含段名与键名: {path}"));
     }
-    let table = descend_table(doc.as_table_mut(), &segments)?;
-    set_table_item_preserving_decor(table, key, edit_value_to_item(value));
+    match descend_edit_container(doc, &segments)? {
+        EditContainer::Table(table) => {
+            set_table_item_preserving_decor(table, key, edit_value_to_item(value));
+        }
+        EditContainer::Inline(table) => {
+            table.insert(key, edit_value_to_value(value));
+        }
+    }
     Ok(())
 }
 
-/// 沿段名下行到目标表；数组表段（`[[llm.providers]]`）按 `name=` 匹配条目。
-/// 对 `item` 做 match 分臂消费 + 尾递归（NLL 借用规则不允许跨分支持有衍生可变借用）。
-fn descend_table<'a>(
-    table: &'a mut toml_edit::Table,
+/// 下钻终点的两种容器：常规表（含数组表条目）或内联表（含内联数组条目）。
+enum EditContainer<'a> {
+    Table(&'a mut toml_edit::Table),
+    Inline(&'a mut toml_edit::InlineTable),
+}
+
+/// 沿段名下行到目标容器；数组段（数组表或内联数组）的下一段按条目 `name=` 匹配。
+/// 缺失的中间表自动创建，与旧实现保持一致。
+fn descend_edit_container<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
     segments: &[&str],
-) -> Result<&'a mut toml_edit::Table, String> {
-    let Some(seg) = segments.first().copied() else {
-        return Ok(table);
-    };
-    let rest = &segments[1..];
-    let item = table
-        .entry(seg)
-        .or_insert_with(|| toml_edit::Item::Table(explicit_table()));
-    if item.is_none() {
-        *item = toml_edit::Item::Table(explicit_table());
-    }
-    match item {
-        toml_edit::Item::ArrayOfTables(arr) => {
-            let name = rest
-                .first()
-                .copied()
-                .ok_or_else(|| format!("路径在数组段 [{seg}] 后缺少按 name 匹配的条目名"))?;
-            let entry = arr
-                .iter_mut()
-                .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
-                .ok_or_else(|| format!("[{seg}] 数组中未找到 name=\"{name}\" 的条目"))?;
-            descend_table(entry, &rest[1..])
+) -> Result<EditContainer<'a>, String> {
+    let mut container = EditContainer::Table(doc.as_table_mut());
+    let mut index = 0;
+    while index < segments.len() {
+        let seg = segments[index];
+        match container {
+            EditContainer::Table(table) => {
+                if !table.contains_key(seg) {
+                    table.insert(seg, toml_edit::Item::Table(explicit_table()));
+                }
+                let item = table
+                    .get_mut(seg)
+                    .ok_or_else(|| format!("配置缺少段 [{seg}]"))?;
+                match item {
+                    toml_edit::Item::Table(sub) => {
+                        container = EditContainer::Table(sub);
+                        index += 1;
+                    }
+                    toml_edit::Item::ArrayOfTables(entries) => {
+                        let name = *segments.get(index + 1).ok_or_else(|| {
+                            format!("路径在数组段 [{seg}] 后缺少按 name 匹配的条目名")
+                        })?;
+                        let sub = entries
+                            .iter_mut()
+                            .find(|entry| {
+                                entry
+                                    .get("name")
+                                    .and_then(|name| name.as_str())
+                                    .map(|value| value.trim() == name.trim())
+                                    .unwrap_or(false)
+                            })
+                            .ok_or_else(|| {
+                                format!("[{seg}] 数组中未找到 name=\"{name}\" 的条目")
+                            })?;
+                        container = EditContainer::Table(sub);
+                        index += 2;
+                    }
+                    toml_edit::Item::Value(value) => {
+                        container = edit_container_from_value(value, seg, segments, &mut index)?
+                    }
+                    toml_edit::Item::None => {
+                        return Err(format!("段 [{seg}] 已是非表值，无法继续下钻"))
+                    }
+                }
+            }
+            EditContainer::Inline(table) => {
+                let value = table
+                    .get_mut(seg)
+                    .ok_or_else(|| format!("配置缺少键 {seg}"))?;
+                container = edit_container_from_value(value, seg, segments, &mut index)?;
+            }
         }
-        other => match other.as_table_mut() {
-            Some(sub) => descend_table(sub, rest),
-            None => Err(format!("段 [{seg}] 已是非表值，无法继续下钻")),
-        },
+    }
+    Ok(container)
+}
+
+/// 从内联表/内联数组值继续下钻；`index` 会推进到下一段（数组多消费一个 name）。
+fn edit_container_from_value<'a>(
+    value: &'a mut toml_edit::Value,
+    seg: &str,
+    segments: &[&str],
+    index: &mut usize,
+) -> Result<EditContainer<'a>, String> {
+    match value {
+        toml_edit::Value::InlineTable(table) => {
+            *index += 1;
+            Ok(EditContainer::Inline(table))
+        }
+        toml_edit::Value::Array(entries) => {
+            let name = *segments
+                .get(*index + 1)
+                .ok_or_else(|| format!("路径在数组段 [{seg}] 后缺少按 name 匹配的条目名"))?;
+            let entry = entries
+                .iter_mut()
+                .filter_map(|value| value.as_inline_table_mut())
+                .find(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .map(|value| value.trim() == name.trim())
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| format!("[{seg}] 数组中未找到 name=\"{name}\" 的条目"))?;
+            *index += 2;
+            Ok(EditContainer::Inline(entry))
+        }
+        _ => Err(format!("段 [{seg}] 已是非表值，无法继续下钻")),
     }
 }
 
@@ -604,19 +942,23 @@ fn explicit_table() -> toml_edit::Table {
     t
 }
 
-fn edit_value_to_item(value: &EditValue) -> toml_edit::Item {
+fn edit_value_to_value(value: &EditValue) -> toml_edit::Value {
     match value {
-        EditValue::Bool(b) => toml_edit::value(*b),
-        EditValue::Int(i) => toml_edit::value(*i),
-        EditValue::Float(f) => toml_edit::value(*f),
-        EditValue::Str(s) => toml_edit::value(s.as_str()),
-        EditValue::StrArray(items) => toml_edit::value(
+        EditValue::Bool(b) => toml_edit::Value::from(*b),
+        EditValue::Int(i) => toml_edit::Value::from(*i),
+        EditValue::Float(f) => toml_edit::Value::from(*f),
+        EditValue::Str(s) => toml_edit::Value::from(s.as_str()),
+        EditValue::StrArray(items) => toml_edit::Value::Array(
             items
                 .iter()
                 .map(|s| toml_edit::Value::from(s.as_str()))
                 .collect::<toml_edit::Array>(),
         ),
     }
+}
+
+fn edit_value_to_item(value: &EditValue) -> toml_edit::Item {
+    toml_edit::Item::Value(edit_value_to_value(value))
 }
 
 /// 覆盖已有值时同时保留 table key 的原始格式，以及 value 上承载的空白/行内注释。
@@ -708,6 +1050,154 @@ mod tests {
             "[[llm.providers]]\nname = \"deepseek\"\nmodel = \"old\"\n",
         );
         assert!(toml.set_provider_fields("zhipu", "m", "u", 0).is_err());
+    }
+
+    #[test]
+    fn ensure_provider_entry_appends_missing_provider_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = write_config(
+            dir.path(),
+            "# 顶部注释\n[llm]\nprovider = \"zhipu\"\n\n[[llm.providers]]\nname = \"zhipu\"\nmodel = \"glm-5.3\"\nbase_url = \"https://open.bigmodel.cn/api/coding/paas/v4\"\napi_key = \"secret\"\n",
+        );
+        let entry = NewProviderEntry {
+            name: "deepseek",
+            base_url: "https://api.deepseek.com/v1",
+            model: "deepseek-flash",
+            context_length: 1_048_576,
+            max_tokens: 384_000,
+            thinking: "enabled",
+            reasoning_effort: "max",
+            media_wire: "deepseek",
+            reasoning_field: "reasoning_content",
+            max_tokens_key: "max_tokens",
+            flavor: Some("deepseek"),
+        };
+        assert!(toml.ensure_provider_entry(&entry).unwrap());
+        let text = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
+        assert!(text.contains("# 顶部注释"), "注释必须保真");
+        assert!(text.contains("name = \"deepseek\""));
+        assert!(text.contains("api_key = \"\""), "自动补的条目 key 必须留空");
+        assert!(text.contains("context_length = 1048576"));
+        assert!(text.contains("max_tokens = 384000"));
+        assert!(text.contains("flavor = \"deepseek\""));
+        assert!(text.contains("请先填写 api_key"));
+        assert!(provider_exists_in_text(&text, "deepseek").unwrap());
+        assert!(!provider_has_api_key_in_text(&text, "deepseek").unwrap());
+        assert!(provider_has_api_key_in_text(&text, "zhipu").unwrap());
+
+        // 幂等：同名条目已存在时不重复追加，也不改文件。
+        assert!(!toml.ensure_provider_entry(&entry).unwrap());
+        let again = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
+        assert_eq!(again.matches("name = \"deepseek\"").count(), 1);
+    }
+
+    #[test]
+    fn ensure_provider_entry_creates_llm_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = write_config(dir.path(), "# 空配置\n");
+        let entry = NewProviderEntry {
+            name: "deepseek",
+            base_url: "https://api.deepseek.com/v1",
+            model: "deepseek-flash",
+            context_length: 1_048_576,
+            max_tokens: 384_000,
+            thinking: "enabled",
+            reasoning_effort: "max",
+            media_wire: "deepseek",
+            reasoning_field: "reasoning_content",
+            max_tokens_key: "max_tokens",
+            flavor: None,
+        };
+        assert!(toml.ensure_provider_entry(&entry).unwrap());
+        let text = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
+        assert!(text.contains("# 空配置"));
+        assert!(text.contains("[[llm.providers]]"), "{text}");
+        assert!(text.contains("name = \"deepseek\""), "{text}");
+        assert!(!text.contains("flavor ="), "{text}");
+    }
+
+    #[test]
+    fn ensure_provider_entry_appends_to_inline_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = write_config(dir.path(), "[llm]\nproviders = []\n");
+        let entry = NewProviderEntry {
+            name: "deepseek",
+            base_url: "https://api.deepseek.com/v1",
+            model: "deepseek-flash",
+            context_length: 1_048_576,
+            max_tokens: 384_000,
+            thinking: "enabled",
+            reasoning_effort: "max",
+            media_wire: "deepseek",
+            reasoning_field: "reasoning_content",
+            max_tokens_key: "max_tokens",
+            flavor: Some("deepseek"),
+        };
+        assert!(toml.ensure_provider_entry(&entry).unwrap());
+        let text = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
+        // 沿用内联数组表达，不改写成数组表（避免丢装饰/语法形态）。
+        assert!(text.contains("providers = ["), "{text}");
+        assert!(text.contains("name = \"deepseek\""), "{text}");
+        assert!(!text.contains("[[llm.providers]]"), "{text}");
+        assert!(provider_exists_in_text(&text, "deepseek").unwrap());
+    }
+
+    #[test]
+    fn ensure_provider_entry_keeps_inline_array_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = write_config(
+            dir.path(),
+            "[llm]\nproviders = [\n  # 手写注释：以后加代理条目\n]\n",
+        );
+        let entry = NewProviderEntry {
+            name: "deepseek",
+            base_url: "https://api.deepseek.com/v1",
+            model: "deepseek-flash",
+            context_length: 1_048_576,
+            max_tokens: 384_000,
+            thinking: "enabled",
+            reasoning_effort: "max",
+            media_wire: "deepseek",
+            reasoning_field: "reasoning_content",
+            max_tokens_key: "max_tokens",
+            flavor: Some("deepseek"),
+        };
+        assert!(toml.ensure_provider_entry(&entry).unwrap());
+        let text = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
+        assert!(text.contains("# 手写注释：以后加代理条目"), "{text}");
+        assert!(text.contains("name = \"deepseek\""), "{text}");
+        // 注释保留后仍必须是可解析的 TOML。
+        assert!(text.parse::<toml_edit::DocumentMut>().is_ok(), "{text}");
+    }
+
+    #[test]
+    fn inline_provider_entries_are_found_and_checked() {
+        let text = "[llm]\nprovider = \"deepseek\"\nproviders = [\n  { name = \"zhipu\", base_url = \"https://open.bigmodel.cn/api/coding/paas/v4\", model = \"glm-5.3\", api_key = \"secret\" },\n  { name = \"deepseek\", base_url = \"https://api.deepseek.com/v1\", model = \"deepseek-flash\", api_key = \"\" },\n]\n";
+        assert!(provider_exists_in_text(text, "zhipu").unwrap());
+        assert!(provider_exists_in_text(text, "deepseek").unwrap());
+        assert!(!provider_exists_in_text(text, "other").unwrap());
+        assert!(provider_has_api_key_in_text(text, "zhipu").unwrap());
+        assert!(!provider_has_api_key_in_text(text, "deepseek").unwrap());
+
+        // 已存在的内联条目不会再被追加。
+        let dir = tempfile::tempdir().unwrap();
+        let toml = write_config(dir.path(), text);
+        let entry = NewProviderEntry {
+            name: "deepseek",
+            base_url: "https://api.deepseek.com/v1",
+            model: "deepseek-flash",
+            context_length: 1_048_576,
+            max_tokens: 384_000,
+            thinking: "enabled",
+            reasoning_effort: "max",
+            media_wire: "deepseek",
+            reasoning_field: "reasoning_content",
+            max_tokens_key: "max_tokens",
+            flavor: Some("deepseek"),
+        };
+        assert!(!toml.ensure_provider_entry(&entry).unwrap());
+        let unchanged = std::fs::read_to_string(dir.path().join("rclaw.toml")).unwrap();
+        assert_eq!(unchanged.matches("name = \"deepseek\"").count(), 1);
     }
 
     #[test]
@@ -803,6 +1293,47 @@ mod tests {
     }
 
     #[test]
+    fn apply_edits_preview_supports_inline_providers_and_inline_llm() {
+        // 常规 [llm] + 内联 providers 数组：设置页能按 name 填 api_key。
+        let dir = tempfile::tempdir().unwrap();
+        let toml = write_config(
+            dir.path(),
+            "[llm]\nprovider = \"deepseek\"\nproviders = [\n  { name = \"zhipu\", model = \"glm-5.3\", api_key = \"secret\" },\n  { name = \"deepseek\", model = \"deepseek-flash\", api_key = \"\" },\n]\n",
+        );
+        let out = toml
+            .apply_edits_preview(&[
+                (
+                    "llm.providers.deepseek.api_key".into(),
+                    EditValue::Str("test-key".into()),
+                ),
+                ("llm.provider".into(), EditValue::Str("zhipu".into())),
+            ])
+            .unwrap();
+        assert!(out.contains("providers = ["), "必须保留内联数组形态: {out}");
+        assert!(out.contains("api_key = \"test-key\""), "{out}");
+        assert!(
+            out.contains("api_key = \"secret\""),
+            "其它条目不得被改: {out}"
+        );
+        assert!(out.contains("provider = \"zhipu\""), "{out}");
+
+        // 整段 llm 内联表。
+        let dir2 = tempfile::tempdir().unwrap();
+        let toml2 = write_config(
+            dir2.path(),
+            "llm = { provider = \"deepseek\", providers = [{ name = \"deepseek\", model = \"deepseek-flash\", api_key = \"\" }] }\n",
+        );
+        let out2 = toml2
+            .apply_edits_preview(&[(
+                "llm.providers.deepseek.api_key".into(),
+                EditValue::Str("test-key-2".into()),
+            )])
+            .unwrap();
+        assert!(out2.contains("api_key = \"test-key-2\""), "{out2}");
+        assert!(out2.starts_with("llm = {"), "{out2}");
+    }
+
+    #[test]
     fn apply_edits_preview_creates_missing_section_and_rejects_bad_paths() {
         let dir = tempfile::tempdir().unwrap();
         let toml = write_config(
@@ -821,9 +1352,12 @@ mod tests {
             EditValue::Str("m".into()),
         )]);
         assert!(err.is_err());
-        // 裸键名（无段）是错误。
+        // 裸键名（无段）与空段（`a..b`）都是错误。
         assert!(toml
             .apply_edits_preview(&[("base_dir".into(), EditValue::Str("x".into()))])
+            .is_err());
+        assert!(toml
+            .apply_edits_preview(&[("llm.providers..model".into(), EditValue::Str("x".into()))])
             .is_err());
     }
 

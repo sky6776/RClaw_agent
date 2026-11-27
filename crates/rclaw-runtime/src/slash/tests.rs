@@ -338,6 +338,80 @@ api_key = "secret"
 }
 
 #[test]
+fn missing_provider_is_added_before_session_model_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rclaw.toml");
+    std::fs::write(
+        &path,
+        r#"[llm]
+provider = "zhipu"
+
+[[llm.providers]]
+name = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-5.3"
+api_key = "secret"
+"#,
+    )
+    .unwrap();
+    let provider = Arc::new(SwappableProvider::new(zhipu_fixture()).expect("build swappable"));
+    let factory: ProviderFactory = Arc::new(
+        |name: &str, _text: &str, over: Option<&ProviderProfileOverride<'_>>| match name {
+            "zhipu" => Ok(apply_profile(zhipu_fixture(), over)),
+            other => Err(format!("unknown provider {other}")),
+        },
+    );
+    let session = rclaw_store::SessionStore::open(rclaw_store::Layout::new(dir.path())).unwrap();
+    let reg = SlashRegistry::new(provider.clone(), path.clone(), "zhipu".into())
+        .with_provider_factory(factory)
+        .with_session_store(session);
+    let fallback = provider.current_config().unwrap();
+    let before = reg.session_llm_state("desktop", "chat-a", Some(&fallback));
+
+    let error = reg
+        .set_session_model_at(
+            "desktop",
+            "chat-a",
+            "deepseek-flash",
+            Some(&before.model.provider),
+            Some(&before.model.model),
+            Some(before.revision),
+            Some(&fallback),
+        )
+        .expect_err("缺少 provider 时应先补条目并提示填 key");
+    assert!(
+        error.contains("已自动在 rclaw.toml 中添加 provider「deepseek」"),
+        "{error}"
+    );
+    assert!(error.contains("api_key"), "{error}");
+    // 本次切换不生效：会话仍跟随默认配置。
+    assert!(reg.session_provider("desktop", "chat-a").is_none());
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("name = \"deepseek\""), "{text}");
+    assert!(text.contains("api_key = \"\""), "{text}");
+    assert!(
+        text.contains("base_url = \"https://api.deepseek.com/v1\""),
+        "{text}"
+    );
+
+    // 条目已在但 key 仍为空：再次选择给出同一条「先填 api_key」提示，而不是
+    // 构造期的技术错误。
+    let again = reg
+        .set_session_model_at(
+            "desktop",
+            "chat-a",
+            "deepseek-flash",
+            Some(&before.model.provider),
+            Some(&before.model.model),
+            Some(before.revision),
+            Some(&fallback),
+        )
+        .expect_err("key 为空时不得切换");
+    assert!(again.contains("还没有配置 api_key"), "{again}");
+}
+
+#[test]
 fn set_model_switches_runtime_and_persists_all_params() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rclaw.toml");

@@ -384,18 +384,159 @@ fn scalar_display(value: &toml_edit::Value) -> Option<String> {
 
 /// 当前值的 UI 显示形态：字符串去引号、数组转逗号分隔（元素按标量类型取值），
 /// 其余标量按类型取干净文本（内联表兜底原样序列化）。
+///
+/// 与 [`resolve_current`] 的区别：这里同时支持用户把 `llm` / `llm.providers`
+/// 写成内联表/内联数组（TOML 合法且 `Config` 可加载），设置页能读到自动补建的
+/// provider 字段并据此填写 `api_key`。
 pub fn resolve_current_display(doc: &toml_edit::DocumentMut, path: &str) -> Option<String> {
-    let item = resolve_current(doc, path)?;
-    let value = item.as_value()?;
-    if let Some(arr) = value.as_array() {
-        return Some(
-            arr.iter()
-                .filter_map(scalar_display)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+    let value = match resolve_field(doc, path)? {
+        ResolveChild::Item(item) => item.as_value()?,
+        ResolveChild::Value(value) => value,
+    };
+    Some(display_value(value))
+}
+
+/// 按 provider 名读取条目字段的显示值。
+///
+/// provider 名作为**独立值**传入，不拼进点分路径：名称本身可以包含 `.`（TOML 与
+/// `Config` 都允许），字符串拼接会把 `deepseek.` 与 `deepseek` 混成同一条路径。
+pub fn resolve_provider_field_display(
+    doc: &toml_edit::DocumentMut,
+    provider_name: &str,
+    field: &str,
+) -> Option<String> {
+    provider_field_value(doc, provider_name, field).map(display_value)
+}
+
+fn provider_field_value<'a>(
+    doc: &'a toml_edit::DocumentMut,
+    provider_name: &str,
+    field: &str,
+) -> Option<&'a toml_edit::Value> {
+    let providers = match doc.get("llm")? {
+        toml_edit::Item::Table(llm) => llm.get("providers")?,
+        toml_edit::Item::Value(llm) => {
+            let llm = llm.as_inline_table()?;
+            let providers = llm.get("providers")?;
+            let entries = providers.as_array()?;
+            return entries
+                .iter()
+                .filter_map(|value| value.as_inline_table())
+                .find(|entry| name_matches_value(entry.get("name"), provider_name))?
+                .get(field);
+        }
+        _ => return None,
+    };
+    match providers {
+        toml_edit::Item::ArrayOfTables(entries) => entries
+            .iter()
+            .find(|entry| name_matches(entry.get("name"), provider_name))?
+            .get(field)?
+            .as_value(),
+        toml_edit::Item::Value(toml_edit::Value::Array(entries)) => entries
+            .iter()
+            .filter_map(|value| value.as_inline_table())
+            .find(|entry| name_matches_value(entry.get("name"), provider_name))?
+            .get(field),
+        _ => None,
     }
-    Some(scalar_display(value).unwrap_or_else(|| value.to_string()))
+}
+
+fn display_value(value: &toml_edit::Value) -> String {
+    if let Some(arr) = value.as_array() {
+        return arr
+            .iter()
+            .filter_map(scalar_display)
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    scalar_display(value).unwrap_or_else(|| value.to_string())
+}
+
+/// 点分路径的一次解析视图：表（常规/内联）与数组（数组表/内联数组）都能下钻。
+enum ResolveContainer<'a> {
+    Table(&'a toml_edit::Table),
+    Inline(&'a toml_edit::InlineTable),
+    Tables(&'a toml_edit::ArrayOfTables),
+    Array(&'a toml_edit::Array),
+}
+
+enum ResolveChild<'a> {
+    Item(&'a toml_edit::Item),
+    Value(&'a toml_edit::Value),
+}
+
+fn resolve_field<'a>(doc: &'a toml_edit::DocumentMut, path: &str) -> Option<ResolveChild<'a>> {
+    let segments: Vec<&str> = path.split('.').collect();
+    // 空段（`a..b` / 末尾点）不合法：读路径必须与写路径一样明确拒绝，不能悄悄
+    // 跳过空段去读另一个同名条目。
+    if segments.is_empty() || segments.iter().any(|seg| seg.is_empty()) {
+        return None;
+    }
+    let mut container = ResolveContainer::Table(doc.as_table());
+    let mut index = 0;
+    loop {
+        let seg = *segments.get(index)?;
+        let last = index + 1 == segments.len();
+        let child = match container {
+            ResolveContainer::Table(table) => ResolveChild::Item(table.get(seg)?),
+            ResolveContainer::Inline(table) => ResolveChild::Value(table.get(seg)?),
+            // 数组容器里这一段的语义是「条目 name」，不是键。
+            ResolveContainer::Tables(entries) => {
+                container = ResolveContainer::Table(
+                    entries
+                        .iter()
+                        .find(|entry| name_matches(entry.get("name"), seg))?,
+                );
+                index += 1;
+                continue;
+            }
+            ResolveContainer::Array(entries) => {
+                container = ResolveContainer::Inline(
+                    entries
+                        .iter()
+                        .filter_map(|value| value.as_inline_table())
+                        .find(|entry| name_matches_value(entry.get("name"), seg))?,
+                );
+                index += 1;
+                continue;
+            }
+        };
+        if last {
+            return Some(child);
+        }
+        container = match child {
+            ResolveChild::Item(toml_edit::Item::Table(table)) => ResolveContainer::Table(table),
+            ResolveChild::Item(toml_edit::Item::ArrayOfTables(entries)) => {
+                ResolveContainer::Tables(entries)
+            }
+            ResolveChild::Item(toml_edit::Item::Value(value)) => value_container(value)?,
+            ResolveChild::Item(_) => return None,
+            ResolveChild::Value(value) => value_container(value)?,
+        };
+        index += 1;
+    }
+}
+
+fn value_container(value: &toml_edit::Value) -> Option<ResolveContainer<'_>> {
+    match value {
+        toml_edit::Value::InlineTable(table) => Some(ResolveContainer::Inline(table)),
+        toml_edit::Value::Array(entries) => Some(ResolveContainer::Array(entries)),
+        _ => None,
+    }
+}
+
+fn name_matches(item: Option<&toml_edit::Item>, name: &str) -> bool {
+    item.and_then(|item| item.as_str())
+        .map(|value| value.trim() == name.trim())
+        .unwrap_or(false)
+}
+
+fn name_matches_value(value: Option<&toml_edit::Value>, name: &str) -> bool {
+    value
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim() == name.trim())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -654,5 +795,57 @@ mod tests {
             resolve_current_display(&doc, "llm.nums"),
             Some("1, 2".to_string())
         );
+    }
+
+    /// 设置页必须能读到内联写法的 provider 字段（自动补条目可能落在内联数组里）。
+    #[test]
+    fn resolve_current_display_supports_inline_providers_and_inline_llm() {
+        let text = "[llm]\n\
+                    provider = \"deepseek\"\n\
+                    providers = [\n\
+                      { name = \"zhipu\", model = \"glm-5.3\", api_key = \"secret\" },\n\
+                      { name = \"deepseek\", model = \"deepseek-flash\", api_key = \"\" },\n\
+                    ]\n";
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        assert_eq!(
+            resolve_current_display(&doc, "llm.provider"),
+            Some("deepseek".to_string())
+        );
+        assert_eq!(
+            resolve_current_display(&doc, "llm.providers.zhipu.model"),
+            Some("glm-5.3".to_string())
+        );
+        assert_eq!(
+            resolve_current_display(&doc, "llm.providers.deepseek.api_key"),
+            Some(String::new())
+        );
+        assert!(resolve_current_display(&doc, "llm.providers.nope.api_key").is_none());
+
+        let inline = "llm = { provider = \"deepseek\", providers = [{ name = \"deepseek\", model = \"deepseek-flash\", api_key = \"\" }] }\n";
+        let doc: toml_edit::DocumentMut = inline.parse().unwrap();
+        assert_eq!(
+            resolve_current_display(&doc, "llm.provider"),
+            Some("deepseek".to_string())
+        );
+        assert_eq!(
+            resolve_current_display(&doc, "llm.providers.deepseek.model"),
+            Some("deepseek-flash".to_string())
+        );
+
+        // 空路径段两侧一致拒绝，不能悄悄跳过空段读到别的条目。
+        assert!(resolve_current_display(&doc, "llm.providers..model").is_none());
+
+        // provider 名允许带点：按独立值查找，不把它拆成路径。
+        let dotted = "[llm]\nprovider = \"team.alpha\"\nproviders = [{ name = \"team.alpha\", model = \"m1\" }, { name = \"team\", model = \"m2\" }]\n";
+        let doc: toml_edit::DocumentMut = dotted.parse().unwrap();
+        assert_eq!(
+            resolve_provider_field_display(&doc, "team.alpha", "model"),
+            Some("m1".to_string())
+        );
+        assert_eq!(
+            resolve_provider_field_display(&doc, "team", "model"),
+            Some("m2".to_string())
+        );
+        assert!(resolve_current_display(&doc, "llm.providers.team.alpha.model").is_none());
     }
 }
