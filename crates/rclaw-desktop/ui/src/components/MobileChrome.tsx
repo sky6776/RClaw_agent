@@ -1,25 +1,15 @@
 import type { ReactNode } from "react";
 
-import { BellIcon, GearIcon } from "./NavIcons";
+import { ActivityIcon, ChatsIcon, GearIcon } from "./NavIcons";
 
-const icon = {
-  width: 18,
-  height: 18,
-  viewBox: "0 0 16 16",
-  fill: "none",
-  stroke: "currentColor",
-  strokeWidth: 1.4,
-  strokeLinecap: "round",
-  strokeLinejoin: "round",
-} as const;
-
-/** 移动端顶栏：汉堡开抽屉 + 标题 + 活动 + 设置。
+/** 移动端顶栏：会话列表入口 + 标题 + 活动 + 设置。
  * Android 无自绘窗控（系统提供返回/主页），标题栏不可拖拽移动窗口。 */
 export default function MobileTopBar({
   title,
   activityCount,
   activityPulse,
   activityHint,
+  syncPending,
   onOpenDrawer,
   onOpenActivity,
   onOpenSettings,
@@ -28,37 +18,38 @@ export default function MobileTopBar({
   activityCount: number;
   activityPulse: boolean;
   activityHint?: string;
+  syncPending?: number;
   onOpenDrawer: () => void;
   onOpenActivity: () => void;
   onOpenSettings: () => void;
 }) {
   return (
     <div
-      className="topbar-bg flex h-14 shrink-0 items-center gap-1 border-b border-[#2a2f3a] bg-[#12151d] pl-1.5 pr-2"
+      className="topbar-bg flex min-h-12 shrink-0 items-center gap-0.5 border-b border-[#2a2f3a] bg-[#12151d] pl-1 pr-1.5"
       style={{ paddingTop: "env(safe-area-inset-top)" }}
     >
       <button
         onClick={onOpenDrawer}
-        title="打开菜单"
+        title="打开会话列表"
+        aria-label="打开会话列表"
         className="flex h-11 w-11 items-center justify-center rounded-full text-gray-300 transition active:bg-[#1a1f29]"
       >
-        <svg {...icon}>
-          <path d="M2.5 4h11M2.5 8h11M2.5 12h11" />
-        </svg>
+        <ChatsIcon />
       </button>
       {/* 品牌图标不放在顶栏（用户偏好）：桌面 TitleBar 不受影响 */}
-      <span className="min-w-0 flex-1 truncate px-2 text-[15px] font-medium text-gray-200">
+      <span className="min-w-0 flex-1 truncate px-1.5 text-[14px] font-medium text-gray-200">
         {title}
       </span>
       <button
         onClick={onOpenActivity}
         title={activityHint || "活动"}
+        aria-label={activityHint || "活动"}
         className="relative flex h-11 w-11 items-center justify-center rounded-full text-gray-400 transition active:bg-[#1a1f29]"
       >
-        <BellIcon />
+        <ActivityIcon />
         {activityCount > 0 && (
           <span
-            className={`absolute right-1.5 top-1.5 min-w-3.5 rounded-full bg-amber-400 px-1 text-[9px] leading-3.5 text-black ${
+            className={`absolute right-1 top-1 min-w-3.5 rounded-full bg-amber-400 px-1 text-[9px] leading-[14px] text-black ${
               activityPulse ? "animate-pulse" : ""
             }`}
           >
@@ -68,10 +59,23 @@ export default function MobileTopBar({
       </button>
       <button
         onClick={onOpenSettings}
-        title="设置"
+        title={syncPending && syncPending > 0 ? `设置（${syncPending} 件多端同步事项待处理）` : "设置"}
+        aria-label={
+          syncPending && syncPending > 0 ? `设置，${syncPending} 件多端同步事项待处理` : "设置"
+        }
         className="flex h-11 w-11 items-center justify-center rounded-full text-gray-400 transition active:bg-[#1a1f29]"
       >
-        <GearIcon />
+        <span className="relative flex items-center">
+          <GearIcon />
+          {syncPending !== undefined && syncPending > 0 && (
+            <span
+              aria-hidden="true"
+              className="absolute -right-2 -top-1 min-w-3 rounded-full bg-amber-400 px-0.5 text-[9px] leading-3 text-black"
+            >
+              {syncPending}
+            </span>
+          )}
+        </span>
       </button>
     </div>
   );

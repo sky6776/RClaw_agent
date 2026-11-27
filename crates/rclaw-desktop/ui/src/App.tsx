@@ -1509,23 +1509,35 @@ ${event.payload.command}
   // localOnly（多端同步的「仅本机」）：先把标记落库，成功才打开会话——发送入口不等待
   // 标记，先打开后标记的话，标记没落库的窗口里发出去的首条消息会被发布扫描接走（标记
   // 失败时也拿不到任何补救机会）。打开失败就留在原页，草稿不动，用户可以直接重试。
+  // 单飞只锁安卓快捷入口：抽屉里的「仅本机」常驻，落库往返期间连点会创建
+  // 多个空会话并反复切换。桌面菜单点击后立即收起，不需要这层保护；普通新建
+  // 是同步的，且分享/转发的「新对话」会紧接着往里追加内容，也不能被拦掉。
+  const localChatInFlight = useRef(false);
   const newChat = useCallback(
-    async (localOnly = false) => {
-      const id = freshChatId();
-      if (localOnly) {
-        try {
-          await api.syncSetLocalOnly(id, true);
-        } catch (e) {
-          setErrorToast(`没能把新对话标成「仅本机」，没有打开它: ${String(e)}`);
-          return;
-        }
-        void loadSyncMarks();
+    async (localOnly = false, singleFlight = false) => {
+      if (singleFlight) {
+        if (localChatInFlight.current) return;
+        localChatInFlight.current = true;
       }
-      prepareChat(id);
-      setChats((prev) => [
-        { chat_id: id, title: "新对话", updated_at: Date.now(), archived: false },
-        ...prev.filter((c) => c.chat_id !== id),
-      ]);
+      try {
+        const id = freshChatId();
+        if (localOnly) {
+          try {
+            await api.syncSetLocalOnly(id, true);
+          } catch (e) {
+            setErrorToast(`没能把新对话标成「仅本机」，没有打开它: ${String(e)}`);
+            return;
+          }
+          void loadSyncMarks();
+        }
+        prepareChat(id);
+        setChats((prev) => [
+          { chat_id: id, title: "新对话", updated_at: Date.now(), archived: false },
+          ...prev.filter((c) => c.chat_id !== id),
+        ]);
+      } finally {
+        if (singleFlight) localChatInFlight.current = false;
+      }
     },
     [prepareChat, loadSyncMarks],
   );
@@ -3026,7 +3038,6 @@ ${event.payload.command}
                 activeId={activeId}
                 busyByChat={busyByChat}
                 syncMarks={syncMarks}
-                syncPending={syncPending}
                 syncOn={syncOn}
                 importBusy={importBusy}
                 activityCount={liveCounts.active}
@@ -3055,12 +3066,11 @@ ${event.payload.command}
                 onRestore={(id, recordId) => void restoreChat(id, recordId)}
                 onDeleteChat={(id, title, recordId) => setDeleteConfirm({ chatId: id, title, epoch: chatEpoch.current[id] ?? 0, recordId })}
                 onNewChat={() => leaveSettings(() => void newChat())}
-                onNewLocalChat={() => leaveSettings(() => void newChat(true))}
+                onNewLocalChat={() => leaveSettings(() => void newChat(true, true))}
                 onImportBundle={importBundle}
                 onOpenBotChat={(name) => openChatChecked(`bot-${name}`)}
                 onOpenGroupCreate={() => setGroupCreateOpen(true)}
                 onManageBots={() => openSettings("bots")}
-                onOpenSettings={() => openSettings()}
                 onOpenActivity={() => openActivity("tasks")}
                 onOpenBrowser={() => {
                   void api.browserToggleVisible().catch(() => {});
@@ -3086,7 +3096,6 @@ ${event.payload.command}
               activeId={activeId}
               busyByChat={busyByChat}
               syncMarks={syncMarks}
-              syncPending={syncPending}
               syncOn={syncOn}
               importBusy={importBusy}
               activityCount={liveCounts.active}
@@ -3120,7 +3129,6 @@ ${event.payload.command}
               onOpenBotChat={(name) => openChatChecked(`bot-${name}`)}
               onOpenGroupCreate={() => setGroupCreateOpen(true)}
               onManageBots={() => openSettings("bots")}
-              onOpenSettings={() => openSettings()}
               onOpenActivity={() => openActivity("tasks")}
               loadBots={loadBots}
             />
@@ -3312,6 +3320,7 @@ ${event.payload.command}
           activityCount={liveCounts.active}
           activityPulse={liveCounts.running > 0}
           activityHint={activityHint}
+          syncPending={syncPending}
           onOpenDrawer={() => {
             drawerViaBack.current = false;
             setDrawerOpen(true);

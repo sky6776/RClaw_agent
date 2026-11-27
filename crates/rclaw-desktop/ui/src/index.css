@@ -294,6 +294,16 @@ html.theme-light #root {
 .theme-light .hover\:bg-\[\#1a1f29\]:hover {
   background-color: #e3e6eb;
 }
+/* 紧凑侧栏/安卓顶栏的开创快捷按钮 active 按压底：active: 变体也编译成独立类名，
+   缺覆盖会在浅色主题下按出深底、文字图标看不清。限定在会话顶栏与抽屉内，
+   不要波及照片编辑页等复用同一工具类的其它面板。 */
+.theme-light .topbar-bg .active\:bg-\[\#1a1f29\]:active,
+.theme-light .sidebar-bg .active\:bg-\[\#1a1f29\]:active {
+  background-color: #e3e6eb;
+}
+.theme-light .sidebar-bg .active\:bg-indigo-500\/20:active {
+  background-color: #e0e7ff;
+}
 .theme-light .bg-\[\#1a2030\] {
   background-color: #e4e8fb;
 }

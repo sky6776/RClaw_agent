@@ -9,7 +9,7 @@ import type { BotEntry, ChatMeta, GroupRoom, SyncSessionMark, UsageSnapshot } fr
 import { useBackClose } from "../lib/backNav";
 import { syncTitle } from "../lib/syncUi";
 import { SyncMarkTags } from "./SyncBits";
-import { BellIcon, BotIcon, GearIcon, GlobeIcon, SearchIcon, UsersIcon } from "./NavIcons";
+import { ActivityIcon, BotIcon, GlobeIcon, ImportIcon, PlusIcon, SearchIcon, UsersIcon } from "./NavIcons";
 
 export interface SidebarProps {
   compact: boolean;
@@ -20,7 +20,6 @@ export interface SidebarProps {
   activeId: string;
   busyByChat: Record<string, boolean>;
   syncMarks: Record<string, SyncSessionMark>;
-  syncPending: number;
   syncOn: boolean;
   importBusy: boolean;
   activityCount: number;
@@ -41,7 +40,6 @@ export interface SidebarProps {
   onOpenBotChat: (name: string) => void;
   onOpenGroupCreate: () => void;
   onManageBots: () => void;
-  onOpenSettings: () => void;
   onOpenActivity: () => void;
   onOpenBrowser?: () => void;
   loadBots: () => Promise<BotEntry[]>;
@@ -69,7 +67,6 @@ export default function Sidebar({
   activeId,
   busyByChat,
   syncMarks,
-  syncPending,
   syncOn,
   importBusy,
   activityCount,
@@ -90,7 +87,6 @@ export default function Sidebar({
   onOpenBotChat,
   onOpenGroupCreate,
   onManageBots,
-  onOpenSettings,
   onOpenActivity,
   onOpenBrowser,
   loadBots,
@@ -372,7 +368,7 @@ export default function Sidebar({
           title="活动"
           className="relative flex h-9 w-9 items-center justify-center rounded-lg text-gray-400 transition hover:bg-[#1a1f29] hover:text-gray-200"
         >
-          <BellIcon />
+          <ActivityIcon />
           {activityCount > 0 && (
             <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-amber-400" />
           )}
@@ -406,42 +402,50 @@ export default function Sidebar({
     );
   }
 
-  function newMenu() {
+  /** 新建菜单。compact（安卓抽屉）已把新建/仅本机/导入提到外面，菜单只留
+   *  群聊与智能体入口，触发器也换成机器人图标；固定宽度防止长名字撑出抽屉。 */
+  function newMenu(showCreate = true, narrow = false) {
     const item =
       "block w-full whitespace-nowrap rounded-md px-3 py-1.5 text-left text-xs text-gray-300 transition hover:bg-[#1a1f29] hover:text-gray-100";
     return (
-      <div className="min-w-44 rounded-xl border border-[#2a2f3a] bg-[#141821] py-1 shadow-2xl">
-        <button
-          className={item}
-          onClick={() => {
-            setNewMenuOpen(false);
-            onNewChat();
-          }}
-        >
-          新建对话
-        </button>
-        {syncOn && (
-          <button
-            className={item}
-            onClick={() => {
-              setNewMenuOpen(false);
-              onNewLocalChat();
-            }}
-          >
-            仅本机对话
-          </button>
+      <div
+        className={`${narrow ? "w-full" : "min-w-44"} rounded-xl border border-[#2a2f3a] bg-[#141821] py-1 shadow-2xl`}
+      >
+        {showCreate && (
+          <>
+            <button
+              className={item}
+              onClick={() => {
+                setNewMenuOpen(false);
+                onNewChat();
+              }}
+            >
+              新建对话
+            </button>
+            {syncOn && (
+              <button
+                className={item}
+                onClick={() => {
+                  setNewMenuOpen(false);
+                  onNewLocalChat();
+                }}
+              >
+                仅本机对话
+              </button>
+            )}
+            <button
+              className={item}
+              disabled={importBusy}
+              onClick={() => {
+                setNewMenuOpen(false);
+                inputRef.current?.click();
+              }}
+            >
+              {importBusy ? "导入中…" : "导入会话包…"}
+            </button>
+            <div className="my-1 border-t border-[#252b36]" />
+          </>
         )}
-        <button
-          className={item}
-          disabled={importBusy}
-          onClick={() => {
-            setNewMenuOpen(false);
-            inputRef.current?.click();
-          }}
-        >
-          {importBusy ? "导入中…" : "导入会话包…"}
-        </button>
-        <div className="my-1 border-t border-[#252b36]" />
         <button
           className={item}
           onClick={() => {
@@ -461,14 +465,29 @@ export default function Sidebar({
                 <button
                   key={bot.name}
                   className={item}
+                  title={narrow ? `${bot.title} @${bot.name}` : undefined}
                   onClick={() => {
                     setNewMenuOpen(false);
                     onOpenBotChat(bot.name);
                   }}
                 >
-                  <span className="inline-flex items-center gap-1.5">
-                    <BotIcon /> {bot.title}
-                    <span className="text-gray-600">@{bot.name}</span>
+                  <span className={narrow ? "flex min-w-0 items-start gap-1.5" : "inline-flex items-center gap-1.5"}>
+                    <span className={narrow ? "mt-px shrink-0 text-gray-500" : ""}>
+                      <BotIcon />
+                    </span>
+                    {narrow ? (
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate">{bot.title}</span>
+                        <span className="block whitespace-normal break-words text-xs leading-4 text-gray-400">
+                          @{bot.name}
+                        </span>
+                      </span>
+                    ) : (
+                      <>
+                        {bot.title}
+                        <span className="text-gray-600">@{bot.name}</span>
+                      </>
+                    )}
                   </span>
                 </button>
               ))}
@@ -502,20 +521,35 @@ export default function Sidebar({
           if (file) onImportBundle(file);
         }}
       />
-      <div className={`flex items-center gap-2 pb-1 pt-3 ${compact ? "px-3" : "px-3"}`}>
+      <div className="flex items-center gap-2 px-3 pb-1 pt-3">
         {!compact && (
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-sm font-bold text-white">
             R
           </div>
         )}
-        {!compact && <span className="min-w-0 flex-1 truncate font-semibold text-gray-100">RClaw</span>}
+        <span className="min-w-0 flex-1 truncate font-semibold text-gray-100">RClaw</span>
         <button
           ref={newBtnRef}
           onClick={() => setNewMenuOpen((v) => !v)}
-          title="新建"
-          className="ml-auto flex h-8 items-center gap-0.5 rounded-lg px-2 text-base leading-none text-gray-400 transition hover:bg-[#1a1f29] hover:text-indigo-300"
+          title={compact ? "群聊与智能体" : "新建"}
+          aria-label={compact ? "群聊与智能体" : undefined}
+          aria-expanded={compact ? newMenuOpen : undefined}
+          className={
+            compact
+              ? "ml-auto flex h-11 w-11 items-center justify-center rounded-lg text-gray-400 transition active:bg-[#1a1f29] active:text-indigo-300"
+              : "ml-auto flex h-8 items-center gap-0.5 rounded-lg px-2 text-base leading-none text-gray-400 transition hover:bg-[#1a1f29] hover:text-indigo-300"
+          }
         >
-          ＋<span className="text-[10px]">▾</span>
+          {compact ? (
+            <span className="flex items-center gap-0.5">
+              <BotIcon />
+              <span className="text-[9px] leading-none">▾</span>
+            </span>
+          ) : (
+            <>
+              ＋<span className="text-[10px]">▾</span>
+            </>
+          )}
         </button>
         {!compact && (
           <button
@@ -528,36 +562,45 @@ export default function Sidebar({
         )}
       </div>
       {newMenuOpen && (
-        <div ref={menuRef} className="absolute left-3 top-12 z-50">
-          {newMenu()}
+        <div
+          ref={menuRef}
+          className={`absolute z-50 ${
+            compact ? "right-3 top-14 w-[15rem] max-w-[calc(100%_-_1.5rem)]" : "left-3 top-12"
+          }`}
+        >
+          {newMenu(!compact, compact)}
         </div>
       )}
       {compact && (
-        <div className="flex items-center gap-2 px-3 pb-1">
+        <div className="flex items-center gap-1.5 px-3 pb-1.5">
           <button
-            onClick={onOpenActivity}
-            title="活动"
-            className="relative flex h-9 flex-1 items-center justify-center rounded-lg border border-[#2a2f3a] text-sm text-gray-300"
+            onClick={onNewChat}
+            className="flex h-11 min-w-0 flex-1 items-center justify-center gap-1 rounded-lg border border-indigo-500/40 bg-indigo-500/10 text-[13px] font-medium text-indigo-200 transition active:bg-indigo-500/20"
           >
-            <BellIcon /> 活动
-            {activityCount > 0 && (
-              <span className="ml-1 rounded-full bg-amber-500/15 px-1.5 text-[10px] text-amber-300">
-                {activityCount}
-              </span>
-            )}
+            <PlusIcon />
+            新建对话
           </button>
-          {onOpenBrowser && (
+          {syncOn && (
             <button
-              onClick={onOpenBrowser}
-              title="浏览器"
-              className="flex h-9 items-center justify-center rounded-lg border border-[#2a2f3a] px-3 text-gray-300"
+              onClick={onNewLocalChat}
+              title="新对话只保存在本机、不参与多端同步"
+              className="flex h-11 shrink-0 items-center justify-center rounded-lg border border-[#2a2f3a] px-2.5 text-[13px] text-gray-300 transition active:bg-[#1a1f29]"
             >
-              <GlobeIcon />
+              仅本机
             </button>
           )}
+          <button
+            onClick={() => inputRef.current?.click()}
+            disabled={importBusy}
+            title={importBusy ? "导入中…" : "导入会话包"}
+            aria-label={importBusy ? "导入中" : "导入会话包"}
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[#2a2f3a] text-gray-300 transition active:bg-[#1a1f29] disabled:opacity-50"
+          >
+            <ImportIcon />
+          </button>
         </div>
       )}
-      <div className="px-3 pb-1">
+      <div className={`px-3 pb-1 ${compact ? "flex items-center gap-1.5" : ""}`}>
         <input
           ref={searchRef}
           value={search}
@@ -570,8 +613,39 @@ export default function Sidebar({
             }
           }}
           placeholder="搜索会话"
-          className="w-full rounded-lg border border-[#2a2f3a] bg-[#141821] px-2.5 py-1.5 text-xs text-gray-200 outline-none transition focus:border-indigo-500/50"
+          className={`rounded-lg border border-[#2a2f3a] bg-[#141821] px-2.5 text-xs text-gray-200 outline-none transition focus:border-indigo-500/50 ${
+            compact ? "h-11 min-w-0 flex-1" : "w-full py-1.5"
+          }`}
         />
+        {compact && (
+          <button
+            onClick={onOpenActivity}
+            title={activityCount > 0 ? `活动，${activityCount} 项活跃任务` : "活动"}
+            aria-label={activityCount > 0 ? `活动，${activityCount} 项活跃任务` : "活动"}
+            className="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[#2a2f3a] text-gray-300 transition active:bg-[#1a1f29]"
+          >
+            <ActivityIcon />
+            {activityCount > 0 && (
+              <span
+                className={`absolute -right-1 -top-1 min-w-3.5 rounded-full bg-amber-400 px-1 text-[9px] leading-[14px] text-black ${
+                  activityPulse ? "animate-pulse" : ""
+                }`}
+              >
+                {activityCount}
+              </span>
+            )}
+          </button>
+        )}
+        {compact && onOpenBrowser && (
+          <button
+            onClick={onOpenBrowser}
+            title="浏览器"
+            aria-label="浏览器"
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[#2a2f3a] text-gray-300 transition active:bg-[#1a1f29]"
+          >
+            <GlobeIcon />
+          </button>
+        )}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-2">
         {showRecent && (
@@ -679,27 +753,6 @@ export default function Sidebar({
         <div className="mx-3 mb-2 truncate text-[10px] text-gray-400" title={homePath}>
           {homePath}
         </div>
-      )}
-      {compact && (
-      <div className="border-t border-[#252b36] px-3 py-2">
-        <button
-          onClick={onOpenSettings}
-          className="relative flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left text-sm text-gray-300 transition hover:bg-[#1a1f29] hover:text-gray-100 max-md:text-[15px]"
-        >
-          <span className="flex h-4 w-4 shrink-0 items-center justify-center text-gray-500">
-            <GearIcon />
-          </span>
-          <span className="min-w-0 flex-1 truncate">设置</span>
-          {syncPending > 0 && (
-            <span
-              title={`${syncPending} 件多端同步事项待处理`}
-              className="inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-amber-500/15 px-1.5 py-px font-mono text-[10px] tabular-nums text-amber-300"
-            >
-              {syncPending}
-            </span>
-          )}
-        </button>
-      </div>
       )}
     </div>
   );

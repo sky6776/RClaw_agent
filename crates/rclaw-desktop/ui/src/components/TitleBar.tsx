@@ -8,7 +8,7 @@ import {
 } from "react";
 import { api } from "../lib/api";
 import { PanelRightIcon } from "./icons";
-import { BellIcon, GearIcon } from "./NavIcons";
+import { ActivityIcon, GearIcon } from "./NavIcons";
 
 /** 标题栏右侧统一的图标按钮（主题切换 / 窗控三键）。 */
 function BarButton({
@@ -137,7 +137,7 @@ export default function TitleBar({
           onClick={onOpenActivity}
         >
           <span className="relative flex items-center">
-            <BellIcon />
+            <ActivityIcon />
             {activityCount > 0 && (
               <span
                 className={`absolute -right-1.5 -top-1 min-w-3 rounded-full bg-amber-400 px-0.5 text-[9px] leading-3 text-black ${

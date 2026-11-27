@@ -118,6 +118,34 @@ export function SearchIcon() {
   );
 }
 
+/** 会话：带文本行的对话气泡（顶栏打开会话抽屉）。 */
+export function ChatsIcon() {
+  return (
+    <svg {...base}>
+      <path d="M13.6 4.4c0-.8-.7-1.5-1.5-1.5H3.9c-.8 0-1.5.7-1.5 1.5v4.1c0 .8.7 1.5 1.5 1.5h.8v2.6L7.5 10h4.6c.8 0 1.5-.7 1.5-1.5V4.4z" />
+      <path d="M5.2 5.4h5.6M5.2 7.4h3.5" />
+    </svg>
+  );
+}
+
+export function PlusIcon() {
+  return (
+    <svg {...base}>
+      <path d="M8 3.2v9.6M3.2 8h9.6" />
+    </svg>
+  );
+}
+
+/** 导入：箭头落入托盘。 */
+export function ImportIcon() {
+  return (
+    <svg {...base}>
+      <path d="M8 2.6v6.2M5.4 6.4L8 9l2.6-2.6" />
+      <path d="M3.2 10.6v1.6c0 .7.5 1.2 1.2 1.2h7.2c.7 0 1.2-.5 1.2-1.2v-1.6" />
+    </svg>
+  );
+}
+
 export function BellIcon() {
   return (
     <svg {...base}>
