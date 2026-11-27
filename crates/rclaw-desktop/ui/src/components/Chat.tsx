@@ -12,7 +12,8 @@ import remarkGfm from "remark-gfm";
 import { api, type LlmState, type PermissionMode, type PlanStatus, type UsageSnapshot } from "../lib/api";
 import type { ToolCallView } from "../lib/toolCalls";
 import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
-import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
+import { isAndroidDevice } from "../lib/useIsMobile";
+import { useCompactLayout } from "../lib/compactLayout";
 import { useBackClose } from "../lib/backNav";
 import MediaPreviews, { mentionsPath, parseMediaItems } from "./MediaPreviews";
 import {
@@ -89,6 +90,8 @@ interface Props {
   onFontScale: (next: number) => void;
   /** 当前会话 id：变化时重置滚动跟随并直达新会话底部（Chat 不随会话重挂载）。 */
   sessionKey: string;
+  /** 当前会话记录代次：换代时上传回执等异步结果必须丢弃。 */
+  recordEpoch: number;
   /** 从该消息锚点分叉出新会话（复制可见历史 + 自动回滚之后的文件改动，原会话不动）。 */
   onFork?: (entry: Entry) => void;
   /** 最近的 PlanRun 计划状态（流程步骤卡片；完整列表，最多 6 条）。 */
@@ -103,6 +106,9 @@ interface Props {
   onQueueRemove: (id: number) => void;
   /** 当前会话上下文用量（App 每 5s 轮询 usage_snapshot）：底部环形按钮实时显示占比。 */
   usage?: UsageSnapshot | null;
+  /** 前景覆盖层（设置/活动/群聊）打开：关闭并注销所有内部弹层，避免返回键先关
+   *  被遮住的弹层；由 App 传入。 */
+  suspended?: boolean;
 }
 
 /** 排队消息条目（App 级状态，按会话分桶存放——Chat 随页面切换会卸载，组件内
@@ -660,6 +666,7 @@ export default function Chat({
   onCapture,
   onForwardToChat,
   sessionKey,
+  recordEpoch,
   onFork,
   plans,
   onPlanPause,
@@ -669,6 +676,7 @@ export default function Chat({
   fontScale,
   onFontScale,
   usage,
+  suspended = false,
 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -831,7 +839,7 @@ export default function Chat({
   // 结算」机制（思考块批量开合引入，见下方结算 effect）。
   const [foldGen, setFoldGen] = useState(0);
   // 移动端无物理键盘：占位文案去掉 Enter/↑↓ 提示。
-  const isMobile = useIsMobile();
+  const isMobile = useCompactLayout();
   // 会话页「模型 + 思考强度」：选项完全由后端按 live provider + 模型给出。切会话、
   // 窗口重获焦点、打开菜单、turn 结束都刷新；提交带 expected provider/model，防止
   // 菜单打开后模型被另一窗口切走仍把旧档位写进新模型。
@@ -1394,6 +1402,8 @@ export default function Chat({
 
   // 切换会话：恢复跟随并把视图直达新会话最新消息（DOM 已随 props 更新完再滚）。
   const sessionKeyRef = useRef(sessionKey);
+  const recordEpochRef = useRef(recordEpoch);
+  recordEpochRef.current = recordEpoch;
   useEffect(() => {
     if (sessionKeyRef.current === sessionKey) return;
     sessionKeyRef.current = sessionKey;
@@ -1409,6 +1419,7 @@ export default function Chat({
     setHistoryIndex(null);
     setQuote(null);
     setSelectIds(null);
+    setMsgMenu(null);
     setExportResult(null);
     draftRef.current = "";
     // 手势态一并复位：残留的 active/zombie/ids 会把跟随压制带到新会话。
@@ -1595,6 +1606,8 @@ export default function Chat({
 
   const onFilesPicked = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
+    const keyAtPick = sessionKeyRef.current;
+    const epochAtPick = recordEpochRef.current;
     setUploading(true);
     for (const file of Array.from(files)) {
       try {
@@ -1606,6 +1619,10 @@ export default function Chat({
         });
         const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
         const uploaded = await api.uploadFile(file.name, base64);
+        // 上传期间切了会话：回执属于旧会话，不能挂到新会话的附件上。
+        if (sessionKeyRef.current !== keyAtPick || recordEpochRef.current !== epochAtPick) {
+          continue;
+        }
         setAttachments((prev) => [
           ...prev,
           { rel: uploaded.rel_path, abs: uploaded.abs_path, name: file.name },
@@ -1754,6 +1771,19 @@ export default function Chat({
   useBackClose(gallery !== null, () => setGallery(null));
   useBackClose(attachMenuOpen, () => setAttachMenuOpen(false));
   useBackClose(permOpen, () => setPermOpen(false));
+
+  // 前景覆盖层打开：关闭并注销所有内部弹层（含模型选择器 via suspended prop）。
+  useEffect(() => {
+    if (!suspended) return;
+    setMsgMenu(null);
+    setTextSelectId(null);
+    window.getSelection?.()?.removeAllRanges();
+    setSelectIds(null);
+    setGallery(null);
+    setAttachMenuOpen(false);
+    setPermOpen(false);
+    setNavOpen(false);
+  }, [suspended]);
 
   const flashNotice = (text: string) => {
     setNotice(text);

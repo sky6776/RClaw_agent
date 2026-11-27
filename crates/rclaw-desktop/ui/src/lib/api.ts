@@ -41,6 +41,8 @@ export interface CronEntry {
 
 export interface ChatMeta {
   chat_id: string;
+  /** `session.id` 行主键：同 chat_id 重建后变化（删除前置校验）。 */
+  record_id?: number;
   title: string;
   updated_at: number;
   archived: boolean;
@@ -529,7 +531,20 @@ export interface ConfigDocDto {
 export interface ConfigStateDto {
   path: string;
   raw: string;
+  /** 主配置读取失败（权限/非 UTF-8）：没有可信原文，只允许从文件导入。 */
+  read_error: string | null;
+  /** 原文可读但 TOML 解析失败：可编辑原文并保存启动。 */
+  parse_error: string | null;
   doc: ConfigDocDto;
+}
+
+export interface ConfigImportOutcome {
+  written: boolean;
+  started: boolean;
+  already_running: boolean;
+  restart_required: boolean;
+  start_error: string | null;
+  sync_reloaded: boolean;
 }
 
 export interface ConfigEdit {
@@ -1177,14 +1192,16 @@ export const api = {
   planPause: (planId: string, paused: boolean) =>
     invoke<void>("plan_pause", { planId, paused }),
 
-  chatArchive: (chatId: string) => invoke<void>("chat_archive", { chatId }),
+  chatArchive: (chatId: string, expectedRecordId?: number) =>
+    invoke<void>("chat_archive", { chatId, expectedRecordId }),
 
-  chatRestore: (chatId: string) => invoke<void>("chat_restore", { chatId }),
+  chatRestore: (chatId: string, expectedRecordId?: number) =>
+    invoke<void>("chat_restore", { chatId, expectedRecordId }),
 
   /** 删除会话（state.sqlite 里的会话记录 + 自定义标题；前端先弹确认）。参与同步的
    *  会话：删除会传播到其他设备，各端先留一份在回收站；purge = 彻底删除，都不留。 */
-  chatDelete: (chatId: string, purge = false) =>
-    invoke<void>("chat_delete", { chatId, purge }),
+  chatDelete: (chatId: string, purge = false, expectedRecordId?: number) =>
+    invoke<void>("chat_delete", { chatId, purge, expectedRecordId }),
 
   /** 重命名会话；标题去空白后为空 = 恢复自动派生标题（首条用户消息截断）。 */
   chatRename: (chatId: string, title: string) =>
@@ -1252,7 +1269,7 @@ export const api = {
     invoke<void>("config_save", { edits }),
 
   configImportRaw: (content: string) =>
-    invoke<void>("config_import_raw", { content }),
+    invoke<ConfigImportOutcome>("config_import_raw", { content }),
 
   /** wxbot 联系人查询（连接参数用表单当前值：草稿 ?? 基线；reject 抛 {code,message}）。 */
   wxbotContactsList: (apiBase: string, apiToken: string, kind: "friends" | "groups") =>
@@ -1695,8 +1712,18 @@ export const api = {
   syncSessionMarks: () => invoke<SyncSessionMark[]>("sync_session_marks"),
 
   /** 标记 / 取消「仅本机」。 */
-  syncSetLocalOnly: (chatId: string, on: boolean) =>
-    invoke<void>("sync_set_local_only", { chatId, on }),
+  syncSetLocalOnly: (
+    chatId: string,
+    on: boolean,
+    expectedRecordId?: number,
+    confirmed = false,
+  ) =>
+    invoke<void>("sync_set_local_only", {
+      chatId,
+      on,
+      expectedRecordId,
+      confirmed,
+    }),
 
   /** 回收站里的会话和记忆条目。不需要开启同步，退出同步空间之后也读得出来；过了保留期
    *  的在这一次读取时清掉。 */

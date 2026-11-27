@@ -15,7 +15,7 @@ export default function PhotoEditor({
   dataUrl,
   rel,
   onClose,
-  onSent,
+  onSend,
   onSaved,
   onError,
 }: {
@@ -23,8 +23,8 @@ export default function PhotoEditor({
   /** 原始采集文件（相对 agent/）：取消时删除。 */
   rel: string;
   onClose: () => void;
-  /** 发送到当前会话：返回编辑后落盘的工作区路径。 */
-  onSent: (rel: string) => void;
+  /** 发送到当前会话：由父层先过离开守卫，确认后才调用 exportPhoto 落盘。 */
+  onSend: (exportPhoto: () => Promise<string>) => Promise<void>;
   /** 保存到本地：返回编辑后落盘的工作区路径。 */
   onSaved: (rel: string) => void;
   onError: (message: string) => void;
@@ -185,10 +185,10 @@ export default function PhotoEditor({
   const sendToChat = async () => {
     setBusy(true);
     try {
-      const saved = await exportPhoto();
-      onSent(saved);
+      await onSend(exportPhoto);
     } catch (e) {
-      onError(String(e));
+      // 守卫取消不是错误：保持编辑页与画布内容。
+      if (!String(e).includes("已取消")) onError(String(e));
     } finally {
       setBusy(false);
     }
@@ -207,7 +207,13 @@ export default function PhotoEditor({
   };
 
   return (
-    <div className="fixed inset-0 z-[60] flex flex-col bg-[#0b0e14]">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="编辑照片"
+      tabIndex={-1}
+      className="fixed bottom-0 left-0 right-0 top-0 z-[60] flex flex-col bg-[#0b0e14]"
+    >
       {/* 顶栏：编辑工具 */}
       <div className="flex shrink-0 items-center gap-2 border-b border-[#2a2f3a] bg-[#12151d] px-3 py-2 max-md:px-2">
         <span className="text-sm font-medium text-gray-200 max-md:hidden">编辑照片</span>

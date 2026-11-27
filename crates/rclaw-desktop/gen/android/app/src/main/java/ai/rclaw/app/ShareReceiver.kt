@@ -91,33 +91,19 @@ object ShareReceiver {
         AppConfig.trace(context, "share-received files=${saved.size} hasText=${text.isNotBlank()}")
     }
 
-    /** 原子落盘 pending_share.json（tmp + rename；消费端轮询读后即删，非原子写
-     *  可能被读到半截后删除，整份分享丢失）。存在未消费的旧分享时合并而非
-     *  覆盖：旧附件引用追加保留，新分享无文本时沿用旧文本。 */
+    /** 每批分享写一个独立文件（share_inbox/share-<millis>-<rand>.json）：同一轮询前
+     *  到达的多批分享不会互相覆盖；消费端按文件原子认领，也不会误删新批次。 */
     private fun writePending(context: Context, files: List<String>, text: String) {
-        val target = File(context.filesDir, "pending_share.json")
-        val mergedFiles = ArrayList<String>()
-        var mergedText = text
-        try {
-            val old = JSONObject(target.readText())
-            val oldFiles = old.optJSONArray("files")
-            if (oldFiles != null) {
-                for (i in 0 until oldFiles.length()) {
-                    val name = oldFiles.optString(i)
-                    if (name.isNotBlank()) mergedFiles.add(name)
-                }
-            }
-            if (mergedText.isBlank()) mergedText = old.optString("text", "")
-        } catch (_: Exception) {
-            // 旧 pending 缺失/损坏：按全新分享处理。
-        }
-        mergedFiles.addAll(files)
+        val inbox = File(context.filesDir, "share_inbox")
+        inbox.mkdirs()
+        val name = "share-${System.currentTimeMillis()}-${java.util.UUID.randomUUID().toString().take(8)}.json"
+        val target = File(inbox, name)
         val payload = JSONObject().apply {
-            put("files", JSONArray(mergedFiles))
-            if (mergedText.isNotBlank()) put("text", mergedText)
+            put("files", JSONArray(files))
+            if (text.isNotBlank()) put("text", text)
         }
         try {
-            val tmp = File(context.filesDir, "pending_share.json.tmp")
+            val tmp = File(inbox, "$name.tmp")
             tmp.writeText(payload.toString())
             if (!tmp.renameTo(target)) {
                 target.writeText(payload.toString())

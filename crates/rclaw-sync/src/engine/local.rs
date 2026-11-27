@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rclaw_store::session::raw::SessionDeleteSync;
 use rclaw_store::sync_db::{self, INBOX_PENDING, INBOX_QUEUED, SEAL_LOCAL, SEAL_SEALED};
 use rclaw_store::MemoryTarget;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use crate::attach::{self, now_ms, Backlog};
@@ -280,6 +280,18 @@ pub(crate) fn delete_session(
     purge: bool,
     keep_trash: bool,
 ) -> Result<bool> {
+    delete_session_checked(ctx, channel, chat_id, purge, keep_trash, None)
+}
+
+/// 同 [`delete_session`]，可带会话行主键前置条件（事务内核对，防止同键重建误删）。
+pub(crate) fn delete_session_checked(
+    ctx: &Ctx,
+    channel: &str,
+    chat_id: &str,
+    purge: bool,
+    keep_trash: bool,
+    expected_row_id: Option<i64>,
+) -> Result<bool> {
     let mode = if purge {
         SessionDeleteSync::Purge
     } else {
@@ -291,10 +303,17 @@ pub(crate) fn delete_session(
         return Ok(ctx
             .env
             .sessions
-            .delete_session_with(channel, chat_id, mode)?);
+            .delete_session_with_checked(channel, chat_id, mode, expected_row_id)?);
     }
     let guard = hold_session(ctx, channel, chat_id)?;
-    let existed = delete_held(ctx, channel, chat_id, mode, keep_trash && !purge)?;
+    let existed = delete_held_checked(
+        ctx,
+        channel,
+        chat_id,
+        mode,
+        keep_trash && !purge,
+        expected_row_id,
+    )?;
     drop(guard);
     Ok(existed)
 }
@@ -307,6 +326,30 @@ fn delete_held(
     mode: SessionDeleteSync,
     stash: bool,
 ) -> Result<bool> {
+    delete_held_checked(ctx, channel, chat_id, mode, stash, None)
+}
+
+fn delete_held_checked(
+    ctx: &Ctx,
+    channel: &str,
+    chat_id: &str,
+    mode: SessionDeleteSync,
+    stash: bool,
+    expected_row_id: Option<i64>,
+) -> Result<bool> {
+    // 过期确认不产生回收站副作用：先核对记录，再导出/删除（存储事务里还会再核对一次）。
+    if let Some(expected) = expected_row_id {
+        let current = ctx
+            .env
+            .sessions
+            .session_row_id(channel, chat_id)
+            .map_err(|error| SyncError::other(format!("校验会话记录失败: {error}")))?;
+        if current != Some(expected) {
+            return Err(SyncError::other("会话记录已变化，请刷新列表后再试"));
+        }
+    }
+    // 先导出到暂存（不发布）；删除事务成功后才发布到回收站，失败则丢弃。
+    // 记录身份已核对；按原有语义先导出回收站，再走带行校验的删除事务。
     if stash {
         trash::stash(ctx, channel, chat_id).map_err(|error| {
             SyncError::other(format!(
@@ -317,7 +360,8 @@ fn delete_held(
     Ok(ctx
         .env
         .sessions
-        .delete_session_with(channel, chat_id, mode)?)
+        .delete_session_with_checked(channel, chat_id, mode, expected_row_id)
+        .map_err(SyncError::from)?)
 }
 
 /// `/clear confirm all`（§7.5）：把参与同步、已经发布的会话逐个按「删除」处理——本机留
@@ -473,12 +517,37 @@ pub(crate) fn is_local_only(ctx: &Ctx, channel: &str, chat_id: &str) -> Result<b
 /// 标记一个已经发布的会话：向其他设备发「彻底删除」，本机这一份解除与线程的对应关系
 /// ——以后取消标记时，它作为一个新线程重新发布。
 pub(crate) fn set_local_only(ctx: &Ctx, channel: &str, chat_id: &str, on: bool) -> Result<()> {
+    set_local_only_checked(ctx, channel, chat_id, on, None, true)
+}
+
+/// 同 [`set_local_only`]，可在写事务内核对会话行主键：确认期间同键重建时，
+/// 「设为仅本机」不能作用到新记录上。
+pub(crate) fn set_local_only_checked(
+    ctx: &Ctx,
+    channel: &str,
+    chat_id: &str,
+    on: bool,
+    expected_row_id: Option<i64>,
+    confirmed: bool,
+) -> Result<()> {
     if !ids::is_valid_channel(channel) || !ids::is_valid_chat_id(chat_id) {
         return Err(SyncError::invalid("会话标识不合规"));
     }
     let key = db::local_only_key(channel, chat_id);
     if !on {
         return db::write(ctx.db(), |tx| {
+            if let Some(expected) = expected_row_id {
+                let current: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM session WHERE channel = ?1 AND chat_id = ?2",
+                        params![channel, chat_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if current != Some(expected) {
+                    return Err(SyncError::other("会话记录已变化，请刷新列表后再试"));
+                }
+            }
             sync_db::kv_del(tx, &key)?;
             // 下一次发布扫描从头来，把它捡起来。
             publish::reset_cursor(tx)
@@ -490,9 +559,39 @@ pub(crate) fn set_local_only(ctx: &Ctx, channel: &str, chat_id: &str, on: bool) 
         false => None,
     };
     db::write(ctx.db(), |tx| {
+        if let Some(expected) = expected_row_id {
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM session WHERE channel = ?1 AND chat_id = ?2",
+                    params![channel, chat_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current != Some(expected) {
+                return Err(SyncError::other("会话记录已变化，请刷新列表后再试"));
+            }
+        }
         sync_db::kv_put(tx, &key, "true")?;
         if !sync_db::sync_tables_exist(tx)? {
             return Ok(());
+        }
+        if !confirmed {
+            if let Some(session) = map::session_map_by_key(tx, channel, chat_id)? {
+                if session.sealed == SEAL_SEALED {
+                    let row_id: Option<i64> = tx
+                        .query_row(
+                            "SELECT id FROM session WHERE channel = ?1 AND chat_id = ?2",
+                            params![channel, chat_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    // #<行ID> 供前端确认后按同一记录重试；0 表示没读到（前端应终止）。
+                    return Err(SyncError::other(format!(
+                        "需要确认#{}：这个会话已经同步到其他设备，设为仅本机等于在那边删除",
+                        row_id.unwrap_or(0)
+                    )));
+                }
+            }
         }
         let Some(session) = map::session_map_by_key(tx, channel, chat_id)? else {
             return Ok(());

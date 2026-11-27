@@ -39,6 +39,8 @@ pub struct SessionStore {
 /// 会话列表条目（桌面版多会话管理 / `/export all` / 交接）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
+    /// `session.id`（行主键）：删除/重建同一 chat_id 时会变化，用于操作前置校验。
+    pub row_id: i64,
     pub channel: String,
     pub chat_id: String,
     pub archived: bool,
@@ -134,9 +136,10 @@ fn is_artifact_chat_dir_name(name: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// 删除某会话的 artifact 目录（工具结果落盘句柄的实体；会话删除时级联清理）。
-/// best-effort：目录不存在视为成功，删除失败只告警（artifact 只是上下文优化产物，
-/// 不能让会话删除因此失败）。
+/// 把某会话的 artifact 目录原子改名到一个唯一墓碑名，返回墓碑路径。
+/// 删除事务提交前先移走旧目录；之后即使同键恢复写入新目录，也不会被旧删除清掉。
+/// 删除某会话的 artifact 目录（工具结果落盘句柄的实体；内部删除/全清时清理）。
+/// best-effort：目录不存在视为成功，删除失败只告警。
 fn remove_artifact_dir(layout: &crate::fs::Layout, channel: &str, chat_id: &str) {
     let dir = layout
         .base
@@ -772,7 +775,7 @@ impl SessionStore {
     /// 列出会话（`channel = None` 为全部），按 `updated_at` 降序。
     pub fn list_sessions(&self, channel: Option<&str>) -> Result<Vec<SessionSummary>> {
         self.db.with(|conn| {
-            let sql = "SELECT s.channel, s.chat_id, s.archived_at, s.created_at, s.updated_at, \
+            let sql = "SELECT s.id, s.channel, s.chat_id, s.archived_at, s.created_at, s.updated_at, \
                        (SELECT count(*) FROM message m WHERE m.session_id = s.id) \
                        FROM session s WHERE (?1 IS NULL OR s.channel = ?1) \
                        ORDER BY s.updated_at DESC, s.id DESC";
@@ -791,7 +794,7 @@ impl SessionStore {
         self.db.with(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT s.channel, s.chat_id, s.archived_at, s.created_at, s.updated_at, \
+                    "SELECT s.id, s.channel, s.chat_id, s.archived_at, s.created_at, s.updated_at, \
                      (SELECT count(*) FROM message m WHERE m.session_id = s.id) \
                      FROM session s WHERE s.channel = ?1 AND s.chat_id = ?2",
                     params![channel, chat_id],
@@ -803,8 +806,34 @@ impl SessionStore {
 
     /// 归档 / 取消归档。返回会话是否存在（不存在视为无事可做，调用方按幂等处理）。
     pub fn set_archived(&self, channel: &str, chat_id: &str, archived: bool) -> Result<bool> {
+        self.set_archived_checked(channel, chat_id, archived, None)
+    }
+
+    /// 同 [`Self::set_archived`]，但可在同一把库锁内校验会话行主键：确认期间同键重建时，
+    /// 旧归档操作不能作用到新记录上。
+    pub fn set_archived_checked(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        archived: bool,
+        expected_row_id: Option<i64>,
+    ) -> Result<bool> {
         let now = now_ms();
         self.db.with(|conn| {
+            if let Some(expected) = expected_row_id {
+                let current: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM session WHERE channel = ?1 AND chat_id = ?2",
+                        params![channel, chat_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if current != Some(expected) {
+                    return Err(StoreError::Other(
+                        "会话记录已变化，请刷新列表后再试".to_string(),
+                    ));
+                }
+            }
             let n = conn.execute(
                 "UPDATE session SET archived_at = ?3 WHERE channel = ?1 AND chat_id = ?2",
                 params![channel, chat_id, archived.then_some(now)],
@@ -1652,16 +1681,32 @@ fn session_id(conn: &Connection, channel: &str, chat_id: &str) -> Result<Option<
         .optional()?)
 }
 
-/// `session` 摘要行的列映射（`channel, chat_id, archived_at, created_at, updated_at, count`）。
+/// `session` 摘要行的列映射（`id, channel, chat_id, archived_at, created_at, updated_at, count`）。
 fn row_to_summary(row: &Row<'_>) -> rusqlite::Result<SessionSummary> {
     Ok(SessionSummary {
-        channel: row.get(0)?,
-        chat_id: row.get(1)?,
-        archived: row.get::<_, Option<i64>>(2)?.is_some(),
-        created_at: row.get(3)?,
-        updated_at: row.get(4)?,
-        message_count: row.get::<_, i64>(5)?.max(0) as u32,
+        row_id: row.get(0)?,
+        channel: row.get(1)?,
+        chat_id: row.get(2)?,
+        archived: row.get::<_, Option<i64>>(3)?.is_some(),
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        message_count: row.get::<_, i64>(6)?.max(0) as u32,
     })
+}
+
+impl SessionStore {
+    /// 会话行主键（不存在返回 None）。删除前校验，防止同 chat_id 的重建记录被旧操作误删。
+    pub fn session_row_id(&self, channel: &str, chat_id: &str) -> Result<Option<i64>> {
+        self.db.with(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT id FROM session WHERE channel = ?1 AND chat_id = ?2",
+                    params![channel, chat_id],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
 }
 
 /// 取（或创建）会话行并刷新 `updated_at`（追加消息时使用）。

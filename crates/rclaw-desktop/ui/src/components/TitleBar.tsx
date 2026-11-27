@@ -8,6 +8,7 @@ import {
 } from "react";
 import { api } from "../lib/api";
 import { PanelRightIcon } from "./icons";
+import { BellIcon } from "./NavIcons";
 
 /** 标题栏右侧统一的图标按钮（主题切换 / 窗控三键）。 */
 function BarButton({
@@ -50,16 +51,20 @@ const icon = {
  * 进入系统原生移动循环后 webview 收不到 dblclick 事件。 */
 export default function TitleBar({
   title,
-  theme,
   taskPanelOpen,
+  activityCount,
+  activityPulse,
+  activityHint,
+  onOpenActivity,
   onToggleTaskPanel,
-  onToggleTheme,
 }: {
   title: string;
-  theme: "dark" | "light";
   taskPanelOpen: boolean;
+  activityCount: number;
+  activityHint?: string;
+  activityPulse: boolean;
+  onOpenActivity: () => void;
   onToggleTaskPanel: () => void;
-  onToggleTheme: () => void;
 }) {
   const [maximized, setMaximized] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
@@ -115,24 +120,32 @@ export default function TitleBar({
         {title}
       </span>
       <div className="flex h-full items-center">
+        <BarButton
+          title={
+            activityHint ||
+            (activityCount > 0
+              ? `活动：${activityCount} 个执行进行中`
+              : "活动（任务概览 / Agent 执行）")
+          }
+          onClick={onOpenActivity}
+        >
+          <span className="relative flex items-center">
+            <BellIcon />
+            {activityCount > 0 && (
+              <span
+                className={`absolute -right-1.5 -top-1 min-w-3 rounded-full bg-amber-400 px-0.5 text-[9px] leading-3 text-black ${
+                  activityPulse ? "animate-pulse" : ""
+                }`}
+              >
+                {activityCount}
+              </span>
+            )}
+          </span>
+        </BarButton>
         <BarButton title={taskPanelOpen ? "收起任务面板" : "展开任务面板"} onClick={onToggleTaskPanel}>
           <PanelRightIcon active={taskPanelOpen} />
         </BarButton>
-        <BarButton
-          title={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"}
-          onClick={onToggleTheme}
-        >
-          {theme === "dark" ? (
-            <svg {...icon}>
-              <circle cx="8" cy="8" r="2.7" />
-              <path d="M8 1.5v1.7M8 12.8v1.7M1.5 8h1.7M12.8 8h1.7M3.4 3.4l1.2 1.2M11.4 11.4l1.2 1.2M12.6 3.4l-1.2 1.2M4.6 11.4l-1.2 1.2" />
-            </svg>
-          ) : (
-            <svg {...icon}>
-              <path d="M13.5 9.7A5.6 5.6 0 0 1 6.3 2.5a5.6 5.6 0 1 0 7.2 7.2z" />
-            </svg>
-          )}
-        </BarButton>
+
         {/* 浏览器快捷入口：窗控按钮左侧（最大/最小化左边）。地球图标点亮 =
             可见浏览器窗口已开启（用户可像 Firefox 一样上网，与助手共享会话）。 */}
         <BarButton

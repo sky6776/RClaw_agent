@@ -52,6 +52,7 @@ export default function ModelThinkingPicker({
   state,
   busy,
   compact = true,
+  suspended = false,
   onModelSelect,
   onThinkingSelect,
   onOpen,
@@ -60,6 +61,8 @@ export default function ModelThinkingPicker({
   busy?: boolean;
   /** 安卓窄屏显示缩写；桌面有空间，显示完整模型名与思考强度名。 */
   compact?: boolean;
+  /** 前景覆盖层打开：收起菜单并注销返回注册（App 统一调度返回）。 */
+  suspended?: boolean;
   onModelSelect: (model: string, expected: LlmState) => Promise<void>;
   onThinkingSelect: (value: string, expected: LlmState) => Promise<void>;
   onOpen?: () => void;
@@ -74,7 +77,10 @@ export default function ModelThinkingPicker({
     maxHeight: number;
   } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
-  useBackClose(open, () => setOpen(false));
+  useBackClose(open && !suspended, () => setOpen(false));
+  useEffect(() => {
+    if (suspended) setOpen(false);
+  }, [suspended]);
 
   // 菜单固定在视口内：与按钮右缘对齐、向左展开；窄屏收窄。上方空间不足时
   // 改向下展开；两侧都紧张时按可用空间限高（菜单自身滚动）。监听 window 与
@@ -199,7 +205,7 @@ export default function ModelThinkingPicker({
           </span>
         )}
       </button>
-      {open && pos !== null && pos.maxHeight >= 24 && pos.width >= 80 && (
+      {open && !suspended && pos !== null && pos.maxHeight >= 24 && pos.width >= 80 && (
         <div
           role="menu"
           aria-label="模型与思考强度"

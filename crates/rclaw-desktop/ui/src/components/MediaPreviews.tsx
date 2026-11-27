@@ -8,7 +8,8 @@ import {
 } from "react";
 import { api, type SyncAttachment } from "../lib/api";
 import { createLongPressGuard, type LongPressGuard } from "../lib/longPress";
-import { useIsMobile, isAndroidDevice } from "../lib/useIsMobile";
+import { isAndroidDevice } from "../lib/useIsMobile";
+import { useCompactLayout } from "../lib/compactLayout";
 import {
   AttachmentCard,
   clearAttachmentChanged,
@@ -242,7 +243,7 @@ export default function MediaPreviews({
   // ""=获取失败（降级为「点开」卡交给系统播放器）。
   const [videoUrls, setVideoUrls] = useState<Record<string, string>>({});
   const videoRequested = useRef<Set<string>>(new Set());
-  const isMobile = useIsMobile();
+  const isMobile = useCompactLayout();
   // 长按触发后吞掉紧随的 click（长按松手仍会派发 click，会误触「点开」/查看器）。
   const suppressClickRef = useRef(false);
   // 组件还活着、还是同一个会话：点播/预览这类异步结果回来时再确认一次，别把上一个

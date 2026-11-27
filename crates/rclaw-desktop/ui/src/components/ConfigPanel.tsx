@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type ConfigEdit,
+  type ConfigImportOutcome,
   type ConfigItem,
   type ConfigSection,
   type ConfigStateDto,
@@ -482,24 +483,34 @@ function SectionCard({
  * 轮播周期的编辑——标语属界面偏好（desktop_prefs.json），不写入 rclaw.toml。 */
 export default function ConfigPanel({
   agentReady,
+  repairMode = false,
   slogans,
   sloganInterval,
   onSlogansSaved,
+  onImportRaw,
 }: {
   agentReady: boolean;
+  /** 启动失败进入设置：只显示原文/导入修复视图（结构化表单禁用）。 */
+  repairMode?: boolean;
   slogans: string[];
   sloganInterval: number;
   onSlogansSaved: (prefs: SloganPrefs) => void;
+  /** 统一由 App 调用 config_import_raw（置 importInFlight 抑制 starting）。 */
+  onImportRaw: (content: string) => Promise<ConfigImportOutcome>;
 }) {
   const [state, setState] = useState<ConfigStateDto | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  /** 导入回执提示（重启/启动失败/同步重载）：与读配置的 error 分开，
+   *  3 秒自动刷新成功不会把它清掉。 */
+  const [receipt, setReceipt] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
   // 安卓 App 专属：从手机存储导入整份 rclaw.toml 覆盖现有配置（桌面无此入口）。
   const android = isAndroidDevice();
   const fileRef = useRef<HTMLInputElement>(null);
   const [importing, setImporting] = useState(false);
+  const [rawDraft, setRawDraft] = useState("");
   // 标语草稿（每行一条）与轮播周期（秒）；loaded 标记是否已从后端加载。
   const [sloganDraft, setSloganDraft] = useState<string>("");
   const [intervalDraft, setIntervalDraft] = useState<string>("");
@@ -562,6 +573,7 @@ export default function ConfigPanel({
     try {
       const s = await api.configState();
       setState(s);
+      setRawDraft(s.raw);
       // 轮询刷新保留未保存草稿：展示值 = 草稿 ?? 基线，外部改动刷新基线后，
       // 无草稿的键立即反映文件内容；保存后的刷新仍全量重置草稿。
       if (!opts?.keepDrafts) setDrafts({});
@@ -571,22 +583,41 @@ export default function ConfigPanel({
     }
   }, []);
 
+  // 配置首载不依赖 agent：启动失败（error 修复模式）时也要能读到原文/错误信息。
   useEffect(() => {
-    if (agentReady) void refresh();
-  }, [agentReady, refresh]);
+    void refresh();
+  }, [refresh]);
 
-  // 导入整份配置文件：后端校验通过才落盘，成功后重读刷新整个面板。
+  // 导入整份配置文件：App 统一调用（importInFlight 抑制 starting），按回执给反馈。
+  const runImport = useCallback(
+    async (content: string) => {
+      setError(null);
+      setReceipt(null);
+      setImporting(true);
+      try {
+        const outcome = await onImportRaw(content);
+        await refresh();
+        const notes: string[] = [];
+        if (outcome.restart_required) {
+          notes.push("配置已写入；当前 agent 仍在运行旧配置，请重启应用生效。");
+        } else if (outcome.start_error) {
+          notes.push(`配置已写入，但启动失败：${outcome.start_error}`);
+        }
+        if (!outcome.sync_reloaded) {
+          notes.push("同步引擎重载失败；请到「多端同步」检查。");
+        }
+        if (notes.length > 0) setReceipt(notes.join(" "));
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setImporting(false);
+      }
+    },
+    [onImportRaw, refresh],
+  );
+
   const importToml = async (file: File) => {
-    setError(null);
-    setImporting(true);
-    try {
-      await api.configImportRaw(await file.text());
-      await refresh();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setImporting(false);
-    }
+    await runImport(await file.text());
   };
 
   // 外部编辑 rclaw.toml 的近实时同步：config_state 每次都从磁盘新读，这里仅在
@@ -613,6 +644,10 @@ export default function ConfigPanel({
 
   const save = useCallback(async () => {
     if (!state) return;
+    if (state.read_error) {
+      setError(`主配置当前不可读（${state.read_error}）；请用「从文件导入」覆盖它。`);
+      return;
+    }
     const edits: ConfigEdit[] = state.doc.sections
       .flatMap((sec) => sec.items)
       .filter((it) => {
@@ -622,6 +657,7 @@ export default function ConfigPanel({
       .map((it) => ({ path: it.path, kind: it.kind, value: drafts[it.path] }));
     setSaving(true);
     setError(null);
+    setReceipt(null);
     try {
       await api.configSave(edits);
       await refresh();
@@ -636,6 +672,78 @@ export default function ConfigPanel({
     return (
       <div className="flex h-full items-center justify-center text-sm text-gray-500">
         {error ?? "加载配置…"}
+      </div>
+    );
+  }
+
+  if (repairMode || state.read_error) {
+    const readError = state.read_error;
+    const parseError = state.parse_error;
+    const editable = !readError;
+    return (
+      <div className="flex h-full flex-col overflow-y-auto p-6 max-md:p-3">
+        <h1 className="text-base font-semibold text-gray-100">
+          {repairMode ? "配置修复" : "主配置不可读"}
+        </h1>
+        <p className="mt-1 font-mono text-[10px] text-gray-600">{state.path}</p>
+        <div className="mt-3 rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-2 text-[11px] leading-relaxed text-gray-500">
+          {repairMode
+            ? "agent 未能启动。修正主配置后点「保存并启动」（走整份导入：校验 → 原子写 → 启动）；当前 agent 已在运行时只会提示重启应用。"
+            : "主配置读取失败（权限或编码问题）。为避免用空内容覆盖真实文件，结构化保存已禁用；只能从文件导入覆盖它。"}
+        </div>
+        {(readError || parseError) && (
+          <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-[11px] leading-relaxed text-red-300">
+            {readError ?? parseError}
+          </div>
+        )}
+        {readError ? (
+          <div className="mt-3 rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-2 text-[11px] leading-relaxed text-gray-400">
+            主配置当前不可读，没有可信原文。只能从文件导入（导入会覆盖它）。
+          </div>
+        ) : (
+          <textarea
+            value={rawDraft}
+            onChange={(e) => setRawDraft(e.target.value)}
+            spellCheck={false}
+            className="mt-3 min-h-64 w-full flex-1 resize-y rounded-lg border border-[#2a2f3a] bg-[#141821] p-3 font-mono text-[11px] leading-relaxed text-gray-200 outline-none focus:border-indigo-500/50"
+            aria-label="rclaw.toml 原文"
+          />
+        )}
+        {error && <div className="mt-2 text-xs text-red-400">{error}</div>}
+        {receipt && (
+          <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-300">
+            {receipt}
+          </div>
+        )}
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {editable && (
+            <button
+              onClick={() => void runImport(rawDraft)}
+              disabled={importing || rawDraft.trim() === ""}
+              className="rounded-lg bg-indigo-500/80 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-indigo-500 disabled:opacity-40"
+            >
+              {importing ? "保存中…" : "保存并启动"}
+            </button>
+          )}
+          <button
+            onClick={() => fileRef.current?.click()}
+            disabled={importing}
+            className="rounded-lg border border-[#2a2f3a] bg-[#1a1f29] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-200 disabled:opacity-40"
+          >
+            从文件导入…
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".toml,text/plain,application/toml"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (f) void importToml(f);
+            }}
+          />
+        </div>
       </div>
     );
   }
@@ -690,9 +798,9 @@ export default function ConfigPanel({
           </p>
         )}
 
-        <SoulCard />
+        {agentReady && <SoulCard />}
 
-        <SkillOpsCard />
+        {agentReady && <SkillOpsCard />}
 
         {/* 标题栏循环标语：界面偏好，不写 rclaw.toml */}
         <div className="mb-4 rounded-xl border border-[#2a2f3a] bg-[#141821] p-4">
@@ -854,6 +962,12 @@ export default function ConfigPanel({
             放弃修改
           </button>
           {error && <span className="min-w-0 flex-1 truncate text-xs text-red-400" title={error}>{error}</span>}
+          {receipt && <span className="min-w-0 flex-1 truncate text-xs text-amber-300" title={receipt}>{receipt}</span>}
+        </div>
+      )}
+      {dirtyCount === 0 && receipt && (
+        <div className="border-t border-[#2a2f3a] bg-[#12151d] px-6 py-3 text-xs text-amber-300">
+          {receipt}
         </div>
       )}
       {dirtyCount === 0 && error && (

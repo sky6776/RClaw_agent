@@ -149,10 +149,14 @@ async fn save_with_secret(
 }
 
 /// `rclaw.toml` 被别的入口改写之后（配置面板保存了 `sync.*`、导入了整份配置）：把文件里
-/// 的 `[sync]` 重新交给引擎。读不出来只记日志——文件本身的毛病由那个入口自己报。
-pub(super) async fn reload_config(state: &AppState) {
+/// 的 `[sync]` 重新交给引擎。读不出来返回错误（调用方决定提示还是只记日志）。
+///
+/// 成功边界：已从磁盘（在存储锁内）读到当前配置并交给引擎。引擎内部发布/线程启动
+/// 失败不在这里展开——它们由 sync 状态/日志反映，UI 只在 `sync_reloaded == false`
+/// 时提示「同步引擎重载失败」。
+pub(super) async fn reload_config(state: &AppState) -> Result<(), String> {
     let Some(engine) = state.sync() else {
-        return;
+        return Ok(());
     };
     let home = state.home.clone();
     let paths = rclaw_sync::SyncPaths::new(&home);
@@ -170,8 +174,12 @@ pub(super) async fn reload_config(state: &AppState) {
             engine.apply_config_locked(config);
             drop(lock);
             crate::sync_host::emit_status();
+            Ok(())
         }
-        Err(error) => tracing::warn!("重新读取 [sync] 设置失败: {error}"),
+        Err(error) => {
+            tracing::warn!("重新读取 [sync] 设置失败: {error}");
+            Err(error)
+        }
     }
 }
 
@@ -581,13 +589,29 @@ pub async fn sync_set_local_only(
     state: State<'_, AppState>,
     chat_id: String,
     on: bool,
+    expected_record_id: Option<i64>,
+    confirmed: Option<bool>,
 ) -> Result<(), String> {
     check_chat_id(&chat_id)?;
     let engine = handle(&state)?;
-    run_blocking("设置仅本机", move || {
-        engine
-            .set_local_only(CHANNEL_DESKTOP, &chat_id, on)
-            .map_err(fail)
+    run_blocking("设置仅本机", move || match expected_record_id {
+        Some(expected) => engine
+            .set_local_only_checked(
+                CHANNEL_DESKTOP,
+                &chat_id,
+                on,
+                expected,
+                confirmed.unwrap_or(false),
+            )
+            .map_err(fail),
+        None => engine
+            .set_local_only_confirmed(
+                CHANNEL_DESKTOP,
+                &chat_id,
+                on,
+                confirmed.unwrap_or(false),
+            )
+            .map_err(fail),
     })
     .await
 }

@@ -36,10 +36,16 @@ function closeTopmost(): boolean {
   return true;
 }
 
+/** Esc 与 Android 返回共用的第一层判定：先关当前可见的弹层/确认框。
+ *  返回是否已消费；未消费时由调用方处理前景/抽屉/聊天。 */
+export function dispatchBackKey(): boolean {
+  return closeTopmost();
+}
+
 /** 装载返回键决策函数（仅安卓 APP 主界面调用；未装载时返回键由原生侧走
  *  系统默认退出，向导/启动期即此行为）。 */
 export function installBackNavigation(onBack: () => boolean) {
   (window as unknown as Record<string, unknown>).__rclawBack = () => {
-    closeTopmost() || onBack();
+    dispatchBackKey() || onBack();
   };
 }

@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { BellIcon, GearIcon } from "./NavIcons";
+
 const icon = {
   width: 18,
   height: 18,
@@ -11,18 +13,24 @@ const icon = {
   strokeLinejoin: "round",
 } as const;
 
-/** 移动端顶栏（<768px）：汉堡开抽屉 + 标题 + 主题切换。
+/** 移动端顶栏：汉堡开抽屉 + 标题 + 活动 + 设置。
  * Android 无自绘窗控（系统提供返回/主页），标题栏不可拖拽移动窗口。 */
 export default function MobileTopBar({
   title,
-  theme,
+  activityCount,
+  activityPulse,
+  activityHint,
   onOpenDrawer,
-  onToggleTheme,
+  onOpenActivity,
+  onOpenSettings,
 }: {
   title: string;
-  theme: "dark" | "light";
+  activityCount: number;
+  activityPulse: boolean;
+  activityHint?: string;
   onOpenDrawer: () => void;
-  onToggleTheme: () => void;
+  onOpenActivity: () => void;
+  onOpenSettings: () => void;
 }) {
   return (
     <div
@@ -43,20 +51,27 @@ export default function MobileTopBar({
         {title}
       </span>
       <button
-        onClick={onToggleTheme}
-        title={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"}
+        onClick={onOpenActivity}
+        title={activityHint || "活动"}
+        className="relative flex h-11 w-11 items-center justify-center rounded-full text-gray-400 transition active:bg-[#1a1f29]"
+      >
+        <BellIcon />
+        {activityCount > 0 && (
+          <span
+            className={`absolute right-1.5 top-1.5 min-w-3.5 rounded-full bg-amber-400 px-1 text-[9px] leading-3.5 text-black ${
+              activityPulse ? "animate-pulse" : ""
+            }`}
+          >
+            {activityCount}
+          </span>
+        )}
+      </button>
+      <button
+        onClick={onOpenSettings}
+        title="设置"
         className="flex h-11 w-11 items-center justify-center rounded-full text-gray-400 transition active:bg-[#1a1f29]"
       >
-        {theme === "dark" ? (
-          <svg {...icon}>
-            <circle cx="8" cy="8" r="2.7" />
-            <path d="M8 1.5v1.7M8 12.8v1.7M1.5 8h1.7M12.8 8h1.7M3.4 3.4l1.2 1.2M11.4 11.4l1.2 1.2M12.6 3.4l-1.2 1.2M4.6 11.4l-1.2 1.2" />
-          </svg>
-        ) : (
-          <svg {...icon}>
-            <path d="M13.5 9.7A5.6 5.6 0 0 1 6.3 2.5a5.6 5.6 0 1 0 7.2 7.2z" />
-          </svg>
-        )}
+        <GearIcon />
       </button>
     </div>
   );
@@ -66,7 +81,7 @@ export default function MobileTopBar({
 export function DrawerScrim({ onClose }: { onClose: () => void }) {
   return (
     <div
-      className="fixed inset-0 z-40 bg-black/60"
+      className="fixed bottom-0 left-0 right-0 top-0 z-40 bg-black/60"
       style={{ top: "env(safe-area-inset-top)" }}
       onClick={onClose}
     />

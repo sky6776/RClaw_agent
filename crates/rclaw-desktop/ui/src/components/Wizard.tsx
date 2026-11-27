@@ -1,9 +1,23 @@
 import { useRef, useState } from "react";
-import { api, PROVIDER_PRESETS, type WizardInput } from "../lib/api";
+import {
+  api,
+  PROVIDER_PRESETS,
+  type ConfigImportOutcome,
+  type WizardInput,
+} from "../lib/api";
 import { isAndroidDevice } from "../lib/useIsMobile";
 
 /** 首运行配置向导：生成 rclaw.toml 并启动 agent。 */
-export default function Wizard({ home, onDone }: { home: string; onDone: () => void }) {
+export default function Wizard({
+  home,
+  onDone,
+  onImportRaw,
+}: {
+  home: string;
+  onDone: () => void;
+  /** App 统一调用 config_import_raw（importInFlight 抑制 starting），返回回执。 */
+  onImportRaw: (content: string) => Promise<ConfigImportOutcome>;
+}) {
   const [preset, setPreset] = useState<string>("zhipu");
   const [provider, setProvider] = useState("zhipu");
   const [baseUrl, setBaseUrl] = useState(PROVIDER_PRESETS.zhipu.baseUrl);
@@ -22,8 +36,16 @@ export default function Wizard({ home, onDone }: { home: string; onDone: () => v
     setError(null);
     setImporting(true);
     try {
-      await api.configImportRaw(await file.text());
-      onDone();
+      const outcome = await onImportRaw(await file.text());
+      if (outcome.started) {
+        onDone();
+      } else if (outcome.restart_required) {
+        setError("配置已写入；应用已在运行旧配置，请重启/重新打开后生效。");
+      } else if (outcome.start_error) {
+        setError(`配置已写入，但启动失败：${outcome.start_error}`);
+      } else {
+        setError("配置已写入，但 agent 未启动，请检查配置后重试。");
+      }
     } catch (e) {
       setError(String(e));
     } finally {

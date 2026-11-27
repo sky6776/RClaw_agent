@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
-import { isAndroidDevice, useIsMobile } from "../lib/useIsMobile";
+import { isAndroidDevice } from "../lib/useIsMobile";
+import { useCompactLayout } from "../lib/compactLayout";
 import { useBackClose } from "../lib/backNav";
 
 /** 工作区文件面板：安卓上 agent 目录（应用私有存储）文件管理器无法访问，
@@ -50,7 +51,17 @@ function entryIcon(entry: Entry): string {
   return entry.is_dir ? "📁" : "📄";
 }
 
-export default function FilePanel({ onError }: { onError?: (m: string) => void }) {
+export default function FilePanel({
+  onError,
+  onEditorDirtyChange,
+  onRequestLeave,
+}: {
+  onError?: (m: string) => void;
+  /** 编辑器脏态上抛（App 的离开守卫据此拦截关闭设置/切分区/切会话）。 */
+  onEditorDirtyChange?: (dirty: boolean) => void;
+  /** 统一离开守卫：确认后执行 after（取消则留在编辑器）。 */
+  onRequestLeave?: (after: () => void) => void;
+}) {
   const [dir, setDir] = useState("");
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -64,6 +75,26 @@ export default function FilePanel({ onError }: { onError?: (m: string) => void }
   const [newName, setNewName] = useState("");
   // 脏文件关闭二次确认（WebView 无原生 confirm）。
   const [confirmClose, setConfirmClose] = useState(false);
+  useEffect(() => {
+    onEditorDirtyChange?.(editor?.dirty ?? false);
+  }, [editor?.dirty, onEditorDirtyChange]);
+  useEffect(() => () => onEditorDirtyChange?.(false), [onEditorDirtyChange]);
+  const requestCloseEditor = () => {
+    if (!editor) return;
+    if (confirmClose) {
+      setConfirmClose(false);
+      return;
+    }
+    if (editor.dirty && onRequestLeave) {
+      onRequestLeave(() => setEditor(null));
+      return;
+    }
+    if (editor.dirty) {
+      setConfirmClose(true);
+      return;
+    }
+    setEditor(null);
+  };
   // 行操作菜单（长按 450ms / 右键）：menu 记录目标与坐标。
   const [menu, setMenu] = useState<{ entry: Entry; x: number; y: number } | null>(null);
   // 长按打开后抬指的合成 click 会落在遮罩上把菜单瞬间关掉：一发式吞吐
@@ -85,24 +116,14 @@ export default function FilePanel({ onError }: { onError?: (m: string) => void }
     window.clearTimeout(noticeTimer.current);
     noticeTimer.current = window.setTimeout(() => setNotice(null), 2000);
   };
-  const isMobile = useIsMobile();
+  const isMobile = useCompactLayout();
   const pressTimer = useRef<number | null>(null);
   const suppressClickRef = useRef(false);
   // 系统返回键关行操作菜单 / 删除确认 / 全页编辑器 / 重命名与新建行（弹层栈
   // 后进先出：编辑器是覆盖整页的 fixed 层，不注册的话返回键会穿透到侧栏呼出）。
   useBackClose(menu !== null, () => setMenu(null));
   useBackClose(confirmDel !== null, () => setConfirmDel(null));
-  useBackClose(editor !== null, () => {
-    if (confirmClose) {
-      setConfirmClose(false); // 最上层是「放弃修改」确认条：返回 = 继续编辑
-      return;
-    }
-    if (editor?.dirty) {
-      setConfirmClose(true); // 脏文件先出确认，与「关闭」按钮同一语义
-      return;
-    }
-    setEditor(null);
-  });
+  useBackClose(editor !== null, requestCloseEditor);
   useBackClose(renaming !== null, () => setRenaming(null));
   useBackClose(creating || creatingFolder, () => {
     setCreating(false);
@@ -547,7 +568,7 @@ export default function FilePanel({ onError }: { onError?: (m: string) => void }
       {menu && (
         <>
           <div
-            className="fixed inset-0 z-50"
+            className="fixed bottom-0 left-0 right-0 top-0 z-50"
             onClick={() => {
               // 长按打开后抬指的合成 click 吞掉，防菜单瞬间自关。
               if (menuClickGuard.current) {
@@ -693,7 +714,7 @@ export default function FilePanel({ onError }: { onError?: (m: string) => void }
 
       {/* 文本编辑器（覆盖整页）。 */}
       {editor && (
-        <div className="fixed inset-0 z-50 flex flex-col bg-[#0f1117]">
+        <div className="fixed bottom-0 left-0 right-0 top-0 z-50 flex flex-col bg-[#0f1117]">
           <div
             className="flex items-center gap-2 border-b border-[#2a2f3a] px-3 py-2"
             style={{ paddingTop: "calc(env(safe-area-inset-top) + 0.5rem)" }}
@@ -713,14 +734,7 @@ export default function FilePanel({ onError }: { onError?: (m: string) => void }
               保存
             </button>
             <button
-              onClick={() => {
-                if (!editor.dirty) {
-                  setEditor(null);
-                  return;
-                }
-                // WebView 无原生 confirm：脏文件走二次点击确认。
-                setConfirmClose((v) => !v);
-              }}
+              onClick={requestCloseEditor}
               className="rounded-lg border border-[#2a2f3a] px-3 py-1.5 text-xs text-gray-300 transition hover:text-gray-100"
             >
               {confirmClose && editor.dirty ? "确认放弃修改？" : "关闭"}

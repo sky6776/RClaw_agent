@@ -73,10 +73,12 @@ export default function SyncTrash({
     setBusy(item.id);
     try {
       const imported = await api.syncTrashRestore(item.id);
-      await load();
       if (imported.channel === "desktop") {
+        // 先通知 App 换代/清草稿/打开，再刷新回收站列表，缩短旧草稿可发送窗口。
         onOpenChat(imported.chat_id);
+        await load();
       } else {
+        await load();
         // 不是桌面通道的会话（比如别的入口产生的）：这里的会话列表里没有它，说一声。
         onNotice(
           `「${item.title || item.chat_id}」已经恢复成一个新会话。它属于「${imported.channel}」通道，不在这里的会话列表里。`,

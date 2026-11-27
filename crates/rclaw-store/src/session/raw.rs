@@ -493,7 +493,28 @@ impl SessionStore {
         chat_id: &str,
         sync: SessionDeleteSync,
     ) -> Result<bool> {
-        let existed = self.db.transaction(|tx| {
+        self.delete_session_with_checked(channel, chat_id, sync, None)
+    }
+
+    /// 同 [`Self::delete_session_with`]，但可在事务内校验会话行主键：确认框打开后
+    /// 同 chat_id 被重建（同步恢复/导入）时拒绝删除，避免旧确认删到新记录。
+    pub fn delete_session_with_checked(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        sync: SessionDeleteSync,
+        expected_row_id: Option<i64>,
+    ) -> Result<bool> {
+        // 先把旧 artifact 目录改名暂存：事务提交后同键恢复写入的新目录不会被清掉；
+        // 删除失败/记录不存在时再改回来。
+        let result = self.db.transaction(|tx| {
+            if let Some(expected) = expected_row_id {
+                if session_id(tx, channel, chat_id)? != Some(expected) {
+                    return Err(StoreError::Other(
+                        "会话记录已变化，请刷新列表后再试".to_string(),
+                    ));
+                }
+            }
             tx.execute(
                 "DELETE FROM usage_anchor WHERE channel = ?1 AND chat_id = ?2",
                 params![channel, chat_id],
@@ -522,8 +543,11 @@ impl SessionStore {
                 params![channel, chat_id],
             )?;
             Ok(n > 0)
-        })?;
-        if existed {
+        });
+        let existed = result?;
+        if existed && expected_row_id.is_none() {
+            // 无记录前置条件的删除（内部/全清）仍按原路径清理；带前置条件的用户删除
+            // 不删 artifact 目录：同键重建可能已写入新文件，宁可留下无引用目录也不误删。
             remove_artifact_dir(&self.layout, channel, chat_id);
         }
         Ok(existed)

@@ -105,8 +105,14 @@ export default function CaptureDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="mx-4 w-[20rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-4 shadow-2xl max-md:w-[calc(100%-2rem)]">
+    <div className="fixed bottom-0 left-0 right-0 top-0 z-50 flex items-center justify-center bg-black/50">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="采集结果"
+        tabIndex={-1}
+        className="mx-4 w-[20rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-4 shadow-2xl max-md:w-[calc(100%-2rem)]"
+      >
         <h2 className="text-sm font-semibold text-gray-100">
           {kind === "video" ? "视频已就绪" : "录音已完成"}
         </h2>

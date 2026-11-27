@@ -16,7 +16,10 @@ import {
   type AgentEvent,
   type AppVersions,
   type ChatHistoryDelta,
+  type BotEntry,
   type ChatMeta,
+  type ConfigImportOutcome,
+  type GroupRoom,
   type HistoryMsg,
   type PermissionRequest,
   type PlanStatus,
@@ -56,12 +59,23 @@ import TaskOverviewPanel from "./components/TaskOverviewPanel";
 import TaskPanel from "./components/TaskPanel";
 import TitleBar from "./components/TitleBar";
 import MobileTopBar, { Drawer, DrawerScrim } from "./components/MobileChrome";
+import Sidebar from "./components/Sidebar";
+import SettingsOverlay, {
+  type SettingsSection,
+  type SettingsState,
+} from "./components/SettingsOverlay";
+import ActivityOverlay, { type ActivityState } from "./components/ActivityOverlay";
+import GroupRoomView from "./components/GroupRoomView";
+import GroupCreateDialog from "./components/GroupCreateDialog";
+import ExecutionPage from "./components/ExecutionPage";
+import { CompactLayoutProvider } from "./lib/compactLayout";
+import { useFocusTrap } from "./lib/focusTrap";
 import PhotoEditor from "./components/PhotoEditor";
 import CaptureDialog from "./components/CaptureDialog";
 import KeepAliveCard from "./components/KeepAliveCard";
 import { useIsMobile, isAndroidDevice } from "./lib/useIsMobile";
 import { useEdgeSwipe } from "./lib/useEdgeSwipe";
-import { installBackNavigation, useBackClose } from "./lib/backNav";
+import { dispatchBackKey, installBackNavigation, useBackClose } from "./lib/backNav";
 import {
   AboutIcon,
   AgentsIcon,
@@ -78,47 +92,6 @@ import {
   TasksIcon,
   ToolsIcon,
 } from "./components/icons";
-
-type Page =
-  | "chat"
-  | "chats"
-  | "bots"
-  | "tools"
-  | "skills"
-  | "files"
-  | "agents"
-  | "evolution"
-  | "cron"
-  | "sync"
-  | "taskview"
-  | "config"
-  | "about";
-
-/** 会话列表页的图标（对话气泡叠层）。 */
-function SessionsIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M2 3.5h8.5v5H5L2 11V3.5z" />
-      <path d="M6 12.5h7.5L16 15V8.2c0-.7-.4-1.2-1-1.2H14" />
-    </svg>
-  );
-}
-
-/** 导航项：页面 / 标签 / 图标。「对话」列在首位（收起后的图标栏也需要回到对话的入口）。 */
-const NAV: Array<[Page, string, () => ReactNode]> = [
-  ["chat", "对话", () => <ChatIcon />],
-  ["chats", "会话", () => <SessionsIcon />],
-  ["bots", "智能体", () => <BotsIcon />],
-  ["tools", "工具", () => <ToolsIcon />],
-  ["skills", "技能", () => <SkillsIcon />],
-  ["files", "工作区", () => <FolderIcon />],
-  ["agents", "Agent", () => <AgentsIcon />],
-  ["evolution", "自进化", () => <EvolutionIcon />],
-  ["cron", "定时任务", () => <CronIcon />],
-  ["sync", "多端同步", () => <SyncIcon />],
-  ["config", "配置", () => <ConfigIcon />],
-  ["about", "关于", () => <AboutIcon />],
-];
 
 let next_entry_id = 1;
 
@@ -237,57 +210,6 @@ function ResizeHandle({ onDrag }: { onDrag: (clientX: number) => void }) {
   );
 }
 
-/** Agent / 任务概览页：列表面板（children，按「是否被盖住」渲染）+ 盖在上面的执行详情。
- *  进详情时列表面板仍挂着（只是隐藏），返回不重新加载、滚动位置不丢；详情按 agentId 作
- *  key，切换执行时整页重建，不复用旧记录的状态。返回时把焦点还给刚才点开的那张卡片
- *  （`data-agent-id`）：详情卸载后焦点否则落到 body；卡片在面板的滚动容器里，键盘翻页
- *  仍然可用——列表容器本身不做可聚焦（可聚焦祖先会截住键盘滚动）。卡片已被清掉就退到
- *  列表第一张；一张都没有则不聚焦。 */
-function ExecutionPage({
-  selectedAgentId,
-  onBack,
-  children,
-}: {
-  selectedAgentId: string | null;
-  onBack: () => void;
-  children: (hidden: boolean) => ReactNode;
-}) {
-  const listRef = useRef<HTMLDivElement | null>(null);
-  const back = () => {
-    const agentId = selectedAgentId;
-    onBack();
-    if (agentId === null) return;
-    // 列表容器在这次更新提交后才重新可见（visibility:hidden 的元素不可聚焦），下一帧再聚焦。
-    // 那张卡片已被清掉（详情里看到「已被清除」后返回）就退到列表第一张，键盘翻页仍有锚点；
-    // 一张都没有则无处可聚焦，也无可滚动。回到原卡片时 preventScroll 保住列表滚动位置
-    // （卡片若被新入表的执行顶出可视区，焦点环会暂时不可见，接受这个取舍）；退到第一张时
-    // 原锚点已不存在，让它滚进视口。
-    requestAnimationFrame(() => {
-      const list = listRef.current;
-      if (!list) return;
-      const card =
-        list.querySelector<HTMLElement>(`[data-agent-id="${CSS.escape(agentId)}"]`) ??
-        list.querySelector<HTMLElement>("[data-agent-id]");
-      card?.focus({ preventScroll: card.dataset.agentId === agentId });
-    });
-  };
-  const showingDetail = selectedAgentId !== null;
-  return (
-    <div className="relative h-full">
-      <div
-        ref={listRef}
-        className={showingDetail ? "invisible absolute inset-0 overflow-hidden" : "h-full"}
-        aria-hidden={showingDetail}
-      >
-        {children(showingDetail)}
-      </div>
-      {selectedAgentId !== null && (
-        <AgentExecutionDetail key={selectedAgentId} agentId={selectedAgentId} onBack={back} />
-      )}
-    </div>
-  );
-}
-
 /** 应用壳：向导模式 / agent 启动中 / 主界面三态。
  *
  * 会话转录与忙碌状态按 chat_id 提升到本层持有——切换页面 / 会话都不会丢失；
@@ -296,9 +218,20 @@ export default function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [agentState, setAgentState] = useState<"idle" | "starting" | "ready" | "error">("idle");
   const [agentError, setAgentError] = useState<string | null>(null);
-  const [page, setPage] = useState<Page>("chat");
-  // 正在查看详情的子 agent 执行（Agent / 任务概览页内的详情层；null = 列表）。
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  // 前景覆盖层（设置 / 活动 / 群聊房间）；null = 只看聊天。
+  const [settings, setSettings] = useState<SettingsState | null>(null);
+  const [activity, setActivity] = useState<ActivityState | null>(null);
+  const [roomId, setRoomId] = useState<string | null>(null);
+  // 群房间快照（App 单一持有；BotsPanel/Sidebar/＋菜单共用）。
+  const [rooms, setRooms] = useState<GroupRoom[]>([]);
+  const roomsRef = useRef<GroupRoom[]>([]);
+  roomsRef.current = rooms;
+  const [roomMenu, setRoomMenu] = useState<{ room: GroupRoom; x: number; y: number } | null>(
+    null,
+  );
+  /** 删除群聊确认（侧栏菜单与设置「智能体」共用）。 */
+  const [roomDeleteConfirm, setRoomDeleteConfirm] = useState<{ room: GroupRoom } | null>(null);
+  const [botsForRoom, setBotsForRoom] = useState<BotEntry[]>([]);
   // 侧边栏「Agent / 任务概览」实时徽标：直播仓里活跃（排队 / 运行 / 等待 / 取消中）的执行数。
   // 只订阅统计数字：每条进度 / token 事件都不该让 App 整树重渲。
   const liveCounts = useAgentExecutionCounts(agentState === "ready");
@@ -353,54 +286,220 @@ ${event.payload.command}
   }, [slogans, sloganInterval]);
   // 标语轮播到原生窗口标题栏（「最上面」的 RClaw 处）。
   const sloganTitle = slogans.length ? slogans[sloganIdx % slogans.length] : "RClaw";
-  // 移动端（<768px）：侧栏改为抽屉，任务面板/窗控隐藏；桌面布局零影响。
+  // 移动端（<768px）+ Android 设备都走紧凑布局；桌面窄窗口/安卓横屏都不出现
+  // Windows TitleBar。Context 下发给 Chat/FilePanel/MediaPreviews/Picker。
   const isMobile = useIsMobile();
+  const compactLayout = isMobile || isAndroidDevice();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const drawerViaBack = useRef(false);
+  const chatWrapRef = useRef<HTMLDivElement | null>(null);
+  const [groupCreateOpen, setGroupCreateOpen] = useState(false);
+  const [importInFlight, setImportInFlight] = useState(false);
+  const importLock = useRef(false);
+  const [fileDirty, setFileDirty] = useState(false);
+  const [leaveConfirm, setLeaveConfirm] = useState<{
+    after: () => void;
+    onCancel?: () => void;
+  } | null>(null);
+  /** 当前显示的离开确认（同步持有，不等 React 渲染；两次请求不会互相覆盖）。 */
+  type LeaveReq = { after: () => void; onCancel?: () => void };
+  const leaveHead = useRef<LeaveReq | null>(null);
+  /** 同时只显示一个离开确认；后来的请求排队（保证照片发送等 Promise 都能结算）。 */
+  const leaveQueue = useRef<LeaveReq[]>([]);
+  const importInFlightRef = useRef(false);
+  importInFlightRef.current = importInFlight;
   // 安卓 App：左缘右滑呼出抽屉 / 抽屉内左滑收起（与内部横向滚动互斥判定
-  // 见 hook）；向导/启动页不启用。桌面版（含窄窗口）不挂任何监听。
+  // 见 hook）；向导/启动页/前景覆盖层打开时不启用。桌面版（含窄窗口）不挂监听。
   const showWizard = status?.wizard_needed ?? false;
   useEdgeSwipe({
     open: drawerOpen,
-    onOpen: () => setDrawerOpen(true),
-    onClose: () => setDrawerOpen(false),
-    enabled: isAndroidDevice() && isMobile && !showWizard,
+    onOpen: () => {
+      drawerViaBack.current = false;
+      setDrawerOpen(true);
+    },
+    onClose: () => {
+      drawerViaBack.current = false;
+      setDrawerOpen(false);
+    },
+    enabled: isAndroidDevice() && compactLayout && !showWizard && !settings && !activity && !roomId,
   });
 
   // 安卓返回键导航（原生侧 MainActivity 把返回键翻译成 __rclawBack 调用）：
-  // 弹层开着 = 关一层；抽屉开 = 退出应用；会话由「会话」列表点开 = 先回列表
-  // （钻取式回退）；否则 = 呼出侧边栏（「返回回到侧边栏，再按退出」）。向导/
-  // 启动期不装载（走系统默认退出）。
+  // ① useBackClose 栈（弹层/确认框）→ ② 前景内部层级（设置 section→list、活动
+  // detail→list、关闭 room）→ ③ 抽屉（返回键打开的再按退出；手动打开的只关闭）
+  // → ④ 聊天页打开抽屉。向导/启动期不装载（走系统默认退出）。
   const drawerOpenRef = useRef(drawerOpen);
   drawerOpenRef.current = drawerOpen;
-  const pageRef = useRef(page);
-  pageRef.current = page;
-  // 对话页的钻取来源：只有从「会话」列表点开会话（或在列表里新建 / 归档 /
-  // 删除后自动切换）才记。显式写在入口里、不靠 page 迁移推断——抽屉「对话」
-  // 等既非钻取又可能停在原页的入口不该被当成回列表。离开对话页即失效。
-  const chatReturnPageRef = useRef<Page | null>(null);
-  useEffect(() => {
-    if (page !== "chat") chatReturnPageRef.current = null;
-  }, [page]);
-  const backNavArmed = isAndroidDevice() && isMobile && !!status && !status.wizard_needed;
-  useEffect(() => {
-    if (!backNavArmed) return;
-    installBackNavigation(() => {
-      if (drawerOpenRef.current) {
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const activityRef = useRef(activity);
+  activityRef.current = activity;
+  const roomIdRef = useRef(roomId);
+  roomIdRef.current = roomId;
+  const closeDrawer = useCallback(() => {
+    drawerViaBack.current = false;
+    setDrawerOpen(false);
+  }, []);
+
+  /** 活动详情返回列表：三条路径（详情按钮由 ExecutionPage 处理回焦、Esc、安卓
+   *  返回）共用同一段回焦，避免键盘返回把焦点丢在已卸载的详情上。 */
+  const backActivityDetail = useCallback(() => {
+    const id = activityRef.current?.selectedId;
+    setActivity((prev) => (prev ? { tab: prev.tab, view: "list" } : prev));
+    if (!id) return;
+    requestAnimationFrame(() => {
+      const card =
+        document.querySelector<HTMLElement>(`[data-agent-id="${CSS.escape(id)}"]`) ??
+        document.querySelector<HTMLElement>("[data-agent-id]");
+      card?.focus();
+    });
+  }, []);
+
+  /** 统一离开守卫：运行目录有未保存编辑时先确认，确认后执行 after。
+   *  onCancel 用于分享/转发等需要把载荷和选择器恢复原样的入口。 */
+  const requestLeave = useCallback(
+    (after: () => void, onCancel?: () => void) => {
+      if (!fileDirty) {
+        after();
+        return;
+      }
+      const req = { after, onCancel };
+      if (leaveHead.current) {
+        leaveQueue.current.push(req);
+        return;
+      }
+      leaveHead.current = req;
+      setLeaveConfirm(req);
+    },
+    [fileDirty],
+  );
+
+  const requestLeaveRef = useRef(requestLeave);
+  requestLeaveRef.current = requestLeave;
+
+  /** 结算当前离开确认；接受则执行 after，否则执行 onCancel，然后显示排队请求。 */
+  const settleLeave = useCallback((accepted: boolean) => {
+    const current = leaveHead.current;
+    if (!current) return;
+    // 先同步推进队首/队列，再执行回调：回调里再次 requestLeave 会排到后面，
+    // 也不会把当前这条结算两次。
+    leaveHead.current = null;
+    const next = leaveQueue.current.shift() ?? null;
+    leaveHead.current = next;
+    setLeaveConfirm(next);
+    if (accepted) current.after();
+    else current.onCancel?.();
+  }, []);
+
+  const handleBack = useCallback((): boolean => {
+    const s = settingsRef.current;
+    if (s) {
+      if (compactLayout && s.view === "section") setSettings({ ...s, view: "list" });
+      else setSettings(null);
+      return true;
+    }
+    const a = activityRef.current;
+    if (a) {
+      if (a.view === "detail") backActivityDetail();
+      else setActivity(null);
+      return true;
+    }
+    if (roomIdRef.current) {
+      setRoomId(null);
+      return true;
+    }
+    if (drawerOpenRef.current) {
+      if (drawerViaBack.current) {
         void api.appExit().catch(() => {});
         return true;
       }
-      const returnPage = chatReturnPageRef.current;
-      if (pageRef.current === "chat" && returnPage) {
-        // 同步清目标并镜像 page：连按两次返回时第二下不该跳过列表直接开抽屉。
-        chatReturnPageRef.current = null;
-        pageRef.current = returnPage;
-        setPage(returnPage);
-        return true;
-      }
-      setDrawerOpen(true);
+      closeDrawer();
       return true;
-    });
-  }, [backNavArmed]);
+    }
+    drawerViaBack.current = true;
+    setDrawerOpen(true);
+    return true;
+  }, [backActivityDetail, compactLayout, closeDrawer]);
+  const backNavArmed = isAndroidDevice() && compactLayout && !!status && !status.wizard_needed;
+  useEffect(() => {
+    if (!backNavArmed) return;
+    installBackNavigation(handleBack);
+  }, [backNavArmed, handleBack]);
+  // 桌面 Esc：先走 useBackClose 栈（与 Android 返回同一层），再关前景（详情→列表→关闭）。
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (dispatchBackKey()) return;
+      const s = settingsRef.current;
+      if (s) {
+        event.preventDefault();
+        if (s.view === "section") setSettings({ ...s, view: "list" });
+        else setSettings(null);
+        return;
+      }
+      const a = activityRef.current;
+      if (a) {
+        event.preventDefault();
+        if (a.view === "detail") backActivityDetail();
+        else setActivity(null);
+        return;
+      }
+      if (roomIdRef.current) {
+        event.preventDefault();
+        setRoomId(null);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  // 群房间快照：App 单一持有（首载 + onGroup 防抖 + 代次丢弃过期响应）。
+  const roomsGen = useRef(0);
+  const refreshRooms = useCallback(async () => {
+    const gen = ++roomsGen.current;
+    try {
+      const list = await api.groupsList();
+      if (gen === roomsGen.current) setRooms(list);
+    } catch {
+      /* 群列表失败不阻塞主界面 */
+    }
+  }, []);
+  useEffect(() => {
+    if (agentState !== "ready") return;
+    void refreshRooms();
+    const un = api.onGroup(() => void refreshRooms());
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, [agentState, refreshRooms]);
+  const loadBots = useCallback(() => api.botsList(), []);
+  useEffect(() => {
+    if (!roomId && !groupCreateOpen) return;
+    let alive = true;
+    void api
+      .botsList()
+      .then((list) => {
+        if (alive) setBotsForRoom(list);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [roomId, groupCreateOpen]);
+  useBackClose(roomMenu !== null, () => setRoomMenu(null));
+  // 前景覆盖层打开时把 Chat 从可访问性树/交互中隔离（桌面非模态：侧栏仍可用）。
+  const overlayOpenForChat = settings !== null || activity !== null || roomId !== null;
+  useEffect(() => {
+    const el = chatWrapRef.current;
+    if (!el) return;
+    if (overlayOpenForChat) {
+      el.setAttribute("inert", "");
+      el.setAttribute("aria-hidden", "true");
+    } else {
+      el.removeAttribute("inert");
+      el.removeAttribute("aria-hidden");
+    }
+  }, [overlayOpenForChat]);
   useEffect(() => {
     void api.setWindowTitle(sloganTitle).catch(() => {});
   }, [sloganTitle]);
@@ -435,9 +534,7 @@ ${event.payload.command}
     setTheme(next);
     localStorage.setItem("rclaw_theme", next);
     void api.themeSet(next).catch((e) => setErrorToast(`主题保存失败: ${String(e)}`));
-    setThemePickerOpen(false);
   }, []);
-  const [themePickerOpen, setThemePickerOpen] = useState(false);
   const [chatFont, setChatFont] = useState(readStoredChatFont);
   const applyChatFont = useCallback((next: number) => {
     setChatFont((prev) => {
@@ -452,10 +549,6 @@ ${event.payload.command}
       return clamped;
     });
   }, []);
-  const toggleTheme = useCallback(() => {
-    setThemePickerOpen((v) => !v);
-  }, []);
-
   // 侧栏收放（图标栏）与右侧任务面板开关：界面偏好，存 localStorage。
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => localStorage.getItem("rclaw_sidebar") === "collapsed",
@@ -502,6 +595,23 @@ ${event.payload.command}
   // 多会话状态（提升到 App：切页 / 切会话不丢历史）。
   const [chats, setChats] = useState<ChatMeta[]>([]);
   const [activeId, setActiveId] = useState<string>(DEFAULT_CHAT);
+  // 安卓/紧凑顶栏显示当前会话名（用户要求：不轮播标语）。群房间优先显示房间名；
+  // bot 会话没有列表项时退回 @名字；空白工作会话显示「新对话」。
+  const activityHint =
+    liveCounts.active > 0
+      ? `活动：运行 ${liveCounts.running} · 排队 ${liveCounts.queued} · 待恢复 ${liveCounts.stalled}`
+      : "";
+  const activeChatTitle = (() => {
+    if (roomId) {
+      const room = rooms.find((r) => r.id === roomId);
+      if (room) return room.name;
+    }
+    if (activeId.startsWith("bot-")) return `@${activeId.slice(4)}`;
+    const chat = chats.find((c) => c.chat_id === activeId);
+    if (chat?.title) return chat.title;
+    if (!activeId) return "RClaw";
+    return "新对话";
+  })();
   const [entriesByChat, setEntriesByChat] = useState<Record<string, Entry[]>>({});
   const [busyByChat, setBusyByChat] = useState<Record<string, boolean>>({});
   // 事件回调（分叉等）只在点击时才需要最新的转录 / 忙碌态：经 ref 读取，不把这两个
@@ -522,27 +632,93 @@ ${event.payload.command}
   // 行级游标（每会话）：已消费到哪条持久化消息行。快照落定 / 增量入账时推进；
   // turn 收尾与窗口恢复可见时按它续读增量（重连不重拉全量）。
   const cursorByChat = useRef<Record<string, number>>({});
+  /** 快照请求令牌：全局单调递增，跨代次也不复用；旧请求不得清理新请求的标记。 */
+  const snapshotTokenSeq = useRef(0);
+  const snapshotTokens = useRef<Record<string, number>>({});
   // 本地新建、后端尚未确认的会话 id（「+」路径）：其占位标题可被首条消息更新。
   const localChatIds = useRef<Set<string>>(new Set());
+  /** 会话记录代次：删除/远端失效/重建（导入、恢复、列表里重新出现）时推进。
+   *  确认框和快照请求都带捕获的代次，旧请求不得落到同键的新记录上。 */
+  const chatEpoch = useRef<Record<string, number>>({});
+  /** 当前会话记录换代的非零计数：Chat 按它重挂载以清附件/引用/历史浏览。 */
+  const [activeRecordNonce, setActiveRecordNonce] = useState(0);
+  /** 每个会话的记录代次（同步 ref）：异步回执用它判断是否换代，不依赖 React 提交。 */
+  const chatEpochLiveRef = useRef<Record<string, number>>({});
+  /** 每个会话的未发送草稿：切走时暂存，切回时恢复；记录换代时作废。 */
+  const draftByChat = useRef<Record<string, string>>({});
+  const seenChatIds = useRef<Set<string>>(new Set());
+  const goneChatIds = useRef<Set<string>>(new Set());
+  const bumpChatEpoch = useCallback((chatId: string) => {
+    chatEpoch.current[chatId] = (chatEpoch.current[chatId] ?? 0) + 1;
+    // 新记录必须重新装载：旧的转录、恢复标记、游标和在途快照全部作废。
+    restoredChats.current.delete(chatId);
+    snapshotLoading.current.delete(chatId);
+    delete cursorByChat.current[chatId];
+    delete snapshotTokens.current[chatId];
+    delete draftByChat.current[chatId];
+    chatEpochLiveRef.current[chatId] = (chatEpochLiveRef.current[chatId] ?? 0) + 1;
+    if (activeIdRef.current === chatId) setActiveRecordNonce((n) => n + 1);
+    setEntriesByChat((prev) => {
+      if (!(chatId in prev)) return prev;
+      const next = { ...prev };
+      delete next[chatId];
+      return next;
+    });
+    seenChatIds.current.delete(chatId);
+  }, []);
 
-  const refreshChats = useCallback(async () => {
-    try {
+  /** 会话列表刷新串行化：每个调用都等到自己的请求完成；最新结果同步写入
+   *  `chatsRef`（调用方随后立即读取也能看到），再发布 React 状态。 */
+  const refreshQueue = useRef<Promise<ChatMeta[]>>(Promise.resolve([]));
+  const refreshChats = useCallback((): Promise<ChatMeta[]> => {
+    const run = refreshQueue.current.then(async () => {
       const backend = await api.chatList();
       // 后端已确认的会话不再是本地占位（标题此后以服务端为准）。
       backend.forEach((c) => localChatIds.current.delete(c.chat_id));
+      // 同键重建检测：曾经消失又出现，或 record_id 直接变化，都推进代次。
+      const ids = new Set(backend.map((c) => c.chat_id));
+      const prev = chatsRef.current;
+      const prevById = new Map(prev.map((c) => [c.chat_id, c]));
+      for (const c of backend) {
+        const old = prevById.get(c.chat_id);
+        const replaced =
+          old !== undefined &&
+          old.record_id !== undefined &&
+          c.record_id !== undefined &&
+          old.record_id !== c.record_id;
+        if (goneChatIds.current.has(c.chat_id) || replaced) {
+          goneChatIds.current.delete(c.chat_id);
+          bumpChatEpoch(c.chat_id);
+          if (activeIdRef.current === c.chat_id) {
+            // 正开着的会话被同键重建：旧草稿属于旧记录，清掉后重开。
+            chatDraftRef.current = "";
+            setChatDraft("");
+            void openChat(c.chat_id, { keepForeground: true });
+          }
+        }
+      }
+      for (const id of seenChatIds.current) {
+        if (!ids.has(id)) goneChatIds.current.add(id);
+      }
+      for (const id of ids) seenChatIds.current.add(id);
       // 后端只列出已有消息记录的会话；本地刚新建、尚未发首条消息的会话还没有记录，
-      // 直接整体替换会让空新会话从侧栏消失——保留仍是当前会话的本地未持久化项。
-      setChats((prev) => {
-        const ids = new Set(backend.map((c) => c.chat_id));
-        const locals = prev.filter(
-          (c) => !ids.has(c.chat_id) && !c.archived && c.chat_id === activeId,
-        );
-        return [...locals, ...backend].sort((a, b) => b.updated_at - a.updated_at);
-      });
-    } catch {
-      // agent 未启动 / 首次运行时静默。
-    }
-  }, [activeId]);
+      // 直接整体替换会让空新会话从侧栏消失——只保留仍是当前会话的本地占位。
+      const locals = prev.filter(
+        (c) =>
+          !ids.has(c.chat_id) &&
+          !c.archived &&
+          c.chat_id === activeIdRef.current &&
+          localChatIds.current.has(c.chat_id),
+      );
+      const next = [...locals, ...backend].sort((a, b) => b.updated_at - a.updated_at);
+      chatsRef.current = next;
+      setChats(next);
+      return next;
+    });
+    const safe = run.catch(() => chatsRef.current);
+    refreshQueue.current = safe;
+    return safe;
+  }, [activeId, bumpChatEpoch]);
 
   // 多端同步：会话列表的角标（仅本机 / 已同步 / 分支 / 正在别的设备上运行，按 chat_id）
   // 与「多端同步」栏目上的待处理事项数。没开同步时两者都很便宜：角标只扫「仅本机」标记，
@@ -906,17 +1082,21 @@ ${event.payload.command}
   const snapshotReady = useRef<Record<string, Promise<void>>>({});
   const resyncChat = useCallback(
     (chatId: string): Promise<void> => {
-      const inflight = resyncInflight.current[chatId];
+      // 会话键 + 代次：同键重建后的新记录不能搭旧代次的在飞请求/尾随标记。
+      const key = `${chatId}#${chatEpoch.current[chatId] ?? 0}`;
+      const inflight = resyncInflight.current[key];
       if (inflight) {
-        resyncPending.current[chatId] = true;
+        resyncPending.current[key] = true;
         return inflight;
       }
       const run = (async () => {
         for (;;) {
-          resyncPending.current[chatId] = false;
+          resyncPending.current[key] = false;
           await snapshotReady.current[chatId];
           if (!restoredChats.current.has(chatId)) return;
           let after = cursorByChat.current[chatId] ?? 0;
+          const epoch = chatEpoch.current[chatId] ?? 0;
+          if (`${chatId}#${epoch}` !== key) return;
           for (let page = 0; page < 20; page++) {
             let delta: ChatHistoryDelta;
             try {
@@ -924,18 +1104,19 @@ ${event.payload.command}
             } catch {
               return; // agent 未启动等瞬时失败：下次收尾再补。
             }
+            if ((chatEpoch.current[chatId] ?? 0) !== epoch) return;
             cursorByChat.current[chatId] = Math.max(after, delta.cursor);
             if (delta.entries.length > 0) applyCommitted(chatId, delta.entries);
             if (!delta.more) break;
             after = delta.cursor;
           }
-          if (!resyncPending.current[chatId]) return;
+          if (!resyncPending.current[key]) return;
         }
       })();
-      resyncInflight.current[chatId] = run;
+      resyncInflight.current[key] = run;
       void run.finally(() => {
-        delete resyncInflight.current[chatId];
-        resyncPending.current[chatId] = false;
+        delete resyncInflight.current[key];
+        resyncPending.current[key] = false;
       });
       return run;
     },
@@ -954,6 +1135,13 @@ ${event.payload.command}
   useEffect(() => {
     void api.getStatus().then(applyStatus);
     const unAgent = api.onAgent((e: AgentEvent) => {
+      // 导入期间由回执统一迁移界面：start_agent 在命令返回前就会发 ready/error，
+      // 此时立即切状态/查 getStatus 会先卸载向导，或让向导 onDone 把 ready 又降回
+      // starting。这里只留错误原因，状态交给 importRaw 回执与 onDone。
+      if (importInFlightRef.current) {
+        if (e.state === "error" && e.error) setAgentError(e.error);
+        return;
+      }
       setAgentState(e.state);
       if (e.error) setAgentError(e.error);
       if (e.state === "ready") {
@@ -1045,25 +1233,33 @@ ${event.payload.command}
   }, [agentState, applyStatus]);
 
   // 打开会话：内存没有转录时从持久化历史恢复（重启后会话历史仍在）。
-  // returnTo：「会话」列表钻取进来时传来源页（返回键据此先回列表，见
-  // chatReturnPageRef）；其余入口走默认 null，顺手清掉残留目标。
+  // 前景覆盖层/抽屉都在这里统一收起；目标校验与离开守卫由调用方（导航网关）负责。
   const openChat = useCallback(
-    async (chatId: string, returnTo: Page | null = null) => {
-      chatReturnPageRef.current = returnTo;
-      // 同步镜像页：原生返回事件可能早于本次 setState 的提交到达，返回处理器
-      // 必须立刻看到「已在对话页」，否则会误判成其它页而直接开抽屉。
-      pageRef.current = "chat";
+    async (
+      chatId: string,
+      opts?: { keepForeground?: boolean; preserveDraft?: boolean },
+    ) => {
+      if (!opts?.keepForeground) {
+        setSettings(null);
+        setActivity(null);
+        setRoomId(null);
+        setGroupCreateOpen(false);
+        closeDrawer();
+      }
       setActiveId(chatId);
-      setPage("chat");
-      setDrawerOpen(false);
-      // 会话边界清草稿（入口同步清，不依赖 Chat 挂载后的 effect 时序——
-      // 分享确认等"先切会话再并入草稿"的路径会被后跑的清空 effect 抵消）。
-      setChatDraft("");
+      // 会话边界草稿：把当前会话的草稿暂存，切到目标会话时恢复它自己的草稿。
+      // 同一会话追加分享（preserveDraft）不能清掉上一批已放置的内容。
+      if (!opts?.preserveDraft) {
+        draftByChat.current[activeIdRef.current] = chatDraftRef.current;
+        setChatDraft(draftByChat.current[chatId] ?? "");
+      }
       // 多端同步：打开会话时让引擎补一次拉取，并预取这个会话尾部引用的附件。只是通知，
       // 不等结果，不耽误打开；已经装载过的会话再次打开时也通知。
       api.syncNotify("open_session", chatId).catch(() => {});
       if (restoredChats.current.has(chatId) || snapshotLoading.current.has(chatId)) return;
       snapshotLoading.current.add(chatId);
+      const token = ++snapshotTokenSeq.current;
+      snapshotTokens.current[chatId] = token;
       // 快照就绪闸门：装完（成功或失败都算解除）前到达的增量拉取在这里等，
       // 落定后从最新游标补读快照读库与安装之间落库的行。
       let resolveReady!: () => void;
@@ -1071,10 +1267,22 @@ ${event.payload.command}
         resolveReady = resolve;
       });
       setEntriesByChat((prev) => ({ ...prev, [chatId]: prev[chatId] ?? [] }));
+      const epochAtOpen = chatEpoch.current[chatId] ?? 0;
       try {
         // 快照装配：已落库条目是权威投影，整体重建；此后视图 = 快照 + 按游标续读
         // 的增量（resyncChat），不存在「数第 N 次出现」式的文本对位。
         const history = await api.chatHistory(chatId);
+        if (
+          (chatEpoch.current[chatId] ?? 0) !== epochAtOpen ||
+          snapshotTokens.current[chatId] !== token
+        ) {
+          // 等待响应期间同键记录被删除/重建（或已有更新的快照请求）：旧响应不得
+          // 回写，也不得清掉新请求的 loading；但本次请求自己的就绪闸门必须结算，
+          // 否则等它的增量会永久挂起。
+          if (snapshotTokens.current[chatId] === token) snapshotLoading.current.delete(chatId);
+          resolveReady();
+          return;
+        }
         cursorByChat.current[chatId] = history.cursor;
         snapshotLoading.current.delete(chatId);
         restoredChats.current.add(chatId);
@@ -1126,8 +1334,9 @@ ${event.payload.command}
         });
       } catch {
         // agent 未启动等瞬时失败：回滚加载标记，下次打开还能重试；
-        // 否则该会话永远保持空转录。
-        snapshotLoading.current.delete(chatId);
+        // 否则该会话永远保持空转录。旧令牌的失败同样不能干扰新请求，但自己的
+        // 就绪闸门必须结算。
+        if (snapshotTokens.current[chatId] === token) snapshotLoading.current.delete(chatId);
         resolveReady();
       }
     },
@@ -1277,24 +1486,31 @@ ${event.payload.command}
 
   // 新建会话的公共部分：重置草稿/转录/占位标记并切换到对话页。是否在侧栏
   // 列表补条目由调用方决定（「＋」新建要补；删空后的裸工作会话不补）。
-  // returnTo 同 openChat：在「会话」列表里新建时传来源页。
-  const prepareChat = useCallback((id: string, returnTo: Page | null = null) => {
-    chatReturnPageRef.current = returnTo;
-    pageRef.current = "chat";
-    setChatDraft("");
-    restoredChats.current.add(id);
-    localChatIds.current.add(id);
-    setEntriesByChat((prev) => ({ ...prev, [id]: [] }));
-    setBusyByChat((prev) => ({ ...prev, [id]: false }));
-    setActiveId(id);
-    setPage("chat");
-  }, []);
+  const prepareChat = useCallback(
+    (id: string, keepForeground = false) => {
+      if (!keepForeground) {
+        setSettings(null);
+        setActivity(null);
+        setRoomId(null);
+        closeDrawer();
+      }
+      draftByChat.current[activeIdRef.current] = chatDraftRef.current;
+      draftByChat.current[id] = "";
+      setChatDraft("");
+      restoredChats.current.add(id);
+      localChatIds.current.add(id);
+      setEntriesByChat((prev) => ({ ...prev, [id]: [] }));
+      setBusyByChat((prev) => ({ ...prev, [id]: false }));
+      setActiveId(id);
+    },
+    [closeDrawer],
+  );
 
   // localOnly（多端同步的「仅本机」）：先把标记落库，成功才打开会话——发送入口不等待
   // 标记，先打开后标记的话，标记没落库的窗口里发出去的首条消息会被发布扫描接走（标记
   // 失败时也拿不到任何补救机会）。打开失败就留在原页，草稿不动，用户可以直接重试。
   const newChat = useCallback(
-    async (returnTo: Page | null = null, localOnly = false) => {
+    async (localOnly = false) => {
       const id = freshChatId();
       if (localOnly) {
         try {
@@ -1305,7 +1521,7 @@ ${event.payload.command}
         }
         void loadSyncMarks();
       }
-      prepareChat(id, returnTo);
+      prepareChat(id);
       setChats((prev) => [
         { chat_id: id, title: "新对话", updated_at: Date.now(), archived: false },
         ...prev.filter((c) => c.chat_id !== id),
@@ -1315,49 +1531,65 @@ ${event.payload.command}
   );
 
   const archiveChat = useCallback(
-    async (chatId: string) => {
-      // 正在工作的会话禁止归档：turn 收尾还会向原路径追加（文件会被重建），先停止再归档。
-      if (busyByChat[chatId]) {
-        setErrorToast("会话正在工作中，请先停止任务再归档");
-        return;
-      }
-      // 自动切换到的会话继承钻取来源：在「会话」列表里操作恒为 chats；其它页面
-      // 操作沿用该对话页已有的来源。必须在任何 await 之前取（切页会改 pageRef）。
-      const from: Page | null =
-        pageRef.current === "chats" ? "chats" : chatReturnPageRef.current;
-      try {
-        await api.chatArchive(chatId);
+    (chatId: string, expectedRecordId?: number) => {
+      // 运行目录有未保存编辑时先过守卫；确认后才真正归档并自动切换。
+      requestLeave(() => {
+        void (async () => {
+          // 守卫确认后重新核对最新状态（busy / 列表 / 记录身份）；不复用旧闭包。
+          if (busyByChatRef.current[chatId]) {
+            setErrorToast("会话正在工作中，请先停止任务再归档");
+            return;
+          }
+          if (
+            expectedRecordId !== undefined &&
+            chatsRef.current.find((c) => c.chat_id === chatId)?.record_id !== expectedRecordId
+          ) {
+            setErrorToast("会话记录已变化，请刷新列表后再试");
+            void refreshChats();
+            return;
+          }
+          if (!chatsRef.current.some((c) => c.chat_id === chatId)) {
+            setErrorToast("会话已经不存在了");
+            void refreshChats();
+            return;
+          }
+          try {
+            await api.chatArchive(chatId, expectedRecordId);
       } catch (e) {
         setErrorToast(String(e));
         return;
       }
       await refreshChats();
-      if (chatId === activeId) {
-        setChats((list) => {
-          const next = list.find((c) => !c.archived);
-          if (next) {
-            void openChat(next.chat_id, from);
-          } else {
-            void newChat(from);
+          if (chatId === activeIdRef.current) {
+            setChats((list) => {
+              const next = list.find((c) => !c.archived);
+              if (next) {
+                void openChat(next.chat_id);
+              } else {
+                void newChat();
+              }
+              return list;
+            });
           }
-          return list;
-        });
-      }
+        })();
+      });
     },
-    [activeId, busyByChat, newChat, openChat, refreshChats],
+    [activeId, busyByChat, newChat, openChat, refreshChats, requestLeave],
   );
 
   const restoreChat = useCallback(
-    async (chatId: string) => {
+    async (chatId: string, expectedRecordId?: number) => {
       try {
-        await api.chatRestore(chatId);
+        await api.chatRestore(chatId, expectedRecordId);
       } catch (e) {
         setErrorToast(String(e));
         return;
       }
+      // 取消归档只改 archived_at，不换代；若列表发现同键 record_id 变化，
+      // refreshChats 会自行推进代次并重装历史。
       await refreshChats();
     },
-    [refreshChats],
+    [bumpChatEpoch, refreshChats],
   );
 
   // 删除会话（不可恢复，入口先弹确认）：正在工作的会话禁止删除（turn 收尾会
@@ -1365,16 +1597,41 @@ ${event.payload.command}
   // 重开时拼回已删除的历史。
   // purge（多端同步的「彻底删除」）：已同步的会话默认先进各台设备的回收站，purge 则都不留。
   const deleteChat = useCallback(
-    async (chatId: string, purge = false) => {
-      if (busyByChat[chatId]) {
-        setErrorToast("会话正在工作中，请先停止任务再删除");
-        return;
-      }
-      // 同 archiveChat：自动切换到的会话继承钻取来源，且必须在 await 前取。
-      const from: Page | null =
-        pageRef.current === "chats" ? "chats" : chatReturnPageRef.current;
-      try {
-        await api.chatDelete(chatId, purge);
+    (chatId: string, purge = false, expectedEpoch?: number, expectedRecordId?: number) => {
+      requestLeave(() => {
+        void (async () => {
+          // 守卫确认后重新核对最新状态；列表/忙碌标记/记录代次可能已变化。
+          if (
+            expectedEpoch !== undefined &&
+            (chatEpoch.current[chatId] ?? 0) !== expectedEpoch
+          ) {
+            setErrorToast("这个会话已经被替换或删除，删除确认已失效");
+            void refreshChats();
+            return;
+          }
+          if (
+            expectedRecordId !== undefined &&
+            chatsRef.current.find((c) => c.chat_id === chatId)?.record_id !== expectedRecordId
+          ) {
+            setErrorToast("会话记录已变化，请刷新列表后再试");
+            void refreshChats();
+            return;
+          }
+          if (bundleImportInFlight.current) {
+            setErrorToast("会话包导入进行中，请稍后再删除");
+            return;
+          }
+          if (busyByChatRef.current[chatId]) {
+            setErrorToast("会话正在工作中，请先停止任务再删除");
+            return;
+          }
+          if (!chatsRef.current.some((c) => c.chat_id === chatId)) {
+            setErrorToast("会话已经不存在了");
+            void refreshChats();
+            return;
+          }
+          try {
+            await api.chatDelete(chatId, purge, expectedRecordId);
       } catch (e) {
         setErrorToast(String(e));
         return;
@@ -1392,19 +1649,27 @@ ${event.payload.command}
       // 的本地未持久化条目」，若带着被删的 activeId 去刷新，它会以幽灵条目
       // 复活（表现为「删掉最后一个会话后侧栏出现两条、永远删不空」）。
       setChats((prev) => prev.filter((c) => c.chat_id !== chatId));
-      if (chatId === activeId) {
-        const next = chats.find((c) => !c.archived && c.chat_id !== chatId);
-        if (next) {
-          void openChat(next.chat_id, from);
-        } else {
-          // 全部删空：不再自动补「新对话」条目，侧栏显示「暂无会话」；主区挂
-          // 一个不进列表的空白工作会话，发出首条消息时 handleSend 会补进列表。
-          prepareChat(freshChatId(), from);
-        }
-      }
-      await refreshChats();
+          if (chatId === activeIdRef.current) {
+            // 被删会话的草稿不能回存/带入下一条会话。
+            chatDraftRef.current = "";
+            setChatDraft("");
+            const next = chatsRef.current.find(
+              (c) => !c.archived && c.chat_id !== chatId,
+            );
+            if (next) {
+              void openChat(next.chat_id);
+            } else {
+              // 全部删空：不再自动补「新对话」条目，侧栏显示「暂无会话」；主区挂
+              // 一个不进列表的空白工作会话，发出首条消息时 handleSend 会补进列表。
+              prepareChat(freshChatId());
+            }
+          }
+          bumpChatEpoch(chatId);
+          await refreshChats();
+        })();
+      });
     },
-    [activeId, busyByChat, chats, openChat, prepareChat, refreshChats],
+    [activeId, bumpChatEpoch, busyByChat, chats, openChat, prepareChat, refreshChats, requestLeave],
   );
 
   // ---- 多端同步：别的设备带来的变化 ----
@@ -1420,6 +1685,8 @@ ${event.payload.command}
   // 会话，并告诉用户它去哪了。
   const forgetChat = useCallback(
     (chatId: string) => {
+      bumpChatEpoch(chatId);
+      goneChatIds.current.add(chatId);
       restoredChats.current.delete(chatId);
       snapshotLoading.current.delete(chatId);
       delete cursorByChat.current[chatId];
@@ -1431,20 +1698,23 @@ ${event.payload.command}
       });
       setChats((prev) => prev.filter((c) => c.chat_id !== chatId));
       if (chatId !== activeIdRef.current) return;
-      const from = chatReturnPageRef.current;
+      // 远端删除当前会话：草稿随记录失效，不能回存或带入下一条。
+      chatDraftRef.current = "";
+      setChatDraft("");
       const next = chatsRef.current.find((c) => !c.archived && c.chat_id !== chatId);
       if (next) {
-        void openChat(next.chat_id, from);
+        // 后台失效切换：保持设置/活动前景与文件编辑草稿不动，只换底层会话。
+        void openChat(next.chat_id, { keepForeground: true });
       } else {
-        prepareChat(freshChatId(), from);
+        prepareChat(freshChatId(), true);
       }
       setErrorToast("这个会话已经在另一台设备上删除。需要的话，可以在「多端同步」的回收站里恢复。");
     },
-    [openChat, prepareChat],
+    [bumpChatEpoch, openChat, prepareChat],
   );
 
   // 对话页开着时装载这个会话的附件清单（多端同步；没开同步时是空的）。
-  useSyncAttachmentLoader(agentState === "ready" && page === "chat" ? activeId : null);
+  useSyncAttachmentLoader(agentState === "ready" ? activeId : null);
 
 
   // 同步事件的处理函数经 ref 取最新的，订阅只跟着 agent 的启停建一次。把它们直接列进
@@ -1493,14 +1763,8 @@ ${event.payload.command}
         if (named.length > 0) void on().refreshChats();
         return;
       }
-      void on().refreshChats().then(async () => {
+      void on().refreshChats().then((backend) => {
         if (named.length === 0) return;
-        let backend: ChatMeta[];
-        try {
-          backend = await api.chatList();
-        } catch {
-          return;
-        }
         const alive = new Set(backend.map((c) => c.chat_id));
         named.forEach((chatId) => {
           // 本地刚新建、还没发首条消息的会话本来就不在后端列表里：不算被删。
@@ -1522,6 +1786,8 @@ ${event.payload.command}
   const [deleteConfirm, setDeleteConfirm] = useState<{
     chatId: string;
     title: string;
+    epoch: number;
+    recordId?: number;
   } | null>(null);
   // 删除已同步的会话时的「彻底删除」勾选。弹窗每次打开、关闭都复位（不管是怎么关的，
   // 包括返回键）：这个勾选不能从上一次带到下一次删除。
@@ -1617,6 +1883,12 @@ ${event.payload.command}
   // 工作区外访问授权（默认权限下工具触达工作区之外时后端推送）：
   // 请求排队逐个弹窗，允许 / 拒绝后回填后端，超时由后端按拒绝兜底。
   const [permQueue, setPermQueue] = useState<PermissionRequest[]>([]);
+  const permQueueRef = useRef<PermissionRequest[]>([]);
+  permQueueRef.current = permQueue;
+  // 授权弹窗自己持焦点（Tab 循环）；关闭后把焦点还给下层。
+  const permTrapRef = useFocusTrap<HTMLDivElement>(
+    permQueue.length > 0 ? permQueue[0]?.id ?? "open" : "closed",
+  );
   useEffect(() => {
     const un = api.onPermissionRequest((req) =>
       setPermQueue((q) => [...q, req]),
@@ -1625,15 +1897,36 @@ ${event.payload.command}
       un.then((fn) => fn());
     };
   }, []);
+  // 请求 id = 毫秒时间戳-随机数（后端 120s 超时拒绝）；前端同步按同一时限失效，
+  // 过期项不能继续显示可点的允许/拒绝。
+  const permTs = (id: string) => {
+    const ms = Number(id.split("-")[0]);
+    return Number.isFinite(ms) ? ms : Date.now();
+  };
+  useEffect(() => {
+    if (permQueue.length === 0) return;
+    const timer = setInterval(() => {
+      const now = Date.now();
+      setPermQueue((q) => q.filter((r) => now - permTs(r.id) < 120_000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [permQueue.length]);
   const answerPermission = useCallback(
     (allowed: boolean) => {
       const head = permQueue[0];
       if (!head) return;
-      setPermQueue((q) => q.slice(1));
+      // 按请求 id 出队：过期过滤可能已移除队首，不能误删下一项。
+      setPermQueue((q) => q.filter((r) => r.id !== head.id));
+      if (Date.now() - permTs(head.id) >= 120_000) {
+        setErrorToast("授权请求已过期，已按拒绝处理");
+        return;
+      }
       // 副作用放在 updater 之外：StrictMode 下 updater 可能双调，回填必须只发一次。
-      void api.permissionRespond(head.id, allowed).catch(() => {});
+      void api.permissionRespond(head.id, allowed).catch((e) => {
+        setErrorToast(`授权结果回填失败: ${String(e)}`);
+      });
     },
-    [permQueue],
+    [permQueue, setErrorToast],
   );
 
   // 状态条数据目录：单击复制路径、双击在文件管理器打开。单击先挂 400ms 定时器，
@@ -1701,12 +1994,21 @@ ${event.payload.command}
   const [chatMenu, setChatMenu] = useState<{
     chatId: string;
     title: string;
+    /** 打开菜单时那一行的记录主键/代次：刷新后同键重建时菜单立即失效。 */
+    recordId?: number;
+    epoch: number;
     x: number;
     y: number;
     // 打开菜单的触发元素（「···」钮 / 会话行）：菜单卸载后键盘/读屏焦点
     // 的返还锚点（导出对话框关闭时用）。
     trigger: HTMLElement | null;
   } | null>(null);
+  // 刷新后同键记录已变化（或消失）：旧菜单失效，避免用旧标题删到新记录。
+  useEffect(() => {
+    if (!chatMenu) return;
+    const current = chats.find((c) => c.chat_id === chatMenu.chatId);
+    if (!current || current.record_id !== chatMenu.recordId) setChatMenu(null);
+  }, [chatMenu, chats]);
   // 菜单外按下或 Esc 关闭；菜单内点击交给菜单项自己的 onClick。
   // 在会话行上右键时不关闭——行处理器会把菜单移到新位置。
   useEffect(() => {
@@ -1796,16 +2098,56 @@ ${event.payload.command}
   const [localOnlyConfirm, setLocalOnlyConfirm] = useState<{
     chatId: string;
     title: string;
+    recordId?: number;
   } | null>(null);
-  const setLocalOnly = (chatId: string, on: boolean) => {
+  const localOnlyBusyRef = useRef(false);
+  const setLocalOnly = (
+    chatId: string,
+    on: boolean,
+    expectedRecordId?: number,
+    confirmed = false,
+  ) => {
+    if (localOnlyBusyRef.current) {
+      setErrorToast("上一个「仅本机」操作还在处理中，请稍候");
+      return;
+    }
+    localOnlyBusyRef.current = true;
     api
-      .syncSetLocalOnly(chatId, on)
-      .then(() => loadSyncMarks())
-      .catch((e) => setErrorToast(String(e)));
+      .syncSetLocalOnly(chatId, on, expectedRecordId, confirmed)
+      .then(() => {
+        loadSyncMarks();
+        localOnlyBusyRef.current = false;
+      })
+      .catch((e) => {
+        const message = String(e);
+        if (on) {
+          const matched = /需要确认#(\d+)/.exec(message);
+          if (matched) {
+            const rowId = Number(matched[1]);
+            if (!rowId) {
+              // 拿不到事务内行 ID：不做无身份的跨设备删除。
+              localOnlyBusyRef.current = false;
+              setErrorToast("无法确认要操作的会话记录，请刷新列表后重试");
+              return;
+            }
+            const row = chatsRef.current.find((c) => c.chat_id === chatId);
+            setLocalOnlyConfirm({
+              chatId,
+              title: row?.title || chatId,
+              recordId: rowId,
+            });
+            // 占用保留到用户确认/取消，避免另一条请求替换确认目标。
+            return;
+          }
+        }
+        localOnlyBusyRef.current = false;
+        setErrorToast(message);
+      });
   };
   // 导入会话包：选一个文件 → 读成文本 → 后端新建一个会话（从不覆盖已有的）→ 打开它。
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const [importBusy, setImportBusy] = useState(false);
+  const bundleImportInFlight = useRef(false);
   const importBundle = (file: File) => {
     if (importBusy) return;
     // 与后端的上限一致：超了就不往内存里读了。
@@ -1813,21 +2155,30 @@ ${event.payload.command}
       setErrorToast("会话包太大（超过 50 MB）");
       return;
     }
-    setImportBusy(true);
-    file
-      .text()
-      .then((text) => api.sessionImportBundle(text))
-      .then(async (imported) => {
-        await refreshChats();
-        void loadSyncMarks();
-        // 导入总是落在桌面通道；防御性地判断一下，别的通道的会话这里打不开。
-        if (imported.channel === "desktop") {
-          void openChat(imported.chat_id, "chats");
-          setPage("chat");
-        }
-      })
-      .catch((e) => setErrorToast(String(e)))
-      .finally(() => setImportBusy(false));
+    requestLeave(() => {
+      setImportBusy(true);
+      bundleImportInFlight.current = true;
+      file
+        .text()
+        .then((text) => api.sessionImportBundle(text))
+        .then(async (imported) => {
+          // 创建成功即刻推进代次（在刷新/跳转之前）：旧删除确认立即失效。
+          bumpChatEpoch(imported.chat_id);
+          if (imported.chat_id === activeIdRef.current) {
+            // 必须在等待刷新前清：等待期间用户切走会把旧草稿重新暂存。
+            chatDraftRef.current = "";
+            setChatDraft("");
+          }
+          await refreshChats();
+          void loadSyncMarks();
+          if (imported.channel === "desktop") openChatChecked(imported.chat_id);
+        })
+        .catch((e) => setErrorToast(String(e)))
+        .finally(() => {
+          bundleImportInFlight.current = false;
+          setImportBusy(false);
+        });
+    });
   };
 
   // 移动端抽屉的上下文/内存状态（桌面由右侧 TaskPanel 承担，互不影响）。
@@ -1839,17 +2190,47 @@ ${event.payload.command}
   // 会话输入草稿（App 持有：Chat 随页面切换卸载重挂载时未发送内容不丢，
   // 分享/采集预填也直接写入这里）。
   const [chatDraft, setChatDraft] = useState("");
-  // 系统分享待消费内容（选择目标期间的暂存，确认后并入 chatDraft）。
-  const [shareDraft, setShareDraft] = useState<string | null>(null);
-  const shareDraftRef = useRef<string | null>(null);
-  useEffect(() => {
-    shareDraftRef.current = shareDraft;
-  }, [shareDraft]);
+  const chatDraftRef = useRef(chatDraft);
+  chatDraftRef.current = chatDraft;
+  // 系统分享待放置载荷队列：回执可能连续到达，确认期间新到的保留到下一轮。
+  const [shareQueue, setShareQueue] = useState<Array<{ id: number; text: string }>>([]);
+  const shareQueueRef = useRef(shareQueue);
+  shareQueueRef.current = shareQueue;
+  const shareSeq = useRef(0);
+  const pushShare = useCallback((text: string) => {
+    const item = { id: ++shareSeq.current, text };
+    const next = [...shareQueueRef.current, item];
+    shareQueueRef.current = next;
+    setShareQueue(next);
+  }, []);
+  const consumeShare = useCallback((ids: Set<number>) => {
+    const next = shareQueueRef.current.filter((q) => !ids.has(q.id));
+    shareQueueRef.current = next;
+    setShareQueue(next);
+    return next.length;
+  }, []);
+  const cancelShareChooser = useCallback(() => {
+    const ids = shareChooserIdsRef.current;
+    shareChooserIdsRef.current = new Set();
+    chooserOwnerRef.current = null;
+    setShareChooserOpen(false);
+    const left = consumeShare(ids);
+    if (left > 0) setShareChooserPending(true);
+  }, [consumeShare]);
   const [shareChooserOpen, setShareChooserOpen] = useState(false);
+  const shareChooserOpenRef = useRef(false);
+  shareChooserOpenRef.current = shareChooserOpen;
+  const [shareChooserPending, setShareChooserPending] = useState(false);
+  const shareChooserIdsRef = useRef<Set<number>>(new Set());
+  /** 同步仲裁：同一时刻最多一个选择器持有（state/ref 要等渲染，拦不住同帧交错）。 */
+  const chooserOwnerRef = useRef<"share" | "forward" | null>(null);
+  const [forwardChooserOpen, setForwardChooserOpen] = useState(false);
+  const forwardChooserOpenRef = useRef(false);
+  forwardChooserOpenRef.current = forwardChooserOpen;
   useEffect(() => {
-    // 对话页的环形上下文按钮需要实时快照；移动端抽屉的状态区也复用它。
-    // 其它页面（桌面）不轮询，避免每 5s 扫一次技能目录/记忆文件。
-    if (agentState !== "ready" || (!isMobile && page !== "chat")) return;
+    // 环形上下文按钮 + 侧栏用量卡都复用同一快照；ready 即轮询（设置覆盖层打开时
+    // Chat 仍挂载，侧栏也可能可见）。
+    if (agentState !== "ready") return;
     let stopped = false;
     let usageTimer: number | undefined;
     // 切会话先清掉上一会话的百分比，避免环形按钮最多 5s 显示错数据。
@@ -1871,25 +2252,47 @@ ${event.payload.command}
       stopped = true;
       if (usageTimer !== undefined) window.clearTimeout(usageTimer);
     };
-  }, [agentState, activeId, isMobile, page]);
+  }, [agentState, activeId]);
 
   // 系统分享消费：其他应用分享进来的文件已由 Java 侧落盘 uploads/。
   // 轮询消费（应用运行中分享经 onNewIntent 也会写入）；消费后弹目标选择：
   // 多会话选一个，或发到新会话（用户要求）。
   useEffect(() => {
     if (agentState !== "ready") return;
+    let polling = false;
     const check = async () => {
-      const share = await api.consumePendingShare().catch(() => null);
-      if (!share) return;
-      const lines = share.files.map(
-        (f) => `[附件] ${f}（已放入 agent 工作区）`,
-      );
-      const draft = [...lines, share.text ?? ""].filter(Boolean).join("\n");
-      if (!draft) return;
-      // 未消费的旧草稿（选择框还开着）合并而非覆盖：附件引用不丢。
-      setShareDraft((prev) => (prev ? prev + "\n" + draft : draft));
-      setShareChooserOpen(true);
-      setPage("chat");
+      if (polling) return;
+      polling = true;
+      try {
+      // 原生每批分享一个文件；一次轮询把积压的批次全部领走（最多 20 批）。
+      for (let i = 0; i < 20; i += 1) {
+        const share = await api.consumePendingShare().catch(() => null);
+        if (!share) return;
+        const lines = share.files.map(
+          (f) => `[附件] ${f}（已放入 agent 工作区）`,
+        );
+        const draft = [...lines, share.text ?? ""].filter(Boolean).join("\n");
+        if (!draft) continue;
+        pushShare(draft);
+        if (
+          permQueueRef.current.length > 0 ||
+          leaveHead.current ||
+          chooserOwnerRef.current !== null
+        ) {
+          setShareChooserPending(true);
+        } else if (!shareChooserOpenRef.current) {
+          chooserOwnerRef.current = "share";
+          shareChooserIdsRef.current = new Set(shareQueueRef.current.map((q) => q.id));
+          setShareChooserOpen(true);
+        } else {
+          // 选择器刚提交/关闭、React 还来不及把 openRef 置 false：交给调度，
+          // 下一次渲染看到已关闭时补开，避免这批只入队不显示。
+          setShareChooserPending(true);
+        }
+      }
+      } finally {
+        polling = false;
+      }
     };
     void check();
     const timer = setInterval(check, 5000);
@@ -1897,44 +2300,201 @@ ${event.payload.command}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentState]);
 
+  useEffect(() => {
+    if (!shareChooserPending || permQueue.length > 0 || leaveConfirm || forwardChooserOpen) return;
+    if (shareChooserOpenRef.current || chooserOwnerRef.current !== null) return;
+    if (shareQueueRef.current.length === 0) {
+      setShareChooserPending(false);
+      return;
+    }
+    setShareChooserPending(false);
+    chooserOwnerRef.current = "share";
+    shareChooserIdsRef.current = new Set(shareQueueRef.current.map((q) => q.id));
+    setShareChooserOpen(true);
+  }, [
+    forwardChooserOpen,
+    leaveConfirm,
+    permQueue.length,
+    shareChooserPending,
+    shareQueue.length,
+    shareChooserOpen,
+  ]);
+
   const placeShare = useCallback(
     (target: "new" | string) => {
-      setShareChooserOpen(false);
-      const text = shareDraftRef.current;
-      setShareDraft(null);
-      // 先切会话（入口会清空草稿），再并入分享文本：同一事件批处理中
-      // 函数式更新按序应用，并入最终生效。
-      if (target === "new") {
-        void newChat();
-      } else {
-        void openChat(target);
+      // 只处理选择器打开时绑定的批次；打开后新到的分享等下一轮。
+      const ids = new Set(shareChooserIdsRef.current);
+      const items = shareQueueRef.current.filter((q) => ids.has(q.id));
+      if (items.length === 0) return;
+      let claimed = false;
+      const pending = items.map((q) => q.text).join("\n");
+      const epochAtPick = target === "new" ? 0 : (chatEpoch.current[target] ?? 0);
+      const recordAtPick =
+        target === "new"
+          ? undefined
+          : chatsRef.current.find((c) => c.chat_id === target)?.record_id;
+      if (target !== "new" && !chatsRef.current.some((c) => c.chat_id === target)) {
+        setErrorToast("目标会话已经不存在了，请重新选择");
+        void refreshChats();
+        return;
       }
-      if (text) setChatDraft((prev) => (prev ? prev + "\n" + text : text));
+      setShareChooserOpen(false);
+      chooserOwnerRef.current = null;
+      const commit = () => {
+        // 同一批选择只提交一次（重复点击/回调重入不重复追加）。
+        if (claimed) return;
+        chooserOwnerRef.current = null;
+        if (
+          target !== "new" &&
+          (!chatsRef.current.some((c) => c.chat_id === target) ||
+            (chatEpoch.current[target] ?? 0) !== epochAtPick ||
+            chatsRef.current.find((c) => c.chat_id === target)?.record_id !== recordAtPick)
+        ) {
+          setErrorToast("目标会话已经不存在了，请重新选择");
+          void refreshChats();
+          setShareChooserPending(true);
+          return;
+        }
+        const actual = shareQueueRef.current.filter((q) => ids.has(q.id));
+        if (actual.length === 0) {
+          claimed = true;
+          return;
+        }
+        const actualText = actual.map((q) => q.text).join("\n");
+        claimed = true;
+        const remaining = consumeShare(new Set(actual.map((q) => q.id)));
+        if (remaining > 0) setShareChooserPending(true);
+        if (target === "new") {
+          void newChat();
+        } else {
+          void openChat(target, { preserveDraft: target === activeIdRef.current });
+        }
+        setChatDraft((prev) => (prev ? prev + "\n" + actualText : actualText));
+      };
+      // 设置里编辑文件未保存时先确认；取消则恢复选择器，载荷保留在队列里。
+      leaveSettingsRef.current(commit, () => setShareChooserPending(true));
     },
-    [newChat, openChat],
+    [consumeShare, newChat, openChat, refreshChats],
   );
 
   // 消息选择「发送到会话」：与系统分享同款目标选择器；选中后把打包文本并入
   // 目标会话草稿（可检查/编辑后发送，不直接触发 turn）。
-  const forwardDraftRef = useRef<string | null>(null);
-  const [forwardChooserOpen, setForwardChooserOpen] = useState(false);
+  const [forwardQueue, setForwardQueue] = useState<Array<{ id: number; text: string }>>([]);
+  const forwardQueueRef = useRef(forwardQueue);
+  forwardQueueRef.current = forwardQueue;
+  const forwardSeq = useRef(0);
+  const [forwardChooserPending, setForwardChooserPending] = useState(false);
+  const forwardChooserIdsRef = useRef<Set<number>>(new Set());
   const forwardToChat = useCallback((text: string) => {
-    forwardDraftRef.current = text;
-    setForwardChooserOpen(true);
+    const item = { id: ++forwardSeq.current, text };
+    const next = [...forwardQueueRef.current, item];
+    forwardQueueRef.current = next;
+    setForwardQueue(next);
+    if (
+      chooserOwnerRef.current !== null ||
+      permQueueRef.current.length > 0 ||
+      leaveHead.current
+    ) {
+      setForwardChooserPending(true);
+    } else {
+      chooserOwnerRef.current = "forward";
+      forwardChooserIdsRef.current = new Set(forwardQueueRef.current.map((q) => q.id));
+      setForwardChooserOpen(true);
+    }
   }, []);
+  const consumeForward = useCallback((ids: Set<number>) => {
+    const next = forwardQueueRef.current.filter((q) => !ids.has(q.id));
+    forwardQueueRef.current = next;
+    setForwardQueue(next);
+    return next.length;
+  }, []);
+  const cancelForwardChooser = useCallback(() => {
+    const ids = forwardChooserIdsRef.current;
+    forwardChooserIdsRef.current = new Set();
+    chooserOwnerRef.current = null;
+    setForwardChooserOpen(false);
+    const left = consumeForward(ids);
+    if (left > 0) setForwardChooserPending(true);
+  }, [consumeForward]);
+  useEffect(() => {
+    if (
+      !forwardChooserPending ||
+      permQueue.length > 0 ||
+      leaveConfirm ||
+      shareChooserOpen ||
+      shareChooserPending
+    )
+      return;
+    if (forwardChooserOpenRef.current || chooserOwnerRef.current !== null) return;
+    if (forwardQueueRef.current.length === 0) {
+      setForwardChooserPending(false);
+      return;
+    }
+    setForwardChooserPending(false);
+    chooserOwnerRef.current = "forward";
+    forwardChooserIdsRef.current = new Set(forwardQueueRef.current.map((q) => q.id));
+    setForwardChooserOpen(true);
+  }, [
+    forwardChooserPending,
+    leaveConfirm,
+    permQueue.length,
+    forwardQueue.length,
+    shareChooserOpen,
+    shareChooserPending,
+  ]);
   const placeForward = useCallback(
     (target: "new" | string) => {
-      setForwardChooserOpen(false);
-      const text = forwardDraftRef.current;
-      forwardDraftRef.current = null;
-      if (target === "new") {
-        void newChat();
-      } else {
-        void openChat(target);
+      const ids = new Set(forwardChooserIdsRef.current);
+      const items = forwardQueueRef.current.filter((q) => ids.has(q.id));
+      if (items.length === 0) return;
+      let claimed = false;
+      const pending = items.map((q) => q.text).join("\n");
+      const epochAtPick = target === "new" ? 0 : (chatEpoch.current[target] ?? 0);
+      const recordAtPick =
+        target === "new"
+          ? undefined
+          : chatsRef.current.find((c) => c.chat_id === target)?.record_id;
+      if (target !== "new" && !chatsRef.current.some((c) => c.chat_id === target)) {
+        setErrorToast("目标会话已经不存在了，请重新选择");
+        void refreshChats();
+        return;
       }
-      if (text) setChatDraft((prev) => (prev ? prev + "\n" + text : text));
+      setForwardChooserOpen(false);
+      chooserOwnerRef.current = null;
+      const commit = () => {
+        // 同一批选择只提交一次（重复点击/回调重入不重复追加）。
+        if (claimed) return;
+        chooserOwnerRef.current = null;
+        if (
+          target !== "new" &&
+          (!chatsRef.current.some((c) => c.chat_id === target) ||
+            (chatEpoch.current[target] ?? 0) !== epochAtPick ||
+            chatsRef.current.find((c) => c.chat_id === target)?.record_id !== recordAtPick)
+        ) {
+          setErrorToast("目标会话已经不存在了，请重新选择");
+          void refreshChats();
+          setForwardChooserPending(true);
+          return;
+        }
+        const actual = forwardQueueRef.current.filter((q) => ids.has(q.id));
+        if (actual.length === 0) {
+          claimed = true;
+          return;
+        }
+        const actualText = actual.map((q) => q.text).join("\n");
+        claimed = true;
+        const remaining = consumeForward(new Set(actual.map((q) => q.id)));
+        if (remaining > 0) setForwardChooserPending(true);
+        if (target === "new") {
+          void newChat();
+        } else {
+          void openChat(target, { preserveDraft: target === activeIdRef.current });
+        }
+        setChatDraft((prev) => (prev ? prev + "\n" + actualText : actualText));
+      };
+      leaveSettingsRef.current(commit, () => setForwardChooserPending(true));
     },
-    [newChat, openChat],
+    [consumeForward, newChat, openChat, refreshChats],
   );
 
   // ---------------------------------------------------------------------------
@@ -1944,10 +2504,21 @@ ${event.payload.command}
   // ---------------------------------------------------------------------------
   const [captureInFlight, setCaptureInFlight] = useState(false);
   const [photoEditor, setPhotoEditor] = useState<{ dataUrl: string; rel: string } | null>(null);
+  const captureOpSeq = useRef(0);
   const [captureDialog, setCaptureDialog] = useState<{
     kind: "video" | "audio";
     rel: string;
+    op: number;
   } | null>(null);
+  /** 打开采集选择层：分配操作号，旧层的迟到回执不能改动后来的界面。 */
+  const openCapture = useCallback((kind: "video" | "audio", rel: string) => {
+    captureOpSeq.current += 1;
+    setCaptureDialog({ kind, rel, op: captureOpSeq.current });
+  }, []);
+  const closeCaptureDialog = useCallback(() => {
+    captureOpSeq.current += 1;
+    setCaptureDialog(null);
+  }, []);
   const [recording, setRecording] = useState<{ startedAt: number } | null>(null);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const capturePollRef = useRef<number | null>(null);
@@ -2014,7 +2585,7 @@ ${event.payload.command}
                 setErrorToast(`读取拍摄结果失败: ${String(e)}`);
               });
           } else {
-            setCaptureDialog({ kind: "video", rel: result.file });
+            openCapture("video", result.file);
           }
         };
         capturePollRef.current = window.setInterval(() => {
@@ -2080,7 +2651,7 @@ ${event.payload.command}
     try {
       const rel = await api.recordStop();
       setRecording(null);
-      if (rel) setCaptureDialog({ kind: "audio", rel });
+      if (rel) openCapture("audio", rel);
       else setErrorToast("录音失败或时长过短");
     } catch (e) {
       setRecording(null);
@@ -2097,13 +2668,91 @@ ${event.payload.command}
     setRecording(null);
   }, []);
 
-  /** 采集/编辑产物 → 并入当前会话草稿（App 持有，切页不丢）。 */
-  const prefillCapture = useCallback((draft: string) => {
-    setCaptureDialog(null);
-    setPhotoEditor(null);
-    setChatDraft((prev) => (prev ? prev + "\n" + draft : draft));
-    setPage("chat");
-  }, []);
+  /** 采集/编辑产物 → 并入当前会话草稿（App 持有，切页不丢）。
+   *  运行目录有未保存编辑时先过守卫；取消则保留编辑器和本次采集结果。 */
+  const prefillCapture = useCallback(
+    (draft: string, op?: number) => {
+      // 旧采集层的迟到回执：层已关闭/换了新操作，直接丢弃。
+      if (op !== undefined && op !== captureOpSeq.current) return;
+      // 用最新的离开守卫（旧闭包可能捕获了干净的 fileDirty）。
+      requestLeaveRef.current(() => {
+        // 排队期间该操作可能已被关闭/替换：第二个确认不能再次提交。
+        if (op !== undefined && op !== captureOpSeq.current) return;
+        closeCaptureDialog();
+        setPhotoEditor(null);
+        setChatDraft((prev) => (prev ? prev + "\n" + draft : draft));
+        setSettings(null);
+        setActivity(null);
+        setRoomId(null);
+      });
+    },
+    [closeCaptureDialog],
+  );
+
+  /** 编辑照片发送：先过离开守卫，确认后才导出落盘（取消不产生新文件）。 */
+  const photoOpSeq = useRef(0);
+  const sendPhotoCapture = useCallback(
+    (exportPhoto: () => Promise<string>) =>
+      new Promise<void>((resolve, reject) => {
+        // 绑定点击时的会话与操作号：写盘迟到或用户取消后，回执不得改动后来打开的界面。
+        const op = ++photoOpSeq.current;
+        const targetChat = activeIdRef.current;
+        const targetEpoch = chatEpoch.current[targetChat] ?? 0;
+        const targetRecord = chatsRef.current.find(
+          (c) => c.chat_id === targetChat,
+        )?.record_id;
+        requestLeave(
+          () => {
+            if (
+              op !== photoOpSeq.current ||
+              (chatEpoch.current[targetChat] ?? 0) !== targetEpoch ||
+              chatsRef.current.find((c) => c.chat_id === targetChat)?.record_id !==
+                targetRecord
+            ) {
+              setErrorToast("目标会话已变化，照片没有发送；请重新选择会话后再发送");
+              resolve();
+              return;
+            }
+            void exportPhoto()
+              .then((rel) => {
+                if (op !== photoOpSeq.current) {
+                  resolve();
+                  return;
+                }
+                if (
+                  (chatEpoch.current[targetChat] ?? 0) !== targetEpoch ||
+                  chatsRef.current.find((c) => c.chat_id === targetChat)?.record_id !==
+                    targetRecord
+                ) {
+                  // 目标会话已被同键替换：不把旧附件写进新记录；保留编辑页重新发送。
+                  setErrorToast("目标会话已变化，照片没有发送；请重新选择会话后再发送");
+                  resolve();
+                  return;
+                }
+                const draft = `[附件] ${rel}（已放入 agent 工作区）`;
+                if (activeIdRef.current === targetChat) {
+                  setChatDraft((prev) => (prev ? prev + "\n" + draft : draft));
+                  setSettings(null);
+                  setActivity(null);
+                  setRoomId(null);
+                } else {
+                  // 已切到别的会话：附件进入原会话的草稿，切回时恢复。
+                  const prev = draftByChat.current[targetChat] ?? "";
+                  draftByChat.current[targetChat] = prev ? prev + "\n" + draft : draft;
+                }
+                setPhotoEditor(null);
+                resolve();
+              })
+              .catch((e) => {
+                setErrorToast(String(e));
+                reject(e);
+              });
+          },
+          () => reject(new Error("已取消")),
+        );
+      }),
+    [requestLeave, setErrorToast],
+  );
 
   /** 采集产物保存到系统相册（编辑页「保存到本地」）。 */
   const saveCaptureLocal = useCallback(
@@ -2127,6 +2776,7 @@ ${event.payload.command}
 
   /** 丢弃编辑（取消）：删除采集原图。 */
   const discardPhotoEditor = useCallback(() => {
+    photoOpSeq.current += 1; // 使在途发送回执失效
     if (photoEditor) {
       void api.discardCapture(photoEditor.rel).catch(() => {});
     }
@@ -2148,38 +2798,199 @@ ${event.payload.command}
   // 系统返回键关一层弹层（与视觉层级无关，按打开先后响应；未注册的弹层
   // 返回键落到抽屉逻辑）。授权弹窗返回 = 拒绝（不响应会卡住队列，后端超时
   // 同样按拒绝兜底）。
-  useBackClose(themePickerOpen, () => setThemePickerOpen(false));
-  useBackClose(shareChooserOpen, () => setShareChooserOpen(false));
-  useBackClose(forwardChooserOpen, () => {
-    forwardDraftRef.current = null;
-    setForwardChooserOpen(false);
-  });
+  useBackClose(shareChooserOpen && permQueue.length === 0, cancelShareChooser);
+  useBackClose(forwardChooserOpen && permQueue.length === 0, cancelForwardChooser);
   useBackClose(chatMenu !== null, () => setChatMenu(null));
   useBackClose(
     exportFmtTarget !== null && !exportFullBusy,
     () => closeExportDialog(),
   );
-  useBackClose(deleteConfirm !== null, () => setDeleteConfirm(null));
+  useBackClose(deleteConfirm !== null && permQueue.length === 0, () => setDeleteConfirm(null));
+  useBackClose(roomDeleteConfirm !== null && permQueue.length === 0, () => setRoomDeleteConfirm(null));
   useBackClose(permQueue.length > 0, () => answerPermission(false));
-  useBackClose(photoEditor !== null, discardPhotoEditor);
-  useBackClose(captureDialog !== null, () => setCaptureDialog(null));
-  useBackClose(recording !== null, () => void cancelRecording());
-  // 子 agent 执行详情层：返回键先回到列表。抽屉盖在上面时不接管——抽屉开着按返回是
-  // 「退出应用」（见 installBackNavigation），不该先把底下看不见的详情关掉。
-  // agent 未就绪时详情层根本没渲染，返回键不该被一个看不见的层吃掉。
-  useBackClose(
-    agentState === "ready" &&
-      selectedAgentId !== null &&
-      (page === "agents" || page === "taskview") &&
-      !drawerOpen,
-    () => setSelectedAgentId(null),
+  useBackClose(photoEditor !== null && permQueue.length === 0, discardPhotoEditor);
+  useBackClose(captureDialog !== null && permQueue.length === 0, closeCaptureDialog);
+  useBackClose(recording !== null && permQueue.length === 0, () => void cancelRecording());
+  const leaveSettings = useCallback(
+    (after: () => void, onCancel?: () => void) => {
+      if (settings?.section === "files" && fileDirty) requestLeave(after, onCancel);
+      else after();
+    },
+    [fileDirty, requestLeave, settings?.section],
+  );
+  useBackClose(groupCreateOpen && permQueue.length === 0, () => setGroupCreateOpen(false));
+  useBackClose(leaveConfirm !== null && permQueue.length === 0, () => {
+    settleLeave(false);
+  });
+  const leaveSettingsRef = useRef(leaveSettings);
+  leaveSettingsRef.current = leaveSettings;
+  /** 列表入口打开会话：进守卫前预检（失效目标不弹放弃草稿），确认后再用
+   *  最新列表复核（确认期间可能被删/重建）；bot 会话不在列表里，直接放行。 */
+  const openChatChecked = useCallback(
+    (id: string) => {
+      if (!id.startsWith("bot-") && !chatsRef.current.some((c) => c.chat_id === id)) {
+        setErrorToast("会话已经不存在了");
+        void refreshChats();
+        return;
+      }
+      leaveSettingsRef.current(() => {
+        if (!id.startsWith("bot-") && !chatsRef.current.some((c) => c.chat_id === id)) {
+          setErrorToast("会话已经不存在了");
+          void refreshChats();
+          return;
+        }
+        void openChat(id);
+      });
+    },
+    [openChat, refreshChats],
   );
 
-  /** 打开 Agent 页（可选直达某条执行的详情）。 */
-  const openAgents = useCallback((agentId?: string) => {
-    setSelectedAgentId(agentId ?? null);
-    setPage("agents");
-  }, []);
+  /** 打开活动覆盖层（可选直达某条执行详情）。 */
+  const openActivity = useCallback(
+    (tab: "tasks" | "agents", agentId?: string) => {
+      requestLeave(() => {
+        closeDrawer();
+        setSettings(null);
+        setRoomId(null);
+        setActivity({ tab, view: agentId ? "detail" : "list", selectedId: agentId });
+      });
+    },
+    [closeDrawer, requestLeave],
+  );
+
+  /** 打开设置（错误态把分区 clamp 到可修复集合；桌面默认上次分区/移动端列表）。 */
+  const openSettings = useCallback(
+    (section?: SettingsSection) => {
+      const allowed: SettingsSection[] =
+        agentState === "error" ? ["models", "appearance", "about"] : [];
+      let next =
+        section ??
+        ((localStorage.getItem("rclaw_settings_section") as SettingsSection | null) ??
+          "appearance");
+      if (allowed.length > 0 && !allowed.includes(next)) next = "models";
+      const explicit = section !== undefined || allowed.length > 0;
+      requestLeave(() => {
+        try {
+          localStorage.setItem("rclaw_settings_section", next);
+        } catch {
+          /* 忽略配额错误 */
+        }
+        closeDrawer();
+        setActivity(null);
+        setRoomId(null);
+        setSettings({
+          view: explicit || !compactLayout ? "section" : "list",
+          section: next,
+        });
+      });
+    },
+    [agentState, compactLayout, closeDrawer, requestLeave],
+  );
+
+  /** 打开群房间（关闭设置/活动/抽屉）。确认后再复核房间仍在——守卫打开期间
+   *  列表可能被同步刷新删掉；复用的快照/闭包不可信。 */
+  const openRoom = useCallback(
+    (id: string) => {
+      if (!roomsRef.current.some((room) => room.id === id)) {
+        setErrorToast("这个群聊已经不存在了");
+        void refreshRooms();
+        return;
+      }
+      requestLeave(() => {
+        if (!roomsRef.current.some((room) => room.id === id)) {
+          setErrorToast("这个群聊已经不存在了");
+          void refreshRooms();
+          return;
+        }
+        closeDrawer();
+        setSettings(null);
+        setActivity(null);
+        setRoomId(id);
+      });
+    },
+    [closeDrawer, refreshRooms, requestLeave],
+  );
+
+  /** 删除群聊：统一确认后执行（侧栏菜单 / 设置智能体分区同一入口）。 */
+  const requestRoomDelete = useCallback(
+    (room: GroupRoom) => {
+      setRoomMenu(null);
+      setRoomDeleteConfirm({ room });
+    },
+    [],
+  );
+  const confirmRoomDelete = useCallback(() => {
+    const room = roomDeleteConfirm?.room;
+    if (!room) return;
+    setRoomDeleteConfirm(null);
+    void api
+      .groupDelete(room.id)
+      .then(() => {
+        if (roomIdRef.current === room.id) setRoomId(null);
+        return refreshRooms();
+      })
+      .catch((e) => setErrorToast(String(e)));
+  }, [roomDeleteConfirm, refreshRooms, setErrorToast]);
+
+  // 桌面快捷键：Ctrl+K 搜索会话、Ctrl+N 新建、Ctrl+, 设置（输入框内不劫持 N）。
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      // 授权弹窗在顶层时不让快捷键打开背景抽屉/新会话/设置。
+      if (permQueueRef.current.length > 0) return;
+      const key = event.key.toLowerCase();
+      if (key === "k") {
+        if (settingsRef.current || activityRef.current || roomIdRef.current) return;
+        event.preventDefault();
+        if (compactLayout && !drawerOpenRef.current) {
+          drawerViaBack.current = false;
+          setDrawerOpen(true);
+        }
+        setTimeout(() => {
+          document
+            .querySelector<HTMLInputElement>('input[placeholder="搜索会话"]')
+            ?.focus();
+        }, 80);
+      } else if (key === "n" && !event.shiftKey) {
+        event.preventDefault();
+        leaveSettingsRef.current(() => void newChat());
+      } else if (key === ",") {
+        event.preventDefault();
+        openSettings();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [compactLayout, newChat, openSettings]);
+
+  /** 统一导入入口：置 importInFlight 抑制导入期事件，按回执迁移界面状态。 */
+  const importRaw = useCallback(
+    async (content: string): Promise<ConfigImportOutcome> => {
+      // 同步占用：ConfigPanel 卸载会丢失自己的 importing，App 层必须拒绝并发导入，
+      // 否则先结束的请求会替后一个请求解除事件抑制。
+      if (importLock.current) throw new Error("已有配置导入正在进行，请稍候");
+      importLock.current = true;
+      setImportInFlight(true);
+      try {
+        const outcome = await api.configImportRaw(content);
+        if (!outcome.sync_reloaded) {
+          setErrorToast("配置已写入，但同步引擎重载失败；请到「多端同步」检查。");
+        }
+        // 只有真正启动成功才迁移到 ready；失败/需要重启由调用方按回执提示，
+        // 界面保持原状态（修复页/Wizard 不闪离）。
+        if (outcome.started) {
+          setAgentState("ready");
+          void api.getStatus().then(applyStatus);
+          void refreshChats();
+        }
+        return outcome;
+      } finally {
+        importLock.current = false;
+        setImportInFlight(false);
+      }
+    },
+    [applyStatus, refreshChats, setErrorToast],
+  );
 
   let body: ReactNode;
   if (!status) {
@@ -2189,8 +3000,10 @@ ${event.payload.command}
     body = (
       <Wizard
         home={status.home}
+        onImportRaw={importRaw}
         onDone={() => {
-          setAgentState("starting");
+          // 导入路径的回执可能已把状态置为 ready；不要把它降回 starting 再等轮询。
+          setAgentState((prev) => (prev === "ready" ? "ready" : "starting"));
           setStatus({ ...status, wizard_needed: false });
         }}
       />
@@ -2198,646 +3011,362 @@ ${event.payload.command}
   } else {
     const activeBusy = busyFor(activeId);
     const activeEntries = entriesByChat[activeId] ?? [];
+    const overlayOpen = settings !== null || activity !== null || roomId !== null;
     body = (
       <div className="flex h-full">
-      {isMobile && drawerOpen && <DrawerScrim onClose={() => setDrawerOpen(false)} />}
-      {/* 侧边栏：展开 = 图标+文字（宽度可拖拽调整）；收起 = 图标栏（悬浮 title 提示）。 */}
-      <div
-        className={`sidebar-bg flex shrink-0 flex-col overflow-hidden border-r border-[#2a2f3a] bg-[#12151d] ${
-          isMobile
-            ? drawerOpen
-              ? "fixed inset-y-0 left-0 z-50 w-[17rem] max-w-[85vw] shadow-2xl"
-              : "hidden"
-            : sidebarCollapsed
-              ? "w-14"
-              : ""
-        }`}
-        style={
-          isMobile
-            ? { paddingTop: "env(safe-area-inset-top)" }
-            : sidebarCollapsed
-              ? undefined
-              : { width: leftWidth }
-        }
-      >
-        <div
-          className={`flex items-center gap-2 py-4 max-md:py-2.5 ${
-            sidebarCollapsed ? "flex-col px-0" : "px-3"
-          }`}
-        >
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-sm font-bold text-white">
-            R
-          </div>
-          {!sidebarCollapsed && (
-            <span className="min-w-0 flex-1 truncate font-semibold text-gray-100">RClaw</span>
-          )}
-          {/* 新建对话快捷按钮（RClaw 右侧；新建即回到对话页）。 */}
-          <button
-            onClick={() => {
-              void newChat();
-              setPage("chat");
-              setDrawerOpen(false);
-            }}
-            title="新建对话"
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-base leading-none text-gray-400 transition hover:bg-[#1a1f29] hover:text-indigo-300"
-          >
-            ＋
-          </button>
-          <button
-            onClick={toggleSidebar}
-            title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
-            className="rounded-md px-1.5 py-1.5 text-gray-500 transition hover:bg-[#1a1f29] hover:text-gray-200"
-          >
-            {sidebarCollapsed ? <ExpandIcon /> : <CollapseIcon />}
-          </button>
-        </div>
-
-        {/* 侧边栏顶部常驻入口：浏览器（应用内面板，手动上网/人工过码）。
-            桌面版入口在标题栏右上角（地球图标），此处仅移动端抽屉展示。 */}
-        {isMobile && (
-          <div className="px-3 pb-1">
-            <button
-              onClick={() => {
-                void api.browserToggleVisible().catch(() => {});
-                setDrawerOpen(false);
-              }}
-              className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm text-gray-300 transition hover:bg-[#1a1f29] hover:text-gray-100 max-md:py-2"
-            >
-              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="8" cy="8" r="6.2" />
-                  <path d="M1.8 8h12.4M8 1.8c1.9 1.7 2.9 3.8 2.9 6.2S9.9 12.5 8 14.2C6.1 12.5 5.1 10.4 5.1 8S6.1 3.5 8 1.8z" />
-                </svg>
-              </span>
-              浏览器
-            </button>
-          </div>
-        )}
-
-        {/* 导航区自滚（条目多时上下滑动，不再把底部会话区挤走）。 */}
-        <nav className={`min-h-0 flex-1 space-y-1 overflow-y-auto ${sidebarCollapsed ? "px-2" : "px-3"}`}>
-          {/* 任务概览仅移动端抽屉展示（桌面由右侧 TaskPanel 承担）：
-              与其他栏目同级，点击进入专门的概览详情页。
-              「关于」固定置底：先渲染除它以外的栏目，安卓的主题入口垫在
-              「配置」之后，最后渲染「关于」（NAV 末项）。 */}
-          {(
-            isMobile
-              ? ([
-                  ...NAV.slice(0, 7),
-                  ["taskview", "任务概览", () => <TasksIcon />],
-                  ...NAV.slice(7, -1),
-                ] as Array<[Page, string, () => ReactNode]>)
-              : NAV.slice(0, -1)
-          ).map(([key, label, Icon]) => {
-            // Agent / 任务概览：实时徽标 = 活跃执行数（有在运行的带脉动；收起时只剩小圆点）。
-            // 多端同步：徽标 = 等用户处理的事项数（不脉动）。
-            const isSync = key === "sync";
-            const badge = isSync
-              ? syncPending
-              : key === "agents" || key === "taskview"
-                ? liveCounts.active
-                : 0;
-            const pulse = !isSync && badge > 0 && liveCounts.running > 0;
-            return (
-              <button
-                key={key}
-                onClick={() => {
-                  // 点栏目总是回到列表层（在详情里再点一次「Agent」= 返回列表）。
-                  setSelectedAgentId(null);
-                  setPage(key);
-                  setDrawerOpen(false);
-                }}
-                title={
-                  badge > 0
-                    ? isSync
-                      ? `${label}：${badge} 件事等你处理`
-                      : `${label}：${badge} 个任务活跃`
-                    : label
+        {compactLayout && drawerOpen && <DrawerScrim onClose={closeDrawer} />}
+        {compactLayout ? (
+          drawerOpen ? (
+            <Drawer>
+              <Sidebar
+                compact
+                collapsed={false}
+                chats={chats}
+                rooms={rooms}
+                activeId={activeId}
+                busyByChat={busyByChat}
+                syncMarks={syncMarks}
+                syncPending={syncPending}
+                syncOn={syncOn}
+                importBusy={importBusy}
+                activityCount={liveCounts.active}
+                activityPulse={liveCounts.running > 0}
+                usage={mobileUsage}
+                homePath={status?.home}
+                onOpenChat={openChatChecked}
+                onOpenRoom={(id) => leaveSettings(() => openRoom(id))}
+                onChatMenu={(chatId, title, recordId, x, y, trigger) =>
+                  setChatMenu({
+                    chatId,
+                    title,
+                    recordId,
+                    epoch: chatEpoch.current[chatId] ?? 0,
+                    x,
+                    y,
+                    trigger,
+                  })
                 }
-                className={`relative flex w-full items-center rounded-lg text-sm transition max-md:text-[15px] ${
-                  sidebarCollapsed ? "justify-center py-2" : "gap-2.5 px-3 py-2 text-left max-md:py-2"
-                } ${
-                  page === key
-                    ? "bg-indigo-500/10 text-indigo-300"
-                    : "text-gray-400 hover:bg-[#1a1f29] hover:text-gray-200"
-                }`}
-              >
-                <span className="relative flex h-4 w-4 shrink-0 items-center justify-center">
-                  <Icon />
-                  {badge > 0 && sidebarCollapsed && (
-                    <span
-                      className={`absolute -right-1 -top-1 h-2 w-2 rounded-full bg-amber-400 ${
-                        pulse ? "animate-pulse" : ""
-                      }`}
-                    />
-                  )}
-                </span>
-                {!sidebarCollapsed && <span className="min-w-0 flex-1 truncate">{label}</span>}
-                {!sidebarCollapsed && badge > 0 && (
-                  <span
-                    className={`ml-auto inline-flex min-w-[1.25rem] shrink-0 items-center justify-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-px font-mono text-[10px] tabular-nums text-amber-300 ${
-                      pulse ? "" : "opacity-80"
-                    }`}
-                  >
-                    {pulse && <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />}
-                    {badge}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-          {/* 安卓 App：主题选择入口（顶栏已移除，收进侧栏栏目；仅手机布局）。 */}
-          {isAndroidDevice() && isMobile && !sidebarCollapsed && (
-            <button
-              onClick={() => {
-                setDrawerOpen(false);
-                setThemePickerOpen(true);
-              }}
-              title="主题"
-              className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm text-gray-400 transition hover:bg-[#1a1f29] hover:text-gray-200 max-md:py-2 max-md:text-[15px]"
-            >
-              <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[13px]">
-                🎨
-              </span>
-              主题
-            </button>
-          )}
-          {NAV.slice(-1).map(([key, label, Icon]) => (
-            <button
-              key={key}
-              onClick={() => {
-                setPage(key);
-                setDrawerOpen(false);
-              }}
-              title={label}
-              className={`flex w-full items-center rounded-lg text-sm transition max-md:text-[15px] ${
-                sidebarCollapsed ? "justify-center py-2" : "gap-2.5 px-3 py-2 text-left max-md:py-2"
-              } ${
-                page === key
-                  ? "bg-indigo-500/10 text-indigo-300"
-                  : "text-gray-400 hover:bg-[#1a1f29] hover:text-gray-200"
-              }`}
-            >
-              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
-                <Icon />
-              </span>
-              {!sidebarCollapsed && label}
-            </button>
-          ))}
-        </nav>
-
-        {/* 移动端：上下文窗口 / 内存占用（数据路径上方；桌面在 TaskPanel）。
-            单行紧凑卡：小圆点颜色表达上下文压力（>80% 变红，替代桌面进度条）。 */}
-        {isMobile && (
-          <div className="mx-3 mb-2 flex items-center justify-between rounded-xl border border-[#2a2f3a] bg-[#141821] px-3 py-2 text-[11px] text-gray-500">
-            <span className="flex items-center gap-1.5">
-              <span
-                className={`inline-block h-1.5 w-1.5 rounded-full ${
-                  mobileUsage &&
-                  mobileUsage.context_length > 0 &&
-                  mobileUsage.request_used / mobileUsage.context_length > 0.8
-                    ? "bg-red-500"
-                    : "bg-indigo-500"
-                }`}
-              />
-              上下文{" "}
-              <span className="font-mono text-gray-300">
-                {mobileUsage && mobileUsage.context_length > 0
-                  ? `${(mobileUsage.request_used / 1000).toFixed(1)}K/${(mobileUsage.context_length / 1000).toFixed(1)}K`
-                  : "—"}
-              </span>
-            </span>
-            <span>
-              内存{" "}
-              <span className="font-mono text-gray-300">
-                {mobileUsage && mobileUsage.rss_bytes > 0
-                  ? `${(mobileUsage.rss_bytes / 1024 / 1024).toFixed(0)} MB`
-                  : "—"}
-              </span>
-            </span>
-          </div>
-        )}
-
-        {!sidebarCollapsed && (
-          <div className="px-5 py-3 text-[10px] leading-relaxed text-gray-600">
-            <button
-              type="button"
-              title="单击复制路径，双击在文件管理器打开"
-              onClick={handleHomeClick}
-              onDoubleClick={handleHomeDoubleClick}
-              className="block max-w-full cursor-pointer truncate text-left transition hover:text-gray-300"
-            >
-              {homeHint ?? `数据：${status.home}`}
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* 侧栏拖宽手柄（收起为图标栏时无意义，隐藏）。 */}
-      {!isMobile && !sidebarCollapsed && <ResizeHandle onDrag={resizeLeft} />}
-
-      {/* 主区 */}
-      <div className="min-w-0 flex-1">
-        {agentState === "starting" && (
-          <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-gray-400">
-            <div className="h-8 w-8 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent" />
-            正在启动 RClaw…
-            {agentError && <div className="text-red-400">{agentError}</div>}
-          </div>
-        )}
-        {agentState === "error" && (
-          <div className="flex h-full flex-col items-center justify-center gap-2 px-8 text-center">
-            <div className="text-sm text-red-400">agent 启动失败</div>
-            <div className="max-w-lg text-xs text-gray-500">{agentError}</div>
-            <div className="text-xs text-gray-600">
-              请检查 {status.home}/rclaw.toml 的 provider 配置后重启应用。
-            </div>
-          </div>
-        )}
-        {agentState === "ready" && page === "chats" && (
-          <div className="h-full overflow-y-auto bg-[#0f131b] px-5 py-4 max-md:px-3">
-        {/* 会话列表（收起为图标栏时隐藏）；移动端保证最小可见高度，
-            超出部分由侧栏整体滚动承接（导航/状态块不再挤占会话区）。 */}
-        <div className="mb-3 flex items-center justify-between gap-2">
-          <h2 className="text-base font-semibold text-gray-100">会话</h2>
-          <div className="flex min-w-0 items-center gap-2">
-            {/* 导入会话包：另一台设备（或这台设备以前）「导出会话包」得到的文件。总是新建
-                一个会话，从不覆盖已有的；不需要开启同步。 */}
-            <button
-              onClick={() => importInputRef.current?.click()}
-              disabled={importBusy}
-              title="导入一个会话包文件（.rclaw-session.jsonl），作为新会话加入列表"
-              className="shrink-0 whitespace-nowrap rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 disabled:opacity-40 max-md:px-2"
-            >
-              {/* 窄屏用短文案：三个按钮要排得下一行。 */}
-              {importBusy ? (
-                "导入中…"
-              ) : (
-                <>
-                  <span className="max-md:hidden">导入会话包</span>
-                  <span className="md:hidden">导入</span>
-                </>
-              )}
-            </button>
-            {/* 不设 accept：会话包的扩展名系统不认识，安卓的文件选择器会把它灰掉。 */}
-            <input
-              ref={importInputRef}
-              type="file"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files && e.target.files[0];
-                // 清空选择：同一个文件连续选两次也要触发 change。
-                e.target.value = "";
-                if (file) importBundle(file);
-              }}
-            />
-            {/* 多端同步开着时才有意义：新建一个从一开始就不同步的对话。 */}
-            {syncOn && (
-              <button
-                onClick={() => {
-                  // 标记落库成功才会切到对话页（newChat 内部做）；失败留在本页提示。
-                  void newChat("chats", true);
-                  setDrawerOpen(false);
+                onRoomMenu={(room, x, y) => setRoomMenu({ room, x, y })}
+                onRename={async (id, title) => {
+                  await api.chatRename(id, title);
+                  await refreshChats();
                 }}
-                title="新建一个只留在这台设备上、不同步到其他设备的对话"
-                className="shrink-0 whitespace-nowrap rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 max-md:px-2"
-              >
-                <span className="max-md:hidden">＋ 仅本机对话</span>
-                <span className="md:hidden">＋ 仅本机</span>
-              </button>
-            )}
-            <button
-            onClick={() => {
-              void newChat("chats");
-              setDrawerOpen(false);
-            }}
-              className="shrink-0 whitespace-nowrap rounded-lg border border-[#2a2f3a] bg-[#141821] px-3 py-1.5 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 max-md:px-2"
-            >
-              ＋ 新建对话
-            </button>
-          </div>
-        </div>
-          {/* todo（zcode 会话面板同款信息位）：最近一个未收尾计划的步骤清单，
-              与消息流的「流程步骤」卡片同源数据。 */}
-          {latestPlan && !latestPlan.completed && latestPlan.steps.length > 0 && (
-            <div className="mb-2 rounded-lg border border-[#2a2f3a] bg-[#141821] px-2.5 py-2">
-              <div className="flex items-center justify-between text-[11px] text-gray-500">
-                <span className="truncate">📋 {latestPlan.name}</span>
-                <span>
-                  {latestPlan.steps.filter((s) => s.status === "pending").length} 项待办
-                </span>
-              </div>
-              <ul className="mt-1 space-y-0.5">
-                {latestPlan.steps.slice(0, 8).map((step) => (
-                  <li key={step.id} className="flex items-start gap-1.5 text-[11px] leading-snug">
-                    <span
-                      className={
-                        step.status === "succeeded"
-                          ? "text-emerald-400"
-                          : step.status === "failed"
-                            ? "text-red-400"
-                            : step.status === "skipped"
-                              ? "text-gray-600"
-                              : step.status === "running"
-                                ? "text-indigo-400"
-                                : step.status === "verifying"
-                                  ? "text-amber-300"
-                                  : "text-amber-400"
-                      }
-                    >
-                      {step.status === "succeeded"
-                        ? "✓"
-                        : step.status === "failed"
-                          ? "✗"
-                          : step.status === "skipped"
-                            ? "⤼"
-                            : step.status === "running"
-                              ? "◌"
-                              : step.status === "verifying"
-                                ? "🔍"
-                                : "☐"}
-                    </span>
-                    <span
-                      className="min-w-0 truncate text-gray-400"
-                      title={step.task || step.summary}
-                    >
-                      {step.id}
-                      {step.task ? ` · ${step.task}` : ""}
-                    </span>
-                  </li>
-                ))}
-                {latestPlan.steps.length > 8 && (
-                  <li className="pl-4 text-[10px] text-gray-600">
-                    … 共 {latestPlan.steps.length} 步
-                  </li>
-                )}
-              </ul>
-            </div>
-          )}
-          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-2">
-            {chats.filter((c) => !c.archived).length === 0 && (
-              <div className="px-2 py-1 text-xs text-gray-600">暂无会话</div>
-            )}
-            {chats
-              .filter((c) => !c.archived)
-              .map((c) => (
-                <div
-                  key={c.chat_id}
-                  data-chat-row
-                  className={`group flex items-center rounded-lg transition ${
-                    activeId === c.chat_id
-                      ? "bg-[#1a2030] text-indigo-200"
-                      : "text-gray-400 hover:bg-[#1a1f29]"
-                  }`}
-                >
-                  {/* 会话工作状态：agent 工作中 = 转圈，turn 结束 = 绿点。 */}
-                  {renamingId !== c.chat_id &&
-                    (busyByChat[c.chat_id] ? (
-                      <span
-                        title="Agent 工作中"
-                        className="ml-2.5 h-2.5 w-2.5 shrink-0 animate-spin rounded-full border-[1.5px] border-indigo-400 border-t-transparent"
-                      />
-                    ) : (
-                      <span
-                        title="空闲"
-                        className="ml-3 h-2 w-2 shrink-0 rounded-full bg-emerald-500"
-                      />
-                    ))}
-                  {renamingId === c.chat_id ? (
-                    <input
-                      autoFocus
-                      value={renameDraft}
-                      onChange={(e) => setRenameDraft(e.target.value)}
-                      onClick={(e) => e.stopPropagation()}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          void commitRename();
-                        } else if (e.key === "Escape") {
-                          renameCancelled.current = true;
-                          setRenamingId(null);
-                        }
-                      }}
-                      onBlur={() => void commitRename()}
-                      maxLength={120}
-                      placeholder={c.chat_id}
-                      className="min-w-0 flex-1 rounded-md border border-indigo-500/50 bg-[#161a22] px-2 py-1 text-xs text-gray-200 outline-none"
-                    />
-                  ) : (
-                    <button
-                      onClick={() => {
-                        void openChat(c.chat_id, "chats");
-                        setPage("chat");
-                      }}
-                      onDoubleClick={() => startRename(c.chat_id, c.title || c.chat_id)}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        setChatMenu({
-                          chatId: c.chat_id,
-                          title: c.title || c.chat_id,
-                          x: e.clientX,
-                          // 靠底行向上弹，避免菜单溢出窗口。
-                          y: Math.min(e.clientY, window.innerHeight - 230),
-                          trigger: e.currentTarget,
-                        });
-                      }}
-                      className="min-w-0 flex-1 px-2 py-1.5 text-left max-md:py-2.5"
-                      title={`${syncTitle(c.title || c.chat_id, syncMarks[c.chat_id])}（双击重命名，右键更多操作）`}
-                    >
-                      {/* 多端同步：分支 / 换键落地的会话标题带本机显示用的后缀，行尾是同步角标。 */}
-                      <div className="flex items-center gap-1.5">
-                        <span className="min-w-0 truncate text-xs max-md:text-[13px]">
-                          {c.chat_id.startsWith("bot-") ? "🤖 " : ""}
-                          {syncTitle(c.title || c.chat_id, syncMarks[c.chat_id])}
-                        </span>
-                        <SyncMarkTags mark={syncMarks[c.chat_id]} />
-                      </div>
-                    </button>
-                  )}
-                  {!busyByChat[c.chat_id] && renamingId !== c.chat_id && (
-                    <>
-                      {/* 移动端操作入口（触屏无右键/hover）：弹出重命名/导出/归档菜单 */}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const r = e.currentTarget.getBoundingClientRect();
-                          setChatMenu({
-                            chatId: c.chat_id,
-                            title: c.title || c.chat_id,
-                            x: Math.min(r.left, window.innerWidth - 176),
-                            y: Math.min(r.bottom + 4, window.innerHeight - 230),
-                            trigger: e.currentTarget,
-                          });
-                        }}
-                        title="会话操作"
-                        className="mr-0.5 hidden shrink-0 rounded px-1.5 py-0.5 text-xs leading-none text-gray-500 transition hover:text-gray-200 max-md:block"
-                      >
-                        ⋯
-                      </button>
-                      <button
-                        onClick={() => void archiveChat(c.chat_id)}
-                        title="归档此会话"
-                        className="mr-1 hidden rounded px-1 text-[10px] text-gray-500 transition hover:text-amber-300 group-hover:block"
-                      >
-                        归档
-                      </button>
-                    </>
-                  )}
-                </div>
-              ))}
-            {/* 已归档（折叠展示，可恢复/删除） */}
-            {chats.some((c) => c.archived) && (
-              <ArchivedSection
-                items={chats.filter((c) => c.archived)}
-                onRestore={(id) => void restoreChat(id)}
-                onDelete={(id, title) => setDeleteConfirm({ chatId: id, title })}
+                onArchive={(id, recordId) => void archiveChat(id, recordId)}
+                onRestore={(id, recordId) => void restoreChat(id, recordId)}
+                onDeleteChat={(id, title, recordId) => setDeleteConfirm({ chatId: id, title, epoch: chatEpoch.current[id] ?? 0, recordId })}
+                onNewChat={() => leaveSettings(() => void newChat())}
+                onNewLocalChat={() => leaveSettings(() => void newChat(true))}
+                onImportBundle={importBundle}
+                onOpenBotChat={(name) => openChatChecked(`bot-${name}`)}
+                onOpenGroupCreate={() => setGroupCreateOpen(true)}
+                onManageBots={() => openSettings("bots")}
+                onOpenSettings={() => openSettings()}
+                onOpenActivity={() => openActivity("tasks")}
+                onOpenBrowser={() => {
+                  void api.browserToggleVisible().catch(() => {});
+                  closeDrawer();
+                }}
+                loadBots={loadBots}
               />
-            )}
-          </div>
+            </Drawer>
+          ) : null
+        ) : (
+          <div
+            className={`sidebar-bg flex shrink-0 flex-col overflow-hidden border-r border-[#2a2f3a] bg-[#12151d] ${
+              sidebarCollapsed ? "w-14" : ""
+            }`}
+            style={sidebarCollapsed ? undefined : { width: leftWidth }}
+          >
+            <Sidebar
+              compact={false}
+              collapsed={sidebarCollapsed}
+              onToggleCollapse={toggleSidebar}
+              chats={chats}
+              rooms={rooms}
+              activeId={activeId}
+              busyByChat={busyByChat}
+              syncMarks={syncMarks}
+              syncPending={syncPending}
+              syncOn={syncOn}
+              importBusy={importBusy}
+              activityCount={liveCounts.active}
+              activityPulse={liveCounts.running > 0}
+              usage={mobileUsage}
+              homePath={status?.home}
+              onOpenChat={openChatChecked}
+              onOpenRoom={(id) => leaveSettings(() => openRoom(id))}
+              onChatMenu={(chatId, title, recordId, x, y, trigger) =>
+                  setChatMenu({
+                    chatId,
+                    title,
+                    recordId,
+                    epoch: chatEpoch.current[chatId] ?? 0,
+                    x,
+                    y,
+                    trigger,
+                  })
+                }
+              onRoomMenu={(room, x, y) => setRoomMenu({ room, x, y })}
+              onRename={async (id, title) => {
+                await api.chatRename(id, title);
+                await refreshChats();
+              }}
+              onArchive={(id, recordId) => void archiveChat(id, recordId)}
+              onRestore={(id, recordId) => void restoreChat(id, recordId)}
+              onDeleteChat={(id, title, recordId) => setDeleteConfirm({ chatId: id, title, epoch: chatEpoch.current[id] ?? 0, recordId })}
+              onNewChat={() => leaveSettings(() => void newChat())}
+              onNewLocalChat={() => leaveSettings(() => void newChat(true))}
+              onImportBundle={importBundle}
+              onOpenBotChat={(name) => openChatChecked(`bot-${name}`)}
+              onOpenGroupCreate={() => setGroupCreateOpen(true)}
+              onManageBots={() => openSettings("bots")}
+              onOpenSettings={() => openSettings()}
+              onOpenActivity={() => openActivity("tasks")}
+              loadBots={loadBots}
+            />
           </div>
         )}
+        {!compactLayout && !sidebarCollapsed && <ResizeHandle onDrag={resizeLeft} />}
 
-        {agentState === "ready" && page === "chat" && (
-          // 多端同步的那一条在对话上方（没有要说的时候它什么都不渲染，对话页和原来一样）；
-          // 对话占满余下的高度——用绝对定位给 Chat 的 h-full 一个确定的高度。
-          <div className="flex h-full flex-col">
-            <SyncChatBar
-              chatId={activeId}
-              runningOn={syncMarks[activeId] ? syncMarks[activeId].running_on : undefined}
-              onError={setErrorToast}
-            />
-            <div className="relative min-h-0 flex-1">
-              <div className="absolute inset-0">
-                <Chat
-                  entries={activeEntries}
-                  busy={activeBusy}
-                  onSend={handleSend}
-                  onCancel={handleCancel}
-                  onError={setErrorToast}
-                  draft={chatDraft}
-                  onDraftChange={setChatDraft}
-                  onCapture={isMobile ? handleCaptureAction : undefined}
-                  onForwardToChat={forwardToChat}
-                  sessionKey={activeId}
-                  usage={mobileUsage}
-                  fontScale={chatFont}
-                  onFontScale={applyChatFont}
-                  onFork={handleFork}
-                  plans={plans}
-                  onPlanPause={handlePlanPause}
-                  queue={queueByChat[activeId] ?? []}
-                  onQueueEnqueue={(text) => enqueueQueued(activeId, text)}
-                  onQueueRemove={(id) => removeQueued(activeId, id)}
-                  futureThinkingCollapsed={futureThinkingCollapsed[activeId] ?? false}
-                  onToggleThinking={(collapsed) =>
-                    setFutureThinkingCollapsed((prev) => ({ ...prev, [activeId]: collapsed }))
-                  }
+        {/* 主内容区：Chat 始终挂载（设置/活动/群聊为覆盖层）。 */}
+        <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+          <SyncChatBar
+            chatId={activeId}
+            runningOn={syncMarks[activeId] ? syncMarks[activeId].running_on : undefined}
+            onError={setErrorToast}
+          />
+          <div className="relative min-h-0 flex-1">
+            {agentState === "starting" && (
+              <div className="absolute bottom-0 left-0 right-0 top-0 flex h-full flex-col items-center justify-center gap-3 text-sm text-gray-400">
+                <div className="h-8 w-8 animate-spin rounded-full border-2 border-indigo-500 border-t-transparent" />
+                正在启动 RClaw…
+                {agentError && <div className="text-red-400">{agentError}</div>}
+              </div>
+            )}
+            {agentState === "error" && (
+              <div className="absolute bottom-0 left-0 right-0 top-0 flex h-full flex-col items-center justify-center gap-2 px-8 text-center">
+                <div className="text-sm text-red-400">agent 启动失败</div>
+                <div className="max-w-lg text-xs text-gray-500">{agentError}</div>
+                <div className="text-xs text-gray-600">
+                  请检查 {status?.home}/rclaw.toml 的 provider 配置，或打开设置修复。
+                </div>
+                <button
+                  onClick={() => openSettings("models")}
+                  className="mt-2 rounded-lg bg-indigo-500/80 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-indigo-500"
+                >
+                  打开设置（模型与配置）
+                </button>
+              </div>
+            )}
+            {agentState === "ready" && (
+            <div ref={chatWrapRef} className="absolute bottom-0 left-0 right-0 top-0">
+              <Chat
+                key={`chat-${activeRecordNonce}`}
+                recordEpoch={chatEpochLiveRef.current[activeId] ?? 0}
+                entries={activeEntries}
+                busy={activeBusy}
+                onSend={handleSend}
+                onCancel={handleCancel}
+                onError={setErrorToast}
+                draft={chatDraft}
+                onDraftChange={setChatDraft}
+                onCapture={isAndroidDevice() ? handleCaptureAction : undefined}
+                onForwardToChat={forwardToChat}
+                sessionKey={activeId}
+                usage={mobileUsage}
+                fontScale={chatFont}
+                onFontScale={applyChatFont}
+                onFork={handleFork}
+                plans={plans}
+                onPlanPause={handlePlanPause}
+                queue={queueByChat[activeId] ?? []}
+                onQueueEnqueue={(text) => enqueueQueued(activeId, text)}
+                onQueueRemove={(id) => removeQueued(activeId, id)}
+                suspended={settings !== null || activity !== null || roomId !== null}
+                futureThinkingCollapsed={futureThinkingCollapsed[activeId] ?? false}
+                onToggleThinking={(collapsed) =>
+                  setFutureThinkingCollapsed((prev) => ({ ...prev, [activeId]: collapsed }))
+                }
+              />
+            </div>
+            )}
+            {roomId && (
+              <div className="absolute top-0 right-0 bottom-0 left-0 z-40 flex flex-col bg-[#0f131b]">
+                <GroupRoomView
+                  key={roomId}
+                  id={roomId}
+                  bots={botsForRoom}
+                  onError={(msg) => {
+                    if (msg) setErrorToast(msg);
+                  }}
+                  onClose={() => setRoomId(null)}
                 />
               </div>
-            </div>
+            )}
+            {settings && (
+              <SettingsOverlay
+                compact={compactLayout}
+                state={settings}
+                agentState={agentState}
+                themes={THEMES}
+                theme={theme}
+                onTheme={applyTheme}
+                chatFont={chatFont}
+                onFont={applyChatFont}
+                fontMin={CHAT_FONT_MIN}
+                fontMax={CHAT_FONT_MAX}
+                fontDefault={CHAT_FONT_DEFAULT}
+                slogans={slogans}
+                sloganInterval={sloganInterval}
+                onSlogansSaved={(prefs) => {
+                  setSlogans(prefs.slogans);
+                  setSloganInterval(prefs.interval_secs);
+                }}
+                onImportRaw={importRaw}
+                rooms={rooms}
+                onRoomsChanged={() => void refreshRooms()}
+                onDeleteRoom={requestRoomDelete}
+                onOpenChat={openChatChecked}
+                onOpenRoom={(id) => leaveSettings(() => openRoom(id))}
+                syncPending={syncPending}
+                captureBusy={captureInFlight}
+                onError={setErrorToast}
+                onSyncOpenChat={(id) => {
+                  // 回收站恢复可能重建了同键记录：先推进代次，再按最新守卫/列表打开。
+                  bumpChatEpoch(id);
+                  if (id === activeIdRef.current) {
+                    chatDraftRef.current = "";
+                    setChatDraft("");
+                  }
+                  void refreshChats().then(() => {
+                    void loadSyncMarks();
+                    openChatChecked(id);
+                  });
+                }}
+                onEditorDirtyChange={setFileDirty}
+                onRequestLeave={requestLeave}
+                home={status?.home ?? ""}
+                about={<About home={status?.home ?? ""} />}
+                onSection={(section) =>
+                  leaveSettings(() => setSettings({ view: "section", section }))
+                }
+                onBack={() =>
+                  leaveSettings(() =>
+                    setSettings((prev) => (prev ? { ...prev, view: "list" } : prev)),
+                  )
+                }
+                onClose={() => leaveSettings(() => setSettings(null))}
+              />
+            )}
+            {activity && (
+              <ActivityOverlay
+                compact={compactLayout}
+                state={activity}
+                agentReady={agentState === "ready"}
+                onTab={(tab) => setActivity({ tab, view: "list" })}
+                onOpenDetail={(tab, id) => setActivity({ tab, view: "detail", selectedId: id })}
+                onBack={backActivityDetail}
+                onClose={() => setActivity(null)}
+              />
+            )}
           </div>
+        </div>
+        {taskPanelOpen && agentState === "ready" && !compactLayout && (
+          <>
+            <ResizeHandle onDrag={resizeRight} />
+            <TaskPanel
+              agentReady
+              activeChatId={activeId}
+              width={rightWidth}
+              onOpenAgents={(id) => openActivity("agents", id)}
+            />
+          </>
         )}
-        {agentState === "ready" && page === "bots" && (
-          <BotsPanel agentReady onOpenChat={(id) => void openChat(id)} />
-        )}
-        {agentState === "ready" && page === "tools" && <ToolsPanel agentReady />}
-        {agentState === "ready" && page === "skills" && <SkillsPanel agentReady />}
-        {agentState === "ready" && page === "files" && <FilePanel onError={setErrorToast} />}
-        {/* Agent / 任务概览：列表 + 盖在上面的执行详情（见 ExecutionPage）。 */}
-        {agentState === "ready" && page === "agents" && (
-          <ExecutionPage selectedAgentId={selectedAgentId} onBack={() => setSelectedAgentId(null)}>
-            {(hidden) => <AgentsPanel agentReady hidden={hidden} onOpen={setSelectedAgentId} />}
-          </ExecutionPage>
-        )}
-        {agentState === "ready" && page === "evolution" && <EvolutionPanel agentReady />}
-        {agentState === "ready" && page === "cron" && <CronPanel agentReady />}
-        {agentState === "ready" && page === "sync" && (
-          <SyncPanel
-            agentReady
-            captureBusy={captureInFlight}
-            onError={setErrorToast}
-            onOpenChat={(id) => {
-              // 从回收站恢复出来的是一个新会话：先让它进会话列表（带上角标），再打开。
-              void refreshChats().then(() => {
-                void loadSyncMarks();
-                void openChat(id);
-              });
-            }}
-          />
-        )}
-        {agentState === "ready" && page === "taskview" && (
-          <ExecutionPage selectedAgentId={selectedAgentId} onBack={() => setSelectedAgentId(null)}>
-            {(hidden) => <TaskOverviewPanel agentReady hidden={hidden} onOpen={setSelectedAgentId} />}
-          </ExecutionPage>
-        )}
-        {agentState === "ready" && page === "config" && (
-          <ConfigPanel
-            agentReady
-            slogans={slogans}
-            sloganInterval={sloganInterval}
-            onSlogansSaved={(prefs) => {
-              setSlogans(prefs.slogans);
-              setSloganInterval(prefs.interval_secs);
-            }}
-          />
-        )}
-        {agentState === "ready" && page === "about" && <About home={status.home} />}
-      </div>
-
-      {/* 右侧任务面板：任务概览 + 上下文/内存状态（宽度可拖拽调整）。移动端
-          不渲染（信息在「Agent」页），避免挤压会话区。 */}
-      {taskPanelOpen && agentState === "ready" && !isMobile && (
-        <>
-          <ResizeHandle onDrag={resizeRight} />
-          <TaskPanel
-            agentReady
-            activeChatId={activeId}
-            width={rightWidth}
-            onOpenAgents={openAgents}
-          />
-        </>
-      )}
       </div>
     );
   }
 
   return (
-    <div
-      className="flex h-full flex-col"
-      style={
-        // 安卓 App 无顶栏：让出系统状态栏/刘海安全区（其余平台由顶栏承担）。
-        isAndroidDevice() && isMobile && status && !status.wizard_needed
-          ? { paddingTop: "env(safe-area-inset-top)" }
-          : undefined
-      }
-    >
-      {!isMobile && (
+    <CompactLayoutProvider value={compactLayout}>
+    <div className="flex h-full flex-col">
+      {!compactLayout && (
         <TitleBar
           title={sloganTitle}
-          theme={THEMES.find((t) => t.id === theme)?.base ?? "dark"}
           taskPanelOpen={taskPanelOpen}
+          activityCount={liveCounts.active}
+          activityPulse={liveCounts.running > 0}
+          activityHint={activityHint}
+          onOpenActivity={() => openActivity("tasks")}
           onToggleTaskPanel={toggleTaskPanel}
-          onToggleTheme={toggleTheme}
         />
       )}
-      {/* 安卓 App 去掉顶栏（侧栏由左缘右滑呼出，主题入口在侧栏栏目里）；
-          其他移动端（桌面窄窗口模拟）保持顶栏不变。 */}
-      {isMobile && !isAndroidDevice() && status && !status.wizard_needed && (
+      {/* 紧凑布局（含 Android 横屏/平板）统一顶栏：☰ / 标题 / 活动 / 设置。 */}
+      {compactLayout && status && !status.wizard_needed && (
         <MobileTopBar
-          title={sloganTitle}
-          theme={THEMES.find((t) => t.id === theme)?.base ?? "dark"}
-          onOpenDrawer={() => setDrawerOpen(true)}
-          onToggleTheme={toggleTheme}
+          title={activeChatTitle}
+          activityCount={liveCounts.active}
+          activityPulse={liveCounts.running > 0}
+          activityHint={activityHint}
+          onOpenDrawer={() => {
+            drawerViaBack.current = false;
+            setDrawerOpen(true);
+          }}
+          onOpenActivity={() => openActivity("tasks")}
+          onOpenSettings={() => openSettings()}
         />
       )}
       <div className="min-h-0 flex-1">{body}</div>
+      {leaveConfirm && permQueue.length === 0 && (
+        <div className="fixed bottom-0 left-0 right-0 top-0 z-[65] flex items-center justify-center bg-black/50">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="放弃未保存修改"
+            className="mx-4 w-[22rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-4 shadow-2xl"
+          >
+            <h2 className="text-sm font-semibold text-gray-100">放弃未保存的修改？</h2>
+            <p className="mt-1 text-[11px] text-gray-500">
+              运行目录里还有未保存的文件编辑，离开会丢失这些修改。
+            </p>
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                onClick={() => settleLeave(false)}
+                className="rounded-lg border border-[#2a2f3a] px-3 py-1.5 text-xs text-gray-300 hover:text-gray-100"
+              >
+                继续编辑
+              </button>
+              <button
+                onClick={() => settleLeave(true)}
+                className="rounded-lg bg-red-500/80 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500"
+              >
+                放弃修改
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {groupCreateOpen && (
+        <GroupCreateDialog
+          bots={botsForRoom}
+          onClose={() => setGroupCreateOpen(false)}
+          onCreated={(room) => {
+            setGroupCreateOpen(false);
+            // 先用创建回执更新 App 快照，已校验的 openRoom 才不会误判不存在。
+            roomsRef.current = [room, ...roomsRef.current.filter((r) => r.id !== room.id)];
+            setRooms(roomsRef.current);
+            openRoom(room.id);
+            void refreshRooms();
+          }}
+        />
+      )}
       {toast && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm text-red-300">
           {toast}
         </div>
       )}
       {/* 系统分享目标选择：多会话时选择发送到哪个会话或新会话。 */}
-      {shareChooserOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      {shareChooserOpen && permQueue.length === 0 && (
+        <div className="fixed bottom-0 left-0 right-0 top-0 z-50 flex items-center justify-center bg-black/50">
           <div className="mx-4 w-[20rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-4 shadow-2xl max-md:w-[calc(100%-2rem)]">
             <h2 className="text-sm font-semibold text-gray-100">分享到 RClaw</h2>
             <p className="mt-1 text-[11px] text-gray-500">选择发送到哪个会话：</p>
@@ -2863,7 +3392,7 @@ ${event.payload.command}
                 ))}
             </div>
             <button
-              onClick={() => setShareChooserOpen(false)}
+              onClick={cancelShareChooser}
               className="mt-3 w-full rounded-lg border border-[#2a2f3a] px-3 py-1.5 text-xs text-gray-400 transition hover:text-gray-200"
             >
               取消（文件保留在 uploads/）
@@ -2872,8 +3401,8 @@ ${event.payload.command}
         </div>
       )}
       {/* 消息选择「发送到会话」目标选择器：并入目标会话草稿（可编辑后发送）。 */}
-      {forwardChooserOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      {forwardChooserOpen && permQueue.length === 0 && (
+        <div className="fixed bottom-0 left-0 right-0 top-0 z-50 flex items-center justify-center bg-black/50">
           <div className="mx-4 w-[20rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-4 shadow-2xl max-md:w-[calc(100%-2rem)]">
             <h2 className="text-sm font-semibold text-gray-100">发送到会话</h2>
             <p className="mt-1 text-[11px] text-gray-500">
@@ -2901,10 +3430,7 @@ ${event.payload.command}
                 ))}
             </div>
             <button
-              onClick={() => {
-                forwardDraftRef.current = null;
-                setForwardChooserOpen(false);
-              }}
+              onClick={cancelForwardChooser}
               className="mt-3 w-full rounded-lg border border-[#2a2f3a] px-3 py-1.5 text-xs text-gray-400 transition hover:text-gray-200"
             >
               取消
@@ -2914,7 +3440,11 @@ ${event.payload.command}
       )}
       {/* 工作区外访问授权弹窗（默认权限下工具请求触达工作区之外时出现）。 */}
       {permQueue.length > 0 && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+        <div
+          ref={permTrapRef}
+          tabIndex={-1}
+          className="fixed bottom-0 left-0 right-0 top-0 z-[70] flex items-center justify-center bg-black/50"
+        >
           <div className="mx-4 w-[26rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-5 shadow-2xl max-md:mx-4 max-md:w-[calc(100%-2rem)]">
             <h2 className="text-sm font-semibold text-gray-100">工具授权请求</h2>
             <p className="mt-2 text-xs leading-relaxed text-gray-400">
@@ -3005,11 +3535,10 @@ ${event.payload.command}
                 const mark = syncMarks[m.chatId];
                 setChatMenu(null);
                 if (mark && mark.local_only) {
-                  setLocalOnly(m.chatId, false);
-                } else if (mark && mark.synced) {
-                  setLocalOnlyConfirm({ chatId: m.chatId, title: m.title });
+                  setLocalOnly(m.chatId, false, m.recordId);
                 } else {
-                  setLocalOnly(m.chatId, true);
+                  // 先按未确认提交；后端在写事务里判断是否已发布，需要时返回并补弹确认。
+                  setLocalOnly(m.chatId, true, m.recordId);
                 }
               }}
             >
@@ -3023,7 +3552,15 @@ ${event.payload.command}
             onClick={() => {
               const m = chatMenu;
               setChatMenu(null);
-              void archiveChat(m.chatId);
+              if (
+                m.recordId !== undefined &&
+                chatsRef.current.find((c) => c.chat_id === m.chatId)?.record_id !== m.recordId
+              ) {
+                setErrorToast("会话记录已变化，请刷新列表后再试");
+                void refreshChats();
+                return;
+              }
+              void archiveChat(m.chatId, m.recordId);
             }}
           >
             归档
@@ -3033,7 +3570,12 @@ ${event.payload.command}
             onClick={() => {
               const m = chatMenu;
               setChatMenu(null);
-              setDeleteConfirm({ chatId: m.chatId, title: m.title });
+              setDeleteConfirm({
+                chatId: m.chatId,
+                title: m.title,
+                epoch: m.epoch,
+                recordId: m.recordId,
+              });
             }}
           >
             删除
@@ -3041,9 +3583,58 @@ ${event.payload.command}
         </div>
       )}
 
+      {/* 群房间操作菜单（打开 / 取消运行 / 刷新 / 删除）。 */}
+      {roomMenu && (
+        <div
+          className="fixed z-50 min-w-40 rounded-lg border border-[#2a2f3a] bg-[#141821] py-1 shadow-xl"
+          style={{
+            left: Math.min(roomMenu.x, window.innerWidth - 176),
+            top: Math.min(roomMenu.y, window.innerHeight - 170),
+          }}
+        >
+          <button
+            className={CHAT_MENU_ITEM}
+            onClick={() => {
+              const id = roomMenu.room.id;
+              setRoomMenu(null);
+              openRoom(id);
+            }}
+          >
+            打开群聊
+          </button>
+          {roomMenu.room.running && (
+            <button
+              className={CHAT_MENU_ITEM}
+              onClick={() => {
+                const id = roomMenu.room.id;
+                setRoomMenu(null);
+                void api.groupCancel(id).then(() => refreshRooms()).catch((e) => setErrorToast(String(e)));
+              }}
+            >
+              取消当前编排
+            </button>
+          )}
+          <button
+            className={CHAT_MENU_ITEM}
+            onClick={() => {
+              setRoomMenu(null);
+              void refreshRooms();
+            }}
+          >
+            刷新列表
+          </button>
+          <button
+            className={`${CHAT_MENU_ITEM} text-red-400 hover:bg-red-500/10 hover:text-red-300`}
+            onClick={() => requestRoomDelete(roomMenu.room)}
+          >
+            删除群聊
+          </button>
+        </div>
+      )}
+
       {/* 导出完整聊天记录：格式选择（md 纯文本 / docx 内嵌图片 / html 折叠+导航）。 */}
       {exportFmtTarget && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+        <div className="fixed bottom-0 left-0 right-0 top-0 z-50 flex items-center justify-center bg-black/50">
           <div
             ref={exportDialogRef}
             tabIndex={-1}
@@ -3205,8 +3796,8 @@ ${event.payload.command}
       )}
 
       {/* 删除会话确认（不可恢复；区别于可撤销的「归档」）。 */}
-      {deleteConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      {deleteConfirm && permQueue.length === 0 && (
+        <div className="fixed bottom-0 left-0 right-0 top-0 z-50 flex items-center justify-center bg-black/50">
           <div className="mx-4 w-[24rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-5 shadow-2xl max-md:w-[calc(100%-2rem)]">
             <h2 className="text-sm font-semibold text-gray-100">删除会话</h2>
             {syncMarks[deleteConfirm.chatId] && syncMarks[deleteConfirm.chatId].published ? (
@@ -3255,9 +3846,41 @@ ${event.payload.command}
                   const purge = deletePurge && Boolean(mark && mark.published);
                   setDeleteConfirm(null);
                   setDeletePurge(false);
-                  void deleteChat(m.chatId, purge);
+                  void deleteChat(m.chatId, purge, m.epoch, m.recordId);
                 }}
                 className="rounded-lg bg-red-600 px-4 py-1.5 text-xs font-medium text-white transition hover:bg-red-500"
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {roomDeleteConfirm && permQueue.length === 0 && (
+        <div className="fixed bottom-0 left-0 right-0 top-0 z-50 flex items-center justify-center bg-black/50">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="删除群聊"
+            className="mx-4 w-[22rem] rounded-xl border border-[#2a2f3a] bg-[#141821] p-4 shadow-2xl"
+          >
+            <h2 className="text-sm font-semibold text-gray-100">
+              删除群聊「{roomDeleteConfirm.room.name}」？
+            </h2>
+            <p className="mt-2 text-xs leading-relaxed text-gray-400">
+              房间转录与成员配置会一并删除，不可恢复。
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                onClick={() => setRoomDeleteConfirm(null)}
+                className="rounded-lg border border-[#2a2f3a] px-4 py-1.5 text-xs text-gray-300 hover:text-gray-100"
+              >
+                取消
+              </button>
+              <button
+                onClick={confirmRoomDelete}
+                className="rounded-lg bg-red-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-red-500"
               >
                 删除
               </button>
@@ -3275,9 +3898,24 @@ ${event.payload.command}
           onConfirm={() => {
             const m = localOnlyConfirm;
             setLocalOnlyConfirm(null);
-            setLocalOnly(m.chatId, true);
+            const currentId = chatsRef.current.find((c) => c.chat_id === m.chatId)?.record_id;
+            if (
+              m.recordId !== undefined &&
+              currentId !== undefined &&
+              currentId !== m.recordId
+            ) {
+              localOnlyBusyRef.current = false;
+              setErrorToast("会话记录已变化，请刷新列表后再试");
+              void refreshChats();
+              return;
+            }
+            localOnlyBusyRef.current = false;
+            setLocalOnly(m.chatId, true, m.recordId, true);
           }}
-          onCancel={() => setLocalOnlyConfirm(null)}
+          onCancel={() => {
+            localOnlyBusyRef.current = false;
+            setLocalOnlyConfirm(null);
+          }}
         >
           <p>
             「{localOnlyConfirm.title}」已经同步到你的其他设备。
@@ -3326,9 +3964,7 @@ ${event.payload.command}
           dataUrl={photoEditor.dataUrl}
           rel={photoEditor.rel}
           onClose={discardPhotoEditor}
-          onSent={(rel) =>
-            prefillCapture(`[附件] ${rel}（已放入 agent 工作区）`)
-          }
+          onSend={sendPhotoCapture}
           onSaved={(rel) => saveCaptureLocal(rel, "photo")}
           onError={setErrorToast}
         />
@@ -3339,85 +3975,14 @@ ${event.payload.command}
         <CaptureDialog
           kind={captureDialog.kind}
           rel={captureDialog.rel}
-          onDraft={prefillCapture}
-          onClose={() => setCaptureDialog(null)}
+          onDraft={(draft) => prefillCapture(draft, captureDialog.op)}
+          onClose={closeCaptureDialog}
           onError={setErrorToast}
         />
       )}
 
-      {/* 主题选择器：一键切换，含聊天/侧边栏背景预览。 */}
-      {themePickerOpen && (
-        <div className="fixed inset-0 z-50" onClick={() => setThemePickerOpen(false)}>
-          <div
-            className="absolute right-2 w-64 rounded-xl border border-[#2a2f3a] bg-[#141821] p-3 shadow-2xl max-md:left-1/2 max-md:right-auto max-md:-translate-x-1/2"
-            style={{
-              top: isAndroidDevice()
-                ? "calc(env(safe-area-inset-top) + 0.75rem)"
-                : "calc(env(safe-area-inset-top) + 3.75rem)",
-            }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="mb-2 text-sm font-semibold text-gray-100">主题</h2>
-            <div className="grid grid-cols-2 gap-2">
-              {THEMES.map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => applyTheme(t.id)}
-                  className={`rounded-lg border p-2 text-left transition ${
-                    theme === t.id
-                      ? "border-indigo-400 bg-indigo-500/10"
-                      : "border-[#2a2f3a] hover:border-indigo-500/50"
-                  }`}
-                >
-                  <div className="flex h-10 overflow-hidden rounded-md border border-black/20">
-                    <div className="h-full w-1/3" style={{ backgroundColor: t.swatch[1] }} />
-                    <div className="h-full flex-1" style={{ backgroundColor: t.swatch[0] }} />
-                  </div>
-                  <span className="mt-1.5 block text-xs font-medium text-gray-200">
-                    {theme === t.id ? "✓ " : ""}
-                    {t.name}
-                  </span>
-                  <span className="block text-[10px] text-gray-500">{t.desc}</span>
-                </button>
-              ))}
-            </div>
-            <div className="mt-3 border-t border-[#2a2f3a] pt-2.5">
-              <h2 className="mb-1.5 text-sm font-semibold text-gray-100">会话文字大小</h2>
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={() => applyChatFont(chatFont - 5)}
-                  disabled={chatFont <= CHAT_FONT_MIN}
-                  className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 disabled:opacity-40"
-                  aria-label="缩小文字"
-                >
-                  A−
-                </button>
-                <span className="min-w-0 flex-1 text-center text-xs tabular-nums text-gray-300">
-                  {chatFont}%
-                </span>
-                <button
-                  onClick={() => applyChatFont(chatFont + 5)}
-                  disabled={chatFont >= CHAT_FONT_MAX}
-                  className="rounded-lg border border-[#2a2f3a] px-2.5 py-1 text-xs text-gray-300 transition hover:border-indigo-500/50 hover:text-indigo-300 disabled:opacity-40"
-                  aria-label="放大文字"
-                >
-                  A+
-                </button>
-                <button
-                  onClick={() => applyChatFont(CHAT_FONT_DEFAULT)}
-                  className="rounded-lg border border-[#2a2f3a] px-2 py-1 text-[11px] text-gray-400 transition hover:border-indigo-500/50 hover:text-indigo-300"
-                >
-                  重置
-                </button>
-              </div>
-              <p className="mt-1.5 text-[10px] leading-relaxed text-gray-500">
-                桌面上还可以 Ctrl + 鼠标滚轮；手机在会话里双指捏合。只影响消息文字，不动图片/视频。
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
+    </CompactLayoutProvider>
   );
 }
 

@@ -1139,6 +1139,28 @@ impl SyncEngine {
         Ok(existed)
     }
 
+    /// 删除会话并要求会话行主键仍是调用方看到的那一行。校验在删除事务内完成：
+    /// 同 chat_id 的重建记录（同步恢复/导入）不会被旧确认误删。
+    pub fn delete_session_checked(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        purge: bool,
+        expected_row_id: i64,
+    ) -> Result<bool> {
+        let keep_trash = self.config().trash_days > 0;
+        let existed = local::delete_session_checked(
+            &self.inner.ctx,
+            channel,
+            chat_id,
+            purge,
+            keep_trash,
+            Some(expected_row_id),
+        )?;
+        self.notify(Trigger::LocalChange);
+        Ok(existed)
+    }
+
     /// `/clear confirm all`（§7.5）第一半：把参与同步、已经发布的会话逐个删除并传播出去，
     /// 本机各留一份在回收站。返回登记删除的会话数。其余会话由调用方接着清。
     ///
@@ -1191,6 +1213,41 @@ impl SyncEngine {
     /// 标记 / 取消「仅本机」（§7.9）。
     pub fn set_local_only(&self, channel: &str, chat_id: &str, on: bool) -> Result<()> {
         local::set_local_only(&self.inner.ctx, channel, chat_id, on)?;
+        self.notify(Trigger::LocalChange);
+        Ok(())
+    }
+
+    /// 同 [`Self::set_local_only`]，写事务内校验会话行主键（同键重建后旧确认失效）。
+    pub fn set_local_only_checked(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        on: bool,
+        expected_row_id: i64,
+        confirmed: bool,
+    ) -> Result<()> {
+        local::set_local_only_checked(
+            &self.inner.ctx,
+            channel,
+            chat_id,
+            on,
+            Some(expected_row_id),
+            confirmed,
+        )?;
+        self.notify(Trigger::LocalChange);
+        Ok(())
+    }
+
+    /// 无记录 ID 的「仅本机」：仍走写事务内的发布状态检查，confirmed=true 才允许
+    /// 对已发布会话登记跨设备删除。
+    pub fn set_local_only_confirmed(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        on: bool,
+        confirmed: bool,
+    ) -> Result<()> {
+        local::set_local_only_checked(&self.inner.ctx, channel, chat_id, on, None, confirmed)?;
         self.notify(Trigger::LocalChange);
         Ok(())
     }

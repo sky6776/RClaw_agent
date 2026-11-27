@@ -775,6 +775,8 @@ pub async fn cancel(app: AppHandle, chat_id: String) -> Result<(), String> {
 #[derive(Debug, Serialize)]
 pub struct ChatDto {
     pub chat_id: String,
+    /// `session.id` 行主键：同 chat_id 重建后变化，删除时用来拒绝旧确认。
+    pub record_id: i64,
     /// 用户自定义名（存在库里，经 chat_rename 写入，跟着会话同步）优先；
     /// 无自定义名时 = 首条用户消息截断。
     pub title: String,
@@ -828,6 +830,7 @@ pub async fn chat_list(state: State<'_, AppState>) -> Result<Vec<ChatDto>, Strin
             let title = custom_titles.get(&chat_id).cloned().unwrap_or(derived);
             out.push(ChatDto {
                 chat_id,
+                record_id: summary.row_id,
                 title,
                 updated_at: summary.updated_at.max(0) as u64,
                 archived: summary.archived,
@@ -2348,24 +2351,41 @@ pub async fn chat_history_since(
 
 /// 归档会话：打 `archived_at` 标记（恢复 = 清除标记）；消息、chat_id 都不动。
 #[tauri::command]
-pub async fn chat_archive(state: State<'_, AppState>, chat_id: String) -> Result<(), String> {
-    set_chat_archived(&state, chat_id, true).await
+pub async fn chat_archive(
+    state: State<'_, AppState>,
+    chat_id: String,
+    expected_record_id: Option<i64>,
+) -> Result<(), String> {
+    set_chat_archived(&state, chat_id, true, expected_record_id).await
 }
 
 /// 恢复归档会话。
 #[tauri::command]
-pub async fn chat_restore(state: State<'_, AppState>, chat_id: String) -> Result<(), String> {
-    set_chat_archived(&state, chat_id, false).await
+pub async fn chat_restore(
+    state: State<'_, AppState>,
+    chat_id: String,
+    expected_record_id: Option<i64>,
+) -> Result<(), String> {
+    set_chat_archived(&state, chat_id, false, expected_record_id).await
 }
 
-async fn set_chat_archived(state: &AppState, chat_id: String, archive: bool) -> Result<(), String> {
+async fn set_chat_archived(
+    state: &AppState,
+    chat_id: String,
+    archive: bool,
+    expected_record_id: Option<i64>,
+) -> Result<(), String> {
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
     }
     let session = state.session().ok_or("agent 尚未启动")?;
     let cascade_chat_id = chat_id.clone();
-    run_blocking("更新会话归档状态", move || {
-        set_session_archived(&session, &chat_id, archive)
+    run_blocking("更新会话归档状态", move || match expected_record_id {
+        Some(expected) => session
+            .set_archived_checked(CHANNEL_DESKTOP, &chat_id, archive, Some(expected))
+            .map(|_| ())
+            .map_err(|e| format!("更新会话归档状态失败: {e}")),
+        None => set_session_archived(&session, &chat_id, archive),
     })
     .await?;
     // 归档标记跟着会话同步。
@@ -2414,6 +2434,7 @@ pub async fn chat_delete(
     state: State<'_, AppState>,
     chat_id: String,
     purge: Option<bool>,
+    expected_record_id: Option<i64>,
 ) -> Result<(), String> {
     if !is_valid_chat_id(&chat_id) {
         return Err(format!("非法会话 id: {chat_id}"));
@@ -2435,9 +2456,16 @@ pub async fn chat_delete(
         // 经同步引擎删：已经发布过的会话要先占住（同步正往里合入内容时最多等两秒）、
         // 导出到回收站，再连同「删除」一起登记进待发队列。同步没开时它就是普通的删除。
         // 自定义标题在同一个事务里随会话清掉。
-        engine
-            .delete_session(CHANNEL_DESKTOP, &chat_id, purge)
-            .map_err(|e| format!("删除会话失败: {e}"))?;
+        // 记录级前置条件在删除事务内核对：确认框打开后同 chat_id 可能已重建
+        // （同步恢复/导入），旧确认不能删到新记录。
+        match expected_record_id {
+            Some(expected) => engine
+                .delete_session_checked(CHANNEL_DESKTOP, &chat_id, purge, expected)
+                .map_err(|e| format!("删除会话失败: {e}"))?,
+            None => engine
+                .delete_session(CHANNEL_DESKTOP, &chat_id, purge)
+                .map_err(|e| format!("删除会话失败: {e}"))?,
+        };
         lifecycle.forget_session(CHANNEL_DESKTOP, &chat_id);
         Ok(())
     })
@@ -3045,7 +3073,11 @@ pub struct ConfigStateDto {
     pub path: String,
     /// 当前文件原文（只读展示 / 高级编辑参考）。
     pub raw: String,
-    /// 按示例解析的段/键文档模型（含每键当前值）。
+    /// 读取主配置失败（权限 / 非 UTF-8 等）：没有可信原文，UI 只允许从文件导入。
+    pub read_error: Option<String>,
+    /// 原文存在但 TOML 解析失败：UI 可编辑原文并「保存并启动」。
+    pub parse_error: Option<String>,
+    /// 按示例解析的段/键文档模型（含每键当前值）；解析失败时 sections 为空。
     pub doc: rclaw_store::config_doc::ConfigDoc,
 }
 
@@ -3061,11 +3093,37 @@ pub struct ConfigEdit {
 
 pub fn config_state_for(home: &std::path::Path) -> Result<ConfigStateDto, String> {
     let path = home.join("rclaw.toml");
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc = rclaw_store::config_doc::parse_example(rclaw_store::config_doc::EXAMPLE);
-    let user: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|e| format!("rclaw.toml 解析失败: {}", toml_error_summary(&e)))?;
+    let doc = rclaw_store::config_doc::parse_example(rclaw_store::config_doc::EXAMPLE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        // 文件不存在 = 首次运行：空配置、无错误（向导负责创建）。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Ok(ConfigStateDto {
+                path: path.display().to_string(),
+                raw: String::new(),
+                read_error: Some(format!(
+                    "读取 rclaw.toml 失败（{}）：{error}",
+                    path.display()
+                )),
+                parse_error: None,
+                doc,
+            });
+        }
+    };
+    let mut doc = doc;
+    let user: toml_edit::DocumentMut = match raw.parse() {
+        Ok(user) => user,
+        Err(error) => {
+            return Ok(ConfigStateDto {
+                path: path.display().to_string(),
+                raw,
+                read_error: None,
+                parse_error: Some(format!("rclaw.toml 解析失败: {}", toml_error_summary(&error))),
+                doc,
+            });
+        }
+    };
     for section in &mut doc.sections {
         for item in &mut section.items {
             item.current = rclaw_store::config_doc::resolve_current_display(&user, &item.path);
@@ -3075,6 +3133,8 @@ pub fn config_state_for(home: &std::path::Path) -> Result<ConfigStateDto, String
     Ok(ConfigStateDto {
         path: path.display().to_string(),
         raw,
+        read_error: None,
+        parse_error: None,
         doc,
     })
 }
@@ -3263,9 +3323,12 @@ pub async fn config_save(state: State<'_, AppState>, edits: Vec<ConfigEdit>) -> 
         .map_err(|e| format!("保存配置失败: {e}"))??;
     // 发布要自己取协议锁（见 apply_config）：先把写盘用的锁放掉。
     drop(_lock);
-    // `[sync]` 的改动马上生效（开关、存储、范围……），不用等重启。
+    // `[sync]` 的改动马上生效（开关、存储、范围……），不用等重启。写盘已成功，
+    // 重载失败要如实告知（不能假装整体成功）。
     if touches_sync {
-        sync::reload_config(&state).await;
+        if let Err(error) = sync::reload_config(&state).await {
+            return Err(format!("配置已写入，但同步引擎重载失败：{error}"));
+        }
     }
     Ok(())
 }
@@ -3310,12 +3373,30 @@ pub fn config_import_raw_for(home: &std::path::Path, content: &str) -> Result<()
     rclaw_store::RclawToml::new(home.join("rclaw.toml")).write_text(content)
 }
 
+/// 整份配置导入的回执：区分「写盘成功」与「启动结果」，避免把运行中的 agent
+/// 未重载误报成成功，也避免把启动失败混进「校验拒绝」。
+#[derive(Debug, serde::Serialize)]
+pub struct ConfigImportOutcome {
+    /// 配置已原子写入（校验拒绝时命令直接 Err，不会返回本结构）。
+    pub written: bool,
+    /// 本次真的新装配了 agent（真机首次启动/修复页重试）。
+    pub started: bool,
+    /// 导入前已有 agent 在运行：本次不会重载它。
+    pub already_running: bool,
+    /// 需要重启应用/重新打开才能让配置生效（already_running 时为 true）。
+    pub restart_required: bool,
+    /// 新装配失败的原因（written=true、started=false 时）。
+    pub start_error: Option<String>,
+    /// `[sync]` 是否已按新配置重载成功（无同步引擎视为成功）。
+    pub sync_reloaded: bool,
+}
+
 #[tauri::command]
 pub async fn config_import_raw(
     app: AppHandle,
     state: State<'_, AppState>,
     content: String,
-) -> Result<(), String> {
+) -> Result<ConfigImportOutcome, String> {
     let home = state.home.clone();
     // 和保存存储设置走同一把协议锁写 TOML：两次写与各自随后的发布有明确的先后，
     // 不会出现「较早的存储保存回执迟到、把刚导入的设置盖回去」。
@@ -3332,13 +3413,36 @@ pub async fn config_import_raw(
         .map_err(|e| format!("导入配置失败: {e}"))??;
     // 配置发布要自己取协议锁（见 apply_config）：先把导入用的锁放掉。
     drop(_lock);
-    // 导入即完成配置落盘：与 wizard_save 同路径启动 agent。此前只写文件不
-    // 启动——App 启动时无配置则 agent 不会被拉起，导入后 UI 永久卡「正在启动」。
-    agent::start_agent(app, state.home.clone()).await?;
-    // agent 本来就在跑的话上面什么都没做：导入的 `[sync]` 设置在这里交给同步引擎
-    // （刚启动的 agent 读到的已经是新文件，再交一次没有变化、不做任何事）。
-    sync::reload_config(&state).await;
-    Ok(())
+    // 已有 agent：不重建（没有安全的进程内 shutdown 生命周期），提示重启。
+    let already_running = state
+        .agent
+        .read()
+        .map(|agent| agent.is_some())
+        .unwrap_or(true);
+    let (started, start_error) = if already_running {
+        (false, None)
+    } else {
+        match agent::start_agent(app, state.home.clone()).await {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        }
+    };
+    // 写入成功后，无论启动成败都把已落盘的 [sync] 交给引擎（失败落日志 + 回执 false）。
+    let sync_reloaded = match sync::reload_config(&state).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!("导入配置后同步引擎重载失败: {error}");
+            false
+        }
+    };
+    Ok(ConfigImportOutcome {
+        written: true,
+        started,
+        already_running,
+        restart_required: already_running,
+        start_error,
+        sync_reloaded,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -8117,12 +8221,55 @@ pub async fn consume_pending_share(
 ) -> Result<Option<PendingShareDto>, String> {
     let home = state.home.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let path = home.join("pending_share.json");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        // 旧版单文件优先；新版本每批一个文件，取最早一个并原子认领。
+        let legacy = home.join("pending_share.json");
+        let path = if legacy.exists() {
+            Some(legacy)
+        } else {
+            std::fs::read_dir(home.join("share_inbox"))
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .map(|n| {
+                                    let name = n.to_string_lossy();
+                                    name.contains(".json") && !name.ends_with(".json.tmp")
+                                })
+                                .unwrap_or(false)
+                        })
+                        .min_by_key(|p| p.file_name().map(|n| n.to_owned()))
+                })
+        };
+        let Some(path) = path else {
             return Ok(None);
         };
-        // 读到即删：分享只消费一次（解析失败也删，防坏文件永久卡消费）。
-        let _ = std::fs::remove_file(&path);
+        let claimed = {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            path.with_file_name(format!(
+                "{}.claimed-{nonce}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "share".to_string())
+            ))
+        };
+        if std::fs::rename(&path, &claimed).is_err() {
+            return Ok(None);
+        }
+        let raw = match std::fs::read_to_string(&claimed) {
+            Ok(raw) => raw,
+            Err(_) => {
+                let _ = std::fs::remove_file(&claimed);
+                return Ok(None);
+            }
+        };
+        // 读到即删（与原单文件语义一致）：分享只消费一次，坏文件也不永久卡消费。
+        let _ = std::fs::remove_file(&claimed);
         let value: serde_json::Value =
             serde_json::from_str(&raw).map_err(|e| format!("pending_share.json 解析失败: {e}"))?;
         let files: Vec<String> = value
