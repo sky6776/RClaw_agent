@@ -1071,31 +1071,36 @@ export const api = {
 
   chatList: () => invoke<ChatMeta[]>("chat_list"),
 
-  /** 会话页「模型 + 思考强度」：当前选择器状态。 */
-  chatLlmState: () => invoke<LlmState>("chat_llm_state"),
+  /** 会话页「模型 + 思考强度」：当前会话的选择器状态（按 chat 独立）。 */
+  chatLlmState: (chatId: string) =>
+    invoke<LlmState>("chat_llm_state", { chatId }),
 
-  /** 切换模型；expected* 用于拒绝"菜单打开后模型已被切走"的过期提交。 */
+  /** 切换当前会话的模型；expected* 用于拒绝"菜单打开后模型已被切走"的过期提交。 */
   chatSetModel: (
+    chatId: string,
     model: string,
     expectedProvider?: string | null,
     expectedModel?: string | null,
     expectedRevision?: number | null,
   ) =>
     invoke<LlmState>("chat_set_model", {
+      chatId,
       model,
       expectedProvider,
       expectedModel,
       expectedRevision,
     }),
 
-  /** 切换思考强度；expected* 语义同 chatSetModel。 */
+  /** 切换当前会话的思考强度；expected* 语义同 chatSetModel。 */
   chatSetThinking: (
+    chatId: string,
     value: string,
     expectedProvider?: string | null,
     expectedModel?: string | null,
     expectedRevision?: number | null,
   ) =>
     invoke<LlmState>("chat_set_thinking", {
+      chatId,
       value,
       expectedProvider,
       expectedModel,
@@ -1581,8 +1586,12 @@ export const api = {
     listen<ToolCallsEvent>("tool_calls", (event) => cb(event.payload)),
 
   /** 模型/思考强度切换广播：所有窗口共用同一权威状态，不靠轮询。 */
-  onLlmStateChanged: (cb: (state: LlmState) => void): Promise<UnlistenFn> =>
-    listen<LlmState>("llm_state_changed", (event) => cb(event.payload)),
+  onLlmStateChanged: (
+    cb: (payload: { chat_id: string; state: LlmState }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ chat_id: string; state: LlmState }>("llm_state_changed", (event) =>
+      cb(event.payload),
+    ),
 
   onAgent: (cb: (payload: AgentEvent) => void): Promise<UnlistenFn> =>
     listen<AgentEvent>("agent", (event) => cb(event.payload)),

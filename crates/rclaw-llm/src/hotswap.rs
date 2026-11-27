@@ -161,6 +161,10 @@ fn normalize_base_url(base_url: String) -> Result<String> {
 
 #[async_trait]
 impl Provider for SwappableProvider {
+    fn config_snapshot(&self) -> Option<ProviderConfig> {
+        self.current_config().ok()
+    }
+
     fn name(&self) -> &str {
         // name 不随模型切换变化，直接返回存储的 &str（无需取锁）。
         &self.name

@@ -162,6 +162,11 @@ impl SessionLifecycle {
         self.turn_mgr.forget_session(channel, chat_id);
     }
 
+    /// 删除会话（含同步远端删除）时一并失效会话级模型缓存。
+    pub fn forget_session_model(&self, channel: &str, chat_id: &str) {
+        self.turn_mgr.forget_session_model(channel, chat_id);
+    }
+
     // ---- 多端同步用的入口（docs/multi-device-sync.md §7.3）----
 
     /// 占住一个会话做合入（见 [`TurnManager::begin_merge`]）：会话上没有会改历史的活动

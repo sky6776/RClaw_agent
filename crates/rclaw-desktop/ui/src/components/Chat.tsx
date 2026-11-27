@@ -835,27 +835,48 @@ export default function Chat({
   // 会话页「模型 + 思考强度」：选项完全由后端按 live provider + 模型给出。切会话、
   // 窗口重获焦点、打开菜单、turn 结束都刷新；提交带 expected provider/model，防止
   // 菜单打开后模型被另一窗口切走仍把旧档位写进新模型。
-  const [llm, setLlm] = useState<LlmState | null>(null);
+  const [llm, setLlm] = useState<{ chatId: string; state: LlmState } | null>(null);
   const llmSeq = useRef(0);
   const llmRevision = useRef(0);
-  const applyLlm = useCallback((next: LlmState) => {
+  // 当前渲染的会话与切换代次：旧会话的异步回执不得写入新会话。
+  const activeSessionRef = useRef(sessionKey);
+  activeSessionRef.current = sessionKey;
+  const sessionGen = useRef(0);
+  const applyLlm = useCallback((chatId: string, next: LlmState) => {
+    // 快照与来源 chat 一起保存：渲染时只认当前会话，切会话首帧不会显示旧状态。
+    if (chatId !== activeSessionRef.current) return;
     // 版本单调：晚到的 GET / 旧窗口的 SET 回执 / 乱序广播都不能倒退状态。
     if (next.revision < llmRevision.current) return;
     llmRevision.current = next.revision;
-    setLlm(next);
+    setLlm({ chatId, state: next });
   }, []);
   const refreshLlm = useCallback(() => {
+    const gen = sessionGen.current;
+    if (activeSessionRef.current !== sessionKey) return;
     const seq = ++llmSeq.current;
     api
-      .chatLlmState()
+      .chatLlmState(sessionKey)
       .then((next) => {
-        if (seq === llmSeq.current) applyLlm(next);
+        if (
+          gen === sessionGen.current &&
+          seq === llmSeq.current &&
+          activeSessionRef.current === sessionKey
+        ) {
+          applyLlm(sessionKey, next);
+        }
       })
       .catch(() => {
         // 刷新失败保留最近一次有效快照：期间收到的广播/回执可能比这次 GET 新，
         // 不能因为一次晚到的 IPC 失败把底栏选择器清空。
       });
-  }, [applyLlm]);
+  }, [applyLlm, sessionKey]);
+  // 切会话先清空旧选择器状态，避免新会话 GET 失败时仍显示上一个会话的模型。
+  useEffect(() => {
+    sessionGen.current += 1;
+    llmSeq.current += 1;
+    setLlm(null);
+    llmRevision.current = 0;
+  }, [sessionKey]);
   useEffect(() => {
     void refreshLlm();
   }, [sessionKey, refreshLlm]);
@@ -866,8 +887,10 @@ export default function Chat({
     let active = true;
     // 事件不推进请求序号：用 revision 排序，避免旧广播把补读拿到的高版本 GET
     // 一并作废（序号只用于拒绝失效生命周期的 GET/失败）。
-    const pending = api.onLlmStateChanged((next) => {
-      applyLlm(next);
+    const pending = api.onLlmStateChanged((payload) => {
+      if (!active || activeSessionRef.current !== sessionKey) return;
+      if (payload.chat_id !== sessionKey) return;
+      applyLlm(sessionKey, payload.state);
     });
     void pending.then((unlisten) => {
       if (!active) {
@@ -880,12 +903,20 @@ export default function Chat({
       active = false;
       void pending.then((unlisten) => unlisten());
     };
-  }, [applyLlm, refreshLlm]);
+  }, [applyLlm, refreshLlm, sessionKey]);
   useEffect(() => {
     const onFocus = () => void refreshLlm();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [refreshLlm]);
+  // 卸载后迟到的 SET/GET 回调不能再作用于已销毁的会话。
+  useEffect(
+    () => () => {
+      sessionGen.current += 1;
+      llmSeq.current += 1;
+    },
+    [],
+  );
   const wasBusyRef = useRef(busy);
   useEffect(() => {
     if (wasBusyRef.current && !busy) void refreshLlm();
@@ -2396,41 +2427,54 @@ export default function Chat({
   const navEnabled = rounds.length >= 2 && selectIds === null && textSelectId === null;
   const railVisible = navEnabled && !isAndroidDevice() && widePointer;
   const fabVisible = navEnabled && !railVisible;
-  // 模型 + 思考强度选择器：bot/群编排会话用各自的固定 provider，不显示主 provider 的档位。
-  const modelPicker =
-    llm && !sessionKey.startsWith("bot-") && !sessionKey.startsWith("grp-") ? (
+  // 模型 + 思考强度选择器：所有会话（含 bot/grp）都按 chat 独立选择；
+  // 桌面显示完整名称，安卓窄屏显示缩写。
+  const llmState = llm && llm.chatId === sessionKey ? llm.state : null;
+  const modelPicker = llmState ? (
       <ModelThinkingPicker
-        state={llm}
+        key={sessionKey}
+        state={llmState}
         busy={busy}
+        compact={isMobile}
         onOpen={refreshLlm}
         onModelSelect={async (model, expected) => {
+          const gen = sessionGen.current;
           try {
             const next = await api.chatSetModel(
+              sessionKey,
               model,
               expected.model.provider,
               expected.model.model,
               expected.revision,
             );
-            // 回执按 revision 参与排序；若期间有更新的 GET/广播，它会覆盖本次，
-            // 反之本次也不会作废更高版本的 GET。
-            applyLlm(next);
+            if (gen === sessionGen.current && activeSessionRef.current === sessionKey) {
+              applyLlm(sessionKey, next);
+            }
           } catch (error) {
-            onError?.(String(error));
-            refreshLlm();
+            if (gen === sessionGen.current && activeSessionRef.current === sessionKey) {
+              onError?.(String(error));
+              refreshLlm();
+            }
           }
         }}
         onThinkingSelect={async (value, expected) => {
+          const gen = sessionGen.current;
           try {
             const next = await api.chatSetThinking(
+              sessionKey,
               value,
               expected.model.provider,
               expected.model.model,
               expected.revision,
             );
-            applyLlm(next);
+            if (gen === sessionGen.current && activeSessionRef.current === sessionKey) {
+              applyLlm(sessionKey, next);
+            }
           } catch (error) {
-            onError?.(String(error));
-            refreshLlm();
+            if (gen === sessionGen.current && activeSessionRef.current === sessionKey) {
+              onError?.(String(error));
+              refreshLlm();
+            }
           }
         }}
       />

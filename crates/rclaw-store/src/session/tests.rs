@@ -1165,8 +1165,21 @@ fn clear_all_sessions_empties_tables_and_keeps_journal() {
     s.journal()
         .append(crate::JOURNAL_PLAN, "p", &json!({"e": 1}))
         .unwrap();
+    s.journal()
+        .kv_set(
+            &crate::session::session_model_key("cli", "c"),
+            &json!({"provider":"p","base_url":"https://x/v1","model":"m","profile":false}),
+        )
+        .unwrap();
 
     s.clear_all_sessions().unwrap();
+    assert!(
+        s.journal()
+            .kv_get(&crate::session::session_model_key("cli", "c"))
+            .unwrap()
+            .is_none(),
+        "全清主事务必须删除会话模型 KV"
+    );
     assert!(s.list_sessions(None).unwrap().is_empty());
     assert_eq!(message_count(&s), 0);
     assert!(s.load_file_checkpoints("cli", "c").unwrap().is_empty());

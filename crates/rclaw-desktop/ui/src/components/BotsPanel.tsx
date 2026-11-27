@@ -7,7 +7,8 @@
  *   一条消息触发后端串行轮转编排（3 轮 / 10 条 / 补轮 2 次上限），增量经 group 事件刷新。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type BotEntry, type GroupRoom } from "../lib/api";
+import { api, type BotEntry, type GroupRoom, type LlmState } from "../lib/api";
+import ModelThinkingPicker from "./ModelThinkingPicker";
 
 const PANEL =
   "flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-[#2a2f3a] bg-[#161a22]";
@@ -451,6 +452,7 @@ export default function BotsPanel({
           </div>
         ) : openGroupId ? (
           <GroupRoomView
+            key={openGroupId}
             id={openGroupId}
             bots={bots}
             onError={setError}
@@ -489,6 +491,19 @@ function GroupRoomView({
   const [failed, setFailed] = useState(false);
   const [text, setText] = useState("");
   const transcriptRef = useRef<HTMLDivElement>(null);
+  // 群房间的模型选择：每个成员的实际轮次是独立的 grp-<gid>-<member> 会话，
+  // 这里按成员分别读写同一个会话级选择器。
+  const [modelMember, setModelMember] = useState("");
+  const [llm, setLlm] = useState<{ chatId: string; state: LlmState } | null>(null);
+  const llmSeq = useRef(0);
+  const llmRevision = useRef(0);
+  const memberChatId =
+    room && room.id === id && room.members.includes(modelMember)
+      ? `grp-${id}-${modelMember}`
+      : "";
+  const activeMemberRef = useRef(memberChatId);
+  activeMemberRef.current = memberChatId;
+  const memberGen = useRef(0);
 
   const refresh = useCallback(async () => {
     try {
@@ -512,6 +527,81 @@ function GroupRoomView({
       void un.then((fn) => fn());
     };
   }, [id, refresh]);
+
+  useEffect(() => {
+    if (!room) return;
+    if (!room.members.includes(modelMember)) {
+      setModelMember(room.members[0] ?? "");
+    }
+  }, [room, modelMember]);
+
+  const applyLlm = useCallback((chatId: string, next: LlmState) => {
+    if (chatId !== activeMemberRef.current) return;
+    if (next.revision < llmRevision.current) return;
+    llmRevision.current = next.revision;
+    setLlm({ chatId, state: next });
+  }, []);
+  const refreshLlm = useCallback(() => {
+    if (!memberChatId || activeMemberRef.current !== memberChatId) {
+      setLlm(null);
+      return;
+    }
+    const gen = memberGen.current;
+    const seq = ++llmSeq.current;
+    api
+      .chatLlmState(memberChatId)
+      .then((next) => {
+        if (
+          gen === memberGen.current &&
+          seq === llmSeq.current &&
+          activeMemberRef.current === memberChatId
+        ) {
+          applyLlm(memberChatId, next);
+        }
+      })
+      .catch(() => {
+        /* 保留最近一次有效快照 */
+      });
+  }, [applyLlm, memberChatId]);
+  useEffect(() => {
+    memberGen.current += 1;
+    llmSeq.current += 1;
+    llmRevision.current = 0;
+    setLlm(null);
+    void refreshLlm();
+  }, [memberChatId, refreshLlm]);
+  useEffect(
+    () => () => {
+      memberGen.current += 1;
+      llmSeq.current += 1;
+    },
+    [],
+  );
+  useEffect(() => {
+    if (!memberChatId) return;
+    let active = true;
+    const pending = api.onLlmStateChanged((payload) => {
+      if (
+        active &&
+        activeMemberRef.current === memberChatId &&
+        payload.chat_id === memberChatId
+      ) {
+        applyLlm(memberChatId, payload.state);
+      }
+    });
+    // 订阅完成后再补读一次：首读与订阅建立之间的提交不会漏收。
+    void pending.then((unlisten) => {
+      if (!active) {
+        unlisten();
+        return;
+      }
+      void refreshLlm();
+    });
+    return () => {
+      active = false;
+      void pending.then((unlisten) => unlisten());
+    };
+  }, [applyLlm, memberChatId, refreshLlm]);
 
   // 新消息时滚动到底部。
   useEffect(() => {
@@ -580,11 +670,76 @@ function GroupRoomView({
           </div>
           </div>
         </div>
-        {room.running && (
-          <button className={BTN} onClick={() => void api.groupCancel(id).catch((e) => onError(String(e)))}>
-            取消编排
-          </button>
-        )}
+        <div className="flex shrink-0 items-center gap-2">
+          <select
+            value={modelMember}
+            onChange={(e) => setModelMember(e.target.value)}
+            className="rounded-lg border border-[#2a2f3a] bg-[#1a1f29] px-1.5 py-1 text-[10px] text-gray-300 outline-none"
+            aria-label="选择要设置模型的群成员"
+          >
+            {room.members.map((m) => (
+              <option key={m} value={m}>
+                @{m}
+              </option>
+            ))}
+          </select>
+          {llm && llm.chatId === memberChatId && (
+            <ModelThinkingPicker
+              key={memberChatId}
+              state={llm.state}
+              busy={room.running}
+              compact={false}
+              onOpen={refreshLlm}
+              onModelSelect={async (model, expected) => {
+                const gen = memberGen.current;
+                const chat = memberChatId;
+                try {
+                  const next = await api.chatSetModel(
+                    chat,
+                    model,
+                    expected.model.provider,
+                    expected.model.model,
+                    expected.revision,
+                  );
+                  if (gen === memberGen.current && activeMemberRef.current === chat) {
+                    applyLlm(chat, next);
+                  }
+                } catch (e) {
+                  if (gen === memberGen.current && activeMemberRef.current === chat) {
+                    onError(String(e));
+                    refreshLlm();
+                  }
+                }
+              }}
+              onThinkingSelect={async (value, expected) => {
+                const gen = memberGen.current;
+                const chat = memberChatId;
+                try {
+                  const next = await api.chatSetThinking(
+                    chat,
+                    value,
+                    expected.model.provider,
+                    expected.model.model,
+                    expected.revision,
+                  );
+                  if (gen === memberGen.current && activeMemberRef.current === chat) {
+                    applyLlm(chat, next);
+                  }
+                } catch (e) {
+                  if (gen === memberGen.current && activeMemberRef.current === chat) {
+                    onError(String(e));
+                    refreshLlm();
+                  }
+                }
+              }}
+            />
+          )}
+          {room.running && (
+            <button className={BTN} onClick={() => void api.groupCancel(id).catch((e) => onError(String(e)))}>
+              取消编排
+            </button>
+          )}
+        </div>
       </div>
 
       <div ref={transcriptRef} className="min-h-0 flex-1 space-y-2 overflow-y-auto px-4 py-3">

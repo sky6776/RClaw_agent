@@ -2837,8 +2837,50 @@ impl TurnManager {
         let session = self.session.clone();
         let layout = self.layout.clone();
         let all_scope = matches!(scope, Some(sync::ClearScope::All));
-        let cleared =
-            tokio::task::spawn_blocking(move || clear_agent_state(&session, &layout)).await;
+        let slash = self.slash.clone();
+        // 全清主事务提交、缓存失效与 epoch 推进必须和模型 setter 串行：否则
+        // 主事务与补删之间的一次提交会写回刚清掉的 KV。VACUUM/记忆清理都在
+        // 同一阻塞任务内，持锁到它们结束，避免留下竞态窗口。
+        let cleared = tokio::task::spawn_blocking(move || {
+            let _guard = slash
+                .as_ref()
+                .and_then(|slash| slash.session_mutation_guard().ok());
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                clear_agent_state(&session, &layout)
+            })) {
+                Ok(Ok(summary)) => {
+                    // 主事务已提交：缓存/epoch 失效之外再补删一次（幂等；主事务
+                    // 已含同一前缀），避免提交与失效之间残留。
+                    if let Some(slash) = slash.as_ref() {
+                        slash.forget_all_session_models_locked();
+                    }
+                    Ok(summary)
+                }
+                Ok(Err(failure)) => {
+                    if failure.sessions_cleared {
+                        // 主事务已提交、只是 memory/ 收尾失败：模型状态同样失效。
+                        if let Some(slash) = slash.as_ref() {
+                            slash.forget_all_session_models_locked();
+                        }
+                    }
+                    // sessions_cleared=false：库没动，模型覆盖原样保留。
+                    Err(failure)
+                }
+                Err(_) => {
+                    // 提交状态未知：只失效进程内缓存并推进 epoch，让下一次冷读按
+                    // 数据库实际状态恢复；不补删 KV——主事务可能没有提交，删了会
+                    // 丢掉仍然有效的模型设置。
+                    if let Some(slash) = slash.as_ref() {
+                        slash.invalidate_all_session_models_locked();
+                    }
+                    Err(ClearFailure {
+                        sessions_cleared: true,
+                        message: "清理任务异常中止（会话可能已清空）".to_string(),
+                    })
+                }
+            }
+        })
+        .await;
         if control.is_some() {
             // 记忆清空等改动由同步引擎的下一轮发布出去（已退出空间时这一下没有作用）。
             self.notify_sync(false);
@@ -3235,6 +3277,13 @@ impl TurnManager {
         self.ledger_forget(channel, chat_id);
     }
 
+    /// 会话被删除（含同步远端删除）时一并失效会话级模型缓存。
+    pub fn forget_session_model(&self, channel: &str, chat_id: &str) {
+        if let Some(slash) = self.slash.as_ref() {
+            slash.forget_session_model(channel, chat_id);
+        }
+    }
+
     /// 测试 / 观测用：是否所有会话都没有活动 turn（review 不计入——它不阻塞下一轮 turn）。
     pub fn is_idle(&self) -> bool {
         self.gate.running().0 == 0
@@ -3445,9 +3494,13 @@ impl TurnManager {
             .as_ref()
             .map(|p| p.memory.clone())
             .unwrap_or_else(|| self.memory.clone());
-        let base_provider = persona
+        // 模型选择的优先级：本会话独立覆盖 > bot 固定 provider > 主 provider。
+        // 会话覆盖只影响这个 chat，不写 rclaw.toml；bot/主 provider 仍作为默认。
+        let base_provider = self
+            .slash
             .as_ref()
-            .and_then(|p| p.provider.clone())
+            .and_then(|slash| slash.session_provider(&msg.channel, &msg.chat_id))
+            .or_else(|| persona.as_ref().and_then(|p| p.provider.clone()))
             .unwrap_or_else(|| self.provider.clone());
         // 固定本次 turn 的 provider 快照：模型选择器在 turn 中途切换时，本 turn 的能力判断、
         // 输出预算、工具链与重试继续用同一份配置；下一 turn 才用新模型。

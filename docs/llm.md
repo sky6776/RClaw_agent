@@ -63,17 +63,18 @@ Provider 名不设白名单：任何 OpenAI 兼容端点（DeepSeek、Kimi、Ope
 
 ## 模型与思考强度（会话页选择器）
 
-模型切换与思考强度都收在会话输入框底部、发送按钮左侧的「🧠 模型」控件里（它左边是环形上下文使用率按钮）。旧 `/llmodel` 命令已移除，只保留一条引导文案。
+模型切换与思考强度都收在会话输入框底部、发送按钮左侧的「🧠 模型」控件里（它左边是环形上下文使用率按钮）。旧 `/llmodel` 命令已移除，只保留一条引导文案。桌面端按钮显示完整模型名与完整思考强度名；安卓窄屏显示缩写（`GLM-5.3F` / `GLM-5.4` / `dp-flash` + 单字档位），完整名称仍在菜单、悬停提示与无障碍标签里。
 
 - **可选模型**（固定三项）：
   - `glm-5.3-flash`：智谱，1M 上下文 / 128K 输出，原生多模态，强制思考（低/高/最高）；
   - `glm-5.4`：智谱旗舰，1M / 128K，多模态，思考低/高/最高（仅 Coding Plan 端点）；
   - `deepseek-flash`：DeepSeek-V4.1-Flash-1017，1M / 384K，支持图像，思考可「关闭」或低/高/最高。
-- **整组切换**：选模型不是只改 `model`，还会同步 provider / `base_url` / `context_length` / `max_tokens` / `thinking` / `reasoning_effort` / `media_wire` / `reasoning_field` / `max_tokens_key`，并一次写回 `rclaw.toml`。这次覆盖以 profile 为准（包括条目里显式写的 `media_wire`），但 `flavor` 保持条目自身的显式值/域名判定：热切换与重启后行为一致。
-- **安全边界**：跨 provider 切换只在目标条目端点与官方端点同源时复用该条目的 key；代理端点不会被强行改写到官方端点（会明确报错）。`[llm].model` 全局覆盖存在时拒绝切换（该键会盖掉条目 model）。
-- **生效时机**：先写盘、后发布 live；主链在每个用户 turn 开始时冻结 provider 快照，进行中的 turn（含工具续轮与重试）继续用旧配置，**下一个用户轮**才用新模型。`context_length` 派生的压缩预算下次启动才重算。
-- **思考强度**：同一控件里按当前模型给出档位；DeepSeek 才有「关闭」。切换只改当前 provider 条目的 `thinking` / `reasoning_effort`，不碰其它参数。
-- **作用域**：设置作用于当前主 provider，同一模型的所有会话共享；显式绑定 provider 的 bot / 子代理 / 评审各用自己的实例，未显式绑定的 bot 继承主 provider 并跟随变化。bot/群编排会话不显示该控件。
+- **按会话独立**：每个 chat 各自保存选择（`state.sqlite` 的 `session-model/<channel>/<chat_id>`），互不影响；不修改 `rclaw.toml`，也不改变主 provider。普通会话、`bot-*`、`grp-*` 都可用这个选择器，各自独立。新建会话默认跟随主 provider / 该 bot 的固定 provider。
+- **整组参数**：选模型不是只改 `model`，该会话的独立 provider 会按 profile 同步 `base_url` / `max_tokens` / `thinking` / `reasoning_effort` / `media_wire` / `reasoning_field` / `max_tokens_key`；覆盖以 profile 为准（包括条目里显式写的 `media_wire`），`flavor` 保持条目自身的显式值/域名判定。上下文压缩/用量预算仍按启动时的主配置派生；若启动阈值/尾窗超过目标模型的可用输入窗口（`context_length - max_tokens`），切换会被明确拒绝并提示调低 `compression_threshold_tokens` / `compression_tail_token_budget`（三个白名单模型都是约 1M 窗口）。
+- **安全边界**：跨 provider 选择只在目标条目端点与官方端点同源时复用该条目的 key；代理端点不会被强行改写到官方端点（会明确报错）。`[llm].model` 全局覆盖不影响会话级选择。
+- **生效时机**：选择后只影响该会话的**下一轮**；进行中的 turn（含工具续轮与重试）继续用轮次开始时的 provider 快照。选择持久化，重启后仍生效。
+- **思考强度**：同一控件里按该会话当前模型给出档位；DeepSeek 才有「关闭」。切换只重建该会话的独立 provider，不碰全局配置。
+- **bot / 群聊**：bot 可在花名册里固定 provider；不同 bot 可指向不同 provider 条目（条目各自带 model），因而默认模型可以不同。bot/群聊的每个会话仍可再用选择器覆盖，二者互不影响。子代理 / 评审使用各自的 provider 或主 provider。
 
 ## 多 provider 场景
 

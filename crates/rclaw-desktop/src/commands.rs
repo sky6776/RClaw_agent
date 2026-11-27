@@ -439,11 +439,46 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<StatusDto, String>
     })
 }
 
+/// 会话模型状态的广播载荷：只更新对应 chat 的窗口，避免 A 会话切换影响 B 的显示。
+#[derive(Clone, serde::Serialize)]
+struct SessionLlmStateEvent {
+    chat_id: String,
+    state: rclaw_runtime::LlmState,
+}
+
+/// 当前 chat 的默认配置：bot 固定 provider 优先，否则主 provider。
+fn session_default_config(
+    state: &AppState,
+    slash: &rclaw_runtime::SlashRegistry,
+    chat_id: &str,
+) -> Option<rclaw_llm::ProviderConfig> {
+    if let Some((bots, _, _)) = state.bot_components() {
+        if let Some(persona) = bots.persona_for_chat("desktop", chat_id) {
+            // 与请求使用同一个 live provider 快照，避免「界面显示磁盘新模型、
+            // 实际请求仍用启动时 provider」的分叉。
+            if let Some(config) = persona
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.config_snapshot())
+            {
+                return Some(config);
+            }
+        }
+    }
+    slash.current_config().ok()
+}
+
 /// 会话页「模型 + 思考强度」当前状态。agent 未启动时返回 unsupported（前端隐藏控件）。
 #[tauri::command]
-pub async fn chat_llm_state(state: State<'_, AppState>) -> Result<rclaw_runtime::LlmState, String> {
+pub async fn chat_llm_state(
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<rclaw_runtime::LlmState, String> {
     match state.slash() {
-        Some(slash) => Ok(slash.llm_state()),
+        Some(slash) => {
+            let fallback = session_default_config(&state, &slash, &chat_id);
+            Ok(slash.session_llm_state("desktop", &chat_id, fallback.as_ref()))
+        }
         None => Ok(rclaw_runtime::LlmState {
             revision: 0,
             model: rclaw_runtime::ModelState {
@@ -457,14 +492,16 @@ pub async fn chat_llm_state(state: State<'_, AppState>) -> Result<rclaw_runtime:
     }
 }
 
-/// 切换当前模型（输入框底部模型选择器）。
+/// 切换当前**会话**的模型（输入框底部模型选择器）。
 ///
-/// `expected_provider` / `expected_model` 由前端在打开菜单时带回：若期间模型已被
-/// 另一窗口/会话切走，本次请求直接拒绝，避免把旧模型的档位写进新模型。
+/// 只影响该 chat：不写 rclaw.toml、不影响其它会话；bot/grp 会话同样按 chat 独立。
+/// `expected_provider` / `expected_model` 由前端在打开菜单时带回，期间被另一窗口
+/// 改过就拒绝，避免把旧模型的档位写进新模型。
 #[tauri::command]
 pub async fn chat_set_model(
     app: AppHandle,
     state: State<'_, AppState>,
+    chat_id: String,
     model: String,
     expected_provider: Option<String>,
     expected_model: Option<String>,
@@ -481,25 +518,36 @@ pub async fn chat_set_model(
     let Some(expected_revision) = expected_revision else {
         return Err("缺少预期状态版本（expected revision），请刷新后重试".into());
     };
+    let fallback = session_default_config(&state, &slash, &chat_id);
+    let event_chat = chat_id.clone();
     let next = run_blocking("切换模型", move || {
-        slash.set_model_at(
+        slash.set_session_model_at(
+            "desktop",
+            &chat_id,
             &model,
             expected_provider.as_deref(),
             expected_model.as_deref(),
             Some(expected_revision),
+            fallback.as_ref(),
         )
     })
     .await?;
-    // 广播给所有窗口：其它窗口的底部选择器立即跟随，不靠 5s 轮询。
-    let _ = app.emit("llm_state_changed", &next);
+    let _ = app.emit(
+        "llm_state_changed",
+        &SessionLlmStateEvent {
+            chat_id: event_chat,
+            state: next.clone(),
+        },
+    );
     Ok(next)
 }
 
-/// 切换当前模型的思考强度。
+/// 切换当前会话的思考强度。
 #[tauri::command]
 pub async fn chat_set_thinking(
     app: AppHandle,
     state: State<'_, AppState>,
+    chat_id: String,
     value: String,
     expected_provider: Option<String>,
     expected_model: Option<String>,
@@ -516,16 +564,27 @@ pub async fn chat_set_thinking(
     let Some(expected_revision) = expected_revision else {
         return Err("缺少预期状态版本（expected revision），请刷新后重试".into());
     };
+    let fallback = session_default_config(&state, &slash, &chat_id);
+    let event_chat = chat_id.clone();
     let next = run_blocking("切换思考强度", move || {
-        slash.set_thinking_at(
+        slash.set_session_thinking_at(
+            "desktop",
+            &chat_id,
             &value,
             expected_provider.as_deref(),
             expected_model.as_deref(),
             Some(expected_revision),
+            fallback.as_ref(),
         )
     })
     .await?;
-    let _ = app.emit("llm_state_changed", &next);
+    let _ = app.emit(
+        "llm_state_changed",
+        &SessionLlmStateEvent {
+            chat_id: event_chat,
+            state: next.clone(),
+        },
+    );
     Ok(next)
 }
 
@@ -2383,6 +2442,9 @@ pub async fn chat_delete(
         Ok(())
     })
     .await?;
+    if let Some(slash) = state.slash() {
+        slash.forget_session_model(CHANNEL_DESKTOP, &cascade_chat_id);
+    }
     // 级联清掉源自该会话的后台执行记录（仅终态；活任务保留，完成后可被「清除历史」清走）。
     // agent 未启动时不存在执行记录，跳过。
     if let Some(runtime) = state.agent_runtime() {

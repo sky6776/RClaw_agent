@@ -57,6 +57,11 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// 当前 provider 使用的配置快照（不可变；用于界面展示 bot/会话默认模型）。
+    fn config_snapshot(&self) -> Option<ProviderConfig> {
+        None
+    }
+
     /// 当前 live 身份 `(provider 名, 模型名)`。
     ///
     /// `name()` 在可热切换实现里是启动时的名字（trait 返回 `&str`，无法在锁内返回）；
@@ -143,6 +148,10 @@ impl<P: ChatProtocol> ProtocolProvider<P> {
 
 #[async_trait]
 impl<P: ChatProtocol + Send + Sync> Provider for ProtocolProvider<P> {
+    fn config_snapshot(&self) -> Option<ProviderConfig> {
+        Some(self.cfg.clone())
+    }
+
     fn name(&self) -> &str {
         &self.cfg.name
     }

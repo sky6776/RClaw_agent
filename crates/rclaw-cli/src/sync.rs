@@ -202,8 +202,11 @@ impl SessionGate for RuntimeGate {
         self.0.long_running_sessions(RUNNING_HINT_AFTER)
     }
 
-    fn session_changed(&self, channel: &str, chat_id: &str, _deleted: bool) {
+    fn session_changed(&self, channel: &str, chat_id: &str, deleted: bool) {
         self.0.forget_session(channel, chat_id);
+        if deleted {
+            self.0.forget_session_model(channel, chat_id);
+        }
     }
 
     fn when_quiet(&self, f: &mut dyn FnMut()) -> bool {

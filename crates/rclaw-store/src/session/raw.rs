@@ -13,8 +13,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{
     artifact_chat_key, fork_lineage_key, insert_tool_call_metas, parse_tool_call_meta,
-    remove_artifact_dir, session_goal_key, session_id, validate_compaction_anchors, CompactionMeta,
-    SessionStore, ToolCallMetaRecord,
+    remove_artifact_dir, session_goal_key, session_id, session_model_key,
+    validate_compaction_anchors, CompactionMeta, SessionStore, ToolCallMetaRecord,
 };
 use crate::db::now_ms;
 use crate::{sync_db, Result, StoreError};
@@ -501,11 +501,12 @@ impl SessionStore {
             // 会话级 kv（/goal 目标、fork 血缘、标题）随会话删除：目标活不过它的会话；血缘
             // 与标题留着会让 chat_id 复用时「新会话被当成旧分叉 / 顶着旧标题」。
             tx.execute(
-                "DELETE FROM kv WHERE key IN (?1, ?2, ?3)",
+                "DELETE FROM kv WHERE key IN (?1, ?2, ?3, ?4)",
                 params![
                     session_goal_key(channel, chat_id),
                     fork_lineage_key(channel, chat_id),
-                    session_title_key(channel, chat_id)
+                    session_title_key(channel, chat_id),
+                    session_model_key(channel, chat_id)
                 ],
             )?;
             if let Some(sid) = session_id(tx, channel, chat_id)? {

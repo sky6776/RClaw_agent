@@ -77,6 +77,11 @@ pub fn session_goal_key(channel: &str, chat_id: &str) -> String {
     format!("session-goal/{channel}/{chat_id}")
 }
 
+/// 会话独立模型选择的 kv 键（`{"model": "...", "effort": "..."}`）。
+pub fn session_model_key(channel: &str, chat_id: &str) -> String {
+    format!("session-model/{channel}/{chat_id}")
+}
+
 /// artifact 目录的会话键（与 runtime `turn::artifact` 同一规则，单一事实源在此）：
 /// `[A-Za-z0-9._-]` 之外替换成 `_`（防 chat_id 里的路径分隔符逃出目录），取前 46 字符
 /// 后拼 `-` + 完整原始键的 FNV-1a 64 位摘要（16 hex，总长 ≤63）——纯截断会把只差尾部
@@ -808,6 +813,14 @@ impl SessionStore {
         })
     }
 
+    /// 删除全部会话级模型选择（`/clear` 全清时调用；幂等）。
+    pub fn delete_all_session_models(&self) -> Result<()> {
+        self.db.transaction(|tx| {
+            tx.execute("DELETE FROM kv WHERE key LIKE 'session-model/%'", [])?;
+            Ok(())
+        })
+    }
+
     /// 删除会话（消息 / checkpoint 级联；usage 锚点、会话目标、fork 血缘与标题 kv 一并
     /// 删除，artifact 目录级联清理）。返回会话是否存在。该会话参与多端同步时，删除会
     /// 传播到其他设备（见 [`Self::delete_session_with`]）。
@@ -1120,13 +1133,13 @@ impl SessionStore {
                 "DELETE FROM tool_call_meta; DELETE FROM file_checkpoint; DELETE FROM message; \
                  DELETE FROM session; DELETE FROM usage_anchor;",
             )?;
-            // 会话全清，会话级 kv（/goal 目标、fork 血缘、标题）一并删除——否则 /clear 后旧
+            // 会话全清，会话级 kv（/goal 目标、fork 血缘、标题、会话模型选择）一并删除——否则 /clear 后旧
             // 目标还挂在 kv 里，goal reminder 会把它注进「全新」的会话；血缘行与标题会让
             // 复用 chat_id 的新会话被当成旧分叉 / 顶着旧标题。plan / workflow 等运行时
             // journal 与其 kv 不属会话，保留。
             tx.execute(
                 "DELETE FROM kv WHERE key LIKE 'session-goal/%' OR key LIKE 'session-fork/%' \
-                 OR key LIKE 'session-title/%'",
+                 OR key LIKE 'session-title/%' OR key LIKE 'session-model/%'",
                 [],
             )?;
             raw::on_clear_all_sessions(tx)

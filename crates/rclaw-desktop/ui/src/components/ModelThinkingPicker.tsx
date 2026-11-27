@@ -51,12 +51,15 @@ function shortModelLabel(model: string): string {
 export default function ModelThinkingPicker({
   state,
   busy,
+  compact = true,
   onModelSelect,
   onThinkingSelect,
   onOpen,
 }: {
   state: LlmState;
   busy?: boolean;
+  /** 安卓窄屏显示缩写；桌面有空间，显示完整模型名与思考强度名。 */
+  compact?: boolean;
   onModelSelect: (model: string, expected: LlmState) => Promise<void>;
   onThinkingSelect: (value: string, expected: LlmState) => Promise<void>;
   onOpen?: () => void;
@@ -145,7 +148,9 @@ export default function ModelThinkingPicker({
   const currentModel =
     state.model.models.find((option) => option.model === state.model.model) ?? null;
   const fullModelLabel = currentModel?.label ?? state.model.model;
-  const displayModelLabel = shortModelLabel(state.model.model);
+  const displayModelLabel = compact
+    ? shortModelLabel(state.model.model)
+    : fullModelLabel;
   const effortLabel = state.thinking.supported
     ? (state.thinking.options.find((option) => option.value === state.thinking.current)
         ?.label ?? "默认")
@@ -165,7 +170,9 @@ export default function ModelThinkingPicker({
         aria-label={`模型 ${fullModelLabel}${effortLabel ? `，思考强度 ${effortLabel}` : ""}`}
         aria-haspopup="menu"
         aria-expanded={open}
-        className="flex h-10 max-w-[110px] items-center gap-1 rounded-lg px-1.5 text-[10px] text-gray-400 transition hover:bg-[#1a2030] hover:text-indigo-300 disabled:opacity-40"
+        className={`flex h-10 items-center gap-1 rounded-lg px-1.5 text-[10px] text-gray-400 transition hover:bg-[#1a2030] hover:text-indigo-300 disabled:opacity-40 ${
+          compact ? "max-w-[110px]" : "max-w-[260px]"
+        }`}
       >
         <span aria-hidden="true" className="text-[13px] leading-none">
           🧠
@@ -173,7 +180,7 @@ export default function ModelThinkingPicker({
         <span className="min-w-0 truncate">{displayModelLabel}</span>
         {effortLabel && (
           <span className="shrink-0 rounded bg-[#232937] px-1 py-0.5 text-[10px] leading-none text-gray-300">
-            {shortEffort(state.thinking.current)}
+            {compact ? shortEffort(state.thinking.current) : effortLabel}
           </span>
         )}
       </button>

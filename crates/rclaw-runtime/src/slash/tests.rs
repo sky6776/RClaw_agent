@@ -165,6 +165,179 @@ fn model_state_lists_three_models_and_current() {
 }
 
 #[test]
+fn session_models_are_isolated_and_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rclaw.toml");
+    std::fs::write(
+        &path,
+        r#"[llm]
+provider = "zhipu"
+
+[[llm.providers]]
+name = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-5.3"
+api_key = "secret"
+"#,
+    )
+    .unwrap();
+    let provider = Arc::new(SwappableProvider::new(zhipu_fixture()).expect("build swappable"));
+    let factory: ProviderFactory = Arc::new(
+        |name: &str, _text: &str, over: Option<&ProviderProfileOverride<'_>>| match name {
+            "zhipu" => Ok(apply_profile(zhipu_fixture(), over)),
+            other => Err(format!("unknown provider {other}")),
+        },
+    );
+    let session = rclaw_store::SessionStore::open(rclaw_store::Layout::new(dir.path())).unwrap();
+    let reg = SlashRegistry::new(provider.clone(), path.clone(), "zhipu".into())
+        .with_provider_factory(factory.clone())
+        .with_session_store(session.clone());
+    let fallback = provider.current_config().unwrap();
+    let before = reg.session_llm_state("desktop", "chat-a", Some(&fallback));
+    assert_eq!(before.model.model, "glm-5.3");
+
+    let changed = reg
+        .set_session_model_at(
+            "desktop",
+            "chat-a",
+            "glm-5.4",
+            None,
+            None,
+            Some(before.revision),
+            Some(&fallback),
+        )
+        .unwrap();
+    assert_eq!(changed.model.model, "glm-5.4");
+    assert_eq!(changed.thinking.current.as_deref(), Some("max"));
+
+    // chat-b 不受影响。
+    let other = reg.session_llm_state("desktop", "chat-b", Some(&fallback));
+    assert_eq!(other.model.model, "glm-5.3");
+    assert!(reg.session_provider("desktop", "chat-b").is_none());
+    assert!(reg.session_provider("desktop", "chat-a").is_some());
+
+    let thinking = reg
+        .set_session_thinking_at(
+            "desktop",
+            "chat-a",
+            "high",
+            Some(&changed.model.provider),
+            Some(&changed.model.model),
+            Some(changed.revision),
+            Some(&fallback),
+        )
+        .unwrap();
+    assert_eq!(thinking.thinking.current.as_deref(), Some("high"));
+    let other_after = reg.session_llm_state("desktop", "chat-b", Some(&fallback));
+    assert_eq!(other_after.model.model, "glm-5.3");
+    assert_eq!(other_after.thinking.current, None);
+
+    // 重新装配后仍从 state.sqlite 读回 chat-a 的选择。
+    let reg2 = SlashRegistry::new(provider.clone(), path.clone(), "zhipu".into())
+        .with_provider_factory(factory.clone())
+        .with_session_store(session.clone());
+    let reloaded = reg2.session_llm_state("desktop", "chat-a", None);
+    assert_eq!(reloaded.model.model, "glm-5.4");
+    assert_eq!(reloaded.thinking.current.as_deref(), Some("high"));
+
+    // 「提交状态未知」分支只失效缓存/推进 epoch、不删持久化 KV：冷读按数据库
+    // 恢复同一选择，失效前的旧 revision 仍被拒绝。
+    {
+        let _guard = reg.session_mutation_guard().expect("config 锁可用");
+        reg.invalidate_all_session_models_locked();
+    }
+    let recovered = reg
+        .session_provider("desktop", "chat-a")
+        .expect("提交状态未知时不得删除持久化 KV")
+        .config_snapshot()
+        .expect("ProtocolProvider 快照");
+    assert_eq!(recovered.default_model, "glm-5.4");
+    assert_eq!(
+        crate::thinking::state_from_config(&recovered)
+            .current
+            .as_deref(),
+        Some("high")
+    );
+    let stale_after_unknown = reg
+        .set_session_model_at(
+            "desktop",
+            "chat-a",
+            "glm-5.4",
+            None,
+            None,
+            Some(thinking.revision),
+            Some(&fallback),
+        )
+        .expect_err("失效前的 revision 必须过期");
+    assert!(
+        stale_after_unknown.contains("状态已更新"),
+        "{stale_after_unknown}"
+    );
+
+    // 全清推进版本地板：清理前的旧 revision 提交必须被拒绝。
+    reg.forget_all_session_models();
+    let stale = reg
+        .set_session_model_at(
+            "desktop",
+            "chat-a",
+            "glm-5.4",
+            None,
+            None,
+            Some(thinking.revision),
+            Some(&fallback),
+        )
+        .expect_err("清理前的 revision 必须过期");
+    assert!(stale.contains("状态已更新"), "{stale}");
+
+    // 启动预算超过目标窗口时拒绝切换（而不是等远端超限）。
+    let guarded = SlashRegistry::new(provider.clone(), path.clone(), "zhipu".into())
+        .with_provider_factory(factory.clone())
+        .with_session_store(session.clone())
+        .with_session_budget(900_000, 90_000);
+    let guarded_state = guarded.session_llm_state("desktop", "chat-a", Some(&fallback));
+    assert_eq!(guarded_state.model.model, "glm-5.3");
+    let budget = guarded
+        .set_session_model_at(
+            "desktop",
+            "chat-a",
+            "glm-5.4",
+            None,
+            None,
+            Some(guarded_state.revision),
+            Some(&fallback),
+        )
+        .expect_err("预算超过模型窗口应拒绝");
+    assert!(budget.contains("压缩预算"), "{budget}");
+
+    // 直接对 bot/默认配置调档（未显式选模型）只保存档位；重启后不得套入
+    // profile 的 max_tokens 等整组参数。
+    let mut bot_default = zhipu_fixture();
+    bot_default.default_model = "glm-5.4".into();
+    bot_default.max_tokens = 4_096;
+    reg2.set_session_thinking_at(
+        "desktop",
+        "chat-c",
+        "high",
+        None,
+        None,
+        Some(0),
+        Some(&bot_default),
+    )
+    .unwrap();
+    let reg3 = SlashRegistry::new(provider.clone(), path.clone(), "zhipu".into())
+        .with_provider_factory(factory.clone())
+        .with_session_store(session.clone());
+    let restored = reg3
+        .session_provider("desktop", "chat-c")
+        .expect("调档覆盖应可恢复")
+        .config_snapshot()
+        .expect("ProtocolProvider 快照");
+    assert_eq!(restored.default_model, "glm-5.4");
+    assert_eq!(restored.max_tokens, 4_096, "调档不应套 profile 输出上限");
+    assert_eq!(restored.reasoning.effort.as_deref(), Some("high"));
+}
+
+#[test]
 fn set_model_switches_runtime_and_persists_all_params() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rclaw.toml");

@@ -504,6 +504,25 @@ pub async fn assemble_core_with(
     let tools = Arc::new(tools);
     let _ = agent_tools_registry.set(tools.clone());
 
+    // 压缩 token 预算派生：context_length / threshold / tail 未显式配置时按模型窗口派生。
+    let (derived_threshold, derived_tail) =
+        rclaw_runtime::options::derive_compression_token_budgets(
+            cfg.selected_context_length(),
+            cfg.llm.max_tokens,
+        );
+    // 运行期实际采用的阈值/尾窗（显式配置优先）——注册表与 AgentOptions 必须
+    // 用同一份值做会话模型窗口校验，不能拿派生值代替。
+    let effective_threshold = if cfg.agent.compression_threshold_tokens != 0 {
+        cfg.agent.compression_threshold_tokens
+    } else {
+        derived_threshold
+    };
+    let effective_tail = if cfg.agent.compression_tail_token_budget != 0 {
+        cfg.agent.compression_tail_token_budget
+    } else {
+        derived_tail
+    };
+
     // 斜杠命令注册表：搜索控制与模型/思考切换持久化到调用方指定的 rclaw.toml 路径。
     // 后面收尾没存完的同步设置还要写回同一个文件：留一份路径。
     let sync_config_path = slash_config_path.clone();
@@ -513,6 +532,8 @@ pub async fn assemble_core_with(
             slash_config_path,
             cfg.effective_provider_name().to_string(),
         )
+        .with_session_store(session.clone())
+        .with_session_budget(effective_threshold, effective_tail)
         // 跨 provider 切换用：解析调用方传入的**事务快照文本**（与写回同一份），
         // 不做遗留节物理写回，选中目标条目并用它自己的 key 构造；构造失败时
         // 调用方明确报错且不改运行时。
@@ -547,12 +568,6 @@ pub async fn assemble_core_with(
         }
     });
 
-    // 压缩 token 预算派生：context_length / threshold / tail 未显式配置时按模型窗口派生。
-    let (derived_threshold, derived_tail) =
-        rclaw_runtime::options::derive_compression_token_budgets(
-            cfg.selected_context_length(),
-            cfg.llm.max_tokens,
-        );
     let derived_summary_ceiling = rclaw_runtime::options::derive_summary_token_ceiling(
         cfg.selected_context_length(),
         cfg.agent.compression_summary_max_tokens as usize,
@@ -565,16 +580,8 @@ pub async fn assemble_core_with(
         session_compression_enabled: cfg.agent.session_compression,
         compression_protect_first: cfg.agent.compression_protect_first,
         compression_keep_recent: cfg.agent.compression_keep_recent,
-        compression_threshold_tokens: if cfg.agent.compression_threshold_tokens != 0 {
-            cfg.agent.compression_threshold_tokens
-        } else {
-            derived_threshold
-        },
-        compression_tail_token_budget: if cfg.agent.compression_tail_token_budget != 0 {
-            cfg.agent.compression_tail_token_budget
-        } else {
-            derived_tail
-        },
+        compression_threshold_tokens: effective_threshold,
+        compression_tail_token_budget: effective_tail,
         compression_tail_min_floor: cfg.agent.compression_tail_min_floor,
         compression_summary_max_tokens: cfg.agent.compression_summary_max_tokens,
         compression_summary_context_ceiling: derived_summary_ceiling,
